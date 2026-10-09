@@ -1162,8 +1162,10 @@ def _continuation(conn: sqlite3.Connection, db_path: Path, row: dict, body: str,
             kb.add_comment(conn, item, _REVIEW_CREATOR, body)
         return {"rework": item}
     task = kb.get_task(conn, source)
-    governed = conn.execute("SELECT execution_tier, model_policy_lock, owner_receipt_bound FROM tasks WHERE id = ?",
-                            (source,)).fetchone()
+    governed = conn.execute("SELECT execution_tier, provider_override, model_override, reasoning_effort, "
+                            "model_policy_lock, owner_receipt_bound FROM tasks WHERE id = ?", (source,)).fetchone()
+    route = {key: governed[key] for key in ("execution_tier", "provider_override", "model_override",
+                                            "reasoning_effort")}
     implementer = kb._latest_review_provenance(conn, source)[0]
     root, name = branch
     found = _run_git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}")
@@ -1171,10 +1173,11 @@ def _continuation(conn: sqlite3.Connection, db_path: Path, row: dict, body: str,
         raise PublishRefused("branch_not_at_head", f"{name} is not at {head} in the write transaction")
     lock = parked = None
     # Owner rule 1: the source card's own route and tier, locked for the builder; unadmitted, the card parks.
-    # Owner rule 3 of round 3: its owner_receipt_bound too. When a governed source's route cannot be locked, the
-    # card is created parked with the reason and stays governed, never a manual card: it keeps the source's
-    # provider, which create_task refuses with no model, and, governed by nothing else, the source's lock, which
-    # binds no route with no tier.
+    # Owner rule 3 of round 3: its owner_receipt_bound too, and its route as it is: locked, the card keeps the
+    # source's effort with that lock, which the pin of a new card would move. When a governed source's route cannot
+    # be locked, the card is created parked with the reason and stays governed, never a manual card: it keeps the
+    # source's tier and route as stored, which create_task would strip or refuse, and, governed by nothing else,
+    # the source's lock, which binds no route with no tier.
     try:
         lock = kb.mint_policy_lock(implementer, task.provider_override, task.model_override,
                                    task.reasoning_effort, task.execution_tier)
@@ -1183,17 +1186,20 @@ def _continuation(conn: sqlite3.Connection, db_path: Path, row: dict, body: str,
     item = kb.create_task(
         conn, title=owner_title(task.title), body=body, assignee=implementer, parents=[source], tenant=task.tenant,
         workspace_kind="worktree", project_id=task.project_id, branch_name=name, owned_paths=task.owned_paths,
-        risk_tier=task.risk_tier, execution_tier=task.execution_tier, requires_review=task.requires_review,
-        provider_override=None if parked else task.provider_override, model_override=task.model_override,
-        reasoning_effort=task.reasoning_effort, model_policy_lock=lock,
-        receipt_owned=bool(governed["owner_receipt_bound"]), board=_board_slug(db_path))
+        risk_tier=task.risk_tier, requires_review=task.requires_review, model_policy_lock=lock,
+        receipt_owned=bool(governed["owner_receipt_bound"]), board=_board_slug(db_path), **({} if parked else route))
     conn.execute("UPDATE tasks SET base_commit = ? WHERE id = ?", (head, item))  # the claim keeps it
     if Path(kb.get_task(conn, item).workspace_path or "") != root / ".worktrees" / item:
         raise PublishRefused("no_repository", f"the project of {source} no longer anchors its cards in {root}")
+    if lock:  # a pin's record stays only where the pin kept that effort
+        effort = kb.normalize_reasoning_effort(task.reasoning_effort)
+        conn.execute("UPDATE tasks SET pinned_effort = CASE WHEN reasoning_effort IS ? THEN pinned_effort END, "
+                     "reasoning_effort = ?, model_policy_lock = ? WHERE id = ?", (effort, effort, lock, item))
     if parked:
-        conn.execute("UPDATE tasks SET provider_override = ?, model_policy_lock = CASE WHEN execution_tier IS NULL "
-                     "AND NOT owner_receipt_bound THEN ? END WHERE id = ?",
-                     (task.provider_override, governed["model_policy_lock"], item))
+        alone = not (governed["execution_tier"] or governed["owner_receipt_bound"])
+        conn.execute("UPDATE tasks SET execution_tier = ?, provider_override = ?, model_override = ?, "
+                     "reasoning_effort = ?, model_policy_lock = ? WHERE id = ?",
+                     (*route.values(), governed["model_policy_lock"] if alone else None, item))
         kb._pause_unpinnable_task(conn, item, parked)  # as the readiness guard parks a card it cannot lock
     else:
         kb.authorize_executable_transition(conn, item)  # its route lock, or none for a manual source's card

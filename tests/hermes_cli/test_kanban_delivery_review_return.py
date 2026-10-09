@@ -30,13 +30,17 @@ CONTINUED = ("SELECT * FROM tasks WHERE id IN (SELECT child_id FROM task_links W
 KEPT = ("owned_paths", "risk_tier", "execution_tier", "requires_review")
 BUILDER = "raphael-claude-worker"
 # Owner rule 3 of round 3: a source card _governed sealed, then left so that no lock binds its route for its builder,
-# beside the start of the reason its continuation parks with: governed by its lock alone, with no tier; or owner
-# receipt-bound on a model not admitted, or on a provider with no model. ROUTE: the fields the continuation copies.
+# beside the start of the reason its continuation parks with: governed by its lock alone, with no tier, or by a blank
+# tier alone, which create_task strips; or owner receipt-bound on a model not admitted, on a provider with no model,
+# or with no tier on an effort create_task refuses. ROUTE: the fields the continuation copies.
 UNLOCKABLE = {"lock_only": ("execution_tier = NULL", "names no admitted"),
+              "blank_tier": ("execution_tier = ' ', model_policy_lock = NULL", "names no admitted"),
               "unadmitted": ("owner_receipt_bound = 1, model_policy_lock = NULL, model_override = 'claude-unadmitted'",
                              "'claude-unadmitted'"),
               "provider_only": ("owner_receipt_bound = 1, model_policy_lock = NULL, model_override = NULL",
-                                "is incomplete")}
+                                "is incomplete"),
+              "unknown_effort": ("owner_receipt_bound = 1, execution_tier = NULL, model_policy_lock = NULL, "
+                                 "reasoning_effort = 'not-admitted'", "names no admitted")}
 ROUTE = ("owner_receipt_bound", "execution_tier", "provider_override", "model_override", "reasoning_effort")
 
 
@@ -113,6 +117,30 @@ def _held(kb, tid, card, returned, why):
         conn.close()
     assert _raw(db, "SELECT status, model_override FROM tasks WHERE id = ?", card["id"]) == [
         {"status": "blocked", "model_override": card["model_override"]}]
+
+
+def _legacy(kb, tid):
+    """The source card as sealed before the pins: owner receipt-bound at risk tier 2 with no pinned effort, on its
+    builder's routine route at high, which the pin of a new card at that tier would move to max."""
+    model = _governed(kb, tid, "routine")[0]
+    _raw(kb.kanban_db_path(), "UPDATE tasks SET risk_tier = 2, owner_receipt_bound = 1, pinned_effort = NULL, "
+         "reasoning_effort = 'high', model_policy_lock = ? WHERE id = ?",
+         kb.mint_policy_lock(BUILDER, "anthropic", model, "high", "routine"), tid)
+
+
+def _copied(kb, tid, continued, returned):
+    """Owner rule 3 of round 3: the one continuation of the _legacy source card ``tid`` is ready on the source's
+    ROUTE, effort included, with the very lock the source holds, which proves both routes, and no recorded pin;
+    the one return event ``returned`` names it and parks nothing."""
+    db = kb.kanban_db_path()
+    (source,) = _raw(db, "SELECT * FROM tasks WHERE id = ?", tid)
+    (card,) = continued
+    assert ([payload["rework"] for payload in returned], "parked" in returned[0]) == ([card["id"]], False)
+    copied = (*ROUTE, "model_policy_lock", "pinned_effort")
+    assert (card["status"], [card[key] for key in copied]) == ("ready", [source[key] for key in copied])
+    assert (card["reasoning_effort"], card["risk_tier"]) == ("high", 2)
+    with kb.connect_closing() as conn:
+        assert [kb.route_authority_error(conn, task) for task in (tid, card["id"])] == [None, None]
 
 
 def _run(db, card, started, *findings):
@@ -396,13 +424,15 @@ def test_a_governed_sources_continuation_is_claimable_on_its_builders_route(arme
     assert (claimed["branch_name"], _git(Path(claimed["workspace_path"]), "rev-parse", "HEAD")) == (_branch(tid, head), head)
 
 
-@pytest.mark.parametrize("route", ["admitted", "incomplete", "unadmitted", "lock_only", "provider_only"])
+@pytest.mark.parametrize("route", ["admitted", "incomplete", "unadmitted", "lock_only", "provider_only", "blank_tier",
+                                   "unknown_effort"])
 def test_a_governed_sources_continuation_keeps_its_receipt_binding_and_parks_with_why_when_unlockable(armed, route):
     """Owner rule 3 of round 3: the source card is owner receipt-bound, on its builder's admitted route, on no
-    route at all, on a model not admitted or on a provider with no model; or it is governed by its lock alone, with
-    no tier. The continuation copies the source's owner_receipt_bound. Locked for its builder, it is ready; when its
-    route cannot be locked, it is created parked with the reason, the return event names it, and it stays governed
-    (_held). A governed source gives no manual card."""
+    route at all, on a model not admitted, on a provider with no model or, with no tier, on an effort create_task
+    refuses; or it is governed by its lock alone, with no tier, or by a blank tier alone. The continuation copies
+    the source's owner_receipt_bound. Locked for its builder, it is ready; when its route cannot be locked, it is
+    created parked with the reason, the return event names it, and it stays governed on the source's tier and route
+    as stored (_held). A governed source gives no manual card."""
     kb, root, repo, gh = armed
     db = kb.kanban_db_path()
     tid, head, cards = _changes_requested(armed)
@@ -417,13 +447,27 @@ def test_a_governed_sources_continuation_keeps_its_receipt_binding_and_parks_wit
     (returned,) = _returned(kb, tid)
     parked = [json.loads(event["payload"])["detail"] for event in _raw(
         db, "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'model_route_unapproved'", card["id"])]
-    assert (card["owner_receipt_bound"], returned["rework"]) == (int(route != "lock_only"), card["id"])
+    bound = int(route not in ("lock_only", "blank_tier"))
+    assert (card["owner_receipt_bound"], returned["rework"]) == (bound, card["id"])
     if route == "admitted":
         assert (card["status"], card["execution_tier"], parked, "parked" in returned) == ("ready", "routine", [], False)
         assert kb.policy_lock_error(card["model_policy_lock"], BUILDER, "anthropic", card["model_override"],
                                     card["reasoning_effort"], "routine") is None
         return
     _held(kb, tid, card, returned, why)
+
+
+def test_a_legacy_sources_continuation_keeps_its_exact_route_and_lock(armed):
+    """Owner rule 3 of round 3: the source card was sealed before the pins (_legacy), at high on risk tier 2. The
+    review return's continuation copies its route as it is, with the lock its builder gets for those fields, the
+    source's own, and no recorded pin: the pin of a new card does not move it to max (_copied)."""
+    kb, root, repo, gh = armed
+    tid, head, cards = _changes_requested(armed)
+    _legacy(kb, tid)
+
+    _tick(kb)
+
+    _copied(kb, tid, _raw(kb.kanban_db_path(), CONTINUED, tid), _returned(kb, tid))
 
 
 @pytest.mark.parametrize("layout", ["external", "advanced", "dot_worktrees", "removed", "other_clone", "separate_git_dir"])
