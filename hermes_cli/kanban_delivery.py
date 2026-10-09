@@ -22,7 +22,9 @@ whether the approved head becomes the delivery's one pull request.
 on green it creates that head's review cards; when a required check is red it
 names the failed tests and reruns the failed jobs once if ``decide_rerun``
 allows it, or else returns the work once to its builder through one continuation
-card, and a later pass reads CI again. :func:`arm_step` then arms GitHub
+card, and a later pass reads CI again. An open head whose pull request GitHub
+shows closed, merged or not, outside the delivery step is marked closed outside,
+its final state. :func:`arm_step` then arms GitHub
 auto-merge once on each head whose required review cards are done and approve it,
 returns the work of each head whose review requests changes through that same card,
 and closes once each pull request a rework card replaced; GitHub does the merge.
@@ -295,11 +297,12 @@ def record_approved_delivery(conn: sqlite3.Connection, task_id: str) -> Optional
             (task_id, head),
         ).fetchone()
         # The approval is the source card's latest, so every other head of it,
-        # older or newer, is returned for changes; a head GitHub may hold armed, or merged, stays as it is.
+        # older or newer, is returned for changes; a head GitHub may hold armed, or merged, stays as it is,
+        # and so does one whose pull request GitHub showed closed outside the delivery step.
         conn.execute(
             "UPDATE kanban_deliveries SET pull_request_state = 'returned_for_changes' "
-            "WHERE source_task_id = ? AND source_head != ? AND IFNULL(pull_request_state, '') NOT IN (?, ?, ?, ?)",
-            (task_id, head, *_ARM_HELD, _MERGED),
+            "WHERE source_task_id = ? AND source_head != ? AND IFNULL(pull_request_state, '') NOT IN (?, ?, ?, ?, ?)",
+            (task_id, head, *_ARM_HELD, _MERGED, _CLOSED_OUTSIDE),
         )
         return record["id"]
 
@@ -774,6 +777,10 @@ _REVIEW_BODY = (
 )
 # Added once the card has its id: the line that ties the reviewer's GitHub review to this one card.
 _REVIEW_LINE = "Start your GitHub review body with this exact line:\nReview card {card}\n"
+# GitHub showed the open row's pull request closed, merged or not, outside the delivery step: final. An approval
+# of another head of its source card leaves it as it is, the review step never reads that row again, and the merge
+# step, which reads armed or unknown arms only, never records it.
+_CLOSED_OUTSIDE = "closed_outside"
 
 
 def review_key(source_task_id: str, head: str, responsibility: str) -> str:
@@ -813,10 +820,16 @@ def _page(github, path: str, key: str, **query) -> tuple:
     return page, count
 
 
-def _open_at_head(github, repository: str, row: dict) -> bool:
-    """The pull request, read through the fenced pull endpoint, is open at the row's head."""
+def _pull(github, repository: str, row: dict) -> dict:
+    """The row's pull request, read through the fenced pull endpoint: GitHub's object, or {} for any other answer."""
     answer = _answered(github.request("GET", f"/repos/{repository}/pulls/{row['pull_request_number']}"))
-    pull = answer["data"] if answer["status"] == 200 and isinstance(answer["data"], dict) else {}
+    return answer["data"] if answer["status"] == 200 and isinstance(answer["data"], dict) else {}
+
+
+def _open_at_head(github, repository: str, row: dict, pull: Optional[dict] = None) -> bool:
+    """The pull request, read through the fenced pull endpoint unless ``pull`` is that read, is open at the
+    row's head."""
+    pull = _pull(github, repository, row) if pull is None else pull
     pulled = pull["head"].get("sha") if isinstance(pull.get("head"), dict) else None
     return (pull.get("state"), pulled) == ("open", row["pull_request_head"])
 
@@ -854,6 +867,32 @@ def _waiting(conn: sqlite3.Connection, row: dict, code: str, **details) -> None:
         kb._append_event(conn, row["source_task_id"], "delivery_review_waiting", _outcome(row, code=code, **details))
 
 
+def _closed_outside(db_path: Path, row: dict, merged: bool) -> Optional[str]:
+    """GitHub shows the row's pull request closed, merged or not, outside the delivery step. One write
+    transaction marks the row closed outside only while it is still open at the same head and pull request,
+    with one event on the source card naming them and whether GitHub shows it merged; a row changed
+    meanwhile gets nothing. Returns the state stored, if any."""
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+        if not delivery_settings() or not conn.execute(
+                "UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ? AND pull_request_state = 'open' "
+                "AND pull_request_head = ? AND pull_request_number = ?",
+                (_CLOSED_OUTSIDE, row["id"], row["pull_request_head"], row["pull_request_number"])).rowcount:
+            return None  # the row moved on, or names another head or pull request, while GitHub was read
+        kb._append_event(conn, row["source_task_id"], f"delivery_{_CLOSED_OUTSIDE}", _outcome(row, merged=merged))
+    return _CLOSED_OUTSIDE
+
+
+def _review_pull(db_path: Path, github, repository: str, row: dict) -> tuple:
+    """A review pass's read of the row's pull request, through the fenced pull endpoint: ``(open at H, the state
+    stored)``. GitHub's pull request object with the row's own number, state closed and a boolean merged marks the
+    row closed outside (:func:`_closed_outside`); any other answer stores nothing."""
+    pull = _pull(github, repository, row)
+    if (pull.get("number"), pull.get("state")) == (row["pull_request_number"], "closed") and type(
+            pull.get("merged")) is bool:  # closed outside the delivery step: final, never read again
+        return False, _closed_outside(db_path, row, pull["merged"])
+    return _open_at_head(github, repository, row, pull), None
+
+
 def review_step(db_path: Path) -> None:
     """Card 2 on the board whose file is ``db_path``: each published head whose CI is
     green gets its review cards; one whose CI still runs or is red waits, and a later
@@ -861,8 +900,8 @@ def review_step(db_path: Path) -> None:
     created. Owner rule 2 of round 3: a head with a recorded refused or unanswered rerun
     and no return is read too, for that return, in whatever phase other passes moved its
     row to while the rerun call waited (review cards, an arm sent or answered, a close);
-    only a merged or replaced row, whose pull request is closed, is not. Raises no error,
-    so the tick goes on."""
+    only a merged, replaced or closed outside row, whose pull request is closed, is not.
+    Raises no error, so the tick goes on."""
     try:
         reviewer, route = _review_route() if delivery_settings() else (None, None)
         if reviewer is None:
@@ -870,7 +909,7 @@ def review_step(db_path: Path) -> None:
         with kb.connect_closing(db_path=db_path) as conn:
             rows = [dict(row) for row in conn.execute(
                 "SELECT * FROM kanban_deliveries WHERE pull_request_number IS NOT NULL "
-                "AND pull_request_state NOT IN (?, ?) ORDER BY id", (_MERGED, _REPLACED))]
+                "AND pull_request_state NOT IN (?, ?, ?) ORDER BY id", (_MERGED, _REPLACED, _CLOSED_OUTSIDE))]
             rows = [row for row in rows if row["pull_request_state"] == "open" or _refused_rerun(
                 conn, row["source_task_id"], row["pull_request_head"]) is not None]
     except Exception:
@@ -895,8 +934,10 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
     as that request answered them, before the red check is rerun or returned. Owner rule 2
     of round 3: a recorded refused or unanswered rerun of H with no return recorded for H
     returns the work before CI on H is read, whatever it shows, in whatever phase the row
-    is; such a row is read for nothing else. Returns the state or the red outcome stored,
-    if any."""
+    is; such a row is read for nothing else. An open row whose pull request any read of this
+    pass (:func:`_review_pull`: the first, the one after CI, the one before a rerun or a
+    return) shows closed, merged or not, is marked closed outside, and nothing more is read,
+    recorded or sent. Returns the state or the red outcome stored, if any."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     source, head = row["source_task_id"], row["pull_request_head"]
@@ -927,8 +968,9 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
         github = GitHubTransport("read_checks", repository)
         if refused is not None:  # owner rule 2 of round 3: green, pending or red, CI on H does not change it
             return _rerun_refused(db_path, row, read, github, repository, *refused)
-        if not _open_at_head(github, repository, row):
-            return None  # the pull request moved off H or closed: no card for a stale head
+        at_head, stored = _review_pull(db_path, github, repository, row)
+        if not at_head:
+            return stored  # the pull request closed outside the delivery step, or moved off H: no card for a stale head
         required = policy.required_checks[repository]
         runs, count = _page(github, f"/repos/{repository}/commits/{head}/check-runs", "check_runs", filter="latest")
         if count > 100 or len(runs) != count:  # the one decision request, read last: whole on its one page
@@ -937,8 +979,11 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
         if not named or any(len(found) != 1 for found in named.values()):
             return None  # a required check that is not in the answer exactly once decides nothing
         outcomes = {_required_check(name, head, {"check_runs": found, "statuses": []}) for name, found in named.items()}
-        if outcomes & {"pending", "stale"} or not _open_at_head(github, repository, row):
-            return None  # CI on H still runs, or the pull request left H while CI was read: a later step tries again
+        if outcomes & {"pending", "stale"}:
+            return None  # CI on H still runs: a later step tries again
+        at_head, stored = _review_pull(db_path, github, repository, row)
+        if not at_head:
+            return stored  # the pull request closed outside the delivery step, or left H, while CI was read
         if outcomes == {"success"}:
             return _create_review_cards(db_path, row, read, repository, base, required, reviewer, route)
         failed = [{"id": run["id"], "conclusion": run.get("conclusion")} for (run,) in named.values()
@@ -1012,7 +1057,8 @@ def _rerun_or_return(db_path: Path, row: dict, read: tuple, github, repository: 
     rerun calls are sent and as red_check_rerun_outcome with their answers after them, or returns the
     work: red_check_returned and one continuation card for the builder, once for H, also when a rerun call was
     refused (rerun_refused) or got no answer (rerun_unknown). Nothing is recorded or sent unless the pull
-    request, read after H's run, jobs and annotations, is still open at H. Until GitHub shows a newer
+    request, read after H's run, jobs and annotations, is still open at H; that read showing it closed outside
+    the delivery step marks the open row closed outside instead (:func:`_review_pull`). Until GitHub shows a newer
     attempt than the rerun whose recorded outcome shows every call accepted, the pass waits; after a
     refused or unanswered one, the pass reads the pull request again (owner rule 4). Returns the outcome
     recorded, if any."""
@@ -1034,8 +1080,9 @@ def _rerun_or_return(db_path: Path, row: dict, read: tuple, github, repository: 
     if decision.allowed and decision.code != "rerun":
         return None
     branch = None if decision.allowed else _return_branch(db_path, row)  # owner rule 2: the branch comes first
-    if not _open_at_head(github, repository, row):
-        return None  # owner rule 1: the pull request left H or closed while H's run was read
+    at_head, stored = _review_pull(db_path, github, repository, row)
+    if not at_head:
+        return stored  # owner rule 1: the pull request left H or closed while H's run was read
     code = "red_check_rerun" if decision.allowed else "red_check_returned"
     tests = [test for job in jobs for test in job.get("failed_tests") or () if isinstance(test, str)]
     ids = sorted({match["job_id"] for match in decision.matches})
@@ -1079,12 +1126,15 @@ def _refused_rerun(conn: sqlite3.Connection, source: str, head: str) -> Optional
 
 def _rerun_refused(db_path: Path, row: dict, read: tuple, github, repository: str, sent: dict, tests: list):
     """Owner rule 4: H's rerun outcome ``sent`` shows a refused or unanswered call, so the pull request is read
-    again and, open at H, red_check_returned is recorded once for H with H's continuation. A failed read
-    raises and only ends the pass; a later pass reads it again. Returns the outcome recorded, if any."""
+    again and, open at H, red_check_returned is recorded once for H with H's continuation; shown closed outside
+    the delivery step, an open row is marked closed outside instead (:func:`_review_pull`) and the work is not
+    returned. A failed read raises and only ends the pass; a later pass reads it again. Returns the outcome
+    recorded, if any."""
     source, head = row["source_task_id"], row["pull_request_head"]
     branch = _return_branch(db_path, row)
-    if not _open_at_head(github, repository, row):
-        return None  # safety rule 1: the pull request left H or closed
+    at_head, stored = _review_pull(db_path, github, repository, row)
+    if not at_head:
+        return stored  # safety rule 1: the pull request left H or closed
     reason = _rerun_reason(sent["statuses"])
     refusal = Decision(False, reason, f"the rerun calls of jobs {sent['jobs']} were answered {sent['statuses']} "
                                       "(None: no answer)")
@@ -1318,7 +1368,7 @@ def _replaced(conn: sqlite3.Connection, old_id: Optional[int] = None) -> list:
     another card's work continues: that card is a task_links child of the row's source card,
     its recorded base is the row's head and its own published pull request is another one of
     the same repository. The row is still the latest on its pull request, and no close of it
-    was sent; a merged row is final (card 10's owner rule 2)."""
+    was sent; a merged row is final (card 10's owner rule 2), and so is a row closed outside."""
     old, new, later = (_RECEIPT.format(name) for name in ("old", "new", "later"))
     return [dict(row) for row in conn.execute(
         f"SELECT old.*, {old} AS repository, MIN(rework.id) AS replaced_by FROM kanban_deliveries AS old "
@@ -1326,12 +1376,13 @@ def _replaced(conn: sqlite3.Connection, old_id: Optional[int] = None) -> list:
         "JOIN task_links AS link ON link.parent_id = old.source_task_id AND link.child_id = rework.id "
         "JOIN kanban_deliveries AS new ON new.source_task_id = rework.id AND new.pull_request_number IS NOT NULL "
         f"AND new.pull_request_number != old.pull_request_number AND {new} = {old} "
-        "WHERE old.pull_request_number IS NOT NULL AND (? IS NULL OR old.id = ?) AND old.pull_request_state IS NOT ? "
+        "WHERE old.pull_request_number IS NOT NULL AND (? IS NULL OR old.id = ?) "
+        "AND IFNULL(old.pull_request_state, '') NOT IN (?, ?) "
         "AND NOT EXISTS (SELECT 1 FROM kanban_deliveries AS later WHERE later.id > old.id "
         f"AND later.pull_request_number = old.pull_request_number AND {later} = {old}) "
         "AND NOT EXISTS (SELECT 1 FROM task_events WHERE task_id = old.source_task_id "
         "AND kind = 'delivery_close_pending' AND json_extract(payload, '$.delivery_id') = old.id) "
-        "GROUP BY old.id ORDER BY old.id", (old_id, old_id, _MERGED))]
+        "GROUP BY old.id ORDER BY old.id", (old_id, old_id, _MERGED, _CLOSED_OUTSIDE))]
 
 
 def _approving_cards(conn: sqlite3.Connection, row: dict, read: tuple, returned: bool = False) -> list:

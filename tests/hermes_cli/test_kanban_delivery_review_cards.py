@@ -38,7 +38,7 @@ def world(board, monkeypatch):
     gh["pad"] puts 100 other items after the real ones of a collection, so its total_count is over one page;
     gh["short"] states one more than it holds; gh["broken"] answers 502. gh["each"] runs at every request,
     gh["during"] at the check-runs request, the one CI read, and gh["move_after"] at the request whose path
-    ends with it."""
+    ends with it. gh["pull"] holds fields that replace the pull request's own, as GitHub shows it closed."""
     kb, root, repo = board
     from hermes_cli import kanban_delivery_github as transport
 
@@ -46,7 +46,7 @@ def world(board, monkeypatch):
     _write_config(root, enabled=True)
     gh = {"calls": [], "queries": [], "steps": [], "pull_head": None, "check": ("completed", "success"),
           "copies": None, "pad": None, "short": None, "broken": None, "move_after": None, "during": None,
-          "each": None}
+          "each": None, "pull": None}
 
     def listed(key, items, page):
         if gh["broken"] == key:
@@ -64,7 +64,7 @@ def world(board, monkeypatch):
         if gh["each"]:
             gh["each"]()
         if (method, path) == ("GET", f"/repos/{REPO}/pulls/41"):
-            return 200, {"number": 41, "state": "open", "head": {"sha": gh["pull_head"] or head}}
+            return 200, {"number": 41, "state": "open", "head": {"sha": gh["pull_head"] or head}, **(gh["pull"] or {})}
         if gh["move_after"] and path.endswith(gh["move_after"]):  # the pull request moves on while CI is read
             gh["pull_head"] = "f" * 40
         if gh["during"] and path.endswith(PAGED["check_runs"]):  # the source card changes while CI is read
@@ -353,6 +353,366 @@ def test_a_head_the_pull_request_left_gets_no_outcome(world, moved, conclusion):
     assert (_cards(kb), _state(kb, head), _events(kb, tid), _source(kb, tid)["status"]) == ([], "open", events, "done")
     pulls = [path for _, path in gh["calls"] if path.endswith("/pulls/41")]
     assert (len(pulls), len(gh["calls"]) > len(pulls)) == ((1, False) if moved == "before" else (2, True))
+
+
+@pytest.mark.parametrize("merged", [True, False], ids=["merged", "closed"])
+def test_a_pull_request_closed_outside_the_step_marks_its_row_closed_outside_once(world, merged):
+    """GitHub shows the open row's pull request closed outside the delivery step, merged by someone else or
+    closed unmerged: the pass marks the row closed outside, with exactly one event on the source card naming
+    the pull request, its head and whether GitHub shows it merged. No later pass reads that pull request
+    again, and the release record never holds the row."""
+    from hermes_cli import release_ledger
+
+    kb, root, repo, gh = world
+    db, every = kb.kanban_db_path(), "SELECT COUNT(*) AS n FROM task_events WHERE task_id = ?"
+    tid, head = _ready(world)
+    gh["pull"] = {"state": "closed", "merged": merged,  # merged into main as GitHub shows a merge, or not merged
+                  **({"base": {"ref": "main"}, "merge_commit_sha": "d" * 40} if merged else {})}
+    events, count = _events(kb, tid), _raw(db, every, tid)[0]["n"]
+
+    _tick(kb)
+
+    assert (_cards(kb), _state(kb, head), _events(kb, tid)[len(events):]) == ([], "closed_outside", [
+        ("delivery_closed_outside", {"delivery_id": 1, "head": head, "pull_request_number": 41, "merged": merged})])
+    read = [("GET", f"/repos/{REPO}/pulls/41")]
+    assert (_raw(db, every, tid)[0]["n"], gh["calls"]) == (count + 1, read)
+    _tick(kb)
+    _tick(kb)
+    assert (gh["calls"], _state(kb, head), _raw(db, every, tid)[0]["n"]) == (read, "closed_outside", count + 1)
+    conn = release_ledger.connect()
+    try:
+        assert [member for batch in release_ledger.list_batches(conn) for member in batch["members"]] == []
+    finally:
+        conn.close()
+
+
+def test_a_pull_request_open_at_another_head_keeps_its_row_open_and_writes_nothing(world):
+    """A pull request still open but moved off H keeps today's behaviour exactly: the row stays open with no
+    new state, no event is appended, and each later pass reads that pull request again."""
+    kb, root, repo, gh = world
+    db, every = kb.kanban_db_path(), "SELECT * FROM task_events WHERE task_id = ? ORDER BY id"
+    tid, head = _ready(world)
+    gh["pull_head"] = "f" * 40
+    rows, events = _raw(db, "SELECT * FROM kanban_deliveries"), _raw(db, every, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_cards(kb), _raw(db, "SELECT * FROM kanban_deliveries"), _raw(db, every, tid)) == ([], rows, events)
+    assert _state(kb, head) == "open" and gh["calls"] == [("GET", f"/repos/{REPO}/pulls/41")] * 2
+
+
+@pytest.mark.parametrize("column, value", [
+    ("pull_request_state", "close_pending"), ("pull_request_head", "f" * 40), ("pull_request_number", 42)],
+    ids=["state", "head", "pull_request"])
+def test_a_row_changed_while_its_closed_pull_request_is_read_is_left_untouched(world, column, value):
+    """The row leaves open (here as the delivery step's own close reserves it), or names another head or pull
+    request, while GitHub is read: the one write transaction finds it changed, so nothing is written and no
+    event is appended."""
+    kb, root, repo, gh = world
+    db, every = kb.kanban_db_path(), "SELECT * FROM task_events WHERE task_id = ? ORDER BY id"
+    tid, head = _ready(world)
+    gh["pull"], changed, events = {"state": "closed", "merged": False}, [], _raw(db, every, tid)
+
+    def change():  # once, during the pull request read
+        if not changed:
+            _raw(db, f"UPDATE kanban_deliveries SET {column} = ? WHERE source_head = ?", value, head)
+            changed.extend(_raw(db, "SELECT * FROM kanban_deliveries"))
+
+    gh["each"] = change
+    _tick(kb)
+
+    assert (_raw(db, "SELECT * FROM kanban_deliveries"), _raw(db, every, tid)) == (changed, events)
+    assert gh["calls"] == [("GET", f"/repos/{REPO}/pulls/41")] and changed[0][column] == value
+
+
+def _closed(merged):
+    """The fields of GitHub's pull request once someone closed it outside the delivery step: merged into main as
+    GitHub shows a merge, or closed unmerged."""
+    return {"state": "closed", "merged": merged,
+            **({"base": {"ref": "main"}, "merge_commit_sha": "d" * 40} if merged else {})}
+
+
+def _ready_to_return(world):
+    """H published, its source card of the project whose primary folder is the repository, so the branch of a
+    return can be made there: the review return card's _ready."""
+    from tests.hermes_cli import test_kanban_delivery_review_return as review_return
+
+    return review_return._ready(world)
+
+
+@pytest.fixture
+def red_run(world, monkeypatch):
+    """The world with H's required check red on its one workflow run 77, as the red check card's ``red`` fixture
+    serves it: the summary job 900 failed at "Evaluate job results", slice 1 (901) passed, slice 3 (903) failed at
+    its test step and its check run names gh["tests"] (the listed flaky test unless set) beside one annotation of
+    another title, and the timing report (904) completed. Each rerun call is kept in gh["reruns"] and answered
+    gh["rerun"] (403 unless set), or not at all when None, as the real exchange raises when the call times out.
+    With gh["closes"] = (end, merged), someone outside the delivery step closes the pull request at H, merged or
+    not, while the request whose path ends with ``end`` waits."""
+    kb, root, repo, gh = world
+    from hermes_cli import kanban_delivery_github as transport
+    from tests.hermes_cli.test_kanban_delivery_red_check import FLAKY, RERUN, UNLISTED
+
+    table = transport._exchange  # the world's: the pull request and H's check runs
+    gh.update(check=("completed", "failure"), tests=[FLAKY], reruns=[], rerun=403, closes=None)
+
+    def exchange(method, target, authorization, payload=None):
+        status, value = table(method, target, authorization, payload)
+        path, head = urlsplit(target).path, gh["head"]
+        if gh["closes"] and path.endswith(gh["closes"][0]):
+            gh["pull"] = _closed(gh["closes"][1])
+        job = {"head_sha": head, "status": "completed", "conclusion": "failure", "run_attempt": 1}
+        if (method, path) == ("GET", f"/repos/{REPO}/actions/runs"):
+            return 200, {"total_count": 1, "workflow_runs": [{"id": 77, "head_sha": head}]}
+        if (method, path) == ("GET", f"/repos/{REPO}/actions/runs/77/jobs"):
+            return 200, {"total_count": 4, "jobs": [
+                dict(job, id=900, name=CHECK, steps=[{"name": "Evaluate job results", "conclusion": "failure"}]),
+                dict(job, id=901, name="Python tests / Run tests slice 1/12", conclusion="success",
+                     steps=[{"name": "Run tests (slice 1/12)", "conclusion": "success"}]),
+                dict(job, id=903, name="Python tests / Run tests slice 3/12", steps=[
+                    {"name": "Checkout code", "conclusion": "success"},
+                    {"name": "Run tests (slice 3/12)", "conclusion": "failure"}]),
+                dict(job, id=904, name="CI timing report", conclusion="success", steps=[])]}
+        if (method, path) == ("GET", f"/repos/{REPO}/check-runs/903/annotations"):
+            return 200, [{"path": ".github", "annotation_level": "notice", "title": "Failed test",
+                          "message": f"count {len(gh['tests'])}"},
+                         *({"path": ".github", "annotation_level": "failure", "title": "Failed test",
+                            "message": test, "raw_details": None} for test in gh["tests"]),
+                         {"path": ".github", "annotation_level": "failure",
+                          "title": "Process completed with exit code 1.", "message": UNLISTED}]
+        if (method, path) == ("POST", RERUN):
+            gh["reruns"].append(path)
+            if gh["rerun"] is None:  # what the real exchange raises when the call times out
+                raise transport.GitHubTransportError("network_error")
+            return gh["rerun"], None
+        return status, value
+
+    monkeypatch.setattr(transport, "_exchange", exchange)
+    return world
+
+
+@pytest.mark.parametrize("answer", [403, None], ids=["refused", "unanswered"])
+@pytest.mark.parametrize("merged", [True, False], ids=["merged", "closed"])
+def test_a_pull_request_closed_while_a_refused_rerun_call_waits_is_closed_outside_by_that_pass(red_run, merged,
+                                                                                              answer):
+    """H's listed flaky failure is rerun once, and while the rerun call waits someone merges or closes the pull
+    request; the call is refused (403) or gets no answer. The read after it, which would return the work, marks the
+    row closed outside in that same pass with exactly one event naming the pull request, H and whether GitHub shows
+    it merged: no continuation and no red_check_returned. Later passes send no request."""
+    from tests.hermes_cli.test_kanban_delivery_red_check import FLAKY, RERUN
+    from tests.hermes_cli.test_kanban_delivery_review_return import CONTINUED
+
+    kb, root, repo, gh = red_run
+    tid, head = _ready_to_return(red_run)
+    gh.update(rerun=answer, closes=("/rerun", merged))
+    events = _events(kb, tid)
+
+    _tick(kb)
+
+    outcome = {"delivery_id": 1, "head": head, "pull_request_number": 41}
+    assert _events(kb, tid)[len(events):] == [
+        ("delivery_review_waiting", dict(outcome, code="red_check_waiting",
+                                         check_runs=[{"id": 900, "conclusion": "failure"}])),
+        ("delivery_review_waiting", dict(outcome, code="red_check_rerun", jobs=[903], tests=[FLAKY], attempt=1)),
+        ("delivery_review_waiting", dict(outcome, code="red_check_rerun_outcome", jobs=[903], statuses=[answer])),
+        ("delivery_closed_outside", dict(outcome, merged=merged))]
+    assert (_state(kb, head), _raw(kb.kanban_db_path(), CONTINUED, tid), _cards(kb)) == ("closed_outside", [], [])
+    assert (gh["reruns"], gh["calls"][-2:]) == ([RERUN], [("POST", RERUN), ("GET", f"/repos/{REPO}/pulls/41")])
+    calls, count = list(gh["calls"]), len(_events(kb, tid))
+    for _ in range(3):
+        _tick(kb)
+    assert (gh["calls"], _state(kb, head), len(_events(kb, tid))) == (calls, "closed_outside", count)
+
+
+@pytest.mark.parametrize("answer", [403, None], ids=["refused", "unanswered"])
+@pytest.mark.parametrize("merged", [True, False], ids=["merged", "closed"])
+def test_a_pull_request_closed_after_a_refused_rerun_is_closed_outside_by_the_pass_that_would_return_it(
+        red_run, merged, answer):
+    """H's rerun call is refused (403) or unanswered and the pull request read after it fails, so that pass records
+    the rerun's outcome and ends with no return. Someone then merges or closes the pull request: the next pass,
+    which reads it only for that return, marks the row closed outside with exactly one event; no continuation, no
+    red_check_returned and one rerun call in all. Later passes send no request."""
+    from hermes_cli import kanban_delivery_github as transport
+    from tests.hermes_cli.test_kanban_delivery_red_check import RERUN, _waited
+    from tests.hermes_cli.test_kanban_delivery_review_return import CONTINUED
+
+    kb, root, repo, gh = red_run
+    tid, head = _ready_to_return(red_run)
+    pull, failed = ("GET", f"/repos/{REPO}/pulls/41"), []
+
+    def fail():  # the one pull request read after the rerun call
+        if gh["reruns"] and not failed:
+            failed.append(gh["calls"][-1])
+            raise transport.GitHubTransportError("network_error")
+
+    gh.update(rerun=answer, each=fail)
+    _tick(kb)
+    gh["each"] = None
+    assert (failed, _state(kb, head), [p["statuses"] for p in _waited(kb, tid, "red_check_rerun_outcome")]) == (
+        [pull], "open", [[answer]])
+    gh["pull"], calls, events = _closed(merged), list(gh["calls"]), _events(kb, tid)
+
+    _tick(kb)
+
+    assert _events(kb, tid)[len(events):] == [("delivery_closed_outside", {
+        "delivery_id": 1, "head": head, "pull_request_number": 41, "merged": merged})]
+    assert (gh["calls"][len(calls):], _state(kb, head), gh["reruns"]) == ([pull], "closed_outside", [RERUN])
+    assert (_waited(kb, tid, "red_check_returned"), _raw(kb.kanban_db_path(), CONTINUED, tid)) == ([], [])
+    calls = list(gh["calls"])
+    for _ in range(3):
+        _tick(kb)
+    assert (gh["calls"], _state(kb, head)) == (calls, "closed_outside")
+
+
+@pytest.mark.parametrize("merged", [True, False], ids=["merged", "closed"])
+@pytest.mark.parametrize("read, check, listed", [
+    (PAGED["check_runs"], "success", True), (PAGED["check_runs"], "failure", True), ("/jobs", "failure", True),
+    ("/annotations", "failure", True), ("/jobs", "failure", False), ("/annotations", "failure", False)],
+    ids=["ci_green", "ci_red", "jobs_rerun", "annotations_rerun", "jobs_return", "annotations_return"])
+def test_a_pull_request_closed_while_ci_or_the_red_run_is_read_is_closed_outside_by_that_pass(red_run, read, check,
+                                                                                            listed, merged):
+    """Someone merges or closes the pull request while the pass reads CI on H, green or red, or the jobs or the
+    annotations of H's red run, whose failure is the listed flaky test to rerun or another test to return. The read
+    after CI, or the read after the return's branch, marks the row closed outside in that pass, once: no review card,
+    no waiting record past the red check's own, no rerun call and no continuation. Later passes send no request."""
+    from tests.hermes_cli.test_kanban_delivery_red_check import FLAKY, UNLISTED
+    from tests.hermes_cli.test_kanban_delivery_review_return import CONTINUED
+
+    kb, root, repo, gh = red_run
+    tid, head = _ready_to_return(red_run)
+    gh.update(check=("completed", check), tests=[FLAKY if listed else UNLISTED], closes=(read, merged))
+    events = _events(kb, tid)
+
+    _tick(kb)
+
+    outcome = {"delivery_id": 1, "head": head, "pull_request_number": 41}
+    red = [] if read == PAGED["check_runs"] else [("delivery_review_waiting", dict(
+        outcome, code="red_check_waiting", check_runs=[{"id": 900, "conclusion": "failure"}]))]
+    assert _events(kb, tid)[len(events):] == red + [("delivery_closed_outside", dict(outcome, merged=merged))]
+    assert (_state(kb, head), _cards(kb), _raw(kb.kanban_db_path(), CONTINUED, tid), gh["reruns"]) == (
+        "closed_outside", [], [], [])
+    assert {method for method, _ in gh["calls"]} == {"GET"} and gh["calls"][-1] == ("GET", f"/repos/{REPO}/pulls/41")
+    calls = list(gh["calls"])
+    _tick(kb)
+    _tick(kb)
+    assert (gh["calls"], _state(kb, head)) == (calls, "closed_outside")
+
+
+def test_a_row_closed_outside_stays_so_when_another_head_and_then_its_own_are_approved(red_run):
+    """H's row is closed outside with H's refused rerun outstanding: while the first pass's pull request read waits,
+    an overlapping native pass reruns H's listed flaky failure, someone merges the pull request while that call
+    waits, and GitHub refuses it (403). The owner then sends the source card back, a different head J is approved,
+    and H is approved again, all through the real lifecycle: H's row keeps closed_outside and its one closure event,
+    and review passes, driven directly so that J's own publication sends nothing, send no request for it."""
+    from hermes_cli.kanban_delivery import review_step
+    from tests.hermes_cli.test_kanban_delivery_red_check import RERUN, _waited
+
+    kb, root, repo, gh = red_run
+    tid, head = _ready_to_return(red_run)
+    pull, overlapped = ("GET", f"/repos/{REPO}/pulls/41"), []
+
+    def overlap():  # once, while the first pass's first pull request read waits
+        if not overlapped:
+            overlapped.append(gh["calls"][-1])
+            _tick(kb)
+
+    gh.update(rerun=403, closes=("/rerun", True), each=overlap)
+    _tick(kb)
+    gh["each"] = None
+
+    closure = [("delivery_closed_outside", {
+        "delivery_id": 1, "head": head, "pull_request_number": 41, "merged": True})]
+    assert (overlapped, _state(kb, head), gh["reruns"], _waited(kb, tid, "red_check_returned")) == (
+        [pull], "closed_outside", [RERUN], [])
+    assert [p["statuses"] for p in _waited(kb, tid, "red_check_rerun_outcome")] == [[403]]
+    assert [event for event in _events(kb, tid) if event[0] == "delivery_closed_outside"] == closure
+
+    other = _rework(kb, repo, tid)  # the owner sends the card back and a different head J is approved
+    assert (_state(kb, head), _state(kb, other)) == ("closed_outside", None)
+    assert _rework(kb, repo, tid, restore=head) == head  # then H is approved again
+    calls = list(gh["calls"])
+    for _ in range(3):
+        review_step(kb.kanban_db_path())
+
+    assert (gh["calls"], _state(kb, head), _state(kb, other)) == (calls, "closed_outside", "returned_for_changes")
+    assert [event for event in _events(kb, tid) if event[0] == "delivery_closed_outside"] == closure
+    assert _waited(kb, tid, "red_check_returned") == []
+
+
+def _retired_then_continued(red_run):
+    """H's red check, an unlisted failed test, natively returns the work through one continuation linked at H;
+    someone then closes pull request 41 unmerged outside the delivery step, and the next pass retires its row
+    closed outside. The kernel claims the continuation at H, and it is built on, completed, approved and published
+    as pull request 42 of the same repository."""
+    from tests.hermes_cli.test_kanban_delivery import _approve
+    from tests.hermes_cli.test_kanban_delivery_auto_merge import _published_as
+    from tests.hermes_cli.test_kanban_delivery_red_check import UNLISTED, _waited
+    from tests.hermes_cli.test_kanban_delivery_review_return import CONTINUED
+
+    kb, root, repo, gh = red_run
+    db = kb.kanban_db_path()
+    tid, head = _ready_to_return(red_run)
+    gh["tests"] = [UNLISTED]
+    _tick(kb)
+    (card,) = _raw(db, CONTINUED, tid)
+    assert [p["rework"] for p in _waited(kb, tid, "red_check_returned")] == [card["id"]]
+    gh["pull"] = _closed(False)
+    _tick(kb)
+    assert _state(kb, head) == "closed_outside"
+    (root / "profiles" / IMPLEMENTER).mkdir(parents=True)
+    _tick(kb)
+    (card,) = _raw(db, CONTINUED, tid)
+    assert (card["status"], card["base_commit"]) == ("running", head)
+    workspace = Path(card["workspace_path"])
+    (workspace / "src" / "impl" / "feature.py").write_text("ok = 3", encoding="utf-8")
+    _git(workspace, "commit", "-qam", "fix: the failed test")
+    continued = _git(workspace, "rev-parse", "HEAD")
+    conn = kb.connect()
+    try:
+        kb.complete_task(conn, card["id"], summary="fixed the failed test",
+                         expected_run_id=kb.get_task(conn, card["id"]).current_run_id)
+        assert _approve(kb, conn, card["id"]) is True
+    finally:
+        conn.close()
+    _published_as(db, {"pulls": {}}, card["id"], continued, 42)  # the stand-in answers pull request 41 alone
+    return tid, head
+
+
+def test_a_retired_pull_request_that_stays_closed_is_not_read_once_its_continuation_is_published(red_run):
+    """Pull request 41 stays closed after its row was retired closed outside and H's native continuation was
+    published as pull request 42 of the same repository: two arm step passes neither read nor close it, its row
+    keeps closed_outside and the source card's events are unchanged."""
+    from hermes_cli.kanban_delivery import arm_step
+
+    kb, root, repo, gh = red_run
+    db, every = kb.kanban_db_path(), "SELECT * FROM task_events WHERE task_id = ? ORDER BY id"
+    tid, head = _retired_then_continued(red_run)
+    calls, events = list(gh["calls"]), _raw(db, every, tid)
+
+    arm_step(db)
+    arm_step(db)
+
+    assert (gh["calls"], _state(kb, head), _raw(db, every, tid)) == (calls, "closed_outside", events)
+
+
+def test_a_retired_pull_request_reopened_by_its_owner_is_neither_read_nor_closed(red_run):
+    """The owner reopens pull request 41 after its row was retired closed outside and H's native continuation was
+    published as pull request 42, so GitHub shows it open at H again: two arm step passes neither read nor close
+    it, its row keeps closed_outside and the source card's events are unchanged, with no delivery_close_pending
+    and no delivery_replaced."""
+    from hermes_cli.kanban_delivery import arm_step
+
+    kb, root, repo, gh = red_run
+    db, every = kb.kanban_db_path(), "SELECT * FROM task_events WHERE task_id = ? ORDER BY id"
+    tid, head = _retired_then_continued(red_run)
+    gh["pull"] = None  # the owner reopens it: GitHub shows it open at H
+    calls, events = list(gh["calls"]), _raw(db, every, tid)
+
+    arm_step(db)
+    arm_step(db)
+
+    assert (gh["calls"], _state(kb, head), _raw(db, every, tid)) == (calls, "closed_outside", events)
 
 
 @pytest.mark.parametrize("answer, conclusion", [
