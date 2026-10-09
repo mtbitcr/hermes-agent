@@ -145,7 +145,7 @@ def test_only_a_listed_flaky_failure_is_rerun_and_only_once(red):
     assert set(gh["steps"]) == {"read_checks", "rerun_flaky"}
     gh["check"] = ("completed", "success")
     _tick(kb)
-    assert len(_cards(kb)) == 2 and _state(kb, head) == "review_cards_created" and gh["reruns"] == [RERUN]
+    assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created" and gh["reruns"] == [RERUN]
 
 
 def test_nothing_is_decided_while_a_job_of_the_run_still_runs(red):
@@ -390,7 +390,7 @@ def test_a_second_native_tick_while_the_rerun_response_waits_cannot_drop_its_ret
         _tick(kb)
 
     continued, phases = _raw(db, CONTINUED, tid), ["review_cards_created", *arm[1:]]  # the phases the ticks reached
-    assert (overlapped, _state(kb, head), len(_cards(kb))) == ([[1, 0], *phases], phases[-1], 2)
+    assert (overlapped, _state(kb, head), len(_cards(kb))) == ([[1, 0], *phases], phases[-1], 1)
     assert (len(_arms(gh)), len(continued), gh["reruns"]) == (1 if arm else 0, 1 if reason else 0, [RERUN])
     assert [p["statuses"] for p in _waited(kb, tid, "red_check_rerun_outcome")] == [[answer]]
     assert [(p["reason"], p["tests"], p["rework"]) for p in _waited(kb, tid, "red_check_returned")] == [
@@ -560,7 +560,7 @@ def test_a_review_return_on_the_red_returned_head_reuses_its_one_continuation(re
     cards = {card["responsibility"]: card["id"] for card in _cards(kb)}
     _run(db, cards["R12"], 100, "VALIDATE_QUERY_FROM_LATEST_REVIEW")
     _done(db)
-    _reviews(gh, ("APPROVED", head, cards["R15"]), ("CHANGES_REQUESTED", head, cards["R12"]))
+    _reviews(gh, ("CHANGES_REQUESTED", head, cards["R12"]))
 
     _tick(kb)
     _tick(kb)

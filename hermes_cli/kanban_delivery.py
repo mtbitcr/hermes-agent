@@ -756,11 +756,13 @@ REVIEW_KEY_PREFIX = "review:"
 # route are the team policy's, resolved on each pass.
 _REVIEW_CREATOR, _REVIEW_TIER = "kanban-delivery", "routine"
 
-# Tiers 0 and 1 get one combined card; tier 2, or no recorded tier, gets a
-# correctness (R15) and a security (R12) card (owner decision, 2026-10-04). Only
-# the recorded tier decides: code nothing calls yet gets its tier before delivery.
-_COMBINED = {"R15": "correctness and security"}
-_SPLIT = {"R15": "correctness", "R12": "security"}
+# Each tier's review cards, by responsibility: the one set read both where a
+# head's cards are made and where its merge requires their approvals, so the two
+# never differ. Tiers 0 and 1 get one combined card; tier 2, or no recorded tier,
+# gets one security (R12) card alone, since the card review before delivery
+# already judged the correctness of the same tree. Only the recorded tier
+# decides: code nothing calls yet gets its tier before delivery.
+_LENSES = {0: {"R15": "correctness and security"}, 1: {"R15": "correctness and security"}, 2: {"R12": "security"}}
 
 # Fixed kernel text: the title names the source card by its own title, and the body carries the ids.
 _REVIEW_TITLE = "Review ({lens}) of {title}"
@@ -1232,7 +1234,7 @@ def _create_review_cards(db_path, row, read, repository, base, checks, reviewer,
         text = {"source": source, "head": head, "base": base, "repository": repository, "checks": ", ".join(checks),
                 "number": row["pull_request_number"], "branch": row["pull_request_branch"], "title": task["title"],
                 "tier": tier if recorded else f"{tier}. {RISK_NOT_RECORDED}"}
-        lenses = _COMBINED if tier < 2 else _SPLIT
+        lenses = _LENSES[tier]
         taken = sorted(card for responsibility in lenses for (card,) in conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ?", (review_key(source, head, responsibility),)))
         if taken:
@@ -1347,7 +1349,7 @@ def _approving_cards(conn: sqlite3.Connection, row: dict, read: tuple, returned:
     cards = [conn.execute("SELECT id, idempotency_key, created_by, status, head_commit, base_commit FROM tasks "
                           "WHERE idempotency_key = ? AND created_by = ?",
                           (review_key(source, head, responsibility), _REVIEW_CREATOR)).fetchone()
-             for responsibility in (_COMBINED if tier < 2 else _SPLIT)]
+             for responsibility in _LENSES[tier]]
     if any(card is None or card["status"] != "done" or not returned and conn.execute(
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'changes_requested'", (card["id"],)).fetchone()
            for card in cards):

@@ -147,7 +147,7 @@ def _source(kb, tid):
 
 @pytest.mark.parametrize("tier, lenses", [
     (0, {"R15": "correctness and security"}), (1, {"R15": "correctness and security"}),
-    (2, {"R12": "security", "R15": "correctness"}), (None, {"R12": "security", "R15": "correctness"})])
+    (2, {"R12": "security"}), (None, {"R12": "security"})])
 def test_the_recorded_tier_alone_decides_the_cards_of_the_exact_head(world, tier, lenses):
     kb, root, repo, gh = world
     tid, head = _ready(world, tier)
@@ -169,6 +169,45 @@ def test_the_recorded_tier_alone_decides_the_cards_of_the_exact_head(world, tier
         assert card["max_runtime_seconds"] == pinned_time_box_seconds("review")
         assert card["pinned_effort"] == card["reasoning_effort"] == effort
         assert not card["requires_review"] and card["owned_paths"] == "[]"
+
+
+def test_a_tier_2_head_gets_exactly_one_security_card(world):
+    """Tier 2 gets one card on its pull request, the security lens (R12): the card review before delivery
+    already judged the correctness of the same tree."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world, tier=2)
+
+    _tick(kb)
+
+    cards = _cards(kb)
+    assert [(c["idempotency_key"], c["responsibility"], c["title"]) for c in cards] == [
+        (f"review:{tid}:{head}:R12", "R12", "Review (security) of build feature")]
+    assert [p["cards"] for kind, p in _events(kb, tid) if kind == "delivery_review_cards_created"] == [
+        [cards[0]["id"]]]
+
+
+@pytest.mark.parametrize("tier", [None, 3], ids=["unrecorded", "invalid"])
+def test_an_unrecorded_or_invalid_tier_gets_the_same_single_security_card(world, tier):
+    """No recorded tier, or a stored value that is not a tier, counts as tier 2: the same one security card,
+    whose body says the risk was not recorded."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world, tier=tier)
+
+    _tick(kb)
+
+    assert [(c["idempotency_key"], c["responsibility"], c["title"], c["risk_tier"], "Risk not recorded" in c["body"])
+            for c in _cards(kb)] == [(f"review:{tid}:{head}:R12", "R12", "Review (security) of build feature", 2, True)]
+
+
+@pytest.mark.parametrize("tier", [0, 1])
+def test_tiers_0_and_1_each_keep_exactly_one_combined_card(world, tier):
+    kb, root, repo, gh = world
+    tid, head = _ready(world, tier=tier)
+
+    _tick(kb)
+
+    assert [(c["idempotency_key"], c["responsibility"], c["title"]) for c in _cards(kb)] == [
+        (f"review:{tid}:{head}:R15", "R15", "Review (correctness and security) of build feature")]
 
 
 def test_security_review_pins_max_on_an_admitted_high_route(world, monkeypatch):
@@ -218,7 +257,7 @@ def test_cards_carry_the_command_fields_after_the_same_route_guard(world):
                           f"Repository: {REPO}", "Pull request: 41", f"Branch: delivery/{tid}", "Risk tier: 2",
                           f"CI on {head}: passed ({CHECK})"):
             assert reference in card["body"]
-    assert parents == [tid, tid]
+    assert parents == [tid]
 
 
 def test_each_card_tells_the_reviewer_to_start_its_github_review_with_the_cards_own_line(world):
@@ -230,7 +269,7 @@ def test_each_card_tells_the_reviewer_to_start_its_github_review_with_the_cards_
     _tick(kb)
 
     cards = _cards(kb)
-    assert len(cards) == 2 and all(f"exact line:\nReview card {card['id']}\n" in card["body"]
+    assert len(cards) == 1 and all(f"exact line:\nReview card {card['id']}\n" in card["body"]
                                    and card["id"] not in card["title"] for card in cards)
 
 
@@ -277,7 +316,7 @@ def test_the_route_and_reviewer_come_from_the_team_policy_and_delivery_off_does_
     route = {"provider_override": "anthropic", "model_override": "claude-opus-5-5", "reasoning_effort": "max"}
     _policy_route(monkeypatch, route)
     _tick(kb)
-    assert [({f: c[f] for f in route}, c["assignee"], c["status"]) for c in _cards(kb)] == [(route, REVIEWER, "ready")] * 2
+    assert [({f: c[f] for f in route}, c["assignee"], c["status"]) for c in _cards(kb)] == [(route, REVIEWER, "ready")]
 
 
 @pytest.mark.parametrize("status", ["queued", "in_progress"])
@@ -295,7 +334,7 @@ def test_no_card_while_ci_is_pending(world, status):
     assert (_cards(kb), _state(kb, head), _events(kb, tid), set(gh["steps"])) == ([], "open", events, {"read_checks"})
     gh["check"] = ("completed", "success")  # a later delivery step tries again
     _tick(kb)
-    assert len(_cards(kb)) == 2 and _state(kb, head) == "review_cards_created"
+    assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created"
 
 
 @pytest.mark.parametrize("moved, conclusion", [
@@ -336,7 +375,7 @@ def test_a_decision_answer_over_100_check_runs_or_unreadable_waits_with_no_recor
         {"filter": ["latest"], "per_page": ["100"]}] * 2
     gh[answer], gh["check"] = None, ("completed", "success")
     _tick(kb)
-    assert len(_cards(kb)) == 2 and _state(kb, head) == "review_cards_created"
+    assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created"
 
 
 @pytest.mark.parametrize("copies", [
@@ -354,7 +393,7 @@ def test_the_required_check_must_appear_exactly_once_in_the_decision_answer(worl
     assert (_cards(kb), _state(kb, head), _events(kb, tid)) == ([], "open", events)
     gh["copies"] = None
     _tick(kb)
-    assert len(_cards(kb)) == 2 and _state(kb, head) == "review_cards_created"
+    assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created"
 
 
 @pytest.mark.parametrize("conclusion", ["success", "failure"])
@@ -402,7 +441,7 @@ def test_a_red_check_waits_once_per_head_until_a_green_rerun(world, conclusion):
     assert [path for _, path in gh["calls"] if "/actions/" in path] == [f"/repos/{REPO}/actions/runs"] * 3  # no jobs
     gh["check"] = ("completed", "success")
     _tick(kb)
-    assert len(_cards(kb)) == 2 and _state(kb, head) == "review_cards_created"
+    assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created"
 
 
 @pytest.mark.parametrize("holder", ["someone-else", "archived", "this-step"])
@@ -418,7 +457,7 @@ def test_a_key_that_names_any_card_gives_a_conflict_and_no_new_card(world, holde
     else:
         with kb.connect_closing() as conn:
             other = kb.create_task(conn, title="Not a review", assignee=REVIEWER, created_by="someone-else",
-                                   idempotency_key=f"review:{tid}:{head}:R15")
+                                   idempotency_key=f"review:{tid}:{head}:R12")
             assert holder != "archived" or kb.archive_task(conn, other)
     cards, events = [c["id"] for c in _cards(kb)], _events(kb, tid)
 
@@ -475,7 +514,7 @@ def test_the_source_is_read_again_where_the_outcome_is_stored(world, change, mad
         ("review_cards_created", 1) if made else ("open", 0))
     _tick(kb)
     assert [(c["responsibility"], "Risk tier: 2" in c["body"]) for c in _cards(kb)] == (
-        [("R12", True), ("R15", True)] if change == "tier_raised" else [(r, False) for r, _ in made])
+        [("R12", True)] if change == "tier_raised" else [(r, False) for r, _ in made])
 
 
 def test_a_new_head_gets_new_cards_and_old_cards_are_untouched(world):
@@ -491,7 +530,7 @@ def test_a_new_head_gets_new_cards_and_old_cards_are_untouched(world):
     cards = _cards(kb)
     assert [c for c in cards if first in c["idempotency_key"]] == old
     assert sorted(c["idempotency_key"] for c in cards if second in c["idempotency_key"]) == [
-        f"review:{tid}:{second}:R12", f"review:{tid}:{second}:R15"]
+        f"review:{tid}:{second}:R12"]
     assert (_state(kb, first), _state(kb, second)) == ("returned_for_changes", "review_cards_created")
 
 
@@ -529,9 +568,9 @@ def test_cards_land_on_the_ticked_board_under_the_worker_environment(world, monk
         ticked.close()
 
     count = "SELECT COUNT(*) AS n FROM tasks WHERE idempotency_key LIKE 'review:%'"
-    assert [_raw(db, count)[0]["n"] for db in (other_db, own_db, root / "kanban.db")] == [2, 0, 0]
+    assert [_raw(db, count)[0]["n"] for db in (other_db, own_db, root / "kanban.db")] == [1, 0, 0]
     cards = _cards(kb, other_db)
-    assert {c["idempotency_key"] for c in cards} == {f"review:{tid}:{head}:R15", f"review:{tid}:{head}:R12"}
+    assert {c["idempotency_key"] for c in cards} == {f"review:{tid}:{head}:R12"}
     source = Path(_raw(other_db, "SELECT workspace_path FROM tasks WHERE id = ?", tid)[0]["workspace_path"])
     assert [(c["project_id"], c["workspace_path"]) for c in cards] == [
         ("delivery-project", str(source.parent / c["id"])) for c in cards]
