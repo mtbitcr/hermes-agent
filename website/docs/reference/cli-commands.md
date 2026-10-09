@@ -99,7 +99,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes completion` | Print shell completion scripts (bash/zsh/fish). |
 | `hermes --version` | Show version information. |
 | `hermes update` | Pull latest code and reinstall dependencies. `--check` previews without installing; `--backup` takes a pre-pull `HERMES_HOME` snapshot. |
-| `hermes release` | Check a release before it runs: `prepare` runs every release guard and writes nothing; `status` shows the waiting batch and the last outcome. |
+| `hermes release` | Check, run and recover a release: `prepare` runs every release guard and writes nothing; `status` shows the waiting batch and the last outcome; `run [BATCH]` releases the accepted batch; `start BATCH` runs it as the release unit; `recover BATCH` brings the platform back from a release that stopped midway. |
 | `hermes uninstall` | Remove Hermes from the system. |
 
 ## `hermes chat`
@@ -1834,13 +1834,20 @@ Additional behavior:
 ## `hermes release`
 
 ```bash
-hermes release <prepare|status>
+hermes release <prepare|status|run [BATCH]|start BATCH|recover BATCH>
 ```
 
 | Subcommand | Description |
 |------------|-------------|
-| `prepare` | Work out PREV (the NEW of the last released batch; before the first release, the checkout's head) and NEW (the merge commit of the accepted batch's last member), ask the host every release guard and print each result. Writes nothing. Exits non-zero when a guard fails or the release is refused, for example from a profile home: it runs only from the root Hermes home. |
-| `status` | Show the batch waiting for the owner's decision and the outcome of the last release. Writes nothing. |
+| `prepare` | Work out PREV and NEW, ask the host every release guard and print each result in plain words, writing nothing to the release state. |
+| `status` | Print the waiting batch and the last outcome. |
+| `run [BATCH]` | Release the accepted batch after the same preflight, under the pause, in the calling process. |
+| `start BATCH` | Run `release run BATCH` as the release unit, the transient user service of release_unit, so the release keeps running when the gateway stops. |
+| `recover BATCH` | Bring the platform back from a release that stopped midway, as `run BATCH` does for a batch the record shows releasing or failed. |
+
+A merged delivery joins the one waiting batch. The owner accepts that batch on the Decisions page, and the release unit then runs `hermes release run` for that batch.
+
+Guard G3 currently requires every commit between PREV and NEW to be a recorded merge whose parents are the base that review saw and the reviewed head, so a release passes only when each merge was built on the main it merged into.
 
 The `release` section of the root `config.yaml` describes the release host: `units` (user unit names for the `gateway`, `serve` and `sandbox-tunnel` roles; defaults `hermes-gateway`, `hermes-serve` and empty), `health_url` (the health readback address, empty by default), `workspace_container` (the Workspace container in which a readback reads the projects list and one board with `docker exec`; default `raphael-workspace`), `snapshot_dir` (empty means `release-snapshots` under the root home) and `drain_poll_seconds` (30). `${VAR}` and `${env:VAR}` references in this section are resolved first, and `prepare` refuses while a unit name or the health address is empty, or while one of them or `snapshot_dir` refers to a variable that is not set.
 
