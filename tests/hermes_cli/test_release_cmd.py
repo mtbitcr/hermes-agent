@@ -39,11 +39,11 @@ WROTE_NOTHING = "Nothing in the release state was written."
 CHECKOUT = "/srv/hermes/checkout"
 CONFIG = {"config.yaml": "digest"}
 PAGE_REF = "decisions-page:release"
-# What the owner sets in config.yaml; the gateway and serve units keep their defaults.
+# What the owner sets in config.yaml; the gateway and serve units and the Workspace container keep
+# their defaults.
 SETTINGS = {
     "units": {"sandbox-tunnel": "hermes-sandbox-tunnel"},
     "health_url": "http://127.0.0.1:8642/health",
-    "workspace_check_url": "http://127.0.0.1:8650/api/projects",
 }
 UNITS = {"gateway": "hermes-gateway", "serve": "hermes-serve", **SETTINGS["units"]}
 # Each required setting and the plain name its refusal gives it.
@@ -52,9 +52,6 @@ REQUIRED = [
     pytest.param("units.serve", "the serve unit", id="serve-unit"),
     pytest.param("units.sandbox-tunnel", "the sandbox tunnel unit", id="sandbox-tunnel-unit"),
     pytest.param("health_url", "the health address", id="health-address"),
-    pytest.param(
-        "workspace_check_url", "the owner-page check address", id="owner-page-check-address"
-    ),
 ]
 # The two forms of a reference in config.yaml; a test puts its own variable's name for VAR.
 REFERENCE_FORMS = [pytest.param("${VAR}", id="var"), pytest.param("${env:VAR}", id="env-var")]
@@ -394,7 +391,7 @@ def test_prepare_runs_every_guard_and_writes_nothing(root, tmp_path, monkeypatch
     assert host.built == [
         {**shared, "snapshot_name": NEW},
         {**shared, "health_url": SETTINGS["health_url"],
-         "workspace_check_url": SETTINGS["workspace_check_url"]},
+         "workspace_container": "raphael-workspace"},
     ]
 
     host.kill_mode, host.runs_readable = "control-group", False
@@ -478,11 +475,6 @@ def test_prepare_refuses_under_a_profile_home(root, tmp_path, monkeypatch, capsy
             "the health address is not set: set release.health_url",
             id="health-address",
         ),
-        pytest.param(
-            {**SETTINGS, "workspace_check_url": ""},
-            "the owner-page check address is not set: set release.workspace_check_url",
-            id="owner-page-check-address",
-        ),
     ],
 )
 def test_unset_required_settings_refuse(root, monkeypatch, capsys, settings, reason):
@@ -561,7 +553,7 @@ def test_both_adapters_are_built_from_the_resolved_settings(root, monkeypatch, f
             "sandbox-tunnel": ref("RELEASE_REF_TEST_TUNNEL", "hermes-sandbox-tunnel-blue"),
         },
         "health_url": ref("RELEASE_REF_TEST_HEALTH", "http://127.0.0.1:9642/health"),
-        "workspace_check_url": ref("RELEASE_REF_TEST_CHECK", "http://127.0.0.1:9650/api/projects"),
+        "workspace_container": ref("RELEASE_REF_TEST_CONTAINER", "raphael-workspace-blue"),
         # An empty snapshot_dir, here from a reference, means release-snapshots under the root.
         "snapshot_dir": ref("RELEASE_REF_TEST_EMPTY", ""),
     }
@@ -585,7 +577,7 @@ def test_both_adapters_are_built_from_the_resolved_settings(root, monkeypatch, f
         {
             **shared,
             "health_url": "http://127.0.0.1:9642/health",
-            "workspace_check_url": "http://127.0.0.1:9650/api/projects",
+            "workspace_container": "raphael-workspace-blue",
         },
     ]
 

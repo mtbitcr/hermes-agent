@@ -59,9 +59,34 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # another page, such as a login page, is not the answer: an error status
 
 
-# The readbacks ask the host's own addresses, so no proxy from the environment stands between,
-# and the answer must come from the address itself.
+# The health readback asks the host's own address, so no proxy from the environment stands
+# between, and the answer must come from the address itself.
 _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+# R6's two reads, run by node inside the Workspace container as the manual release runs them: with
+# the platform address and access file the container's environment names, the projects list, then
+# the board of the first project. The script writes nothing, not even an error, so neither a
+# response nor the access file's content can reach the journal, and it exits 0 only when both
+# reads answer 2xx with JSON. A redirect is no answer, and the access file never follows one. It
+# ends itself after the readback's ten seconds too: a docker exec killed at the time limit leaves
+# its command running in the container.
+_WORKSPACE_READS = r"""
+const fs = require("fs");
+setTimeout(() => process.exit(1), 10000);
+(async () => {
+  const base = process.env.HERMES_API_BASE_URL.replace(/\/+$/, "");
+  const token = fs.readFileSync(process.env.HERMES_API_TOKEN_FILE, "utf8").trim();
+  const read = async (path) => {
+    const answer = await fetch(base + path, {
+      headers: { Authorization: `Bearer ${token}` },
+      redirect: "error",
+    });
+    if (!answer.ok) throw new Error();
+    return answer.json();
+  };
+  const { projects } = await read("/api/plugins/kanban/projects");
+  await read(`/api/plugins/kanban/board?board=${encodeURIComponent(projects[0].slug)}`);
+})().then(() => process.exit(0), () => process.exit(1));
+"""
 
 
 class ReleaseHostActions:
@@ -79,14 +104,14 @@ class ReleaseHostActions:
         units: Mapping[str, str],
         snapshot_root: str | Path,
         health_url: str,
-        workspace_check_url: str,
+        workspace_container: str,
     ) -> None:
         self.checkout_path = Path(checkout)  # `checkout` is the move below
         self.root_home = Path(root_home)
         self.units = dict(units)
         self.snapshot_root = Path(snapshot_root)
         self.health_url = health_url
-        self.workspace_check_url = workspace_check_url
+        self.workspace_container = workspace_container
         # The configuration snapshot this release saved: the one the restore puts back.
         self.config_snapshot = ""
 
@@ -296,7 +321,20 @@ class ReleaseHostActions:
         return _answers_ok(self.health_url)
 
     def workspace_reads_ok(self) -> bool:
-        return _answers_ok(self.workspace_check_url)
+        """R6: the projects list and one board read both succeed inside the Workspace container,
+        within the time limit. What the read writes goes nowhere, so neither a response nor the
+        access file can reach the journal. A refused, failed or late read reads False."""
+        try:
+            done = subprocess.run(
+                ["docker", "exec", self.workspace_container, "node", "-e", _WORKSPACE_READS],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=READBACK_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False  # no docker, or the time limit passed
+        return done.returncode == 0
 
     def fleet_version(self) -> str:
         """The one code version every live gateway reports, or "" when that is not so.

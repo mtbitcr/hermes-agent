@@ -38,7 +38,6 @@ CONFIG = {"config.yaml": "digest"}
 SETTINGS = {
     "units": {"sandbox-tunnel": "hermes-sandbox-tunnel"},
     "health_url": "http://127.0.0.1:8642/health",
-    "workspace_check_url": "http://127.0.0.1:8650/api/projects",
 }
 OWNER = "owner: hold everything"
 TOKEN = "placeholder-release-token"
