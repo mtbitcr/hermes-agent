@@ -39,6 +39,7 @@ DUMMY = "ghs_" + "Nf64Jt8Yw2Qs" * 3  # a credential of the controls' own, so a c
 DUMMY_BASIC = base64.b64encode(f"x-access-token:{DUMMY}".encode()).decode()
 HEAD = "a" * 40
 BASE = "b" * 40
+NESTED = b"[" * 100000 + b"]" * 100000  # a JSON body nested deeper than any parser recurses
 SAMPLE = {"repo": REPO, "number": "7", "sha": HEAD, "id": "9", "head_sha": HEAD, "installation": str(INSTALLATION),
           "branch": "card-1"}
 SECTION_4_PERMISSIONS = {"contents", "pull_requests", "checks", "actions"}
@@ -268,7 +269,7 @@ def github(tmp_path):
     key_file.parent.mkdir()
     key_file.write_bytes(_pem(key))
     state = {"public": key.public_key(), "key_file": key_file, "jwts": [], "rejected_jwts": 0,
-             "token_requests": [], "calls": [], "token_reply": "minted"}
+             "token_requests": [], "calls": [], "token_reply": "minted", "merges": [], "nested": None}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -279,6 +280,9 @@ def github(tmp_path):
 
         def do_PATCH(self):
             self._route("PATCH")
+
+        def do_PUT(self):
+            self._route("PUT")
 
         def _reply(self, status, value=None, extra=(), raw=None, cut=0):
             data = raw if raw is not None else b"" if value is None else json.dumps(value).encode()
@@ -321,6 +325,8 @@ def github(tmp_path):
             path = self.path.split("?")[0]
             if auth != f"Bearer {TOKEN}":
                 return self._reply(401, {"message": f"Bad credentials {TOKEN}"})
+            if state["nested"]:  # every call answered with this status and a body nested too deep to parse
+                return self._reply(state["nested"], raw=NESTED)
             if method == "GET" and path.endswith("/pulls/7"):
                 return self._reply(200, {
                     "number": 7, "state": "open", "title": TOKEN, "body": TOKEN, "token": TOKEN,
@@ -350,6 +356,10 @@ def github(tmp_path):
                     return self._reply(200, {"ref": "refs/heads/delivery/card-1", "node_id": TOKEN, "url": TOKEN,
                                              "object": {"sha": HEAD, "type": "commit", "url": TOKEN}})
                 return self._reply(404, {"message": f"Not Found {TOKEN}"})
+            if method == "PUT" and path.endswith("/merge"):  # each merge's body kept; the head has moved on
+                state["merges"].append(body)
+                return self._reply(409, {"message": f"Head branch was modified. Review and try the merge again. {TOKEN}",
+                                         "documentation_url": f"https://docs.example/{TOKEN}"})
             return self._reply(200, {})
 
         def log_message(self, *args):
@@ -1033,17 +1043,17 @@ def test_commit_statuses_are_refused_before_any_socket_or_token(monkeypatch, tmp
     assert opened == []
 
 
-def test_the_annotations_read_is_the_one_new_call_and_the_unused_merge_and_review_posts_are_gone(github, monkeypatch):
+def test_the_annotations_read_is_the_one_new_call_and_the_unused_review_post_is_gone(github, monkeypatch):
     """The red check card adds one read: the annotations of one check run in the bound repository, with
     checks read, each annotation's title and message only. The owner decisions of 2026-10-04 removed the
-    unused REST merge and review post, so no step reaches them, and every other path and method near the
+    unused review post, so no step reaches it, and every other path and method near the
     new read stays refused before any token or socket."""
     mod = _transport_module(monkeypatch, github)
     entries = {(e.method, e.template) for e in mod.REST_ALLOWLIST}
     assert ("GET", "/repos/{repo}/check-runs/{id}/annotations") in entries
-    assert not entries & {("PUT", "/repos/{repo}/pulls/{number}/merge"), ("POST", "/repos/{repo}/pulls/{number}/reviews")}
+    assert ("POST", "/repos/{repo}/pulls/{number}/reviews") not in entries
     path = f"/repos/{REPO}/check-runs/9/annotations"
-    outside = [("PUT", f"/repos/{REPO}/pulls/7/merge"), ("POST", f"/repos/{REPO}/pulls/7/reviews"),
+    outside = [("POST", f"/repos/{REPO}/pulls/7/reviews"),
                ("GET", f"/repos/{SIBLING}/check-runs/9/annotations"), ("GET", f"/repos/{REPO}/check-runs/09/annotations"),
                ("GET", f"/repos/{REPO}/check-runs/x/annotations"), ("GET", f"{path}/1"), ("GET", f"{path}/"),
                ("GET", f"/repos/{REPO}/check-runs/9"), ("GET", f"/repos/{REPO}/check-suites/9/annotations"),
@@ -1138,36 +1148,59 @@ def test_branch_head_is_none_when_github_answers_404(github, monkeypatch):
     assert github["calls"] == [("GET", f"/repos/{REPO}/git/ref/heads/delivery/card-2")]
 
 
-@pytest.mark.parametrize("read, sends", [({"state": "open", "head": {"sha": HEAD}}, True), (None, False),
-                                         ({"state": "closed", "head": {"sha": HEAD}}, False),
-                                         ({"state": "open", "head": {"sha": "f" * 40}}, False)])
-def test_the_arm_reads_nothing_and_sends_only_on_the_transports_own_read_of_the_open_head(monkeypatch, read, sends):
-    """Owner rule 2 of round 2: the arm makes no read and mints no token. It sends the one mutation, with the
-    token the transport's earlier reads minted, only when its own read of the pull request showed it open at
-    the head. A reviews read keeps each review's author login, state, commit and body's first line only."""
+def test_a_reviews_read_keeps_each_reviews_author_login_state_commit_and_first_line_only(monkeypatch):
     mod = _module()
-    sent, mints = [], []
-    answers = {f"/repos/{REPO}/pulls/41": dict(read or {}, number=41, node_id="PR_kw"),
-               f"/repos/{REPO}/pulls/41/reviews": [{"id": 3, "state": "APPROVED", "commit_id": HEAD, "html_url": STRAY,
-                                                    "body": "Review card t_1 \r\nfine", "user": {"login": "b", "id": 9}}]}
-    monkeypatch.setattr(mod, "_exchange", lambda method, target, authorization, payload=None: (
-        sent.append((method, target.split("?")[0], authorization)) or (200, answers.get(target.split("?")[0], {}))))
-    monkeypatch.setattr(mod.GitHubTransport, "_installation_token", lambda self: (
-        mints.append(self) or setattr(self, "_token", DUMMY) or DUMMY))
+    review = {"id": 3, "state": "APPROVED", "commit_id": HEAD, "html_url": STRAY, "body": "Review card t_1 \r\nfine",
+              "user": {"login": "b", "id": 9}}
+    monkeypatch.setattr(mod, "_exchange", lambda method, target, authorization, payload=None: (200, [review]))
+    monkeypatch.setattr(mod.GitHubTransport, "_installation_token", lambda self: setattr(self, "_token", DUMMY) or DUMMY)
     github = mod.GitHubTransport("publish", REPO)
     assert github.request("GET", f"/repos/{REPO}/pulls/41/reviews", query={"per_page": 100})["data"] == [
         {"user": {"login": "b"}, "state": "APPROVED", "commit_id": HEAD, "body": "Review card t_1"}]
-    if read is not None:
-        github.request("GET", f"/repos/{REPO}/pulls/41")
-    reads = len(sent)
 
-    if sends:
-        github.arm_auto_merge(41, HEAD)
-    for number, head in ((41, BASE), (42, HEAD)) + (() if sends else ((41, HEAD),)):
-        with pytest.raises(mod.GitHubTransportError):
-            github.arm_auto_merge(number, head)
 
-    assert sent[reads:] == ([("POST", "/graphql", f"Bearer {DUMMY}")] if sends else []) and len(mints) == reads
+def test_the_merge_takes_only_its_exact_body_and_passes_on_only_githubs_status(github, monkeypatch):
+    """Card 5's one write: the merge of a pull request at exactly H, as a merge commit. Its one body is the
+    keys sha and merge_method only, the whole sha 40 lowercase hex and the method merge; any other body is
+    refused before any token or socket, for each step that may write contents. Of GitHub's answer, here a
+    moved head's 409, only the status passes: its body is never read (owner rule 1 of round 2, card 142)."""
+    mod = _transport_module(monkeypatch, github)
+    path, merge = f"/repos/{REPO}/pulls/7/merge", {"sha": HEAD, "merge_method": "merge"}
+    bodies = [None, {}, {"sha": HEAD}, {"merge_method": "merge"}, dict(merge, commit_title="merged"),
+              *(dict(merge, merge_method=method) for method in ("squash", "rebase", "MERGE", None)),
+              *(dict(merge, sha=sha) for sha in ("g" * 40, HEAD.upper(), "a" * 39, "a" * 41, HEAD + "\n", None, 1,
+                                                 [HEAD]))]
+    for step in ("publish", "merge"):
+        for body in bodies:
+            with pytest.raises(mod.GitHubTransportError) as refused:
+                mod.GitHubTransport(step, REPO, key_path=github["key_file"]).request("PUT", path, body=body)
+            assert refused.value.reason == "body_not_allowed", (step, body)
+    assert github["calls"] == [] and github["token_requests"] == []
+    reads, read = [], http.client.HTTPResponse.read  # the status of each answer whose body is read
+    monkeypatch.setattr(http.client.HTTPResponse, "read", lambda self, *a: reads.append(self.status) or read(self, *a))
+
+    answer = mod.GitHubTransport("merge", REPO, key_path=github["key_file"]).request("PUT", path, body=merge)
+
+    assert github["calls"] == [("PUT", path)] and github["merges"] == [merge]
+    assert (answer, reads) == ({"status": 409, "data": None}, [201])  # the token's answer read, the merge's never
+
+
+@pytest.mark.parametrize("status", [302, 404, 409, 422, 500])
+def test_a_non_2xx_answer_nested_too_deep_to_parse_returns_its_status_on_every_other_endpoint(github, monkeypatch,
+                                                                                               status):
+    """Owner rule 2 of round 2 (card 142): every endpoint but the merge keeps the base behaviour for an answer
+    that is not 2xx: the status decides first and the body is not parsed, so a JSON body nested deeper than any
+    parser recurses raises no error and passes nothing on."""
+    mod = _transport_module(monkeypatch, github)
+    transport = mod.GitHubTransport("publish", REPO, key_path=github["key_file"])
+    github["nested"] = status
+    sent = [("GET", f"/repos/{REPO}/pulls/7", None), ("PATCH", f"/repos/{REPO}/pulls/7", {"state": "closed"}),
+            ("GET", f"/repos/{REPO}/pulls/7/reviews", None), ("GET", f"/repos/{REPO}/git/ref/heads/card-1", None)]
+
+    answers = [transport.request(method, path, body=body) for method, path, body in sent]
+
+    assert answers == [{"status": status, "data": None}] * len(sent)
+    assert github["calls"] == [(method, path) for method, path, body in sent]
 
 
 def test_the_reviews_read_says_only_whether_github_names_a_next_page(github, monkeypatch):

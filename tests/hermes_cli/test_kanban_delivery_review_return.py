@@ -307,7 +307,7 @@ def test_an_approving_review_creates_no_continuation(armed, case):
     _tick(kb)
 
     assert (_raw(db, CONTINUED, tid), _returned(kb, tid), _branches(repo)) == ([], [], "")
-    assert [body["variables"]["expectedHeadOid"] for body in _arms(gh)] == [head]
+    assert [body["sha"] for body in _arms(gh)] == [head]
 
 
 @pytest.mark.parametrize("case", ["card_open", "moved", "closed"])
