@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from hermes_cli import release_runner
 from hermes_cli.release_guards import Pins, RecordedMerge
 from hermes_cli.release_runner import PLATFORM_UNITS, SANDBOX_TUNNEL_UNIT, run_release
 
@@ -165,6 +166,15 @@ class FakeHost:
         self.snapshot_dirs.remove(name)
 
 
+@pytest.fixture(autouse=True)
+def waits(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """The seconds asked for by each wait between two reads of a readback, in order. Every test
+    here replaces the runner's wait function with this record, so no test sleeps."""
+    asked: list[float] = []
+    monkeypatch.setattr(release_runner, "_wait", asked.append)
+    return asked
+
+
 def test_tier2_forward_back_forward():
     host = FakeHost()
 
@@ -226,6 +236,77 @@ def test_tier0_goes_forward_only():
     assert result.steps == FORWARD_ONLY
     assert result.outcome == "released"
     assert (host.head, host.running) == (NEW, NEW)
+
+
+def test_a_start_is_read_back_until_every_check_holds(waits):
+    """As on 2026-10-09, one to two seconds after a start a healthy host's checks need not hold
+    yet. A readback after a start reads the whole host again, 5 seconds apart, until every check
+    holds, here first on the third read. That read alone decides and is recorded: the steps and
+    readbacks are those of a release whose checks held at once."""
+    host, reads = FakeHost(), []
+
+    def health_ok():  # NEW's health endpoint answers from 10 seconds after its start
+        reads.append((host.running, sum(waits)))  # only the waits move time on
+        return sum(waits) >= 10
+
+    host.health_ok = health_ok
+    result = run_release(host, PINS, 1, MERGES)
+
+    assert waits == [5, 5]
+    # Three reads after the forward move, 5 seconds apart, then one after the closing start.
+    assert reads == [(NEW, 0), (NEW, 5), (NEW, 10), (NEW, 10)]
+    assert (result.outcome, result.steps) == ("released", FORWARD_ONLY)
+    assert [(readback.expected, readback.ok) for readback in result.readbacks] == [
+        (NEW, True), (NEW, True),
+    ]
+    assert (host.head, host.running) == (NEW, NEW)
+
+
+def test_a_start_that_never_holds_fails_the_release_after_twelve_reads(waits):
+    """A host whose checks never all hold after the start: the readback reads it 12 times, 5
+    seconds apart, and the release fails with the last read's errors, the only read it records.
+    The restore then brings PREV back, which holds on its first read."""
+    host, reads = FakeHost(), []
+
+    def health_ok():  # NEW's health endpoint never answers; each error says when it was read
+        reads.append((host.running, sum(waits)))
+        if host.running != NEW:
+            return True
+        raise ConnectionError(f"no answer from {NEW} {sum(waits)} seconds after its start")
+
+    host.health_ok = health_ok
+    result = run_release(host, PINS, 1, MERGES)
+
+    assert waits == [5] * 11
+    assert reads == [(NEW, 5 * read) for read in range(12)] + [(PREV, 55)]
+    assert (result.outcome, result.steps) == ("restored", RESTORE_AFTER_FORWARD)
+    assert result.error == f"ReadbackFailed: R4 did not hold on {NEW}"
+    assert [(readback.expected, readback.ok) for readback in result.readbacks] == [
+        (NEW, False), (PREV, True),
+    ]
+    assert result.readbacks[0].errors == {
+        "R4": f"ConnectionError: no answer from {NEW} 55 seconds after its start",
+    }
+
+
+def test_a_readback_after_a_start_that_failed_is_read_once(waits):
+    """A start of the units that fails starts nothing to wait for, so the readback after it is
+    read once, like any readback that follows no start. Here NEW never holds after its start and
+    is read 12 times; the restore's start of PREV then fails, and PREV is read once."""
+    host, reads = FakeHost(unhealthy={NEW}, will_not_start={PREV}), []
+    health_ok = host.health_ok
+
+    def counted_health_ok():  # each read of the host asks its health once
+        reads.append(host.head)
+        return health_ok()
+
+    host.health_ok = counted_health_ok
+    result = run_release(host, PINS, 1, MERGES)
+
+    assert waits == [5] * 11  # all of them between two reads of NEW
+    assert reads == [NEW] * 12 + [PREV]
+    assert (result.outcome, result.steps) == ("failed", RESTORE_AFTER_FORWARD)
+    assert result.restore_errors == (f"RuntimeError: units failed to start on {PREV}",)
 
 
 @pytest.mark.parametrize(

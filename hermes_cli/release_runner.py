@@ -13,6 +13,7 @@ instead of the one running the release.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -30,6 +31,12 @@ from hermes_cli.release_guards import (
 PLATFORM_UNITS = (GATEWAY_UNIT, SERVE_UNIT)
 SANDBOX_TUNNEL_UNIT = "sandbox-tunnel"
 KEEP_SNAPSHOTS = 2
+
+# Freshly started units need not answer at once, so a readback after a start of the units reads
+# the whole host again until every check holds, as the manual release wrapper does: at most
+# READBACK_ATTEMPTS reads, READBACK_INTERVAL_SECONDS apart. Release and recovery share it.
+READBACK_ATTEMPTS = 12
+READBACK_INTERVAL_SECONDS = 5
 
 # Tier 2 rehearses the way back before settling forward. Tiers 0 and 1 only go forward; if a
 # readback after that fails, the failure rule brings them back.
@@ -150,16 +157,16 @@ def run_release(
         _snapshot(host, pins)
         for move in moves:
             steps.append(move)
-            _require(_read_back(host, MOVES[move](host, pins), steps, readbacks))
+            _require(_read_back(host, MOVES[move](host, pins), steps, readbacks, started=True))
         # The last move already brought both units up on NEW, so this start changes nothing on a
         # healthy host; it closes the sequence the way the plan lays it out.
         steps.append("start")
         host.start_units(PLATFORM_UNITS)
-        _require(_read_back(host, pins.new, steps, readbacks))
+        _require(_read_back(host, pins.new, steps, readbacks, started=True))
     except BaseException as failure:
         steps.append("restore")
-        restore_errors = _restore(host, pins)
-        restored = _read_back(host, pins.prev, steps, readbacks).ok
+        restore_errors, started = _restore(host, pins)
+        restored = _read_back(host, pins.prev, steps, readbacks, started=started).ok
         return ReleaseResult(
             "restored" if restored else "failed",
             tuple(steps),
@@ -177,7 +184,10 @@ def recover(host: ReleaseHost, pins: Pins, *, saved: bool = True) -> ReleaseResu
     The checked-out version is read back when it is PREV or NEW, and kept when the readback holds:
     NEW ends released, PREV restored. Otherwise the merged restore steps run and PREV is read
     back, and the outcome is failed when that fails too. Recovery never checks NEW out, and asks
-    no guard: the release asked them all before its cutover.
+    no guard: the release asked them all before its cutover. As in a release, the readback after
+    the restore steps, once their start of the units went through, reads until every check
+    holds, at most READBACK_ATTEMPTS times; the first readback, of the host as recovery finds
+    it, follows no start and reads once.
 
     The live configuration is compared with NEW's configuration snapshot unless ``saved`` is False:
     the caller's readback of its path found no such name, which alone proves it was not published.
@@ -196,8 +206,8 @@ def recover(host: ReleaseHost, pins: Pins, *, saved: bool = True) -> ReleaseResu
         _require(_read_back(host, head, steps, readbacks, first))
     except BaseException as failure:
         steps.append("restore")
-        restore_errors = _restore(host, pins)
-        restored = _read_back(host, pins.prev, steps, readbacks, reads).ok
+        restore_errors, started = _restore(host, pins)
+        restored = _read_back(host, pins.prev, steps, readbacks, reads, started=started).ok
         return ReleaseResult(
             "restored" if restored else "failed",
             tuple(steps),
@@ -240,18 +250,22 @@ def _back(host: ReleaseHost, pins: Pins) -> str:
     return pins.prev
 
 
-def _restore(host: ReleaseHost, pins: Pins) -> tuple[str, ...]:
-    """Take every step of going back, even after one fails, and return each failure.
+def _restore(host: ReleaseHost, pins: Pins) -> tuple[tuple[str, ...], bool]:
+    """Take every step of going back, even after one fails, and return each failure and whether
+    the last, the start of the units, went through.
 
     Only the restore contains its own failures, so the readback of PREV after it always runs.
     """
     errors: list[str] = []
+    started = False
     for step in BACK_STEPS:
         try:
             step(host, pins)
         except BaseException as error:
             errors.append(f"{type(error).__name__}: {error}")
-    return tuple(errors)
+        else:
+            started = step is BACK_STEPS[-1]  # the last step starts the units
+    return tuple(errors), started
 
 
 MOVES: dict[str, Callable[[ReleaseHost, Pins], str]] = {"forward": _forward, "back": _back}
@@ -263,13 +277,40 @@ def _read_back(
     steps: list[str],
     readbacks: list[Readback],
     reads: Sequence[tuple[str, Callable[[ReleaseHost, str], bool]]] = READBACKS,
+    *,
+    started: bool = False,
 ) -> Readback:
+    """Read the host back as running ``expected``, recorded as one step and one readback.
+
+    Right after a start of the units that went through, ``started``, a read whose checks do not
+    all hold is repeated whole, READBACK_INTERVAL_SECONDS apart, up to READBACK_ATTEMPTS reads.
+    Only the last read decides, and only it is recorded.
+    """
     steps.append("readback")
-    errors: dict[str, str] = {}
-    checks = {name: _holds(name, check, host, expected, errors) for name, check in reads}
-    readback = Readback(expected, checks, errors)
+    readback = _read(host, expected, reads)
+    for _attempt in range(1, READBACK_ATTEMPTS if started else 1):
+        if readback.ok:
+            break
+        _wait(READBACK_INTERVAL_SECONDS)
+        readback = _read(host, expected, reads)
     readbacks.append(readback)
     return readback
+
+
+def _read(
+    host: ReleaseHost,
+    expected: str,
+    reads: Sequence[tuple[str, Callable[[ReleaseHost, str], bool]]],
+) -> Readback:
+    """One read of the host: every check in ``reads``, each read afresh."""
+    errors: dict[str, str] = {}
+    checks = {name: _holds(name, check, host, expected, errors) for name, check in reads}
+    return Readback(expected, checks, errors)
+
+
+def _wait(seconds: float) -> None:
+    """Every wait between two reads of a readback goes through here, so a test can replace it."""
+    time.sleep(seconds)
 
 
 def _holds(

@@ -46,14 +46,16 @@ TOKEN = "placeholder-release-token"
 RESTORE = ["stop", f"checkout {PREV}", "restore config", "start"]
 _REPO = Path(__file__).resolve().parents[2]
 # ``hermes release COMMAND BATCH`` in its own process, as _command runs it, on a host where
-# neither version reads back; its last line of output is its host's calls. Given "held", it says
-# ready as it is about to count its recovery attempt, and goes on once its input ends.
+# neither version reads back, with the runner's wait between two reads replaced so none sleeps;
+# its last line of output is its host's calls. Given "held", it says ready as it is about to
+# count its recovery attempt, and goes on once its input ends.
 # Given "at-prev", its host is PREV, healthy, with NEW's snapshot as the live reader reads it.
 _PROCESS = (
     "import json, sys\n"
     "import pytest\n"
     "sys.path.insert(0, sys.argv.pop(1))\n"
     "import test_release_recover as t\n"
+    "t.release_runner._wait = lambda seconds: None\n"
     "begin, host = t.ledger.begin_recovery, t._midway(t.NEW, t.PREV)\n"
     "def held(*args):\n"
     "    print('ready', flush=True)\n"
@@ -172,6 +174,16 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HERMES_HOME", str(home))
     (home / "config.yaml").write_text(yaml.safe_dump({"release": SETTINGS}))
     return home
+
+
+@pytest.fixture(autouse=True)
+def waits(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """The seconds asked for by each wait between two reads of a readback, in order. Every test
+    here replaces the runner's wait function with this record, so no test sleeps; a process
+    from _process replaces it too."""
+    asked: list[float] = []
+    monkeypatch.setattr(release_runner, "_wait", asked.append)
+    return asked
 
 
 def _accepted() -> int:
@@ -346,6 +358,78 @@ def test_recover_reports_failed_and_never_moves_forward(head):
     assert (result.outcome, host.calls, host.head) == ("failed", RESTORE, PREV)
     assert result.steps[-2:] == ("restore", "readback") and result.readbacks[-1].expected == PREV
     assert not any(readback.ok for readback in result.readbacks)
+
+
+def test_recovery_reads_back_after_its_restore_until_every_check_holds(waits):
+    """The readback after the restore, which starts the units, takes a release's window: PREV's
+    health endpoint answers from 10 seconds after its start, so the third read is the first whose
+    checks all hold, and it alone decides and is recorded. The readback of the host as recovery
+    finds it follows no start: it is read once, though NEW never holds there."""
+    host, reads = _midway(), []
+
+    def health_ok():  # PREV's health endpoint answers from 10 seconds after its start
+        reads.append((host.running, sum(waits)))  # only the waits move time on
+        return host.running == PREV and sum(waits) >= 10
+
+    host.health_ok = health_ok
+    result = release_runner.recover(host, PINS)
+
+    assert waits == [5, 5]
+    # One read of the stopped units at NEW, then three of PREV after the restore, 5 seconds apart.
+    assert reads == [(None, 0), (PREV, 0), (PREV, 5), (PREV, 10)]
+    assert (result.outcome, result.steps, host.calls) == (
+        "restored", ("readback", "restore", "readback"), RESTORE,
+    )
+    assert [(readback.expected, readback.ok) for readback in result.readbacks] == [
+        (NEW, False), (PREV, True),
+    ]
+
+
+def test_recovery_that_never_holds_fails_after_twelve_reads(waits):
+    """PREV's checks never all hold once the restore starts it: the readback reads the host 12
+    times, 5 seconds apart, and recovery fails with the last read, the only one it records, whose
+    errors it keeps."""
+    host, reads = _midway(), []
+
+    def health_ok():  # PREV's health endpoint never answers; each error says when it was read
+        reads.append((host.running, sum(waits)))
+        if host.running != PREV:
+            return False
+        raise ConnectionError(f"no answer from {PREV} {sum(waits)} seconds after its start")
+
+    host.health_ok = health_ok
+    result = release_runner.recover(host, PINS)
+
+    assert waits == [5] * 11
+    assert reads == [(None, 0)] + [(PREV, 5 * read) for read in range(12)]
+    assert (result.outcome, result.steps, host.calls) == (
+        "failed", ("readback", "restore", "readback"), RESTORE,
+    )
+    assert [(readback.expected, readback.ok) for readback in result.readbacks] == [
+        (NEW, False), (PREV, False),
+    ]
+    assert result.readbacks[-1].errors == {
+        "R4": f"ConnectionError: no answer from {PREV} 55 seconds after its start",
+    }
+
+
+def test_recovery_reads_back_once_after_a_start_that_failed(waits):
+    """The restore's start of the units fails, so it started nothing to wait for: PREV is read
+    back once, and recovery fails."""
+    host = _midway()
+
+    def start_units(units):  # PREV's units fail to start
+        host.calls.append("start")
+        raise RuntimeError(f"units failed to start on {host.head}")
+
+    host.start_units = start_units
+    result = release_runner.recover(host, PINS)
+
+    assert waits == []
+    assert (result.outcome, result.steps, host.calls) == (
+        "failed", ("readback", "restore", "readback"), RESTORE,
+    )
+    assert result.restore_errors == (f"RuntimeError: units failed to start on {PREV}",)
 
 
 @pytest.mark.parametrize(
