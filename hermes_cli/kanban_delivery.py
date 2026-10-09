@@ -856,7 +856,9 @@ def review_step(db_path: Path) -> None:
     """Card 2 on the board whose file is ``db_path``: each published head whose CI is
     green gets its review cards; one whose CI still runs or is red waits, and a later
     pass reads CI again. With no reviewer from the team policy nothing is read or
-    created. Raises no error, so the tick goes on."""
+    created. A head whose review cards another pass made while its rerun call waited
+    is read too, for that rerun's return (owner rule 2 of round 3). Raises no error,
+    so the tick goes on."""
     try:
         reviewer, route = _review_route() if delivery_settings() else (None, None)
         if reviewer is None:
@@ -864,7 +866,7 @@ def review_step(db_path: Path) -> None:
         with kb.connect_closing(db_path=db_path) as conn:
             rows = [dict(row) for row in conn.execute(
                 "SELECT * FROM kanban_deliveries WHERE pull_request_number IS NOT NULL "
-                "AND pull_request_state = 'open' ORDER BY id")]
+                "AND pull_request_state IN ('open', 'review_cards_created') ORDER BY id")]
     except Exception:
         logger.exception("kanban delivery: the review step failed")
         return
@@ -886,8 +888,9 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
     decision's waiting record holds the id and conclusion of each red required check run,
     as that request answered them, before the red check is rerun or returned. Owner rule 2
     of round 3: a recorded refused or unanswered rerun of H with no return recorded for H
-    returns the work before CI on H is read, whatever it shows. Returns the state or the
-    red outcome stored, if any."""
+    returns the work before CI on H is read, whatever it shows, also once H has its review
+    cards; such a row is read for nothing else. Returns the state or the red outcome stored,
+    if any."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     source, head = row["source_task_id"], row["pull_request_head"]
@@ -898,8 +901,8 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
             "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'delivery_bound' "
             "ORDER BY id DESC", (source,))]
         refused = _refused_rerun(conn, source, head)
-    if (read[1], _sha(read[2])) != ("done", head):
-        return None  # the source card is not done at H: nothing to decide for it
+    if (read[1], _sha(read[2])) != ("done", head) or refused is None and row["pull_request_state"] != "open":
+        return None  # the source card is not done at H, or H has its review cards and no return waits
     repository = _origin_repository(_repository(task["workspace_path"])) if task is not None else None
     try:
         policy = load_policy(_POLICY_FILE.read_text(encoding="utf-8"))
@@ -1422,7 +1425,8 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
     lens. One write transaction then reads the complete evidence again, finds the pull request
     unclaimed and reserves the arm under this attempt. The arm is the one call after it, and
     its answer is written to this attempt only. A full tenth page of reviews that GitHub does not
-    show to be the last refuses H once instead, and a review requesting changes returns H (:func:`_return_review`)."""
+    show to be the last refuses H once instead, and a review requesting changes returns H (:func:`_return_review`).
+    Owner rule 2 of round 3: while a recorded refused or unanswered rerun of H has no return, nothing is read or sent."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     source, head, number, repository = (row[key] for key in (
@@ -1430,8 +1434,9 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
     with kb.connect_closing(db_path=db_path) as conn:
         evidence = _arm_evidence(conn, row)
         claimed = _claimed(conn, repository, number)
-    if claimed or not evidence[3] or repository not in _policy_repositories() or not delivery_settings():
-        return None  # claimed, a required card is missing or open, or no repository recorded
+        returning = _refused_rerun(conn, source, head) is not None  # the review step returns H's work first
+    if claimed or returning or not evidence[3] or repository not in _policy_repositories() or not delivery_settings():
+        return None  # claimed, H's work returns first, a required card is missing or open, or no repository recorded
     reviews, whole = [], False
     try:
         github = GitHubTransport("publish", repository)

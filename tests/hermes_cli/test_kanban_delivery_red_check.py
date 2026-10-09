@@ -342,6 +342,49 @@ def test_a_recorded_refused_or_unknown_rerun_returns_the_work_whatever_ci_shows_
     assert gh["reruns"] == [RERUN]
 
 
+@pytest.mark.parametrize("cards", ["ready", "done"])
+@pytest.mark.parametrize("answer, reason", [(403, "rerun_refused"), (None, "rerun_unknown")])
+def test_a_second_native_tick_while_the_rerun_response_waits_cannot_drop_its_return(red, monkeypatch, answer,
+                                                                                    reason, cards):
+    """Owner rule 2 of round 3 with overlapping native ticks: the listed flaky failure's rerun is recorded, and while
+    its call waits for its answer CI on H turns green and a second tick makes H's review cards, then left ``cards``.
+    The call is then refused (403) or unanswered, and three more ticks follow: red_check_returned is recorded once
+    for H with one continuation, before any pass reads H's reviews to arm or return them, and one rerun call is sent."""
+    from hermes_cli import kanban_delivery_github as transport
+
+    kb, root, repo, gh = red
+    db = kb.kanban_db_path()
+    tid, head = _ready(red)
+    gh["rerun"] = answer
+    table, overlapped, reviewed = transport._exchange, [], []
+
+    def exchange(method, target, authorization, payload=None):
+        path = urlsplit(target).path
+        if (method, path) == ("POST", RERUN) and not overlapped:  # the rerun is recorded; its answer waits
+            overlapped.append([len(_waited(kb, tid, code)) for code in ("red_check_rerun", "red_check_rerun_outcome")])
+            gh["check"] = ("completed", "success")
+            _tick(kb)  # the second native tick
+            overlapped.append(_state(kb, head))
+            if cards == "done":
+                _done(db)
+        if path.endswith("/reviews"):  # a read of H's reviews, to arm H or return its review
+            reviewed.append(len(_waited(kb, tid, "red_check_returned")))
+        return table(method, target, authorization, payload)
+
+    monkeypatch.setattr(transport, "_exchange", exchange)
+
+    _tick(kb)
+    for _ in range(3):
+        _tick(kb)
+
+    (item,) = _raw(db, CONTINUED, tid)
+    assert (overlapped, len(_cards(kb))) == ([[1, 0], "review_cards_created"], 2)
+    assert [p["statuses"] for p in _waited(kb, tid, "red_check_rerun_outcome")] == [[answer]]
+    assert [(p["reason"], p["tests"], p["rework"]) for p in _waited(kb, tid, "red_check_returned")] == [
+        (reason, [FLAKY], item["id"])]
+    assert gh["reruns"] == [RERUN] and set(reviewed) == ({1} if cards == "done" else set())
+
+
 @pytest.mark.parametrize("after", ["moved", "closed", "failed"])
 @pytest.mark.parametrize("tests, answer", [([UNLISTED], 201), ([FLAKY], 403), ([FLAKY], None)],
                          ids=["returned", "refused", "unanswered"])
