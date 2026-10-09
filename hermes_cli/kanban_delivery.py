@@ -1202,9 +1202,31 @@ def _return_branch(db_path: Path, row: dict) -> Optional[tuple]:
     return root, branch
 
 
+def _builder_route(conn: sqlite3.Connection, source: str, builder: Optional[str]) -> dict:
+    """The route ``builder`` last ran the card ``source`` on, under the card's route fields: the provider, model and
+    effort that the runtime receipt of its latest run of the card records (``runtime_receipt`` in the run's
+    metadata, as the kernel stamps it). Empty when it has no run of the card, that run has no receipt, or the
+    receipt names no route a card can hold, as with an effort of "provider-default"."""
+    row = conn.execute("SELECT * FROM task_runs WHERE task_id = ? AND profile = ? ORDER BY started_at DESC, id DESC "
+                       "LIMIT 1", (source, builder)).fetchone()
+    run = kb.Run.from_row(row) if row is not None else None
+    receipt = run.metadata.get("runtime_receipt") if run is not None and isinstance(run.metadata, dict) else None
+    if not isinstance(receipt, dict):
+        return {}
+    provider, model, effort = (receipt.get(key) for key in ("provider", "model", "reasoning_effort"))
+    try:
+        effort = kb.normalize_reasoning_effort(effort) if isinstance(effort, str) else None
+    except ValueError:
+        effort = None
+    if not (effort and all(isinstance(part, str) and part.strip() for part in (provider, model))):
+        return {}
+    return {"provider_override": provider, "model_override": model, "reasoning_effort": effort}
+
+
 def _continuation(conn: sqlite3.Connection, db_path: Path, row: dict, body: str, branch: Optional[tuple]) -> dict:
     """H's one continuation card, for a review or a red check return: a task_links child of the source for
-    its builder, with its owned paths, tiers, route and review requirement, titled through owner_title and
+    its builder, with its owned paths, tiers, route and review requirement, the route the builder's own where the
+    receipt of its latest run of the source records one (:func:`_builder_route`), titled through owner_title and
     recorded under the identity of the source, H and "continuation". Owner rule 3: a recorded one is used for
     its lifetime, and one not done or archived gets ``body`` as one comment. A new card is made in the source
     card's project, which anchors it under the project's primary folder, on ``branch``, the folder and branch
@@ -1226,20 +1248,21 @@ def _continuation(conn: sqlite3.Connection, db_path: Path, row: dict, body: str,
     route = {key: governed[key] for key in ("execution_tier", "provider_override", "model_override",
                                             "reasoning_effort")}
     implementer = kb._latest_review_provenance(conn, source)[0]
+    route.update(_builder_route(conn, source, implementer))  # an approved review leaves the reviewer's on the source
     root, name = branch
     found = _run_git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}")
     if found is None or found.returncode != 0 or _sha(found.stdout.decode()) != head:
         raise PublishRefused("branch_not_at_head", f"{name} is not at {head} in the write transaction")
     lock = parked = None
-    # Owner rule 1: the source card's own route and tier, locked for the builder; unadmitted, the card parks.
-    # Owner rule 3 of round 3: its owner_receipt_bound too, and its route as it is: locked, the card keeps the
-    # source's effort with that lock, which the pin of a new card would move. When a governed source's route cannot
-    # be locked, the card is created parked with the reason and stays governed, never a manual card: it keeps the
-    # source's tier and route as stored, which create_task would strip or refuse, and, governed by nothing else,
-    # the source's lock, which binds no route with no tier.
+    # Owner rule 1: the source card's tier and its builder's route, else the source's own, locked for the builder;
+    # unadmitted, the card parks. Owner rule 3 of round 3: its owner_receipt_bound too, and that route as it is:
+    # locked, the card keeps that route's effort with that lock, which the pin of a new card would move. When a
+    # governed source's route cannot be locked, the card is created parked with the reason and stays governed, never
+    # a manual card: it keeps that tier and route as stored, which create_task would strip or refuse, and, governed
+    # by nothing else, the source's lock, which binds no route with no tier.
     try:
-        lock = kb.mint_policy_lock(implementer, task.provider_override, task.model_override,
-                                   task.reasoning_effort, task.execution_tier)
+        lock = kb.mint_policy_lock(implementer, route["provider_override"], route["model_override"],
+                                   route["reasoning_effort"], route["execution_tier"])
     except ValueError as error:
         parked = str(error) if kb.task_is_policy_governed(governed) else None
     item = kb.create_task(
@@ -1251,7 +1274,7 @@ def _continuation(conn: sqlite3.Connection, db_path: Path, row: dict, body: str,
     if Path(kb.get_task(conn, item).workspace_path or "") != root / ".worktrees" / item:
         raise PublishRefused("no_repository", f"the project of {source} no longer anchors its cards in {root}")
     if lock:  # a pin's record stays only where the pin kept that effort
-        effort = kb.normalize_reasoning_effort(task.reasoning_effort)
+        effort = kb.normalize_reasoning_effort(route["reasoning_effort"])
         conn.execute("UPDATE tasks SET pinned_effort = CASE WHEN reasoning_effort IS ? THEN pinned_effort END, "
                      "reasoning_effort = ?, model_policy_lock = ? WHERE id = ?", (effort, effort, lock, item))
     if parked:
