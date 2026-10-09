@@ -15,7 +15,7 @@ from tests.hermes_cli.test_kanban_delivery import (  # noqa: F401  (board is a f
     IMPLEMENTER, REVIEWER, _become, _git, _park, _rework, _spawned_worker_env, _write_config, board,
 )
 from tests.hermes_cli.test_kanban_delivery_auto_merge import (  # noqa: F401  (armed is a fixture)
-    ELSEWHERE, OTHER, _done, _reviews, armed,
+    ARMED, ELSEWHERE, OTHER, _arms, _done, _lenses, _reviews, armed,
 )
 from tests.hermes_cli.test_kanban_delivery_github import REPO
 from tests.hermes_cli.test_kanban_delivery_publish_step import _approved, _events, _tick
@@ -342,19 +342,26 @@ def test_a_recorded_refused_or_unknown_rerun_returns_the_work_whatever_ci_shows_
     assert gh["reruns"] == [RERUN]
 
 
-@pytest.mark.parametrize("cards", ["ready", "done"])
-@pytest.mark.parametrize("answer, reason", [(403, "rerun_refused"), (None, "rerun_unknown")])
-def test_a_second_native_tick_while_the_rerun_response_waits_cannot_drop_its_return(red, monkeypatch, answer,
-                                                                                    reason, cards):
+@pytest.mark.parametrize("cards, arm", [
+    ("ready", ()), ("done", ()), ("done", ((200, ARMED), "auto_merge_armed")),
+    ("done", ((403, None), "auto_merge_refused")), ("done", ("timeout", "auto_merge_unknown"))],
+    ids=["ready", "done", "arm_accepted", "arm_refused", "arm_unknown"])
+@pytest.mark.parametrize("answer, reason", [(403, "rerun_refused"), (None, "rerun_unknown"), (201, None)])
+def test_a_second_native_tick_while_the_rerun_response_waits_cannot_drop_its_return(red, request, monkeypatch, answer,
+                                                                                    reason, cards, arm):
     """Owner rule 2 of round 3 with overlapping native ticks: the listed flaky failure's rerun is recorded, and while
-    its call waits for its answer CI on H turns green and a second tick makes H's review cards, then left ``cards``.
-    The call is then refused (403) or unanswered, and three more ticks follow: red_check_returned is recorded once
-    for H with one continuation, before any pass reads H's reviews to arm or return them, and one rerun call is sent."""
+    its call waits for its answer CI on H turns green and a second tick makes H's review cards, then left ``cards``;
+    with ``arm``, every lens approves H and a third tick arms it, GitHub accepting, refusing or not answering the arm.
+    The rerun call is then refused (403) or unanswered, and three more ticks follow: red_check_returned is recorded
+    once for H with one continuation, whatever phase the row reached, before any later pass reads H's reviews, and
+    one rerun call is sent. An accepted rerun (201) returns nothing."""
     from hermes_cli import kanban_delivery_github as transport
 
     kb, root, repo, gh = red
     db = kb.kanban_db_path()
     tid, head = _ready(red)
+    rerun = transport._exchange  # the red fixture's, which answers the rerun call; the armed fixture's answers the rest
+    request.getfixturevalue("armed")
     gh["rerun"] = answer
     table, overlapped, reviewed = transport._exchange, [], []
 
@@ -367,9 +374,14 @@ def test_a_second_native_tick_while_the_rerun_response_waits_cannot_drop_its_ret
             overlapped.append(_state(kb, head))
             if cards == "done":
                 _done(db)
-        if path.endswith("/reviews"):  # a read of H's reviews, to arm H or return its review
+            if arm:
+                _reviews(gh, *_lenses(kb, head))
+                gh["arm"] = arm[0]
+                _tick(kb)  # the third native tick, which arms H
+                overlapped.append(_state(kb, head))
+        if path.endswith("/reviews") and _waited(kb, tid, "red_check_rerun_outcome"):  # a later read of H's reviews
             reviewed.append(len(_waited(kb, tid, "red_check_returned")))
-        return table(method, target, authorization, payload)
+        return (rerun if (method, path) == ("POST", RERUN) else table)(method, target, authorization, payload)
 
     monkeypatch.setattr(transport, "_exchange", exchange)
 
@@ -377,12 +389,13 @@ def test_a_second_native_tick_while_the_rerun_response_waits_cannot_drop_its_ret
     for _ in range(3):
         _tick(kb)
 
-    (item,) = _raw(db, CONTINUED, tid)
-    assert (overlapped, len(_cards(kb))) == ([[1, 0], "review_cards_created"], 2)
+    continued, phases = _raw(db, CONTINUED, tid), ["review_cards_created", *arm[1:]]  # the phases the ticks reached
+    assert (overlapped, _state(kb, head), len(_cards(kb))) == ([[1, 0], *phases], phases[-1], 2)
+    assert (len(_arms(gh)), len(continued), gh["reruns"]) == (1 if arm else 0, 1 if reason else 0, [RERUN])
     assert [p["statuses"] for p in _waited(kb, tid, "red_check_rerun_outcome")] == [[answer]]
     assert [(p["reason"], p["tests"], p["rework"]) for p in _waited(kb, tid, "red_check_returned")] == [
-        (reason, [FLAKY], item["id"])]
-    assert gh["reruns"] == [RERUN] and set(reviewed) == ({1} if cards == "done" else set())
+        (reason, [FLAKY], item["id"]) for item in continued]
+    assert set(reviewed) == ({1 if reason else 0} if (cards, arm) == ("done", ()) else set())
 
 
 @pytest.mark.parametrize("after", ["moved", "closed", "failed"])

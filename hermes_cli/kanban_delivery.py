@@ -856,8 +856,10 @@ def review_step(db_path: Path) -> None:
     """Card 2 on the board whose file is ``db_path``: each published head whose CI is
     green gets its review cards; one whose CI still runs or is red waits, and a later
     pass reads CI again. With no reviewer from the team policy nothing is read or
-    created. A head whose review cards another pass made while its rerun call waited
-    is read too, for that rerun's return (owner rule 2 of round 3). Raises no error,
+    created. Owner rule 2 of round 3: a head with a recorded refused or unanswered rerun
+    and no return is read too, for that return, in whatever phase other passes moved its
+    row to while the rerun call waited (review cards, an arm sent or answered, a close);
+    only a merged or replaced row, whose pull request is closed, is not. Raises no error,
     so the tick goes on."""
     try:
         reviewer, route = _review_route() if delivery_settings() else (None, None)
@@ -866,7 +868,9 @@ def review_step(db_path: Path) -> None:
         with kb.connect_closing(db_path=db_path) as conn:
             rows = [dict(row) for row in conn.execute(
                 "SELECT * FROM kanban_deliveries WHERE pull_request_number IS NOT NULL "
-                "AND pull_request_state IN ('open', 'review_cards_created') ORDER BY id")]
+                "AND pull_request_state NOT IN (?, ?) ORDER BY id", (_MERGED, _REPLACED))]
+            rows = [row for row in rows if row["pull_request_state"] == "open" or _refused_rerun(
+                conn, row["source_task_id"], row["pull_request_head"]) is not None]
     except Exception:
         logger.exception("kanban delivery: the review step failed")
         return
@@ -888,8 +892,8 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
     decision's waiting record holds the id and conclusion of each red required check run,
     as that request answered them, before the red check is rerun or returned. Owner rule 2
     of round 3: a recorded refused or unanswered rerun of H with no return recorded for H
-    returns the work before CI on H is read, whatever it shows, also once H has its review
-    cards; such a row is read for nothing else. Returns the state or the red outcome stored,
+    returns the work before CI on H is read, whatever it shows, in whatever phase the row
+    is; such a row is read for nothing else. Returns the state or the red outcome stored,
     if any."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
@@ -902,7 +906,7 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
             "ORDER BY id DESC", (source,))]
         refused = _refused_rerun(conn, source, head)
     if (read[1], _sha(read[2])) != ("done", head) or refused is None and row["pull_request_state"] != "open":
-        return None  # the source card is not done at H, or H has its review cards and no return waits
+        return None  # the source card is not done at H, or the row is past open and no return waits
     repository = _origin_repository(_repository(task["workspace_path"])) if task is not None else None
     try:
         policy = load_policy(_POLICY_FILE.read_text(encoding="utf-8"))
