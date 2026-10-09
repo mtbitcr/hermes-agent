@@ -640,6 +640,81 @@ def test_a_row_closed_outside_stays_so_when_another_head_and_then_its_own_are_ap
     assert _waited(kb, tid, "red_check_returned") == []
 
 
+def _retired_then_continued(red_run):
+    """H's red check, an unlisted failed test, natively returns the work through one continuation linked at H;
+    someone then closes pull request 41 unmerged outside the delivery step, and the next pass retires its row
+    closed outside. The kernel claims the continuation at H, and it is built on, completed, approved and published
+    as pull request 42 of the same repository."""
+    from tests.hermes_cli.test_kanban_delivery import _approve
+    from tests.hermes_cli.test_kanban_delivery_auto_merge import _published_as
+    from tests.hermes_cli.test_kanban_delivery_red_check import UNLISTED, _waited
+    from tests.hermes_cli.test_kanban_delivery_review_return import CONTINUED
+
+    kb, root, repo, gh = red_run
+    db = kb.kanban_db_path()
+    tid, head = _ready_to_return(red_run)
+    gh["tests"] = [UNLISTED]
+    _tick(kb)
+    (card,) = _raw(db, CONTINUED, tid)
+    assert [p["rework"] for p in _waited(kb, tid, "red_check_returned")] == [card["id"]]
+    gh["pull"] = _closed(False)
+    _tick(kb)
+    assert _state(kb, head) == "closed_outside"
+    (root / "profiles" / IMPLEMENTER).mkdir(parents=True)
+    _tick(kb)
+    (card,) = _raw(db, CONTINUED, tid)
+    assert (card["status"], card["base_commit"]) == ("running", head)
+    workspace = Path(card["workspace_path"])
+    (workspace / "src" / "impl" / "feature.py").write_text("ok = 3", encoding="utf-8")
+    _git(workspace, "commit", "-qam", "fix: the failed test")
+    continued = _git(workspace, "rev-parse", "HEAD")
+    conn = kb.connect()
+    try:
+        kb.complete_task(conn, card["id"], summary="fixed the failed test",
+                         expected_run_id=kb.get_task(conn, card["id"]).current_run_id)
+        assert _approve(kb, conn, card["id"]) is True
+    finally:
+        conn.close()
+    _published_as(db, {"pulls": {}}, card["id"], continued, 42)  # the stand-in answers pull request 41 alone
+    return tid, head
+
+
+def test_a_retired_pull_request_that_stays_closed_is_not_read_once_its_continuation_is_published(red_run):
+    """Pull request 41 stays closed after its row was retired closed outside and H's native continuation was
+    published as pull request 42 of the same repository: two arm step passes neither read nor close it, its row
+    keeps closed_outside and the source card's events are unchanged."""
+    from hermes_cli.kanban_delivery import arm_step
+
+    kb, root, repo, gh = red_run
+    db, every = kb.kanban_db_path(), "SELECT * FROM task_events WHERE task_id = ? ORDER BY id"
+    tid, head = _retired_then_continued(red_run)
+    calls, events = list(gh["calls"]), _raw(db, every, tid)
+
+    arm_step(db)
+    arm_step(db)
+
+    assert (gh["calls"], _state(kb, head), _raw(db, every, tid)) == (calls, "closed_outside", events)
+
+
+def test_a_retired_pull_request_reopened_by_its_owner_is_neither_read_nor_closed(red_run):
+    """The owner reopens pull request 41 after its row was retired closed outside and H's native continuation was
+    published as pull request 42, so GitHub shows it open at H again: two arm step passes neither read nor close
+    it, its row keeps closed_outside and the source card's events are unchanged, with no delivery_close_pending
+    and no delivery_replaced."""
+    from hermes_cli.kanban_delivery import arm_step
+
+    kb, root, repo, gh = red_run
+    db, every = kb.kanban_db_path(), "SELECT * FROM task_events WHERE task_id = ? ORDER BY id"
+    tid, head = _retired_then_continued(red_run)
+    gh["pull"] = None  # the owner reopens it: GitHub shows it open at H
+    calls, events = list(gh["calls"]), _raw(db, every, tid)
+
+    arm_step(db)
+    arm_step(db)
+
+    assert (gh["calls"], _state(kb, head), _raw(db, every, tid)) == (calls, "closed_outside", events)
+
+
 @pytest.mark.parametrize("answer, conclusion", [
     ("pad", "success"), ("pad", "failure"), ("short", "success"), ("broken", "success")])
 def test_a_decision_answer_over_100_check_runs_or_unreadable_waits_with_no_record(world, answer, conclusion):

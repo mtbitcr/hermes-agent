@@ -1368,7 +1368,7 @@ def _replaced(conn: sqlite3.Connection, old_id: Optional[int] = None) -> list:
     another card's work continues: that card is a task_links child of the row's source card,
     its recorded base is the row's head and its own published pull request is another one of
     the same repository. The row is still the latest on its pull request, and no close of it
-    was sent; a merged row is final (card 10's owner rule 2)."""
+    was sent; a merged row is final (card 10's owner rule 2), and so is a row closed outside."""
     old, new, later = (_RECEIPT.format(name) for name in ("old", "new", "later"))
     return [dict(row) for row in conn.execute(
         f"SELECT old.*, {old} AS repository, MIN(rework.id) AS replaced_by FROM kanban_deliveries AS old "
@@ -1376,12 +1376,13 @@ def _replaced(conn: sqlite3.Connection, old_id: Optional[int] = None) -> list:
         "JOIN task_links AS link ON link.parent_id = old.source_task_id AND link.child_id = rework.id "
         "JOIN kanban_deliveries AS new ON new.source_task_id = rework.id AND new.pull_request_number IS NOT NULL "
         f"AND new.pull_request_number != old.pull_request_number AND {new} = {old} "
-        "WHERE old.pull_request_number IS NOT NULL AND (? IS NULL OR old.id = ?) AND old.pull_request_state IS NOT ? "
+        "WHERE old.pull_request_number IS NOT NULL AND (? IS NULL OR old.id = ?) "
+        "AND IFNULL(old.pull_request_state, '') NOT IN (?, ?) "
         "AND NOT EXISTS (SELECT 1 FROM kanban_deliveries AS later WHERE later.id > old.id "
         f"AND later.pull_request_number = old.pull_request_number AND {later} = {old}) "
         "AND NOT EXISTS (SELECT 1 FROM task_events WHERE task_id = old.source_task_id "
         "AND kind = 'delivery_close_pending' AND json_extract(payload, '$.delivery_id') = old.id) "
-        "GROUP BY old.id ORDER BY old.id", (old_id, old_id, _MERGED))]
+        "GROUP BY old.id ORDER BY old.id", (old_id, old_id, _MERGED, _CLOSED_OUTSIDE))]
 
 
 def _approving_cards(conn: sqlite3.Connection, row: dict, read: tuple, returned: bool = False) -> list:
