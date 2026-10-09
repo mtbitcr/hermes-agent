@@ -124,8 +124,13 @@ def _chain_was_reviewed(host: HostReader, pins: Pins, merges: Sequence[RecordedM
 
 
 def _matches_review(host: HostReader, merge: RecordedMerge) -> bool:
+    # The first parent is not compared: GitHub merges onto main as it is by then, which can be
+    # newer than the reviewed base, as for a continuation built on an earlier delivered head. The
+    # reviewed head as the second parent and exactly the reviewed tree still pin what review saw.
+    parents = host.commit_parents(merge.commit)
     return (
-        host.commit_parents(merge.commit) == (merge.reviewed_base, merge.reviewed_head)
+        len(parents) == 2
+        and parents[1] == merge.reviewed_head
         and host.commit_tree(merge.commit) == merge.reviewed_tree
     )
 
