@@ -1205,8 +1205,10 @@ def _return_branch(db_path: Path, row: dict) -> Optional[tuple]:
 def _builder_route(conn: sqlite3.Connection, source: str, builder: Optional[str]) -> dict:
     """The route ``builder`` last ran the card ``source`` on, under the card's route fields: the provider, model and
     effort that the runtime receipt of its latest run of the card records (``runtime_receipt`` in the run's
-    metadata, as the kernel stamps it). Empty when it has no run of the card, that run has no receipt, or the
-    receipt names no route a card can hold, as with an effort of "provider-default"."""
+    metadata, as the kernel stamps it). An effort a card cannot hold, as the receipt's "provider-default" for a run
+    that set none of its own, is NULL, which on a card means just that: the worker profile's own effort. No lock
+    binds a route with no effort, so a governed card parks on it. Empty when it has no run of the card, or that
+    run has no receipt naming a provider and model."""
     row = conn.execute("SELECT * FROM task_runs WHERE task_id = ? AND profile = ? ORDER BY started_at DESC, id DESC "
                        "LIMIT 1", (source, builder)).fetchone()
     run = kb.Run.from_row(row) if row is not None else None
@@ -1218,7 +1220,7 @@ def _builder_route(conn: sqlite3.Connection, source: str, builder: Optional[str]
         effort = kb.normalize_reasoning_effort(effort) if isinstance(effort, str) else None
     except ValueError:
         effort = None
-    if not (effort and all(isinstance(part, str) and part.strip() for part in (provider, model))):
+    if not all(isinstance(part, str) and part.strip() for part in (provider, model)):
         return {}
     return {"provider_override": provider, "model_override": model, "reasoning_effort": effort}
 

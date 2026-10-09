@@ -543,6 +543,51 @@ def test_a_reviewed_sources_continuation_keeps_todays_route_without_its_builders
     _held(kb, tid, card, returned, "names no admitted")
 
 
+def test_a_reviewed_sources_continuation_parks_on_its_builders_route_from_a_provider_default_receipt(armed):
+    """Test A's _reviewed source card, its builder's latest run of it stamped by the kernel with the native receipt
+    of a builder session that set no effort of its own: the provider and model that session ran on, at the effort
+    "provider-default", which a card holds as NULL, the worker profile's own effort. The continuation takes that
+    route, not an older run's or the reviewer's, with the source's tier. No lock binds a route with no effort, so
+    it is created parked with that reason on the builder's route, not today's, and stays governed: its route
+    authority fails for that reason and an unblock without route approval is refused."""
+    from hermes_state import SessionDB
+
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    tid, head, cards = _changes_requested(armed)
+    model = _reviewed(kb, tid, "routine")
+    _ran(db, tid, BUILDER, 100, "anthropic", model, "max")
+    _ran(db, tid, BUILDER, 200)
+    _ran(db, tid, REVIEWER, 300, "openai-codex", "gpt-6.1-sol", "max")
+    (root / "profiles" / BUILDER).mkdir(parents=True)
+    with SessionDB(db_path=root / "profiles" / BUILDER / "state.db") as sessions:
+        sessions.create_session("session-200", source="kanban", model=model, model_config={}, profile_name=BUILDER)
+        sessions.update_token_counts("session-200", input_tokens=10, output_tokens=4, model=model,
+                                     billing_provider="anthropic", api_call_count=1)
+    (run,) = _raw(db, "SELECT id FROM task_runs WHERE task_id = ? AND started_at = 200", tid)
+    with kb.connect_closing() as conn:
+        stamped = kb._stamp_run_receipt(conn, tid, run["id"], None)
+    _raw(db, "UPDATE task_runs SET metadata = ? WHERE id = ?", json.dumps(stamped), run["id"])
+    receipt = [stamped["runtime_receipt"][key] for key in ("provider", "model", "reasoning_effort")]
+    assert receipt == ["anthropic", model, "provider-default"]
+
+    _tick(kb)
+
+    (card,) = _raw(db, CONTINUED, tid)
+    (returned,) = _returned(kb, tid)
+    parked = [json.loads(event["payload"])["detail"] for event in _raw(
+        db, "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'model_route_unapproved'", card["id"])]
+    assert (card["assignee"], card["status"], card["block_kind"], returned["rework"]) == (
+        BUILDER, "blocked", "needs_input", card["id"])
+    assert [card[key] for key in ROUTE[1:]] == ["routine", "anthropic", model, None]
+    assert (card["model_policy_lock"], parked) == (None, [returned["parked"]])
+    assert returned["parked"] == (f"policy-locked route is incomplete (assignee={BUILDER!r}, provider='anthropic', "
+                                  f"model={model!r}, reasoning_effort=None)")
+    with kb.connect_closing() as conn:
+        assert kb.task_is_policy_governed(card) and kb.route_authority_error(conn, card["id"]) == returned["parked"]
+        assert kb.unblock_task(conn, card["id"]) is False
+
+
 @pytest.mark.parametrize("layout", ["external", "advanced", "dot_worktrees", "removed", "other_clone", "separate_git_dir"])
 def test_a_source_checked_out_outside_its_repository_continues_in_a_worktree_of_its_own(armed, layout):
     """The source card's checkout is linked from outside its repository, there advanced past H, in an external
