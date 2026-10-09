@@ -24,7 +24,7 @@ import pytest
 import yaml
 
 from agent import estop
-from hermes_cli import build_info, release_guards, release_host_actions
+from hermes_cli import build_info, release_guards, release_host_actions, release_runner
 from hermes_cli import release_ledger as ledger
 from hermes_cli.release_guards import GUARDS, OpenRun
 from hermes_cli.subcommands.release import build_release_parser
@@ -444,10 +444,13 @@ def test_guard_read_that_raises_is_refused_and_resumes(root, monkeypatch, capsys
 @pytest.mark.parametrize(("unhealthy", "outcome"), [({NEW}, "restored"), ({NEW, PREV}, "failed")])
 def test_restored_resumes_and_failed_stays_paused(root, monkeypatch, unhealthy, outcome):
     batch_id = _accepted(1)["batch_id"]
-    host = FakeHost(unhealthy=unhealthy)
+    host, waits = FakeHost(unhealthy=unhealthy), []
+    monkeypatch.setattr(release_runner, "_wait", waits.append)  # no wait between reads sleeps
 
     assert _run(monkeypatch, host) == 1
     assert [result.outcome for result in host.results] == [outcome] == [_batches()[0]["outcome"]]
+    # Each unhealthy version is read 12 times after its start, 5 seconds apart, and never holds.
+    assert waits == [5] * 11 * len(unhealthy)
     paused = outcome == "failed"
     assert ("resume" in host.journal) is not paused
     assert (estop.get_state() or {}).get("reason") == (f"release {batch_id}" if paused else None)
