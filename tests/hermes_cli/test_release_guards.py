@@ -32,6 +32,18 @@ MERGES = (
         NEW, reviewed_base=FIRST_MERGE, reviewed_head="feature-b-sha", reviewed_tree="new-tree"
     ),
 )
+# NEW as the continuation of a returned delivery review. It is built on the earlier delivered
+# head, so its publish binds that head as the reviewed base; GitHub merges it with main as the
+# first parent, so that parent, the first merge, is a newer main than the reviewed base.
+CONTINUATION_MERGES = (
+    MERGES[0],
+    RecordedMerge(
+        NEW,
+        reviewed_base="delivered-head-sha",
+        reviewed_head="feature-b-sha",
+        reviewed_tree="new-tree",
+    ),
+)
 
 
 @dataclass
@@ -171,6 +183,19 @@ def test_g2_accepts_an_origin_main_that_moved_past_new():
     assert host.writes == []
 
 
+def test_g3_accepts_a_merge_built_on_a_newer_main_than_its_reviewed_base():
+    # Main moved on after review, but the merge still holds exactly what review saw: the reviewed
+    # head as its second parent, and the reviewed tree.
+    host = FakeHost()
+
+    results = prepare(host, PINS, CONTINUATION_MERGES)
+
+    assert [(result.guard, result.ok) for result in results] == [
+        (guard, True) for guard in ALL_GUARDS
+    ]
+    assert host.writes == []
+
+
 @pytest.mark.parametrize(
     ("guard", "merges", "host_setup"),
     [
@@ -205,6 +230,27 @@ def test_g2_accepts_an_origin_main_that_moved_past_new():
                 "direct-sha": (FIRST_MERGE,),
                 NEW: ("direct-sha", "feature-b-sha"),
             },
+        ),
+        # NEW merged onto a newer main than its reviewed base must still be a two-parent merge of
+        # the reviewed head with exactly the reviewed tree.
+        refusal(
+            "G3",
+            "G3-newer-main-merge-tree-not-reviewed",
+            merges=CONTINUATION_MERGES,
+            trees={FIRST_MERGE: "first-tree", NEW: "other-tree"},
+        ),
+        refusal(
+            "G3",
+            "G3-newer-main-merge-second-parent-not-reviewed",
+            merges=CONTINUATION_MERGES,
+            parents={FIRST_MERGE: (PREV, "feature-a-sha"), NEW: (FIRST_MERGE, "unreviewed-sha")},
+        ),
+        # A squash or rebase merge onto main leaves one parent, even with the reviewed tree.
+        refusal(
+            "G3",
+            "G3-newer-main-commit-with-one-parent",
+            merges=CONTINUATION_MERGES,
+            parents={FIRST_MERGE: (PREV, "feature-a-sha"), NEW: (FIRST_MERGE,)},
         ),
         refusal("G4", "G4-prev-not-ancestor-of-new", prev_is_ancestor=False),
         refusal("G5", "G5-lock-file-changed", changed={"hermes_cli/main.py", "uv.lock"}),
