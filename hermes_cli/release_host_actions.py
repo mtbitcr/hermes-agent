@@ -201,9 +201,13 @@ class ReleaseHostActions:
     def restore_config(self) -> None:
         """Put back the saved configuration set (S-D): the same files with the same bytes.
 
-        Each saved file comes back by one atomic replace, into a private directory made again when
-        it is gone. A configuration file of a served home that the save does not hold is removed.
-        A profile deleted since the save, every other file and the databases stay as they are.
+        The whole save is read and checked first. A save without the root home's config.yaml, or
+        with a file that cannot be read or that is no configuration file of the root home or of a
+        profile home, is refused before any live file changes: putting it back would remove live
+        configuration that it does not hold. Each saved file comes back by one atomic replace,
+        into a private directory made again when it is gone. A configuration file of a served home
+        that the save does not hold is removed. A profile deleted since the save, every other file
+        and the databases stay as they are.
         """
         if not self.config_snapshot:
             raise RuntimeError("no configuration snapshot was saved")
@@ -211,7 +215,7 @@ class ReleaseHostActions:
         if not saved.is_dir():
             raise FileNotFoundError(f"the configuration snapshot {self.config_snapshot} is gone")
         kept = set()
-        for copy in sorted(filter(Path.is_file, saved.rglob("*"))):
+        for copy in _read_config_save(saved):
             live = self.root_home / copy.relative_to(saved)
             kept.add(live)
             if live.parent != self.root_home and named_profile_is_deleted(live.parent):
@@ -353,6 +357,41 @@ def _copied(source: Path, copy: Path) -> bool:
     except OSError:
         return False
     return True
+
+
+def _read_config_save(saved: Path) -> list[Path]:
+    """Every file of a configuration save, sorted, once each one was read (S-D).
+
+    Each directory of the save is listed, and a listing that fails raises rather than leave its
+    files out. So does a file that is not regular, such as a pipe, which is never opened, or one
+    that cannot be read. A file other than CONFIG_FILES of the root home or of a profile home, by
+    the names _served_homes takes, and a save without the root home's config.yaml raise too.
+    """
+    files, directories = [], [saved]
+    while directories:
+        for path in directories.pop().iterdir():
+            if path.is_dir() and not path.is_symlink():
+                directories.append(path)
+                continue
+            rel = path.relative_to(saved)
+            home = rel.parent.parts  # () for the root home, ("profiles", NAME) for a profile's
+            a_home = not home or (
+                len(home) == 2
+                and home[0] == "profiles"
+                and home[1] != "default"
+                and _PROFILE_ID_RE.match(home[1])
+            )
+            if rel.name not in CONFIG_FILES or not a_home:
+                raise ValueError(
+                    f"the configuration snapshot {saved.name} holds {rel}, no configuration file"
+                )
+            if not path.is_file():
+                raise OSError(f"the configuration snapshot {saved.name} holds {rel}, not a file")
+            path.read_bytes()  # only the read: the restore copies the file with its mode
+            files.append(path)
+    if saved / "config.yaml" not in files:
+        raise FileNotFoundError(f"the configuration snapshot {saved.name} holds no config.yaml")
+    return sorted(files)
 
 
 def _answers_ok(url: str) -> bool:
