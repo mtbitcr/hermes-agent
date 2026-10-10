@@ -356,7 +356,8 @@ def _release(inputs: tuple[Any, ...], host: _Host, token: str) -> int:
 
 
 def _tell_owner(line: str) -> None:
-    """Send ``line`` to the owner on Telegram; a send that fails prints its cause and no more."""
+    """Send ``line`` to the owner on Telegram; a send that fails or is interrupted prints its
+    cause and no more."""
     try:
         sent = subprocess.run(
             [sys.executable, "-m", "hermes_cli.main", "send", "--to", "telegram", "--file", "-"],
@@ -367,6 +368,9 @@ def _tell_owner(line: str) -> None:
         )
     except subprocess.TimeoutExpired as error:
         print(f"The owner was not told: the send timed out after {error.timeout} seconds.")
+    except KeyboardInterrupt:
+        # The outcome is recorded and a recovery has no signal handler: its last steps must run.
+        print("The owner was not told: the send was interrupted.")
     except Exception as error:  # whatever goes wrong here, the release's outcome stands
         print(f"The owner was not told: the send could not start ({type(error).__name__}).")
     else:

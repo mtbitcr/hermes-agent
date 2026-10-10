@@ -9,6 +9,7 @@ import contextlib
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -25,7 +26,7 @@ from hermes_cli.release_guards import Pins
 from hermes_cli.release_runner import PLATFORM_UNITS, SANDBOX_TUNNEL_UNIT
 from hermes_cli.subcommands.release import build_release_parser
 from tests.hermes_cli.test_release_cmd import (
-    CAUSES, SECRET, _printed_outcome, _root_at, _send_fails, _unprivileged,
+    RECOVERY_CAUSES, SECRET, _printed_outcome, _root_at, _send_fails, _unprivileged,
 )
 
 
@@ -205,6 +206,15 @@ def sent(monkeypatch: pytest.MonkeyPatch) -> Sent:
     lines.real = release_cmd._tell_owner
     monkeypatch.setattr(release_cmd, "_tell_owner", lines.append)
     return lines
+
+
+@pytest.fixture(autouse=True)
+def _default_sigint():
+    """A recovery installs no SIGINT handler of its own. A runner can start the tests with SIGINT
+    ignored, so each test runs under Python's default handler and the caller's is put back."""
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    yield
+    signal.signal(signal.SIGINT, previous or signal.SIG_DFL)
 
 
 def _accepted() -> int:
@@ -715,12 +725,9 @@ def test_a_recovery_that_ends_tells_the_owner_once(
     assert sent == [f"Release {batch_id} {printed}{paused}"]
 
 
-@pytest.mark.parametrize("branch", ["counted before", "counted by its own write"])
-def test_a_batch_capped_and_recorded_failed_tells_the_owner_once(root, monkeypatch, sent, branch):
-    """Both caps that record failed: the last attempt ended before its outcome, or the count its
-    own write returned is past the cap. Neither asks the host anything."""
-    from hermes_cli import release_cmd
-
+def _capped(monkeypatch: pytest.MonkeyPatch, branch: str) -> int:
+    """A batch stopped midway whose recovery ends at the cap, on ``branch``: the last attempt ended
+    before its outcome, or the count its own write returns is past the cap."""
     batch_id = _stopped_midway()
     if branch == "counted before":
         with contextlib.closing(ledger.connect()) as conn:
@@ -728,6 +735,16 @@ def test_a_batch_capped_and_recorded_failed_tells_the_owner_once(root, monkeypat
                 ledger.begin_recovery(conn, batch_id)
     else:
         monkeypatch.setattr(ledger, "begin_recovery", lambda conn, batch: {"recovery_attempts": 4})
+    return batch_id
+
+
+@pytest.mark.parametrize("branch", ["counted before", "counted by its own write"])
+def test_a_batch_capped_and_recorded_failed_tells_the_owner_once(root, monkeypatch, sent, branch):
+    """Both caps that record failed: the last attempt ended before its outcome, or the count its
+    own write returned is past the cap. Neither asks the host anything."""
+    from hermes_cli import release_cmd
+
+    batch_id = _capped(monkeypatch, branch)
     host = _midway(NEW, PREV)
 
     assert _command(monkeypatch, host, "recover", str(batch_id)) == 0
@@ -749,10 +766,11 @@ def test_a_batch_already_failed_at_the_cap_tells_the_owner_nothing(root, monkeyp
     assert sent == []
 
 
-@pytest.mark.parametrize("how", list(CAUSES))
+@pytest.mark.parametrize("command", ["recover", "run"])
+@pytest.mark.parametrize("how", list(RECOVERY_CAUSES))
 @pytest.mark.parametrize("outcome", ["released", "failed"])
 def test_a_send_that_fails_on_a_recovery_changes_nothing_else_and_names_its_cause(
-    root, monkeypatch, capsys, sent, outcome, how
+    root, monkeypatch, capsys, sent, command, outcome, how
 ):
     from hermes_cli import release_cmd
 
@@ -761,12 +779,46 @@ def test_a_send_that_fails_on_a_recovery_changes_nothing_else_and_names_its_caus
     monkeypatch.setattr(release_cmd, "_tell_owner", sent.real)
     _send_fails(monkeypatch, how, told)
 
-    code = _command(monkeypatch, ENDS[outcome](), "recover", str(batch_id))
+    try:
+        code = _command(monkeypatch, ENDS[outcome](), command, str(batch_id))
+    except KeyboardInterrupt:
+        pytest.fail("the interrupt ended the recovery")
 
     shown = capsys.readouterr()
     lines = shown.out.splitlines()
     assert _batch(batch_id)["outcome"] == outcome
     assert code == (0 if outcome == "released" else 1)
     assert lines.count(f"Batch {batch_id} {release_cmd._OUTCOMES[outcome]}.") == 1
-    assert len([line for line in lines if all(part in line for part in CAUSES[how])]) == 1
+    named = [line for line in lines if all(part in line for part in RECOVERY_CAUSES[how])]
+    assert len(named) == 1
+    assert len(told) == 1 and SECRET not in shown.out + shown.err
+    assert (_sentinel() is None) == (outcome == "released")
+
+
+@pytest.mark.parametrize("command", ["recover", "run"])
+@pytest.mark.parametrize("branch", ["counted before", "counted by its own write"])
+@pytest.mark.parametrize("how", list(RECOVERY_CAUSES))
+def test_a_send_that_fails_at_the_cap_changes_nothing_else_and_names_its_cause(
+    root, monkeypatch, capsys, sent, command, branch, how
+):
+    from hermes_cli import release_cmd
+
+    batch_id, told = _capped(monkeypatch, branch), []
+    before, host = _sentinel(), _midway(NEW, PREV)
+    monkeypatch.setattr(release_cmd, "_tell_owner", sent.real)
+    _send_fails(monkeypatch, how, told)
+
+    try:
+        code = _command(monkeypatch, host, command, str(batch_id))
+    except KeyboardInterrupt:
+        pytest.fail("the interrupt ended the recovery")
+
+    shown = capsys.readouterr()
+    lines = shown.out.splitlines()
+    capped = release_cmd._CAPPED.format(batch_id, release_cmd._RECOVERY_ATTEMPTS)
+    assert (_batch(batch_id)["outcome"], code, host.calls) == ("failed", 0, [])
+    assert lines.count(capped) == 1
+    named = [line for line in lines if all(part in line for part in RECOVERY_CAUSES[how])]
+    assert len(named) == 1
+    assert _sentinel() == before
     assert len(told) == 1 and SECRET not in shown.out + shown.err

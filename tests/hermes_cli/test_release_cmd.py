@@ -96,7 +96,18 @@ CAUSES = {
     "cannot start": ("could not start", "FileNotFoundError"),
     "exits 1": ("exited with status 1",),
     "timeout": ("timed out after 60 seconds",),
+    "interrupted": ("was interrupted",),
 }
+# A recovery installs no signal handler of its own, so only its tests can take a real SIGINT during
+# the send; in a normal release the handlers turn it into a stop flag. The 'signal' case needs
+# SIGINT at Python's default handler: ignored, it would do nothing.
+RECOVERY_CAUSES = {**CAUSES, "signal": CAUSES["interrupted"]}
+# An offline stand-in for the send: it reads its line as the send does, sends SIGINT to its parent,
+# the process running the release, and then waits to be killed.
+_INTERRUPTING_SEND = (
+    "import os, signal, sys, time; sys.stdin.read();"
+    " os.kill(os.getppid(), signal.SIGINT); time.sleep(20)"
+)
 
 
 @dataclass
@@ -239,15 +250,34 @@ def _send_fails(monkeypatch: pytest.MonkeyPatch, how: str, told: list) -> None:
     """The send's process fails as ``how`` says, after noting its input; any other is real."""
     real = subprocess.run
 
+    def cannot_start(argv, options):
+        raise FileNotFoundError(f"no such file: {SECRET}")
+
+    def exits_1(argv, options):
+        return subprocess.CompletedProcess(argv, 1, SECRET, SECRET)
+
+    def times_out(argv, options):
+        raise subprocess.TimeoutExpired(argv, options["timeout"], stderr=SECRET)
+
+    def is_interrupted(argv, options):
+        raise KeyboardInterrupt(SECRET)
+
+    def is_signalled(argv, options):  # the real call, to an offline child that signals this process
+        return real([argv[0], "-c", _INTERRUPTING_SEND], **options)
+
+    fails = {
+        "cannot start": cannot_start,
+        "exits 1": exits_1,
+        "timeout": times_out,
+        "interrupted": is_interrupted,
+        "signal": is_signalled,
+    }
+
     def run(argv, **options):
         if list(argv[1:4]) != ["-m", "hermes_cli.main", "send"]:
             return real(argv, **options)
         told.append(options["input"])
-        if how == "cannot start":
-            raise FileNotFoundError(f"no such file: {SECRET}")
-        if how == "timeout":
-            raise subprocess.TimeoutExpired(argv, options["timeout"], stderr=SECRET)
-        return subprocess.CompletedProcess(argv, 1, SECRET, SECRET)
+        return fails[how](argv, options)
 
     monkeypatch.setattr(subprocess, "run", run)
 
