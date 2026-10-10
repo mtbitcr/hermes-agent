@@ -459,8 +459,11 @@ def test_state_snapshot_inside_the_root_copies_the_walks_list_from_before_its_fi
     root = tmp_path / "root"
     wal_database(root / "state.db", 2)
     (root / "config.yaml").write_bytes(b"model: root\n")
-    actions = make_actions(tmp_path, snapshot_root=root / "release-snapshots")
+    assert "kept-snapshots" not in backup._EXCLUDED_DIRS  # else the walk never enters it
+    actions = make_actions(tmp_path, snapshot_root=root / "kept-snapshots")
     state = actions.snapshot_root / "state"
+    # An earlier release snapshot in the root, which the walk must skip.
+    make_actions(tmp_path, snapshot_root=root / "release-snapshots").take_snapshot("EARLIER")
     actions.save_config_snapshot("CONFIG")
     actions.take_snapshot("OLD")
     expected = walked(root, state / "NEW")
@@ -468,9 +471,10 @@ def test_state_snapshot_inside_the_root_copies_the_walks_list_from_before_its_fi
 
     files = sorted(published(state / "NEW"))
     assert files == expected
-    # The earlier snapshot is in it, as the walk yields it, and nothing of its own staging or copy.
-    assert "release-snapshots/state/OLD/state.db" in files
-    own = ("release-snapshots/.state-NEW", "release-snapshots/state/NEW/")
+    assert "state.db" in files
+    assert [rel for rel in files if "release-snapshots" in Path(rel).parts] == []
+    # Nothing of its own staging or copy: the walk's list was taken before its first copy.
+    own = ("kept-snapshots/.state-NEW", "kept-snapshots/state/NEW/")
     assert [rel for rel in files if rel.startswith(own)] == []
 
 
