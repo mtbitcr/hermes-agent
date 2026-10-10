@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import json
 import os
 import sqlite3
 import stat
@@ -65,6 +66,7 @@ _CLI = (
     "from hermes_cli import release_cmd\n"
     "host = FakeHost(kill_mode=sys.argv.pop(1))\n"
     "release_cmd.LiveHostReader = release_cmd.ReleaseHostActions = host.build\n"
+    "release_cmd._tell_owner = lambda line: None\n"
     "from hermes_cli.main import main\n"
     "sys.argv[0] = 'hermes'\n"
     "sys.exit(main())\n"
@@ -88,6 +90,62 @@ _WRITER = (
 # The first bytes of a rollback journal once it is synced, as it is before a writer puts any change
 # into the database file. Until then they are zeros, and the journal is not hot.
 _JOURNAL_MAGIC = bytes.fromhex("d9d505f920a163d7")
+# A failed send's error text could carry the bot token: no stream of a release may show it.
+SECRET = "123456:fake-bot-token"
+# Each way a send fails, with the parts of the one line that must name its cause.
+CAUSES = {
+    "cannot start": ("could not start", "FileNotFoundError"),
+    "exits 1": ("exited with status 1",),
+    "timeout": ("timed out after 60 seconds",),
+    "interrupted": ("was interrupted",),
+}
+# A recovery installs no signal handler of its own, so only its tests can take a real SIGINT during
+# the send; in a normal release the handlers turn it into a stop flag. The 'signal' case needs
+# SIGINT at Python's default handler: ignored, it would do nothing.
+RECOVERY_CAUSES = {**CAUSES, "signal": CAUSES["interrupted"]}
+# An offline stand-in for the send: it reads its line as the send does, sends SIGINT to its parent,
+# the process running the release, and then waits to be killed.
+_INTERRUPTING_SEND = (
+    "import os, signal, sys, time; sys.stdin.read();"
+    " os.kill(os.getppid(), signal.SIGINT); time.sleep(20)"
+)
+# An offline Telegram transport, as the sitecustomize.py the send child loads from PYTHONPATH. It
+# imports nothing of hermes at start-up (hermes modules cache HERMES_HOME at import, which would
+# settle the profile before the child chose it) and opens no socket. When the product imports
+# tools.send_message_tool, that module's _send_to_platform becomes a function that appends one JSON
+# line {platform, token, chat_id, message} to the file named by OFFLINE_TELEGRAM_LOG.
+_OFFLINE_HOOK = (
+    "import importlib.machinery, json, os, sys\n"
+    "\n"
+    "async def offline_send(platform, pconfig, chat_id, message, *args, **kwargs):\n"
+    "    line = {'platform': getattr(platform, 'value', str(platform)), 'token': pconfig.token,\n"
+    "            'chat_id': chat_id, 'message': message}\n"
+    "    with open(os.environ['OFFLINE_TELEGRAM_LOG'], 'a', encoding='utf-8') as log:\n"
+    "        log.write(json.dumps(line) + '\\n')\n"
+    "    return {'success': True}\n"
+    "\n"
+    "class Loader:\n"
+    "    def __init__(self, real):\n"
+    "        self.real = real\n"
+    "    def __getattr__(self, name):\n"
+    "        return getattr(self.real, name)\n"
+    "    def create_module(self, spec):\n"
+    "        return self.real.create_module(spec)\n"
+    "    def exec_module(self, module):\n"
+    "        self.real.exec_module(module)\n"
+    "        module._send_to_platform = offline_send\n"
+    "\n"
+    "class Finder:\n"
+    "    def find_spec(self, name, path=None, target=None):\n"
+    "        if name != 'tools.send_message_tool':\n"
+    "            return None\n"
+    "        spec = importlib.machinery.PathFinder.find_spec(name, path)\n"
+    "        if spec is not None and spec.loader is not None:\n"
+    "            spec.loader = Loader(spec.loader)\n"
+    "        return spec\n"
+    "\n"
+    "sys.meta_path.insert(0, Finder())\n"
+)
 
 
 @dataclass
@@ -178,6 +236,14 @@ class FakeHost:
         return dict(CONFIG)
 
 
+@pytest.fixture(autouse=True)
+def _no_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test here ends a release; if one did, it must not start a real send."""
+    from hermes_cli import release_cmd
+
+    monkeypatch.setattr(release_cmd, "_tell_owner", lambda line: None)
+
+
 @pytest.fixture
 def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """The root Hermes home at ``<tmp>/.hermes``, with the release settings this host needs."""
@@ -210,6 +276,83 @@ def _command(monkeypatch: pytest.MonkeyPatch, host: FakeHost | None = None):
         monkeypatch.setattr(release_cmd, "LiveHostReader", host.build)
         monkeypatch.setattr(release_cmd, "ReleaseHostActions", host.build)
     return release_cmd
+
+
+def _printed_outcome(out: str, batch_id: int) -> str:
+    """The text after 'Batch N ' in the last line of ``out`` that starts so: how it ended."""
+    prefix = f"Batch {batch_id} "
+    return [line for line in out.splitlines() if line.startswith(prefix)][-1].removeprefix(prefix)
+
+
+def _send_fails(monkeypatch: pytest.MonkeyPatch, how: str, told: list) -> None:
+    """The send's process fails as ``how`` says, after noting its input; any other is real."""
+    real = subprocess.run
+
+    def cannot_start(argv, options):
+        raise FileNotFoundError(f"no such file: {SECRET}")
+
+    def exits_1(argv, options):
+        return subprocess.CompletedProcess(argv, 1, SECRET, SECRET)
+
+    def times_out(argv, options):
+        raise subprocess.TimeoutExpired(argv, options["timeout"], stderr=SECRET)
+
+    def is_interrupted(argv, options):
+        raise KeyboardInterrupt(SECRET)
+
+    def is_signalled(argv, options):  # the real call, to an offline child that signals this process
+        return real([argv[0], "-c", _INTERRUPTING_SEND], **options)
+
+    fails = {
+        "cannot start": cannot_start,
+        "exits 1": exits_1,
+        "timeout": times_out,
+        "interrupted": is_interrupted,
+        "signal": is_signalled,
+    }
+
+    def run(argv, **options):
+        if list(argv[1:4]) != ["-m", "hermes_cli.main", "send"]:
+            return real(argv, **options)
+        told.append(options["input"])
+        return fails[how](argv, options)
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+
+def _two_homes(root: Path, monkeypatch: pytest.MonkeyPatch):
+    """Two Telegram homes and an offline transport, for a send child that is really started.
+
+    The root home has the placeholder bot token SECRET and the home chat 111111. A named profile
+    home, which ``<root>/active_profile`` makes sticky, has another token and the home chat 222222.
+    The environment gets HOME at the temporary top, the hook of _OFFLINE_HOOK first on PYTHONPATH,
+    its log in OFFLINE_TELEGRAM_LOG and no supervisor marker, so an inherited one cannot hide a
+    child that follows the sticky profile. Returns what reads the lines the hook logged back as
+    dicts, and the named profile's token.
+    """
+    top, named = root.parent, root / "profiles" / "work"
+    named.mkdir(parents=True)
+    named_token = "654321:fake-named-profile-token"
+    (root / ".env").write_text(f"TELEGRAM_BOT_TOKEN={SECRET}\nTELEGRAM_HOME_CHANNEL=111111\n")
+    (named / ".env").write_text(f"TELEGRAM_BOT_TOKEN={named_token}\nTELEGRAM_HOME_CHANNEL=222222\n")
+    (root / "active_profile").write_text("work\n")
+    hook, log = top / "offline", top / "offline.log"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_OFFLINE_HOOK)
+    log.touch()
+    monkeypatch.setenv("HOME", str(top))
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(hook), str(_REPO)]))
+    monkeypatch.setenv("OFFLINE_TELEGRAM_LOG", str(log))
+    for marker in (
+        "HERMES_SUPERVISED_CHILD", "HERMES_S6_SUPERVISED_CHILD",
+        "HERMES_GATEWAY_EXTERNAL_SUPERVISOR", "INVOCATION_ID",
+    ):
+        monkeypatch.delenv(marker, raising=False)
+
+    def logged() -> list[dict]:
+        return [json.loads(line) for line in log.read_text().splitlines()]
+
+    return logged, named_token
 
 
 def _merge(conn, commit: str, pr: int = 1, title: str = "") -> dict:
@@ -374,6 +517,24 @@ def _accept_held_at_commit(batch: dict, cache_pages: int, at_commit) -> None:
         conn.execute(f"PRAGMA cache_size={cache_pages}")
         with pytest.raises(_RolledBack):
             _accept(conn, batch)
+
+
+def test_premise_a_bare_send_child_follows_the_sticky_profile(root, monkeypatch):
+    """The premise of the owner's send tests: the fixed send command started with HERMES_HOME at
+    the root and no supervisor marker lands on the named profile's home chat with its token."""
+    logged, named_token = _two_homes(root, monkeypatch)
+
+    child = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "send", "--to", "telegram", "--file", "-"],
+        input="premise",
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "HERMES_HOME": str(root)},
+    )
+
+    assert child.returncode == 0, child.stderr
+    assert [(line["chat_id"], line["token"]) for line in logged()] == [("222222", named_token)]
 
 
 def test_prepare_runs_every_guard_and_writes_nothing(root, tmp_path, monkeypatch, capsys):

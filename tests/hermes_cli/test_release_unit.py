@@ -23,6 +23,7 @@ import pytest
 
 from hermes_cli import release_ledger as ledger
 from hermes_cli.subcommands.release import build_release_parser
+from tests.hermes_cli.test_release_cmd import _printed_outcome
 
 
 def _commit(label: str) -> str:
@@ -52,6 +53,8 @@ SETTINGS = {
 # manager's environment, systemd-run runs the unit's command in it, with the unit's HERMES_HOME
 # and directory, and starts it again while it fails, up to its start limit, as the user manager
 # does under Restart=on-failure and StartLimitIntervalSec=infinity; each run goes to runs.jsonl.
+# The unit's command is the real release with its send to the owner replaced: each line it would
+# send goes to told.jsonl, so no run here starts a real send.
 STAND_IN = r'''
 import json, os, subprocess, sys
 from pathlib import Path
@@ -59,6 +62,16 @@ from pathlib import Path
 top = Path(__file__).parent
 call = [Path(sys.argv[1]).name, *sys.argv[2:]]
 answers = json.loads((top / "answers.json").read_text(encoding="utf-8"))
+CHILD = (
+    "import json, sys\n"
+    "told = sys.argv.pop(1)\n"
+    "from hermes_cli import main, release_cmd\n"
+    "def tell(line):\n"
+    "    with open(told, 'a', encoding='utf-8') as log:\n"
+    "        log.write(json.dumps(line) + '\\n')\n"
+    "release_cmd._tell_owner = tell\n"
+    "main.main()\n"
+)
 if call[0] == "git":
     board = sorted(name for name in os.environ if name.startswith("HERMES_KANBAN"))
     with open(top / "git.jsonl", "a", encoding="utf-8") as log:
@@ -82,6 +95,8 @@ if call[0] == "systemd-run":
                 cwd = value
             elif value.startswith("StartLimitBurst="):
                 starts = int(value.split("=", 1)[1])
+        # "python -m MODULE ARGS" becomes "python -c CHILD TOLD ARGS"
+        command = [command[0], "-c", CHILD, str(top / "told.jsonl"), *command[3:]]
         for _ in range(starts if "--property=Restart=on-failure" in options else 1):
             run = subprocess.run(
                 command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True,
@@ -530,3 +545,17 @@ def test_start_judges_and_reports_the_root_batch(
             )
     assert _files(named) == named_before  # the named record: not a byte changed
     assert [name for name in os.environ if name.startswith("HERMES_KANBAN")] == []
+
+
+def test_a_release_unit_tells_the_owner_once_how_its_batch_ended(root, manager, monkeypatch):
+    """The unit's first run ends the release of its batch and tells the owner. Its restarts refuse
+    a batch that is no longer accepted: they end no release, so they tell nothing."""
+    batch_id = _batch_in("accepted")
+    manager.answer(states=["failed"], environment=_unit_environment(root))
+
+    _start(monkeypatch, batch_id)
+
+    runs = manager.calls("runs.jsonl")
+    printed = _printed_outcome(runs[0][1], batch_id)
+    assert len(runs) > 1
+    assert manager.calls("told.jsonl") == [f"Release {batch_id} {printed}"]
