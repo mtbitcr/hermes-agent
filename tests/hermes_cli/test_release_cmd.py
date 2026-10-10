@@ -96,8 +96,8 @@ class FakeHost:
 
     It stands in for both live adapters and keeps the keywords each was built with. Any other call
     is one of the host's moves or readbacks, which prepare never asks; it is only noted. With
-    live_snapshots, the state snapshots are what the real LiveHostReader, built with the reader's
-    keywords, finds on disk, instead of snapshot_dirs.
+    live_snapshots, the state snapshots and their sizes are what the real LiveHostReader, built
+    with the reader's keywords, finds on disk, instead of snapshot_dirs of 0 bytes each.
     """
 
     head: str = PREV
@@ -159,6 +159,12 @@ class FakeHost:
             [reader] = [settings for settings in self.built if "snapshot_name" in settings]
             return LiveHostReader(**reader).snapshots()
         return list(self.snapshot_dirs)
+
+    def snapshot_bytes(self, name):
+        if self.live_snapshots:
+            [reader] = [settings for settings in self.built if "snapshot_name" in settings]
+            return LiveHostReader(**reader).snapshot_bytes(name)
+        return 0
 
     def open_native_runs(self):
         if not self.runs_readable:

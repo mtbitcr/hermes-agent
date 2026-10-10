@@ -325,6 +325,23 @@ def test_unit_property_returns_signal_names(tmp_path, monkeypatch):
         assert argv[-1] == "hermes-gateway"
 
 
+def test_snapshot_bytes_sums_the_files_of_one_snapshot_and_follows_no_link(tmp_path):
+    state, outside = tmp_path / "snapshots" / "state", tmp_path / "outside"
+    for path, size in (
+        (state / NEW / "state.db", 3000),
+        (state / NEW / "profiles" / "coder" / "config.yaml", 24),
+        (state / ("f" * 40) / "state.db", 5000),  # another snapshot
+        (outside / "kanban.db", 7000),  # outside every snapshot
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(bytes(size))
+    # Links inside the snapshot, to a file and to a directory, are never followed.
+    (state / NEW / "file-link").symlink_to(outside / "kanban.db")
+    (state / NEW / "directory-link").symlink_to(outside, target_is_directory=True)
+
+    assert _reader(tmp_path, tmp_path / "root").snapshot_bytes(NEW) == 3000 + 24
+
+
 @pytest.mark.parametrize("case", ["current", "stale", "unknown", "none", "every"])
 def test_venv_import_root_asks_the_live_gateways(tmp_path, fence_home, monkeypatch, case):
     checkout, prev, (m1, _m2) = _repository(tmp_path)

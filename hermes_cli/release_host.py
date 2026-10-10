@@ -3,7 +3,8 @@
 `LiveHostReader` is the real `HostReader` of `hermes_cli.release_guards`. It reads:
 - the checkout and its history, with origin main read from the remote itself (S-H);
 - the code identity each live gateway stamps, for G6;
-- systemd unit properties through the user manager, free disk and the state snapshot names;
+- systemd unit properties through the user manager, free disk, and the state snapshots' names
+  and sizes;
 - the open runs on every board;
 - digests of the configuration set (S-D), live and in the named configuration snapshot (S-C).
 
@@ -29,6 +30,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 from collections.abc import Collection, Mapping, Sequence
@@ -229,6 +231,19 @@ class LiveHostReader:
             return []
         entries = sorted(state.iterdir(), key=lambda entry: (entry.lstat().st_mtime_ns, entry.name))
         return [entry.name for entry in entries]
+
+    def snapshot_bytes(self, name: str) -> int:
+        # Only regular files count. Every path, the snapshot's own included, is read with lstat, so
+        # no link is followed, whether it points to a file or to a directory.
+        total, paths = 0, [self.snapshot_root / "state" / name]  # S-C
+        while paths:
+            path = paths.pop()
+            info = path.lstat()
+            if stat.S_ISDIR(info.st_mode):
+                paths.extend(path.iterdir())
+            elif stat.S_ISREG(info.st_mode):
+                total += info.st_size
+        return total
 
     # Runs.
 
