@@ -47,6 +47,8 @@ _EXCLUDED_DIRS = {
     "node_modules",     # js deps — reinstalled on demand
     "backups",          # prior auto-backups — don't nest backups exponentially
     _QUICK_SNAPSHOTS_DIR,  # each holds a full state.db copy — same reason as ``backups``
+    # Release snapshots must not nest inside later snapshots or nightly backups.
+    "release-snapshots",
     "checkpoints",      # session-hash-keyed trajectory caches — regenerated, don't port
     # Live CDP browser profiles: Chromium holds their SQLite DBs exclusively locked while running
     # and sqlite3.backup() retries SQLITE_BUSY forever, hanging the backup. Regenerable anyway.
