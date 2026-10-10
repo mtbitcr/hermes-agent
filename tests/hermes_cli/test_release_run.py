@@ -28,6 +28,7 @@ from hermes_cli import build_info, release_guards, release_host_actions, release
 from hermes_cli import release_ledger as ledger
 from hermes_cli.release_guards import GUARDS, OpenRun
 from hermes_cli.subcommands.release import build_release_parser
+from tests.hermes_cli.test_release_cmd import CAUSES, SECRET, _printed_outcome, _send_fails
 
 
 def _commit(label: str) -> str:
@@ -225,6 +226,22 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HERMES_HOME", str(home))
     (home / "config.yaml").write_text(yaml.safe_dump({"release": SETTINGS}))
     return home
+
+
+class Sent(list):
+    """The lines a release told the owner, in order; ``real`` is the send function itself."""
+
+
+@pytest.fixture(autouse=True)
+def sent(monkeypatch: pytest.MonkeyPatch) -> Sent:
+    """Every test here: the send function is replaced by a record of its lines, so no test starts
+    a real send. The record imports nothing when called, as K6 needs."""
+    from hermes_cli import release_cmd
+
+    lines = Sent()
+    lines.real = release_cmd._tell_owner
+    monkeypatch.setattr(release_cmd, "_tell_owner", lines.append)
+    return lines
 
 
 def _accepted(*tiers: object) -> dict:
@@ -911,3 +928,67 @@ def test_run_is_registered(monkeypatch):
     monkeypatch.setattr(release_cmd, "run", lambda: 7)
 
     assert (args.release_command, args.func(args)) == ("run", 7)
+
+
+@pytest.mark.parametrize(
+    ("host", "outcome"),
+    [
+        ({}, "released"), ({"unhealthy": {NEW}}, "restored"),
+        ({"origin": PREV}, "refused"), ({"unhealthy": {NEW, PREV}}, "failed"),
+    ],
+)
+def test_the_owner_is_told_once_how_the_release_ended(
+    root, monkeypatch, capsys, sent, host, outcome
+):
+    batch_id = _accepted(1)["batch_id"]
+    monkeypatch.setattr(release_runner, "_wait", lambda seconds: None)
+
+    _run(monkeypatch, FakeHost(**host))
+
+    printed = _printed_outcome(capsys.readouterr().out, batch_id)
+    paused = " The platform stays paused." if outcome == "failed" else ""
+    assert _batches()[0]["outcome"] == outcome
+    assert sent == [f"Release {batch_id} {printed}{paused}"]
+
+
+def test_the_real_send_starts_one_process_that_reads_the_line(monkeypatch, capsys, sent):
+    calls = []
+
+    def run(argv, **options):
+        calls.append((argv, options))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    sent.real("Release 4 was released.")
+
+    [(argv, options)] = calls
+    assert argv == [
+        sys.executable, "-m", "hermes_cli.main", "send", "--to", "telegram", "--file", "-",
+    ]
+    assert (options["input"], options["timeout"]) == ("Release 4 was released.", 60)
+    assert not options.get("shell") and options.get("capture_output")
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("how", list(CAUSES))
+@pytest.mark.parametrize(("unhealthy", "outcome"), [(set(), "released"), ({NEW, PREV}, "failed")])
+def test_a_send_that_fails_changes_nothing_else_and_names_its_cause(
+    root, monkeypatch, capsys, sent, unhealthy, outcome, how
+):
+    from hermes_cli import release_cmd
+
+    batch_id, told = _accepted(1)["batch_id"], []
+    monkeypatch.setattr(release_runner, "_wait", lambda seconds: None)
+    monkeypatch.setattr(release_cmd, "_tell_owner", sent.real)
+    _send_fails(monkeypatch, how, told)
+
+    code = _run(monkeypatch, FakeHost(unhealthy=unhealthy))
+
+    shown = capsys.readouterr()
+    lines = shown.out.splitlines()
+    assert _batches()[0]["outcome"] == outcome
+    assert code == (0 if outcome == "released" else 1)
+    assert lines.count(f"Batch {batch_id} {release_cmd._OUTCOMES[outcome]}.") == 1
+    assert len([line for line in lines if all(part in line for part in CAUSES[how])]) == 1
+    assert len(told) == 1 and SECRET not in shown.out + shown.err

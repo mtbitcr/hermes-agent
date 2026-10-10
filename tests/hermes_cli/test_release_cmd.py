@@ -65,6 +65,7 @@ _CLI = (
     "from hermes_cli import release_cmd\n"
     "host = FakeHost(kill_mode=sys.argv.pop(1))\n"
     "release_cmd.LiveHostReader = release_cmd.ReleaseHostActions = host.build\n"
+    "release_cmd._tell_owner = lambda line: None\n"
     "from hermes_cli.main import main\n"
     "sys.argv[0] = 'hermes'\n"
     "sys.exit(main())\n"
@@ -88,6 +89,14 @@ _WRITER = (
 # The first bytes of a rollback journal once it is synced, as it is before a writer puts any change
 # into the database file. Until then they are zeros, and the journal is not hot.
 _JOURNAL_MAGIC = bytes.fromhex("d9d505f920a163d7")
+# A failed send's error text could carry the bot token: no stream of a release may show it.
+SECRET = "123456:fake-bot-token"
+# Each way a send fails, with the parts of the one line that must name its cause.
+CAUSES = {
+    "cannot start": ("could not start", "FileNotFoundError"),
+    "exits 1": ("exited with status 1",),
+    "timeout": ("timed out after 60 seconds",),
+}
 
 
 @dataclass
@@ -178,6 +187,14 @@ class FakeHost:
         return dict(CONFIG)
 
 
+@pytest.fixture(autouse=True)
+def _no_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test here ends a release; if one did, it must not start a real send."""
+    from hermes_cli import release_cmd
+
+    monkeypatch.setattr(release_cmd, "_tell_owner", lambda line: None)
+
+
 @pytest.fixture
 def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """The root Hermes home at ``<tmp>/.hermes``, with the release settings this host needs."""
@@ -210,6 +227,29 @@ def _command(monkeypatch: pytest.MonkeyPatch, host: FakeHost | None = None):
         monkeypatch.setattr(release_cmd, "LiveHostReader", host.build)
         monkeypatch.setattr(release_cmd, "ReleaseHostActions", host.build)
     return release_cmd
+
+
+def _printed_outcome(out: str, batch_id: int) -> str:
+    """The text after 'Batch N ' in the last line of ``out`` that starts so: how it ended."""
+    prefix = f"Batch {batch_id} "
+    return [line for line in out.splitlines() if line.startswith(prefix)][-1].removeprefix(prefix)
+
+
+def _send_fails(monkeypatch: pytest.MonkeyPatch, how: str, told: list) -> None:
+    """The send's process fails as ``how`` says, after noting its input; any other is real."""
+    real = subprocess.run
+
+    def run(argv, **options):
+        if list(argv[1:4]) != ["-m", "hermes_cli.main", "send"]:
+            return real(argv, **options)
+        told.append(options["input"])
+        if how == "cannot start":
+            raise FileNotFoundError(f"no such file: {SECRET}")
+        if how == "timeout":
+            raise subprocess.TimeoutExpired(argv, options["timeout"], stderr=SECRET)
+        return subprocess.CompletedProcess(argv, 1, SECRET, SECRET)
+
+    monkeypatch.setattr(subprocess, "run", run)
 
 
 def _merge(conn, commit: str, pr: int = 1, title: str = "") -> dict:

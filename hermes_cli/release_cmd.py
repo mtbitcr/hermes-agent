@@ -29,6 +29,8 @@ import secrets
 import signal
 import sqlite3
 import stat
+import subprocess
+import sys
 import time
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -326,6 +328,8 @@ def _release(inputs: tuple[Any, ...], host: _Host, token: str) -> int:
                 for error in result.restore_errors:
                     print(f"    Going back, a step failed too: {error}")
         release_ledger.finish_release(conn, batch_id, outcome=outcome)
+        paused = " The platform stays paused." if outcome == "failed" else ""
+        _tell_owner(f"Release {batch_id} {_OUTCOMES[outcome]}.{paused}")
     # S-A: lift only the release's own pause, the one with its token, unless the outcome failed;
     # an owner's pause stays. One written between the token's read and the removal goes with it,
     # by design: the owner page then shows the platform running, and the owner can pause again.
@@ -349,6 +353,25 @@ def _release(inputs: tuple[Any, ...], host: _Host, token: str) -> int:
         )
         return 1
     return 0 if outcome == "released" else 1
+
+
+def _tell_owner(line: str) -> None:
+    """Send ``line`` to the owner on Telegram; a send that fails prints its cause and no more."""
+    try:
+        sent = subprocess.run(
+            [sys.executable, "-m", "hermes_cli.main", "send", "--to", "telegram", "--file", "-"],
+            input=line,
+            capture_output=True,  # its text could carry the bot token: it is never shown
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired as error:
+        print(f"The owner was not told: the send timed out after {error.timeout} seconds.")
+    except Exception as error:  # whatever goes wrong here, the release's outcome stands
+        print(f"The owner was not told: the send could not start ({type(error).__name__}).")
+    else:
+        if sent.returncode:
+            print(f"The owner was not told: the send exited with status {sent.returncode}.")
 
 
 def _guards_failed(guards: list[str]) -> str:
@@ -525,6 +548,7 @@ def _recover(batch_id: int) -> int:
         if batch["recovery_attempts"] >= _RECOVERY_ATTEMPTS:  # the host is not asked again
             if batch["state"] == "releasing":  # the last attempt ended before its outcome
                 release_ledger.finish_release(conn, batch_id, outcome="failed")
+                _tell_owner(f"Release {batch_id} {_OUTCOMES['failed']}. The platform stays paused.")
             print(_CAPPED.format(batch_id, _RECOVERY_ATTEMPTS))
             return 0
         try:
@@ -533,6 +557,7 @@ def _recover(batch_id: int) -> int:
             return _refuse(f"batch {batch_id} could not begin its recovery ({error})")
         if attempt > _RECOVERY_ATTEMPTS:  # the count its own write returned: the host is not asked
             release_ledger.finish_release(conn, batch_id, outcome="failed")
+            _tell_owner(f"Release {batch_id} {_OUTCOMES['failed']}. The platform stays paused.")
             print(_CAPPED.format(batch_id, _RECOVERY_ATTEMPTS))
             return 0
         print(
@@ -550,6 +575,8 @@ def _recover(batch_id: int) -> int:
                 print(f"    Going back, a step failed too: {error}")
         outcome = result.outcome
         release_ledger.finish_release(conn, batch_id, outcome=outcome)
+        paused = " The platform stays paused." if outcome == "failed" else ""
+        _tell_owner(f"Release {batch_id} {_OUTCOMES[outcome]}.{paused}")
     # S-A, as in the run: lift only the release's own pause unless the outcome failed. The removal
     # is read back, and never tried again.
     reason = f"release {batch_id}"
