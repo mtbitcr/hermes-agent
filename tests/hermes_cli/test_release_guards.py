@@ -21,6 +21,11 @@ NEW = "second-merge-sha"
 LATER = "later-merge-sha"
 CHECKOUT = "/srv/hermes/checkout"
 ALL_GUARDS = [f"G{number}" for number in range(1, 12)]
+G8_RULE = (
+    "the free disk space, plus the size of every state snapshot except the newest, is at least"
+    " the size of the newest state snapshot plus 4 GiB; with no state snapshot, at least 4 GiB"
+    " of disk are free"
+)
 
 PINS = Pins(new=NEW, prev=PREV)
 # A batch of two merges: NEW's first parent is the first merge, whose first parent is PREV.
@@ -73,6 +78,8 @@ class FakeHost:
     )
     free_bytes: int = 5 * GiB
     snapshot_dirs: list[str] = field(default_factory=lambda: ["release-1"])
+    # The size of each state snapshot.
+    snapshot_size: int = 0
     # A run whose worker died stays listed as open; G10 has to look past it.
     runs: list[OpenRun] = field(
         default_factory=lambda: [OpenRun("crashed-run", worker_alive=False)]
@@ -121,6 +128,9 @@ class FakeHost:
 
     def snapshots(self):
         return list(self.snapshot_dirs)
+
+    def snapshot_bytes(self, name):
+        return self.snapshot_size
 
     def open_native_runs(self):
         return list(self.runs)
@@ -194,6 +204,24 @@ def test_g3_accepts_a_merge_built_on_a_newer_main_than_its_reviewed_base():
         (guard, True) for guard in ALL_GUARDS
     ]
     assert host.writes == []
+
+
+@pytest.mark.parametrize(
+    ("snapshot_dirs", "holds"),
+    [
+        # The newest snapshot stays until the copy is made, and the copy needs as much again.
+        pytest.param(["release-1"], False, id="one-snapshot-of-7-gib"),
+        # The older snapshot is deleted before the copy, so its room counts as free.
+        pytest.param(["release-1", "release-2"], True, id="two-snapshots-of-7-gib"),
+        pytest.param([], True, id="no-snapshot"),
+    ],
+)
+def test_g8_asks_for_the_newest_snapshot_plus_4_gib(snapshot_dirs, holds):
+    host = FakeHost(free_bytes=5 * GiB, snapshot_dirs=snapshot_dirs, snapshot_size=7 * GiB)
+
+    [g8] = [result for result in prepare(host, PINS, MERGES) if result.guard == "G8"]
+
+    assert (g8.rule, g8.ok) == (G8_RULE, holds)
 
 
 @pytest.mark.parametrize(

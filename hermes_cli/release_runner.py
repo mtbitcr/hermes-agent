@@ -30,7 +30,7 @@ from hermes_cli.release_guards import (
 
 PLATFORM_UNITS = (GATEWAY_UNIT, SERVE_UNIT)
 SANDBOX_TUNNEL_UNIT = "sandbox-tunnel"
-KEEP_SNAPSHOTS = 2
+KEEP_SNAPSHOTS = 1
 
 # Freshly started units need not answer at once, so a readback after a start of the units reads
 # the whole host again until every check holds, as the manual release wrapper does: at most
@@ -221,9 +221,14 @@ def recover(host: ReleaseHost, pins: Pins, *, saved: bool = True) -> ReleaseResu
 
 
 def _snapshot(host: ReleaseHost, pins: Pins) -> None:
-    host.take_snapshot(pins.snapshot)
+    # The older state snapshots go before the copy, so it needs room beside the newest one only,
+    # as G8 checked. Once the copy is made, only this release's own snapshot is kept.
     for name in host.snapshots()[:-KEEP_SNAPSHOTS]:
         host.delete_snapshot(name)
+    host.take_snapshot(pins.snapshot)
+    for name in host.snapshots():
+        if name != pins.snapshot:
+            host.delete_snapshot(name)
 
 
 def _forward(host: ReleaseHost, pins: Pins) -> str:

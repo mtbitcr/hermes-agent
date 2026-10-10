@@ -100,6 +100,9 @@ class FakeHost:
     def snapshots(self):
         return list(self.snapshot_dirs)
 
+    def snapshot_bytes(self, name):
+        return 0
+
     def open_native_runs(self):
         return []
 
@@ -475,10 +478,23 @@ def test_failure_after_cutover_restores_previous_and_reads_back(
         assert (host.head, host.running, host.config) == (PREV, PREV, PREV_CONFIG)
 
 
-def test_snapshots_keep_only_last_two():
-    host = FakeHost(snapshot_dirs=["release-1", "release-2", "release-3"])
+def test_a_release_keeps_only_its_own_snapshot():
+    """With snapshots a, b and c, oldest first, the release deletes a and b before it takes its
+    copy, so the copy needs room beside c alone, and c after it. Only its own snapshot remains."""
+    host, order = FakeHost(snapshot_dirs=["a", "b", "c"]), []
+    take_snapshot, delete_snapshot = host.take_snapshot, host.delete_snapshot
 
+    def noted_take_snapshot(name):
+        order.append(f"take {name}")
+        take_snapshot(name)
+
+    def noted_delete_snapshot(name):
+        order.append(f"delete {name}")
+        delete_snapshot(name)
+
+    host.take_snapshot, host.delete_snapshot = noted_take_snapshot, noted_delete_snapshot
     result = run_release(host, PINS, 0, MERGES)
 
     assert result.outcome == "released"
-    assert host.snapshot_dirs == ["release-3", NEW]
+    assert order == ["delete a", "delete b", f"take {NEW}", "delete c"]
+    assert host.snapshot_dirs == [NEW]

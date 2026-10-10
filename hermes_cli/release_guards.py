@@ -100,6 +100,9 @@ class HostReader(Protocol):
     def snapshots(self) -> Sequence[str]:
         """Names of the state snapshots on disk, oldest first."""
 
+    def snapshot_bytes(self, name: str) -> int:
+        """Total size of the regular files in the state snapshot `name`; no link is followed."""
+
     def open_native_runs(self) -> Sequence[OpenRun]: ...
 
     def live_config(self) -> Mapping[str, str]:
@@ -144,6 +147,14 @@ def _gateway_stops_with_sigint_mixed(
     )
 
 
+def _snapshot_fits(host: HostReader, pins: Pins, merges: Sequence[RecordedMerge]) -> bool:
+    # Before its copy, the release deletes every state snapshot but the newest, so their room
+    # counts as free. The copy needs about the newest one's size, with 4 GiB to spare.
+    sizes = [host.snapshot_bytes(name) for name in host.snapshots()]
+    newest = sizes.pop() if sizes else 0
+    return host.free_disk_bytes() + sum(sizes) >= newest + MIN_FREE_DISK_BYTES
+
+
 GUARDS: tuple[tuple[str, str, GuardCheck], ...] = (
     (
         "G1",
@@ -184,8 +195,10 @@ GUARDS: tuple[tuple[str, str, GuardCheck], ...] = (
     ),
     (
         "G8",
-        "at least 4 GiB of disk are free",
-        lambda host, pins, merges: host.free_disk_bytes() >= MIN_FREE_DISK_BYTES,
+        "the free disk space, plus the size of every state snapshot except the newest, is at least"
+        " the size of the newest state snapshot plus 4 GiB; with no state snapshot, at least 4 GiB"
+        " of disk are free",
+        _snapshot_fits,
     ),
     (
         "G9",
