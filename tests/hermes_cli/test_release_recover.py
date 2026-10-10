@@ -26,7 +26,7 @@ from hermes_cli.release_guards import Pins
 from hermes_cli.release_runner import PLATFORM_UNITS, SANDBOX_TUNNEL_UNIT
 from hermes_cli.subcommands.release import build_release_parser
 from tests.hermes_cli.test_release_cmd import (
-    RECOVERY_CAUSES, SECRET, _printed_outcome, _root_at, _send_fails, _unprivileged,
+    RECOVERY_CAUSES, SECRET, _printed_outcome, _root_at, _send_fails, _two_homes, _unprivileged,
 )
 
 
@@ -725,6 +725,34 @@ def test_a_recovery_that_ends_tells_the_owner_once(
     assert sent == [f"Release {batch_id} {printed}{paused}"]
 
 
+@pytest.mark.parametrize("command", ["recover", "run"])
+@pytest.mark.parametrize("outcome", ["released", "failed"])
+def test_the_real_send_of_a_recovery_reaches_the_root_owner_whatever_profile_is_sticky(
+    root, monkeypatch, capsys, sent, command, outcome
+):
+    """The send child is really started, offline, with a named profile made sticky: the line lands
+    on the root home's chat with the root's token."""
+    from hermes_cli import release_cmd
+
+    logged, _ = _two_homes(root, monkeypatch)
+    batch_id = _stopped_midway()
+    _snapshots(root, f"config/{NEW}")  # the release published it before its cutover (S-C)
+    monkeypatch.setattr(release_cmd, "_tell_owner", sent.real)
+
+    code = _command(monkeypatch, ENDS[outcome](), command, str(batch_id))
+
+    out = capsys.readouterr().out
+    printed = _printed_outcome(out, batch_id)
+    paused = " The platform stays paused." if outcome == "failed" else ""
+    assert _batch(batch_id)["outcome"] == outcome
+    assert code == (0 if outcome == "released" else 1)
+    assert out.splitlines().count(f"Batch {batch_id} {release_cmd._OUTCOMES[outcome]}.") == 1
+    [told] = logged()
+    assert told["chat_id"] == "111111", f"expected 111111, got {told['chat_id']}"
+    assert told["token"] == SECRET
+    assert told["message"] == f"Release {batch_id} {printed}{paused}"
+
+
 def _capped(monkeypatch: pytest.MonkeyPatch, branch: str) -> int:
     """A batch stopped midway whose recovery ends at the cap, on ``branch``: the last attempt ended
     before its outcome, or the count its own write returns is past the cap."""
@@ -752,6 +780,33 @@ def test_a_batch_capped_and_recorded_failed_tells_the_owner_once(root, monkeypat
     assert (_batch(batch_id)["outcome"], host.calls) == ("failed", [])
     failed = release_cmd._OUTCOMES["failed"]
     assert sent == [f"Release {batch_id} {failed}. The platform stays paused."]
+
+
+@pytest.mark.parametrize("command", ["recover", "run"])
+@pytest.mark.parametrize("branch", ["counted before", "counted by its own write"])
+def test_the_real_send_at_the_cap_reaches_the_root_owner_whatever_profile_is_sticky(
+    root, monkeypatch, capsys, sent, command, branch
+):
+    """Both caps that record failed, with the send child really started, offline, and a named
+    profile made sticky: the line lands on the root home's chat with the root's token."""
+    from hermes_cli import release_cmd
+
+    logged, _ = _two_homes(root, monkeypatch)
+    batch_id = _capped(monkeypatch, branch)
+    host = _midway(NEW, PREV)
+    monkeypatch.setattr(release_cmd, "_tell_owner", sent.real)
+
+    code = _command(monkeypatch, host, command, str(batch_id))
+
+    out = capsys.readouterr().out
+    capped = release_cmd._CAPPED.format(batch_id, release_cmd._RECOVERY_ATTEMPTS)
+    assert (_batch(batch_id)["outcome"], code, host.calls) == ("failed", 0, [])
+    assert out.splitlines().count(capped) == 1
+    [told] = logged()
+    assert told["chat_id"] == "111111", f"expected 111111, got {told['chat_id']}"
+    assert told["token"] == SECRET
+    failed = release_cmd._OUTCOMES["failed"]
+    assert told["message"] == f"Release {batch_id} {failed}. The platform stays paused."
 
 
 def test_a_batch_already_failed_at_the_cap_tells_the_owner_nothing(root, monkeypatch, sent):

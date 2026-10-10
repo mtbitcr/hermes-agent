@@ -28,7 +28,9 @@ from hermes_cli import build_info, release_guards, release_host_actions, release
 from hermes_cli import release_ledger as ledger
 from hermes_cli.release_guards import GUARDS, OpenRun
 from hermes_cli.subcommands.release import build_release_parser
-from tests.hermes_cli.test_release_cmd import CAUSES, SECRET, _printed_outcome, _send_fails
+from tests.hermes_cli.test_release_cmd import (
+    CAUSES, SECRET, _printed_outcome, _send_fails, _two_homes,
+)
 
 
 def _commit(label: str) -> str:
@@ -951,8 +953,41 @@ def test_the_owner_is_told_once_how_the_release_ended(
     assert sent == [f"Release {batch_id} {printed}{paused}"]
 
 
-def test_the_real_send_starts_one_process_that_reads_the_line(monkeypatch, capsys, sent):
-    calls = []
+@pytest.mark.parametrize(
+    ("host", "outcome"),
+    [
+        ({}, "released"), ({"unhealthy": {NEW}}, "restored"),
+        ({"origin": PREV}, "refused"), ({"unhealthy": {NEW, PREV}}, "failed"),
+    ],
+)
+def test_the_real_send_reaches_the_root_owner_whatever_profile_is_sticky(
+    root, monkeypatch, capsys, sent, host, outcome
+):
+    """The send child is really started, offline, with a named profile made sticky: the line lands
+    on the root home's chat with the root's token."""
+    from hermes_cli import release_cmd
+
+    logged, _ = _two_homes(root, monkeypatch)
+    batch_id = _accepted(1)["batch_id"]
+    monkeypatch.setattr(release_runner, "_wait", lambda seconds: None)
+    monkeypatch.setattr(release_cmd, "_tell_owner", sent.real)
+
+    code = _run(monkeypatch, FakeHost(**host))
+
+    out = capsys.readouterr().out
+    printed = _printed_outcome(out, batch_id)
+    paused = " The platform stays paused." if outcome == "failed" else ""
+    assert _batches()[0]["outcome"] == outcome
+    assert code == (0 if outcome == "released" else 1)
+    assert out.splitlines().count(f"Batch {batch_id} {release_cmd._OUTCOMES[outcome]}.") == 1
+    [told] = logged()
+    assert told["chat_id"] == "111111", f"expected 111111, got {told['chat_id']}"
+    assert told["token"] == SECRET
+    assert told["message"] == f"Release {batch_id} {printed}{paused}"
+
+
+def test_the_real_send_starts_one_process_that_reads_the_line(root, monkeypatch, capsys, sent):
+    calls, before = [], dict(os.environ)
 
     def run(argv, **options):
         calls.append((argv, options))
@@ -968,6 +1003,9 @@ def test_the_real_send_starts_one_process_that_reads_the_line(monkeypatch, capsy
     ]
     assert (options["input"], options["timeout"]) == ("Release 4 was released.", 60)
     assert not options.get("shell") and options.get("capture_output")
+    pinned = {"HERMES_HOME": str(root), "HERMES_SUPERVISED_CHILD": "1"}
+    assert options.get("env") == {**before, **pinned}
+    assert dict(os.environ) == before
     assert capsys.readouterr() == ("", "")
 
 

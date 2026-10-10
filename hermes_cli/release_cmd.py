@@ -356,15 +356,22 @@ def _release(inputs: tuple[Any, ...], host: _Host, token: str) -> int:
 
 
 def _tell_owner(line: str) -> None:
-    """Send ``line`` to the owner on Telegram; a send that fails or is interrupted prints its
-    cause and no more."""
+    """Send ``line`` to the release root's owner on Telegram, whatever profile is sticky; a send
+    that fails or is interrupted prints its cause and no more."""
     try:
+        # Pinned: a bare child would follow the sticky active_profile, not the root's owner.
+        env = {
+            **os.environ,
+            "HERMES_HOME": str(get_default_hermes_root()),
+            "HERMES_SUPERVISED_CHILD": "1",
+        }
         sent = subprocess.run(
             [sys.executable, "-m", "hermes_cli.main", "send", "--to", "telegram", "--file", "-"],
             input=line,
             capture_output=True,  # its text could carry the bot token: it is never shown
             text=True,
             timeout=60,
+            env=env,
         )
     except subprocess.TimeoutExpired as error:
         print(f"The owner was not told: the send timed out after {error.timeout} seconds.")

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import json
 import os
 import sqlite3
 import stat
@@ -107,6 +108,43 @@ RECOVERY_CAUSES = {**CAUSES, "signal": CAUSES["interrupted"]}
 _INTERRUPTING_SEND = (
     "import os, signal, sys, time; sys.stdin.read();"
     " os.kill(os.getppid(), signal.SIGINT); time.sleep(20)"
+)
+# An offline Telegram transport, as the sitecustomize.py the send child loads from PYTHONPATH. It
+# imports nothing of hermes at start-up (hermes modules cache HERMES_HOME at import, which would
+# settle the profile before the child chose it) and opens no socket. When the product imports
+# tools.send_message_tool, that module's _send_to_platform becomes a function that appends one JSON
+# line {platform, token, chat_id, message} to the file named by OFFLINE_TELEGRAM_LOG.
+_OFFLINE_HOOK = (
+    "import importlib.machinery, json, os, sys\n"
+    "\n"
+    "async def offline_send(platform, pconfig, chat_id, message, *args, **kwargs):\n"
+    "    line = {'platform': getattr(platform, 'value', str(platform)), 'token': pconfig.token,\n"
+    "            'chat_id': chat_id, 'message': message}\n"
+    "    with open(os.environ['OFFLINE_TELEGRAM_LOG'], 'a', encoding='utf-8') as log:\n"
+    "        log.write(json.dumps(line) + '\\n')\n"
+    "    return {'success': True}\n"
+    "\n"
+    "class Loader:\n"
+    "    def __init__(self, real):\n"
+    "        self.real = real\n"
+    "    def __getattr__(self, name):\n"
+    "        return getattr(self.real, name)\n"
+    "    def create_module(self, spec):\n"
+    "        return self.real.create_module(spec)\n"
+    "    def exec_module(self, module):\n"
+    "        self.real.exec_module(module)\n"
+    "        module._send_to_platform = offline_send\n"
+    "\n"
+    "class Finder:\n"
+    "    def find_spec(self, name, path=None, target=None):\n"
+    "        if name != 'tools.send_message_tool':\n"
+    "            return None\n"
+    "        spec = importlib.machinery.PathFinder.find_spec(name, path)\n"
+    "        if spec is not None and spec.loader is not None:\n"
+    "            spec.loader = Loader(spec.loader)\n"
+    "        return spec\n"
+    "\n"
+    "sys.meta_path.insert(0, Finder())\n"
 )
 
 
@@ -282,6 +320,41 @@ def _send_fails(monkeypatch: pytest.MonkeyPatch, how: str, told: list) -> None:
     monkeypatch.setattr(subprocess, "run", run)
 
 
+def _two_homes(root: Path, monkeypatch: pytest.MonkeyPatch):
+    """Two Telegram homes and an offline transport, for a send child that is really started.
+
+    The root home has the placeholder bot token SECRET and the home chat 111111. A named profile
+    home, which ``<root>/active_profile`` makes sticky, has another token and the home chat 222222.
+    The environment gets HOME at the temporary top, the hook of _OFFLINE_HOOK first on PYTHONPATH,
+    its log in OFFLINE_TELEGRAM_LOG and no supervisor marker, so an inherited one cannot hide a
+    child that follows the sticky profile. Returns what reads the lines the hook logged back as
+    dicts, and the named profile's token.
+    """
+    top, named = root.parent, root / "profiles" / "work"
+    named.mkdir(parents=True)
+    named_token = "654321:fake-named-profile-token"
+    (root / ".env").write_text(f"TELEGRAM_BOT_TOKEN={SECRET}\nTELEGRAM_HOME_CHANNEL=111111\n")
+    (named / ".env").write_text(f"TELEGRAM_BOT_TOKEN={named_token}\nTELEGRAM_HOME_CHANNEL=222222\n")
+    (root / "active_profile").write_text("work\n")
+    hook, log = top / "offline", top / "offline.log"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(_OFFLINE_HOOK)
+    log.touch()
+    monkeypatch.setenv("HOME", str(top))
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(hook), str(_REPO)]))
+    monkeypatch.setenv("OFFLINE_TELEGRAM_LOG", str(log))
+    for marker in (
+        "HERMES_SUPERVISED_CHILD", "HERMES_S6_SUPERVISED_CHILD",
+        "HERMES_GATEWAY_EXTERNAL_SUPERVISOR", "INVOCATION_ID",
+    ):
+        monkeypatch.delenv(marker, raising=False)
+
+    def logged() -> list[dict]:
+        return [json.loads(line) for line in log.read_text().splitlines()]
+
+    return logged, named_token
+
+
 def _merge(conn, commit: str, pr: int = 1, title: str = "") -> dict:
     """Record a merged change as FakeHost's history has it; returns the batch it joined."""
     return ledger.record_merge(
@@ -444,6 +517,24 @@ def _accept_held_at_commit(batch: dict, cache_pages: int, at_commit) -> None:
         conn.execute(f"PRAGMA cache_size={cache_pages}")
         with pytest.raises(_RolledBack):
             _accept(conn, batch)
+
+
+def test_premise_a_bare_send_child_follows_the_sticky_profile(root, monkeypatch):
+    """The premise of the owner's send tests: the fixed send command started with HERMES_HOME at
+    the root and no supervisor marker lands on the named profile's home chat with its token."""
+    logged, named_token = _two_homes(root, monkeypatch)
+
+    child = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "send", "--to", "telegram", "--file", "-"],
+        input="premise",
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "HERMES_HOME": str(root)},
+    )
+
+    assert child.returncode == 0, child.stderr
+    assert [(line["chat_id"], line["token"]) for line in logged()] == [("222222", named_token)]
 
 
 def test_prepare_runs_every_guard_and_writes_nothing(root, tmp_path, monkeypatch, capsys):
