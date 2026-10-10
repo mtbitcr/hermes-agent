@@ -146,6 +146,36 @@ class TestShouldExclude:
         # The live DB is still backed up.
         assert not _should_exclude(Path("state.db"))
 
+    def test_should_exclude_release_snapshot_state_file(self, tmp_path):
+        """The release unit keeps one full copy of the root home per release in
+        release-snapshots/state/NAME. The walk must not reach it: the next
+        snapshot would copy it and every nightly backup would archive it."""
+        from hermes_cli.backup import _should_exclude
+
+        copy = tmp_path / "release-snapshots/state/9f3c2a7d41be/state.db"
+        copy.parent.mkdir(parents=True)
+        copy.write_bytes(b"\x00")
+        assert _should_exclude(copy.relative_to(tmp_path))
+
+    def test_should_exclude_release_snapshot_config_file(self, tmp_path):
+        """release-snapshots/config/NAME holds the saved config.yaml and .env,
+        so the whole release-snapshots folder is skipped, not only state/."""
+        from hermes_cli.backup import _should_exclude
+
+        copy = tmp_path / "release-snapshots/config/9f3c2a7d41be/config.yaml"
+        copy.parent.mkdir(parents=True)
+        copy.write_text("model:\n  provider: openrouter\n")
+        assert _should_exclude(copy.relative_to(tmp_path))
+
+    def test_default_release_snapshot_folder_is_excluded(self, tmp_path):
+        """The folder the release unit snapshots into when its settings name
+        none must be one the walk skips."""
+        from hermes_cli.backup import _EXCLUDED_DIRS
+        from hermes_cli.release_cmd import _snapshot_root
+
+        folder = _snapshot_root(tmp_path, {}).relative_to(tmp_path)
+        assert folder.name in _EXCLUDED_DIRS
+
     def test_excludes_sqlite_sidecars(self):
         """SQLite WAL/SHM/journal sidecars must not ship alongside the
         safe-copied .db — pairing a fresh snapshot with stale sidecar state
@@ -245,6 +275,32 @@ class TestIterBackupFiles:
         list(_iter_backup_files(root, tmp_path / "out.zip", skipped))
         assert "models" in skipped
         assert "hermes-agent" in skipped
+
+    def test_iter_backup_files_skips_release_snapshots_keeps_live_state_db(self, tmp_path):
+        """The release unit's state snapshot copies what this walk yields for the
+        root home and keeps its snapshots under release-snapshots/ in that same
+        home. If the walk reached them, each snapshot would copy the kept ones
+        and every nightly backup would archive them; the live state.db stays."""
+        from hermes_cli.backup import _iter_backup_files
+
+        root = tmp_path / ".hermes"
+        root.mkdir()
+        _make_hermes_tree(root)
+        (root / "state.db").write_bytes(b"live")
+
+        state_copy = root / "release-snapshots/state/9f3c2a7d41be"
+        config_copy = root / "release-snapshots/config/9f3c2a7d41be"
+        state_copy.mkdir(parents=True)
+        config_copy.mkdir(parents=True)
+        (state_copy / "state.db").write_bytes(b"copy")
+        (state_copy / "config.yaml").write_text("model:\n  provider: openrouter\n")
+        (config_copy / "config.yaml").write_text("model:\n  provider: openrouter\n")
+        (config_copy / ".env").write_text("OPENROUTER_API_KEY=sk-test-123\n")
+
+        selected = {str(rel) for _, rel in _iter_backup_files(root, tmp_path / "out.zip")}
+
+        assert "state.db" in selected
+        assert not any(s.startswith("release-snapshots") for s in selected)
 
 
 # ---------------------------------------------------------------------------
