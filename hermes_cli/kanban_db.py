@@ -94,6 +94,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli import kanban_provider_stops as _provider_stops
+from hermes_cli.kanban_replaced_cards import replaced_task_ids
 from hermes_cli.kanban_risk_tier import (
     active_run_box_seconds,
     card_work_kind,
@@ -20099,7 +20100,7 @@ def _recorded_review_followup(
 def _resolve_recorded_review_followups(
     conn: sqlite3.Connection, task_id: str, *, run_id: int, now: int
 ) -> None:
-    """Close the follow-ups this task's own verdicts recorded, on approval.
+    """Close the follow-ups of this task and the cards it replaced, on approval.
 
     Called by :func:`complete_task` inside the transaction that approves
     ``task_id`` out of review. A changes-requested verdict records its
@@ -20107,9 +20108,10 @@ def _resolve_recorded_review_followups(
     is what accepts that rework, so it is what ends the record -- left open,
     the item would sit on the board until a person tidied it away.
 
-    Only the ids named by this task's own ``review_followup_recorded`` events
-    move -- the same kernel-written record :func:`_recorded_review_followup`
-    trusts -- so a card anyone else linked under the task is never touched.
+    Only the ids named by the ``review_followup_recorded`` events of this task
+    and of the cards it replaced (:func:`replaced_task_ids`) move -- the same
+    kernel-written record :func:`_recorded_review_followup` trusts -- so a card
+    anyone else linked under the task is never touched.
     An item already ``done`` or ``archived`` is left as it is -- which is why
     no approval resolves the same item twice. One a worker currently holds is
     resolved all the same, and its run is not stranded: the claim clears with
@@ -20119,11 +20121,13 @@ def _resolve_recorded_review_followups(
     task, stamped with the approving run.
     """
     followup_ids: list[str] = []
+    cards = [task_id, *replaced_task_ids(conn, task_id)]
     for row in conn.execute(
         "SELECT payload FROM task_events "
-        "WHERE task_id = ? AND kind = 'review_followup_recorded' "
+        f"WHERE task_id IN ({','.join('?' * len(cards))}) "
+        "AND kind = 'review_followup_recorded' "
         "ORDER BY id",
-        (task_id,),
+        cards,
     ).fetchall():
         try:
             payload = json.loads(row["payload"]) if row["payload"] else {}
