@@ -965,7 +965,7 @@ hermes debug share --local      # Print report to terminal (no upload)
 hermes backup [options]
 ```
 
-Create a zip archive of your Hermes configuration, skills, sessions, and data. The backup excludes the hermes-agent codebase itself, and it does not nest earlier backup artifacts (`backups/`, `state-snapshots/`) — each of those already contains its own copy of `state.db`.
+Create a zip archive of your Hermes configuration, skills, sessions, and data. The backup excludes the hermes-agent codebase itself, and it does not nest earlier backup artifacts (`backups/`, `state-snapshots/`, `release-snapshots/`) — each of those already contains its own copy of `state.db`.
 
 | Option | Description |
 |--------|-------------|
@@ -1847,7 +1847,11 @@ hermes release <prepare|status|run [BATCH]|start BATCH|recover BATCH>
 
 A merged delivery joins the one waiting batch. The owner accepts that batch on the Decisions page, and the release unit then runs `hermes release run` for that batch.
 
-Guard G3 currently requires every commit between PREV and NEW to be a recorded merge whose parents are the base that review saw and the reviewed head, so a release passes only when each merge was built on the main it merged into.
+Guard G3 requires every commit between PREV and NEW to be a recorded merge whose second parent is the reviewed head and whose tree equals the reviewed tree. The first parent is not compared, because GitHub merges onto main as it is by then, which can be newer than the base that review saw.
+
+A release keeps only its own state snapshot: it deletes the older ones. Guard G8 requires the free disk space, plus the size of every state snapshot except the newest, to be at least the size of the newest snapshot plus 4 GiB; with no state snapshot, at least 4 GiB must be free.
+
+A release sends the owner one Telegram line with its outcome. If the send fails, the release prints why and its outcome stands.
 
 The `release` section of the root `config.yaml` describes the release host: `units` (user unit names for the `gateway`, `serve` and `sandbox-tunnel` roles; defaults `hermes-gateway`, `hermes-serve` and empty), `health_url` (the health readback address, empty by default), `workspace_container` (the Workspace container in which a readback reads the projects list and one board with `docker exec`; default `raphael-workspace`), `snapshot_dir` (empty means `release-snapshots` under the root home) and `drain_poll_seconds` (30). `${VAR}` and `${env:VAR}` references in this section are resolved first, and `prepare` refuses while a unit name or the health address is empty, or while one of them or `snapshot_dir` refers to a variable that is not set.
 
