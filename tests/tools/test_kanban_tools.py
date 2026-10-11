@@ -2634,6 +2634,289 @@ def test_read_is_hidden_from_a_delegated_child(worker_env, monkeypatch):
     assert "kanban_read" not in names
 
 
+def _record_comments(tid, count, *, board=None):
+    """Add bulky comments aged 2.5 days, so their rendered ages cannot tick over."""
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect_closing(board=board) as conn:
+        for i in range(count):
+            # Non-ASCII text, so the byte-for-byte checks cover JSON escaping too.
+            kb.add_comment(
+                conn, tid, "reviewer", f"note {i:03d} caf{chr(233)} " + "x" * 300
+            )
+        conn.execute(
+            "UPDATE task_comments SET created_at = ? + id WHERE task_id = ?",
+            (int(time.time()) - 216000 - count, tid),
+        )
+        conn.commit()
+
+
+def _stable_show(show):
+    """The kanban_show text, checked to be identical on two reads in a row."""
+    text = show()
+    assert show() == text, "the fixture must render identically on every read"
+    return text
+
+
+def _record_windows(read, limit, show, label="record windows"):
+    """Page the record through ``read``; bounded, so a stuck reader fails, not spins."""
+    pieces, offset = [], 0
+    for _ in range(len(show) // limit + 2):
+        d = json.loads(read({"record": True, "offset": offset, "limit": limit}))
+        assert d.get("source") == "record", f"{label}: not the record: {d}"
+        assert (d["offset"], d["total"]) == (offset, len(show)), f"{label}: {d}"
+        pieces.append(d["content"])
+        offset += d["returned"]
+        if not d["has_more"]:
+            return pieces
+    raise AssertionError(f"{label}: more to read after {len(pieces)} windows")
+
+
+def test_read_record_first_window_is_the_head_of_the_kanban_show_text(worker_env):
+    """With record set, the first window is the head of the text kanban_show returns."""
+    from tools import kanban_tools as kt
+
+    _record_comments(worker_env, 60)
+    show = _stable_show(lambda: kt._handle_show({}))
+    limit = 700
+    assert len(show) > 3 * limit, "the fixture must span several windows"
+
+    d = json.loads(kt._handle_read({"record": True, "limit": limit}))
+    assert d["ok"] is True, d
+    assert d["source"] == "record", d
+    assert d["task_id"] == worker_env
+    assert d["attachment_id"] is None
+    assert d["filename"] is None
+    assert d["offset"] == 0
+    assert d["limit"] == limit
+    assert d["returned"] == limit
+    assert d["total"] == len(show)
+    assert d["has_more"] is True
+    assert d["content"] == show[:limit]
+    # Same fields, in the same order, as the body window replies with.
+    assert list(d) == list(json.loads(kt._handle_read({"limit": limit})))
+
+
+def test_read_record_windows_continue_without_gap_or_overlap(worker_env):
+    """Sequential windows rebuild exactly the kanban_show text, by the usual rules."""
+    from tools import kanban_tools as kt
+
+    _record_comments(worker_env, 60)
+    show = _stable_show(lambda: kt._handle_show({}))
+    limit = 700
+
+    first = json.loads(kt._handle_read({"record": True, "limit": limit}))
+    assert first["source"] == "record", first
+    end = first["offset"] + first["returned"]
+    second = json.loads(
+        kt._handle_read({"record": True, "offset": end, "limit": limit})
+    )
+    assert second["source"] == "record", second
+    assert second["offset"] == end == limit
+    assert second["content"] == show[limit:2 * limit]
+
+    pieces = _record_windows(kt._handle_read, limit, show)
+    assert "".join(pieces) == show
+    assert len(pieces) == -(-len(show) // limit)
+
+    # The window rules are the other sources' own.
+    default = json.loads(kt._handle_read({"record": True}))
+    assert default["limit"] == kt._KANBAN_READ_DEFAULT_LIMIT
+    assert default["content"] == show[:kt._KANBAN_READ_DEFAULT_LIMIT]
+    at_end = json.loads(kt._handle_read({"record": True, "offset": len(show)}))
+    assert (at_end["content"], at_end["has_more"]) == ("", False)
+    for bad in (
+        {"offset": len(show) + 1},
+        {"offset": -1},
+        {"limit": 0},
+        {"limit": kt._KANBAN_READ_MAX_LIMIT + 1},
+    ):
+        out = json.loads(kt._handle_read({"record": True, **bad}))
+        assert "error" in out and out.get("ok") is not True, (bad, out)
+        assert "content" not in out
+
+
+def test_read_record_with_an_attachment_id_is_refused(worker_env):
+    """record and attachment_id together are refused, with an error naming both."""
+    from tools import kanban_tools as kt
+
+    att_id = _attach_text(worker_env, "notes.md", "ATTACHMENT TEXT")
+
+    out = json.loads(kt._handle_read({"record": True, "attachment_id": att_id}))
+    assert "error" in out, out
+    assert out.get("ok") is not True
+    assert "content" not in out
+    assert "record" in out["error"] and "attachment_id" in out["error"], out
+
+    # Each alone is served, so the refusal above is the clash and not a not-found.
+    alone = json.loads(kt._handle_read({"attachment_id": att_id}))
+    assert (alone["source"], alone["content"]) == ("attachment", "ATTACHMENT TEXT")
+    assert json.loads(kt._handle_read({"record": True}))["source"] == "record"
+
+    # A record value that is not a boolean is kanban_read's own error.
+    for junk in ("maybe", "2"):
+        out = json.loads(kt._handle_read({"record": junk}))
+        assert out.get("error", "").startswith("kanban_read: "), (junk, out)
+        assert "record" in out["error"]
+        assert "content" not in out
+
+
+def test_read_record_refuses_a_task_the_caller_does_not_own(worker_env):
+    """record reaches only the caller's own task; another task's record is refused."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    own = json.loads(kt._handle_read({"task_id": worker_env, "record": True}))
+    assert own["source"] == "record", own
+    assert own["task_id"] == worker_env
+
+    secret = "CROSS-TASK RECORD SECRET"
+    with kb.connect_closing() as conn:
+        other = kb.create_task(
+            conn, title=secret, body=secret, assignee="someone-else"
+        )
+        kb.add_comment(conn, other, "someone-else", secret)
+
+    out = json.loads(kt._handle_read({"task_id": other, "record": True}))
+    assert "error" in out, out
+    assert out.get("ok") is not True
+    assert "content" not in out
+    assert secret not in json.dumps(out)
+    # Refused exactly as the body read of that task is.
+    assert out == json.loads(kt._handle_read({"task_id": other}))
+
+
+def test_read_record_leaves_kanban_show_unchanged(worker_env):
+    """kanban_show returns what it always did, and the record windows add up to it."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = worker_env
+    _record_comments(tid, 60)
+    with kb.connect_closing() as conn:
+        t = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        expected = json.dumps({
+            "task": {
+                "id": t.id, "title": t.title, "body": t.body,
+                "assignee": t.assignee, "status": t.status,
+                "tenant": t.tenant, "priority": t.priority,
+                "workspace_kind": t.workspace_kind,
+                "workspace_path": t.workspace_path,
+                "branch_name": t.branch_name,
+                "project_id": t.project_id,
+                "owned_paths": t.owned_paths,
+                "integrates_parent_heads": t.integrates_parent_heads,
+                "base_commit": t.base_commit,
+                "head_commit": t.head_commit,
+                "created_by": t.created_by, "created_at": t.created_at,
+                "started_at": t.started_at,
+                "completed_at": t.completed_at,
+                "result": t.result,
+                "current_run_id": t.current_run_id,
+                "model_override": t.model_override,
+                "provider_override": t.provider_override,
+            },
+            "parents": kb.parent_ids(conn, tid),
+            "children": kb.child_ids(conn, tid),
+            "comments": [
+                {"author": c.author, "body": c.body, "created_at": c.created_at}
+                for c in kb.list_comments(conn, tid)
+            ],
+            "events": [
+                {"kind": e.kind, "payload": e.payload,
+                 "created_at": e.created_at, "run_id": e.run_id}
+                for e in events[-50:]
+            ],
+            "runs": [
+                {"id": r.id, "profile": r.profile, "status": r.status,
+                 "outcome": r.outcome, "summary": r.summary, "error": r.error,
+                 "metadata": r.metadata,
+                 "started_at": r.started_at, "ended_at": r.ended_at}
+                for r in kb.list_runs(conn, tid)
+            ],
+            "worker_context": kb.build_worker_context(conn, tid),
+        })
+    assert len(events) > 50, "the fixture must overflow the 50-event cap"
+
+    show = _stable_show(lambda: kt._handle_show({}))
+    assert show == expected, "(a) kanban_show no longer returns what it returned before"
+
+    pieces = _record_windows(
+        kt._handle_read, kt._KANBAN_READ_MAX_LIMIT, show, "(b) record windows"
+    )
+    assert len(pieces) > 1, "(b) the record must span several maximum-size windows"
+    assert "".join(pieces) == show, "(b) the record windows do not rebuild kanban_show"
+
+
+def test_read_record_is_a_declared_boolean_that_kanban_show_points_to():
+    """record is a declared boolean of kanban_read, and kanban_show points to it."""
+    from tools import kanban_tools  # noqa: F401  (registers the kanban tools)
+    from tools.registry import registry
+
+    read = registry.get_schema("kanban_read")
+    props = read["parameters"]["properties"]
+    assert "record" in props, sorted(props)
+    assert props["record"]["type"] == "boolean"
+    assert "record" not in read["parameters"].get("required", [])
+
+    description = registry.get_schema("kanban_show")["description"]
+    closing = description.rstrip().rsplit(". ", 1)[-1]
+    assert "kanban_read" in closing and "record" in closing, description
+
+
+def test_read_record_in_the_dispatcher_environment(monkeypatch, tmp_path):
+    """As the dispatcher runs a worker: pinned DB and board, own task, profile home."""
+    from hermes_cli import kanban_db as kb
+    from tools.registry import registry
+
+    root = _status_report_env(
+        monkeypatch, tmp_path, profile="worker", has_kanban_toolset=False
+    )
+    _seed_board("own-board", [{"title": "the worker card", "status": "running"}])
+    _seed_board("other-board", [{"title": "OTHER BOARD CARD", "status": "running"}])
+    own_db = kb.kanban_db_path(board="own-board")
+    with kb.connect_closing(board="own-board") as conn:
+        tid = kb.list_tasks(conn, status="running")[0].id
+    _record_comments(tid, 5, board="own-board")
+
+    profile_home = root / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(own_db))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "own-board")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+
+    def read(args):
+        return registry.dispatch("kanban_read", args)
+
+    show = _stable_show(lambda: registry.dispatch("kanban_show", {}))
+    first = json.loads(read({"record": True, "limit": 10}))
+    assert first["source"] == "record", first
+    assert first["task_id"] == tid
+    assert first["total"] == len(show)
+
+    record = json.loads("".join(_record_windows(read, 3000, show)))
+    raw = sqlite3.connect(str(own_db))
+    try:
+        comment_rows = raw.execute(
+            "SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (tid,)
+        ).fetchone()[0]
+    finally:
+        raw.close()
+    assert comment_rows == 5
+    assert len(record["comments"]) == comment_rows
+
+    # HERMES_KANBAN_DB outranks a board argument: an explicit board changes nothing.
+    explicit = {"board": "other-board"}
+    via_record = read({**explicit, "record": True})
+    via_body = read(dict(explicit))
+    assert "OTHER BOARD CARD" not in via_record + via_body
+    assert json.loads(via_body)["task_id"] == tid
+    d = json.loads(via_record)
+    assert (d["source"], d["task_id"], d["total"]) == ("record", tid, len(show))
+
+
 # ---------------------------------------------------------------------------
 # kanban_status_report: bounded cross-project listing (read-only)
 # ---------------------------------------------------------------------------

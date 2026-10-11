@@ -40,6 +40,7 @@ from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
+from tools.kanban_record_window import build_record_text
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
@@ -1093,64 +1094,7 @@ def _handle_show(args: dict, **kw) -> str:
             task = kb.get_task(conn, tid)
             if task is None:
                 return tool_error(f"task {tid} not found")
-            comments = kb.list_comments(conn, tid)
-            events = kb.list_events(conn, tid)
-            runs = kb.list_runs(conn, tid)
-            parents = kb.parent_ids(conn, tid)
-            children = kb.child_ids(conn, tid)
-
-            def _task_dict(t):
-                return {
-                    "id": t.id, "title": t.title, "body": t.body,
-                    "assignee": t.assignee, "status": t.status,
-                    "tenant": t.tenant, "priority": t.priority,
-                    "workspace_kind": t.workspace_kind,
-                    "workspace_path": t.workspace_path,
-                    "branch_name": t.branch_name,
-                    "project_id": t.project_id,
-                    "owned_paths": t.owned_paths,
-                    "integrates_parent_heads": t.integrates_parent_heads,
-                    "base_commit": t.base_commit,
-                    "head_commit": t.head_commit,
-                    "created_by": t.created_by, "created_at": t.created_at,
-                    "started_at": t.started_at,
-                    "completed_at": t.completed_at,
-                    "result": t.result,
-                    "current_run_id": t.current_run_id,
-                    "model_override": t.model_override,
-                    "provider_override": t.provider_override,
-                }
-
-            def _run_dict(r):
-                return {
-                    "id": r.id, "profile": r.profile,
-                    "status": r.status, "outcome": r.outcome,
-                    "summary": r.summary, "error": r.error,
-                    "metadata": r.metadata,
-                    "started_at": r.started_at, "ended_at": r.ended_at,
-                }
-
-            return json.dumps({
-                "task": _task_dict(task),
-                "parents": parents,
-                "children": children,
-                "comments": [
-                    {"author": c.author, "body": c.body,
-                     "created_at": c.created_at}
-                    for c in comments
-                ],
-                "events": [
-                    {"kind": e.kind, "payload": e.payload,
-                     "created_at": e.created_at, "run_id": e.run_id}
-                    for e in events[-50:]   # cap; full log via CLI
-                ],
-                "runs": [_run_dict(r) for r in runs],
-                # Also surface the worker's own context block so the
-                # agent can include it directly if it wants. This is
-                # the same string build_worker_context returns to the
-                # dispatcher at spawn time.
-                "worker_context": kb.build_worker_context(conn, tid),
-            })
+            return build_record_text(kb, conn, task, tid)
         finally:
             conn.close()
     except ValueError as e:
@@ -3019,13 +2963,14 @@ def _read_window_int(args: dict, name: str, default: int) -> int:
 
 
 def _handle_read(args: dict, **kw) -> str:
-    """Return a bounded character window of this task's attachment or body.
+    """Return a bounded character window of this task's attachment, body or record.
 
     Read-only counterpart to the attachment listing: that names a file and
     its path, this hands back the text itself in slices the caller controls,
     so a worker with no general file-reading tool can still follow the
     pointer. ``attachment_id`` selects one of this task's own attachments;
-    omitting it reads the task body. Storage identity and path containment
+    ``record`` selects the text ``kanban_show`` returns; omitting both reads
+    the task body. Storage identity and path containment
     are enforced by the same ``read_attachment_bytes`` the download path
     already uses, so this can never read outside the attachments directory.
     """
@@ -3053,13 +2998,26 @@ def _handle_read(args: dict, **kw) -> str:
             f"{_KANBAN_READ_MAX_LIMIT} (got {limit})"
         )
     att_id = args.get("attachment_id")
+    record, record_err = _parse_bool_arg(args, "record")
+    if record_err:
+        return tool_error(f"kanban_read: {record_err}")
+    if record and att_id is not None:
+        return tool_error(
+            "kanban_read: record and attachment_id cannot be combined; "
+            "name one or the other"
+        )
     try:
         _, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
             if task is None:
                 return tool_error(f"task {tid} not found")
-            if att_id is None:
+            if record:
+                source = "record"
+                att_id_out = None
+                filename = None
+                text = build_record_text(kb, conn, task, tid)
+            elif att_id is None:
                 source = "body"
                 att_id_out = None
                 filename = None
@@ -3641,7 +3599,8 @@ KANBAN_SHOW_SCHEMA = {
         "and recent events. Use this to (re)orient yourself before "
         "starting work, especially on retries. The response includes a "
         "pre-formatted ``worker_context`` string suitable for inclusion "
-        "verbatim in your reasoning."
+        "verbatim in your reasoning. A result too large to show inline "
+        "can be read in windows with ``kanban_read`` and ``record`` set."
     ),
     "parameters": {
         "type": "object",
@@ -4207,8 +4166,9 @@ KANBAN_READ_SCHEMA = {
     "name": "kanban_read",
     "description": (
         "Read a bounded window of your own task's text: an attachment's "
-        "content when you name an attachment id, or the task body when you "
-        "don't. Returns at most `limit` characters starting at `offset`, "
+        "content when you name an attachment id, the record kanban_show "
+        "returns when you set `record`, or the task body when you do "
+        "neither. Returns at most `limit` characters starting at `offset`, "
         "plus the total size and whether more remains, so you can page "
         "through a large file the attachment listing only gives you a path "
         "to. Read-only."
@@ -4225,6 +4185,14 @@ KANBAN_READ_SCHEMA = {
                 "description": (
                     "Id of an attachment on this task (from the attachment "
                     "listing). Omit to read the task's body instead."
+                ),
+            },
+            "record": {
+                "type": "boolean",
+                "description": (
+                    "Read the text kanban_show returns for this task "
+                    "instead of the body. Cannot be combined with "
+                    "attachment_id."
                 ),
             },
             "offset": {
