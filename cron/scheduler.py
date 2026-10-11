@@ -3922,6 +3922,11 @@ def _run_job_script(
             }
         env = build_subprocess_env()
         env.update(env_overlay)
+        # Scheduled runs inherit a PATH led by the venv bin dir; a shell may lack it.
+        _bin_dir = os.path.dirname(sys.executable or "")
+        _env_path = env.get("PATH", "")
+        if _bin_dir and _bin_dir not in _env_path.split(os.pathsep):
+            env["PATH"] = os.pathsep.join(filter(None, [_bin_dir, _env_path]))
         if job_id:
             env["HERMES_CRON_JOB_ID"] = job_id
         # Use the job's workdir as the subprocess cwd when configured,

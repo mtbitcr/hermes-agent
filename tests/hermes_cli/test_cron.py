@@ -278,6 +278,12 @@ class TestCronRunBackgroundDispatch:
         rc = cron_command(Namespace(cron_command="run", job_id="job-1"))
         return rc, capsys.readouterr().out
 
+    def _stub_run(self, monkeypatch, **job_fields):
+        job = {"id": "job-1", "name": "Watchdog", **job_fields}
+        monkeypatch.setattr(
+            cron_cli, "_cron_api", lambda **kwargs: {"success": True, "job": job}
+        )
+
     def test_background_dispatch_with_delegation_id_does_not_report_failed(
         self, monkeypatch, capsys
     ):
@@ -363,7 +369,7 @@ class TestCronRunBackgroundDispatch:
 
         rc, out = self._run_cmd(capsys)
 
-        assert rc == 0
+        assert rc == 1
         assert "Ran now: failed." in out
 
     def test_delegation_id_alone_counts_as_background(self, monkeypatch, capsys):
@@ -383,3 +389,113 @@ class TestCronRunBackgroundDispatch:
         assert rc == 0
         assert "Running in background (delegation del-xyz)." in out
         assert "failed" not in out.lower()
+
+    def test_sync_run_failure_prints_the_first_line_of_its_cause(
+        self, monkeypatch, capsys
+    ):
+        self._stub_run(
+            monkeypatch,
+            executed=True,
+            execution_success=False,
+            execution_error="Script exited with code 7\nstderr:\nbackup volume offline",
+        )
+
+        rc, out = self._run_cmd(capsys)
+
+        lines = out.splitlines()
+        assert rc == 1
+        assert lines[-2].strip() == "Ran now: failed."
+        assert lines[-1] == "Script exited with code 7"
+        assert "backup volume offline" not in out
+
+    def test_sync_run_failure_prints_its_cause_exactly_as_held(
+        self, monkeypatch, capsys
+    ):
+        cause = "[bold red]disk /mnt/backup is full[/]  "
+        self._stub_run(
+            monkeypatch, executed=True, execution_success=False, execution_error=cause
+        )
+
+        rc, out = self._run_cmd(capsys)
+
+        assert rc == 1
+        assert out.endswith(f"Ran now: failed.\n{cause}\n")
+
+    @pytest.mark.parametrize(
+        "error_fields",
+        [{}, {"execution_error": ""}, {"execution_error": None}],
+        ids=["missing", "empty", "none"],
+    )
+    def test_sync_run_failure_without_a_cause_prints_only_the_verdict(
+        self, monkeypatch, capsys, error_fields
+    ):
+        self._stub_run(
+            monkeypatch, executed=True, execution_success=False, **error_fields
+        )
+
+        rc, out = self._run_cmd(capsys)
+
+        assert rc == 1
+        assert out.endswith("Ran now: failed.\n")
+
+    @pytest.mark.parametrize(
+        "error",
+        ["\nsecond line", " \t \nsecond line", "   ", "\n"],
+        ids=["blank-first", "whitespace-first", "whitespace-only", "newline-only"],
+    )
+    def test_sync_run_failure_prints_its_first_line_even_when_blank(
+        self, monkeypatch, capsys, error
+    ):
+        self._stub_run(
+            monkeypatch, executed=True, execution_success=False, execution_error=error
+        )
+
+        rc, out = self._run_cmd(capsys)
+
+        assert rc == 1
+        assert out.endswith(f"Ran now: failed.\n{error.splitlines()[0]}\n")
+
+    def test_sync_run_success_prints_no_cause(self, monkeypatch, capsys):
+        """This is a preservation control that passes before and after the change."""
+        # A run that succeeded can still leave a last_error (e.g. no next run computable).
+        self._stub_run(
+            monkeypatch,
+            executed=True,
+            execution_success=True,
+            execution_error="Failed to compute next run",
+        )
+
+        rc, out = self._run_cmd(capsys)
+
+        assert rc == 0
+        assert out.endswith("Ran now: succeeded.\n")
+
+    def test_sync_run_exit_code_follows_the_verdict(self, monkeypatch, capsys):
+        """An inline run's exit code and cause line follow its verdict.
+
+        A run that succeeded returns 0 and prints no cause, even with an error
+        left over. This pairs that preserved behaviour with the changed behaviour
+        (a run that failed returns 1 and prints the first line of its cause), so
+        it fails on the original code.
+        """
+        self._stub_run(
+            monkeypatch,
+            executed=True,
+            execution_success=True,
+            execution_error="Failed to compute next run",
+        )
+        succeeded_rc, succeeded_out = self._run_cmd(capsys)
+
+        self._stub_run(
+            monkeypatch,
+            executed=True,
+            execution_success=False,
+            execution_error="Script exited with code 7\nstderr:\nbackup volume offline",
+        )
+        failed_rc, failed_out = self._run_cmd(capsys)
+
+        assert succeeded_rc == 0
+        assert succeeded_out.endswith("Ran now: succeeded.\n")
+        assert "Failed to compute next run" not in succeeded_out
+        assert failed_rc == 1
+        assert failed_out.endswith("Ran now: failed.\nScript exited with code 7\n")
