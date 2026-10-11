@@ -149,7 +149,7 @@ def venv_bin(tmp_path, monkeypatch):
 def _run_shell_script(tmp_path, monkeypatch, body):
     """Run `body` as a job script from a temporary HERMES_HOME; returns (ok, output)."""
     scripts_dir = tmp_path / "hermes_home" / "scripts"
-    scripts_dir.mkdir(parents=True)
+    scripts_dir.mkdir(parents=True, exist_ok=True)
     (scripts_dir / "path_probe.sh").write_text(body, encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(scripts_dir.parent))
     return scheduler._run_job_script("path_probe.sh")
@@ -194,6 +194,30 @@ def test_path_already_led_by_the_interpreter_folder_is_unchanged(
 
     assert ok, output
     assert output == led
+
+
+def test_a_hand_started_run_sees_the_path_a_scheduled_run_sees(
+    venv_bin, tmp_path, monkeypatch
+):
+    """A script started by hand sees the PATH a scheduled run's script sees.
+
+    A scheduled run inherits a PATH already led by the interpreter's folder; a
+    shell started by hand has the bare PATH. This pairs the preserved behaviour
+    (the led PATH is passed on unchanged) with the changed behaviour (the bare
+    PATH gets the folder first), so it fails on the original code.
+    """
+    shell_path = os.environ["PATH"]
+    scheduled_path = str(venv_bin) + os.pathsep + shell_path
+
+    monkeypatch.setenv("PATH", scheduled_path)
+    scheduled_ok, scheduled_output = _run_shell_script(tmp_path, monkeypatch, PRINT_PATH)
+    monkeypatch.setenv("PATH", shell_path)
+    by_hand_ok, by_hand_output = _run_shell_script(tmp_path, monkeypatch, PRINT_PATH)
+
+    assert scheduled_ok, scheduled_output
+    assert by_hand_ok, by_hand_output
+    assert scheduled_output == scheduled_path
+    assert by_hand_output == scheduled_output
 
 
 def test_script_without_a_path_gets_only_the_interpreter_folder(

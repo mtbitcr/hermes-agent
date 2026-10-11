@@ -469,3 +469,33 @@ class TestCronRunBackgroundDispatch:
 
         assert rc == 0
         assert out.endswith("Ran now: succeeded.\n")
+
+    def test_sync_run_exit_code_follows_the_verdict(self, monkeypatch, capsys):
+        """An inline run's exit code and cause line follow its verdict.
+
+        A run that succeeded returns 0 and prints no cause, even with an error
+        left over. This pairs that preserved behaviour with the changed behaviour
+        (a run that failed returns 1 and prints the first line of its cause), so
+        it fails on the original code.
+        """
+        self._stub_run(
+            monkeypatch,
+            executed=True,
+            execution_success=True,
+            execution_error="Failed to compute next run",
+        )
+        succeeded_rc, succeeded_out = self._run_cmd(capsys)
+
+        self._stub_run(
+            monkeypatch,
+            executed=True,
+            execution_success=False,
+            execution_error="Script exited with code 7\nstderr:\nbackup volume offline",
+        )
+        failed_rc, failed_out = self._run_cmd(capsys)
+
+        assert succeeded_rc == 0
+        assert succeeded_out.endswith("Ran now: succeeded.\n")
+        assert "Failed to compute next run" not in succeeded_out
+        assert failed_rc == 1
+        assert failed_out.endswith("Ran now: failed.\nScript exited with code 7\n")
