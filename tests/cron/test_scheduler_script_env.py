@@ -3,10 +3,14 @@
 The id goes only into the environment built for the script process: a script
 run without a job gets no such variable, and the scheduler's own environment
 never changes.
+
+The folder of sys.executable is first on the script's PATH, so a script started
+by hand finds the commands a scheduled run finds.
 """
 
 import json
 import os
+import sys
 import threading
 from unittest.mock import MagicMock
 
@@ -124,3 +128,78 @@ def test_job_id_never_reaches_the_scheduler_environment(probe_script):
     assert _job_id_seen_by(result) == RECURRING_JOB["id"]
     assert dict(os.environ) == before
     assert "HERMES_CRON_JOB_ID" not in os.environ
+
+
+VENV_COMMAND = "venv-bin-only-command"
+PRINT_PATH = 'printf %s "$PATH"\n'
+
+
+@pytest.fixture
+def venv_bin(tmp_path, monkeypatch):
+    """A venv-style bin folder holding one command, standing in for sys.executable's."""
+    folder = tmp_path / "venv" / "bin"
+    folder.mkdir(parents=True)
+    command = folder / VENV_COMMAND
+    command.write_text("#!/bin/sh\necho found-in-venv-bin\n", encoding="utf-8")
+    command.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(folder / "python"))
+    return folder
+
+
+def _run_shell_script(tmp_path, monkeypatch, body):
+    """Run `body` as a job script from a temporary HERMES_HOME; returns (ok, output)."""
+    scripts_dir = tmp_path / "hermes_home" / "scripts"
+    scripts_dir.mkdir(parents=True)
+    (scripts_dir / "path_probe.sh").write_text(body, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(scripts_dir.parent))
+    return scheduler._run_job_script("path_probe.sh")
+
+
+def test_script_finds_a_command_in_the_interpreter_folder(
+    venv_bin, tmp_path, monkeypatch
+):
+    """A script whose PATH lacks the interpreter's folder still finds a command placed there."""
+    assert str(venv_bin) not in os.environ["PATH"].split(os.pathsep)
+
+    ok, output = _run_shell_script(tmp_path, monkeypatch, VENV_COMMAND + "\n")
+
+    assert ok, output
+    assert output == "found-in-venv-bin"
+
+
+def test_interpreter_folder_goes_first_on_the_script_path(
+    venv_bin, tmp_path, monkeypatch
+):
+    """The script's PATH is the interpreter's folder, then the PATH the scheduler had."""
+    before = os.environ["PATH"]
+
+    ok, output = _run_shell_script(tmp_path, monkeypatch, PRINT_PATH)
+
+    assert ok, output
+    assert output == str(venv_bin) + os.pathsep + before
+    assert os.environ["PATH"] == before
+
+
+def test_path_already_led_by_the_interpreter_folder_is_unchanged(
+    venv_bin, tmp_path, monkeypatch
+):
+    """A PATH that already starts with the interpreter's folder reaches the script as it is."""
+    led = str(venv_bin) + os.pathsep + os.environ["PATH"]
+    monkeypatch.setenv("PATH", led)
+
+    ok, output = _run_shell_script(tmp_path, monkeypatch, PRINT_PATH)
+
+    assert ok, output
+    assert output == led
+
+
+def test_script_without_a_path_gets_only_the_interpreter_folder(
+    venv_bin, tmp_path, monkeypatch
+):
+    """With no PATH at all the script gets the folder alone, with no empty entry after it."""
+    monkeypatch.delenv("PATH", raising=False)
+
+    ok, output = _run_shell_script(tmp_path, monkeypatch, PRINT_PATH)
+
+    assert ok, output
+    assert output == str(venv_bin)
