@@ -20,6 +20,12 @@ A card an owner plan change replaced vouches the same way: approving its
 replacement -- through any chain of replacements -- also resolves the items the
 replaced cards recorded. A split card has no single replacement, so no one part
 of it resolves its items.
+
+Archiving a card is the other way a round-trip ends: the rework its verdicts
+recorded will never happen. The archive closes the items that are still open,
+in the archive's own transaction, with one ``review_followup_archived``
+receipt on the card per item -- under the same boundary: only what the card
+itself recorded, and only what is still open.
 """
 
 from __future__ import annotations
@@ -630,3 +636,203 @@ def test_an_item_of_an_unrelated_card_stays_open(kanban_home):
         _assert_left_alone(conn, rival_item)
         assert kb.get_task(conn, bystander).status == "ready"
         _assert_resolved_with_receipt(conn, new, item)
+
+
+def _archive_receipts(conn):
+    """Every ``review_followup_archived`` event on the board, as ``(card, item)``."""
+    return [
+        (row["task_id"], json.loads(row["payload"])["followup_task_id"])
+        for row in conn.execute(
+            "SELECT task_id, payload FROM task_events "
+            "WHERE kind = 'review_followup_archived' ORDER BY id"
+        ).fetchall()
+    ]
+
+
+def _event_kinds(conn, task_id):
+    """The kinds of the events written on this card, oldest first."""
+    return [
+        row["kind"]
+        for row in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+    ]
+
+
+def _standing(conn, task_id):
+    """What the board shows of a card, plus how many events it has written."""
+    card = kb.get_task(conn, task_id)
+    assert card is not None
+    return (
+        card.status, card.result, card.completed_at,
+        kb.task_event_revision(conn, task_id),
+    )
+
+
+def _assert_archived_with_its_card(conn, task_id, item):
+    """``item`` is archived, and its result says its card was archived."""
+    closed = kb.get_task(conn, item)
+    assert closed is not None
+    assert closed.status == "archived"
+    assert closed.result, "the closed item carries no result at all"
+    assert "archived" in closed.result
+    assert task_id in closed.result
+
+
+def test_archiving_a_card_archives_the_open_rework_item_it_recorded(kanban_home):
+    """The rework a card recorded will never happen, so its item goes with it.
+
+    Nothing has picked the item up when the card is archived. The archive
+    closes it in the same transaction, with a result that says why, and the
+    card carries ONE receipt for it: an event naming the item.
+    """
+    with kb.connect() as conn:
+        tid, item = _returned_once(conn)
+        _assert_left_alone(conn, item)
+
+        assert kb.archive_task(conn, tid) is True
+
+        assert kb.get_task(conn, tid).status == "archived"
+        _assert_archived_with_its_card(conn, tid, item)
+        assert _archive_receipts(conn) == [(tid, item)]
+
+
+def test_an_item_already_done_or_archived_is_left_exactly_as_it_is(kanban_home):
+    """Only an item that is still open closes with its card.
+
+    The first card was approved, so the item it recorded is ``done``; the
+    second card's item was archived by hand. Archiving either card must not
+    reopen, re-close or re-stamp them: same status, same result, same
+    completion time, nothing appended to the item and no receipt for it. The
+    control is a third card whose item is still open -- the very same archive
+    does close that one.
+    """
+    with kb.connect() as conn:
+        approved, done_item = _returned_once(conn, title="ship the widget")
+        _reviewer_approves(conn, approved)
+        by_hand, hand_item = _returned_once(conn, title="ship the gadget")
+        assert kb.archive_task(conn, hand_item) is True
+        control, open_item = _returned_once(conn, title="ship the gizmo")
+        assert kb.get_task(conn, done_item).status == "done"
+        assert kb.get_task(conn, hand_item).status == "archived"
+        done_before = _standing(conn, done_item)
+        hand_before = _standing(conn, hand_item)
+
+        for card in (approved, by_hand, control):
+            assert kb.archive_task(conn, card) is True
+
+        assert _standing(conn, done_item) == done_before
+        assert _standing(conn, hand_item) == hand_before
+        _assert_archived_with_its_card(conn, control, open_item)
+        assert _archive_receipts(conn) == [(control, open_item)]
+
+
+def test_an_item_a_worker_holds_is_archived_and_its_run_closed(kanban_home):
+    """A held item closes with its card, and the run it held closes with it.
+
+    The owner took this item out of triage and a worker claimed it, so it
+    holds a live run. Archiving the card still closes the item, and the run
+    ends as ``reclaimed`` -- the way ``archive_task`` ends a run it takes a
+    card out from under -- rather than being left open or stranded.
+    """
+    with kb.connect() as conn:
+        tid, item = _returned_once(conn)
+        assert kb.unlink_tasks(conn, tid, item) is True
+        promoted = kb.cas_transition_task(
+            conn, item, expected_status="triage",
+            expected_revision=kb.task_event_revision(conn, item),
+            to_status="ready",
+        )
+        assert promoted["moved"] is True, promoted
+        held = kb.claim_task(conn, item)
+        assert held is not None and held.status == "running"
+        worker_run = held.current_run_id
+        assert worker_run is not None
+        kb._set_worker_pid(conn, item, os.getpid())
+        live = kb.get_task(conn, item)
+        assert None not in (live.claim_lock, live.claim_expires, live.worker_pid)
+
+        assert kb.archive_task(conn, tid) is True
+
+        _assert_archived_with_its_card(conn, tid, item)
+        assert _archive_receipts(conn) == [(tid, item)]
+        claim = conn.execute(
+            "SELECT current_run_id, claim_lock, claim_expires, worker_pid "
+            "FROM tasks WHERE id = ?",
+            (item,),
+        ).fetchone()
+        assert tuple(claim) == (None, None, None, None)
+
+        closed = conn.execute(
+            "SELECT status, outcome, summary, ended_at, "
+            "claim_lock, claim_expires, worker_pid "
+            "FROM task_runs WHERE id = ? AND task_id = ?",
+            (worker_run, item),
+        ).fetchone()
+        status, outcome, summary, ended_at, *run_claim = tuple(closed)
+        assert (status, outcome) == ("reclaimed", "reclaimed")
+        assert ended_at is not None
+        assert run_claim == [None, None, None]
+        assert tid in summary
+
+
+def test_archiving_a_card_that_recorded_no_item_records_nothing_new(kanban_home):
+    """With no rework item recorded there is nothing to close, and nothing is written.
+
+    The plain card recorded no item. Archiving it writes what it always has --
+    the one ``archived`` event on the card -- and no receipt anywhere, and
+    leaves the open item of a different card, and that card, exactly as they
+    were. The control is that different card: it DID record an item, and its
+    archive closes it.
+    """
+    with kb.connect() as conn:
+        plain = kb.create_task(conn, title="a card of its own", assignee="worker")
+        assert _vouched_followups(conn, plain) == []
+        before = _event_kinds(conn, plain)
+        control, item = _returned_once(conn, title="ship the widget")
+        around = (control, item)
+        standing = {card: _standing(conn, card) for card in around}
+
+        assert kb.archive_task(conn, plain) is True
+
+        assert _event_kinds(conn, plain) == [*before, "archived"]
+        assert _archive_receipts(conn) == []
+        assert {card: _standing(conn, card) for card in around} == standing
+
+        assert kb.archive_task(conn, control) is True
+        _assert_archived_with_its_card(conn, control, item)
+        assert _archive_receipts(conn) == [(control, item)]
+        assert _event_kinds(conn, plain) == [*before, "archived"]
+
+
+def test_an_item_of_another_card_stays_open_when_a_card_is_archived(kanban_home):
+    """Only what the archived card itself recorded closes, however alike the rest looks.
+
+    The other card has the same title and owner, and the item IT recorded hangs
+    under the archived card as well, so nothing the board shows tells the two
+    items apart. A third card hangs under the archived card by hand, with the
+    same title shape. The archived card recorded neither, so neither moves --
+    while the item it did record (the control) closes in the same archive.
+    """
+    with kb.connect() as conn:
+        tid, item = _returned_once(conn, title="ship the widget")
+        other, other_item = _returned_once(conn, title="ship the widget")
+        kb.link_tasks(conn, tid, other_item)
+        by_hand = kb.create_task(
+            conn, title="Rework: ship the widget", assignee="worker",
+            triage=True, parents=[tid],
+        )
+        assert _vouched_followups(conn, tid) == [item]
+        assert _vouched_followups(conn, other) == [other_item]
+        around = (other, other_item, by_hand)
+        standing = {card: _standing(conn, card) for card in around}
+
+        assert kb.archive_task(conn, tid) is True
+
+        assert {card: _standing(conn, card) for card in around} == standing
+        _assert_left_alone(conn, other_item)
+        _assert_left_alone(conn, by_hand)
+        assert kb.get_task(conn, other).status == "ready"
+        _assert_archived_with_its_card(conn, tid, item)
+        assert _archive_receipts(conn) == [(tid, item)]
