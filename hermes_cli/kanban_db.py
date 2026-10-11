@@ -94,6 +94,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli import kanban_provider_stops as _provider_stops
+from hermes_cli.kanban_archived_followups import archive_recorded_review_followups
 from hermes_cli.kanban_replaced_cards import replaced_task_ids
 from hermes_cli.kanban_risk_tier import (
     active_run_box_seconds,
@@ -31039,6 +31040,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
+        archive_recorded_review_followups(conn, task_id)
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
