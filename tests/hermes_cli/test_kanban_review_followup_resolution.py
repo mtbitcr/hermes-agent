@@ -15,6 +15,11 @@ The boundary is the kernel's own vouching: only items named by the reviewed
 card's ``review_followup_recorded`` events move, so an item anyone else linked
 under the same card is left exactly where it is. And only items that are still
 open move, so a second approval records nothing new.
+
+A card an owner plan change replaced vouches the same way: approving its
+replacement -- through any chain of replacements -- also resolves the items the
+replaced cards recorded. A split card has no single replacement, so no one part
+of it resolves its items.
 """
 
 from __future__ import annotations
@@ -357,3 +362,271 @@ def test_a_worker_pinned_to_its_board_resolves_and_still_reaches_the_root(
     }
     with kb.connect(db_path=root / "kanban.db") as other_board:
         assert kb.list_tasks(other_board) == []
+
+
+def _archive_by_plan_change(conn, task_id, *, action, **replaced_by):
+    """Archive a card the way an owner plan change replaces it.
+
+    The plan applier archives the replaced card through the public
+    compare-and-swap move and writes an ``owner_project_plan_change`` event on
+    THAT card, naming what took its place: ``replacement_task_id`` for a
+    replace or a merge, ``replacement_task_ids`` for a split. The payload here
+    carries the same fields the applier writes.
+    """
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    moved = kb.cas_transition_task(
+        conn, task_id, expected_status=task.status,
+        expected_revision=kb.task_event_revision(conn, task_id),
+        to_status="archived", event_kind="owner_project_plan_change",
+        event_payload={
+            "actor": "steward", "profile": "steward",
+            "idempotency_key": f"plan-{task_id}", "request_digest": "digest",
+            "action": action, "reason": "superseded", **replaced_by,
+        },
+    )
+    assert moved["moved"] is True, moved
+    assert kb.get_task(conn, task_id).status == "archived"
+
+
+def _assert_all_resolved_with_receipts(conn, task_id, items):
+    """Every item is done, each with ONE receipt on the approved card."""
+    approving_run = kb.latest_run(conn, task_id)
+    assert approving_run is not None
+    assert approving_run.outcome == "completed"
+
+    for item in items:
+        resolved = kb.get_task(conn, item)
+        assert resolved is not None
+        assert resolved.status == "done"
+        assert resolved.completed_at is not None
+        assert str(approving_run.id) in (resolved.result or "")
+        assert task_id in (resolved.result or "")
+
+    assert sorted(_receipts(conn, task_id)) == sorted(
+        (item, approving_run.id) for item in items
+    )
+
+
+def _assert_left_alone(conn, item, *, status="triage"):
+    """``item`` is where it was: its status, no result, no completion time."""
+    card = kb.get_task(conn, item)
+    assert card is not None
+    assert (card.status, card.result, card.completed_at) == (status, None, None)
+
+
+def test_approving_a_replacement_resolves_the_item_of_the_card_it_replaced(
+    kanban_home,
+):
+    """The replaced card's rework is accepted along with its replacement.
+
+    The first card was returned once and then superseded by an owner plan
+    change, so the item that verdict recorded would stay open for good:
+    nothing ever approves an archived card. The replacement's approval is what
+    accepts the work, so it resolves that item -- one receipt, on the
+    replacement, naming the approving run.
+    """
+    with kb.connect() as conn:
+        old, item = _returned_once(conn, title="ship the widget")
+        new = kb.create_task(
+            conn, title="ship the widget, rebuilt", assignee="worker",
+        )
+        _archive_by_plan_change(
+            conn, old, action="replace", replacement_task_id=new,
+        )
+        _assert_left_alone(conn, item)
+
+        _reviewer_approves(conn, new)
+
+        _assert_resolved_with_receipt(conn, new, item)
+        assert kb.get_task(conn, old).status == "archived"
+        assert _receipts(conn, old) == []
+
+
+def test_approving_the_end_of_a_replacement_chain_resolves_both_items(
+    kanban_home,
+):
+    """A card replaced by a card that was itself replaced is still replaced.
+
+    ``first`` was superseded by ``second``, which was superseded in turn by
+    ``third``; each was returned once, so each left an item open. Approving
+    ``third`` accepts the work of the whole chain: both items close, one
+    receipt each, all on ``third``.
+    """
+    with kb.connect() as conn:
+        first, first_item = _returned_once(conn, title="first attempt")
+        second, second_item = _returned_once(conn, title="second attempt")
+        third = kb.create_task(conn, title="third attempt", assignee="worker")
+        _archive_by_plan_change(
+            conn, first, action="replace", replacement_task_id=second,
+        )
+        _archive_by_plan_change(
+            conn, second, action="replace", replacement_task_id=third,
+        )
+        _assert_left_alone(conn, first_item)
+        _assert_left_alone(conn, second_item)
+
+        _reviewer_approves(conn, third)
+
+        _assert_all_resolved_with_receipts(conn, third, [first_item, second_item])
+        assert _receipts(conn, first) == []
+        assert _receipts(conn, second) == []
+
+
+def test_approving_the_card_two_cards_were_merged_into_resolves_both_items(
+    kanban_home,
+):
+    """A merge archives each source card naming the same replacement.
+
+    Both sources were returned once and left an item open. The merged card is
+    the replacement of each of them, so its approval resolves both items --
+    each exactly once, though the card is reached from two directions.
+    """
+    with kb.connect() as conn:
+        left, left_item = _returned_once(conn, title="left half")
+        right, right_item = _returned_once(conn, title="right half")
+        merged = kb.create_task(conn, title="both halves", assignee="worker")
+        for source in (left, right):
+            _archive_by_plan_change(
+                conn, source, action="merge", replacement_task_id=merged,
+            )
+        _assert_left_alone(conn, left_item)
+        _assert_left_alone(conn, right_item)
+
+        _reviewer_approves(conn, merged)
+
+        _assert_all_resolved_with_receipts(conn, merged, [left_item, right_item])
+
+
+def test_approving_one_part_of_a_split_card_leaves_the_split_cards_item_open(
+    kanban_home,
+):
+    """No single part of a split card replaces it, so its rework stays open.
+
+    A split hands the card's work to SEVERAL parts, and approving one part
+    accepts only that part of it: the item the split card recorded cannot be
+    called accepted, and neither part may close it. A card the first part
+    replaced outright is the control -- the very same approval does resolve
+    its item, so the split card's item is left alone by the rule, not by
+    accident.
+    """
+    with kb.connect() as conn:
+        whole, whole_item = _returned_once(conn, title="the whole")
+        outright, outright_item = _returned_once(conn, title="replaced outright")
+        part = kb.create_task(conn, title="first part", assignee="worker")
+        other_part = kb.create_task(conn, title="second part", assignee="worker")
+        _archive_by_plan_change(
+            conn, whole, action="split",
+            replacement_task_ids=[part, other_part],
+        )
+        _archive_by_plan_change(
+            conn, outright, action="replace", replacement_task_id=part,
+        )
+
+        _reviewer_approves(conn, part)
+
+        _assert_left_alone(conn, whole_item)
+        _assert_resolved_with_receipt(conn, part, outright_item)
+
+        _reviewer_approves(conn, other_part)
+
+        _assert_left_alone(conn, whole_item)
+        assert _receipts(conn, other_part) == []
+        assert kb.get_task(conn, whole).status == "archived"
+
+
+def test_an_item_already_archived_stays_archived_when_its_card_is_replaced(
+    kanban_home,
+):
+    """An archived item is a closed record: approval neither reopens nor re-closes it.
+
+    Somebody archived the rework item by hand before the replacement came
+    back. The approval resolves the items of the replaced cards that are still
+    open -- the control, on the second source -- and leaves this one exactly
+    as it is: archived, no result, no receipt, nothing appended to it.
+    """
+    with kb.connect() as conn:
+        old, item = _returned_once(conn, title="ship the widget")
+        sibling, sibling_item = _returned_once(conn, title="ship the gadget")
+        new = kb.create_task(conn, title="ship both", assignee="worker")
+        for source in (old, sibling):
+            _archive_by_plan_change(
+                conn, source, action="merge", replacement_task_id=new,
+            )
+        assert kb.archive_task(conn, item) is True
+        item_revision = kb.task_event_revision(conn, item)
+
+        _reviewer_approves(conn, new)
+
+        _assert_left_alone(conn, item, status="archived")
+        assert kb.task_event_revision(conn, item) == item_revision
+        _assert_resolved_with_receipt(conn, new, sibling_item)
+
+
+def test_approving_a_card_that_replaced_nothing_records_nothing_new(
+    kanban_home,
+):
+    """With nothing replaced there is nothing to resolve, and nothing is written.
+
+    A rework item is open elsewhere on the board, and its card WAS replaced --
+    by a different card, not the one approved here. Approving a card that
+    replaced nothing records no receipt anywhere, and leaves that item and
+    every card around it exactly as it was.
+    """
+    with kb.connect() as conn:
+        old, item = _returned_once(conn, title="ship the widget")
+        elsewhere = kb.create_task(
+            conn, title="ship the widget, rebuilt", assignee="worker",
+        )
+        _archive_by_plan_change(
+            conn, old, action="replace", replacement_task_id=elsewhere,
+        )
+        lone = kb.create_task(conn, title="a card of its own", assignee="worker")
+        around = (old, item, elsewhere)
+        revisions = {card: kb.task_event_revision(conn, card) for card in around}
+
+        _reviewer_approves(conn, lone)
+
+        assert _receipts(conn, lone) == []
+        resolved_anywhere = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events "
+            "WHERE kind = 'review_followup_resolved'"
+        ).fetchone()["n"]
+        assert resolved_anywhere == 0
+        assert {
+            card: kb.task_event_revision(conn, card) for card in around
+        } == revisions
+        _assert_left_alone(conn, item)
+
+
+def test_an_item_of_an_unrelated_card_stays_open(kanban_home):
+    """Only the cards the approved card replaced are resolved with it.
+
+    Two other cards each left an item open: one was never replaced, the other
+    was replaced by a card that is not the one approved. Neither is in the
+    approved card's replacement history, so neither item moves -- while the
+    item of the card it did replace (the control) closes in the same approval.
+    """
+    with kb.connect() as conn:
+        old, item = _returned_once(conn, title="ship the widget")
+        bystander, bystander_item = _returned_once(conn, title="a card of its own")
+        rival, rival_item = _returned_once(conn, title="ship the gadget")
+        new = kb.create_task(
+            conn, title="ship the widget, rebuilt", assignee="worker",
+        )
+        rival_new = kb.create_task(
+            conn, title="ship the gadget, rebuilt", assignee="worker",
+        )
+        _archive_by_plan_change(
+            conn, old, action="replace", replacement_task_id=new,
+        )
+        _archive_by_plan_change(
+            conn, rival, action="replace", replacement_task_id=rival_new,
+        )
+
+        _reviewer_approves(conn, new)
+
+        _assert_left_alone(conn, bystander_item)
+        _assert_left_alone(conn, rival_item)
+        assert kb.get_task(conn, bystander).status == "ready"
+        _assert_resolved_with_receipt(conn, new, item)
