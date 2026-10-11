@@ -551,7 +551,7 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
             if outcome == "failed":
                 # Unredacted on purpose: only the person who ran the command sees it.
                 lines = (job.get("execution_error") or "").splitlines()
-                if lines and lines[0].strip():
+                if lines:
                     print(lines[0])
                 return 1
         elif job.get("execution_skipped"):

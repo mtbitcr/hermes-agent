@@ -438,7 +438,25 @@ class TestCronRunBackgroundDispatch:
         assert rc == 1
         assert out.endswith("Ran now: failed.\n")
 
+    @pytest.mark.parametrize(
+        "error",
+        ["\nsecond line", " \t \nsecond line", "   ", "\n"],
+        ids=["blank-first", "whitespace-first", "whitespace-only", "newline-only"],
+    )
+    def test_sync_run_failure_prints_its_first_line_even_when_blank(
+        self, monkeypatch, capsys, error
+    ):
+        self._stub_run(
+            monkeypatch, executed=True, execution_success=False, execution_error=error
+        )
+
+        rc, out = self._run_cmd(capsys)
+
+        assert rc == 1
+        assert out.endswith(f"Ran now: failed.\n{error.splitlines()[0]}\n")
+
     def test_sync_run_success_prints_no_cause(self, monkeypatch, capsys):
+        """This is a preservation control that passes before and after the change."""
         # A run that succeeded can still leave a last_error (e.g. no next run computable).
         self._stub_run(
             monkeypatch,

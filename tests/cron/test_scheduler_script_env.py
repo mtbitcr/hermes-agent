@@ -183,7 +183,10 @@ def test_interpreter_folder_goes_first_on_the_script_path(
 def test_path_already_led_by_the_interpreter_folder_is_unchanged(
     venv_bin, tmp_path, monkeypatch
 ):
-    """A PATH that already starts with the interpreter's folder reaches the script as it is."""
+    """A PATH that already starts with the interpreter's folder reaches the script as it is.
+
+    This is a preservation control that passes before and after the change.
+    """
     led = str(venv_bin) + os.pathsep + os.environ["PATH"]
     monkeypatch.setenv("PATH", led)
 
