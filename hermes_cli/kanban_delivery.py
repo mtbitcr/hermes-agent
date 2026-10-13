@@ -1781,7 +1781,7 @@ def _intake(db_path: Path, row: dict, merge: str) -> Optional[bool]:
 # bound checkout's owner sees nothing, and there for a fresh dispatcher until record_worktree_base has
 # committed that worktree's base and, in the same transaction, why.
 _REASON = re.compile(r"[a-z_]{1,64}")  # a transport reason code, never an error's text
-_PENDING = "hermes-kanban-base-fallback"  # the pending causes' directory in a git common directory
+_BASE_FALLBACK_DIR = "hermes-kanban-base-fallback"  # the pending causes' directory in a git common directory
 _PENDING_BOUND = 65536  # bytes: a reason code, a commit, a worktree path and a branch name
 _PENDING_FIELDS = {"reason", "base_commit", "target", "branch"}
 
@@ -1798,7 +1798,7 @@ def _pending_path(checkout: Path, key: str) -> Optional[Path]:
     lines = os.fsdecode(found.stdout).splitlines() if found is not None and found.returncode == 0 else []
     if len(lines) != 1 or not os.path.isabs(lines[0]):
         return None
-    return Path(lines[0]).resolve(strict=False) / _PENDING / hashlib.sha256(os.fsencode(key)).hexdigest()
+    return Path(lines[0]).resolve(strict=False) / _BASE_FALLBACK_DIR / hashlib.sha256(os.fsencode(key)).hexdigest()
 
 
 def _pending_cause(path: Path, worktree: Path) -> Optional[dict]:
