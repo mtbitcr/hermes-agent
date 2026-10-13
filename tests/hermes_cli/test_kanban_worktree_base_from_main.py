@@ -334,6 +334,48 @@ def test_no_second_connection_opens_inside_the_live_write_transaction(world, git
     assert _base_events(kb.kanban_db_path(), tid) == expected
 
 
+@pytest.mark.parametrize("failing", ["worktree_base_fallback", "worktree_base_recorded"])
+def test_a_rolled_back_base_keeps_the_fallback_cause_for_the_retry(world, github, caplog, failing):
+    _capture_all_logs(caplog)
+    kb, db = world.kb, world.kb.kanban_db_path()
+    shutil.rmtree(world.bare)
+    tid = _new_card(kb, world.repo)
+    expected = [("worktree_base_recorded", {"base_commit": world.head}),
+                ("worktree_base_fallback", {"base_commit": world.head, "reason": "fetch_failed"})]
+    conn = kb.connect()
+    try:
+        # One real SQLite error inside record_worktree_base's write transaction, on the tick's own connection.
+        conn.execute(f"CREATE TEMP TRIGGER injected BEFORE INSERT ON task_events WHEN NEW.kind = '{failing}' "
+                     "BEGIN SELECT RAISE(ABORT, 'injected'); END")
+        first = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
+        task = _task(kb, tid)
+        # The rollback is real: no base and no base event; no worker, and the card waits in ready.
+        assert task.base_commit is None and _base_events(db, tid) == []
+        assert tid not in [spawned[0] for spawned in first.spawned] and task.status == "ready"
+        conn.execute("DROP TRIGGER temp.injected")
+
+        retry = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
+
+        # The worktree is already there, so nothing is fetched again: the retry records the base the
+        # branch really started at and, after it, why.
+        task = _task(kb, tid)
+        workspace = Path(task.workspace_path)
+        assert tid in [spawned[0] for spawned in retry.spawned] and github["tokens"] == [PUBLISH]
+        assert task.base_commit == world.head == _git(workspace, "rev-parse", "HEAD")
+        assert _base_events(db, tid) == expected
+        # The cause is written once: recording the base again changes nothing.
+        assert kb.record_worktree_base(conn, tid, workspace) == world.head
+    finally:
+        conn.close()
+    assert _base_events(db, tid) == expected
+    raw = sqlite3.connect(str(db))
+    try:
+        stored = repr(raw.execute("SELECT * FROM task_events").fetchall())
+    finally:
+        raw.close()
+    assert not [text for text in (stored, _log_text(caplog)) if TOKEN in text or BASIC in text]
+
+
 def test_store_path_under_the_dispatcher_worker_environment(world, github, monkeypatch):
     """This process has the environment the dispatcher gives a worker on proj-a (its board pinned, its
     card set, a profile home under the root) and ticks another board, whose new card starts at main."""

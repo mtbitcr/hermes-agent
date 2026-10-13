@@ -31997,8 +31997,8 @@ def record_worktree_base(
     head = str(_git_output(workspace, "rev-parse", "--verify", "HEAD")).strip()
     if not re.fullmatch(r"[0-9a-fA-F]{40,64}", head):
         raise WorktreeScopeError("worktree HEAD is not an exact git commit")
-    from hermes_cli.kanban_delivery import record_base_fallback  # why a new branch started at HEAD, not main
-    with write_txn(conn):
+    from hermes_cli.kanban_delivery import base_fallback  # why a new branch started at HEAD, not main
+    with base_fallback(workspace) as record_fallback, write_txn(conn):
         row = conn.execute(
             "SELECT base_commit FROM tasks WHERE id = ? AND task_kind = 'work'",
             (task_id,),
@@ -32015,7 +32015,7 @@ def record_worktree_base(
         )
         if cur.rowcount == 1:
             _append_event(conn, task_id, "worktree_base_recorded", {"base_commit": head})
-            record_base_fallback(conn, task_id, workspace, head)
+            record_fallback(conn, task_id, head)
             return head
         row = conn.execute(
             "SELECT base_commit FROM tasks WHERE id = ? AND task_kind = 'work'",

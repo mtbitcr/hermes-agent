@@ -35,7 +35,7 @@ into main adds the merge to the release decision through
 With ``kanban.delivery.exact_base`` exactly true, :func:`worktree_start` starts a
 new card branch of a policy repository at the main GitHub holds now, fetched
 through the publish step's transport; a failed fetch starts it at HEAD as before
-and :func:`record_base_fallback` records why, after the base.
+and :func:`base_fallback` records why, after the base.
 """
 
 from __future__ import annotations
@@ -1776,7 +1776,7 @@ def _intake(db_path: Path, row: dict, merge: str) -> Optional[bool]:
 
 # A new card branch's start (kanban.delivery.exact_base). The kernel's worktree creator knows no task or
 # database, so the fixed reason a fetch of main failed waits here, by worktree path, until
-# record_worktree_base records that worktree's base and, in the same transaction, why.
+# record_worktree_base has committed that worktree's base and, in the same transaction, why.
 _BASE_FALLBACKS: dict[str, str] = {}
 _REASON = re.compile(r"[a-z_]{1,64}")  # a transport reason code, never an error's text
 
@@ -1790,7 +1790,7 @@ def worktree_start(repo_root, target) -> str:
     with ``kanban.delivery.exact_base`` exactly true and ``repo_root``'s origin a repository of the
     delivery policy, the commit main holds on GitHub now, fetched through the publish step's transport
     into ``refs/remotes/origin/main`` only. When that fetch fails the branch starts at ``HEAD`` and the
-    transport's fixed reason waits for :func:`record_base_fallback`. Opens no database."""
+    transport's fixed reason waits for :func:`base_fallback`. Opens no database."""
     key = _worktree_key(target)
     _BASE_FALLBACKS.pop(key, None)
     if not exact_base_settings():
@@ -1814,10 +1814,21 @@ def worktree_start(repo_root, target) -> str:
     return "HEAD"
 
 
-def record_base_fallback(conn: sqlite3.Connection, task_id: str, workspace_path, base_commit: str) -> None:
-    """Run by ``record_worktree_base`` right after it records ``base_commit`` for the worktree at
-    ``workspace_path``, in its transaction and on its connection, opening none: when that branch started
-    at HEAD because the fetch of main failed, the commit recorded and the fixed reason."""
-    reason = _BASE_FALLBACKS.pop(_worktree_key(workspace_path), None)
-    if reason is not None:
-        kb._append_event(conn, task_id, "worktree_base_fallback", {"base_commit": base_commit, "reason": reason})
+@contextlib.contextmanager
+def base_fallback(workspace_path):
+    """Entered by ``record_worktree_base`` just before its write transaction, in the same ``with``, for the
+    worktree at ``workspace_path``; yields the recorder it runs right after it records that base, in that
+    transaction and on its connection, opening none. When the branch started at HEAD because the fetch of
+    main failed, the recorder appends the commit recorded and the fixed reason. The reason is forgotten
+    only once that transaction has committed: a rollback or a failed commit keeps it for the retry."""
+    key, recorded = _worktree_key(workspace_path), []
+
+    def record(conn: sqlite3.Connection, task_id: str, base_commit: str) -> None:
+        reason = _BASE_FALLBACKS.get(key)
+        if reason is not None:
+            kb._append_event(conn, task_id, "worktree_base_fallback", {"base_commit": base_commit, "reason": reason})
+            recorded.append(reason)
+
+    yield record
+    if recorded:  # reached only on a clean exit, so after write_txn's commit
+        _BASE_FALLBACKS.pop(key, None)
