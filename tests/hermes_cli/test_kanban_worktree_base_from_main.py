@@ -17,13 +17,14 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from tests.hermes_cli.test_kanban_delivery import (  # noqa: F401  (board is a fixture)
-    IMPLEMENTER, _become, _git, _spawned_worker_env, board,
+    IMPLEMENTER, REVIEWER, _WORKER_ENV, _become, _git, _spawned_worker_env, board,
 )
 from tests.hermes_cli.test_kanban_delivery_github import (
     BASIC, REPO, TOKEN, _capture_all_logs, _carries, _files_text, _log_text, _new_key, _pem, _record_git,
@@ -374,6 +375,258 @@ def test_a_rolled_back_base_keeps_the_fallback_cause_for_the_retry(world, github
     finally:
         raw.close()
     assert not [text for text in (stored, _log_text(caplog)) if TOKEN in text or BASIC in text]
+
+
+# The next step in a fresh dispatcher process: the same reviewer policy and transport seams, on the local
+# stand-in and remotes, and the suite's memory-guard pin; the worker's launch is the only other stand-in. It
+# ticks the board once or, given a card and its worktree, records that worktree's base, and prints its answer.
+_FRESH = """
+import http.client, json, sys
+from hermes_cli import kanban_db as kb, kanban_delivery_github as transport
+from plugins.dashboard_auth.raphael_workspace import model_policy
+port, origin, reviewer, *card = sys.argv[1:]
+model_policy.reviewer_profile_ids = lambda: (reviewer,)
+transport._connect = lambda: http.client.HTTPConnection("127.0.0.1", int(port), timeout=10)
+transport.GIT_ORIGIN = origin
+kb._system_memory_sample = lambda: {}
+conn = kb.connect()
+try:
+    answer = kb.record_worktree_base(conn, *card) if card else kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
+finally:
+    conn.close()
+print(json.dumps(answer if card else [spawned[0] for spawned in answer.spawned]))
+"""
+
+
+def _fresh(world, github, *card) -> tuple:
+    """:data:`_FRESH` in a new Python process with exactly this test's environment, on the same board and
+    repository: what it answered, and everything it wrote to its standard streams."""
+    env = {name: value for name, value in os.environ.items() if name not in _WORKER_ENV}
+    env["HOME"] = str(Path.home())
+    argv = [sys.executable, "-c", _FRESH, str(github["port"]), (world.tmp / "remotes").as_uri(), REVIEWER, *card]
+    try:
+        done = subprocess.run(argv, cwd=Path(world.kb.__file__).resolve().parents[1], env=env,
+                              capture_output=True, text=True, timeout=120, check=True)
+    except subprocess.CalledProcessError as error:
+        pytest.fail(f"the fresh dispatcher process failed:\n{error.stderr}")
+    return json.loads(done.stdout.splitlines()[-1]), done.stdout + done.stderr
+
+
+def _pending(workspace: Path) -> dict:
+    """Each file of the repository's git common directory, its objects aside, that names the fallback's reason,
+    with its bytes: the pending cause, while there is one."""
+    common = Path(_git(workspace, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    return {path: path.read_bytes() for path in common.rglob("*") if path.is_file()
+            and path.relative_to(common).parts[0] != "objects" and b"fetch_failed" in path.read_bytes()}
+
+
+def _spawn_failures(db: Path, tid: str) -> list:
+    """The card's spawn failures, read from the board file itself, the one that tripped the breaker included."""
+    raw = sqlite3.connect(str(db))
+    try:
+        return [payload for (payload,) in raw.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND (kind = 'spawn_failed' OR kind = 'gave_up' "
+            "AND json_extract(payload, '$.trigger_outcome') = 'spawn_failed') ORDER BY id", (tid,))]
+    finally:
+        raw.close()
+
+
+def _interrupted(kb, monkeypatch):
+    """One dispatcher pass that stops where it reaches ``record_worktree_base``, before any base write, as a
+    spawn preparation that failed; the dispatcher handles it as it handles any such failure."""
+    def interrupted(*args, **kwargs):
+        raise RuntimeError("interrupted before the base")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(kb, "record_worktree_base", interrupted)
+        return _dispatch(kb)
+
+
+def _waiting(world, github, tid: str, first) -> Path:
+    """After the failed first pass: no base, no base event and no worker, the card back in ready, its prepared
+    worktree clean, and the one token the fetch asked for; that worktree."""
+    task, workspace = _task(world.kb, tid), world.repo / ".worktrees" / tid
+    assert task.base_commit is None and _base_events(world.kb.kanban_db_path(), tid) == []
+    assert tid not in [spawned[0] for spawned in first.spawned] and task.status == "ready"
+    assert workspace.is_dir() and _git(workspace, "status", "--porcelain") == ""
+    assert github["tokens"] == [PUBLISH]
+    return workspace
+
+
+def _recovered(world, github, tid: str, spawned: list, preparations: int = 1) -> None:
+    """The fresh retry spawned the card on the base its branch really started at, recorded why right after it,
+    asked for no token beyond one per preparation and retired the pending cause."""
+    task = _task(world.kb, tid)
+    workspace = Path(task.workspace_path)
+    assert tid in spawned and task.status == "running"
+    assert task.base_commit == world.head == _git(workspace, "rev-parse", "HEAD")
+    assert _base_events(world.kb.kanban_db_path(), tid) == [
+        ("worktree_base_recorded", {"base_commit": world.head}),
+        ("worktree_base_fallback", {"base_commit": world.head, "reason": "fetch_failed"}),
+    ]
+    assert github["tokens"] == [PUBLISH] * preparations and _pending(workspace) == {}
+
+
+def _no_credential_kept(world, *texts: str) -> None:
+    raw = sqlite3.connect(str(world.kb.kanban_db_path()))
+    try:
+        stored = repr(raw.execute("SELECT * FROM task_events").fetchall())
+    finally:
+        raw.close()
+    kept = [stored, *texts, *_files_text(world.tmp).values()]
+    assert not [text for text in kept if TOKEN in text or BASIC in text]
+
+
+def test_a_rolled_back_base_keeps_the_fallback_cause_for_a_fresh_dispatcher(world, github, caplog):
+    _capture_all_logs(caplog)
+    kb = world.kb
+    shutil.rmtree(world.bare)
+    tid = _new_card(kb, world.repo)
+    conn = kb.connect()
+    try:
+        # One real SQLite error at the fallback event, on the tick's own connection, rolls the base back with it.
+        conn.execute("CREATE TEMP TRIGGER injected BEFORE INSERT ON task_events WHEN NEW.kind = "
+                     "'worktree_base_fallback' BEGIN SELECT RAISE(ABORT, 'injected'); END")
+        first = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
+        conn.execute("DROP TRIGGER temp.injected")
+    finally:
+        conn.close()
+    _waiting(world, github, tid, first)
+
+    # The dispatcher restarts: the next pass runs in a fresh process, which never saw the failed fetch.
+    spawned, output = _fresh(world, github)
+
+    _recovered(world, github, tid, spawned)
+    _no_credential_kept(world, output, _log_text(caplog))
+
+
+def test_an_interrupted_preparation_keeps_the_fallback_cause_for_a_fresh_dispatcher(world, github, monkeypatch,
+                                                                                     caplog):
+    _capture_all_logs(caplog)
+    kb, db = world.kb, world.kb.kanban_db_path()
+    shutil.rmtree(world.bare)
+    tid = _new_card(kb, world.repo)
+
+    first = _interrupted(kb, monkeypatch)
+
+    _waiting(world, github, tid, first)
+    raw = sqlite3.connect(str(db))
+    try:
+        assert raw.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'spawn_failed'",
+                           (tid,)).fetchone() == (1,)
+    finally:
+        raw.close()
+
+    spawned, output = _fresh(world, github)
+
+    _recovered(world, github, tid, spawned)
+    _no_credential_kept(world, output, _log_text(caplog))
+
+
+def test_a_retained_cause_writes_no_second_fallback_event(world, github, monkeypatch):
+    kb, db = world.kb, world.kb.kanban_db_path()
+    shutil.rmtree(world.bare)
+    tid = _new_card(kb, world.repo)
+    workspace = _waiting(world, github, tid, _interrupted(kb, monkeypatch))
+    kept = _pending(workspace)
+    _recovered(world, github, tid, _fresh(world, github)[0])
+    recorded = _base_events(db, tid)
+    # As if that process had died between its commit and the retirement: the exact bytes are back.
+    assert kept
+    for path, data in kept.items():
+        path.write_bytes(data)
+
+    answer, output = _fresh(world, github, tid, str(workspace))
+
+    # The base exists, so nothing is written again: one fallback event, the same base, and the cause retired.
+    assert answer == world.head == _task(kb, tid).base_commit
+    assert _base_events(db, tid) == recorded and _pending(workspace) == {}
+    assert github["tokens"] == [PUBLISH]
+    _no_credential_kept(world, output)
+
+
+def test_an_interruption_right_after_the_worktree_is_made_keeps_its_cause_for_a_fresh_dispatcher(
+        world, github, monkeypatch, caplog):
+    _capture_all_logs(caplog)
+    kb, db = world.kb, world.kb.kanban_db_path()
+    shutil.rmtree(world.bare)
+    tid = _new_card(kb, world.repo)
+    run = subprocess.run
+
+    def interrupted(*args, **kwargs):
+        done = run(*args, **kwargs)
+        cmd = args[0] if args else kwargs.get("args")
+        if isinstance(cmd, list) and cmd[3:5] == ["worktree", "add"] and done.returncode == 0:
+            raise RuntimeError("interrupted right after the worktree was made")
+        return done
+
+    # The real git worktree add runs and succeeds; the preparation stops right after it, before anything else.
+    with monkeypatch.context() as patch:
+        patch.setattr(kb.subprocess, "run", interrupted)
+        first = _dispatch(kb)
+
+    workspace = _waiting(world, github, tid, first)
+    assert _git(workspace, "rev-parse", "HEAD") == world.head and len(_spawn_failures(db, tid)) == 1
+
+    spawned, output = _fresh(world, github)
+
+    _recovered(world, github, tid, spawned)
+    _no_credential_kept(world, output, _log_text(caplog))
+
+
+def test_a_failed_durable_write_makes_no_worktree_and_a_fresh_dispatcher_prepares_again(
+        world, github, monkeypatch, caplog):
+    _capture_all_logs(caplog)
+    kb, db = world.kb, world.kb.kanban_db_path()
+    shutil.rmtree(world.bare)
+    refs = _refs(world.repo)
+    tid = _new_card(kb, world.repo)
+
+    def refused(*args, **kwargs):
+        raise OSError("injected: no space left for the cause")
+
+    # The cause cannot be written, and the pass stops at record_worktree_base should it get there, so nothing
+    # this process holds in memory can serve the retry.
+    with monkeypatch.context() as patch:
+        patch.setattr(kb, "_atomic_write_text", refused)
+        first = _interrupted(kb, monkeypatch)
+
+    task = _task(kb, tid)
+    assert not (world.repo / ".worktrees" / tid).exists() and _refs(world.repo) == refs
+    assert task.base_commit is None and _base_events(db, tid) == []
+    assert tid not in [spawned[0] for spawned in first.spawned] and task.status == "ready"
+    failures = _spawn_failures(db, tid)
+    assert len(failures) == 1 and "injected" not in str(failures[0]) + _log_text(caplog)
+
+    # The dispatcher restarts with the remote still gone: the fresh pass prepares from scratch, its own fetch
+    # failing the same way.
+    spawned, output = _fresh(world, github)
+
+    _recovered(world, github, tid, spawned, preparations=2)
+    _no_credential_kept(world, output, _log_text(caplog))
+
+
+def test_an_unverified_prepared_fallback_is_never_ordinary_work(world, github, monkeypatch, caplog):
+    _capture_all_logs(caplog)
+    kb, db = world.kb, world.kb.kanban_db_path()
+    shutil.rmtree(world.bare)
+    tid = _new_card(kb, world.repo)
+    workspace = _waiting(world, github, tid, _interrupted(kb, monkeypatch))
+    kept = _pending(workspace)
+    assert kept
+    # The pending cause now names another commit than the one the prepared worktree holds.
+    for path, data in kept.items():
+        assert world.head.encode() in data
+        path.write_bytes(data.replace(world.head.encode(), world.main.encode()))
+
+    spawned, output = _fresh(world, github)
+
+    task = _task(kb, tid)
+    assert task.base_commit is None and _base_events(db, tid) == []
+    assert tid not in spawned and task.status != "running"
+    failures = _spawn_failures(db, tid)
+    assert len(failures) == 2 and json.loads(failures[-1])["error"].startswith("worktree base: ")
+    _no_credential_kept(world, output, _log_text(caplog))
 
 
 def test_store_path_under_the_dispatcher_worker_environment(world, github, monkeypatch):

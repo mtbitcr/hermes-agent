@@ -41,6 +41,7 @@ and :func:`base_fallback` records why, after the base.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -1774,28 +1775,79 @@ def _intake(db_path: Path, row: dict, merge: str) -> Optional[bool]:
         title=task["title"], board=_board_slug(db_path))["recorded"]
 
 
-# A new card branch's start (kanban.delivery.exact_base). The kernel's worktree creator knows no task or
-# database, so the fixed reason a fetch of main failed waits here, by worktree path, until
-# record_worktree_base has committed that worktree's base and, in the same transaction, why.
-_BASE_FALLBACKS: dict[str, str] = {}
+# A new card branch's start (kanban.delivery.exact_base). When the fetch of main fails, the fixed reason, the
+# commit HEAD holds, the worktree path and the branch go on disk before the worktree exists, in one small file
+# per worktree path in the repository's git common directory: outside every working tree and no ref, so the
+# bound checkout's owner sees nothing, and there for a fresh dispatcher until record_worktree_base has
+# committed that worktree's base and, in the same transaction, why.
 _REASON = re.compile(r"[a-z_]{1,64}")  # a transport reason code, never an error's text
+_PENDING = "hermes-kanban-base-fallback"  # the pending causes' directory in a git common directory
+_PENDING_BOUND = 65536  # bytes: a reason code, a commit, a worktree path and a branch name
+_PENDING_FIELDS = {"reason", "base_commit", "target", "branch"}
 
 
 def _worktree_key(path) -> str:
     return str(Path(path).expanduser().resolve(strict=False))
 
 
-def worktree_start(repo_root, target) -> str:
-    """Where the kernel starts a NEW card branch for the worktree at ``target``: ``HEAD`` as always or,
-    with ``kanban.delivery.exact_base`` exactly true and ``repo_root``'s origin a repository of the
+def _pending_path(checkout: Path, key: str) -> Optional[Path]:
+    """The pending cause's file for the worktree path ``key`` in the git common directory of the repository
+    ``checkout`` belongs to; None when git cannot tell."""
+    found = _run_git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    lines = os.fsdecode(found.stdout).splitlines() if found is not None and found.returncode == 0 else []
+    if len(lines) != 1 or not os.path.isabs(lines[0]):
+        return None
+    return Path(lines[0]).resolve(strict=False) / _PENDING / hashlib.sha256(os.fsencode(key)).hexdigest()
+
+
+def _pending_cause(path: Path, worktree: Path) -> Optional[dict]:
+    """What ``path`` holds for the worktree at ``worktree``, read with a hard size bound: None when nothing is
+    pending for it (no file, or one naming another worktree path or another branch, an earlier preparation's);
+    the cause when it is exactly what :func:`worktree_start` writes; ``{}`` for anything else, a prepared
+    fallback that cannot be verified."""
+    try:
+        if path.is_symlink() or path.exists() and not path.is_file():
+            return {}
+        with open(path, "rb") as file:
+            data = file.read(_PENDING_BOUND + 1)
+        cause = json.loads(data) if len(data) <= _PENDING_BOUND else None
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(cause, dict) or set(cause) != _PENDING_FIELDS or not all(isinstance(v, str) for v in cause.values()):
+        return {}
+    if cause["target"] != _worktree_key(worktree):
+        return None
+    found = _run_git(worktree, "symbolic-ref", "--quiet", "HEAD")
+    branch = os.fsdecode(found.stdout).strip() if found is not None and found.returncode == 0 else None
+    if branch is not None and branch != f"refs/heads/{cause['branch']}":
+        return None
+    if branch is None or not (_SHA.fullmatch(cause["base_commit"]) and _REASON.fullmatch(cause["reason"])):
+        return {}
+    return cause
+
+
+def worktree_start(repo_root, target, branch) -> str:
+    """Where the kernel starts the NEW card branch ``branch`` for the worktree at ``target``: ``HEAD`` as always
+    or, with ``kanban.delivery.exact_base`` exactly true and ``repo_root``'s origin a repository of the
     delivery policy, the commit main holds on GitHub now, fetched through the publish step's transport
-    into ``refs/remotes/origin/main`` only. When that fetch fails the branch starts at ``HEAD`` and the
-    transport's fixed reason waits for :func:`base_fallback`. Opens no database."""
-    key = _worktree_key(target)
-    _BASE_FALLBACKS.pop(key, None)
+    into ``refs/remotes/origin/main`` only. When that fetch fails the branch starts at the commit HEAD holds,
+    returned only once the transport's fixed reason waits on disk for :func:`base_fallback`, so no fallback
+    worktree exists without its cause; should either fail, this raises and no worktree is made. An earlier
+    preparation's cause for ``target`` is cleared first. Opens no database."""
+    checkout, key = Path(repo_root), _worktree_key(target)
+    path = _pending_path(checkout, key)
+    if path is not None:
+        try:
+            path.unlink()
+        except (FileNotFoundError, NotADirectoryError):
+            pass
+        except OSError:
+            raise RuntimeError("kanban delivery: an earlier fallback cause of this worktree could not be cleared") from None
     if not exact_base_settings():
         return "HEAD"
-    repository = _origin_repository(Path(repo_root))
+    repository = _origin_repository(checkout)
     if repository is None or repository not in _policy_repositories():
         return "HEAD"
     reason = "fetch_failed"
@@ -1809,26 +1861,44 @@ def worktree_start(repo_root, target) -> str:
                 reason = error.reason
     except Exception:  # any other failure starts at HEAD too, and its text is never kept
         pass
-    _BASE_FALLBACKS[key] = reason
+    head = _run_git(checkout, "rev-parse", "--verify", "HEAD^{commit}")
+    commit = _sha(os.fsdecode(head.stdout)) if head is not None and head.returncode == 0 else None
+    cause = json.dumps({"reason": reason, "base_commit": commit, "target": key, "branch": branch})
+    kept = commit is not None and path is not None and len(cause) <= _PENDING_BOUND
+    if kept:
+        try:
+            path.parent.mkdir(exist_ok=True)
+            kb._atomic_write_text(path, cause)
+        except OSError:
+            kept = False
+    if not kept:
+        raise RuntimeError("kanban delivery: the fetch of main failed and its cause could not be kept; no worktree was made")
     logger.warning("kanban delivery: the fetch of main failed (%s); the new card branch starts at HEAD", reason)
-    return "HEAD"
+    return commit
 
 
 @contextlib.contextmanager
 def base_fallback(workspace_path):
     """Entered by ``record_worktree_base`` just before its write transaction, in the same ``with``, for the
-    worktree at ``workspace_path``; yields the recorder it runs right after it records that base, in that
-    transaction and on its connection, opening none. When the branch started at HEAD because the fetch of
-    main failed, the recorder appends the commit recorded and the fixed reason. The reason is forgotten
-    only once that transaction has committed: a rollback or a failed commit keeps it for the retry."""
-    key, recorded = _worktree_key(workspace_path), []
+    worktree at ``workspace_path``; yields the recorder it runs right after its UPDATE has set that base, in
+    that transaction and on its connection, opening none. The cause pending for that worktree is read here,
+    before the transaction: when it is this branch's and names the commit recorded, the recorder appends that
+    commit and the fixed reason; when it is there but cannot be verified, the recorder raises, so the base
+    rolls back and that prepared fallback never becomes ordinary work. The cause is retired only once that
+    transaction has committed: a rollback or a failed commit keeps it for the retry, in this process or a
+    fresh one."""
+    workspace = Path(workspace_path)
+    path = _pending_path(workspace, _worktree_key(workspace))
+    pending = _pending_cause(path, workspace) if path is not None else None
 
     def record(conn: sqlite3.Connection, task_id: str, base_commit: str) -> None:
-        reason = _BASE_FALLBACKS.get(key)
-        if reason is not None:
-            kb._append_event(conn, task_id, "worktree_base_fallback", {"base_commit": base_commit, "reason": reason})
-            recorded.append(reason)
+        if pending is None:
+            return
+        if pending.get("base_commit") != base_commit:
+            raise kb.WorktreeScopeError("the pending fallback cause of this worktree cannot be verified")
+        kb._append_event(conn, task_id, "worktree_base_fallback", {"base_commit": base_commit, "reason": pending["reason"]})
 
     yield record
-    if recorded:  # reached only on a clean exit, so after write_txn's commit
-        _BASE_FALLBACKS.pop(key, None)
+    if pending is not None:  # reached only on a clean exit, so after write_txn's commit
+        with contextlib.suppress(OSError):
+            path.unlink()

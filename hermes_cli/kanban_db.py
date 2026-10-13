@@ -31362,7 +31362,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:  # a new branch: at HEAD, or at the current main when kanban.delivery.exact_base is true
         from hermes_cli.kanban_delivery import worktree_start
-        cmd = ["git", "-C", str(repo_root), "worktree", "add", "-b", branch_name, str(target), worktree_start(repo_root, target)]
+        cmd = ["git", "-C", str(repo_root), "worktree", "add", "-b", branch_name, str(target), worktree_start(repo_root, target, branch_name)]
     result = subprocess.run(
         cmd,
         capture_output=True,
