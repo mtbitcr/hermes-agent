@@ -12,6 +12,10 @@ before any credential exists. The push then reads no git configuration the trans
 inherits no variable from the host beyond what starting a process needs, may speak only GIT_ORIGIN's
 own protocol, and names one URL, one refspec and its lease. So no hook, trace, URL rewrite, custom
 transport or push setting of the worktree can reach it.
+
+A fetch of main (GitHubTransport.fetch_main) runs the same way: the checkout's HEAD is copied in first,
+the git that carries the credential fetches main alone, and the commit goes on from that copy into the
+checkout's remote-tracking ref, with no credential.
 """
 from __future__ import annotations
 
@@ -49,6 +53,10 @@ _PUSH_SCHEMES = ("https", "file")
 # operating system needs to start a process at all. Nothing git reads as policy is carried over: no
 # configuration, transport, proxy, trust-store, askpass or trace variable can arrive from the host.
 _GIT_ENV_NAMES = ("PATH", "SYSTEMROOT", "COMSPEC", "TEMP", "TMP", "TMPDIR")
+# A fetch brings one ref, the admitted main, and writes one in the bound checkout, its remote-tracking ref,
+# so the checkout's HEAD, branches, index and working tree never move.
+_MAIN = "refs/heads/main"
+_MAIN_TRACKING = "refs/remotes/origin/main"
 
 # Callers name a step, never a permission map, so these are the only token requests there are.
 # On GitHub write includes read, and every token gets metadata read without asking.
@@ -286,6 +294,12 @@ def _copy_commit(home: str, worktree: str | Path, sha: str, ref: str) -> str:
     return repository
 
 
+def _commit_of(result: subprocess.CompletedProcess | None) -> str:
+    """The commit a successful ``rev-parse --verify`` printed, or "" when it printed none."""
+    text = result.stdout.decode("utf-8", "replace").strip() if result is not None and result.returncode == 0 else ""
+    return text if _is_sha(text) else ""
+
+
 class GitHubTransport:
     """One step's GitHub access to one repository, through one narrowed installation token."""
 
@@ -379,6 +393,51 @@ class GitHubTransport:
         if result.returncode != 0 or not line or line[0] not in {"*", " ", "+", "="}:
             raise GitHubTransportError("push_failed")
         return {"state": "up_to_date" if line[0] == "=" else "pushed", "branch": branch, "head": sha}
+
+    def fetch_main(self, checkout: str | Path) -> str:
+        """Fetch the commit main holds now into the repository at `checkout` as its
+        refs/remotes/origin/main, and nothing else, and return it: the checkout's HEAD, branches, index and
+        working tree never move. As in a push, the git that carries the credential runs in a fresh bare
+        repository in a private temporary directory, here seeded with the checkout's HEAD so only the newer
+        history travels, and the commit goes on into the checkout from that copy with no credential."""
+        if not _holds(self._permissions, ("contents", "read")):
+            raise GitHubTransportError("step_not_permitted")
+        url, scheme = self._push_url()  # the source, fixed before any credential exists
+        checkout = os.path.abspath(checkout)
+        try:
+            home = tempfile.mkdtemp(prefix="hermes-delivery-fetch-")  # mode 0700, for this one fetch
+        except OSError:
+            raise GitHubTransportError("fetch_failed") from None
+        try:
+            env = _git_base_env(home)
+            head = _commit_of(_run_git(["git", "-C", checkout, "rev-parse", "--verify", "HEAD^{commit}"], env))
+            try:
+                repository = _copy_commit(home, checkout, head, "refs/heads/seed") if head else None
+            except GitHubTransportError:
+                repository = None
+            if repository is None:
+                raise GitHubTransportError("fetch_failed")
+            # Only GIT_ORIGIN's own protocol, one URL and one refspec, main into its remote-tracking ref, and
+            # no tag, FETCH_HEAD or maintenance run beside it.
+            argv = ["git", "-c", "protocol.allow=never", "-c", f"protocol.{scheme}.allow=always",
+                    "--git-dir", repository, "fetch", "--no-tags", "--no-write-fetch-head", "--no-auto-maintenance",
+                    url, f"+{_MAIN}:{_MAIN_TRACKING}"]
+            fetched = _run_git(argv, self._git_env(_git_base_env(home)))  # the token is minted here
+            if fetched is None or fetched.returncode != 0:
+                raise GitHubTransportError("fetch_failed")
+            sha = _commit_of(_run_git(
+                ["git", "--git-dir", repository, "rev-parse", "--verify", f"{_MAIN_TRACKING}^{{commit}}"], env))
+            # Into the checkout from that copy, with no credential: only the file protocol, this one commit into
+            # its one ref, and no tag, prune, FETCH_HEAD, submodule fetch or maintenance run.
+            copy = ["git", "-c", "protocol.allow=never", "-c", "protocol.file.allow=always", "-C", checkout,
+                    "fetch", "--no-tags", "--no-prune", "--no-write-fetch-head", "--no-recurse-submodules",
+                    "--no-auto-maintenance", repository, f"+{sha}:{_MAIN_TRACKING}"]
+            copied = _run_git(copy, env) if sha else None
+            if copied is None or copied.returncode != 0:
+                raise GitHubTransportError("fetch_failed")
+        finally:
+            shutil.rmtree(home, ignore_errors=True)  # the copy, the history fetched into it and the config
+        return sha
 
     def _installation_token(self) -> str:
         if self._token is None:
