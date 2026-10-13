@@ -1,15 +1,19 @@
 """Card 2: with ``kanban.delivery.exact_base`` exactly true, the arm step merges an approved head only on the
 base its review saw. Under one merge lock per repository, a file under the kanban root that every board and
 process shares, it reads main and merges when main is the reviewed base or is already in the approved head;
-else it sends nothing and records base_moved with the reviewed base, the observed main and the head. An
-answer that is neither 200 nor 4xx is read back from GitHub once and never sent again. With the setting
-anything but exactly true the arm is today's. Real boards and git; GitHub is the real transport with only
-its exchange and App token replaced, so every call passes the allowlist."""
+else it sends nothing and records base_moved with the reviewed base, the observed main and the head. Main's
+answer must name refs/heads/main. An answer that is neither 200 nor a refusal GitHub documents for a merge it
+did not make is read back from GitHub once and never sent again. The merge pass compares the merge's first
+parent with the main the arm checked and records delivery_merged_off_base when they differ. With the setting
+anything but exactly true the arm and the merge pass are today's. Real boards and git; GitHub is the real
+transport with only its exchange and App token replaced, so every call passes the allowlist, and its git
+origin is a local bare repository."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -46,14 +50,20 @@ def _setting(home: Path, exact_base) -> None:
 
 
 @pytest.fixture
-def exact(armed, monkeypatch):
+def exact(armed, monkeypatch, tmp_path):
     """The armed world, where GitHub also answers main's ref with gh["main"], or gh["main_answer"] ("timeout":
-    no answer), and runs gh["hooks"]["MAIN"] once during that read; each read of it is in gh["calls"]."""
+    no answer), and runs gh["hooks"]["MAIN"] once during that read; each read of it is in gh["calls"]. GitHub's
+    git origin is gh["bare"], a bare repository holding the board repository's main, as part 1's tests lay it
+    out, so the merge recorder's fetch of main never reaches the network."""
     kb, root, repo, gh = armed
     from hermes_cli import kanban_delivery_github as transport
 
+    bare = tmp_path / "remotes" / "mtbitcr" / "hermes-agent.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True, capture_output=True)
+    _git(repo, "push", "-q", str(bare), "main")
+    monkeypatch.setattr(transport, "GIT_ORIGIN", (tmp_path / "remotes").as_uri())
     inner = transport._exchange
-    gh.update(main=None, main_answer=None)
+    gh.update(main=None, main_answer=None, bare=bare)
 
     def exchange(method, target, authorization, payload=None):
         if (method, urlsplit(target).path) == ("GET", MAIN):
@@ -111,6 +121,42 @@ def _intaken(head) -> list:
 def _merges(kb, tid) -> list:
     """The merge commits of the source card's delivery_merged events."""
     return [payload["merge_commit"] for kind, payload in _events(kb, tid) if kind == "delivery_merged"]
+
+
+def _off_base(kb, tid) -> list:
+    """The payloads of the source card's delivery_merged_off_base events."""
+    return [payload for kind, payload in _events(kb, tid) if kind == "delivery_merged_off_base"]
+
+
+def _fetches(monkeypatch) -> list:
+    """Each fetch of main the transport makes from now on, by the checkout it fetches into."""
+    from hermes_cli import kanban_delivery_github as transport
+
+    made, fetch_main = [], transport.GitHubTransport.fetch_main
+
+    def counted(self, checkout):
+        made.append(str(checkout))
+        return fetch_main(self, checkout)
+
+    monkeypatch.setattr(transport.GitHubTransport, "fetch_main", counted)
+    return made
+
+
+def _merge_on_put(scene, move: bool) -> dict:
+    """GitHub's merge of H, made with real git in the board repository during the merge request: a two-parent
+    commit with H second, on main or, when ``move``, on main after it moved on with a change H does not hold.
+    GitHub then shows the pull request merged as that commit, and main at it. The dict holds the merge and its
+    first parent once the merge request is sent."""
+    kb, root, repo, gh = scene
+    landed = {}
+
+    def merge():
+        landed["first_parent"] = _moved(repo) if move else _git(repo, "rev-parse", "main")
+        _git(repo, "merge", "-q", "--no-ff", "--no-edit", gh["head"])
+        landed["merge"] = gh["main"] = gh["ended"][41] = _git(repo, "rev-parse", "HEAD")
+
+    gh["hooks"]["PUT"] = merge
+    return landed
 
 
 def test_the_arm_merges_when_main_is_the_reviewed_base(exact):
@@ -211,16 +257,18 @@ def test_with_the_setting_off_the_arm_merges_as_today(exact, value):
     assert _locks(root) == [] and not (root / "kanban" / "merge-locks").exists()
 
 
-@pytest.mark.parametrize("answer", ["timeout", (502, None)], ids=["timeout", "5xx"])
+@pytest.mark.parametrize("answer", ["timeout", (502, None), (408, None), (429, None)],
+                         ids=["timeout", "5xx", "408", "429"])
 @pytest.mark.parametrize("merged", [True, False], ids=["merged_on_github", "not_merged"])
 def test_an_unknown_answer_is_read_back_once_and_the_merge_is_never_sent_again(exact, answer, merged):
-    """No status, or one neither 200 nor 4xx: the pull request and main are read once, inside the lock. Shown
-    merged into main at H it is armed now and recorded merged by the next pass; shown not merged yet it stays
-    unknown, never refused, and each later pass reads it again. The event keeps the answer's status and reason."""
+    """No status, or one that is neither 200 nor a refusal GitHub documents (a 5xx, a request timeout, a rate
+    limit): the pull request and main are read once, inside the lock. Shown merged into main at H it is armed
+    now and recorded merged by the next pass; shown not merged yet it stays unknown, never refused, and each
+    later pass reads it again. The event keeps the answer's status and reason."""
     kb, root, repo, gh = exact
     tid, head, base = _approved_head(exact)
     gh.update(main=base, arm=answer)
-    if merged:  # GitHub merged it, but its answer was lost or a 5xx
+    if merged:  # GitHub merged it, but its answer was lost or unconfirmed
         gh["hooks"]["PUT"] = lambda: gh["ended"].__setitem__(41, ARMED["sha"]) or gh.update(main=ARMED["sha"])
     _setting(root, "true")
 
@@ -228,7 +276,7 @@ def test_an_unknown_answer_is_read_back_once_and_the_merge_is_never_sent_again(e
 
     assert gh["calls"][-5:] == [("GET", REVIEWS), ("GET", MAIN), ("PUT", MERGE), ("GET", PULL), ("GET", MAIN)]
     [(kind, payload)] = _outcomes(kb, tid)
-    status, reason = (None, "network_error") if answer == "timeout" else (502, None)
+    status, reason = (None, "network_error") if answer == "timeout" else (answer[0], None)
     assert (payload["status"], payload["reason"], payload["read_head"], payload["observed_main"]) == (
         status, reason, head, base)
     if merged:
@@ -267,13 +315,14 @@ def test_a_read_back_showing_another_head_is_unknown_and_never_recorded(exact):
     assert (_merges(kb, tid), _intaken(head)) == ([], [])
 
 
-def test_a_merge_that_completes_after_the_read_back_is_recorded_once_github_shows_it(exact):
+@pytest.mark.parametrize("answer", ["timeout", (408, None)], ids=["timeout", "408"])
+def test_a_merge_that_completes_after_the_read_back_is_recorded_once_github_shows_it(exact, answer):
     """The verifier's second case: the merge request was still in flight when the read-back found the pull
     request not merged. The row is unknown, never refused, so the merge pass records the merge once GitHub shows
-    it merged at H; the merge was sent once in all."""
+    it merged at H; the merge was sent once in all. A request timeout (408) is such an answer too."""
     kb, root, repo, gh = exact
     tid, head, base = _approved_head(exact)
-    gh.update(main=base, arm="timeout")
+    gh.update(main=base, arm=answer)
     _setting(root, "true")
 
     _tick(kb)
@@ -289,6 +338,53 @@ def test_a_merge_that_completes_after_the_read_back_is_recorded_once_github_show
 
     assert (len(_arms(gh)), _state(kb, head), _merges(kb, tid)) == (1, "merged", [ARMED["sha"]])
     assert "delivery_auto_merge_refused" not in [kind for kind, payload in _events(kb, tid)]
+
+
+@pytest.mark.parametrize("status", [403, 404, 405, 409, 422])
+def test_a_documented_refusal_is_recorded_refused_without_a_read_back(exact, status):
+    """An answer GitHub documents for a merge it did not make is a refusal: the row is refused with that status
+    and nothing is read back, so no GitHub call follows the merge, which was sent once; later passes send and
+    read nothing."""
+    kb, root, repo, gh = exact
+    tid, head, base = _approved_head(exact)
+    gh.update(main=base, arm=(status, None))
+    _setting(root, "true")
+
+    _tick(kb)
+
+    assert (_arms(gh), _state(kb, head)) == ([{"sha": head, "merge_method": "merge"}], "auto_merge_refused")
+    assert gh["calls"][-3:] == [("GET", REVIEWS), ("GET", MAIN), ("PUT", MERGE)]  # nothing is read after it
+    [(kind, payload)] = _outcomes(kb, tid)
+    assert (kind, payload["status"], payload["observed_main"]) == ("delivery_auto_merge_refused", status, base)
+    assert set(payload) == TODAY | {"observed_main"}
+    calls = len(gh["calls"])
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (len(_arms(gh)), _state(kb, head), gh["calls"][calls:]) == (1, "auto_merge_refused", [])
+
+
+@pytest.mark.parametrize("answer, state", [
+    ((200, None), "auto_merge_armed"), ((201, None), "auto_merge_refused"), ((400, None), "auto_merge_refused"),
+    ((408, None), "auto_merge_refused"), ((429, None), "auto_merge_refused"), ((500, None), "auto_merge_refused"),
+    ("timeout", "auto_merge_unknown")], ids=["200", "201", "400", "408", "429", "500", "timeout"])
+def test_with_the_setting_off_each_merge_answer_is_recorded_as_today(exact, answer, state):
+    """With the setting absent and main moved, the merge answer is classified exactly as released: armed on 200,
+    unknown with no status, refused with any other status. One merge, no main read, and the merge is the last
+    GitHub call of the pass, with today's event."""
+    kb, root, repo, gh = exact
+    tid, head, base = _approved_head(exact)
+    gh.update(main=_moved(repo), arm=answer)
+    _setting(root, None)
+
+    _tick(kb)
+
+    assert (_state(kb, head), len(_arms(gh))) == (state, 1)
+    assert ("GET", MAIN) not in gh["calls"] and gh["calls"][-1] == ("PUT", MERGE)
+    [(kind, payload)] = _outcomes(kb, tid)
+    assert (kind, set(payload), payload["status"]) == (
+        f"delivery_{state}", TODAY, None if answer == "timeout" else answer[0])
 
 
 @pytest.mark.parametrize("value", ["true", None], ids=["on", "off"])
@@ -357,22 +453,211 @@ def test_a_merge_lock_held_elsewhere_sends_and_records_nothing_until_it_is_free(
     assert (_arms(gh), _state(kb, head)) == ([{"sha": head, "merge_method": "merge"}], "auto_merge_armed")
 
 
-@pytest.mark.parametrize("answer", ["timeout", (404, {"message": "Not Found"}), (200, {"object": {"sha": "main"}})],
-                         ids=["timeout", "404", "malformed"])
+@pytest.mark.parametrize("answer", ["timeout", (404, {"message": "Not Found"}), (200, {"object": {"sha": "main"}}),
+                                    "other_ref", "no_ref"],
+                         ids=["timeout", "404", "malformed", "other_ref", "no_ref"])
 def test_a_main_that_cannot_be_read_sends_and_records_nothing_until_it_can(exact, answer):
+    """An answer naming another ref than main, or none, is no read of main either, even when its commit is the
+    reviewed base: there main has really moved, so once GitHub's answer names main the row is base_moved."""
     kb, root, repo, gh = exact
     tid, head, base = _approved_head(exact)
-    gh.update(main=base, main_answer=answer)
+    moved = _moved(repo) if answer in ("other_ref", "no_ref") else None
+    if moved:  # the reviewed base under another ref's name, or under none
+        answer = (200, {**({"ref": "refs/heads/some-other-branch"} if answer == "other_ref" else {}),
+                        "object": {"sha": base}})
+    gh.update(main=moved or base, main_answer=answer)
     _setting(root, "true")
-    calls = len(gh["calls"])
+    calls, events = len(gh["calls"]), _events(kb, tid)
 
     _tick(kb)
     assert ("GET", MAIN) in gh["calls"][calls:]
-    assert (_arms(gh), _state(kb, head), _outcomes(kb, tid)) == ([], "review_cards_created", [])
+    assert (_arms(gh), _state(kb, head), _events(kb, tid)) == ([], "review_cards_created", events)
 
     gh["main_answer"] = None
     _tick(kb)
-    assert (_arms(gh), _state(kb, head)) == ([{"sha": head, "merge_method": "merge"}], "auto_merge_armed")
+    if moved:
+        assert (_arms(gh), _state(kb, head)) == ([], "base_moved")
+        [(kind, payload)] = _outcomes(kb, tid)
+        assert (kind, payload["reviewed_base"], payload["observed_main"]) == ("delivery_base_moved", base, moved)
+    else:
+        assert (_arms(gh), _state(kb, head)) == ([{"sha": head, "merge_method": "merge"}], "auto_merge_armed")
+
+
+def test_a_read_back_of_main_naming_another_ref_is_a_failed_read(exact):
+    """The merge answer is lost and GitHub then shows the pull request merged at H, but main's answer names
+    another ref: no read of main, so the read-back failed. The row is unknown with read_back read_failed, never
+    armed, and the merge was sent once."""
+    kb, root, repo, gh = exact
+    tid, head, base = _approved_head(exact)
+    gh.update(main=base, arm="timeout")
+    gh["hooks"]["PUT"] = lambda: gh["ended"].__setitem__(41, ARMED["sha"]) or gh.update(main_answer=(
+        200, {"ref": "refs/heads/some-other-branch", "object": {"sha": ARMED["sha"]}}))
+    _setting(root, "true")
+
+    _tick(kb)
+
+    assert gh["calls"][-3:] == [("PUT", MERGE), ("GET", PULL), ("GET", MAIN)]
+    assert (len(_arms(gh)), _state(kb, head)) == (1, "auto_merge_unknown")
+    [(kind, payload)] = _outcomes(kb, tid)
+    assert (kind, payload["read_back"], payload["read_head"], payload["merge_commit"]) == (
+        "delivery_auto_merge_unknown", "read_failed", head, ARMED["sha"])
+    assert "main_on_read" not in payload
+
+
+def test_a_merge_whose_first_parent_is_not_the_checked_main_is_recorded_off_base(exact):
+    """Plan A(b): main is the reviewed base when the arm reads it under the lock, but it moves on before GitHub
+    merges, so the merge's first parent is not the main the arm checked. The merge pass records one
+    delivery_merged_off_base event with the merge commit, its first parent, the checked main and the reviewed
+    base, and records the merge as today: delivery_merged, and the release intake holds it for H."""
+    kb, root, repo, gh = exact
+    tid, head, base = _approved_head(exact)
+    gh["main"] = base
+    _setting(root, "true")
+    landed = _merge_on_put(exact, move=True)
+
+    _tick(kb)
+    _tick(kb)
+    _tick(kb)
+
+    merge, moved = landed["merge"], landed["first_parent"]
+    assert moved != base and _git(repo, "rev-parse", f"{merge}^1") == moved
+    delivery = _raw(kb.kanban_db_path(), "SELECT id FROM kanban_deliveries WHERE source_head = ?", head)[0]["id"]
+    assert _off_base(kb, tid) == [{
+        "delivery_id": delivery, "head": head, "pull_request_number": 41, "repository": REPO,
+        "merge_commit": merge, "first_parent": moved, "observed_main": base, "reviewed_base": base}]
+    assert (_state(kb, head), _merges(kb, tid), _intaken(head), len(_arms(gh))) == ("merged", [merge], [merge], 1)
+
+
+def test_a_merge_on_the_checked_main_is_recorded_merged_with_no_off_base_event(exact, monkeypatch):
+    """The control: GitHub merges H onto the very main the arm checked. Git holds the merge, so nothing is
+    fetched, and its first parent is the checked main: no off-base event, and the merge is recorded as today."""
+    kb, root, repo, gh = exact
+    tid, head, base = _approved_head(exact)
+    gh["main"] = base
+    _setting(root, "true")
+    landed, fetched = _merge_on_put(exact, move=False), _fetches(monkeypatch)
+
+    _tick(kb)
+    _tick(kb)
+
+    merge = landed["merge"]
+    assert _git(repo, "rev-parse", f"{merge}^1") == landed["first_parent"] == base
+    assert (_off_base(kb, tid), fetched) == ([], [])
+    assert (_state(kb, head), _merges(kb, tid), _intaken(head), len(_arms(gh))) == ("merged", [merge], [merge], 1)
+
+
+def test_a_merge_only_github_holds_is_read_after_one_fetch_of_main(exact, monkeypatch, tmp_path):
+    """GitHub's merge exists only on the remote's main (made in a separate clone and pushed there), so the card's
+    repository does not hold it: the merge pass fetches main once, refs/remotes/origin/main then holds the merge,
+    the repository's HEAD and branches did not move, and the first parent is read from what was fetched. Main
+    moved on in that clone first, so the read shows in the off-base event."""
+    kb, root, repo, gh = exact
+    tid, head, base = _approved_head(exact)
+    gh["main"] = base
+    _setting(root, "true")
+    clone, landed = tmp_path / "elsewhere", {}
+
+    def merge_on_github():
+        _git(repo, "push", "-q", str(gh["bare"]), f"{head}:refs/heads/delivery/{tid}")  # the published branch
+        subprocess.run(["git", "clone", "-q", "-b", "main", str(gh["bare"]), str(clone)], check=True, capture_output=True)
+        landed["first_parent"] = _moved(clone)
+        _git(clone, "merge", "-q", "--no-ff", "--no-edit", head)
+        landed["merge"] = gh["main"] = gh["ended"][41] = _git(clone, "rev-parse", "HEAD")
+        _git(clone, "push", "-q", "origin", "main")
+
+    gh["hooks"]["PUT"] = merge_on_github
+    _tick(kb)
+    merge = landed["merge"]
+    held = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"{merge}^{{commit}}"], capture_output=True)
+    assert held.returncode != 0  # the card's repository does not hold the merge
+    where, fetched = (_git(repo, "rev-parse", "HEAD"), _git(repo, "for-each-ref", "refs/heads")), _fetches(monkeypatch)
+
+    _tick(kb)
+
+    assert len(fetched) == 1
+    assert _git(repo, "rev-parse", "refs/remotes/origin/main") == merge
+    assert (_git(repo, "rev-parse", "HEAD"), _git(repo, "for-each-ref", "refs/heads")) == where
+    [payload] = _off_base(kb, tid)
+    assert (payload["merge_commit"], payload["first_parent"], payload["observed_main"]) == (
+        merge, landed["first_parent"], base)
+    assert (_state(kb, head), _merges(kb, tid), _intaken(head), len(_arms(gh))) == ("merged", [merge], [merge], 1)
+
+
+def test_a_merge_git_cannot_find_after_the_fetch_is_recorded_merged_with_no_off_base_event(exact, monkeypatch, caplog):
+    """GitHub names a merge commit that neither the card's repository nor the fetched main holds: its first parent
+    stays unreadable after the one fetch, so one warning names the delivery and the merge commit, no off-base
+    event is recorded, and the merge is recorded as today."""
+    kb, root, repo, gh = exact
+    tid, head, base = _approved_head(exact)
+    gh["main"] = base
+    _setting(root, "true")
+    _tick(kb)
+    gh["ended"][41] = ARMED["sha"]
+    fetched = _fetches(monkeypatch)
+    caplog.set_level(logging.WARNING, logger="hermes_cli.kanban_delivery")
+
+    _tick(kb)
+
+    delivery = _raw(kb.kanban_db_path(), "SELECT id FROM kanban_deliveries WHERE source_head = ?", head)[0]["id"]
+    warned = [record.getMessage() for record in caplog.records
+              if record.name == "hermes_cli.kanban_delivery" and ARMED["sha"] in record.getMessage()]
+    assert len(fetched) == 1 and len(warned) == 1 and f"delivery {delivery}:" in warned[0]
+    assert (_off_base(kb, tid), _state(kb, head)) == ([], "merged")
+    assert (_merges(kb, tid), _intaken(head)) == ([ARMED["sha"]], [ARMED["sha"]])
+
+
+def test_with_the_setting_off_at_record_time_an_off_base_merge_is_recorded_as_today(exact, monkeypatch):
+    """Armed with exact_base on, then GitHub merges H onto a main that moved on; the setting is off when the merge
+    pass records it: no git read and no fetch, so no off-base event, and the merge is recorded as today."""
+    from hermes_cli import kanban_delivery as kd
+
+    kb, root, repo, gh = exact
+    tid, head, base = _approved_head(exact)
+    gh["main"] = base
+    _setting(root, "true")
+    landed = _merge_on_put(exact, move=True)
+    _tick(kb)
+    assert _state(kb, head) == "auto_merge_armed"
+    _setting(root, None)
+    fetched, reads, run_git = _fetches(monkeypatch), [], kd._run_git
+    monkeypatch.setattr(kd, "_run_git", lambda workdir, *args: reads.append(args) or run_git(workdir, *args))
+
+    _tick(kb)
+
+    merge = landed["merge"]
+    assert _git(repo, "rev-parse", f"{merge}^1") == landed["first_parent"] != base
+    assert (_off_base(kb, tid), fetched, [args for args in reads if f"{merge}^1" in args]) == ([], [], [])
+    assert (_state(kb, head), _merges(kb, tid), _intaken(head)) == ("merged", [merge], [merge])
+
+
+def test_an_off_base_merge_whose_intake_waits_a_pass_is_recorded_off_base_once(exact, monkeypatch):
+    """The first merge pass records the off-base event with its claim, but its intake does not settle the row,
+    which stays armed; the pass that records the merge finds that event for this delivery and merge commit and
+    adds none."""
+    from hermes_cli import kanban_delivery as kd
+
+    kb, root, repo, gh = exact
+    tid, head, base = _approved_head(exact)
+    gh["main"] = base
+    _setting(root, "true")
+    landed, intake, waited = _merge_on_put(exact, move=True), kd._intake, []
+
+    def unsettled_once(db_path, row, merge):
+        waited.append(merge)
+        return None if len(waited) == 1 else intake(db_path, row, merge)
+
+    monkeypatch.setattr(kd, "_intake", unsettled_once)
+    _tick(kb)
+    _tick(kb)
+
+    merge = landed["merge"]
+    assert (waited, _state(kb, head), _merges(kb, tid), len(_off_base(kb, tid))) == ([merge], "auto_merge_armed", [], 1)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_state(kb, head), _merges(kb, tid), _intaken(head), len(_arms(gh))) == ("merged", [merge], [merge], 1)
+    assert [payload["first_parent"] for payload in _off_base(kb, tid)] == [landed["first_parent"]]
 
 
 def test_the_merge_lock_is_one_root_file_from_the_worker_environment_too(exact, monkeypatch):
