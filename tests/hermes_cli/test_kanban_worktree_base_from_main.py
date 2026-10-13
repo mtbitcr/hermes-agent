@@ -378,17 +378,33 @@ def test_a_rolled_back_base_keeps_the_fallback_cause_for_the_retry(world, github
 
 
 # The next step in a fresh dispatcher process: the same reviewer policy and transport seams, on the local
-# stand-in and remotes, and the suite's memory-guard pin; the worker's launch is the only other stand-in. It
-# ticks the board once or, given a card and its worktree, records that worktree's base, and prints its answer.
+# stand-in and remotes, and the suite's memory-guard pin; the worker's launch is the only other stand-in. Given a
+# fault, the delivery helper's own launch of its git common directory lookup fails that way and nothing else does:
+# kanban_db's workspace checks and every other git run stay real. It ticks the board once or, given a card and its
+# worktree, records that worktree's base, and prints its answer.
 _FRESH = """
-import http.client, json, sys
-from hermes_cli import kanban_db as kb, kanban_delivery_github as transport
+import errno, http.client, json, os, subprocess, sys, types
+from hermes_cli import kanban_db as kb, kanban_delivery as delivery, kanban_delivery_github as transport
 from plugins.dashboard_auth.raphael_workspace import model_policy
-port, origin, reviewer, *card = sys.argv[1:]
+port, origin, reviewer, fault, *card = sys.argv[1:]
 model_policy.reviewer_profile_ids = lambda: (reviewer,)
 transport._connect = lambda: http.client.HTTPConnection("127.0.0.1", int(port), timeout=10)
 transport.GIT_ORIGIN = origin
 kb._system_memory_sample = lambda: {}
+
+def run(cmd, *args, **kwargs):
+    if cmd[3:] != ["rev-parse", "--path-format=absolute", "--git-common-dir"]:
+        return subprocess.run(cmd, *args, **kwargs)
+    if fault == "launch_refused":
+        raise BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN))
+    if fault == "timeout":
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+    if fault == "nonzero_exit":
+        return subprocess.CompletedProcess(cmd, 128, b"", b"fatal: not a git repository")
+    return subprocess.CompletedProcess(cmd, 0, b".git", b"")  # one path, but not an absolute one
+
+if fault:
+    delivery.subprocess = types.SimpleNamespace(**{**vars(subprocess), "run": run})
 conn = kb.connect()
 try:
     answer = kb.record_worktree_base(conn, *card) if card else kb.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
@@ -398,12 +414,14 @@ print(json.dumps(answer if card else [spawned[0] for spawned in answer.spawned])
 """
 
 
-def _fresh(world, github, *card) -> tuple:
+def _fresh(world, github, *card, fault: str = "") -> tuple:
     """:data:`_FRESH` in a new Python process with exactly this test's environment, on the same board and
-    repository: what it answered, and everything it wrote to its standard streams."""
+    repository, with the ``fault`` it names, if any: what it answered, and everything it wrote to its standard
+    streams."""
     env = {name: value for name, value in os.environ.items() if name not in _WORKER_ENV}
     env["HOME"] = str(Path.home())
-    argv = [sys.executable, "-c", _FRESH, str(github["port"]), (world.tmp / "remotes").as_uri(), REVIEWER, *card]
+    argv = [sys.executable, "-c", _FRESH, str(github["port"]), (world.tmp / "remotes").as_uri(), REVIEWER, fault,
+            *card]
     try:
         done = subprocess.run(argv, cwd=Path(world.kb.__file__).resolve().parents[1], env=env,
                               capture_output=True, text=True, timeout=120, check=True)
@@ -626,6 +644,38 @@ def test_an_unverified_prepared_fallback_is_never_ordinary_work(world, github, m
     assert tid not in spawned and task.status != "running"
     failures = _spawn_failures(db, tid)
     assert len(failures) == 2 and json.loads(failures[-1])["error"].startswith("worktree base: ")
+    _no_credential_kept(world, output, _log_text(caplog))
+
+
+@pytest.mark.parametrize("fault", ["launch_refused", "timeout", "nonzero_exit", "invalid_output"])
+def test_a_failed_lookup_of_the_pending_cause_refuses_the_base_and_keeps_the_cause(
+        world, github, monkeypatch, caplog, fault):
+    _capture_all_logs(caplog)
+    kb, db = world.kb, world.kb.kanban_db_path()
+    shutil.rmtree(world.bare)
+    # The card's own limit is a third failure, so the healthy pass after the interrupted and the faulted one runs.
+    tid = _new_card(kb, world.repo, max_retries=3)
+    workspace = _waiting(world, github, tid, _interrupted(kb, monkeypatch))
+    kept = _pending(workspace)
+    assert kept
+
+    # The dispatcher restarts, and in the fresh process only the delivery helper's lookup of the git common
+    # directory fails, after the worktree and its HEAD were checked: whether a cause waits is unknown, not "no".
+    spawned, output = _fresh(world, github, fault=fault)
+
+    task = _task(kb, tid)
+    assert task.base_commit is None and _base_events(db, tid) == []
+    assert tid not in spawned and task.status == "ready"
+    assert _pending(workspace) == kept
+    failures = _spawn_failures(db, tid)
+    assert len(failures) == 2 and json.loads(failures[-1])["error"] == (
+        "worktree base: whether a fallback cause is pending for this worktree cannot be established")
+    _no_credential_kept(world, output, _log_text(caplog))
+
+    # A healthy fresh dispatcher finds the same cause and records it right after the base.
+    spawned, output = _fresh(world, github)
+
+    _recovered(world, github, tid, spawned)
     _no_credential_kept(world, output, _log_text(caplog))
 
 

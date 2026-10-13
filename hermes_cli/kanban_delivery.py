@@ -1792,7 +1792,8 @@ def _worktree_key(path) -> str:
 
 def _pending_path(checkout: Path, key: str) -> Optional[Path]:
     """The pending cause's file for the worktree path ``key`` in the git common directory of the repository
-    ``checkout`` belongs to; None when git cannot tell."""
+    ``checkout`` belongs to; None when git cannot tell (it could not run or timed out, exited nonzero, or did not
+    answer exactly one absolute path): where a cause would wait is then unknown, never a sign that none does."""
     found = _run_git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
     lines = os.fsdecode(found.stdout).splitlines() if found is not None and found.returncode == 0 else []
     if len(lines) != 1 or not os.path.isabs(lines[0]):
@@ -1881,17 +1882,22 @@ def worktree_start(repo_root, target, branch) -> str:
 def base_fallback(workspace_path):
     """Entered by ``record_worktree_base`` just before its write transaction, in the same ``with``, for the
     worktree at ``workspace_path``; yields the recorder it runs right after its UPDATE has set that base, in
-    that transaction and on its connection, opening none. The cause pending for that worktree is read here,
-    before the transaction: when it is this branch's and names the commit recorded, the recorder appends that
-    commit and the fixed reason; when it is there but cannot be verified, the recorder raises, so the base
-    rolls back and that prepared fallback never becomes ordinary work. The cause is retired only once that
-    transaction has committed: a rollback or a failed commit keeps it for the retry, in this process or a
-    fresh one."""
+    that transaction and on its connection, opening none. Whether a cause is pending for that worktree is found
+    here, before the transaction, with one of three outcomes: git names where it would be and none is there for
+    this worktree, so the base goes alone; one is there, and when it is this branch's and names the commit
+    recorded the recorder appends that commit and the fixed reason, while one that cannot be verified makes the
+    recorder raise; or git cannot tell where it would be, which is no proof that none is, so the recorder raises
+    one fixed error that holds no git output, path or error text. Either refusal rolls the base back, so no
+    worker starts and that prepared fallback never becomes ordinary work. The cause is retired only once that
+    transaction has committed, and only from where git named it: a rollback, a failed commit or an unknown
+    location keeps it for the retry, in this process or a fresh one."""
     workspace = Path(workspace_path)
     path = _pending_path(workspace, _worktree_key(workspace))
     pending = _pending_cause(path, workspace) if path is not None else None
 
     def record(conn: sqlite3.Connection, task_id: str, base_commit: str) -> None:
+        if path is None:  # unknown, not absent: a cause may wait where git could not look
+            raise kb.WorktreeScopeError("whether a fallback cause is pending for this worktree cannot be established")
         if pending is None:
             return
         if pending.get("base_commit") != base_commit:
