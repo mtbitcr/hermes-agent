@@ -31360,11 +31360,9 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
-    else:
-        cmd = [
-            "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
-        ]
+    else:  # a new branch: at HEAD, or at the current main when kanban.delivery.exact_base is true
+        from hermes_cli.kanban_delivery import worktree_start
+        cmd = ["git", "-C", str(repo_root), "worktree", "add", "-b", branch_name, str(target), worktree_start(repo_root, target)]
     result = subprocess.run(
         cmd,
         capture_output=True,
@@ -31999,6 +31997,7 @@ def record_worktree_base(
     head = str(_git_output(workspace, "rev-parse", "--verify", "HEAD")).strip()
     if not re.fullmatch(r"[0-9a-fA-F]{40,64}", head):
         raise WorktreeScopeError("worktree HEAD is not an exact git commit")
+    from hermes_cli.kanban_delivery import record_base_fallback  # why a new branch started at HEAD, not main
     with write_txn(conn):
         row = conn.execute(
             "SELECT base_commit FROM tasks WHERE id = ? AND task_kind = 'work'",
@@ -32016,6 +32015,7 @@ def record_worktree_base(
         )
         if cur.rowcount == 1:
             _append_event(conn, task_id, "worktree_base_recorded", {"base_commit": head})
+            record_base_fallback(conn, task_id, workspace, head)
             return head
         row = conn.execute(
             "SELECT base_commit FROM tasks WHERE id = ? AND task_kind = 'work'",

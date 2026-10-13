@@ -31,6 +31,11 @@ and closes once each pull request a rework card replaced; GitHub does the merge.
 :func:`merge_step` reads each armed pull request, and once GitHub shows it merged
 into main adds the merge to the release decision through
 :mod:`hermes_cli.release_intake` and marks the row merged, its final state.
+
+With ``kanban.delivery.exact_base`` exactly true, :func:`worktree_start` starts a
+new card branch of a policy repository at the main GitHub holds now, fetched
+through the publish step's transport; a failed fetch starts it at HEAD as before
+and :func:`record_base_fallback` records why, after the base.
 """
 
 from __future__ import annotations
@@ -85,6 +90,19 @@ def delivery_settings() -> bool:
     except Exception:
         return False
     return enabled
+
+
+def exact_base_settings() -> bool:
+    """``kanban.delivery.exact_base``: a new card branch starts at the current main;
+    off unless exactly true, and on any doubt."""
+    try:
+        from hermes_cli.config import load_config
+
+        section = (load_config() or {}).get("kanban", {}).get("delivery") or {}
+        exact_base = section.get("exact_base") is True
+    except Exception:
+        return False
+    return exact_base
 
 
 def _sha(value) -> Optional[str]:
@@ -1754,3 +1772,52 @@ def _intake(db_path: Path, row: dict, merge: str) -> Optional[bool]:
         repository=repository, number=number, merge_commit=merge, reviewed_base=reviewed_base,
         reviewed_head=head, reviewed_tree=reviewed_tree, tier=task["risk_tier"], card_id=source,
         title=task["title"], board=_board_slug(db_path))["recorded"]
+
+
+# A new card branch's start (kanban.delivery.exact_base). The kernel's worktree creator knows no task or
+# database, so the fixed reason a fetch of main failed waits here, by worktree path, until
+# record_worktree_base records that worktree's base and, in the same transaction, why.
+_BASE_FALLBACKS: dict[str, str] = {}
+_REASON = re.compile(r"[a-z_]{1,64}")  # a transport reason code, never an error's text
+
+
+def _worktree_key(path) -> str:
+    return str(Path(path).expanduser().resolve(strict=False))
+
+
+def worktree_start(repo_root, target) -> str:
+    """Where the kernel starts a NEW card branch for the worktree at ``target``: ``HEAD`` as always or,
+    with ``kanban.delivery.exact_base`` exactly true and ``repo_root``'s origin a repository of the
+    delivery policy, the commit main holds on GitHub now, fetched through the publish step's transport
+    into ``refs/remotes/origin/main`` only. When that fetch fails the branch starts at ``HEAD`` and the
+    transport's fixed reason waits for :func:`record_base_fallback`. Opens no database."""
+    key = _worktree_key(target)
+    _BASE_FALLBACKS.pop(key, None)
+    if not exact_base_settings():
+        return "HEAD"
+    repository = _origin_repository(Path(repo_root))
+    if repository is None or repository not in _policy_repositories():
+        return "HEAD"
+    reason = "fetch_failed"
+    try:
+        from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
+
+        try:
+            return GitHubTransport("publish", repository).fetch_main(repo_root)
+        except GitHubTransportError as error:
+            if _REASON.fullmatch(str(error.reason)):
+                reason = error.reason
+    except Exception:  # any other failure starts at HEAD too, and its text is never kept
+        pass
+    _BASE_FALLBACKS[key] = reason
+    logger.warning("kanban delivery: the fetch of main failed (%s); the new card branch starts at HEAD", reason)
+    return "HEAD"
+
+
+def record_base_fallback(conn: sqlite3.Connection, task_id: str, workspace_path, base_commit: str) -> None:
+    """Run by ``record_worktree_base`` right after it records ``base_commit`` for the worktree at
+    ``workspace_path``, in its transaction and on its connection, opening none: when that branch started
+    at HEAD because the fetch of main failed, the commit recorded and the fixed reason."""
+    reason = _BASE_FALLBACKS.pop(_worktree_key(workspace_path), None)
+    if reason is not None:
+        kb._append_event(conn, task_id, "worktree_base_fallback", {"base_commit": base_commit, "reason": reason})
