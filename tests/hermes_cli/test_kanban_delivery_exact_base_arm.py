@@ -4,10 +4,12 @@ process shares, it reads main and merges when main is the reviewed base or is al
 else it sends nothing and records base_moved with the reviewed base, the observed main and the head. Main's
 answer must name refs/heads/main. An answer that is neither 200 nor a refusal GitHub documents for a merge it
 did not make is read back from GitHub once and never sent again. The merge pass compares the merge's first
-parent with the main the arm checked and records delivery_merged_off_base when they differ. With the setting
-anything but exactly true the arm and the merge pass are today's. Real boards and git; GitHub is the real
-transport with only its exchange and App token replaced, so every call passes the allowlist, and its git
-origin is a local bare repository."""
+parent with the main the arm checked and records delivery_merged_off_base when they differ; when git cannot
+read that parent it records delivery_merged_off_base_unknown, and later passes read it again until one
+delivery_merged_off_base or delivery_merged_on_base event closes that check. With the setting anything but
+exactly true the arm and the merge pass are today's. Real boards and git; GitHub is the real transport with
+only its exchange and App token replaced, so every call passes the allowlist, and its git origin is a local
+bare repository."""
 
 from __future__ import annotations
 
@@ -128,6 +130,16 @@ def _off_base(kb, tid) -> list:
     return [payload for kind, payload in _events(kb, tid) if kind == "delivery_merged_off_base"]
 
 
+def _off_base_unknown(kb, tid) -> list:
+    """The payloads of the source card's delivery_merged_off_base_unknown events: the checks left open."""
+    return [payload for kind, payload in _events(kb, tid) if kind == "delivery_merged_off_base_unknown"]
+
+
+def _on_base(kb, tid) -> list:
+    """The payloads of the source card's delivery_merged_on_base events."""
+    return [payload for kind, payload in _events(kb, tid) if kind == "delivery_merged_on_base"]
+
+
 def _fetches(monkeypatch) -> list:
     """Each fetch of main the transport makes from now on, by the checkout it fetches into."""
     from hermes_cli import kanban_delivery_github as transport
@@ -140,6 +152,32 @@ def _fetches(monkeypatch) -> list:
 
     monkeypatch.setattr(transport.GitHubTransport, "fetch_main", counted)
     return made
+
+
+def _failing_read(monkeypatch, merge: str, failure: str) -> dict:
+    """While ``failing["now"]`` is true, the fetch of main fails as a network error does (``failure`` "fetch"),
+    or git reads no first parent of ``merge`` though the fetch works ("parent_read"). failing["reads"] holds
+    each git read of that first parent from now on, failed or not."""
+    from hermes_cli import kanban_delivery as kd
+    from hermes_cli import kanban_delivery_github as transport
+
+    failing, fetch_main, run_git = {"now": True, "reads": []}, transport.GitHubTransport.fetch_main, kd._run_git
+
+    def fetch(self, checkout):
+        if failure == "fetch" and failing["now"]:
+            raise transport.GitHubTransportError("network_error")
+        return fetch_main(self, checkout)
+
+    def git(workdir, *args):
+        if f"{merge}^1" in args:
+            failing["reads"].append(args)
+            if failure == "parent_read" and failing["now"]:
+                return None
+        return run_git(workdir, *args)
+
+    monkeypatch.setattr(transport.GitHubTransport, "fetch_main", fetch)
+    monkeypatch.setattr(kd, "_run_git", git)
+    return failing
 
 
 def _merge_on_put(scene, move: bool) -> dict:
@@ -583,10 +621,12 @@ def test_a_merge_only_github_holds_is_read_after_one_fetch_of_main(exact, monkey
     assert (_state(kb, head), _merges(kb, tid), _intaken(head), len(_arms(gh))) == ("merged", [merge], [merge], 1)
 
 
-def test_a_merge_git_cannot_find_after_the_fetch_is_recorded_merged_with_no_off_base_event(exact, monkeypatch, caplog):
+def test_a_merge_git_cannot_find_after_the_fetch_is_recorded_merged_with_its_check_left_open(exact, monkeypatch, caplog):
     """GitHub names a merge commit that neither the card's repository nor the fetched main holds: its first parent
-    stays unreadable after the one fetch, so one warning names the delivery and the merge commit, no off-base
-    event is recorded, and the merge is recorded as today."""
+    stays unreadable after the one fetch, so one warning names the delivery and the merge commit, and the merge is
+    recorded as today with one delivery_merged_off_base_unknown event, which leaves the check open with the merge
+    commit, the checked main and the reviewed base. The next pass fetches and reads again, warns again and adds
+    nothing."""
     kb, root, repo, gh = exact
     tid, head, base = _approved_head(exact)
     gh["main"] = base
@@ -596,14 +636,150 @@ def test_a_merge_git_cannot_find_after_the_fetch_is_recorded_merged_with_no_off_
     fetched = _fetches(monkeypatch)
     caplog.set_level(logging.WARNING, logger="hermes_cli.kanban_delivery")
 
+    def warned():
+        return [record.getMessage() for record in caplog.records
+                if record.name == "hermes_cli.kanban_delivery" and ARMED["sha"] in record.getMessage()]
+
     _tick(kb)
 
     delivery = _raw(kb.kanban_db_path(), "SELECT id FROM kanban_deliveries WHERE source_head = ?", head)[0]["id"]
-    warned = [record.getMessage() for record in caplog.records
-              if record.name == "hermes_cli.kanban_delivery" and ARMED["sha"] in record.getMessage()]
-    assert len(fetched) == 1 and len(warned) == 1 and f"delivery {delivery}:" in warned[0]
+    assert len(fetched) == 1 and len(warned()) == 1 and f"delivery {delivery}:" in warned()[0]
     assert (_off_base(kb, tid), _state(kb, head)) == ([], "merged")
     assert (_merges(kb, tid), _intaken(head)) == ([ARMED["sha"]], [ARMED["sha"]])
+    assert _off_base_unknown(kb, tid) == [{
+        "delivery_id": delivery, "head": head, "pull_request_number": 41, "repository": REPO,
+        "merge_commit": ARMED["sha"], "observed_main": base, "reviewed_base": base}]
+
+    _tick(kb)
+
+    assert len(fetched) == 2 and len(warned()) == 2 and f"delivery {delivery}:" in warned()[1]
+    assert (len(_off_base_unknown(kb, tid)), _off_base(kb, tid), _on_base(kb, tid)) == (1, [], [])
+    assert (_state(kb, head), _merges(kb, tid), _intaken(head), len(_arms(gh))) == (
+        "merged", [ARMED["sha"]], [ARMED["sha"]], 1)
+
+
+@pytest.mark.parametrize("failure", ["fetch", "parent_read"])
+def test_an_off_base_merge_read_after_a_failed_read_is_recorded_off_base_once(exact, monkeypatch, tmp_path, failure):
+    """GitHub's merge exists only on the remote's main, which moved on before it, so its first parent is not the
+    checked main. In the pass that records the merge, the fetch of main fails as a network error does, or git
+    reads no first parent though the fetch works: the merge is recorded as today, and the check left open. Once
+    the read works, a later pass records one delivery_merged_off_base event with the merge commit, its first
+    parent, the checked main and the reviewed base, which closes the check: one more pass neither fetches nor
+    reads, and adds nothing. The merge is sent once and the release intake holds it once."""
+    kb, root, repo, gh = exact
+    tid, head, base = _approved_head(exact)
+    gh["main"] = base
+    _setting(root, "true")
+    clone, landed = tmp_path / "elsewhere", {}
+
+    def merge_on_github():
+        _git(repo, "push", "-q", str(gh["bare"]), f"{head}:refs/heads/delivery/{tid}")  # the published branch
+        subprocess.run(["git", "clone", "-q", "-b", "main", str(gh["bare"]), str(clone)], check=True, capture_output=True)
+        landed["first_parent"] = _moved(clone)
+        _git(clone, "merge", "-q", "--no-ff", "--no-edit", head)
+        landed["merge"] = gh["main"] = gh["ended"][41] = _git(clone, "rev-parse", "HEAD")
+        _git(clone, "push", "-q", "origin", "main")
+
+    gh["hooks"]["PUT"] = merge_on_github
+    _tick(kb)
+    merge, moved = landed["merge"], landed["first_parent"]
+    held = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"{merge}^{{commit}}"], capture_output=True)
+    assert moved != base and held.returncode != 0  # the card's repository does not hold the merge
+    failing = _failing_read(monkeypatch, merge, failure)
+    fetched = _fetches(monkeypatch)
+
+    _tick(kb)
+
+    assert (len(fetched), _state(kb, head), _merges(kb, tid), _intaken(head)) == (1, "merged", [merge], [merge])
+    assert (_off_base(kb, tid), len(_off_base_unknown(kb, tid)), len(_arms(gh))) == ([], 1, 1)
+
+    failing["now"] = False
+    _tick(kb)
+    _tick(kb)
+
+    delivery = _raw(kb.kanban_db_path(), "SELECT id FROM kanban_deliveries WHERE source_head = ?", head)[0]["id"]
+    assert _off_base(kb, tid) == [{
+        "delivery_id": delivery, "head": head, "pull_request_number": 41, "repository": REPO,
+        "merge_commit": merge, "first_parent": moved, "observed_main": base, "reviewed_base": base}]
+    assert (len(_off_base_unknown(kb, tid)), _on_base(kb, tid)) == (1, [])
+    assert (_state(kb, head), _merges(kb, tid), _intaken(head), len(_arms(gh))) == ("merged", [merge], [merge], 1)
+    events, fetches, reads = _events(kb, tid), len(fetched), len(failing["reads"])
+
+    _tick(kb)
+
+    assert (_events(kb, tid), len(fetched), len(failing["reads"])) == (events, fetches, reads)
+
+
+def test_an_on_base_merge_read_after_a_failed_read_closes_its_check_on_base(exact, monkeypatch):
+    """The control: GitHub merges H onto the very main the arm checked, but in the pass that records the merge
+    git reads no first parent, so the check is left open. Once git reads it, a later pass finds the checked main
+    and records one delivery_merged_on_base event with the merge commit, its first parent, the checked main and
+    the reviewed base, which closes the check: later passes neither fetch nor read it, and add nothing."""
+    kb, root, repo, gh = exact
+    tid, head, base = _approved_head(exact)
+    gh["main"] = base
+    _setting(root, "true")
+    landed = _merge_on_put(exact, move=False)
+    _tick(kb)
+    merge = landed["merge"]
+    failing = _failing_read(monkeypatch, merge, "parent_read")
+    fetched = _fetches(monkeypatch)
+
+    _tick(kb)
+
+    assert (_state(kb, head), _merges(kb, tid), _intaken(head)) == ("merged", [merge], [merge])
+    assert (_off_base(kb, tid), len(_off_base_unknown(kb, tid)), _on_base(kb, tid)) == ([], 1, [])
+
+    failing["now"] = False
+    _tick(kb)
+
+    delivery = _raw(kb.kanban_db_path(), "SELECT id FROM kanban_deliveries WHERE source_head = ?", head)[0]["id"]
+    assert landed["first_parent"] == base
+    assert _on_base(kb, tid) == [{
+        "delivery_id": delivery, "head": head, "pull_request_number": 41, "repository": REPO,
+        "merge_commit": merge, "first_parent": base, "observed_main": base, "reviewed_base": base}]
+    assert (_off_base(kb, tid), len(_off_base_unknown(kb, tid))) == ([], 1)
+    events, fetches, reads = _events(kb, tid), len(fetched), len(failing["reads"])
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_events(kb, tid), len(fetched), len(failing["reads"])) == (events, fetches, reads)
+    assert (_state(kb, head), _merges(kb, tid), _intaken(head), len(_arms(gh))) == ("merged", [merge], [merge], 1)
+
+
+def test_with_the_setting_off_an_open_check_is_not_read_until_it_is_on_again(exact, monkeypatch):
+    """A check left open under exact_base stays as it is while the setting is off: no fetch of main, no git read
+    of the first parent and no event. With the setting exactly true again, the next pass reads the first parent
+    and closes the check with one event as it says: delivery_merged_off_base, since main moved on before GitHub
+    merged."""
+    kb, root, repo, gh = exact
+    tid, head, base = _approved_head(exact)
+    gh["main"] = base
+    _setting(root, "true")
+    landed = _merge_on_put(exact, move=True)
+    _tick(kb)
+    merge = landed["merge"]
+    failing = _failing_read(monkeypatch, merge, "parent_read")
+    _tick(kb)
+    assert (_state(kb, head), _off_base(kb, tid), len(_off_base_unknown(kb, tid))) == ("merged", [], 1)
+    failing["now"] = False
+    _setting(root, None)
+    events, fetched, reads = _events(kb, tid), _fetches(monkeypatch), len(failing["reads"])
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_events(kb, tid), fetched, len(failing["reads"])) == (events, [], reads)
+
+    _setting(root, "true")
+    _tick(kb)
+
+    [payload] = _off_base(kb, tid)
+    assert (payload["merge_commit"], payload["first_parent"], payload["observed_main"], payload["reviewed_base"]) == (
+        merge, landed["first_parent"], base, base)
+    assert (len(_off_base_unknown(kb, tid)), _on_base(kb, tid)) == (1, [])
+    assert (_state(kb, head), _merges(kb, tid), _intaken(head), len(_arms(gh))) == ("merged", [merge], [merge], 1)
 
 
 def test_with_the_setting_off_at_record_time_an_off_base_merge_is_recorded_as_today(exact, monkeypatch):
