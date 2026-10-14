@@ -3152,23 +3152,23 @@ def _owner_run_retry_reasons(
     return reasons
 
 
-def owner_project_planning_context(
+def _select_owner_project_task_rows(
     conn: sqlite3.Connection,
     project_id: str,
-    counts: dict[str, int],
     *,
-    owned_paths: bool = False,
-) -> dict:
-    """Return one bounded, relation-aware DTO for owner planning.
+    include_archived: bool,
+) -> tuple[list[sqlite3.Row], bool, bool]:
+    """Select at most the task limit: live work, its linked work, newest finished.
 
-    All live work is selected first. Every same-Project work row directly
-    related to that live set is then retained before recent terminal history
-    fills the remaining capacity. SQL limits apply before materialization; a
-    live or relation overflow is reported and the Workspace refuses to plan.
-
-    ``owned_paths`` serves schema version 2: the same DTO, each task also
-    carrying the owned paths its row stores (``[]`` when it stores none).
+    Returns ``(selected_rows, actionable_truncated, relations_truncated)``.
+    ``include_archived=False`` keeps archived tasks out of every step.
     """
+    archived_filter = "" if include_archived else " AND t.status != 'archived'"
+    terminal_statuses = (
+        _OWNER_PROJECT_TERMINAL_STATUSES
+        if include_archived
+        else tuple(s for s in _OWNER_PROJECT_TERMINAL_STATUSES if s != "archived")
+    )
     status_slots = ",".join("?" for _ in _OWNER_PROJECT_PLANNING_STATUSES)
     actionable_rows = conn.execute(
         "SELECT * FROM tasks WHERE project_id = ? AND task_kind = 'work' "
@@ -3196,8 +3196,9 @@ def owner_project_planning_context(
             "UNION "
             f"SELECT child_id FROM task_links WHERE parent_id IN ({selected_slots})"
             ") "
-            f"AND t.id NOT IN ({selected_slots}) "
-            "ORDER BY COALESCE((SELECT MAX(e.created_at) FROM task_events e "
+            f"AND t.id NOT IN ({selected_slots})"
+            + archived_filter
+            + " ORDER BY COALESCE((SELECT MAX(e.created_at) FROM task_events e "
             "WHERE e.task_id = t.id), t.created_at) DESC, t.id DESC LIMIT ?",
             (
                 project_id,
@@ -3214,7 +3215,7 @@ def owner_project_planning_context(
         remaining = _OWNER_PROJECT_MAX_TASKS - len(selected_rows)
 
     if remaining > 0:
-        terminal_slots = ",".join("?" for _ in _OWNER_PROJECT_TERMINAL_STATUSES)
+        terminal_slots = ",".join("?" for _ in terminal_statuses)
         exclusion = ""
         exclusion_params: tuple[object, ...] = ()
         if selected_ids:
@@ -3230,14 +3231,37 @@ def owner_project_planning_context(
             "WHERE e.task_id = t.id), t.created_at) DESC, t.id DESC LIMIT ?",
             (
                 project_id,
-                *_OWNER_PROJECT_TERMINAL_STATUSES,
+                *terminal_statuses,
                 *exclusion_params,
                 remaining,
             ),
         ).fetchall()
         selected_rows.extend(terminal_rows)
-        selected_ids = [str(row["id"]) for row in selected_rows]
 
+    return selected_rows, actionable_truncated, relations_truncated
+
+
+def owner_project_planning_context(
+    conn: sqlite3.Connection,
+    project_id: str,
+    counts: dict[str, int],
+    *,
+    owned_paths: bool = False,
+) -> dict:
+    """Return one bounded, relation-aware DTO for owner planning.
+
+    All live work is selected first. Every same-Project work row directly
+    related to that live set is then retained before recent terminal history
+    fills the remaining capacity. SQL limits apply before materialization; a
+    live or relation overflow is reported and the Workspace refuses to plan.
+
+    ``owned_paths`` serves schema version 2: the same DTO, each task also
+    carrying the owned paths its row stores (``[]`` when it stores none).
+    """
+    selected_rows, actionable_truncated, relations_truncated = (
+        _select_owner_project_task_rows(conn, project_id, include_archived=True)
+    )
+    selected_ids = [str(row["id"]) for row in selected_rows]
     event_state: dict[str, dict[str, int]] = {}
     parent_map = {task_id: [] for task_id in selected_ids}
     child_map = {task_id: [] for task_id in selected_ids}
@@ -3437,6 +3461,14 @@ def read_project_snapshot(
             "AND status != 'archived' ORDER BY priority DESC, created_at ASC, id ASC LIMIT ?",
             (project_id, _OWNER_PROJECT_MAX_TASKS + 1),
         ).fetchall()
+        tasks_truncated = len(task_rows) > _OWNER_PROJECT_MAX_TASKS
+        if tasks_truncated:
+            task_rows, _, _ = _select_owner_project_task_rows(
+                conn, project_id, include_archived=False,
+            )
+            task_rows.sort(key=lambda row: (
+                -int(row["priority"]), int(row["created_at"]), str(row["id"]),
+            ))
         tasks = [kanban_db.Task.from_row(row) for row in task_rows[:_OWNER_PROJECT_MAX_TASKS]]
         task_ids = [task.id for task in tasks]
         visible = set(task_ids)
@@ -3658,7 +3690,7 @@ def read_project_snapshot(
         "runs": runs,
         "steward": steward,
         "truncated": {
-            "tasks": len(task_rows) > _OWNER_PROJECT_MAX_TASKS,
+            "tasks": tasks_truncated,
             "workers": len(worker_rows) > _OWNER_PROJECT_MAX_WORKERS,
             "attachments": len(attachment_rows) > _OWNER_PROJECT_MAX_ATTACHMENTS,
             "runs": len(run_rows) > _OWNER_PROJECT_MAX_RUNS,
