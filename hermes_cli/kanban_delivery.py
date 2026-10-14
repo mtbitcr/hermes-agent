@@ -575,6 +575,10 @@ def publish_step(db_path: Optional[Path]) -> Optional[dict]:
     review_step(db_path)
     merge_step(db_path)
     arm_step(db_path)
+    if exact_base_settings():  # card 3: each row left base_moved gets its update card on main, or goes back
+        from hermes_cli.kanban_delivery_update import update_step
+
+        update_step(db_path)
     try:
         leased = _take_lease(db_path)
         if leased is None:
@@ -1393,6 +1397,9 @@ _REPLACED, _CLOSE_REFUSED = "replaced", "close_refused"
 # Card 2 (kanban.delivery.exact_base): main is neither the reviewed base nor in H, so nothing was sent; the
 # row waits for part 3. The merge lock is waited for this long, then the next pass tries again.
 _BASE_MOVED = "base_moved"
+# Card 3: a base_moved row whose update card, its builder's, carries the change on current main now, to its own
+# review. Final; its pull request closes once the update is published (:func:`_replaced`).
+_UPDATED = "updated"
 _MERGE_LOCK_SECONDS = 30
 _MERGE_REFUSALS = frozenset({403, 404, 405, 409, 422})  # the answers GitHub documents for a merge it did not make
 _REVIEW_PAGES = 10  # owner rule 2 of round 3: a pull request's reviews are read up to 10 pages of 100
@@ -1431,13 +1438,19 @@ def arm_step(db_path: Path) -> None:
 def _replaced(conn: sqlite3.Connection, old_id: Optional[int] = None) -> list:
     """Each published row (or row ``old_id``) whose pull request, its repository and number,
     another card's work continues: that card is a task_links child of the row's source card,
-    its recorded base is the row's head and its own published pull request is another one of
-    the same repository. The row is still the latest on its pull request, and no close of it
-    was sent; a merged row is final (card 10's owner rule 2), and so is a row closed outside."""
+    its recorded base is the row's head or it is the row's update card (card 3), which only the
+    kernel's delivery_updated event of the row and its head names, and its own
+    published pull request is another one of the same repository. The row is still the latest
+    on its pull request, and no close of it was sent; a merged row is final (card 10's owner
+    rule 2), and so is a row closed outside."""
     old, new, later = (_RECEIPT.format(name) for name in ("old", "new", "later"))
     return [dict(row) for row in conn.execute(
         f"SELECT old.*, {old} AS repository, MIN(rework.id) AS replaced_by FROM kanban_deliveries AS old "
-        "JOIN tasks AS rework ON rework.base_commit = old.pull_request_head AND rework.id != old.source_task_id "
+        "JOIN tasks AS rework ON (rework.base_commit = old.pull_request_head OR EXISTS (SELECT 1 FROM task_events "
+        "WHERE task_id = old.source_task_id AND kind = 'delivery_updated' AND json_extract(payload, '$.delivery_id') "
+        "= old.id AND json_extract(payload, '$.head') = old.pull_request_head "
+        "AND json_extract(payload, '$.update_task_id') = rework.id)) "
+        "AND rework.id != old.source_task_id "
         "JOIN task_links AS link ON link.parent_id = old.source_task_id AND link.child_id = rework.id "
         "JOIN kanban_deliveries AS new ON new.source_task_id = rework.id AND new.pull_request_number IS NOT NULL "
         f"AND new.pull_request_number != old.pull_request_number AND {new} = {old} "

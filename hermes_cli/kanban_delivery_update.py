@@ -1,0 +1,267 @@
+"""Card 3 (kanban.delivery.exact_base): a delivery row the arm left base_moved, brought up to date on main.
+
+Main moved past an approved head H, so card 2's arm sent nothing and recorded base_moved. That approval covers H
+on its reviewed base only; it never merges anything else. Here main is read as GitHub holds it now and its objects
+fetched with the fenced fetch worktree_start uses, into refs/remotes/origin/main of the source card's project folder
+only, so no checkout moves; a failed fetch leaves the row base_moved, and the next pass reads main again. The
+update is then computed without touching any checkout: ``git merge-tree --write-tree`` of that main and H, and
+``git commit-tree`` of that tree with H and main as its two parents. Before anything is created, the update must
+change the same set of paths relative to main as H did relative to its reviewed base, and nothing outside the source
+card's owned paths. Then one update card is made per source card, H and main, through the card creation of
+:func:`hermes_cli.kanban_delivery._continuation`: a task_links child of the source card for its builder, with the
+source's tier, route, effort, policy lock, owner receipt binding, risk tier and review requirement, on a branch at
+the updated head. Its builder hands that head over unchanged through the normal completion, so the kernel's own
+reviewer nomination and route pins apply, and only its own approval merges it. As that completion hands over only
+committed changes since the card's recorded base, the base _continuation records, the updated head, is then moved
+to main in the same transaction: the handover is exactly the approved paths on main. The kernel's
+``delivery_updated`` event of the source card, written in the transaction that creates the card, is the one record
+of it: an existing update card is accepted only through that event, never through a task's caller-chosen fields.
+The row is then final, ``updated``, and :func:`hermes_cli.kanban_delivery._replaced` closes its pull request once
+the update is published. A conflict or another set of paths goes back to the builder through H's continuation card
+instead. :func:`hermes_cli.kanban_delivery.publish_step` calls :func:`update_step` once per pass, with the setting
+on only.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Optional
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_delivery as kd
+
+logger = logging.getLogger(__name__)
+
+_BRANCH = "delivery-update/{source}-{head}-{main}"
+_AUTHOR = ("-c", f"user.name={kd._REVIEW_CREATOR}", "-c", "user.email=kanban-delivery@localhost")
+_MESSAGE = ("{head} of {source} brought up to date on main {main}\n\nThe change approved at {head}, reviewed on "
+            "{base}, merged with main at {main}: git merge-tree --write-tree of main and the approved head.\n")
+_MOVED = ("Main moved past the approved head {head} of {source} (pull request #{number} of {repository}), "
+          "reviewed on {base}: main is at {main}.")
+_UPDATE_BODY = _MOVED + (
+    " This card carries that change brought up to date on main as {update}, on branch {branch}: git merge-tree "
+    "--write-tree of main and the approved head, committed with the approved head and main as its two parents. Its "
+    "recorded base is main, so it changes the same paths relative to main as the approved change did relative to its "
+    "base, all within the source card's owned paths. Hand {update} over unchanged for review: the approval of {head} "
+    "does not cover it, and only this card's own review delivers it.")
+_RETURN_BODY = _MOVED + " {why} Bring the change up to date on main and hand it over for review again."
+_WHY = {
+    "conflict": "Merging main and the approved head conflicts, so no update was made.",
+    "paths": ("The update on main would change another set of paths relative to main than the approved change "
+              "did relative to its base, or paths outside the source card's owned paths, so no update was made."),
+}
+
+
+def update_step(db_path: Path) -> None:
+    """Card 3 on the board whose file is ``db_path``: each row the arm left base_moved gets its one update card
+    on main as GitHub holds it now, or goes back to its builder. Only with ``kanban.delivery.exact_base`` exactly
+    true; otherwise a base_moved row stays where it is. Raises no error, so the tick goes on."""
+    if not kd.delivery_settings() or not kd.exact_base_settings():
+        return
+    try:
+        with kb.connect_closing(db_path=db_path) as conn:
+            rows = [dict(row) for row in conn.execute(
+                f"SELECT d.*, {kd._RECEIPT.format('d')} AS repository FROM kanban_deliveries AS d "
+                "WHERE d.pull_request_number IS NOT NULL AND d.pull_request_state = ? ORDER BY d.id",
+                (kd._BASE_MOVED,))]
+    except Exception:
+        logger.exception("kanban delivery: the update step failed")
+        return
+    for row in rows:
+        try:
+            _update(db_path, row)
+        except kd.PublishRefused as refusal:
+            logger.warning("kanban delivery: delivery %s not updated: %s (%s)", row["id"], refusal.code,
+                           refusal.detail)
+        except Exception:
+            logger.exception("kanban delivery: delivery %s not updated", row["id"])
+
+
+def _update(db_path: Path, row: dict) -> Optional[str]:
+    """One base_moved row: main read and fetched now, the update of H on it checked before anything is created,
+    then the update card, or H back to its builder. Returns what was done, if anything."""
+    source, head = row["source_task_id"], row["pull_request_head"]
+    with kb.connect_closing(db_path=db_path) as conn:
+        moved = _moved(conn, row)
+        task = kb.get_task(conn, source)
+    base = kd._sha(moved.get("reviewed_base"))
+    if kd._sha(head) != head or base is None or moved.get("repository") != row["repository"]:
+        raise kd.PublishRefused("no_main", f"delivery {row['id']} records no reviewed base of its repository")
+    root = _folder(task.project_id, row["repository"])
+    if root is None:
+        raise kd.PublishRefused("no_repository", f"the project folder of {source} is no checkout of "
+                                f"{row['repository']}")
+    main = _main(root, row["repository"])
+    if not all(kd._git_proof(root, commit, None)[0] for commit in (head, base, main)):
+        raise kd.PublishRefused("no_repository", f"the project folder of {source} does not hold {head}, {base} "
+                                f"and {main} of {row['repository']}")
+    facts = {"head": head, "base": base, "main": main, "source": source}
+    with kb.connect_closing(db_path=db_path) as conn:
+        made = _made(conn, row, main)
+    if made is not None:  # the kernel's record of the update card: nothing is computed or made again
+        return _updated(db_path, row, facts, None)
+    merged = kd._run_git(root, "merge-tree", "--write-tree", main, head)
+    if merged is None or merged.returncode not in (0, 1):
+        raise kd.PublishRefused("no_update", f"git merge-tree of {main} and {head} did not run")
+    if merged.returncode == 1:
+        return _returned(db_path, row, facts, "conflict")
+    tree = kd._sha(merged.stdout.decode().split("\n", 1)[0])
+    approved, update = _paths(root, base, head), _paths(root, main, tree)
+    if tree is None or approved is None or update is None:
+        raise kd.PublishRefused("no_update", f"the paths of {head} on {main} cannot be read")
+    if update != approved or not all(_owned(path, task.owned_paths) for path in update):
+        return _returned(db_path, row, facts, "paths")
+    branch = _BRANCH.format(source=source, head=head[:12], main=main[:12])
+    commit = _branch(root, branch, tree, head, main, _MESSAGE.format(**facts))
+    return _updated(db_path, row, facts, (root, branch, commit))
+
+
+def _moved(conn, row: dict) -> dict:
+    """The row's latest delivery_base_moved event at its head: the reviewed base and the main the arm read."""
+    for (payload,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? "
+                                   "AND kind = 'delivery_base_moved' ORDER BY id DESC", (row["source_task_id"],)):
+        moved = json.loads(payload)
+        if moved.get("delivery_id") == row["id"] and moved.get("head") == row["pull_request_head"]:
+            return moved
+    return {}
+
+
+def _folder(project: Optional[str], repository: Optional[str]) -> Optional[Path]:
+    """The primary folder the project registry records for the source card's project, as the continuation's,
+    when its origin names the repository the delivery recorded."""
+    from hermes_cli import projects_db
+
+    folder = None
+    if project:
+        with contextlib.suppress(Exception), projects_db.connect_closing() as registry:  # kb.create_task's registry
+            found = projects_db.get_project(registry, project)
+            folder = found.primary_path if found is not None else None
+    root = Path(folder) if folder and os.path.isabs(folder) else None
+    if root is None or not repository or kd._origin_repository(root) != repository:
+        return None
+    return root
+
+
+def _main(root: Path, repository: str) -> str:
+    """Main as GitHub holds it now, its objects fetched into ``root`` with the fenced fetch worktree_start uses:
+    into refs/remotes/origin/main only, so HEAD, branches, index and worktree never move. A failed fetch refuses
+    the pass, so the row stays base_moved and the next pass reads main again."""
+    from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
+
+    try:
+        main = kd._sha(GitHubTransport("publish", repository).fetch_main(root))
+    except GitHubTransportError:
+        main = None
+    if main is None:
+        raise kd.PublishRefused("no_main", f"main of {repository} was not fetched")
+    return main
+
+
+def _made(conn, row: dict, main: str) -> Optional[dict]:
+    """The kernel's own record of the row's update card on ``main``: the source card's delivery_updated event of
+    this delivery, H and main, written in the transaction that created the card. None while there is none; no
+    field a caller can choose on a task, as its idempotency key, ever stands for it."""
+    for (payload,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'delivery_updated' "
+                                   "ORDER BY id", (row["source_task_id"],)):
+        made = json.loads(payload)
+        if (made.get("delivery_id"), made.get("head"), made.get("observed_main")) == (
+                row["id"], row["pull_request_head"], main) and made.get("update_task_id"):
+            return made
+    return None
+
+
+def _paths(root: Path, old: str, new: str) -> Optional[frozenset]:
+    """The paths git changes from ``old`` to ``new``, each tree-ish, renames as two paths."""
+    changed = kd._run_git(root, "diff-tree", "-r", "--name-only", "--no-renames", "-z", old, new)
+    if changed is None or changed.returncode != 0:
+        return None
+    return frozenset(path for path in changed.stdout.decode("utf-8", "surrogateescape").split("\0") if path)
+
+
+def _owned(path: str, owned: Optional[list]) -> bool:
+    """The kernel's owned path rule: "." owns the repository, every other entry one exact file or subtree.
+    An unscoped card (None) or a read-only one owns nothing that can be shown."""
+    return bool(owned) and ("." in owned or any(path == owner or path.startswith(f"{owner}/") for owner in owned))
+
+
+def _branch(root: Path, name: str, tree: str, head: str, main: str, message: str) -> str:
+    """The updated head on ``name``: the commit of ``tree`` with H and main as its parents, made before the write
+    transaction, or the one a pass stopped before its commit left on the name. No checkout is touched."""
+    found = kd._run_git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}")
+    if found is None or found.returncode != 0:
+        made = kd._run_git(root, *_AUTHOR, "commit-tree", tree, "-p", head, "-p", main, "-m", message)
+        commit = kd._sha(made.stdout.decode()) if made is not None and made.returncode == 0 else None
+        if commit is None:
+            raise kd.PublishRefused("no_update", f"git commit-tree of {tree} did not run")
+        kd._run_git(root, "branch", name, commit)  # git refuses a name that exists; the read below decides
+        found = kd._run_git(root, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}")
+    commit = kd._sha(found.stdout.decode()) if found is not None and found.returncode == 0 else None
+    if commit is None or _commit(root, commit) != (tree, [head, main]):
+        raise kd.PublishRefused("branch_not_at_update", f"{name} is not the update of {head} on {main}")
+    return commit
+
+
+def _commit(root: Path, commit: str) -> tuple:
+    """A commit's tree and parents."""
+    tree = kd._run_git(root, "rev-parse", "--verify", "--quiet", f"{commit}^{{tree}}")
+    parents = kd._run_git(root, "rev-list", "--parents", "-n", "1", commit)
+    if tree is None or parents is None or tree.returncode != 0 or parents.returncode != 0:
+        return None, None
+    return kd._sha(tree.stdout.decode()), parents.stdout.decode().split()[1:]
+
+
+def _still_moved(conn, row: dict) -> bool:
+    """The row is still base_moved at its head and pull request, with the setting still on."""
+    return kd.delivery_settings() and kd.exact_base_settings() and conn.execute(
+        "SELECT 1 FROM kanban_deliveries WHERE id = ? AND pull_request_state = ? AND pull_request_head = ? "
+        "AND pull_request_number = ?", (row["id"], kd._BASE_MOVED, row["pull_request_head"],
+                                        row["pull_request_number"])).fetchone() is not None
+
+
+def _updated(db_path: Path, row: dict, facts: dict, update: Optional[tuple]) -> Optional[str]:
+    """One write transaction, while the row is still base_moved: unless the kernel's delivery_updated event of
+    this delivery, H and main records the update card already, the card is made through _continuation's card
+    creation at the updated head, so for the source's builder with the source's governance, its recorded base then
+    main, and that event names it; then the row is final, updated."""
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+        if not _still_moved(conn, row):
+            return None
+        if _made(conn, row, facts["main"]) is None:
+            if update is None:
+                return None
+            root, branch, commit = update
+            body = _UPDATE_BODY.format(head=facts["head"], source=facts["source"], number=row["pull_request_number"],
+                                       repository=row["repository"], base=facts["base"], main=facts["main"],
+                                       update=commit, branch=branch)
+            made = kd._continuation(conn, db_path, {**row, "pull_request_head": commit}, body, (root, branch))
+            # The kernel's scoped completion hands over only committed changes since the recorded base, so the
+            # unchanged updated head is handed over against main, which it holds: exactly the approved paths.
+            conn.execute("UPDATE tasks SET base_commit = ? WHERE id = ? AND base_commit = ?",
+                         (facts["main"], made["rework"], commit))
+            kb._append_event(conn, row["source_task_id"], "delivery_updated", kd._outcome(
+                row, repository=row["repository"], reviewed_base=facts["base"], observed_main=facts["main"],
+                update_task_id=made["rework"], update_head=commit, update_branch=branch,
+                **({"parked": made["parked"]} if made.get("parked") else {})))
+        conn.execute("UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ?", (kd._UPDATED, row["id"]))
+    return kd._UPDATED
+
+
+def _returned(db_path: Path, row: dict, facts: dict, reason: str) -> Optional[str]:
+    """H back to its builder through its continuation card, on the continuation branch made at H first as card
+    2's return does; the row is returned for changes. The card's body says why, and _continuation's own
+    review_followup_recorded event names the card, so no other event is written. No card goes to review."""
+    branch = kd._return_branch(db_path, row)
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+        if not _still_moved(conn, row):
+            return None
+        body = _RETURN_BODY.format(head=facts["head"], source=facts["source"], number=row["pull_request_number"],
+                                   repository=row["repository"], base=facts["base"], main=facts["main"],
+                                   why=_WHY[reason])
+        kd._continuation(conn, db_path, row, body, branch)
+        conn.execute("UPDATE kanban_deliveries SET pull_request_state = 'returned_for_changes' WHERE id = ?",
+                     (row["id"],))
+    return "returned_for_changes"
