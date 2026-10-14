@@ -10,6 +10,7 @@ late-binding seam in :mod:`hermes_cli.web_deps` so
 import asyncio  # noqa: F401 — used by handlers
 import functools  # noqa: F401
 import logging
+from datetime import datetime
 from typing import Optional  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Request  # noqa: F401
@@ -44,6 +45,7 @@ from plugins.dashboard_auth.raphael_workspace import (  # noqa: E402
 _AUTOMATIONS_LITERAL_ROUTES = (
     ("GET", "/api/cron/jobs"),
     ("GET", "/api/cron/executions"),
+    ("GET", "/api/cron/schedule-preview"),
     ("POST", "/api/cron/jobs"),
 )
 _AUTOMATIONS_TEMPLATE_ROUTES = (
@@ -170,6 +172,54 @@ async def get_cron_job(job_id: str, profile: Optional[str] = None):
 @router.get("/api/cron/jobs/{job_id}/runs")
 async def list_cron_job_runs(job_id: str, profile: Optional[str] = None, limit: int = 20):
     return await _run_cron_dashboard_io(_list_cron_job_runs_sync, job_id, profile, limit)
+
+
+def _preview_cron_schedule_sync(schedule: str, profile: Optional[str] = None):
+    """First run of ``schedule`` in ``profile``, computed as create_job computes it.
+
+    parse_schedule and compute_next_run run under the profile's home, as
+    ``_call_cron_for_profile`` runs create_job, so the profile's time zone
+    applies. Nothing is written: no job store, no state, no file.
+    """
+    from cron import jobs as cron_jobs
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    _profile_name, home = _cron_profile_home(profile)
+    token = set_hermes_home_override(str(home))
+    try:
+        now = cron_jobs._hermes_now()
+        try:
+            parsed = cron_jobs.parse_schedule(schedule)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        next_run_at = cron_jobs.compute_next_run(parsed)
+    finally:
+        reset_hermes_home_override(token)
+    # A one-time start before now is refused, inside the one-shot grace window too:
+    # create_job would still accept it, but the run it describes has already passed.
+    if parsed["kind"] == "once" and (
+        next_run_at is None or datetime.fromisoformat(next_run_at) < now
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "schedule_in_past", "now": now.isoformat()},
+        )
+    return {"now": now.isoformat(), "next_run_at": next_run_at}
+
+
+@router.get("/api/cron/schedule-preview")
+async def preview_cron_schedule_route(
+    request: Request, schedule: str, profile: Optional[str] = None
+):
+    """When ``schedule`` would first run in ``profile``, and the platform's time now.
+
+    Read-only: answers the ``next_run_at`` create_job would store, without
+    creating anything. A one-time start before now answers 409
+    ``schedule_in_past``.
+    """
+    result = await _run_cron_dashboard_io(_preview_cron_schedule_sync, schedule, profile)
+    _audit_automations_machine_success(request, action="preview")
+    return result
 
 
 async def create_cron_job(body: CronJobCreate, profile: Optional[str] = None, idempotency_key: Optional[str] = None):
