@@ -36,6 +36,19 @@ With ``kanban.delivery.exact_base`` exactly true, :func:`worktree_start` starts 
 new card branch of a policy repository at the main GitHub holds now, fetched
 through the publish step's transport; a failed fetch starts it at HEAD as before
 and :func:`base_fallback` records why, after the base.
+
+With the same setting, :func:`arm_step` merges only on the base review saw: under one merge lock per
+repository, a file under the kanban root that every board and process shares, it reads main (an answer
+naming another ref than main is no read), merges when main is the reviewed base or is already in the
+approved head (:func:`base_allows_merge`), and else sends nothing and records the row base_moved with what it
+compared. A merge answer that is neither 200 nor one of the refusals GitHub documents for a merge it did not
+make is settled by reading the pull request and main back, still under the lock: armed only when the pull
+request is merged into main at exactly the approved head, else unknown, never refused, and the merge step
+reads it on every pass; the merge is never sent again. The merge step, too, records only a merge at the
+approved head, and records delivery_merged_off_base beside it when the merge's first parent is not the main
+the arm checked. When git cannot read that parent, it records delivery_merged_off_base_unknown instead, and
+each later pass reads the parent again until one delivery_merged_off_base or delivery_merged_on_base event
+closes that check.
 """
 
 from __future__ import annotations
@@ -496,10 +509,11 @@ def _answered(answer: dict) -> dict:
     return answer
 
 
-def _branch_head(github, branch: str) -> Optional[str]:
+def _branch_head(github, branch: str, *, named: bool = False) -> Optional[str]:
     """The commit ``branch`` holds on GitHub, or ``None`` when GitHub answers 404.
     Read through ``request``: the transport's ``branch_head`` raises one reason
-    for a temporary answer and for a malformed one alike."""
+    for a temporary answer and for a malformed one alike. When ``named`` (card 2's
+    reads of main), an answer whose ref is not exactly ``refs/heads/<branch>`` is unreadable too."""
     answer = _answered(github.request("GET", f"/repos/{github.repository}/git/ref/heads/{branch}"))
     if answer["status"] == 404:
         return None
@@ -507,6 +521,8 @@ def _branch_head(github, branch: str) -> Optional[str]:
     sha = target.get("sha") if isinstance(target, dict) else None
     if answer["status"] != 200 or not isinstance(sha, str) or not _SHA.fullmatch(sha):
         raise PublishRefused("branch_unreadable", f"GitHub answered {answer['status']}")
+    if named and answer["data"].get("ref") != f"refs/heads/{branch}":
+        raise PublishRefused("branch_unreadable", "GitHub answered for another ref")
     return sha
 
 
@@ -1374,6 +1390,11 @@ _PENDING, _ARMED, _ARM_REFUSED, _ARM_UNKNOWN = (
     "auto_merge_pending", "auto_merge_armed", "auto_merge_refused", "auto_merge_unknown")
 _ARM_HELD = (_PENDING, _ARMED, _ARM_UNKNOWN)
 _REPLACED, _CLOSE_REFUSED = "replaced", "close_refused"
+# Card 2 (kanban.delivery.exact_base): main is neither the reviewed base nor in H, so nothing was sent; the
+# row waits for part 3. The merge lock is waited for this long, then the next pass tries again.
+_BASE_MOVED = "base_moved"
+_MERGE_LOCK_SECONDS = 30
+_MERGE_REFUSALS = frozenset({403, 404, 405, 409, 422})  # the answers GitHub documents for a merge it did not make
 _REVIEW_PAGES = 10  # owner rule 2 of round 3: a pull request's reviews are read up to 10 pages of 100
 # A row's repository: the publish step's own record of the pull request it published,
 # never the current git origin. No record, no repository, and nothing is sent.
@@ -1528,7 +1549,11 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
     call after it, and its status line alone, its body never read, is written to this attempt only: armed on
     200, else refused with that status, or unknown with no status. A full tenth page of reviews that GitHub does not
     show to be the last refuses H once instead, and a review requesting changes returns H (:func:`_return_review`).
-    Owner rule 2 of round 3: while a recorded refused or unanswered rerun of H has no return, nothing is read or sent."""
+    Owner rule 2 of round 3: while a recorded refused or unanswered rerun of H has no return, nothing is read or sent.
+    With exact_base, card 2 holds the repository's merge lock from a read of main, which must name main, to the
+    recorded answer; refused is then only a refusal GitHub documents for a merge it did not make (_MERGE_REFUSALS),
+    and any other answer but 200, with or without a status, is read back once (:func:`_read_back`): armed at
+    exactly H, else unknown, never refused, and never sent again."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     source, head, number, repository = (row[key] for key in (
@@ -1559,28 +1584,119 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
         return _return_review(db_path, row, evidence, github, returned)
     if not evidence[2] or whole and not _lenses_approve(reviews, head, evidence[2]):
         return None  # a card returned changes, or a lens or the bot's latest review does not approve H
-    attempt = secrets.token_hex(8)
-    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
-        if not delivery_settings() or _arm_evidence(conn, row) != evidence or _claimed(conn, repository, number):
-            return None  # the evidence changed while GitHub was read: nothing is sent
-        if not whole:  # a full tenth page, a next page named or unknown: H is refused once and never sent
-            conn.execute("UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ?", (_ARM_REFUSED, row["id"]))
-            kb._append_event(conn, source, f"delivery_{_ARM_REFUSED}", _outcome(
-                row, repository=repository, status=None, reason="review_history_over_10_pages",
-                cards=[card[0] for card in evidence[2]]))
-            return _ARM_REFUSED
-        conn.execute("UPDATE kanban_deliveries SET pull_request_state = ?, publish_lease = ? WHERE id = ?",
-                     (_PENDING, attempt, row["id"]))
-    answer = _sent(github, "request", "PUT", f"/repos/{repository}/pulls/{number}/merge",
-                   body={"sha": head, "merge_method": "merge"})
-    state = _ARM_UNKNOWN if answer["status"] is None else _ARMED if answer["status"] == 200 else _ARM_REFUSED
-    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
-        if conn.execute("UPDATE kanban_deliveries SET pull_request_state = ?, publish_lease = NULL "
-                        "WHERE id = ? AND publish_lease = ?", (state, row["id"], attempt)).rowcount:
-            kb._append_event(conn, source, f"delivery_{state}", _outcome(
-                row, repository=repository, status=answer["status"], reason=answer.get("reason"),
-                cards=[card[0] for card in evidence[2]], attempt=attempt))
+    attempt, exact, moved, observed = secrets.token_hex(8), whole and exact_base_settings(), None, {}
+    with contextlib.ExitStack() as held:
+        if exact:  # card 2: from main's read to the answer's record, one repository's arms run one at a time
+            from hermes_cli.sqlite_util import InitLockUnavailable, cross_process_init_lock
+
+            try:
+                held.enter_context(cross_process_init_lock(
+                    _merge_lock_path(repository), timeout_seconds=_MERGE_LOCK_SECONDS, required=True))
+            except InitLockUnavailable:
+                logger.warning("kanban delivery: delivery %s: the merge lock is held elsewhere", row["id"])
+                return None  # nothing is sent or recorded: the next pass tries again
+            try:
+                main = _branch_head(github, _PULL_REQUEST_BASE, named=True)
+            except GitHubTransportError as error:
+                raise _transport_refusal(error) from None
+            if main is None:
+                return None  # GitHub shows no main: nothing is sent or recorded on this pass
+            with kb.connect_closing(db_path=db_path) as conn:
+                reviewed_base, workdir = _reviewed(conn, source, head)
+            observed = {"observed_main": main}
+            if not base_allows_merge(workdir, reviewed_base, main, head):
+                moved = {"reviewed_base": reviewed_base, **observed}
+        with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+            if not delivery_settings() or _arm_evidence(conn, row) != evidence or _claimed(conn, repository, number):
+                return None  # the evidence changed while GitHub was read: nothing is sent
+            if not whole:  # a full tenth page, a next page named or unknown: H is refused once and never sent
+                conn.execute("UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ?", (_ARM_REFUSED, row["id"]))
+                kb._append_event(conn, source, f"delivery_{_ARM_REFUSED}", _outcome(
+                    row, repository=repository, status=None, reason="review_history_over_10_pages",
+                    cards=[card[0] for card in evidence[2]]))
+                return _ARM_REFUSED
+            if moved:  # main left the base review saw and is not in H: nothing is sent, the lease is untouched
+                conn.execute("UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ?", (_BASE_MOVED, row["id"]))
+                kb._append_event(conn, source, f"delivery_{_BASE_MOVED}", _outcome(
+                    row, repository=repository, **moved, cards=[card[0] for card in evidence[2]]))
+                return _BASE_MOVED
+            conn.execute("UPDATE kanban_deliveries SET pull_request_state = ?, publish_lease = ? WHERE id = ?",
+                         (_PENDING, attempt, row["id"]))
+        answer = _sent(github, "request", "PUT", f"/repos/{repository}/pulls/{number}/merge",
+                       body={"sha": head, "merge_method": "merge"})
+        status, reason = answer["status"], answer.get("reason")
+        state = _ARM_UNKNOWN if status is None else _ARMED if status == 200 else _ARM_REFUSED
+        if exact and status != 200 and status not in _MERGE_REFUSALS:
+            state, read = _read_back(github, repository, number, head)  # not a documented refusal: read once
+            observed = {**observed, **read}
+        with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+            if conn.execute("UPDATE kanban_deliveries SET pull_request_state = ?, publish_lease = NULL "
+                            "WHERE id = ? AND publish_lease = ?", (state, row["id"], attempt)).rowcount:
+                kb._append_event(conn, source, f"delivery_{state}", _outcome(
+                    row, repository=repository, status=status, reason=reason,
+                    cards=[card[0] for card in evidence[2]], attempt=attempt, **observed))
     return state
+
+
+def _merge_lock_path(repository: str) -> Path:
+    """The repository's merge lock: under the kanban root, which no board or profile changes, so every
+    dispatcher and process on the host computes the same file."""
+    return kb.kanban_home() / "kanban" / "merge-locks" / hashlib.sha256(repository.lower().encode()).hexdigest()
+
+
+def _reviewed(conn: sqlite3.Connection, source: str, head: str) -> tuple:
+    """The base the publish bound ``head`` to, as :func:`_intake` reads it, and the card's own repository."""
+    task = conn.execute("SELECT workspace_path FROM tasks WHERE id = ?", (source,)).fetchone()
+    bound = conn.execute(
+        "SELECT json_extract(payload, '$.base_commit') FROM task_events WHERE task_id = ? "
+        "AND kind = 'delivery_bound' AND json_extract(payload, '$.head') = ? ORDER BY id DESC LIMIT 1",
+        (source, head)).fetchone()
+    return (_sha(bound[0]) if bound is not None else None), (_repository(task[0]) if task is not None else None)
+
+
+def base_allows_merge(workdir: Optional[Path], reviewed_base: Optional[str], main: str, head: str) -> bool:
+    """Card 2's rule (owner question 1): main is the base review saw, or main is already in the approved
+    head, so the merge result is what review approved. Containment is git's answer in the card's own
+    repository; a git failure, no repository or a commit git does not know is not contained."""
+    if _sha(main) != main:
+        return False
+    if main == _sha(reviewed_base):
+        return True
+    if workdir is None or _sha(head) != head:
+        return False
+    contained = _run_git(Path(workdir), "merge-base", "--is-ancestor", main, head)
+    return contained is not None and contained.returncode == 0
+
+
+def _read_back(github, repository: str, number: int, head: str) -> tuple:
+    """An unconfirmed merge answer settled by one read of the pull request and one of main, never by a second
+    merge: shown merged into main at exactly H it is armed (merge_step records it); else it is unknown, which
+    merge_step reads on every pass: not merged yet, a merge or an open head other than H, or a read that failed
+    or cannot be used. read_back names which, with the head, merge commit and main the read showed. Never
+    refused. No failure escapes: the row is pending."""
+    pull, main = {"status": None, "data": None}, None
+    try:
+        pull = github.request("GET", f"/repos/{repository}/pulls/{number}")
+        main = _branch_head(github, _PULL_REQUEST_BASE, named=True)
+    except Exception:
+        pass  # a read failed: what the pull request read showed is still named
+    shown = _pull_head(pull, number)
+    read = {key: value for key, value in (
+        ("read_head", shown), ("merge_commit", _merge_commit(pull, number)), ("main_on_read", main)) if value}
+    if main is None or shown is None:
+        return _ARM_UNKNOWN, {"read_back": "read_failed", **read}
+    if shown != head:
+        return _ARM_UNKNOWN, {"read_back": "other_head", **read}
+    if "merge_commit" in read:
+        return _ARMED, {"read_back": "merged_at_head", **read}
+    return _ARM_UNKNOWN, {"read_back": "not_merged", **read}
+
+
+def _pull_head(answer: dict, number: int) -> Optional[str]:
+    """The head commit of GitHub's answer when it is a read of pull request ``number``."""
+    pull = answer["data"] if answer["status"] == 200 and isinstance(answer["data"], dict) else {}
+    shown = pull.get("head") if pull.get("number") == number and isinstance(pull.get("head"), dict) else {}
+    return _sha(shown.get("sha"))
 
 
 def _arm_evidence(conn: sqlite3.Connection, row: dict) -> tuple:
@@ -1669,13 +1785,20 @@ def _close_proof(conn: sqlite3.Connection, row: dict) -> tuple:
 
 # GitHub merged the armed pull request into main and the release record holds the merge: final.
 _MERGED = "merged"
+# Card 2's check of a merge's first parent against the main the arm checked. delivery_merged_off_base records
+# that they differ; when git cannot read the parent, delivery_merged_off_base_unknown leaves the check open, and
+# each later pass reads the parent again until one delivery_merged_off_base or delivery_merged_on_base closes it.
+_OFF_BASE, _OFF_BASE_UNKNOWN, _ON_BASE = (
+    "delivery_merged_off_base", "delivery_merged_off_base_unknown", "delivery_merged_on_base")
 
 
 def merge_step(db_path: Path) -> None:
     """Card 10 on the board whose file is ``db_path``: read the pull request of each armed or
     unknown arm and, once GitHub shows it merged into main, add the merge to the waiting
     release decision and mark the row merged. A failure leaves the row as it was, so the next
-    pass reads it again. Raises no error, so the tick goes on."""
+    pass reads it again. With exact_base (card 2), each first-parent check an earlier pass left open is read
+    again first (:func:`_recheck`). Raises no error, so the tick goes on."""
+    checks = _open_checks(db_path) if exact_base_settings() else []  # a check this pass opens waits for the next
     try:
         with kb.connect_closing(db_path=db_path) as conn:
             rows = [dict(row) for row in conn.execute(
@@ -1685,6 +1808,12 @@ def merge_step(db_path: Path) -> None:
     except Exception:
         logger.exception("kanban delivery: the merge step failed")
         return
+    for check in checks:
+        try:
+            _recheck(db_path, check)
+        except Exception:
+            logger.exception("kanban delivery: the first parent of merge %s of delivery %s is not checked",
+                             check["merge_commit"], check["id"])
     for row in rows:
         try:
             _record_merge(db_path, row)
@@ -1699,7 +1828,11 @@ def _record_merge(db_path: Path, row: dict) -> Optional[str]:
     gives the merge commit and the confirmation that it is on main. The rest is what review
     approved, never recomputed from the merge: H, the base the publish bound H to, and H's tree
     read from the card's own repository. The release record ignores a repeat, so a merge whose
-    row could not be marked is still recorded once, however often it is seen."""
+    row could not be marked is still recorded once, however often it is seen. With exact_base (card 2), only a
+    merge at exactly H counts: one at another head is not recorded, and the row stays as it is; one whose first
+    parent is not the main the arm checked is recorded all the same, with one delivery_merged_off_base event,
+    and one whose first parent git cannot read with one delivery_merged_off_base_unknown event, a check that
+    :func:`merge_step` reads again on later passes."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     head, number, repository = (row[key] for key in ("pull_request_head", "pull_request_number", "repository"))
@@ -1713,15 +1846,119 @@ def _record_merge(db_path: Path, row: dict) -> Optional[str]:
     except GitHubTransportError as error:
         raise _transport_refusal(error) from None
     merge = _merge_commit(answer, number)
-    if merge is None:
-        return None  # not merged into main: a later pass reads it again
+    exact = merge is not None and exact_base_settings()
+    if merge is None or exact and _pull_head(answer, number) != head:
+        return None  # not merged into main, or (card 2) merged at another head than H: a later pass reads it again
+    off_base = _off_base(db_path, row, merge) if exact else None  # read before the claim's write, never in it
     attempt = secrets.token_hex(8)
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if _claimed(conn, repository, number) or not conn.execute(
                 "UPDATE kanban_deliveries SET publish_lease = ? WHERE id = ? AND pull_request_state = ?",
                 (attempt, row["id"], row["pull_request_state"])).rowcount:
             return None  # another action took the pull request, or the row moved on, while GitHub was read
+        if off_base:
+            _record_off_base(conn, row, merge, *off_base)
     return _merged(db_path, row, merge, attempt, row["pull_request_state"])
+
+
+def _off_base(db_path: Path, row: dict, merge: str) -> Optional[tuple]:
+    """Card 2: the event the first-parent check of the merge at H records, and its details: the main the arm
+    checked (the observed_main of the latest armed or unknown record of this delivery and H), the reviewed base
+    and, for delivery_merged_off_base, the first parent when it is not the checked main; or
+    delivery_merged_off_base_unknown when git cannot read it (:func:`_first_parent`), which leaves the check
+    open. Else None: no main was checked, or the merge is on it. Raises nothing the fetch raises."""
+    source, head = row["source_task_id"], row["pull_request_head"]
+    with kb.connect_closing(db_path=db_path) as conn:
+        checked = conn.execute(
+            "SELECT json_extract(payload, '$.observed_main') FROM task_events WHERE task_id = ? AND kind IN (?, ?) "
+            "AND json_extract(payload, '$.delivery_id') = ? AND json_extract(payload, '$.head') = ? "
+            "ORDER BY id DESC LIMIT 1", (source, f"delivery_{_ARMED}", f"delivery_{_ARM_UNKNOWN}", row["id"], head),
+        ).fetchone()
+        reviewed_base, workdir = _reviewed(conn, source, head)
+    checked = _sha(checked[0]) if checked is not None else None
+    if checked is None:
+        return None
+    parent = _first_parent(row, workdir, merge)
+    if parent is None:
+        return _OFF_BASE_UNKNOWN, {"observed_main": checked, "reviewed_base": reviewed_base}
+    if parent == checked:
+        return None  # merged on the main the arm checked
+    return _OFF_BASE, {"first_parent": parent, "observed_main": checked, "reviewed_base": reviewed_base}
+
+
+def _first_parent(row: dict, workdir: Optional[Path], merge: str) -> Optional[str]:
+    """Card 2: the first parent of ``merge`` as git reads it in the card's repository ``workdir``, after one fetch
+    of main when git does not hold the merge; None, which one warning names, when there is no repository or git
+    still cannot read it. Raises nothing the fetch raises."""
+    from hermes_cli.kanban_delivery_github import GitHubTransport
+
+    def read() -> Optional[str]:
+        found = _run_git(workdir, "rev-parse", "--verify", "--quiet", f"{merge}^1") if workdir else None
+        return _sha(os.fsdecode(found.stdout)) if found is not None and found.returncode == 0 else None
+
+    parent = read()
+    if parent is None and workdir is not None:
+        try:  # git does not hold the merge: main is fetched once, into refs/remotes/origin/main only
+            GitHubTransport("publish", row["repository"]).fetch_main(workdir)
+        except Exception:
+            pass  # the fetch failed: git is read once more all the same
+        parent = read()
+    if parent is None:
+        logger.warning("kanban delivery: delivery %s: the first parent of merge %s is unreadable", row["id"], merge)
+    return parent
+
+
+def _record_off_base(conn: sqlite3.Connection, row: dict, merge: str, kind: str, details: dict) -> None:
+    """In the caller's write transaction: the first-parent check's ``kind`` event for this delivery and merge
+    commit, unless one is there already or the check is closed, by a delivery_merged_off_base or
+    delivery_merged_on_base event. So each delivery and merge commit has at most one open check and one
+    event that closes it."""
+    if conn.execute("SELECT 1 FROM task_events WHERE task_id = ? AND kind IN (?, ?, ?) "
+                    "AND json_extract(payload, '$.delivery_id') = ? AND json_extract(payload, '$.merge_commit') = ?",
+                    (row["source_task_id"], kind, _OFF_BASE, _ON_BASE, row["id"], merge)).fetchone() is None:
+        kb._append_event(conn, row["source_task_id"], kind, _outcome(
+            row, repository=row["repository"], merge_commit=merge, **details))
+
+
+def _open_checks(db_path: Path) -> list:
+    """Card 2: each first-parent check a delivery_merged_off_base_unknown event left open on a merged row, as
+    that row with the event's merge commit, checked main and reviewed base; a check is open while no
+    delivery_merged_off_base or delivery_merged_on_base event of that delivery and merge commit closes it.
+    No check when they cannot be read, which one error names, so the pass records merges all the same."""
+    try:
+        with kb.connect_closing(db_path=db_path) as conn:
+            return [dict(check) for check in conn.execute(
+                f"SELECT d.*, {_RECEIPT.format('d')} AS repository, json_extract(e.payload, '$.merge_commit') "
+                "AS merge_commit, json_extract(e.payload, '$.observed_main') AS observed_main, "
+                "json_extract(e.payload, '$.reviewed_base') AS reviewed_base FROM kanban_deliveries AS d "
+                "JOIN task_events AS e ON e.task_id = d.source_task_id AND e.kind = ? "
+                "AND json_extract(e.payload, '$.delivery_id') = d.id WHERE d.pull_request_state = ? AND NOT EXISTS ("
+                "SELECT 1 FROM task_events AS c WHERE c.task_id = d.source_task_id AND c.kind IN (?, ?) "
+                "AND json_extract(c.payload, '$.delivery_id') = d.id AND json_extract(c.payload, '$.merge_commit') "
+                "= json_extract(e.payload, '$.merge_commit')) ORDER BY e.id",
+                (_OFF_BASE_UNKNOWN, _MERGED, _OFF_BASE, _ON_BASE))]
+    except Exception:
+        logger.exception("kanban delivery: the open first-parent checks are not read")
+        return []
+
+
+def _recheck(db_path: Path, check: dict) -> None:
+    """Card 2: one open check read again, the merge's first parent read as :func:`_record_merge` reads it. Still
+    unreadable, the check stays open for the next pass; else one event closes it, in a write transaction that
+    first finds it still open: delivery_merged_off_base when the parent is not the check's checked main,
+    delivery_merged_on_base when it is, each with the merge commit, the first parent, that checked main and the
+    reviewed base. The row and the release record stay as they are; no GitHub API is called, only main fetched."""
+    merge = check["merge_commit"]
+    if _sha(merge) != merge:
+        return  # not a merge commit this step recorded: git is not read
+    with kb.connect_closing(db_path=db_path) as conn:
+        workdir = _reviewed(conn, check["source_task_id"], check["pull_request_head"])[1]
+    parent = _first_parent(check, workdir, merge)
+    if parent is None:
+        return
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+        _record_off_base(conn, check, merge, _ON_BASE if parent == check["observed_main"] else _OFF_BASE, {
+            "first_parent": parent, "observed_main": check["observed_main"], "reviewed_base": check["reviewed_base"]})
 
 
 def _merge_commit(answer: dict, number: int) -> Optional[str]:
