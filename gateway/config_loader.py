@@ -346,14 +346,15 @@ def bridge_core_env_settings(yaml_cfg: dict, platforms_data: dict) -> None:
             os.environ["SIGNAL_REQUIRE_MENTION"] = str(signal_cfg["require_mention"]).lower()
 
 
-def read_yaml_layers(home: Path) -> dict:
+def read_yaml_layers(home: Path, *, strict: bool = False) -> dict:
     """User ``config.yaml`` with the managed overlay applied — the YAML the gateway loader sees.
 
     Raises on a malformed user file (the loader then falls back to env + gateway.json WITHOUT the
     managed layer). An ABSENT user file is an empty layer, not a reason to skip the administrator's
     values: a fleet host with no ``config.yaml`` must still honor them. Any pre-activation predicate
     (``gateway.relay.relay_explicitly_disabled``) reads through here so it cannot disagree with
-    ``load_gateway_config()`` on which files count.
+    ``load_gateway_config()`` on which files count. ``strict`` also raises
+    ``ManagedScopeError`` when a managed file is present but cannot be applied.
     """
     import yaml
 
@@ -366,7 +367,7 @@ def read_yaml_layers(home: Path) -> dict:
     # Managed scope: overlay administrator-pinned values (this loader bypasses
     # hermes_cli.config.load_config, so managed quick_commands / stt would otherwise be ignored).
     from hermes_cli import managed_scope
-    return managed_scope.apply_managed_overlay(yaml_cfg)
+    return managed_scope.apply_managed_overlay(yaml_cfg, strict=strict)
 
 
 def load_yaml_layer(home: Path, gw_data: dict) -> None:

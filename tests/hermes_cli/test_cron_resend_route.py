@@ -991,11 +991,19 @@ def test_resolving_another_profile_never_changes_the_dashboard_environment_other
     assert gateways["worker_alpha"].requests == [] and gateways["worker_beta"].requests == []
 
 
+# Falsey YAML roots: none is a mapping, so a managed config.yaml holding one cannot be applied either.
+FALSEY_ROOTS = {"empty-list": "[]", "false": "false", "zero": "0", "zero-float": "0.0", "empty-string": "''"}
+
+
 def _break_settings_file(home, name, damage, port):
     path = home / name
     path.unlink(missing_ok=True)
     if damage == "unreadable":  # chmod cannot stop root reading a file, but nobody can read a directory as a file
         path.mkdir()
+    elif damage == "apply-failing":  # parses as a mapping, but its anchor refers to itself, so applying it never ends
+        path.write_text(f"gateway: &loop {{api_server: {{port: {port}}}, loop: *loop}}\n", encoding="utf-8")
+    elif damage in FALSEY_ROOTS:
+        path.write_text(FALSEY_ROOTS[damage] + "\n", encoding="utf-8")
     elif name == "gateway.json":
         path.write_text('{"platforms": {"api_server": {"extra": {"port": %d}}}\n' % port, encoding="utf-8")
     else:
@@ -1010,14 +1018,20 @@ def _break_settings_file(home, name, damage, port):
         pytest.param("default", "config.yaml", "unreadable", id="unreadable-own-config"),
         pytest.param("default", "gateway.json", "malformed", id="malformed-own-gateway-json"),
         pytest.param("default", "gateway.json", "unreadable", id="unreadable-own-gateway-json"),
+        pytest.param("default", "config.yaml", "apply-failing", id="apply-failing-managed-config"),
+        pytest.param("default", "config.yaml", "empty-list", id="empty-list-managed-config"),
+        pytest.param("default", "config.yaml", "false", id="false-managed-config"),
+        pytest.param("default", "config.yaml", "zero", id="zero-managed-config"),
+        pytest.param("default", "config.yaml", "zero-float", id="zero-float-managed-config"),
+        pytest.param("default", "config.yaml", "empty-string", id="empty-string-managed-config"),
     ],
 )
 def test_settings_that_cannot_be_read_or_parsed_are_refused_instead_of_using_8642(
-    dashboard, stubs, monkeypatch, outgoing, claims, profile, name, damage
+    dashboard, stubs, monkeypatch, managed_dir, outgoing, claims, profile, name, damage
 ):
     gateways = _point_every_gateway(dashboard, stubs, monkeypatch)
     _record_served(dashboard.homes, "worker_alpha")
-    home = dashboard.homes[profile]
+    home = managed_dir if damage == "apply-failing" or damage in FALSEY_ROOTS else dashboard.homes[profile]
     if profile == "worker_alpha":
         _write_config(home, {"platforms": {"api_server": {"extra": {"key": WORKER_KEY}}}})
     _break_settings_file(home, name, damage, gateways[profile].port)
