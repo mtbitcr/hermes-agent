@@ -212,7 +212,7 @@ async def test_release_decision_lists_the_waiting_batch_in_plain_words(root):
         "titles": [
             "Show the release decision",
             "Keep the owner page fast",
-            "Untitled work item",  # owner_title refuses a title that shows a path, as a whole
+            "This piece of work has a title Raphael cannot show here.",  # owner_title refuses a title that shows a path, as a whole
         ],
         "count": 3,
         "tier": 2,
