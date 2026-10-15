@@ -1041,9 +1041,10 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
 # the count of failed tests ("count N"), then each failed test id. No other annotation names a test. Owner
 # rule 4: "count" and a number, 0 included (a setup error's), is the count and never a test id.
 _FAILED_TEST, _FAILED_COUNT = "Failed test", re.compile(r"count ([0-9]+)")
-# Finding 164: the runner's own annotation on the check run of a job it stopped at its time limit, "The job
-# running on runner <name> has exceeded the maximum execution time of <n> minutes.".
-_TIME_LIMIT = re.compile(r"has exceeded the maximum execution time of [0-9]+ minutes?")
+# Finding 164: the runner's own annotation on the check run of a job it stopped at its time limit. GitHub wrote "The
+# job has exceeded the maximum execution time of 1m0s" on the incident's check run 116425444108: the limit as a
+# duration in hours, minutes and seconds. The "... of <n> minutes." wording is accepted too.
+_TIME_LIMIT = re.compile(r"has exceeded the maximum execution time of (?:[0-9]+ minutes?|(?:[0-9]+h)?(?:[0-9]+m)?[0-9]+s)")
 _RED_REWORK_BODY = (
     "Rework of {source}: a required check is red on head {head} of pull request {number} on the code host, "
     "and the delivery returned the work to its builder ({reason}: {detail}). {tests} "

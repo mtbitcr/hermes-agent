@@ -254,7 +254,8 @@ def decide_rerun(policy: Policy, repo: str, head: str, jobs: list[dict], ledger:
     jobs: every job of the run with id, name, head_sha, status, conclusion, run_attempt and
     steps [{name, conclusion}]; a failed slice also carries failed_tests (the test ids its log
     names) and failed_count (the count its pytest summary reports); a job that ended cancelled or
-    timed_out may carry time_limit (a bool: its check run names the runner's time limit). ledger:
+    timed_out may carry time_limit (a bool: its check run names the runner's time limit), and a slice
+    so stopped (time_limit True) needs neither failed_tests nor failed_count. ledger:
     {"reruns": [heads already rerun]}. All or nothing: one ineligible failed job refuses the whole rerun.
     Owner rule 1: repo, names, statuses and failed test ids are non-empty strs, a conclusion too
     or None before its job or step completes, H and the heads SHAs, ids (unique), run_attempt and
@@ -337,7 +338,10 @@ def _rerun_facts(repo: str, head: str, jobs: list[dict], ledger: dict):
             yield f"{name}.steps[{step_index}].conclusion", step["conclusion"] is None or _is_text(step["conclusion"])
         if "time_limit" in job:  # finding 164: optional, and a bool when present
             yield f"{name}.time_limit", _is_bool(job["time_limit"])
-        if job["name"] in TEST_JOB_STEPS and job["conclusion"] not in _PASSING:
+        # A slice stopped at its time limit (decide_rerun's stopped) may have written no pytest count, and its time
+        # limit alone decides it; every other failed slice proves its failed tests and their count.
+        if job["name"] in TEST_JOB_STEPS and job["conclusion"] not in _PASSING and not (
+                job["conclusion"] in ("cancelled", "timed_out") and job.get("time_limit") is True):
             yield from _shape(name, job, "failed_tests failed_count")
             yield from _shape(f"{name}.failed_tests", job["failed_tests"])
             yield f"{name}.failed_tests", all(_is_text(test) for test in job["failed_tests"])
