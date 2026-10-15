@@ -41,6 +41,7 @@ from typing import Any, Optional
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.kanban_record_window import build_record_text
+from tools.kanban_run_ending import add_ending_tool, ends_run
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
@@ -575,6 +576,7 @@ def _capability_from_session(db: Any, session_id: str) -> dict:
         if name in _CAPABILITY_SKILL_TOOLS and (skill := _capability_skill_name(message)):
             skills.add(skill)
         tools.add(name)
+    add_ending_tool(tools)
     return _capability_receipt(
         skills,
         tools,
@@ -1901,6 +1903,7 @@ def _handle_receipts_summary(args: dict, **kw) -> str:
         return tool_error("kanban_receipts_summary: the boards could not be read")
 
 
+@ends_run("kanban_complete")
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
     delegated_err = _reject_delegated_child_mutation("kanban_complete")
@@ -2217,6 +2220,7 @@ def _hand_saved_patch_to_review(
     )
 
 
+@ends_run("kanban_request_review")
 def _handle_request_review(args: dict, **kw) -> str:
     """Move implementation into the first-class review phase."""
     delegated_err = _reject_delegated_child_mutation("kanban_request_review")
@@ -2384,6 +2388,7 @@ def _active_reviewer_run_id(task_id: str) -> tuple[Optional[int], Optional[str]]
     return run_id, None
 
 
+@ends_run("kanban_review_findings")
 def _handle_review_findings(args: dict, **kw) -> str:
     """Reviewer verdict: submit a typed findings document (the sole handback)."""
     delegated_err = _reject_delegated_child_mutation("kanban_review_findings")
