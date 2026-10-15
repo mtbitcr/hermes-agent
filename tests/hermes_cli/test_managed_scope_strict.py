@@ -19,6 +19,19 @@ USER_CONFIG = {"gateway": {"api_server": {"port": 8650}}}
 APPLY_FAILING = "gateway: &loop {api_server: {port: 9000}, loop: *loop}\n"
 MALFORMED = "gateway: {api_server: {port: 9000}\n"
 NOT_A_MAPPING = "- gateway\n- api_server\n"
+# Documents whose root is not a mapping. The falsey ones must not pass for an empty layer.
+NON_MAPPING_ROOTS = [
+    pytest.param(NOT_A_MAPPING, id="not-a-mapping"),
+    pytest.param("[]\n", id="empty-list"),
+    pytest.param("false\n", id="false"),
+    pytest.param("0\n", id="zero"),
+    pytest.param("0.0\n", id="zero-float"),
+    pytest.param("''\n", id="empty-string"),
+    pytest.param("null\n", id="null"),
+    pytest.param("~\n", id="tilde"),
+    pytest.param("!!set {}\n", id="empty-set"),
+    pytest.param('!!binary ""\n', id="empty-binary"),
+]
 
 
 @pytest.fixture()
@@ -54,9 +67,7 @@ def test_managed_file_that_parses_but_fails_while_applied_raises_in_strict_mode(
         load(strict=True)
 
 
-@pytest.mark.parametrize(
-    "text", [pytest.param(MALFORMED, id="malformed"), pytest.param(NOT_A_MAPPING, id="not-a-mapping")]
-)
+@pytest.mark.parametrize("text", [pytest.param(MALFORMED, id="malformed"), *NON_MAPPING_ROOTS])
 def test_malformed_or_non_mapping_managed_file_raises_in_strict_mode(managed_dir, load, text):
     _write_managed(managed_dir, text)
 
@@ -64,12 +75,22 @@ def test_malformed_or_non_mapping_managed_file_raises_in_strict_mode(managed_dir
         load(strict=True)
 
 
+@pytest.mark.parametrize("text", NON_MAPPING_ROOTS)
+def test_non_mapping_managed_file_raises_in_strict_mode_after_a_default_read(managed_dir, load, text):
+    _write_managed(managed_dir, text)
+    assert load() == USER_CONFIG  # so the strict read meets the file already parsed and cached
+
+    with pytest.raises(managed_scope.ManagedScopeError):
+        load(strict=True)
+    assert load() == USER_CONFIG
+
+
 @pytest.mark.parametrize(
     "text",
     [
         pytest.param(APPLY_FAILING, id="apply-failing"),
         pytest.param(MALFORMED, id="malformed"),
-        pytest.param(NOT_A_MAPPING, id="not-a-mapping"),
+        *NON_MAPPING_ROOTS,
     ],
 )
 def test_without_strict_each_such_managed_file_leaves_the_config_unchanged(managed_dir, load, text):
@@ -78,5 +99,27 @@ def test_without_strict_each_such_managed_file_leaves_the_config_unchanged(manag
     assert load() == USER_CONFIG
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("", id="zero-byte"),
+        pytest.param("  \n\n", id="whitespace-only"),
+        pytest.param("# placeholder: no managed values yet\n", id="comment-only"),
+        pytest.param("{}\n", id="empty-mapping"),
+    ],
+)
+def test_managed_file_holding_no_values_raises_nothing_in_strict_mode(managed_dir, load, text):
+    _write_managed(managed_dir, text)
+
+    assert load(strict=True) == USER_CONFIG
+    assert load() == USER_CONFIG
+
+
 def test_absent_managed_directory_raises_nothing_in_strict_mode(managed_dir, load):
+    assert load(strict=True) == USER_CONFIG
+
+
+def test_absent_managed_config_in_a_present_directory_raises_nothing_in_strict_mode(managed_dir, load):
+    managed_dir.mkdir()
+
     assert load(strict=True) == USER_CONFIG

@@ -27,6 +27,9 @@ _CACHE_LOCK = threading.Lock()
 _CONFIG_CACHE: Dict[str, tuple] = {}
 _ENV_CACHE: Dict[str, tuple] = {}
 
+# _cached_read's answer for a missing file, so strict mode can tell it from a ``null`` root.
+_ABSENT = object()
+
 
 def _under_pytest() -> bool:
     """True inside the test suite: ignore the system ``/etc/hermes`` so a real managed scope on a
@@ -65,14 +68,14 @@ class ManagedScopeError(Exception):
 def _cached_read(path: Path, cache: Dict[str, tuple], parse, *, strict: bool = False):
     """Shared (mtime_ns, size)-keyed read; returns a deepcopy of the parsed value.
 
-    ``None`` when the file is absent or fails to parse (fail-open). A parse failure is logged
+    ``_ABSENT`` when absent, ``None`` when it fails to parse (fail-open). A parse failure is logged
     LOUDLY — the admin needs to know their policy isn't applied — but never raises, so a malformed
     managed file can't brick startup. ``strict`` raises ``ManagedScopeError`` for it instead.
     """
     try:
         st = path.stat()
     except OSError:
-        return None  # absent
+        return _ABSENT
     key = (st.st_mtime_ns, st.st_size)
     path_key = str(path)
     with _CACHE_LOCK:
@@ -100,15 +103,17 @@ def _load_managed_file(name: str, cache: Dict[str, tuple], parse, *, strict: boo
     if managed_dir is None:
         return {}
     parsed = _cached_read(managed_dir / name, cache, parse, strict=strict)
-    if strict and parsed is not None and not isinstance(parsed, dict):
+    if strict and parsed is not _ABSENT and not isinstance(parsed, dict):
         raise ManagedScopeError(f"managed scope: {managed_dir / name} is not a mapping")
     return parsed if isinstance(parsed, dict) else {}
 
 
 def load_managed_config(*, strict: bool = False) -> dict:
-    """Parsed managed config.yaml, or {} when absent/malformed (fail-open; ``strict`` raises)."""
-    return _load_managed_file(
-        "config.yaml", _CONFIG_CACHE, lambda f: yaml.safe_load(f) or {}, strict=strict)
+    """Parsed managed config.yaml; {} when absent, empty, malformed or not a mapping (fail-open).
+
+    ``strict`` raises ``ManagedScopeError`` for a malformed or non-mapping file instead.
+    """
+    return _load_managed_file("config.yaml", _CONFIG_CACHE, _parse_config, strict=strict)
 
 
 def load_managed_env() -> Dict[str, str]:
@@ -150,6 +155,20 @@ def apply_managed_overlay(config: dict, *, strict: bool = False) -> dict:
             raise ManagedScopeError(f"managed scope: failed to apply config overlay: {exc}") from exc
         logger.warning("managed scope: failed to apply config overlay", exc_info=True)
         return config
+
+
+def _parse_config(f):
+    """``yaml.safe_load``, except that a stream holding no document at all is ``{}``.
+
+    An empty, blank or comment-only file carries no values. Any document's root is kept as parsed,
+    falsey ones included, so a strict read refuses ``[]`` or ``null`` even from the cache.
+    """
+    loader = yaml.SafeLoader(f)
+    try:
+        node = loader.get_single_node()
+        return {} if node is None else loader.construct_document(node)
+    finally:
+        loader.dispose()
 
 
 def _parse_env(f) -> Dict[str, str]:
