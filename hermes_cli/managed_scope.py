@@ -58,12 +58,16 @@ def invalidate_managed_cache() -> None:
         _ENV_CACHE.clear()
 
 
-def _cached_read(path: Path, cache: Dict[str, tuple], parse):
+class ManagedScopeError(Exception):
+    """A managed file is present but cannot be applied. Raised only to ``strict`` callers."""
+
+
+def _cached_read(path: Path, cache: Dict[str, tuple], parse, *, strict: bool = False):
     """Shared (mtime_ns, size)-keyed read; returns a deepcopy of the parsed value.
 
     ``None`` when the file is absent or fails to parse (fail-open). A parse failure is logged
     LOUDLY — the admin needs to know their policy isn't applied — but never raises, so a malformed
-    managed file can't brick startup.
+    managed file can't brick startup. ``strict`` raises ``ManagedScopeError`` for it instead.
     """
     try:
         st = path.stat()
@@ -79,6 +83,8 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
         with open(path, encoding="utf-8") as f:
             parsed = parse(f)
     except Exception as exc:  # noqa: BLE001 — fail-open, but LOUD
+        if strict:
+            raise ManagedScopeError(f"managed scope: failed to parse {path}: {exc}") from exc
         logger.warning(
             "managed scope: failed to parse %s: %s — IGNORING this managed file. "
             "Admin policy from this file is NOT being applied. Fix and restart.",
@@ -89,17 +95,20 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
     return parsed
 
 
-def _load_managed_file(name: str, cache: Dict[str, tuple], parse) -> dict:
+def _load_managed_file(name: str, cache: Dict[str, tuple], parse, *, strict: bool = False) -> dict:
     managed_dir = get_managed_dir()
     if managed_dir is None:
         return {}
-    parsed = _cached_read(managed_dir / name, cache, parse)
+    parsed = _cached_read(managed_dir / name, cache, parse, strict=strict)
+    if strict and parsed is not None and not isinstance(parsed, dict):
+        raise ManagedScopeError(f"managed scope: {managed_dir / name} is not a mapping")
     return parsed if isinstance(parsed, dict) else {}
 
 
-def load_managed_config() -> dict:
-    """Parsed managed config.yaml, or {} when absent/malformed (fail-open)."""
-    return _load_managed_file("config.yaml", _CONFIG_CACHE, lambda f: yaml.safe_load(f) or {})
+def load_managed_config(*, strict: bool = False) -> dict:
+    """Parsed managed config.yaml, or {} when absent/malformed (fail-open; ``strict`` raises)."""
+    return _load_managed_file(
+        "config.yaml", _CONFIG_CACHE, lambda f: yaml.safe_load(f) or {}, strict=strict)
 
 
 def load_managed_env() -> Dict[str, str]:
@@ -107,7 +116,7 @@ def load_managed_env() -> Dict[str, str]:
     return _load_managed_file(".env", _ENV_CACHE, _parse_env)
 
 
-def apply_managed_overlay(config: dict) -> dict:
+def apply_managed_overlay(config: dict, *, strict: bool = False) -> dict:
     """Overlay administrator-pinned config values on top of an already-built dict.
 
     ``${VAR}`` refs in the managed config expand against the PROCESS env only, so a user cannot
@@ -115,9 +124,13 @@ def apply_managed_overlay(config: dict) -> dict:
     to ``model.default`` so it can't clobber the dict shape callers expect; managed values
     deep-merge ON TOP per leaf while sibling keys stay user-controlled. Fail-open: returns
     ``config`` unchanged when no scope is present or on any error. Mutates and returns ``config``.
+
+    ``strict`` raises ``ManagedScopeError`` instead when a managed file is present but cannot be
+    parsed, is not a mapping or fails while its values are applied: a caller that must not act
+    without the administrator's values can tell that apart from no managed scope at all.
     """
     try:
-        managed = load_managed_config()
+        managed = load_managed_config(strict=strict)
         if not managed:
             return config
         # Imported lazily to avoid an import cycle (config imports managed_scope).
@@ -130,7 +143,11 @@ def apply_managed_overlay(config: dict) -> dict:
             managed_expanded = dict(managed_expanded)
             managed_expanded["model"] = {"default": managed_expanded["model"]}
         return _deep_merge(config, managed_expanded)
-    except Exception:  # noqa: BLE001 — overlay must never break a caller
+    except ManagedScopeError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — overlay must never break a default caller
+        if strict:
+            raise ManagedScopeError(f"managed scope: failed to apply config overlay: {exc}") from exc
         logger.warning("managed scope: failed to apply config overlay", exc_info=True)
         return config
 
