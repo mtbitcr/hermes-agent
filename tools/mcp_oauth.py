@@ -36,6 +36,7 @@ Configuration in config.yaml::
 
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -727,17 +728,45 @@ class HermesTokenStorage:
         """Return True if we have tokens on disk (may be expired)."""
         return self._tokens_path().exists()
 
-    def mark_sign_in_rejected(self) -> bool:
-        """Record on disk that the provider refused this connection's sign-in.
+    def mark_sign_in_rejected(self, refused: "OAuthToken | None") -> bool:
+        """Record on disk that the provider refused the credentials ``refused``.
 
         The dashboard reads it from another process and reports
         ``needs_authorization`` until ``set_tokens`` (a new sign-in) or
-        ``remove`` clears it. Holds no token data. Best-effort: returns False
-        when the marker cannot be written, so callers' auth handling is
-        unchanged.
+        ``remove`` clears it. The marker holds only the SHA-256 of the token
+        file holding ``refused`` (no token data) and counts only while that
+        exact file is on disk, so a refusal of tokens that a newer sign-in has
+        replaced, in this or another process, never rejects the newer ones.
+        Best-effort: returns False when the token file no longer holds
+        ``refused`` or the marker cannot be written, so callers' auth handling
+        is unchanged.
         """
         try:
-            _write_json(self._sign_in_rejected_path(), {})
+            stored_bytes = self._tokens_path().read_bytes()
+            stored = json.loads(stored_bytes)
+        except (OSError, ValueError):
+            stored = None
+        # A refresh response may omit the refresh token; set_tokens then keeps
+        # the stored one, so only an in-memory refresh token must match.
+        if not (
+            refused is not None
+            and isinstance(stored, dict)
+            and stored.get("access_token") == refused.access_token
+            and (
+                refused.refresh_token is None
+                or stored.get("refresh_token") == refused.refresh_token
+            )
+        ):
+            logger.debug(
+                "Refused OAuth credentials for %s are no longer stored; not marked",
+                self._server_name,
+            )
+            return False
+        try:
+            _write_json(
+                self._sign_in_rejected_path(),
+                {"tokens_sha256": hashlib.sha256(stored_bytes).hexdigest()},
+            )
         except (OSError, RuntimeError) as exc:
             logger.warning(
                 "Could not record the rejected sign-in for %s: %s",
@@ -748,8 +777,19 @@ class HermesTokenStorage:
         return True
 
     def is_sign_in_rejected(self) -> bool:
-        """Return True while the sign-in-rejected marker is on disk."""
-        return self._sign_in_rejected_path().exists()
+        """Return True while the marker names the token file now on disk.
+
+        A marker naming tokens that have since been replaced is obsolete and
+        ignored, whatever order the processes wrote in.
+        """
+        marker = _read_json(self._sign_in_rejected_path())
+        if not isinstance(marker, dict) or not isinstance(marker.get("tokens_sha256"), str):
+            return False
+        try:
+            stored_bytes = self._tokens_path().read_bytes()
+        except OSError:
+            return False
+        return marker["tokens_sha256"] == hashlib.sha256(stored_bytes).hexdigest()
 
 
 # ---------------------------------------------------------------------------

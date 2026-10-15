@@ -339,8 +339,14 @@ class MCPServerRunMixin:
             if auth_failure and self._auth_type == "oauth":
                 # Before parking, record the refusal on disk: the dashboard (another process)
                 # then shows this connection as needing a new sign-in instead of connected.
-                from tools.mcp_oauth import HermesTokenStorage
-                HermesTokenStorage(self.name).mark_sign_in_rejected()
+                # The connection's provider noted which credentials the server refused, as it did.
+                try:
+                    provider = self._build_oauth_auth(self._config["url"], self._config)
+                except Exception:  # best-effort: the failure is handled the same either way
+                    provider = None
+                mark_rejected = getattr(provider, "_hermes_mark_sign_in_rejected", None)
+                if mark_rejected is not None:
+                    mark_rejected()
             return await self._park_initial_failure(exc, "after permanent initial failure", budget)
         budget.initial_retries += 1
         if budget.initial_retries > _core._MAX_INITIAL_CONNECT_RETRIES:
