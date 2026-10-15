@@ -83,12 +83,12 @@ def _stored_next_run_at(home, job_id):
     return job["next_run_at"]
 
 
-def _files(root, skip=()):
+def _files(root):
     """Every file under ``root`` with its bytes, so a write anywhere shows up."""
     return {
         path: path.read_bytes()
         for path in root.rglob("*")
-        if path.is_file() and path not in skip
+        if path.is_file()
     }
 
 
@@ -140,6 +140,7 @@ def test_only_the_automations_token_reaches_the_preview_and_the_store_is_untouch
     profile_homes, pinned_clock, tmp_path
 ):
     from hermes_cli import web_server
+    from hermes_cli.dashboard_auth import audit as audit_mod
     from hermes_cli.dashboard_auth import register_provider, token_auth
     from hermes_cli.dashboard_auth.registry import restore_registration, snapshot_registration
     from hermes_cli.web_routers import cron as cron_routes
@@ -171,9 +172,10 @@ def test_only_the_automations_token_reaches_the_preview_and_the_store_is_untouch
     )
     store = home / "cron" / "jobs.json"
     store_before = store.read_bytes()
-    # The one write a machine-token call makes: the authentication record of every Automations call.
-    audit_log = home / "logs" / "dashboard-auth.log"
-    files_before = _files(tmp_path, skip={audit_log})
+    # Owner rule of 2026-10-15: the line the shared machine-token sign-in check writes to this
+    # log for each call is the platform's security record, not a write by the preview.
+    audit_log = audit_mod._resolve_log_path()
+    files_before = _files(tmp_path)
 
     app = FastAPI()
     app.include_router(cron_routes.router)
@@ -190,6 +192,16 @@ def test_only_the_automations_token_reaches_the_preview_and_the_store_is_untouch
             in_past = _preview(client, (PINNED - timedelta(hours=1)).isoformat(), headers=automations)
             assert in_past.status_code == 409, in_past.text
             assert in_past.json()["detail"]["code"] == "schedule_in_past"
+            unparseable = _preview(client, "not a schedule", headers=automations)
+            assert unparseable.status_code == 400, unparseable.text
+            unknown_profile = _preview(client, WEEKLY, "missing_profile", headers=automations)
+            assert unknown_profile.status_code == 404, unknown_profile.text
+            invalid_profile = _preview(client, WEEKLY, "../bad", headers=automations)
+            assert invalid_profile.status_code == 400, invalid_profile.text
+            no_schedule = client.get(
+                "/api/cron/schedule-preview", params={"profile": "default"}, headers=automations
+            )
+            assert no_schedule.status_code == 422, no_schedule.text
             refused = _preview(client, WEEKLY, headers=connections)
             assert refused.status_code == 403, refused.text
     finally:
@@ -198,4 +210,12 @@ def test_only_the_automations_token_reaches_the_preview_and_the_store_is_untouch
                 restore_registration(provider.name, provider, None)
 
     assert store.read_bytes() == store_before
-    assert _files(tmp_path, skip={audit_log}) == files_before
+    files_after = _files(tmp_path)
+    changed = {
+        path
+        for path in files_before.keys() | files_after.keys()
+        if files_before.get(path) != files_after.get(path)
+    }
+    assert changed == {audit_log}
+    # The audit log only grows: what it held before is an unchanged prefix of what it holds now.
+    assert files_after[audit_log].startswith(files_before.get(audit_log, b""))
