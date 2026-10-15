@@ -7085,9 +7085,9 @@ def test_task_graph_persists_canonical_native_titles_and_project_name(ctx):
 
     assert root.title == ow.owner_title(_UNSAFE_NATIVE_TITLE)
     _assert_canonical_stored_title(root.title)
-    # The pinned subdivision flag survives whole; the credential does not.
-    assert _ENGLAND_FLAG in root.title
-    assert "https://***@git.example.com/repo.git" in root.title
+    # The web address fails the title check, so the policy's fixed title
+    # sentence is stored in place of the whole title, flag included.
+    assert root.title == "This piece of work has a title Raphael cannot show here."
 
     assert [child.title for child in children] == [
         "Prepare the release",

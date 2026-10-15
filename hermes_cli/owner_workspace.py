@@ -4639,9 +4639,17 @@ def _native_owner_title(value: Any, field: str) -> str:
     wrote, so it is rejected. Testing the projection against that placeholder
     instead would also reject ``Untitled work item`` as a literal title, which
     is owner-visible text like any other and persists as written.
+
+    A title past those refusals then meets the same owner-text policy title
+    check as :func:`owner_title` (:func:`hermes_cli.owner_text.check_owner_text`),
+    on the whole input — before any line break is collapsed — and once
+    displayed. One failing it is written as the policy's fixed title sentence,
+    the answer :func:`owner_title` gives, never as a redacted spelling such as
+    a masked web address.
     """
+    raw = _bounded_text(value, field, limit=_OWNER_TITLE_LIMIT)
     title = _owner_display_text(
-        _bounded_text(value, field, limit=_OWNER_TITLE_LIMIT),
+        raw,
         limit=_OWNER_TITLE_LIMIT,
         strip_internal_prefix=True,
     )
@@ -4653,7 +4661,9 @@ def _native_owner_title(value: Any, field: str) -> str:
         raise OwnerWorkspaceError(
             "invalid_argument", f"{field} contains private operational detail",
         )
-    return title
+    if check_owner_text(raw, "title") != raw:
+        return check_owner_text(None, "title")
+    return check_owner_text(title, "title")
 
 
 def _native_owner_project_name(value: Any, field: str) -> str:
@@ -4663,17 +4673,20 @@ def _native_owner_project_name(value: Any, field: str) -> str:
     core :func:`owner_project_name` projects through: the 160 code point bound,
     no internal-prefix strip, and canonical emptiness rejected rather than
     stored as the ``Untitled Project`` placeholder. A Project an owner really
-    named ``Untitled Project`` is owner text and is written as it stands.
+    named ``Untitled Project`` is owner text and is written as it stands. A
+    name failing the owner-text policy's project-name check, on the whole
+    input or once displayed, is written as the policy's fixed project-name
+    sentence, as :func:`owner_project_name` answers.
     """
-    name = _owner_display_text(
-        _bounded_text(value, field, limit=_OWNER_PROJECT_NAME_LIMIT),
-        limit=_OWNER_PROJECT_NAME_LIMIT,
-    )
+    raw = _bounded_text(value, field, limit=_OWNER_PROJECT_NAME_LIMIT)
+    name = _owner_display_text(raw, limit=_OWNER_PROJECT_NAME_LIMIT)
     if not name:
         raise OwnerWorkspaceError(
             "invalid_argument", f"{field} has no owner-visible text",
         )
-    return name
+    if check_owner_text(raw, "project_name") != raw:
+        return check_owner_text(None, "project_name")
+    return check_owner_text(name, "project_name")
 
 
 def _open_read_only_sqlite(path, *, label: str) -> sqlite3.Connection:
