@@ -188,11 +188,13 @@ def _preview_cron_schedule_sync(schedule: str, profile: Optional[str] = None):
     token = set_hermes_home_override(str(home))
     try:
         now = cron_jobs._hermes_now()
+        # A first run that cannot be computed is refused like a schedule that does not parse:
+        # a cron date that never comes is a ValueError, a time out of range an OverflowError.
         try:
             parsed = cron_jobs.parse_schedule(schedule)
-        except ValueError as exc:
+            next_run_at = cron_jobs.compute_next_run(parsed)
+        except (ValueError, OverflowError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        next_run_at = cron_jobs.compute_next_run(parsed)
     finally:
         reset_hermes_home_override(token)
     # A one-time start before now is refused, inside the one-shot grace window too:

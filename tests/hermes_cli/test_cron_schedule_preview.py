@@ -63,6 +63,70 @@ def client(profile_homes, pinned_clock):
         yield test_client
 
 
+@pytest.fixture()
+def machine_app(profile_homes, pinned_clock, tmp_path):
+    """The cron router behind the real machine-token check, with one job already stored.
+
+    Real Automations and Connections tokens are issued, and their providers are
+    registered for this test only.
+    """
+    from hermes_cli import web_server
+    from hermes_cli.dashboard_auth import audit as audit_mod
+    from hermes_cli.dashboard_auth import register_provider, token_auth
+    from hermes_cli.dashboard_auth.registry import restore_registration, snapshot_registration
+    from hermes_cli.web_routers import cron as cron_routes
+    from plugins.dashboard_auth.raphael_workspace import (
+        AutomationsManageTokenProvider,
+        ConnectionsManageTokenProvider,
+        token_store,
+    )
+
+    cron_routes._register_automations_machine_routes()
+    token_dir = tmp_path / "machine-tokens"
+    token_dir.mkdir(mode=0o700)
+    automations_path = token_dir / "automations.token"
+    connections_path = token_dir / "connections.token"
+    automations_record = token_store.issue(
+        out_path=automations_path, surface=token_store.AUTOMATIONS_SURFACE
+    )
+    token_store.issue(out_path=connections_path, surface=token_store.CONNECTIONS_SURFACE)
+    automations = {"Authorization": "Bearer " + automations_path.read_text(encoding="utf-8").strip()}
+    connections = {"Authorization": "Bearer " + connections_path.read_text(encoding="utf-8").strip()}
+
+    providers = [AutomationsManageTokenProvider(), ConnectionsManageTokenProvider()]
+    previous = {provider.name: snapshot_registration(provider.name) for provider in providers}
+    try:
+        for provider in providers:
+            if previous[provider.name] is None:
+                register_provider(provider)
+
+        web_server._call_cron_for_profile(
+            "default", "create_job", prompt="Summarize owner progress", schedule="every 1h", name="Owner summary"
+        )
+
+        app = FastAPI()
+        app.include_router(cron_routes.router)
+
+        @app.middleware("http")
+        async def machine_auth(request, call_next):
+            return await token_auth.token_auth_middleware(request, call_next)
+
+        yield {
+            "app": app,
+            "automations": automations,
+            "connections": connections,
+            "automations_credential_id": automations_record.token_id,
+            "store": profile_homes["default"] / "cron" / "jobs.json",
+            # Owner rule of 2026-10-15: the line the shared machine-token sign-in check writes to this
+            # log for each call is the platform's security record, not a write by the preview.
+            "audit_log": audit_mod._resolve_log_path(),
+        }
+    finally:
+        for provider in providers:
+            if previous[provider.name] is None:
+                restore_registration(provider.name, provider, None)
+
+
 def _preview(client, schedule, profile="default", headers=None):
     return client.get(
         "/api/cron/schedule-preview",
@@ -137,77 +201,32 @@ def test_profile_time_zone_shifts_the_preview_as_it_shifts_creation(client, prof
 
 
 def test_only_the_automations_token_reaches_the_preview_and_the_store_is_untouched(
-    profile_homes, pinned_clock, tmp_path
+    machine_app, tmp_path
 ):
-    from hermes_cli import web_server
-    from hermes_cli.dashboard_auth import audit as audit_mod
-    from hermes_cli.dashboard_auth import register_provider, token_auth
-    from hermes_cli.dashboard_auth.registry import restore_registration, snapshot_registration
-    from hermes_cli.web_routers import cron as cron_routes
-    from plugins.dashboard_auth.raphael_workspace import (
-        AutomationsManageTokenProvider,
-        ConnectionsManageTokenProvider,
-        token_store,
-    )
-
-    cron_routes._register_automations_machine_routes()
-    token_dir = tmp_path / "machine-tokens"
-    token_dir.mkdir(mode=0o700)
-    automations_path = token_dir / "automations.token"
-    connections_path = token_dir / "connections.token"
-    token_store.issue(out_path=automations_path, surface=token_store.AUTOMATIONS_SURFACE)
-    token_store.issue(out_path=connections_path, surface=token_store.CONNECTIONS_SURFACE)
-    automations = {"Authorization": "Bearer " + automations_path.read_text(encoding="utf-8").strip()}
-    connections = {"Authorization": "Bearer " + connections_path.read_text(encoding="utf-8").strip()}
-
-    providers = [AutomationsManageTokenProvider(), ConnectionsManageTokenProvider()]
-    previous = {provider.name: snapshot_registration(provider.name) for provider in providers}
-    for provider in providers:
-        if previous[provider.name] is None:
-            register_provider(provider)
-
-    home = profile_homes["default"]
-    web_server._call_cron_for_profile(
-        "default", "create_job", prompt="Summarize owner progress", schedule="every 1h", name="Owner summary"
-    )
-    store = home / "cron" / "jobs.json"
+    automations, connections = machine_app["automations"], machine_app["connections"]
+    store, audit_log = machine_app["store"], machine_app["audit_log"]
     store_before = store.read_bytes()
-    # Owner rule of 2026-10-15: the line the shared machine-token sign-in check writes to this
-    # log for each call is the platform's security record, not a write by the preview.
-    audit_log = audit_mod._resolve_log_path()
     files_before = _files(tmp_path)
 
-    app = FastAPI()
-    app.include_router(cron_routes.router)
-
-    @app.middleware("http")
-    async def machine_auth(request, call_next):
-        return await token_auth.token_auth_middleware(request, call_next)
-
-    try:
-        with TestClient(app) as client:
-            allowed = _preview(client, WEEKLY, headers=automations)
-            assert allowed.status_code == 200, allowed.text
-            assert datetime.fromisoformat(allowed.json()["now"]) == PINNED
-            in_past = _preview(client, (PINNED - timedelta(hours=1)).isoformat(), headers=automations)
-            assert in_past.status_code == 409, in_past.text
-            assert in_past.json()["detail"]["code"] == "schedule_in_past"
-            unparseable = _preview(client, "not a schedule", headers=automations)
-            assert unparseable.status_code == 400, unparseable.text
-            unknown_profile = _preview(client, WEEKLY, "missing_profile", headers=automations)
-            assert unknown_profile.status_code == 404, unknown_profile.text
-            invalid_profile = _preview(client, WEEKLY, "../bad", headers=automations)
-            assert invalid_profile.status_code == 400, invalid_profile.text
-            no_schedule = client.get(
-                "/api/cron/schedule-preview", params={"profile": "default"}, headers=automations
-            )
-            assert no_schedule.status_code == 422, no_schedule.text
-            refused = _preview(client, WEEKLY, headers=connections)
-            assert refused.status_code == 403, refused.text
-    finally:
-        for provider in providers:
-            if previous[provider.name] is None:
-                restore_registration(provider.name, provider, None)
+    with TestClient(machine_app["app"]) as client:
+        allowed = _preview(client, WEEKLY, headers=automations)
+        assert allowed.status_code == 200, allowed.text
+        assert datetime.fromisoformat(allowed.json()["now"]) == PINNED
+        in_past = _preview(client, (PINNED - timedelta(hours=1)).isoformat(), headers=automations)
+        assert in_past.status_code == 409, in_past.text
+        assert in_past.json()["detail"]["code"] == "schedule_in_past"
+        unparseable = _preview(client, "not a schedule", headers=automations)
+        assert unparseable.status_code == 400, unparseable.text
+        unknown_profile = _preview(client, WEEKLY, "missing_profile", headers=automations)
+        assert unknown_profile.status_code == 404, unknown_profile.text
+        invalid_profile = _preview(client, WEEKLY, "../bad", headers=automations)
+        assert invalid_profile.status_code == 400, invalid_profile.text
+        no_schedule = client.get(
+            "/api/cron/schedule-preview", params={"profile": "default"}, headers=automations
+        )
+        assert no_schedule.status_code == 422, no_schedule.text
+        refused = _preview(client, WEEKLY, headers=connections)
+        assert refused.status_code == 403, refused.text
 
     assert store.read_bytes() == store_before
     files_after = _files(tmp_path)
@@ -219,3 +238,38 @@ def test_only_the_automations_token_reaches_the_preview_and_the_store_is_untouch
     assert changed == {audit_log}
     # The audit log only grows: what it held before is an unchanged prefix of what it holds now.
     assert files_after[audit_log].startswith(files_before.get(audit_log, b""))
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    ["0 9 31 2 *", "999999999999999999999999999999h", "every 999999999999999999999999h"],
+    ids=["cron_on_february_31", "one_time_duration_overflows", "interval_overflows"],
+)
+def test_schedule_errors_answer_400_with_one_audit_record_and_write_nothing(
+    machine_app, tmp_path, schedule
+):
+    store, audit_log = machine_app["store"], machine_app["audit_log"]
+    store_before = store.read_bytes()
+    files_before = _files(tmp_path)
+
+    with TestClient(machine_app["app"]) as client:
+        response = _preview(client, schedule, headers=machine_app["automations"])
+
+    assert response.status_code == 400, response.text
+    assert store.read_bytes() == store_before
+    files_after = _files(tmp_path)
+    audit_before, audit_after = files_before.pop(audit_log, b""), files_after.pop(audit_log, b"")
+    assert files_after == files_before
+    # The audit log gained exactly one record, appended after its unchanged earlier bytes.
+    assert audit_after.startswith(audit_before)
+    appended = [json.loads(line) for line in audit_after[len(audit_before):].splitlines()]
+    assert len(appended) == 1, appended
+    expected = {
+        "event": "token_auth_failure",
+        "reason": "downstream_rejected",
+        "status": 400,
+        "decision": "deny",
+        "route_template": "/api/cron/schedule-preview",
+        "credential_id": machine_app["automations_credential_id"],
+    }
+    assert {key: appended[0].get(key) for key in expected} == expected
