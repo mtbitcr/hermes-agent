@@ -103,6 +103,16 @@ class _ProviderEntry:
 # ---------------------------------------------------------------------------
 
 
+# Response extension that marks an answer Hermes built itself (such as the
+# login driver's synthetic 401): it is no server answer and never a refusal.
+_SYNTHETIC_RESPONSE = "hermes_synthetic_response"
+
+
+def _is_synthetic_response(response: Any) -> bool:
+    extensions = getattr(response, "extensions", None)
+    return isinstance(extensions, dict) and extensions.get(_SYNTHETIC_RESPONSE) is True
+
+
 def _make_hermes_provider_class() -> Optional[type]:
     """Lazy-import the SDK base class and return our subclass.
 
@@ -141,9 +151,6 @@ def _make_hermes_provider_class() -> Optional[type]:
             super().__init__(*args, **kwargs)
             self._hermes_server_name = server_name
             self._hermes_home = ""
-            # The credentials the server refused in its last answer to an MCP
-            # request (None after any other answer): what the marker records.
-            self._hermes_refused_tokens = None
             self._hermes_claude_design = claude_design
             self._hermes_callback_state = (
                 callback_state if callback_state is not None else {}
@@ -265,8 +272,14 @@ def _make_hermes_provider_class() -> Optional[type]:
                     # The provider refused the refresh grant (e.g. an expired
                     # or revoked refresh token): only a new sign-in helps.
                     # Record it on disk for the dashboard; 5xx stays retryable.
-                    self._hermes_refused_tokens = self.context.current_tokens
-                    self._hermes_mark_sign_in_rejected()
+                    # The SDK holds its flow lock from building the refresh
+                    # request to this answer, and only code under that lock
+                    # sets current_tokens: they are the tokens whose refresh
+                    # token the refused request carried.
+                    storage = self.context.storage
+                    from tools.mcp_oauth import HermesTokenStorage
+                    if isinstance(storage, HermesTokenStorage):
+                        storage.mark_sign_in_rejected(self.context.current_tokens)
                 self.context.clear_tokens()
                 return False
 
@@ -285,19 +298,6 @@ def _make_hermes_provider_class() -> Optional[type]:
                 logger.warning("Invalid refresh response: %s", response.status_code)
                 self.context.clear_tokens()
                 return False
-
-        def _hermes_mark_sign_in_rejected(self) -> None:
-            """Record on disk that the server refused ``_hermes_refused_tokens``.
-
-            They are taken under the SDK's flow lock as the refusal arrives,
-            so they are the credentials the refused request used. The storage
-            records it only while its token file still holds them, so a late
-            refusal of replaced credentials never marks a newer sign-in.
-            """
-            storage = self.context.storage
-            from tools.mcp_oauth import HermesTokenStorage
-            if isinstance(storage, HermesTokenStorage):
-                storage.mark_sign_in_rejected(self._hermes_refused_tokens)
 
         async def _initialize(self) -> None:
             """Load stored tokens + client info AND seed token_expiry_time.
@@ -579,20 +579,32 @@ def _make_hermes_provider_class() -> Optional[type]:
             inner = super().async_auth_flow(request)
             try:
                 outgoing = await inner.__anext__()
-                # The SDK holds its flow lock until the flow ends: these are
-                # the tokens the flow started with, before any refresh.
-                flow_tokens = self.context.current_tokens
                 while True:
+                    # The credentials the request itself carries as it goes
+                    # out (none without an Authorization header). The flow's
+                    # own refresh, discovery and token requests carry none.
+                    tokens = self.context.current_tokens
+                    sent_tokens = (
+                        tokens
+                        if outgoing is request
+                        and tokens is not None
+                        and tokens.access_token
+                        and outgoing.headers.get("Authorization")
+                        == f"Bearer {tokens.access_token}"
+                        else None
+                    )
                     incoming = yield outgoing
-                    if outgoing is request:
-                        # The server's answer to the credentials the request
-                        # carried or, once a failed refresh cleared them, to
-                        # the ones the flow started with.
-                        refused = getattr(incoming, "status_code", None) in (401, 403)
-                        self._hermes_refused_tokens = (
-                            (self.context.current_tokens or flow_tokens)
-                            if refused else None
-                        )
+                    if (
+                        sent_tokens is not None
+                        and getattr(incoming, "status_code", None) in (401, 403)
+                        and not _is_synthetic_response(incoming)
+                    ):
+                        # The server refused the request: record it now, with
+                        # the credentials that request carried.
+                        storage = self.context.storage
+                        from tools.mcp_oauth import HermesTokenStorage
+                        if isinstance(storage, HermesTokenStorage):
+                            storage.mark_sign_in_rejected(sent_tokens)
                     # Sniff the response for a dead-client-registration signal
                     # before handing it back to the SDK (best-effort, GH#36767).
                     await self._maybe_flag_poisoned_client(incoming)
@@ -838,10 +850,13 @@ class MCPOAuthManager:
                     "Fresh OAuth flow yielded an unexpected initial request"
                 )
 
+            # Both answers to the original request are built here, so each is
+            # marked synthetic: neither may record a refusal.
             response = httpx.Response(
                 401,
                 request=first_request,
                 headers={"www-authenticate": "Bearer"},
+                extensions={_SYNTHETIC_RESPONSE: True},
             )
             async with httpx.AsyncClient(
                 timeout=30.0,
@@ -853,7 +868,11 @@ class MCPOAuthManager:
                     except StopAsyncIteration:
                         break
                     if request is original_request:
-                        response = httpx.Response(200, request=request)
+                        response = httpx.Response(
+                            200,
+                            request=request,
+                            extensions={_SYNTHETIC_RESPONSE: True},
+                        )
                     else:
                         response = await client.send(request)
         finally:
