@@ -82,7 +82,6 @@ import secrets
 import sqlite3
 import stat
 import time
-import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -96,6 +95,7 @@ from hermes_cli.kanban_risk_tier import (
     pinned_reasoning_effort,
     recovered_root_risk_tier,
 )
+from hermes_cli.owner_text import check_owner_text
 from hermes_cli.sqlite_util import write_txn
 from plugins.dashboard_auth.raphael_workspace.model_policy import (
     configured_assignment_for,
@@ -4536,6 +4536,11 @@ def owner_title(value: Any) -> str:
     See :func:`_owner_display_text` for the egress contract. A work-item
     title additionally loses the internal ``B03 — ``-style dispatcher prefix,
     which is Raphael's own bookkeeping and means nothing to the owner.
+
+    An empty title, or one holding a private pattern, becomes
+    :data:`_UNTITLED_WORK_ITEM`; any other title that fails the owner-text
+    policy's title check (:func:`hermes_cli.owner_text.check_owner_text`)
+    becomes the policy's fixed title sentence.
     """
     title = _owner_display_text(
         value, limit=_OWNER_TITLE_LIMIT, strip_internal_prefix=True
@@ -4544,70 +4549,7 @@ def owner_title(value: Any) -> str:
         pattern.search(title) for pattern in _OWNER_PRIVATE_WORK_ITEM_PATTERNS
     ):
         return _UNTITLED_WORK_ITEM
-    return title
-
-
-# Worker stop text carries shapes a title never does, so only
-# :func:`owner_stop_reason` checks these, on top of the title patterns: this
-# kernel's own task ids (``kanban_db._new_task_id``); a full commit id; a
-# ``file:`` link; a drive-relative Windows path (a single letter starting a
-# word, a colon and no space after it, as in ``C:notes.txt``); this platform's
-# own Project ids (``projects_db._new_project_id`` and ``_derive_id``). Each is
-# matched wherever it sits, since an id wrapped in other characters is still an
-# id; a short commit id is :func:`_names_a_commit`'s. Both the cleaned and the
-# raw text are checked, so nothing past the display cut escapes the check. Paths are
-# refused by the characters a reason may hold rather than by shape: a reason
-# reaches the owner only when every character is a letter, mark or digit of any
-# script, a space, or plain punctuation (:data:`_OWNER_STOP_REASON_PUNCTUATION`),
-# so ``/``, ``\\``, every look-alike of either and every other symbol makes the
-# whole reason fall back. A mark counts as text unless its Unicode name says
-# COMBINING or VARIATION SELECTOR, or it encloses what precedes it.
-_OWNER_PRIVATE_STOP_REASON_PATTERNS = (
-    re.compile(r"t_[0-9a-f]{8}", re.IGNORECASE),
-    re.compile(r"[0-9a-f]{40}", re.IGNORECASE),
-    re.compile(r"\bfile:/", re.IGNORECASE),
-    re.compile(r"(?<!\w)[A-Za-z]:(?=\S)"),
-    re.compile(r"p_[0-9a-f]{8,}", re.IGNORECASE),
-)
-_OWNER_STOP_REASON_PUNCTUATION = frozenset(
-    ".,;:!?'\"()-%&"
-    "\u00ab\u00bb\u2013\u2014\u2018\u2019\u201c\u201d\u2026"
-    "\u3001\u3002\uff01\uff08\uff09\uff0c\uff1a\uff1b\uff1f"
-)
-
-
-def _plain_stop_text(text: str) -> bool:
-    """Whether every character of ``text`` is one a stop reason may show the owner.
-
-    Accents are composed into their letters first (NFC); a mark that remains
-    is refused when it encloses what precedes it or when its Unicode name says
-    COMBINING (every overlay) or VARIATION SELECTOR, so what stays is a
-    script's own vowel signs and the like.
-    """
-    for char in unicodedata.normalize("NFC", text):
-        category = unicodedata.category(char)
-        if char in _OWNER_STOP_REASON_PUNCTUATION or category[0] in "LN" or char.isspace():
-            continue
-        name = unicodedata.name(char, "COMBINING")
-        if category in ("Mn", "Mc") and "COMBINING" not in name and "VARIATION SELECTOR" not in name:
-            continue
-        return False
-    return True
-
-
-def _names_a_commit(text: str) -> bool:
-    """Whether ``text`` holds a commit id, full or short: seven or more hex
-    characters in any case that hold a digit, or that stand as a word of their
-    own (no letter or digit of any script beside them), so a word such as
-    "feedback" stays readable."""
-    for match in re.finditer(r"[0-9a-f]{7,}", text, re.IGNORECASE):
-        before = text[match.start() - 1] if match.start() else ""
-        after = text[match.end()] if match.end() < len(text) else ""
-        if any(char.isdigit() for char in match.group()) or not (
-            before.isalnum() or after.isalnum()
-        ):
-            return True
-    return False
+    return check_owner_text(title, "title")
 
 
 def owner_stop_reason(
@@ -4619,24 +4561,17 @@ def owner_stop_reason(
 
     Same egress contract as :func:`owner_title` — see
     :func:`_owner_display_text` — bounded at 500 code points. A reason that is
-    empty after cleaning, whose cleaned or raw text holds a character
-    :func:`_plain_stop_text` refuses or a commit id, or that carries a private
-    pattern (a title's, or one of :data:`_OWNER_PRIVATE_STOP_REASON_PATTERNS`)
-    in the cleaned OR the raw text, is replaced whole by the fixed
-    ``fallback`` sentence rather than shown in part.
+    empty after cleaning, or whose cleaned or raw text fails the owner-text
+    policy's stop-reason check (:func:`hermes_cli.owner_text.check_owner_text`),
+    is replaced whole by the fixed ``fallback`` sentence rather than shown in
+    part; checking the raw text too means nothing past the display cut escapes
+    the check. Both stop-reason kinds hold the same rules, so ``fallback``
+    alone decides which sentence the owner reads.
     """
     reason = _owner_display_text(value, limit=500)
-    raw = str(value or "")
-    texts = (reason, raw)
-    if not reason or not all(_plain_stop_text(text) for text in texts) or any(
-        _names_a_commit(text) for text in texts
-    ) or any(
-        pattern.search(text)
-        for text in texts
-        for pattern in (
-            *_OWNER_PRIVATE_WORK_ITEM_PATTERNS,
-            *_OWNER_PRIVATE_STOP_REASON_PATTERNS,
-        )
+    if any(
+        check_owner_text(text, "stop_reason_decision") != text
+        for text in (reason, str(value or ""))
     ):
         return fallback
     return reason
