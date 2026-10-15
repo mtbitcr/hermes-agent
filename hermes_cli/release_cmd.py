@@ -11,7 +11,9 @@ a hard kill ends it, and its recovery belongs to card 7. ``start BATCH`` runs ``
 as the release unit (S-F), the transient user service of release_unit, so the release keeps
 running when the gateway stops; the start writes nothing to the release state either. ``recover
 BATCH`` brings the platform back from a release that stopped midway, as ``run BATCH`` does for a
-batch the record shows releasing or failed. ``run`` and ``recover`` share one host lock: while one
+batch the record shows releasing or failed. ``settle`` records a release made outside ``run``,
+such as the manual emergency release: every waiting change the checkout's head contains is
+recorded released at that head. ``run``, ``recover`` and ``settle`` share one host lock: while one
 of them is at work, another refuses at once and writes nothing.
 
 Design rule (K6), as in the runner: everything ``run`` and ``recover`` need, the host lock
@@ -98,12 +100,14 @@ class _UnreadableRecord(Exception):
 
 
 def cmd_release(args) -> int:
-    """``hermes release prepare``, ``status``, ``run [BATCH]``, ``start BATCH`` or
-    ``recover BATCH``."""
+    """``hermes release prepare``, ``status``, ``run [BATCH]``, ``start BATCH``,
+    ``recover BATCH`` or ``settle``."""
     if args.release_command == "start":
         return start(args.batch)
     if args.release_command == "recover":
         return recover(args.batch)
+    if args.release_command == "settle":
+        return settle()
     if args.release_command == "run":
         return run() if args.batch is None else run(args.batch)
     return prepare() if args.release_command == "prepare" else status()
@@ -612,6 +616,61 @@ def _recover(batch_id: int) -> int:
         print(_CAPPED.format(batch_id, _RECOVERY_ATTEMPTS))
         return 0
     return 0 if outcome == "released" else 1
+
+
+def settle() -> int:
+    """Record a release made outside ``run``, such as the manual emergency release, whose wrapper
+    runs this as its last step (finding 156): the host runs the checkout's head.
+
+    The head is read through the live reader that prepare and run build, and every waiting change
+    it contains, by the guards' ancestry check, is recorded released at that head in one write to
+    the release record, so the next decision no longer offers it; the changes it does not contain
+    still wait. Like ``run`` and ``recover``, settle holds the host lock from before its first read
+    until it ends: while one of them holds it, or a batch is releasing or failed, settle refuses
+    and writes nothing.
+
+    Returns 0 once the changes are recorded, and when the head contains none and nothing is
+    written; 1 when it refused.
+    """
+    return _locked(_settle, None)
+
+
+def _settle(_batch_id: None) -> int:
+    """``settle`` under the host lock, which it takes for no batch."""
+    found = _root_settings()
+    if isinstance(found, int):
+        return found
+    root, settings = found
+    # The reader is built as prepare and run build it; settle reads no configuration snapshot.
+    reader, _actions = _adapters(root, settings, "")
+    try:
+        running = reader.checkout_head()
+    except Exception as error:
+        return _refuse(
+            f"the checkout's head could not be read, so what the host runs is unknown"
+            f" ({type(error).__name__}: {error})"
+        )
+    try:
+        conn = release_ledger.connect()
+    except (OSError, sqlite3.Error) as error:
+        return _refuse(f"the release record could not be opened ({type(error).__name__}: {error})")
+    with contextlib.closing(conn):
+        try:
+            settled = release_ledger.settle_outside_release(
+                conn, running=running, contains=reader.is_ancestor
+            )
+        except Exception as error:  # the ancestry check is a live read of the checkout too
+            return _refuse(
+                f"the waiting changes could not be settled at {running}"
+                f" ({type(error).__name__}: {error})"
+            )
+    released = 0 if settled["released"] is None else len(settled["released"]["members"])
+    waiting = 0 if settled["waiting"] is None else len(settled["waiting"]["members"])
+    print(
+        f"Settled {released} change{'s' * (released != 1)} as released at {running};"
+        f" {waiting} change{'s' * (waiting != 1)} still waiting."
+    )
+    return 0
 
 
 def _locked(command: Callable[[Any], int], batch_id: int | None) -> int:

@@ -16,7 +16,10 @@ A release runs under the platform's global pause (``hermes pause``), so the
 record keeps no hold of its own. An accepted batch becomes releasing when its
 release begins, with PREV and NEW stored, and ends released, failed (kept for
 recovery, whose attempts are counted) or folded: a restored or refused release
-puts its changes back into the one waiting decision.
+puts its changes back into the one waiting decision. A release made outside the
+release command, such as the manual emergency release, is settled instead: the
+waiting changes the running commit contains are recorded released in a batch of
+their own, and a waiting batch left without changes is folded.
 
 Nothing calls this module yet: the merge-step call, the release command, the
 Decisions page and the reminder job belong to later cards.
@@ -33,7 +36,7 @@ import sqlite3
 import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 from zoneinfo import ZoneInfo
 
 from hermes_cli.kanban_db import kanban_home
@@ -417,6 +420,72 @@ def last_released(conn: sqlite3.Connection) -> Optional[str]:
         "WHERE state = 'released' AND kind = 'release_finished' ORDER BY release_events.id DESC LIMIT 1"
     ).fetchone()
     return None if row is None else row["new"]
+
+
+def settle_outside_release(
+    conn: sqlite3.Connection, *, running: str, contains: Callable[[str, str], bool]
+) -> dict[str, Any]:
+    """Record a release made outside the release command, such as the manual emergency
+    release: the host now runs ``running`` (finding 156).
+
+    ``contains(a, b)`` is the guards' ancestry check, true when commit ``a`` is on the history
+    of ``b``. In one write transaction, every waiting change that ``running`` contains moves, in
+    merge order, into a new batch recorded released, with PREV the NEW of :func:`last_released`
+    (``None`` while no batch was ever released), NEW ``running`` and a ``release_finished``
+    event marked ``outside``; :func:`last_released` then names ``running``. The changes it does
+    not contain stay in the waiting batch, whose version rises, so a decision on the list shown
+    before is stale; a waiting batch left without changes is folded. While any batch is
+    releasing, or failed and not yet recovered, this raises ``ValueError`` and writes nothing,
+    and nothing is written when ``running`` contains no waiting change.
+
+    Returns the ``released`` batch read back, ``None`` when nothing was settled, and the
+    ``waiting`` one, ``None`` when no change waits.
+    """
+    _own_store(conn)
+    _require(running, _COMMIT_RE, "running must be a 40-character lowercase hex commit id")
+
+    with write_txn(conn):
+        unfinished = conn.execute(f"SELECT id FROM release_batches WHERE {_UNFINISHED_SQL}").fetchone()
+        if unfinished is not None:
+            raise ValueError(f"release batch {unfinished['id']} has not finished its release")
+        row = conn.execute(f"SELECT id FROM release_batches WHERE {_WAITING_SQL}").fetchone()
+        waiting = None if row is None else _snapshot(conn, row["id"])
+        members = [] if waiting is None else waiting["members"]
+        settled = [member for member in members if contains(member["merge_commit"], running)]
+        if not settled:
+            return {"released": None, "waiting": waiting}
+        now = int(time.time())
+        released = conn.execute(
+            "INSERT INTO release_batches (state, version, tier, created_at, prev, new, outcome, "
+            "outcome_at) VALUES ('released', 0, ?, ?, ?, ?, 'released', ?)",
+            (max(member["tier"] for member in settled), now, last_released(conn), running, now),
+        ).lastrowid
+        conn.executemany(
+            "UPDATE release_members SET batch_id = ? WHERE merge_commit = ?",
+            [(released, member["merge_commit"]) for member in settled],
+        )
+        # Merge order is rowid order, as in _return_changes: UNIQUE (batch_id, position) is
+        # checked row by row, so the positions in both batches pass through distinct negative
+        # values first.
+        both = (released, waiting["batch_id"])
+        conn.execute("UPDATE release_members SET position = -rowid WHERE batch_id IN (?, ?)", both)
+        conn.execute(
+            "UPDATE release_members SET position = (SELECT COUNT(*) FROM release_members AS earlier "
+            "WHERE earlier.batch_id = release_members.batch_id "
+            "AND earlier.rowid <= release_members.rowid) WHERE batch_id IN (?, ?)",
+            both,
+        )
+        left = len(members) > len(settled)
+        conn.execute(
+            "UPDATE release_batches SET state = ?, version = version + 1 WHERE id = ?",
+            (waiting["state"] if left else "folded", waiting["batch_id"]),
+        )
+        outside = {"outcome": "released", "outside": True}
+        _record_event(conn, released, "release_finished", outside, now)
+        return {
+            "released": _snapshot(conn, released),
+            "waiting": _snapshot(conn, waiting["batch_id"]) if left else None,
+        }
 
 
 def list_batches(conn: sqlite3.Connection) -> list[dict[str, Any]]:
