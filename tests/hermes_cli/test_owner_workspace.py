@@ -1209,6 +1209,30 @@ def test_owner_title_still_hides_internal_ids(value):
         ow._native_owner_title(value, "changes[0].title")
 
 
+def test_native_title_and_project_name_store_what_the_wrappers_show():
+    """A stored title or Project name is the display wrapper's own answer.
+
+    Both read the same raw input, so padding that takes it past a bound gives
+    the policy's fixed sentence in both rather than being trimmed off first.
+    """
+    for value in [
+        " " * 240 + "Ship release",
+        " " * 160 + "Shoe shop",
+        "   Ship release",
+        "Ship release" + "\n" * 240,
+        "Shoe shop" + "\n" * 160,
+        "Ship release\n\n",
+        "Read https://example.com/guide first",
+        "Ship the release",
+        "Café menu für Zoë",
+        "Launch day 🚀",
+    ]:
+        assert ow._native_owner_title(value, "title") == ow.owner_title(value), repr(value)
+        assert ow._native_owner_project_name(value, "name") == ow.owner_project_name(
+            value
+        ), repr(value)
+
+
 def test_owner_title_masks_url_credentials_at_a_non_navigation_egress():
     """A title is never followed as a link, so URL credentials are masked.
 

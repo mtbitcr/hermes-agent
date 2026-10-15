@@ -4616,37 +4616,14 @@ def owner_project_name(value: Any) -> str:
 def _native_owner_title(value: Any, field: str) -> str:
     """Canonicalize one work-item title Hermes itself is about to write.
 
-    Hermes is not only a projection surface: ``owner_task_graph_commit`` and
-    ``owner_project_plan_commit`` write task titles straight into
-    ``kanban.db``, and every owner surface reads them back through
-    :func:`owner_title`. Canonicalizing at input — BEFORE the request digest,
-    the owner's approval description, persistence and the replay comparison
-    all bind to this exact string — is what keeps the stored title and its
-    projection the same text, so a caller that reaches this kernel directly
-    cannot store a title that only becomes safe on the way back out.
-
-    The ``limit`` is unchanged (:data:`_OWNER_TITLE_LIMIT`, still enforced by
-    :func:`_bounded_text` as a rejection, not a truncation, of raw input);
-    :func:`_owner_display_text` — the one core :func:`owner_title` projects
-    through — supplies the rest of the contract, including the same secret
-    redaction and the internal-prefix strip.
-
-    It is called directly rather than through :func:`owner_title` so that
-    emptiness is read from the canonical text itself. A value that
-    canonicalizes to nothing carries no owner-visible text at all — it was
-    invisible characters, or nothing but an internal dispatcher prefix — and
-    storing the read-side placeholder would record a title the owner never
-    wrote, so it is rejected. Testing the projection against that placeholder
-    instead would also reject ``Untitled work item`` as a literal title, which
-    is owner-visible text like any other and persists as written.
-
-    A title past those refusals then meets the same owner-text policy title
-    check as :func:`owner_title` (:func:`hermes_cli.owner_text.check_owner_text`),
-    on the whole input — before any line break is collapsed — and once
-    displayed. One failing it is written as the policy's fixed title sentence,
-    the answer :func:`owner_title` gives, never as a redacted spelling such as
-    a masked web address.
+    The stored title is :func:`owner_title`'s own answer for the whole raw
+    input, taken before the request digest, the owner's approval, persistence
+    and the replay comparison bind to it, so the stored and the shown title
+    cannot differ. A title that is missing, longer than
+    :data:`_OWNER_TITLE_LIMIT` once trimmed, without owner-visible text or
+    holding private operational detail is refused instead of stored.
     """
+    stored = owner_title(value)
     raw = _bounded_text(value, field, limit=_OWNER_TITLE_LIMIT)
     title = _owner_display_text(
         raw,
@@ -4661,32 +4638,25 @@ def _native_owner_title(value: Any, field: str) -> str:
         raise OwnerWorkspaceError(
             "invalid_argument", f"{field} contains private operational detail",
         )
-    if check_owner_text(raw, "title") != raw:
-        return check_owner_text(None, "title")
-    return check_owner_text(title, "title")
+    return stored
 
 
 def _native_owner_project_name(value: Any, field: str) -> str:
     """Canonicalize one Project name Hermes itself is about to write.
 
-    Same native-write contract as :func:`_native_owner_title`, against the
-    core :func:`owner_project_name` projects through: the 160 code point bound,
-    no internal-prefix strip, and canonical emptiness rejected rather than
-    stored as the ``Untitled Project`` placeholder. A Project an owner really
-    named ``Untitled Project`` is owner text and is written as it stands. A
-    name failing the owner-text policy's project-name check, on the whole
-    input or once displayed, is written as the policy's fixed project-name
-    sentence, as :func:`owner_project_name` answers.
+    Same contract as :func:`_native_owner_title`: the stored name is
+    :func:`owner_project_name`'s own answer for the whole raw input, and a
+    name that is missing, longer than :data:`_OWNER_PROJECT_NAME_LIMIT` once
+    trimmed or without owner-visible text is refused instead of stored.
     """
+    stored = owner_project_name(value)
     raw = _bounded_text(value, field, limit=_OWNER_PROJECT_NAME_LIMIT)
     name = _owner_display_text(raw, limit=_OWNER_PROJECT_NAME_LIMIT)
     if not name:
         raise OwnerWorkspaceError(
             "invalid_argument", f"{field} has no owner-visible text",
         )
-    if check_owner_text(raw, "project_name") != raw:
-        return check_owner_text(None, "project_name")
-    return check_owner_text(name, "project_name")
+    return stored
 
 
 def _open_read_only_sqlite(path, *, label: str) -> sqlite3.Connection:
