@@ -3361,7 +3361,7 @@ def test_status_report_output_is_owner_safe(monkeypatch, tmp_path):
 
     # Each offending title collapsed to the shared placeholder rather than
     # being silently dropped from the report.
-    assert [row["title"] for row in out["cards"]] == ["Untitled work item"] * 3
+    assert [row["title"] for row in out["cards"]] == ["This piece of work has a title Raphael cannot show here."] * 3
 
 
 def test_status_report_discloses_rather_than_guesses(monkeypatch, tmp_path):

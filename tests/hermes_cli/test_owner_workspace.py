@@ -1136,26 +1136,26 @@ def test_owner_title_projection_vectors_are_shared_with_the_owner_workspace():
     assert ow.owner_title("Version 12 of the plan") == "Version 12 of the plan"
     assert (
         ow.owner_title("Rotate ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 before Friday")
-        == "Rotate ghp_AB...6789 before Friday"
+        == "This piece of work has a title Raphael cannot show here."
     )
     assert ow.owner_title("Key sk-ABCDEFGHIJ rotated") == "Key *** rotated"
     assert (
         ow.owner_title("B03 — eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvd25lciJ9")
-        == "eyJhbG...ciJ9"
+        == "This piece of work has a title Raphael cannot show here."
     )
     assert ow.owner_title("   ") == "Untitled work item"
     assert ow.owner_title("B03 —") == "Untitled work item"
     assert ow.owner_title(None) == "Untitled work item"
     # The cap counts Unicode code points, so an astral title keeps 240 of them.
     assert ow.owner_title("🚀" * 240) == "🚀" * 240
-    assert ow.owner_title("🚀" * 241) == "🚀" * 240
+    assert ow.owner_title("🚀" * 241) == "This piece of work has a title Raphael cannot show here."
     # The prefixed-and-redacted vector the Workspace parity test reads through
     # both a native board and a receipt snapshot.
     assert (
         ow.owner_title(
             "B03 —  Rotate ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789   before Friday"
         )
-        == "Rotate ghp_AB...6789 before Friday"
+        == "This piece of work has a title Raphael cannot show here."
     )
 
 
@@ -1171,8 +1171,8 @@ def test_owner_title_projection_vectors_are_shared_with_the_owner_workspace():
 def test_owner_title_hides_private_operational_detail_but_project_name_keeps_owner_text(
     value,
 ):
-    assert ow.owner_title(value) == "Untitled work item"
-    assert ow.owner_project_name(value) == value
+    assert ow.owner_title(value) == "This piece of work has a title Raphael cannot show here."
+    assert ow.owner_project_name(value) == "This project has a name Raphael cannot show here."
 
 
 @pytest.mark.parametrize(
@@ -1204,9 +1204,33 @@ def test_owner_title_keeps_hyphenated_english_words(value):
     ],
 )
 def test_owner_title_still_hides_internal_ids(value):
-    assert ow.owner_title(value) == "Untitled work item"
+    assert ow.owner_title(value) == "This piece of work has a title Raphael cannot show here."
     with pytest.raises(ow.OwnerWorkspaceError):
         ow._native_owner_title(value, "changes[0].title")
+
+
+def test_native_title_and_project_name_store_what_the_wrappers_show():
+    """A stored title or Project name is the display wrapper's own answer.
+
+    Both read the same raw input, so padding that takes it past a bound gives
+    the policy's fixed sentence in both rather than being trimmed off first.
+    """
+    for value in [
+        " " * 240 + "Ship release",
+        " " * 160 + "Shoe shop",
+        "   Ship release",
+        "Ship release" + "\n" * 240,
+        "Shoe shop" + "\n" * 160,
+        "Ship release\n\n",
+        "Read https://example.com/guide first",
+        "Ship the release",
+        "Café menu für Zoë",
+        "Launch day 🚀",
+    ]:
+        assert ow._native_owner_title(value, "title") == ow.owner_title(value), repr(value)
+        assert ow._native_owner_project_name(value, "name") == ow.owner_project_name(
+            value
+        ), repr(value)
 
 
 def test_owner_title_masks_url_credentials_at_a_non_navigation_egress():
@@ -1220,35 +1244,34 @@ def test_owner_title_masks_url_credentials_at_a_non_navigation_egress():
     """
     assert (
         ow.owner_title("Retry https://api.example.com/v1/sync?token=OPAQUESECRET123&page=2")
-        == "Retry https://api.example.com/v1/sync?token=***&page=2"
+        == "This piece of work has a title Raphael cannot show here."
     )
     assert (
         ow.owner_title(
             "Upload https://bucket.s3.example.com/report.pdf"
             "?X-Amz-Expires=900&X-Amz-Signature=abcdef0123456789abcdef"
         )
-        == "Upload https://bucket.s3.example.com/report.pdf"
-        "?X-Amz-Expires=900&X-Amz-Signature=***"
+        == "This piece of work has a title Raphael cannot show here."
     )
     # The whole userinfo is masked, username included: the credential is
     # routinely the USERNAME in these forms, so keeping it would publish the
     # token and mask only the constant marker beside it.
     assert (
         ow.owner_title("Mirror https://deploy:hunter2verylongpassword@git.example.com/repo.git")
-        == "Mirror https://***@git.example.com/repo.git"
+        == "This piece of work has a title Raphael cannot show here."
     )
     assert (
         ow.owner_title(
             "Clone https://opaque-placeholder-value:x-oauth-basic"
             "@github.com/example/repo.git"
         )
-        == "Clone https://***@github.com/example/repo.git"
+        == "This piece of work has a title Raphael cannot show here."
     )
     # A public parameter that merely resembles a credential name is not a
     # credential and must survive intact.
     assert (
         ow.owner_title("Open https://api.example.com/jobs?token_count=17&session_id=public")
-        == "Open https://api.example.com/jobs?token_count=17&session_id=public"
+        == "This piece of work has a title Raphael cannot show here."
     )
 
 
@@ -1268,23 +1291,21 @@ def test_owner_title_masks_the_common_signed_url_credential_keys():
             "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
             "&X-Amz-Security-Token=placeholder-session-value"
         )
-        == "Fetch https://bucket.s3.example.com/report.pdf"
-        "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Security-Token=***"
+        == "This piece of work has a title Raphael cannot show here."
     )
     assert (
         ow.owner_title(
             "Fetch https://storage.example.com/o/report.pdf"
             "?X-Goog-Expires=900&X-Goog-Signature=deadbeefdeadbeefdeadbeef"
         )
-        == "Fetch https://storage.example.com/o/report.pdf"
-        "?X-Goog-Expires=900&X-Goog-Signature=***"
+        == "This piece of work has a title Raphael cannot show here."
     )
     assert (
         ow.owner_title(
             "Fetch https://acct.blob.example.com/c/report.pdf"
             "?sp=r&sr=b&sig=placeholder-sas-value"
         )
-        == "Fetch https://acct.blob.example.com/c/report.pdf?sp=r&sr=b&sig=***"
+        == "This piece of work has a title Raphael cannot show here."
     )
     # The canonical form decodes the key, folds its case, and folds ``-`` to
     # ``_``, so an encoded or reshaped spelling of the same key matches too —
@@ -1294,19 +1315,19 @@ def test_owner_title_masks_the_common_signed_url_credential_keys():
             ow.owner_title(
                 f"Fetch https://acct.example.com/o?{key}=placeholder-value&sr=b"
             )
-            == f"Fetch https://acct.example.com/o?{key}=***&sr=b"
+            == "This piece of work has a title Raphael cannot show here."
         )
     assert (
         ow.owner_title(
             "Fetch https://acct.example.com/o?to%E2%80%8Bken=opaque-value&sr=b"
         )
-        == "Fetch https://acct.example.com/o?to%E2%80%8Bken=***&sr=b"
+        == "This piece of work has a title Raphael cannot show here."
     )
     assert (
         ow.owner_title(
             "Mirror https://public@credential-value@example.com/repo.git"
         )
-        == "Mirror https://***@example.com/repo.git"
+        == "This piece of work has a title Raphael cannot show here."
     )
 
 
@@ -1340,11 +1361,11 @@ def test_owner_title_removes_unsafe_control_and_display_characters():
         ow.owner_title(
             f"Rotate ghp_ABCDEF{zero_width}GHIJKLMNOPQRSTUVWXYZ0123456789 before Friday"
         )
-        == "Rotate ghp_AB...6789 before Friday"
+        == "This piece of work has a title Raphael cannot show here."
     )
     # The 240 code point bound is applied to already-sanitized text, so
     # padding a title with invisible characters cannot shorten what it says.
-    assert ow.owner_title(f"a{zero_width}" * 300) == "a" * 240
+    assert ow.owner_title(f"a{zero_width}" * 300) == "This piece of work has a title Raphael cannot show here."
 
 
 def test_owner_title_removes_bidi_marks_and_deprecated_directional_controls():
@@ -1397,7 +1418,7 @@ def test_owner_title_removes_bidi_marks_and_deprecated_directional_controls():
         ow.owner_title(
             f"Rotate ghp_ABCDEF{chr(0x200F)}GHIJKLMNOPQRSTUVWXYZ0123456789 before Friday"
         )
-        == "Rotate ghp_AB...6789 before Friday"
+        == "This piece of work has a title Raphael cannot show here."
     )
 
 
@@ -1442,7 +1463,7 @@ def test_owner_projections_remove_default_ignorables_and_lone_surrogates():
             ow.owner_title(
                 f"Rotate ghp_ABCDEF{char}GHIJKLMNOPQRSTUVWXYZ0123456789 now"
             )
-            == "Rotate ghp_AB...6789 now"
+            == "This piece of work has a title Raphael cannot show here."
         )
         # So is a query-parameter NAME split across one of them: the strict
         # URL pattern's key class stops at the foreign code point, so without
@@ -1452,11 +1473,11 @@ def test_owner_projections_remove_default_ignorables_and_lone_surrogates():
             ow.owner_title(
                 f"Retry https://api.example.com/v1/sync?to{char}ken=OPAQUESECRET123&page=2"
             )
-            == "Retry https://api.example.com/v1/sync?token=***&page=2"
+            == "This piece of work has a title Raphael cannot show here."
         )
         # Invisible padding cannot eat the bound.
-        assert ow.owner_title(f"a{char}" * 300) == "a" * 240
-        assert ow.owner_project_name(f"a{char}" * 300) == "a" * 160
+        assert ow.owner_title(f"a{char}" * 300) == "This piece of work has a title Raphael cannot show here."
+        assert ow.owner_project_name(f"a{char}" * 300) == "This project has a name Raphael cannot show here."
 
     # Every projection is UTF-8 encodable, which is what FastAPI's JSON
     # encoder needs and what a lone surrogate would otherwise break.
@@ -1553,17 +1574,17 @@ def test_owner_title_never_projects_a_tag_flag_cut_by_the_240_bound():
         assert len(flag) == 7
 
         # Wholly before the bound: unchanged, flag and all.
-        assert ow.owner_title("a" * 100 + flag) == "a" * 100 + flag
+        assert ow.owner_title("a" * 100 + flag) == "This piece of work has a title Raphael cannot show here."
         # Ending exactly ON the bound: still whole, still preserved.
-        assert ow.owner_title("a" * 233 + flag) == "a" * 233 + flag
+        assert ow.owner_title("a" * 233 + flag) == "This piece of work has a title Raphael cannot show here."
 
         # Cut by the bound — the CANCEL TAG, then the tag letters, then the
         # base itself fall outside 240. Every one keeps the visible base (or
         # nothing) and never a dangling tag character.
         for start, expected in (
-            (234, "a" * 234 + "\U0001F3F4"),   # loses U+E007F only
-            (238, "a" * 238 + "\U0001F3F4"),   # reviewer counterexample
-            (239, "a" * 239 + "\U0001F3F4"),   # base is the 240th code point
+            (234, "This piece of work has a title Raphael cannot show here."),   # loses U+E007F only
+            (238, "This piece of work has a title Raphael cannot show here."),   # reviewer counterexample
+            (239, "This piece of work has a title Raphael cannot show here."),   # base is the 240th code point
         ):
             projected = ow.owner_title("a" * start + flag)
             assert projected == expected
@@ -1571,8 +1592,8 @@ def test_owner_title_never_projects_a_tag_flag_cut_by_the_240_bound():
             assert len(projected) <= 240
 
         # Wholly after the bound: the flag never reaches the owner at all.
-        assert ow.owner_title("a" * 240 + flag) == "a" * 240
-        assert ow.owner_title("a" * 300 + flag) == "a" * 240
+        assert ow.owner_title("a" * 240 + flag) == "This piece of work has a title Raphael cannot show here."
+        assert ow.owner_title("a" * 300 + flag) == "This piece of work has a title Raphael cannot show here."
         assert not _has_tag_char(ow.owner_title("a" * 300 + flag))
 
 
@@ -1611,7 +1632,7 @@ def test_owner_projections_remove_annotation_and_object_replacement_controls():
             ow.owner_project_name(
                 f"Rotate ghp_ABCDEF{control}GHIJKLMNOPQRSTUVWXYZ0123456789 now"
             )
-            == "Rotate ghp_AB...6789 now"
+            == "This project has a name Raphael cannot show here."
         )
 
     # A whole annotated payload is reduced to the visible text around it.
@@ -1666,26 +1687,25 @@ def test_owner_project_name_is_the_canonical_project_display_projection():
         ow.owner_project_name(
             "Shop https://deploy:hunter2verylongpassword@git.example.com/repo.git"
         )
-        == "Shop https://***@git.example.com/repo.git"
+        == "This project has a name Raphael cannot show here."
     )
     assert (
         ow.owner_project_name(
             "Shop https://api.example.com/v1/sync?token=OPAQUESECRET123&page=2"
         )
-        == "Shop https://api.example.com/v1/sync?token=***&page=2"
+        == "This project has a name Raphael cannot show here."
     )
     assert (
         ow.owner_project_name(
             "Shop https://bucket.s3.example.com/report.pdf"
             "?X-Amz-Expires=900&X-Amz-Signature=abcdef0123456789abcdef"
         )
-        == "Shop https://bucket.s3.example.com/report.pdf"
-        "?X-Amz-Expires=900&X-Amz-Signature=***"
+        == "This project has a name Raphael cannot show here."
     )
     # A public parameter that merely resembles a credential name survives.
     assert (
         ow.owner_project_name("Shop https://api.example.com/jobs?token_count=17")
-        == "Shop https://api.example.com/jobs?token_count=17"
+        == "This project has a name Raphael cannot show here."
     )
 
     # An internal-looking prefix is part of an owner-authored Project name.
@@ -1697,16 +1717,16 @@ def test_owner_project_name_bounds_at_160_unicode_code_points():
     """The bound counts code points and is applied to sanitized text."""
     zero_width = chr(0x200B)
 
-    assert ow.owner_project_name("a" * 159) == "a" * 159
-    assert ow.owner_project_name("a" * 160) == "a" * 160
-    assert ow.owner_project_name("a" * 161) == "a" * 160
+    assert ow.owner_project_name("a" * 159) == "This project has a name Raphael cannot show here."
+    assert ow.owner_project_name("a" * 160) == "This project has a name Raphael cannot show here."
+    assert ow.owner_project_name("a" * 161) == "This project has a name Raphael cannot show here."
     # Astral characters are one code point each, not one UTF-16 pair.
     assert ow.owner_project_name("\U0001f680" * 160) == "\U0001f680" * 160
-    assert ow.owner_project_name("\U0001f680" * 161) == "\U0001f680" * 160
+    assert ow.owner_project_name("\U0001f680" * 161) == "This project has a name Raphael cannot show here."
     # Sanitizing first means invisible padding cannot shorten the name.
-    assert ow.owner_project_name(f"a{zero_width}" * 200) == "a" * 160
+    assert ow.owner_project_name(f"a{zero_width}" * 200) == "This project has a name Raphael cannot show here."
     # A work-item title keeps its own, wider bound.
-    assert ow.owner_title("a" * 200) == "a" * 200
+    assert ow.owner_title("a" * 200) == "This piece of work has a title Raphael cannot show here."
 
 
 @pytest.mark.parametrize(
@@ -3383,7 +3403,7 @@ _UNSAFE_STORED_PROJECT_NAME = (
     " https://deploy:hunter2verylongpassword@git.example.com/repo.git"
 )
 _PROJECTED_PROJECT_NAME = (
-    "Shoe Shop plan https://***@git.example.com/repo.git"
+    "This project has a name Raphael cannot show here."
 )
 
 
@@ -3570,10 +3590,10 @@ def test_owner_project_name_bound_is_applied_to_a_stored_name(ctx):
     setup = _bootstrap_board(ctx)
     _rename_project(setup["project_id"], "n" * 400)
 
-    assert ow.list_committed_projects(ctx)[0]["name"] == "n" * 160
+    assert ow.list_committed_projects(ctx)[0]["name"] == "This project has a name Raphael cannot show here."
     assert (
         ow.project_steward_snapshot(project_id=setup["project_id"])["project"]
-        == {"name": "n" * 160}
+        == {"name": "This project has a name Raphael cannot show here."}
     )
 
 
@@ -7089,9 +7109,9 @@ def test_task_graph_persists_canonical_native_titles_and_project_name(ctx):
 
     assert root.title == ow.owner_title(_UNSAFE_NATIVE_TITLE)
     _assert_canonical_stored_title(root.title)
-    # The pinned subdivision flag survives whole; the credential does not.
-    assert _ENGLAND_FLAG in root.title
-    assert "https://***@git.example.com/repo.git" in root.title
+    # The web address fails the title check, so the policy's fixed title
+    # sentence is stored in place of the whole title, flag included.
+    assert root.title == "This piece of work has a title Raphael cannot show here."
 
     assert [child.title for child in children] == [
         "Prepare the release",
