@@ -193,14 +193,43 @@ def test_owner_title_private_pattern_matches_get_the_title_sentence(title):
     assert ow.owner_title(title) == _SENTENCES["title"]
 
 
-def test_wrappers_keep_their_blank_answers_and_long_safe_text_is_still_cut():
+def test_wrappers_keep_their_blank_answers_and_dispatcher_prefix_rules():
     assert ow.owner_title("   ") == "Untitled work item"
+    assert ow.owner_title(None) == "Untitled work item"
     assert ow.owner_project_name("") == "Untitled Project"
-    long_title = "Plan the shop " + "x" * 300
-    assert ow.owner_title(long_title) == long_title[:240]
-    long_name = "Shoe Shop " + "z" * 200
-    assert ow.owner_project_name(long_name) == long_name[:160]
+    assert ow.owner_title("B03 — Shoe Shop") == "Shoe Shop"
     assert ow.owner_project_name("B03 — Shoe Shop") == "B03 — Shoe Shop"
+    assert ow.owner_title("B03 — Free Samples") == "Free Samples"
+    assert ow.owner_project_name("B03 — Free Samples") == "B03 — Free Samples"
+
+
+def _texts_around(bound):
+    """Texts of ``bound - 1`` to ``bound + 2`` code points, and far over it."""
+    for length in (bound - 1, bound, bound + 1, bound + 2, bound * 2):
+        yield "x" * length
+        yield "Plan the shop " + "x" * (length - 14)
+        yield "\xe9" * length
+        yield "\U0001F680" * length
+        yield "e\u0301" * (length // 2) + "x" * (length % 2)
+        yield " " + "y" * (length - 2) + " "
+
+
+@pytest.mark.parametrize(
+    "kind, wrapper, bound",
+    [("title", ow.owner_title, 240), ("project_name", ow.owner_project_name, 160)],
+    ids=["title", "project-name"],
+)
+def test_wrappers_agree_with_the_checker_at_and_above_the_bound(kind, wrapper, bound):
+    assert OWNER_TEXT_POLICY["rules"]["kinds"][kind]["max_length"] == bound
+    for text in _texts_around(bound):
+        expected = check_owner_text(text, kind)
+        assert (expected == _SENTENCES[kind]) == (len(text) > bound), text
+        assert wrapper(text) == (expected if len(text) > bound else expected.strip())
+
+
+def test_the_checker_takes_no_length_bypass():
+    with pytest.raises(TypeError):
+        check_owner_text("x" * 241, "title", bounded=False)
 
 
 @pytest.mark.parametrize(
@@ -256,12 +285,174 @@ def test_provider_and_model_names_are_hidden_next_to_any_text(text):
 
 @pytest.mark.parametrize(
     "text",
-    ["Plan the trip together", "Update the Google Calendar", "Book the fireworks"],
+    [
+        "Plan the trip together",
+        "Book the fireworks",
+        "Fireworks for the shop",
+        "Order a custom cake",
+        "Check the actual cost",
+        "Reset the router",
+        "Mark the vertex of the roof",
+        "Find a local shop",
+        "Next step: book the room",
+        "Free lunch or dinner",
+        "Go to the shop",
+        "Build a ramp for the van",
+        "Buy a kilo of flour",
+        "Add solar panels",
+        "Sketch a meta plan",
+        "Nous avons r\xe9serv\xe9 la salle",
+        "Find your muse",
+        "Ask the team to upstage nobody",
+        "Find the zen garden",
+        "Book a moonshot venue",
+        "Fw: budget for the shop",
+        "Gluten-Free Bread",
+        "Shop \u2014 Free Delivery",
+    ],
 )
 def test_everyday_words_that_name_a_provider_stay_readable(text):
     assert ow.owner_title(text) == text
     assert ow.owner_project_name(text) == text
+    assert check_owner_text(text, "title") == text
+    assert check_owner_text(text, "project_name") == text
     assert check_owner_text(text, "planner_prose") == text
+
+
+def test_lowercase_bedrock_is_refused_by_the_checker_and_both_wrappers_alike():
+    # The old private title pattern refuses it in any case; the policy agrees.
+    _refused_everywhere("Fix the bedrock of the plan")
+
+
+def _refused_everywhere(text):
+    assert check_owner_text(text, "title") == _SENTENCES["title"], text
+    assert check_owner_text(text, "project_name") == _SENTENCES["project_name"], text
+    assert check_owner_text(text, "planner_prose") == _SENTENCES["planner_prose"], text
+    assert ow.owner_title(text) == _SENTENCES["title"], text
+    assert ow.owner_project_name(text) == _SENTENCES["project_name"], text
+
+
+def _shown_in_titles_and_names(text):
+    assert check_owner_text(text, "title") == text, text
+    assert check_owner_text(text, "project_name") == text, text
+    assert ow.owner_title(text) == text, text
+    assert ow.owner_project_name(text) == text, text
+
+
+_REGISTERED_NAMES = [
+    "ZAI", "Zhipu", "GLM", "Z.AI", "z-ai", "GMI", "Copilot", "Kimi", "Codex",
+    "Nemotron", "Moonshot AI", "Gemini", "Google", "Vertex AI",
+    "Amazon Bedrock", "AWS", "Azure", "OpenRouter", "Anthropic", "Claude",
+    "OpenAI", "ChatGPT", "GPT", "DeepSeek", "Qwen", "Grok", "xAI", "x.ai",
+    "MiniMax", "Mini-Max", "StepFun", "Xiaomi", "MiMo", "Nous Research",
+    "NousResearch", "Novita", "NVIDIA", "Ollama", "vLLM", "llama.cpp", "Llama",
+    "Mistral", "Gemma", "Hugging Face", "HuggingFace", "Arcee", "DeepInfra",
+    "Kilo Code", "KiloCode", "OpenCode", "CommandCode", "Nebius",
+    "Upstage Solar", "Fireworks AI", "Together AI", "Actual Computer",
+    "Ramp Router", "Meta AI", "Muse Spark", "Vercel", "DashScope", "Alibaba",
+    "GitHub", "Sonnet", "Opus", "Haiku",
+]
+
+
+@pytest.mark.parametrize("name", _REGISTERED_NAMES)
+def test_registered_model_and_provider_names_are_hidden_in_any_form(name):
+    for text in (
+        f"Use {name} for the draft.",
+        f"Ask {name} for the draft.",
+        f"Use {name.upper()} for the draft.",
+        f"Use **{name}** for the draft.",
+        f"Use `{name}` for the draft.",
+        f"Use ({name}) for the draft.",
+        f"Use “{name}”, then send it.",
+        f"用{name}写稿。",
+        f"{name}で確認した。",
+        f"Проверь в {name}.",
+        f"{name}",
+        f"{name}s are slow today",
+        f"Use {name}4 for the draft.",
+        f"Use {name}-3.5 for the draft.",
+    ):
+        _refused_everywhere(text)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["zai", "zhipu", "glm", "gmi", "copilot", "kimi", "codex", "nemotron", "gemini",
+     "google", "claude", "openai", "gpt", "qwen", "deepseek", "grok", "minimax",
+     "bedrock"],
+)
+def test_names_are_hidden_in_lowercase_too(name):
+    _refused_everywhere(f"ask {name} for the draft")
+    _refused_everywhere(f"ask {name}2 for the draft")
+
+
+@pytest.mark.parametrize(
+    "word",
+    ["Fireworks", "Vertex", "Router", "Custom", "Actual", "Local",
+     "Step", "Solar", "Meta", "Muse", "Ramp", "Kilo", "Moonshot", "Nous",
+     "Upstage", "Zen", "Free", "Go", "Or"],
+)
+def test_everyday_words_are_hidden_in_their_product_forms(word):
+    for text in (
+        f"Use {word} for the draft.",
+        f"Use **{word}** for the draft.",
+        f"Use {word.upper()} for the draft.",
+        f"用{word}写稿",
+        f"{word}で確認",
+        f"Use {word.lower()}3 for the draft.",
+        f"Use {word.lower()}-2.5 for the draft.",
+        f"Use {word.lower()}:auto for the draft.",
+    ):
+        _refused_everywhere(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Read example.fr today", "Read example.at today", "Read example.cz today",
+        "Read EXAMPLE.FR today", "Read example.co.uk today", "Read my-site.shop today",
+        "Read **example.fr** today", "Read (example.fr) today", "Read example.fr.",
+        "Read example.fr, then reply", "Read 1example.io today",
+        "Read пример.рф today",
+        "Read b\xfccher.de today", "Read 例え.jp today",
+        "Read 例子.中国 today",
+        "Read example。com today", "Read example．com today",
+        "Read example｡com today", "Read example․com today",
+        "Read example﹒com today",
+    ],
+)
+def test_bare_web_addresses_are_refused_without_a_list_of_endings(text):
+    _refused_everywhere(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Ask **@placeholder_owner** to confirm.", "Ask .@placeholder_owner to confirm.",
+        "Ask @\xe9quipe to confirm.", "Ask @Иван to confirm.",
+        "Ask иван@почта.рф to confirm.",
+        "Ask ＠placeholder_owner to confirm.", "Ask ﹫placeholder_owner to confirm.",
+        "Ask x@y to confirm.", "Ask @1234 to confirm.", "Ask @_owner to confirm.",
+        "Ask (@owner) to confirm.", "Ask @小明 to confirm.", "Ask owner@@x",
+    ],
+)
+def test_contact_addresses_are_refused_whatever_surrounds_them(text):
+    _refused_everywhere(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Bring snacks, e.g. chips", "Bring snacks, i.e. chips", "Book 3.5 hours",
+        "Ship v2.1 of the menu", "Done. Next we book the room",
+        "确认了。明天见",
+        "確認した。次へ進む",
+        "Meet @ 5pm", "Ship the thing", "Caf\xe9 na\xefve 日本語",
+        "Ship the thing \U0001F680", "Wait... then book it",
+    ],
+)
+def test_ordinary_dotted_and_at_sign_text_is_shown(text):
+    _shown_in_titles_and_names(text)
 
 
 def test_policy_json_is_canonical_and_loads_back_to_the_constant():

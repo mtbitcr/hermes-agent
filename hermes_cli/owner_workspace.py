@@ -4537,22 +4537,22 @@ def owner_title(value: Any) -> str:
     title additionally loses the internal ``B03 — ``-style dispatcher prefix,
     which is Raphael's own bookkeeping and means nothing to the owner.
 
-    An empty title becomes :data:`_UNTITLED_WORK_ITEM`. A title holding a
-    private pattern, or failing the owner-text policy's title check
+    An empty title becomes :data:`_UNTITLED_WORK_ITEM`. A title failing the
+    owner-text policy's title check
     (:func:`hermes_cli.owner_text.check_owner_text`) on the whole raw input —
-    before any line break is collapsed or the bound cuts it, the bound itself
-    aside — or on the displayed title, becomes the policy's fixed title
-    sentence.
+    before any line break is collapsed, its length included, so an overlong
+    title is refused rather than cut — or holding a private pattern or failing
+    the check once displayed, becomes the policy's fixed title sentence.
     """
+    raw = str(value or "")
+    if raw.strip() and check_owner_text(raw, "title") != raw:
+        return check_owner_text(None, "title")
     title = _owner_display_text(
         value, limit=_OWNER_TITLE_LIMIT, strip_internal_prefix=True
     )
     if not title:
         return _UNTITLED_WORK_ITEM
-    raw = str(value or "")
-    if any(
-        pattern.search(title) for pattern in _OWNER_PRIVATE_WORK_ITEM_PATTERNS
-    ) or check_owner_text(raw, "title", bounded=False) != raw:
+    if any(pattern.search(title) for pattern in _OWNER_PRIVATE_WORK_ITEM_PATTERNS):
         return check_owner_text(None, "title")
     return check_owner_text(title, "title")
 
@@ -4600,16 +4600,16 @@ def owner_project_name(value: Any) -> str:
     An empty name becomes :data:`_UNTITLED_PROJECT`. A name failing the
     owner-text policy's project-name check
     (:func:`hermes_cli.owner_text.check_owner_text`) on the whole raw input —
-    before any line break is collapsed or the bound cuts it, the bound itself
-    aside — or on the displayed name becomes the policy's fixed project-name
-    sentence.
+    before any line break is collapsed, its length included, so an overlong
+    name is refused rather than cut — or on the displayed name becomes the
+    policy's fixed project-name sentence.
     """
+    raw = str(value or "")
+    if raw.strip() and check_owner_text(raw, "project_name") != raw:
+        return check_owner_text(None, "project_name")
     name = _owner_display_text(value, limit=_OWNER_PROJECT_NAME_LIMIT)
     if not name:
         return _UNTITLED_PROJECT
-    raw = str(value or "")
-    if check_owner_text(raw, "project_name", bounded=False) != raw:
-        return check_owner_text(None, "project_name")
     return check_owner_text(name, "project_name")
 
 

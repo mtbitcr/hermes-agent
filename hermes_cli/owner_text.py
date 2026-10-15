@@ -107,34 +107,111 @@ _LEGACY_NAMES = _any_of(
 )
 
 # Model and provider names hidden from every other kind (plan C1.6 and the
-# owner decision of 2026-10-14). A bare name is refused on its own; a
-# provider whose name is also an everyday word or name is refused only with
-# its qualifier, so "together", "fireworks", "Google Calendar" or a friend
-# called Kimi stay readable.
-_BARE_NAMES = [
-    "openai", "anthropic", "claude", "gpt", "chatgpt", "gemini", "gemma",
-    "llama", "mistral", "mixtral", "deepseek", "qwen", "grok", "bedrock",
-    "opus", "sonnet", "haiku", "azure", "openrouter", "deepinfra",
-    "huggingface", "ollama", "nvidia", "minimax", "novita", "nebius", "arcee",
-    "stepfun", "kilocode", "opencode", "commandcode", "xai",
+# owner decision of 2026-10-14): every provider under plugins/model-providers
+# (id, aliases, display names) and every model family of the catalogs. Each
+# name is refused in any letter case, bare, with version digits attached and
+# with a plural ending; any character other than an ASCII letter or digit is a
+# boundary. A name made of several words is also refused written as one word
+# or joined by a space, dot, hyphen or underscore. "bedrock" stays a name, not
+# an everyday word, because owner titles have always refused it in any case.
+_NAMES = [
+    "aci", "actualcomputer", "alibaba", "amazon", "anthropic", "arcee", "aws",
+    "azure", "bedrock", "chatgpt", "claude", "codex", "commandcode", "copilot", "dashscope",
+    "deepinfra", "deepseek", "devstral", "doubao", "gcp", "gemini", "gemma",
+    "github", "glm", "gmi", "google", "gpt", "grok", "haiku", "hermes", "hf",
+    "huggingface", "kilocode", "kimi", "llama", "llamacpp", "mimo", "minimax",
+    "mistral", "mixtral", "msl", "nebius", "nemotron", "novita", "nvidia",
+    "o1", "o3", "o4", "ollama", "openai", "opencode", "openrouter", "opus",
+    "palmyra", "qwen", "qwq", "sakana", "sonnet", "stepfun", "tencent",
+    "unsloth", "vercel", "vllm", "voxtral", "xai", "xiaomi", "zai", "zhipu",
 ]
-_QUALIFIED_NAMES = [
-    ["together", "ai"], ["fireworks", "ai"], ["vertex", "ai"], ["upstage", "ai"],
-    ["moonshot", "ai"], ["meta", "ai"], ["google", "ai"], ["alibaba", "cloud"],
-    ["gmi", "cloud"], ["xiaomi", "mimo"], ["github", "copilot"],
-    ["microsoft", "copilot"], ["nous", "research"], ["kimi", "k2"],
-    ["hugging", "face"],
+_COMPOUND_NAMES = [
+    ["actual", "computer"], ["ai", "gateway"], ["arcee", "ai"], ["command", "code"],
+    ["deep", "infra"], ["deep", "seek"], ["fireworks", "ai"], ["gmi", "cloud"],
+    ["hugging", "face"], ["kilo", "code"], ["kilo", "gateway"], ["llama", "cpp"],
+    ["meta", "ai"], ["mini", "max"], ["minimax", "ai"], ["model", "api"],
+    ["moonshot", "ai"], ["muse", "spark"], ["nous", "portal"], ["nous", "research"],
+    ["novita", "ai"], ["open", "ai"], ["ox", "alpha"], ["ramp", "router"],
+    ["thinking", "machines"], ["together", "ai"], ["token", "factory"],
+    ["upstage", "solar"], ["vertex", "ai"], ["x", "ai"], ["xiaomi", "mimo"],
+    ["z", "ai"],
 ]
-_VERSIONED_FAMILIES = ["glm", "kimi", "phi", "mimo", "codex", "nemotron"]
-_DOMAIN_ENDINGS = [
-    "com", "net", "org", "io", "dev", "app", "ai", "co", "test", "example",
-    "invalid", "localhost", "local", "internal", "info", "biz", "me", "xyz",
-    "cloud", "site", "edu", "gov", "uk", "de",
-]
+# Names that are also everyday words stay readable in their ordinary
+# lowercase use only. Their product forms are refused: capitalized after a
+# word or next to another script, with a version, or before a colon or slash.
+_EVERYDAY_WORDS = {
+    "actual": "English adjective (provider Actual Computer)",
+    "big pickle": "English idiom, a big pickle (catalog model Big Pickle)",
+    "custom": "English adjective (provider id custom)",
+    "elephant": "English noun (catalog model Elephant)",
+    "fable": "English noun (model family Fable)",
+    "fireworks": "English noun (provider Fireworks AI)",
+    "free": "English adjective (provider OpenCode Free)",
+    "fugu": "the dish (catalog model family Fugu)",
+    "fw": "the forwarded-mail mark Fw: (Fireworks alias fw)",
+    "go": "English verb (provider OpenCode Go)",
+    "hy": "Afrikaans pronoun and part of names (model family Hy)",
+    "inkling": "English noun (catalog model Inkling)",
+    "kilo": "unit, a kilo of flour (Kilo Code alias kilo)",
+    "laguna": "Spanish noun and place names (catalog model Laguna)",
+    "local": "English adjective (custom-provider alias local)",
+    "meta": "English prefix and adjective (provider Meta AI)",
+    "moonshot": "English noun (provider Moonshot AI)",
+    "muse": "English noun and verb (Meta model Muse)",
+    "nous": "French pronoun, we (provider Nous Research)",
+    "nova": "English noun (model family Amazon Nova)",
+    "or": "English conjunction (OpenRouter alias or)",
+    "pareto": "the Pareto principle (catalog model Pareto)",
+    "phi": "Greek letter (model family Phi)",
+    "poolside": "English noun (vendor Poolside)",
+    "ramp": "English noun (provider Ramp Router)",
+    "router": "English noun (provider Router)",
+    "solar": "English adjective (Upstage Solar)",
+    "step": "English noun (StepFun alias and model family Step)",
+    "syn": "Polish and Czech noun, son (Upstage model Syn)",
+    "titan": "English noun (model family Amazon Titan)",
+    "trinity": "English noun (Arcee model Trinity)",
+    "upstage": "English verb (provider Upstage)",
+    "vertex": "English noun (provider Vertex AI)",
+    "zen": "English noun (provider OpenCode Zen)",
+}
 
 
 def _rule(pattern: str) -> dict[str, str]:
     return {"pattern": pattern, "flags": "u"}
+
+
+# The word stand-ins ("word_stand_ins" below) turn every other letter and
+# digit into U+00AA or U+0660, so these classes reach letters of any script.
+_STAND_IN_LETTER = r"\u00aa\u0130\u0131\u017f\u212a"
+_STAND_IN = f"[{_STAND_IN_LETTER}\\u0660]"
+_ANY_LETTER = f"[A-Za-z{_STAND_IN_LETTER}]"
+_LOOK_ALIKE_DOTS = r"\u2024\u3002\ufe12\ufe52\uff0e\uff61"
+_NAME_JOINER = f"[{_SPACE_CHARS}._-]*"
+# After a name may come version digits, or a plural ending and then a boundary.
+_NAME_END = "(?:[0-9]|(?:[Ee]?[Ss])?(?![0-9A-Za-z]))"
+_WORD_END = "(?:[0-9]|(?![0-9A-Za-z]))"
+# What may stand between a word and a capitalized everyday word after it:
+# spaces, markup, quotes, brackets, commas and semicolons, but no sentence
+# end and no dash or bar, so "Gluten-Free" and "Shop - Free Delivery" stay
+# readable.
+_GAP = (
+    f"[{_SPACE_CHARS}*_~`\"'\\u00ab\\u00bb\\u2018\\u2019\\u201c\\u201d()\\[\\]{{}}"
+    "<>,;]"
+)
+
+
+def _joined(words: list[str], capitalized: bool = False) -> str:
+    """``words`` in either case, written together or joined; with
+    ``capitalized`` the first letter is upper case only."""
+    pattern = _NAME_JOINER.join(_cased(word) for word in words)
+    return f"{words[0][0].upper()}{pattern[4:]}" if capitalized else pattern
+
+
+_EVERYDAY = "|".join(_joined(word.split()) for word in _EVERYDAY_WORDS)
+_CAPITALIZED_EVERYDAY = "|".join(
+    _joined(word.split(), capitalized=True) for word in _EVERYDAY_WORDS
+)
 
 
 _GROUPS = {
@@ -182,8 +259,11 @@ _GROUPS = {
     "web_addresses": {
         "www_host": _rule(f"(?<!{_ALNUM}){_cased('www')}\\.{_ALNUM}"),
         "mail_link": _rule(f"(?<!{_ALNUM}){_cased('mailto')}:"),
-        "domain_name": _rule(
-            f"{_ALNUM}\\.(?:{_any_of(_DOMAIN_ENDINGS)})(?![0-9A-Za-z-])"
+        # A bare host, label.label with a last label of two or more letters,
+        # whatever its ending; labels may hold letters of any script.
+        "host_name": _rule(f"[-0-9A-Za-z{_STAND_IN_LETTER}\\u0660]\\.{_ANY_LETTER}{{2}}"),
+        "host_name_look_alike_dot": _rule(
+            f"[-0-9A-Za-z][{_LOOK_ALIKE_DOTS}][A-Za-z]{{2}}"
         ),
         "ip_address": _rule(
             "(?<![.0-9])[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}"
@@ -192,7 +272,8 @@ _GROUPS = {
     },
     "addresses": {
         "email": _rule("[%+.0-9A-Z_a-z-]@[0-9A-Za-z-]+\\.[0-9A-Za-z-]"),
-        "chat_handle": _rule("(?<![%*+./0-9:=A-Za-z-])@[0-9A-Z_a-z]"),
+        # Any at-sign or look-alike directly before something other than a space.
+        "at_sign": _rule(f"[@\\ufe6b\\uff20](?={_NOT_SPACE})"),
         "chat_mention": _rule("<[!#@][!&]?[0-9A-Za-z]"),
         "chat_id_or_phone": _rule(f"(?<!{_ALNUM})[+-][0-9]{{7}}"),
     },
@@ -213,20 +294,23 @@ _GROUPS = {
         "process_id": _rule(f"(?<!{_WORD}){_cased('pid')}[ :=]+[0-9]"),
     },
     "model_names": {
-        "bare_name": _rule(f"(?<!{_ALNUM})(?:{_any_of(_BARE_NAMES)})(?![A-Za-z])"),
-        "qualified_name": _rule(
-            f"(?<!{_ALNUM})(?:"
-            + "|".join(
-                f"{_cased(name)}[\\t ._-]*{_cased(qualifier)}"
-                for name, qualifier in _QUALIFIED_NAMES
-            )
-            + ")(?![A-Za-z])"
+        "name": _rule(f"(?<!{_ALNUM})(?:{_any_of(_NAMES)}){_NAME_END}"),
+        "compound_name": _rule(
+            f"(?<!{_ALNUM})(?:{'|'.join(_joined(words) for words in _COMPOUND_NAMES)})"
+            f"{_NAME_END}"
         ),
-        "versioned_name": _rule(
-            f"(?<!{_ALNUM})(?:{_any_of(_VERSIONED_FAMILIES)})-[.0-9A-Za-z]*[0-9]"
+        "everyday_word_capitalized_after_a_word": _rule(
+            f"(?:[0-9A-Za-z{_STAND_IN_LETTER}\\u0660]{_GAP}+|{_STAND_IN})"
+            f"(?:{_CAPITALIZED_EVERYDAY}){_WORD_END}"
         ),
-        "provider_model": _rule(
-            f"(?<!{_ALNUM})(?:{_any_of(['google', 'aws'])}){_SPACE}*:{_SPACE}*{_ALNUM}"
+        "everyday_word_capitalized_before_another_script": _rule(
+            f"(?<!{_ALNUM})(?:{_CAPITALIZED_EVERYDAY}){_STAND_IN}"
+        ),
+        "everyday_word_with_version": _rule(
+            f"(?<!{_ALNUM})(?:{_EVERYDAY})[._-]?[0-9\\u0660]"
+        ),
+        "everyday_word_as_prefix": _rule(
+            f"(?<!{_ALNUM})(?:{_EVERYDAY})[/:](?=[0-9A-Za-z{_STAND_IN_LETTER}\\u0660])"
         ),
     },
     # The stop-reason rules as they stood before this policy, one for one,
@@ -321,7 +405,9 @@ _STOP_REASON = _kind(
     ["stop_reason_compatibility"], characters=True, join_wrapped_lines=False,
     word_stand_ins=True,
 )
-_PROSE = _kind(_TEXT_GROUPS, characters=True, join_wrapped_lines=True)
+_PROSE = _kind(
+    _TEXT_GROUPS, characters=True, join_wrapped_lines=True, word_stand_ins=True
+)
 
 # (kind, text, whether the text passes); a refused text expects its kind's sentence.
 _CASES = [
@@ -515,7 +601,7 @@ _CASES = [
     ("title", "Plan with Together AI", False),
     ("title", "Draft it with gemma-2", False),
     ("title", "Plan the trip together", True),
-    ("title", "Update the Google Calendar", True),
+    ("title", "Update the Google Calendar", False),
     ("title", "Book the fireworks for Friday", True),
     ("title", "Clean the feedback list", True),
     ("title", "Meet at 12:30 in room A", True),
@@ -537,6 +623,78 @@ _CASES = [
     ("planner_prose", "We will travel together.", True),
     ("stop_reason_decision", "OpenAI\u3067\u78ba\u8a8d\u3057\u305f\u3002", True),
     ("stop_reason_decision", "Use Azure for the draft.", True),
+]
+# The same text as each of title, project name and planner prose.
+_CASES += [
+    (kind, text, passes)
+    for text, passes in (
+        ("Ask ZAI for the draft.", False),
+        ("Ask Zhipu for the draft.", False),
+        ("Use GMI for the draft.", False),
+        ("Use Copilot for the draft.", False),
+        ("Use Kimi for the draft.", False),
+        ("Use GLM for the draft.", False),
+        ("Use Codex for the draft.", False),
+        ("Use Nemotron for the draft.", False),
+        ("ask glm4 for the draft", False),
+        ("Kimis are slow today", False),
+        ("\u7528Kimi\u5199\u7a3f\u3002", False),
+        ("Codex\u3067\u78ba\u8a8d\u3057\u305f\u3002", False),
+        ("Use Bedrock for the draft.", False),
+        ("Plan it with Fireworks AI", False),
+        ("Use or:auto for the draft.", False),
+        ("Use router-2 for the draft.", False),
+        ("Book the fireworks", True),
+        ("Order a custom cake", True),
+        ("Reset the router", True),
+        ("Nous avons r\xe9serv\xe9 la salle", True),
+        ("Read example.fr today", False),
+        ("Read example.at today", False),
+        ("Read example.cz today", False),
+        ("Read \u043f\u0440\u0438\u043c\u0435\u0440.\u0440\u0444 today", False),
+        ("Read \u4f8b\u3048.jp today", False),
+        ("Ask **@placeholder_owner** to confirm.", False),
+        ("Ask .@placeholder_owner to confirm.", False),
+        ("Ask @\xe9quipe to confirm.", False),
+        ("Ask @\u0418\u0432\u0430\u043d to confirm.", False),
+        ("Ask \u0438\u0432\u0430\u043d@\u043f\u043e\u0447\u0442\u0430.\u0440\u0444 to confirm.", False),
+        ("Ask \uff20placeholder_owner to confirm.", False),
+        ("Ask \ufe6bplaceholder_owner to confirm.", False),
+        ("Read example\n.fr today", False),
+        ("Read example\u3002com today", False),
+        ("Read example\uff0ecom today", False),
+        ("Read example\uff61com today", False),
+        ("Read example\u2024com today", False),
+        ("Read example\ufe52com today", False),
+        ("We booked the room.\nNext we order food.", True),
+        ("We booked the room.\n\nNext we order food.", True),
+        ("Ship the thing", True),
+        ("Caf\xe9 na\xefve \u65e5\u672c\u8a9e", True),
+        ("Bring snacks, e.g. chips", True),
+        ("Bring snacks, i.e. chips", True),
+        ("Book 3.5 hours", True),
+        ("Ship v2.1 of the menu", True),
+        ("Done. Next we book the room", True),
+        ("\u786e\u8ba4\u4e86\u3002\u660e\u5929\u89c1", True),
+        ("\u78ba\u8a8d\u3057\u305f\u3002\u6b21\u3078\u9032\u3080", True),
+    )
+    for kind in ("title", "project_name", "planner_prose")
+]
+# Title and project name only: planner prose refuses every at-sign and emoji.
+_CASES += [
+    (kind, text, passes)
+    for text, passes in (
+        ("Meet @ 5pm", True),
+        ("Ship the thing \U0001F680", True),
+    )
+    for kind in ("title", "project_name")
+]
+# The bounds count code points; longer text is refused, never cut.
+_CASES += [
+    (kind, char * length, length <= bound)
+    for kind, bound in (("title", 240), ("project_name", 160))
+    for char in ("x", "\U0001F680")
+    for length in (bound, bound + 1)
 ]
 
 OWNER_TEXT_POLICY: dict[str, Any] = {
@@ -567,9 +725,16 @@ OWNER_TEXT_POLICY: dict[str, Any] = {
             "refused_mark_names": ["COMBINING", "VARIATION SELECTOR"],
         },
         "line_break": "\\r\\n|[\\n\\r\\u000b\\u000c\\u0085\\u2028\\u2029]",
+        # A break right after a dot or look-alike dot is not closed up, so a
+        # sentence end before a line break does not read as a host name.
         "wrapped_line_break": (
+            "(?<![.\\u2024\\u3002\\ufe12\\ufe52\\uff0e\\uff61])"
             "[ \\t\\u00ad]*(?:\\r\\n|[\\n\\r\\u000b\\u000c\\u0085\\u2028\\u2029])[ \\t\\u00ad]*"
         ),
+        # A kind's "max_length" counts the code points of the text as given,
+        # before any change: len(text) in Python, [...text].length in
+        # JavaScript. Longer text is refused, never cut.
+        "max_length": "code points of the input",
         # Before the patterns of a kind with "word_stand_ins" run, each
         # character outside ASCII and outside "kept" is replaced: one of the
         # "digit_categories" by "digit", one of the "letter_categories" by
@@ -584,10 +749,12 @@ OWNER_TEXT_POLICY: dict[str, Any] = {
         "groups": _GROUPS,
         "kinds": {
             "title": _kind(
-                _TEXT_GROUPS, characters=False, join_wrapped_lines=True, max_length=240
+                _TEXT_GROUPS, characters=False, join_wrapped_lines=True,
+                word_stand_ins=True, max_length=240,
             ),
             "project_name": _kind(
-                _TEXT_GROUPS, characters=False, join_wrapped_lines=True, max_length=160
+                _TEXT_GROUPS, characters=False, join_wrapped_lines=True,
+                word_stand_ins=True, max_length=160,
             ),
             "stop_reason_decision": _STOP_REASON,
             "stop_reason_receipt": _STOP_REASON,
@@ -598,14 +765,16 @@ OWNER_TEXT_POLICY: dict[str, Any] = {
             "automation_start": _PROSE,
         },
         "model_and_provider_names": {
-            "bare": _BARE_NAMES,
-            "with_qualifier": _QUALIFIED_NAMES,
-            "with_version": _VERSIONED_FAMILIES,
-            "why_some_need_a_qualifier": (
-                "Each of these is also an everyday word or a common name "
-                "(together, fireworks, vertex, upstage, moonshot, meta, google, "
-                "alibaba, gmi, xiaomi, copilot, nous, kimi, hugging face), so it is "
-                "refused only with its qualifier or a version."
+            "names": _NAMES,
+            "compound_names": _COMPOUND_NAMES,
+            "everyday_words": _EVERYDAY_WORDS,
+            "how": (
+                "A name or compound name is refused in any letter case, bare, with "
+                "version digits attached and with a plural ending; any character "
+                "other than an ASCII letter or digit is a boundary. An everyday "
+                "word stays readable in its ordinary lowercase use; it is refused "
+                "capitalized after a word or next to another script, with a "
+                "version, or before a colon or slash, and inside a compound name."
             ),
         },
     },
@@ -685,7 +854,7 @@ def _with_word_stand_ins(text: str) -> str:
     )
 
 
-def check_owner_text(text: Any, kind: str, *, bounded: bool = True) -> str:
+def check_owner_text(text: Any, kind: str) -> str:
     """Return ``text`` when the policy lets the owner see it as ``kind``.
 
     Otherwise return the kind's fixed sentence, whole: for text that is not a
@@ -693,16 +862,16 @@ def check_owner_text(text: Any, kind: str, *, bounded: bool = True) -> str:
     than the kind allows, holding a character the kind refuses or matching a
     rule in one of the kind's groups. A kind that joins wrapped lines checks the
     text with each line break closed up and again with each shown as a space,
-    so a path or id split across lines is still caught. ``bounded=False`` skips
-    the length bound only, for a caller that checks a whole input it then cuts
-    to the bound itself. An unknown ``kind`` raises :class:`KeyError`.
+    so a path or id split across lines is still caught. The length bound
+    counts code points of ``text`` as given. An unknown ``kind`` raises
+    :class:`KeyError`.
     """
     spec, patterns = _KINDS[kind]
     sentence = _SENTENCES[kind]
     if spec["fixed"] or not isinstance(text, str) or not text.strip():
         return sentence
     limit = spec["max_length"]
-    if bounded and limit is not None and len(text) > limit:
+    if limit is not None and len(text) > limit:
         return sentence
     forms = [text]
     if spec["join_wrapped_lines"]:
