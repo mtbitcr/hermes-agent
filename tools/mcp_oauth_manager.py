@@ -258,6 +258,14 @@ def _make_hermes_provider_class() -> Optional[type]:
             """Accept any 2xx refresh response and avoid logging token bodies."""
             if not (200 <= response.status_code < 300):
                 logger.warning("Token refresh failed: %s", response.status_code)
+                if response.status_code in (400, 401):
+                    # The provider refused the refresh grant (e.g. an expired
+                    # or revoked refresh token): only a new sign-in helps.
+                    # Record it on disk for the dashboard; 5xx stays retryable.
+                    storage = self.context.storage
+                    from tools.mcp_oauth import HermesTokenStorage
+                    if isinstance(storage, HermesTokenStorage):
+                        storage.mark_sign_in_rejected()
                 self.context.clear_tokens()
                 return False
 

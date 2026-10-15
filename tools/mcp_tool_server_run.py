@@ -330,11 +330,17 @@ class MCPServerRunMixin:
         if failure_class == "permanent":
             # Deterministic failure (bad command, non-MCP URL, 401/403): park at once; auth
             # failures park (not return) so the task can pick up fresh tokens later.
+            auth_failure = _errors._is_auth_error(root)
             detail = (f"authentication, parking until credentials change; re-authenticate with "
-                      f"`hermes mcp login {self.name}`" if _errors._is_auth_error(root)
+                      f"`hermes mcp login {self.name}`" if auth_failure
                       else "connection with a permanent error, parking without retries")
             logger.warning("MCP server '%s' failed initial %s (state: connecting → parked): %s: %s",
                            self.name, detail, type(root).__name__, root)
+            if auth_failure and self._auth_type == "oauth":
+                # Before parking, record the refusal on disk: the dashboard (another process)
+                # then shows this connection as needing a new sign-in instead of connected.
+                from tools.mcp_oauth import HermesTokenStorage
+                HermesTokenStorage(self.name).mark_sign_in_rejected()
             return await self._park_initial_failure(exc, "after permanent initial failure", budget)
         budget.initial_retries += 1
         if budget.initial_retries > _core._MAX_INITIAL_CONNECT_RETRIES:

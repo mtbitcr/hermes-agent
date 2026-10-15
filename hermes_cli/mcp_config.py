@@ -122,17 +122,19 @@ def _mcp_connection_status(name: str, server_config: dict) -> str:
     """Return a strict, secret-free connection state for dashboard readers.
 
     OAuth configuration alone is not a connection. Only an on-disk token is
-    reported as connected; storage failures stay explicit instead of becoming
-    a false green. Non-OAuth servers use their existing configuration contract.
+    reported as connected, and not while the gateway has marked its sign-in
+    as rejected; storage failures stay explicit instead of becoming a false
+    green. Non-OAuth servers use their existing configuration contract.
     """
     if server_config.get("auth") != "oauth":
         return "configured"
     try:
         from tools.mcp_oauth import HermesTokenStorage
 
+        storage = HermesTokenStorage(name)
         return (
             "connected"
-            if HermesTokenStorage(name).has_cached_tokens()
+            if storage.has_cached_tokens() and not storage.is_sign_in_rejected()
             else "needs_authorization"
         )
     except Exception as exc:  # pragma: no cover - defensive filesystem seam
