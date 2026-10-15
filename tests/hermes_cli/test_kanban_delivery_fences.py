@@ -4,8 +4,9 @@ Tests 1 to 14 are plan section 8's, adapted as the owner directs: load_policy ta
 policy text, and the merge reads the security reviewer's own approval (no mirror). The
 four tests after them show owner cases that tests 1 to 14 do not show in full, the next
 four are regressions for the first independent review's findings 1 to 4, the next is
-the regression for the latest review's finding: an unknown job's unnamed failed step, and the
-last six are regressions for security findings 1 to 6 on pull request 140.
+the regression for the latest review's finding: an unknown job's unnamed failed step, the next
+six are regressions for security findings 1 to 6 on pull request 140, and the last four are
+finding 164's: a job the runner stopped at its time limit.
 """
 import ast
 import json
@@ -891,3 +892,41 @@ def test_merge_after_a_rerun_needs_a_check_run_for_every_required_check():
     facts = checks(check_run(2, name="Python lints"), statuses=[status(5, "success")], evidence_id=20)
     d = fences.decide_merge(policy(), PLATFORM, H, pr(), facts, list(LENSES), [review(10, "APPROVED")], SECURITY)
     assert (d.allowed, d.code) == (True, "merge")
+
+
+def stopped(conclusion="cancelled"):
+    """Finding 164: ci.yaml's "Detect affected areas", stopped by the runner at its 1-minute limit, its check run
+    carrying the runner's notice (time_limit), so the summary check failed at "Evaluate job results"."""
+    return job(4, "Detect affected areas", conclusion, time_limit=True)
+
+
+def test_a_job_stopped_by_its_time_limit_is_rerun_once():
+    for conclusion in ("cancelled", "timed_out"):
+        d = rerun([job(2, GATE, "failure", steps=[EVALUATE]), stopped(conclusion)])
+        assert (d.allowed, d.code, d.matches) == (True, "rerun", [{"job_id": 4, "time_limit": True}]), conclusion
+
+
+def test_a_time_limit_stop_beside_a_listed_flaky_failure_reruns_both():
+    d = rerun([job(2, GATE, "failure", steps=[EVALUATE]), stopped(), slice_job(7, 3, [FLAKY_46])])
+    assert (d.allowed, d.code) == (True, "rerun") and "[4, 7]" in d.detail
+    assert d.matches == [{"job_id": 4, "time_limit": True},
+                         {"job_id": 7, "test": FLAKY_46, "list_entry": {"test": FLAKY_46, "finding": 46}}]
+
+
+def test_a_second_time_limit_stop_after_the_rerun_returns_with_its_own_reason():
+    """One rerun per head in all: once H's ledger or a later attempt shows it, a job stopped at its time limit
+    again returns the work with its own reason, and any other failure beside it keeps rerun_used."""
+    gate = job(2, GATE, "failure", steps=[EVALUATE])
+    for jobs, reruns in (([gate, stopped()], [H]), ([gate, {**stopped(), "run_attempt": 2}], [])):
+        d = rerun(jobs, reruns)
+        assert (d.allowed, d.code, d.matches) == (False, "time_limit_after_rerun", [])
+        assert d.detail == "job 4 stopped at its time limit again after the one rerun"
+    d = rerun([gate, stopped(), slice_job(7, 3, [FLAKY_46])], [H])
+    assert (d.allowed, d.code, d.matches) == (False, "rerun_used", [])
+
+
+def test_a_time_limit_fact_that_is_not_a_bool_is_an_invalid_fact():
+    for value in (1, "true", None, [True]):
+        d = rerun([job(2, GATE, "failure", steps=[EVALUATE]), {**stopped(), "time_limit": value}])
+        assert (d.allowed, d.code, d.matches) == (False, "invalid_fact", []), value
+        assert "jobs[1].time_limit" in d.detail

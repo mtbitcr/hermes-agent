@@ -34,6 +34,8 @@ RERUN = f"/repos/{REPO}/actions/jobs/903/rerun"
 REWORK = "SELECT * FROM tasks WHERE title LIKE 'Rework:%'"
 IDENTITY = ("SELECT json_extract(payload, '$.identity') AS identity FROM task_events WHERE task_id = ? "
             "AND kind = 'review_followup_recorded' AND json_extract(payload, '$.followup_task_id') = ?")
+# Finding 164: the runner's notice on the check run of a job it stopped at its time limit.
+TIME_LIMIT = "The job running on runner GitHub Actions 2 has exceeded the maximum execution time of 1 minutes."
 
 
 @pytest.fixture
@@ -99,6 +101,28 @@ def _red_identity(kb, tid, head):
     return [{"identity": kb._review_followup_identity_key(reviewed_task_id=tid, candidate=f"{head} continuation")}]
 
 
+def _stopped(monkeypatch, notice=TIME_LIMIT):
+    """Finding 164's run: job 903 is ci.yaml's "Detect affected areas", cancelled, so the summary job 900 failed
+    at "Evaluate job results", and the job's check run carries ``notice`` beside "The operation was canceled."."""
+    from hermes_cli import kanban_delivery_github as transport
+
+    table = transport._exchange  # the red fixture's
+
+    def exchange(method, target, authorization, payload=None):
+        status, value = table(method, target, authorization, payload)
+        path = urlsplit(target).path
+        if (method, path) == ("GET", f"/repos/{REPO}/actions/runs/77/jobs"):
+            value = dict(value, jobs=[dict(job, name="Detect affected areas", conclusion="cancelled", steps=[
+                {"name": "Set up job", "conclusion": "success"}, {"name": "Detect changes", "conclusion": "cancelled"}])
+                if job["id"] == 903 else job for job in value["jobs"]])
+        if (method, path) == ("GET", f"/repos/{REPO}/check-runs/903/annotations"):
+            value = [{"path": ".github", "annotation_level": "failure", "title": "", "message": message,
+                      "raw_details": ""} for message in (notice, "The operation was canceled.")]
+        return status, value
+
+    monkeypatch.setattr(transport, "_exchange", exchange)
+
+
 def test_the_annotations_name_the_failed_tests_of_each_failed_test_job(red, monkeypatch):
     """decide_rerun gets every latest job of H's run that holds the red check; the failed slice job carries
     the test ids and the count its own check run's annotations name under the fixed title, and nothing
@@ -146,6 +170,68 @@ def test_only_a_listed_flaky_failure_is_rerun_and_only_once(red):
     gh["check"] = ("completed", "success")
     _tick(kb)
     assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created" and gh["reruns"] == [RERUN]
+
+
+def test_a_time_limit_cancellation_is_rerun_and_recorded_not_returned(red, monkeypatch):
+    """Finding 164: a job cancelled at its time limit, with the runner's notice on its check run, is rerun once
+    through the rerun call, recorded once for H with the time-limit jobs before it is sent and its accepted answer
+    once after, with no return and no continuation card; the green rerun gets H its review cards."""
+    kb, root, repo, gh = red
+    _stopped(monkeypatch)
+    tid, head = _ready(red)
+    events = _events(kb, tid)
+
+    for _ in range(3):
+        _tick(kb)
+
+    outcome = {"delivery_id": 1, "head": head, "pull_request_number": 41}
+    assert _events(kb, tid)[len(events):] == [
+        ("delivery_review_waiting", dict(outcome, code="red_check_waiting",
+                                         check_runs=[{"id": 900, "conclusion": "failure"}])),
+        ("delivery_review_waiting", dict(outcome, code="red_check_rerun", jobs=[903], tests=[], attempt=1,
+                                         time_limit_jobs=[903])),
+        ("delivery_review_waiting", dict(outcome, code="red_check_rerun_outcome", jobs=[903], statuses=[201]))]
+    assert gh["reruns"] == [RERUN] and _raw(kb.kanban_db_path(), CONTINUED, tid) == []
+    gh["check"] = ("completed", "success")
+    _tick(kb)
+    assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created" and gh["reruns"] == [RERUN]
+
+
+def test_a_second_time_limit_cancellation_returns_the_work_once(red, monkeypatch):
+    """Owner decision of 2026-10-15: run attempt 2, the one rerun's, is cancelled at the time limit again. The
+    work returns once, as time_limit_after_rerun with one continuation card whose body names that reason, and
+    no second rerun call is sent over two passes."""
+    kb, root, repo, gh = red
+    _stopped(monkeypatch)
+    tid, head = _ready(red)
+    for _ in range(3):
+        _tick(kb)
+    gh["attempt"] = 2
+
+    for _ in range(2):
+        _tick(kb)
+
+    returned = _waited(kb, tid, "red_check_returned")
+    assert [payload["reason"] for payload in returned] == ["time_limit_after_rerun"]
+    (item,) = _raw(kb.kanban_db_path(), CONTINUED, tid)
+    assert returned[0]["rework"] == item["id"] and gh["reruns"] == [RERUN]
+    assert "(time_limit_after_rerun: job 903 stopped at its time limit again after the one rerun)" in item["body"]
+
+
+def test_a_cancellation_without_the_time_limit_notice_is_still_returned(red, monkeypatch):
+    """A job cancelled with no time-limit notice on its check run is returned as today: not_test_job, once, with
+    one continuation card and no rerun call."""
+    kb, root, repo, gh = red
+    _stopped(monkeypatch, notice="The run was canceled by @mtbitcr.")
+    tid, head = _ready(red)
+
+    for _ in range(3):
+        _tick(kb)
+
+    returned = _waited(kb, tid, "red_check_returned")
+    assert [payload["reason"] for payload in returned] == ["not_test_job"]
+    (item,) = _raw(kb.kanban_db_path(), CONTINUED, tid)
+    assert returned[0]["rework"] == item["id"] and gh["reruns"] == [] and _waited(kb, tid, "red_check_rerun") == []
 
 
 def test_nothing_is_decided_while_a_job_of_the_run_still_runs(red):

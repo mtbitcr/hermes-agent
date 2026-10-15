@@ -249,12 +249,13 @@ def _publish_facts(approval: dict, ledger: dict, remote: dict):
 
 
 def decide_rerun(policy: Policy, repo: str, head: str, jobs: list[dict], ledger: dict) -> Decision:
-    """T3: may the failed jobs of H's workflow run be rerun once, as listed flaky failures?
+    """T3: may the failed jobs of H's workflow run be rerun once, as listed flaky failures or time-limit stops?
 
     jobs: every job of the run with id, name, head_sha, status, conclusion, run_attempt and
     steps [{name, conclusion}]; a failed slice also carries failed_tests (the test ids its log
-    names) and failed_count (the count its pytest summary reports). ledger: {"reruns": [heads
-    already rerun]}. All or nothing: one ineligible failed job refuses the whole rerun.
+    names) and failed_count (the count its pytest summary reports); a job that ended cancelled or
+    timed_out may carry time_limit (a bool: its check run names the runner's time limit). ledger:
+    {"reruns": [heads already rerun]}. All or nothing: one ineligible failed job refuses the whole rerun.
     Owner rule 1: repo, names, statuses and failed test ids are non-empty strs, a conclusion too
     or None before its job or step completes, H and the heads SHAs, ids (unique), run_attempt and
     failed_count positive ints; a failed slice is a TEST_JOB_STEPS job whose conclusion is not passing.
@@ -271,7 +272,14 @@ def decide_rerun(policy: Policy, repo: str, head: str, jobs: list[dict], ledger:
     failed = [job for job in jobs if job["conclusion"] not in _PASSING]
     if not failed:
         return Decision(True, "not_needed", "no job failed")
+    # Finding 164: a job the runner stopped at its time limit is eligible by its own end and its check
+    # run's notice, with no test step to check. It shares H's one rerun with the listed flaky failures.
+    stopped = [job for job in failed if job["name"] != SUMMARY_CHECK
+               and job["conclusion"] in ("cancelled", "timed_out") and job.get("time_limit") is True]
     if head in ledger["reruns"] or any(job["run_attempt"] > 1 for job in jobs):
+        if stopped and all(job in stopped for job in failed if job["name"] != SUMMARY_CHECK):
+            return _refuse("time_limit_after_rerun",
+                           f"job {stopped[0]['id']} stopped at its time limit again after the one rerun")
         return _refuse("rerun_used", "H already had its one rerun")
     # Owner decision 2: the summary check is a summary only beside other failed jobs that are all
     # eligible. It is then not rerun itself; GitHub reruns it after the jobs it waits on. Only its
@@ -288,6 +296,9 @@ def decide_rerun(policy: Policy, repo: str, head: str, jobs: list[dict], ledger:
         return _refuse("summary_failed_alone", "the summary check failed and no other job did")
     flaky, matches = policy.flaky_tests[repo], []
     for job in others:
+        if job in stopped:
+            matches.append({"job_id": job["id"], "time_limit": True})
+            continue
         if not _is_test_job(job):
             return _refuse("not_test_job", f"job {job['id']} did not fail only at its test step")
         named = job.get("failed_tests") or []
@@ -324,6 +335,8 @@ def _rerun_facts(repo: str, head: str, jobs: list[dict], ledger: dict):
             yield from _shape(f"{name}.steps[{step_index}]", step, "name conclusion")
             yield f"{name}.steps[{step_index}].name", _is_text(step["name"])
             yield f"{name}.steps[{step_index}].conclusion", step["conclusion"] is None or _is_text(step["conclusion"])
+        if "time_limit" in job:  # finding 164: optional, and a bool when present
+            yield f"{name}.time_limit", _is_bool(job["time_limit"])
         if job["name"] in TEST_JOB_STEPS and job["conclusion"] not in _PASSING:
             yield from _shape(name, job, "failed_tests failed_count")
             yield from _shape(f"{name}.failed_tests", job["failed_tests"])

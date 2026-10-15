@@ -1038,9 +1038,12 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
 
 
 # The one title tests.yml gives every annotation a failed slice job writes on its own check run: first
-# the count of failed tests ("count N"), then each failed test id. No other annotation is read. Owner
+# the count of failed tests ("count N"), then each failed test id. No other annotation names a test. Owner
 # rule 4: "count" and a number, 0 included (a setup error's), is the count and never a test id.
 _FAILED_TEST, _FAILED_COUNT = "Failed test", re.compile(r"count ([0-9]+)")
+# Finding 164: the runner's own annotation on the check run of a job it stopped at its time limit, "The job
+# running on runner <name> has exceeded the maximum execution time of <n> minutes.".
+_TIME_LIMIT = re.compile(r"has exceeded the maximum execution time of [0-9]+ minutes?")
 _RED_REWORK_BODY = (
     "Rework of {source}: a required check is red on head {head} of pull request {number} on the code host, "
     "and the delivery returned the work to its builder ({reason}: {detail}). {tests} "
@@ -1065,7 +1068,9 @@ def _recorded(conn: sqlite3.Connection, source: str, code: str) -> list:
 def _failed_jobs(github, repository: str, head: str, red: set) -> Optional[list]:
     """Every latest job of H's workflow run that holds a red required check run (an Actions job is its
     check run), each failed slice job with the test ids and the count its own check run's annotations of
-    the fixed title name; None when no run of H on the one page read holds one, or while that run runs."""
+    the fixed title name, and each job that ended cancelled or timed_out with time_limit: whether one of its
+    check run's annotations is the runner's time-limit notice; None when no run of H on the one page read
+    holds one, or while that run runs."""
     runs, _ = _page(github, f"/repos/{repository}/actions/runs", "workflow_runs", head_sha=head)
     for run in runs:
         jobs, count = _page(github, f"/repos/{repository}/actions/runs/{run['id']}/jobs", "jobs", filter="latest")
@@ -1076,11 +1081,17 @@ def _failed_jobs(github, repository: str, head: str, red: set) -> Optional[list]
         if any(job.get("status") != "completed" for job in jobs):
             return None  # the run still runs (ci.yaml's timing report runs after the summary check): decide later
         for job in jobs:
-            if job.get("name") in TEST_JOB_STEPS and job.get("conclusion") not in _PASSING:
+            failed = job.get("name") in TEST_JOB_STEPS and job.get("conclusion") not in _PASSING
+            stopped = job.get("conclusion") in ("cancelled", "timed_out")
+            if failed or stopped:
                 answer = _answered(github.request(
                     "GET", f"/repos/{repository}/check-runs/{job['id']}/annotations", query={"per_page": 100}))
                 if answer["status"] != 200 or not isinstance(answer["data"], list):
                     raise PublishRefused("ci_unreadable", f"GitHub answered {answer['status']} for job {job['id']}")
+            if stopped:
+                job["time_limit"] = any(isinstance(note, dict) and isinstance(note.get("message"), str)
+                                        and _TIME_LIMIT.search(note["message"]) is not None for note in answer["data"])
+            if failed:
                 notes = [note["message"] for note in answer["data"]
                          if note["title"] == _FAILED_TEST and isinstance(note["message"], str)]
                 counts = [int(found[1]) for found in map(_FAILED_COUNT.fullmatch, notes) if found]
@@ -1125,12 +1136,15 @@ def _rerun_or_return(db_path: Path, row: dict, read: tuple, github, repository: 
     code = "red_check_rerun" if decision.allowed else "red_check_returned"
     tests = [test for job in jobs for test in job.get("failed_tests") or () if isinstance(test, str)]
     ids = sorted({match["job_id"] for match in decision.matches})
+    # Finding 164: the jobs the one rerun covers for their time limit, recorded only when there are any.
+    stopped = sorted({match["job_id"] for match in decision.matches if match.get("time_limit") is True})
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if not delivery_settings() or not _unchanged(conn, row, read) or any(
                 record["head"] == head for record in _recorded(conn, source, code)):
             return None
         if decision.allowed:
-            _waiting(conn, row, code, jobs=ids, tests=tests, attempt=attempt)
+            _waiting(conn, row, code, jobs=ids, tests=tests, attempt=attempt,
+                     **({"time_limit_jobs": stopped} if stopped else {}))
         else:
             _waiting(conn, row, code, reason=decision.code, tests=tests,
                      **_continuation(conn, db_path, row, _red_body(row, decision, tests), branch))
