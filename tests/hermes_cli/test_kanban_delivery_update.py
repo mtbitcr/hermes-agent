@@ -9,8 +9,9 @@ branch at the updated head, main its recorded base, as the normal completion han
 since that base. Its builder hands that head over unchanged through the normal completion, so the kernel's reviewer
 nomination and route authority apply and only its own approval merges it. The kernel's delivery_updated event,
 written with the card, is the one proof of an update card. The old row is updated, and its
-pull request closes once the update is published. A conflict or a changed set of paths goes back to the builder
-through the continuation card instead. With the setting off a base_moved row stays where it is. Real boards and git
+pull request closes once the update is published. A changed set of paths goes back to the builder through the
+continuation card instead, and so does a conflict outside the approved paths; a conflict inside them gets the update
+card on main with the conflict marked. With the setting off a base_moved row stays where it is. Real boards and git
 in temporary folders; GitHub is the real transport with only its exchange and App token replaced, so every call
 passes the allowlist, and its git origin is a local bare repository."""
 
@@ -422,17 +423,82 @@ def test_an_update_that_changes_other_paths_goes_back_to_the_builder(exact, chan
     _returned(kb, repo, gh, tid, head, main, "paths", branches)
 
 
+def test_a_conflicting_update_gets_a_card_on_main_with_the_conflict_marked(exact):
+    """Main moves on the approved change's own file, so merging main and H conflicts in it, inside the approved paths
+    and the card's owned paths: one pass makes one update card for the builder based on main, with no return. Its
+    branch head has H and main as its parents and holds git's merged tree with the conflict marked, and the kernel's
+    delivery_updated event names the conflicted file."""
+    kb, root, repo, gh = exact
+    tid, head, base, main = _moved_on(exact, path="src/impl/feature.py", text="ok = False\n")
+
+    _tick(kb)
+
+    db = kb.kanban_db_path()
+    assert (_state(kb, head), [task["branch_name"] for task in _raw(db, CONTINUED, tid)], _arms(gh)) == (
+        "updated", [], [])
+    card = _update(kb, tid)
+    update = _head(repo, card)
+    assert (card["status"], card["assignee"], card["head_commit"], card["base_commit"]) == (
+        "ready", IMPLEMENTER, None, main)
+    assert _parents(repo, update) == [head, main]
+    marked = _git(repo, "show", f"{update}:src/impl/feature.py").splitlines()
+    assert [line for line in marked if line.startswith(("<<<<<<<", "=======", ">>>>>>>"))] == [
+        f"<<<<<<< {main}", "=======", f">>>>>>> {head}"] and "ok = False" in marked
+    assert set(_git(repo, "diff", "--name-only", main, update).split()) == {"src/impl/feature.py"}
+    assert [(payload["update_task_id"], payload["update_head"], payload["observed_main"], payload["reviewed_base"],
+             payload["conflicts"]) for payload in _updated(kb, tid)] == [
+        (card["id"], update, main, base, ["src/impl/feature.py"])]
+    assert [task["id"] for task in _raw(db, ON_UPDATE_BRANCHES, tid)] == [card["id"]]
+
+
 def test_a_conflicting_update_goes_back_to_the_builder_with_no_card_in_review(exact):
+    """The conflict goes back to the builder as that update card, ready for the builder and not in review: its body
+    names the conflicted file and asks for the marked conflicts in it resolved and nothing else changed. No checkout
+    moved, no branch but the update's was made, and another pass makes no other card and no return."""
     kb, root, repo, gh = exact
     tid, head, base, main = _moved_on(exact, path="src/impl/feature.py", text="ok = False\n")
     before, branches = _checkout(repo), _branches(repo)
 
     _tick(kb)
 
-    _returned(kb, repo, gh, tid, head, main, "conflict", branches)
-    assert _checkout(repo) == before
+    db = kb.kanban_db_path()
+    assert (_state(kb, head), [task["branch_name"] for task in _raw(db, CONTINUED, tid)]) == ("updated", [])
+    card = _update(kb, tid)
+    assert (card["status"], card["assignee"]) == ("ready", IMPLEMENTER)
+    assert (f"main is at {main}. Merging it with the approved change conflicts in these files: src/impl/feature.py. "
+            f"This card's branch {card['branch_name']} at {_head(repo, card)} is on current main with the conflict "
+            "marked. Resolve the marked conflicts in those files only, change nothing else, and hand over for review."
+            ) in card["body"] and "over unchanged" not in card["body"]
+    assert _raw(db, "SELECT id FROM tasks WHERE status = 'review'") == []
+    assert _checkout(repo) == before and _branches(repo) == branches | {card["branch_name"]}
     _tick(kb)
-    assert len(_raw(kb.kanban_db_path(), CONTINUED, tid)) == 1
+    assert ([task["id"] for task in _raw(db, ON_UPDATE_BRANCHES, tid)], _raw(db, CONTINUED, tid)) == ([card["id"]], [])
+
+
+@pytest.mark.parametrize("conflict", ["added_on_both_sides", "deleted_under_the_base"])
+def test_a_conflict_outside_the_approved_paths_goes_back_to_the_builder(exact, conflict):
+    """The reviewed base is a commit only the registered checkout holds, and it changes docs/kept.md, which main on
+    GitHub changes too and the approved change never touches: merging main and H conflicts in that file, outside the
+    approved paths, so it goes back to the builder as a conflict and no update card is made. Both add the file, so the
+    merged tree changes it relative to main as well; or the base deletes it while main changes it, so git leaves
+    main's version in the tree, and only the conflicted file lies outside the approved paths."""
+    kb, root, repo, gh = exact
+    if conflict == "deleted_under_the_base":
+        _main_moves(exact, "docs/kept.md", "kept\n", where="local")
+        _git(repo, "rm", "-q", "docs/kept.md")
+    else:
+        (repo / "docs").mkdir(exist_ok=True)
+        (repo / "docs" / "kept.md").write_text("in the reviewed base\n", encoding="utf-8")
+        _git(repo, "add", "docs/kept.md")
+    _git(repo, "commit", "-q", "-m", "the reviewed base changes docs/kept.md")
+    tid, head, base = _approved_head(exact)
+    main = _main_moves(exact, "docs/kept.md", "changed on main\n")
+    _setting(root, "true")
+    branches = _branches(repo)
+
+    _tick(kb)
+
+    _returned(kb, repo, gh, tid, head, main, "conflict", branches)
 
 
 def test_a_continued_delivery_is_brought_up_to_date_when_main_moves(exact):
