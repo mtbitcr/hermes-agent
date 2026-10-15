@@ -1,7 +1,10 @@
 {
+  "_reasons": {
+    "hermes_cli/kanban_db.py": "39491 to 39497: +6 lines, the measured net growth of card C1 (finding 116). A repeated needs_input owner question now stays blocked, waiting for the owner, instead of going to triage. Owner rule of 2026-10-13."
+  },
   "cron/scheduler.py": 7520,
   "gateway/platforms/api_server.py": 16182,
-  "hermes_cli/kanban_db.py": 39491,
+  "hermes_cli/kanban_db.py": 39497,
   "plugins/kanban/dashboard/plugin_api.py": 4833,
   "tools/kanban_tools.py": 4921
 }

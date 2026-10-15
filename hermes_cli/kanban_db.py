@@ -145,6 +145,7 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # for a human, and the unblock-loop breaker (see ``block_task`` /
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
+# Except ``needs_input``: a repeated owner question stays ``blocked``.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
@@ -155,6 +156,7 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # human-in-the-loop decision. Mirrors the dispatcher's ``DEFAULT_FAILURE_LIMIT``
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
+# ``needs_input`` is exempt: it stays ``blocked`` (still counted) for the owner.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
@@ -27412,7 +27414,9 @@ def _block_task_within_txn(
     same_cause = prev_kind == kind
     recurrences = prev_recurrences + 1 if same_cause else 1
 
-    if recurrences >= BLOCK_RECURRENCE_LIMIT:
+    # A ``needs_input`` block never goes through the loop breaker: a repeated
+    # owner question takes the ordinary blocked path, its count stored.
+    if recurrences >= BLOCK_RECURRENCE_LIMIT and kind != "needs_input":
         # Loop detected — stop letting the unblocker spin this task. Route
         # to triage for a human-in-the-loop decision instead of blocked.
         cur = conn.execute(
@@ -27539,7 +27543,9 @@ def block_task(
       unblock-loop counter (``block_recurrences``) increments. When it reaches
       :data:`BLOCK_RECURRENCE_LIMIT`, the task is routed to ``triage`` instead
       of ``blocked`` — breaking the cron-unblock ↔ worker-re-block loop and
-      forcing a human-in-the-loop triage decision.
+      forcing a human-in-the-loop triage decision. Except ``needs_input``: a
+      repeated owner question stays ``blocked`` with its count stored, so it
+      keeps waiting for the owner.
 
     * ``transient`` — treated like a generic block for routing, but a worker
       can use it to signal "this might clear on its own"; it still participates
