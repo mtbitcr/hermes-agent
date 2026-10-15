@@ -4537,18 +4537,23 @@ def owner_title(value: Any) -> str:
     title additionally loses the internal ``B03 — ``-style dispatcher prefix,
     which is Raphael's own bookkeeping and means nothing to the owner.
 
-    An empty title, or one holding a private pattern, becomes
-    :data:`_UNTITLED_WORK_ITEM`; any other title that fails the owner-text
-    policy's title check (:func:`hermes_cli.owner_text.check_owner_text`)
-    becomes the policy's fixed title sentence.
+    An empty title becomes :data:`_UNTITLED_WORK_ITEM`. A title holding a
+    private pattern, or failing the owner-text policy's title check
+    (:func:`hermes_cli.owner_text.check_owner_text`) on the whole raw input —
+    before any line break is collapsed or the bound cuts it, the bound itself
+    aside — or on the displayed title, becomes the policy's fixed title
+    sentence.
     """
     title = _owner_display_text(
         value, limit=_OWNER_TITLE_LIMIT, strip_internal_prefix=True
     )
-    if not title or any(
-        pattern.search(title) for pattern in _OWNER_PRIVATE_WORK_ITEM_PATTERNS
-    ):
+    if not title:
         return _UNTITLED_WORK_ITEM
+    raw = str(value or "")
+    if any(
+        pattern.search(title) for pattern in _OWNER_PRIVATE_WORK_ITEM_PATTERNS
+    ) or check_owner_text(raw, "title", bounded=False) != raw:
+        return check_owner_text(None, "title")
     return check_owner_text(title, "title")
 
 
@@ -4591,10 +4596,21 @@ def owner_project_name(value: Any) -> str:
     Every owner-facing surface that shows a Project name projects it through
     here, so the name an owner reads in a Project list, a snapshot, a steward
     report or a decision cannot disagree between surfaces.
+
+    An empty name becomes :data:`_UNTITLED_PROJECT`. A name failing the
+    owner-text policy's project-name check
+    (:func:`hermes_cli.owner_text.check_owner_text`) on the whole raw input —
+    before any line break is collapsed or the bound cuts it, the bound itself
+    aside — or on the displayed name becomes the policy's fixed project-name
+    sentence.
     """
-    return _owner_display_text(
-        value, limit=_OWNER_PROJECT_NAME_LIMIT
-    ) or _UNTITLED_PROJECT
+    name = _owner_display_text(value, limit=_OWNER_PROJECT_NAME_LIMIT)
+    if not name:
+        return _UNTITLED_PROJECT
+    raw = str(value or "")
+    if check_owner_text(raw, "project_name", bounded=False) != raw:
+        return check_owner_text(None, "project_name")
+    return check_owner_text(name, "project_name")
 
 
 def _native_owner_title(value: Any, field: str) -> str:
