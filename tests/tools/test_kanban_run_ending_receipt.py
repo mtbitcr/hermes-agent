@@ -7,11 +7,14 @@ yet its result row, so the ``tool_name`` column the receipt reads never names
 it, and the stored receipt left out the very call that ended the run.
 
 The three tools that end a worker's run now mark the call while it runs
-(``tools.kanban_run_ending.ends_run``), and the receipt builder adds the
-marked name. A run the kernel ends from a process that is not its worker
-carries no mark, so its receipt lists exactly the session's tools, as before.
-The mark is bound to the worker's own session, so an ending another agent
-calls on the worker's card from outside any worker adds nothing either.
+(``tools.kanban_run_ending.ends_run``), and the kernel adds the marked name
+to the receipt it stamps. A run the kernel ends from a process that is not
+its worker carries no mark, so its receipt lists exactly the session's
+tools, as before. The mark is bound to the run the dispatcher launched the
+worker for (owner rule of 2026-10-15), not to a session: an ending another
+agent calls on the worker's card from outside any worker adds nothing, and
+a reviewer whose session a context compression rotated before its verdict
+still names it.
 
 The worker side of every scenario runs in the exact environment the
 dispatcher gives the worker it launches. It is taken from
@@ -27,6 +30,7 @@ counted independently with plain SQL as well.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import sqlite3
@@ -34,6 +38,7 @@ import subprocess
 import sys
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -583,3 +588,163 @@ def test_an_owner_completing_the_card_adds_nothing_to_the_worker_receipt(
     assert "kanban_complete" not in capability["tools"], capability["tools"]
     assert capability["tools"] == sorted(session_tools)
     assert len(capability["tools"]) == len(session_tools)
+
+
+# The reviewer's session before and after a native context compression.
+PARENT_SESSION = "reviewer-parent-session"
+CHILD_SESSION = "reviewer-child-session"
+
+
+def _claim_review(build: dict, root: Path, tmp_path: Path, monkeypatch):
+    """Back in the dispatcher: it claims the review and launches the reviewer."""
+    conn, task_id = build["conn"], build["task"]
+    _become(build["dispatcher_env"], monkeypatch)
+    review = kb.claim_review_task(conn, task_id)
+    assert review is not None and review.assignee == REVIEWER
+    _launch_worker(conn, review, root, tmp_path, monkeypatch)
+    return review
+
+
+def _finding(conn, task_id: str) -> dict:
+    """One typed finding against the candidate under review."""
+    return {
+        "severity": "major", "file": MODULE, "lines": "1",
+        "problem": "the owned module sets the wrong value",
+        "impact": "readers of the module get the wrong value",
+        "smallest_fix": "set the value the card asks for",
+        "candidate_digest": kb._latest_review_head_provenance(conn, task_id),
+    }
+
+
+def _verdict_after_compression(findings: list, monkeypatch) -> tuple[Path, dict]:
+    """The reviewer's session is compressed, then it submits its verdict.
+
+    Its first heartbeat links the run to the parent session. A native
+    context compression publishes the child session and rebinds the caller
+    to it; the child logs the request for ``kanban_review_findings``, and a
+    later heartbeat leaves the run linked to the parent. Returns the
+    reviewer's session store and the verdict call's answer.
+    """
+    import hermes_logging
+    from agent.compression_facade import _rebind_caller_session_context
+    from hermes_state import SessionDB
+    from tools import kanban_tools as kt
+
+    state_db = _record_session(
+        PARENT_SESSION, REVIEWER, EARLIER_CALLS + (("kanban_heartbeat", {}),),
+    )
+    monkeypatch.setenv("HERMES_SESSION_ID", PARENT_SESSION)
+    assert json.loads(kt._handle_heartbeat({}))["ok"] is True
+    with SessionDB(db_path=state_db) as db:
+        db.publish_compression_child(
+            parent_session_id=PARENT_SESSION, child_session_id=CHILD_SESSION,
+            source="kanban", model="served-model", model_config={},
+            messages=[{"role": "user", "content": "The same review, continued."}],
+            profile_name=REVIEWER, require_compression_lease=False,
+        )
+        # The rebind writes HERMES_SESSION_ID, restored by monkeypatch; its
+        # log and context-variable bindings end with this test as well.
+        monkeypatch.setattr(
+            hermes_logging._session_context, "session_id", None, raising=False,
+        )
+        contextvars.copy_context().run(
+            _rebind_caller_session_context, SimpleNamespace(session_id=CHILD_SESSION),
+        )
+        assert os.environ["HERMES_SESSION_ID"] == CHILD_SESSION
+        db.append_message(
+            CHILD_SESSION, "assistant", content="",
+            tool_calls=[_tool_call(
+                "call-ending", "kanban_review_findings", {"findings": findings},
+            )],
+        )
+    assert json.loads(kt._handle_heartbeat({}))["ok"] is True
+    return state_db, json.loads(kt._handle_review_findings({"findings": findings}))
+
+
+def _assert_receipt_names_the_verdict(root: Path, run_id: int, state_db: Path) -> None:
+    """The run stays linked to the parent session, and its receipt names the verdict."""
+    board_db = root / "kanban" / "boards" / SLUG / "kanban.db"
+    with closing(sqlite3.connect(board_db)) as db:
+        (raw,) = db.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+    assert json.loads(raw)["worker_session_id"] == PARENT_SESSION
+    # The verdict call has no result row in either session.
+    assert _session_tool_names(state_db, CHILD_SESSION) == set()
+    session_tools = _session_tool_names(state_db, PARENT_SESSION)
+    assert session_tools == {name for name, _ in EARLIER_CALLS} | {"kanban_heartbeat"}
+    capability = _stored_capability(root, run_id)
+    assert capability["tools"] == sorted(session_tools | {"kanban_review_findings"})
+    assert len(capability["tools"]) == len(session_tools) + 1
+
+
+@pytest.mark.parametrize("handed_back", [False, True], ids=["passed", "handed_back"])
+def test_a_verdict_after_compression_names_kanban_review_findings(
+    root, review_build, tmp_path, monkeypatch, handed_back,
+):
+    """Owner rule of 2026-10-15: a compressed review still names its verdict.
+
+    The review run stays linked to the session its first heartbeat named,
+    while the verdict is called from the compression child the caller was
+    rebound to. The mark is bound to the run, so the receipt names
+    ``kanban_review_findings`` whether the review passes or hands back.
+    """
+    build = review_build
+    conn, task_id = build["conn"], build["task"]
+    _request_review(build, monkeypatch)
+    review = _claim_review(build, root, tmp_path, monkeypatch)
+    findings = [_finding(conn, task_id)] if handed_back else []
+
+    state_db, out = _verdict_after_compression(findings, monkeypatch)
+    assert out.get("ok") is True, out
+    assert out["outcome"] == ("handed_back" if handed_back else "passed")
+    assert kb.get_task(conn, task_id).status == ("ready" if handed_back else "done")
+    _assert_receipt_names_the_verdict(root, review.current_run_id, state_db)
+
+
+def test_a_stop_for_repeated_findings_after_compression_names_kanban_review_findings(
+    root, review_build, tmp_path, monkeypatch,
+):
+    """Owner rule of 2026-10-15: the stop for repeated findings, after compression.
+
+    A first review hands the build back with one finding, and the
+    implementer asks for review of the unchanged candidate again. The
+    second reviewer's session is compressed before it raises the same
+    finding, so the kernel stops the card for an owner decision; that
+    review run's receipt names ``kanban_review_findings``.
+    """
+    from tools import kanban_tools as kt
+
+    build = review_build
+    conn, task_id = build["conn"], build["task"]
+    _request_review(build, monkeypatch)
+    _claim_review(build, root, tmp_path, monkeypatch)
+    findings = [_finding(conn, task_id)]
+    _record_session("first-review-session", REVIEWER, running="kanban_review_findings")
+    monkeypatch.setenv("HERMES_SESSION_ID", "first-review-session")
+    first = json.loads(kt._handle_review_findings({"findings": findings}))
+    assert first.get("ok") is True, first
+    assert first["outcome"] == "handed_back"
+
+    # Back in the dispatcher: the implementer runs again and asks for review
+    # of the unchanged candidate.
+    _become(build["dispatcher_env"], monkeypatch)
+    again = kb.claim_task(conn, task_id)
+    assert again is not None and again.assignee == IMPLEMENTER
+    _launch_worker(conn, again, root, tmp_path, monkeypatch)
+    _record_session("second-build-session", IMPLEMENTER, running="kanban_request_review")
+    monkeypatch.setenv("HERMES_SESSION_ID", "second-build-session")
+    requested = json.loads(kt._handle_request_review({
+        "summary": "asks again for review of the unchanged candidate",
+    }))
+    assert requested.get("ok") is True, requested
+    assert kb._latest_review_head_provenance(conn, task_id) == (
+        findings[0]["candidate_digest"]
+    )
+
+    review = _claim_review(build, root, tmp_path, monkeypatch)
+    state_db, out = _verdict_after_compression(findings, monkeypatch)
+    assert out.get("ok") is True, out
+    assert out["outcome"] == "owner_decision_blocked"
+    assert kb.get_task(conn, task_id).status == "blocked"
+    _assert_receipt_names_the_verdict(root, review.current_run_id, state_db)

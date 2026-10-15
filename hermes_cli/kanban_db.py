@@ -23679,7 +23679,9 @@ def _stamp_run_receipt(
     stamped["worker_session_id"] = session_id
     receipt = _trusted_runtime_receipt(session_id, profile)
     if receipt is not None:
-        stamped["runtime_receipt"] = receipt
+        from tools.kanban_run_ending import with_ending_tool
+
+        stamped["runtime_receipt"] = with_ending_tool(receipt, run_id)
     return stamped
 
 

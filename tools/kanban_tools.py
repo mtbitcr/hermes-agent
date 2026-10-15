@@ -41,7 +41,7 @@ from typing import Any, Optional
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.kanban_record_window import build_record_text
-from tools.kanban_run_ending import add_ending_tool, ends_run
+from tools.kanban_run_ending import ends_run
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
@@ -576,7 +576,6 @@ def _capability_from_session(db: Any, session_id: str) -> dict:
         if name in _CAPABILITY_SKILL_TOOLS and (skill := _capability_skill_name(message)):
             skills.add(skill)
         tools.add(name)
-    add_ending_tool(tools, session_id)
     return _capability_receipt(
         skills,
         tools,
