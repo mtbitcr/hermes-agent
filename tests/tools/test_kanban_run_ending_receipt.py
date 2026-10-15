@@ -10,6 +10,8 @@ The three tools that end a worker's run now mark the call while it runs
 (``tools.kanban_run_ending.ends_run``), and the receipt builder adds the
 marked name. A run the kernel ends from a process that is not its worker
 carries no mark, so its receipt lists exactly the session's tools, as before.
+The mark is bound to the worker's own session, so an ending another agent
+calls on the worker's card from outside any worker adds nothing either.
 
 The worker side of every scenario runs in the exact environment the
 dispatcher gives the worker it launches. It is taken from
@@ -501,5 +503,83 @@ def test_a_run_the_kernel_ends_from_another_process_lists_exactly_the_session_to
     session_tools = _session_tool_names(state_db, "builder-elsewhere-session")
     assert session_tools == {name for name, _ in EARLIER_CALLS} | {"kanban_heartbeat"}
     capability = _stored_capability(root, run_id)
+    assert capability["tools"] == sorted(session_tools)
+    assert len(capability["tools"]) == len(session_tools)
+
+
+@pytest.fixture
+def live_worker():
+    """A real live process to record as a run's worker; stopped at teardown.
+
+    It only sleeps, in a session of its own, so no signal meant for a worker
+    reaches the test process.
+    """
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(600)"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        yield child
+    finally:
+        child.kill()
+        child.wait(timeout=60)
+
+
+def test_an_owner_completing_the_card_adds_nothing_to_the_worker_receipt(
+    root, board, tmp_path, monkeypatch, live_worker,
+):
+    """Review finding: an ending called from outside the run's worker names nothing.
+
+    The worker is live and linked to its session when the owner agent closes
+    its card through the tool, from the owner's own session and outside any
+    worker. The run's receipt is read from the worker's session, which never
+    called ``kanban_complete``, so it lists exactly that session's tools.
+    """
+    from tools import kanban_tools as kt
+
+    conn = board
+    dispatcher_env = dict(os.environ)
+    task_id = kb.create_task(conn, title="build the owner closes", assignee=IMPLEMENTER)
+    claimed = kb.claim_task(conn, task_id)
+    assert claimed is not None and claimed.current_run_id is not None
+    run_id = claimed.current_run_id
+    (root / "profiles" / IMPLEMENTER).mkdir(parents=True)
+    _launch_worker(conn, claimed, root, tmp_path, monkeypatch)
+    # The dispatcher records the live process it launched as the run's worker.
+    kb._set_worker_pid(conn, task_id, live_worker.pid)
+
+    # The worker works, and its heartbeat links the run to its session.
+    state_db = _record_session(
+        "builder-owner-closed-session", IMPLEMENTER,
+        EARLIER_CALLS + (("kanban_heartbeat", {}),),
+    )
+    monkeypatch.setenv("HERMES_SESSION_ID", "builder-owner-closed-session")
+    assert json.loads(kt._handle_heartbeat({}))["ok"] is True
+
+    # The owner agent, in its own session, names no card and no run.
+    _become(dispatcher_env, monkeypatch)
+    monkeypatch.setenv("HERMES_SESSION_ID", "owner-session")
+    assert "HERMES_KANBAN_TASK" not in os.environ
+    assert "HERMES_KANBAN_RUN_ID" not in os.environ
+    board_db = root / "kanban" / "boards" / SLUG / "kanban.db"
+    with closing(sqlite3.connect(board_db)) as db:
+        recorded = db.execute(
+            "SELECT worker_pid FROM task_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+    assert recorded == (live_worker.pid,)
+    assert live_worker.poll() is None, "the run's worker is not live"
+
+    out = json.loads(kt._handle_complete(
+        {"board": SLUG, "task_id": task_id, "summary": "owner closure"}
+    ))
+    assert out.get("ok") is True, out
+    assert out["run_id"] == run_id
+    assert kb.get_task(conn, task_id).status == "done"
+
+    session_tools = _session_tool_names(state_db, "builder-owner-closed-session")
+    assert session_tools == {name for name, _ in EARLIER_CALLS} | {"kanban_heartbeat"}
+    capability = _stored_capability(root, run_id)
+    assert "kanban_complete" not in capability["tools"], capability["tools"]
     assert capability["tools"] == sorted(session_tools)
     assert len(capability["tools"]) == len(session_tools)

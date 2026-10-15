@@ -576,7 +576,7 @@ def _capability_from_session(db: Any, session_id: str) -> dict:
         if name in _CAPABILITY_SKILL_TOOLS and (skill := _capability_skill_name(message)):
             skills.add(skill)
         tools.add(name)
-    add_ending_tool(tools)
+    add_ending_tool(tools, session_id)
     return _capability_receipt(
         skills,
         tools,
