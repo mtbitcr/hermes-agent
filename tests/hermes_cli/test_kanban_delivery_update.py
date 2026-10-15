@@ -252,6 +252,83 @@ def _governed_update(scene, tier):
     return tid, head, _update(kb, tid), model, effort
 
 
+def _fix(workspace, path="src/impl/fix.py", text="fixed = True\n") -> None:
+    """The continuation's own change on top of H: one commit writing ``path``."""
+    (workspace / path).write_text(text, encoding="utf-8")
+    _git(workspace, "add", path)
+    _git(workspace, "commit", "-q", "-m", f"fix: {path}")
+
+
+def _continued(scene, link="parent", build=_fix):
+    """An approved head H went back to its builder as every return sends it: its row returned for changes, and its
+    continuation card made by _continuation on the return branch at H, so H is that card's recorded base. The card is
+    the source card's task_links child ("parent"), or is linked to it only by the owner's replacement record
+    ("replacement"). Its builder commits ``build`` on top of H and hands it over, its own review approves it, and it is
+    published as pull request 42 bound to H, its review cards done and approved by every lens: the next pass arms it.
+    Returns the source card, H, H's reviewed base, the continuation card and its head."""
+    from hermes_cli import kanban_delivery as kd
+
+    kb, root, repo, gh = scene
+    db = kb.kanban_db_path()
+    tid, head, base = _approved_head(scene)
+    branch = f"delivery-return/{tid}-{head[:12]}"
+    _git(repo, "branch", branch, head)
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            card = kd._continuation(conn, db, {"source_task_id": tid, "pull_request_head": head},
+                                    "Changes requested.", (repo, branch))["rework"]
+            conn.execute("UPDATE kanban_deliveries SET pull_request_state = 'returned_for_changes' "
+                         "WHERE source_task_id = ?", (tid,))
+            if link == "replacement":
+                conn.execute("DELETE FROM task_links WHERE parent_id = ? AND child_id = ?", (tid, card))
+                kb._append_event(conn, tid, "owner_project_plan_change", {"replacement_task_id": card})
+    finally:
+        conn.close()
+    (root / "profiles" / IMPLEMENTER).mkdir(parents=True, exist_ok=True)
+    _tick(kb)
+    claimed = _task(kb, card)
+    assert (claimed["status"], claimed["assignee"], claimed["base_commit"]) == ("running", IMPLEMENTER, head)
+    workspace = Path(claimed["workspace_path"])
+    assert _git(workspace, "rev-parse", "HEAD") == head
+    build(workspace)
+    fixed = _git(workspace, "rev-parse", "HEAD")
+    conn = kb.connect()
+    try:
+        assert kb.complete_task(conn, card, summary="fixed on top of H",
+                                expected_run_id=kb.get_task(conn, card).current_run_id) is True
+    finally:
+        conn.close()
+    assert _approve_card(kb, card) is True
+    _publish(kb, gh, card, fixed, 42)
+    _tick(kb)
+    _done(db)
+    _reviews(gh, *_lenses(kb, fixed), number=42)
+    return tid, head, base, card, fixed
+
+
+def _up_to_date(scene, tid, head, base, cont, fixed, main, held):
+    """The continuation's delivery, which the arm left base_moved on its reviewed base H, was brought up to date on
+    main: no return, and one update card for its builder on a branch at the updated head, with the continuation's head
+    and main as its parents and main as its recorded base, changing the whole chain's paths, H's and the continuation's
+    own. The row is updated and nothing merged; the delivery_updated event names the chain's start, H's reviewed base,
+    as the approved base beside H. H's own row stays as the kernel left it, ``held``, with no update of its own."""
+    kb, root, repo, gh = scene
+    db = kb.kanban_db_path()
+    assert [payload["reviewed_base"] for kind, payload in _events(kb, cont) if kind == "delivery_base_moved"] == [head]
+    assert ([card["body"] for card in _raw(db, CONTINUED, cont)], _state(kb, fixed)) == ([], "updated")
+    card = _update(kb, cont)
+    update = _head(repo, card)
+    assert (card["status"], card["assignee"], card["head_commit"], card["base_commit"]) == (
+        "ready", IMPLEMENTER, None, main)
+    assert _parents(repo, update) == [fixed, main]
+    assert set(_git(repo, "diff", "--name-only", main, update).split()) == {"src/impl/feature.py", "src/impl/fix.py"}
+    assert [(payload["update_task_id"], payload["update_head"], payload["observed_main"], payload["reviewed_base"],
+             payload["approved_base"]) for payload in _updated(kb, cont)] == [(card["id"], update, main, head, base)]
+    assert [task["id"] for task in _raw(db, ON_UPDATE_BRANCHES, cont)] == [card["id"]]
+    assert (_arms(gh), _state(kb, head), _updated(kb, tid)) == ([], held, [])
+
+
 def test_a_moved_branch_gets_one_update_card_based_on_current_main(exact):
     """The update card is the original builder's card, ready, on a branch at the updated head, with main as its
     recorded base; that head has H and the current main as its parents. Nothing is in review yet, the kernel's
@@ -356,6 +433,79 @@ def test_a_conflicting_update_goes_back_to_the_builder_with_no_card_in_review(ex
     assert _checkout(repo) == before
     _tick(kb)
     assert len(_raw(kb.kanban_db_path(), CONTINUED, tid)) == 1
+
+
+def test_a_continued_delivery_is_brought_up_to_date_when_main_moves(exact):
+    """H went back to its builder, and its continuation, reviewed on H, is approved and delivered on top. Main moves
+    on an unrelated file, so the arm records base_moved. The approved change runs from where the chain started, H's
+    reviewed base, which main holds: one pass makes one update card based on main, with no return. H's own pull
+    request was replaced by its child's when that was published."""
+    kb, root, repo, gh = exact
+    tid, head, base, cont, fixed = _continued(exact)
+    main = _main_moves(exact)
+    _setting(root, "true")
+
+    _tick(kb)
+
+    _up_to_date(exact, tid, head, base, cont, fixed, main, held="replaced")
+
+
+def test_a_replacement_that_continues_a_delivered_head_is_brought_up_to_date(exact):
+    """The same, with the continuation linked to the delivered card only by the owner's replacement record, as a
+    replacement made through the conversation is, and by no task_links parent. H's own row stays returned for
+    changes."""
+    kb, root, repo, gh = exact
+    tid, head, base, cont, fixed = _continued(exact, link="replacement")
+    assert _raw(kb.kanban_db_path(), "SELECT parent_id FROM task_links WHERE child_id = ?", cont) == []
+    main = _main_moves(exact)
+    _setting(root, "true")
+
+    _tick(kb)
+
+    _up_to_date(exact, tid, head, base, cont, fixed, main, held="returned_for_changes")
+
+
+def test_a_continued_delivery_whose_chain_does_not_start_on_main_goes_back(exact):
+    """H's reviewed base is a commit only the registered checkout holds. GitHub's main holds its change as another
+    commit, as a squash merge leaves it, so the update would change exactly the chain's paths; but the chain does not
+    start in main's history, so it goes back to the builder."""
+    kb, root, repo, gh = exact
+    (repo / "docs").mkdir(exist_ok=True)
+    (repo / "docs" / "reviewed.md").write_text("in the reviewed base\n", encoding="utf-8")
+    _git(repo, "add", "docs/reviewed.md")
+    _git(repo, "commit", "-q", "-m", "the reviewed base writes docs/reviewed.md")
+    tid, head, base, cont, fixed = _continued(exact)
+    _main_moves(exact, "docs/reviewed.md", "in the reviewed base\n")
+    main = _main_moves(exact)
+    _setting(root, "true")
+    branches = _branches(repo)
+
+    _tick(kb)
+
+    _returned(kb, repo, gh, cont, fixed, main, "paths", branches)
+
+
+def test_a_continued_update_that_brings_an_unapproved_path_goes_back(exact):
+    """The continuation's builder brings H up to date by merging main, which added src/impl/shared.py after H's
+    reviewed base, and its fix drops that file again. Neither review saw that path, as neither change touches it
+    relative to its own base, and the chain does not change it from its start; yet the update would delete it from
+    main: a path outside the chain's approved paths, so it goes back to the builder."""
+    kb, root, repo, gh = exact
+
+    def merges_main_and_drops_its_file(workspace):
+        _main_moves(exact, "src/impl/shared.py", "shared = 1\n", where="local")
+        _git(workspace, "merge", "-q", "--no-edit", "main")
+        _git(workspace, "rm", "-q", "src/impl/shared.py")
+        _fix(workspace)
+
+    tid, head, base, cont, fixed = _continued(exact, build=merges_main_and_drops_its_file)
+    main = _main_moves(exact)
+    _setting(root, "true")
+    branches = _branches(repo)
+
+    _tick(kb)
+
+    _returned(kb, repo, gh, cont, fixed, main, "paths", branches)
 
 
 def test_the_old_pull_request_closes_once_the_update_is_published(exact):

@@ -7,7 +7,9 @@ only, so no checkout moves; a failed fetch leaves the row base_moved, and the ne
 update is then computed without touching any checkout: ``git merge-tree --write-tree`` of that main and H, and
 ``git commit-tree`` of that tree with H and main as its two parents. Before anything is created, the update must
 change the same set of paths relative to main as H did relative to its reviewed base, and nothing outside the source
-card's owned paths. Then one update card is made per source card, H and main, through the card creation of
+card's owned paths. When H continues an earlier delivery, its reviewed base the head of a delivery of a task_links
+parent of its card or of a card its card replaced, the change is measured from where the chain started, which main
+and H must both hold. Then one update card is made per source card, H and main, through the card creation of
 :func:`hermes_cli.kanban_delivery._continuation`: a task_links child of the source card for its builder, with the
 source's tier, route, effort, policy lock, owner receipt binding, risk tier and review requirement, on a branch at
 the updated head. Its builder hands that head over unchanged through the normal completion, so the kernel's own
@@ -33,6 +35,7 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_delivery as kd
+from hermes_cli.kanban_replaced_cards import replaced_task_ids
 
 logger = logging.getLogger(__name__)
 
@@ -109,8 +112,15 @@ def _update(db_path: Path, row: dict) -> Optional[str]:
         raise kd.PublishRefused("no_update", f"git merge-tree of {main} and {head} did not run")
     if merged.returncode == 1:
         return _returned(db_path, row, facts, "conflict")
+    with kb.connect_closing(db_path=db_path) as conn:
+        start = _approved_base(conn, source, base)
+    if start != base:  # H continues an earlier delivery of the same work: approved from where the chain started
+        if start is None or not (kd._git_proof(root, start, None)[0] and kd._git_proof(root, main, start)[1]
+                                 and kd._git_proof(root, head, start)[1]):
+            return _returned(db_path, row, facts, "paths")
+        facts["approved_base"] = start
     tree = kd._sha(merged.stdout.decode().split("\n", 1)[0])
-    approved, update = _paths(root, base, head), _paths(root, main, tree)
+    approved, update = _paths(root, start, head), _paths(root, main, tree)
     if tree is None or approved is None or update is None:
         raise kd.PublishRefused("no_update", f"the paths of {head} on {main} cannot be read")
     if update != approved or not all(_owned(path, task.owned_paths) for path in update):
@@ -128,6 +138,27 @@ def _moved(conn, row: dict) -> dict:
         if moved.get("delivery_id") == row["id"] and moved.get("head") == row["pull_request_head"]:
             return moved
     return {}
+
+
+def _approved_base(conn, source: str, base: str) -> Optional[str]:
+    """Where the change reviewed on ``base`` for ``source`` starts: while ``base`` is the head of a delivery of a
+    task_links parent of the card or of a card it replaced, an earlier delivery the card continues, that delivery's
+    reviewed base, then on from that card, at most 8 links back. ``base`` itself when no such delivery is at it;
+    None when a link records no reviewed base or the chain goes on past 8 links."""
+    for link in range(9):
+        cards = [parent for (parent,) in conn.execute("SELECT parent_id FROM task_links WHERE child_id = ?",
+                                                      (source,))] + replaced_task_ids(conn, source)
+        earlier = conn.execute(
+            "SELECT source_task_id FROM kanban_deliveries WHERE pull_request_head = ? AND source_task_id IN "
+            f"({', '.join('?' * len(cards))}) ORDER BY id DESC LIMIT 1", (base, *cards)).fetchone() if cards else None
+        if earlier is None:
+            return base
+        if link == 8:
+            break
+        source, base = earlier[0], kd._reviewed(conn, earlier[0], base)[0]
+        if base is None:
+            return None
+    return None  # a ninth link: where the chain starts is not read, so the work goes back
 
 
 def _folder(project: Optional[str], repository: Optional[str]) -> Optional[Path]:
@@ -245,6 +276,7 @@ def _updated(db_path: Path, row: dict, facts: dict, update: Optional[tuple]) -> 
             kb._append_event(conn, row["source_task_id"], "delivery_updated", kd._outcome(
                 row, repository=row["repository"], reviewed_base=facts["base"], observed_main=facts["main"],
                 update_task_id=made["rework"], update_head=commit, update_branch=branch,
+                **({"approved_base": facts["approved_base"]} if "approved_base" in facts else {}),
                 **({"parked": made["parked"]} if made.get("parked") else {})))
         conn.execute("UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ?", (kd._UPDATED, row["id"]))
     return kd._UPDATED
