@@ -20,11 +20,10 @@ to main in the same transaction: the handover is exactly the approved paths on m
 of it: an existing update card is accepted only through that event, never through a task's caller-chosen fields.
 The row is then final, ``updated``, and :func:`hermes_cli.kanban_delivery._replaced` closes its pull request once
 the update is published. Another set of paths goes back to the builder through H's continuation card instead. So
-does a conflict, unless every conflicted file is inside the approved paths, git's merged tree passes the same checks,
-and it holds each of those files with git's conflict markers, or as H's version of a file main deleted: then the
-update card is made on that tree the same way, its body names those files, the deleted ones apart, for its builder to
-resolve and nothing else, and its delivery_updated event names them as ``conflicts``, the deleted ones also as
-``deleted_on_main``.
+does a conflict, unless git's merged tree passes the same checks and git's own messages, never the merged files, name
+only content conflicts, each in a file inside the approved and owned paths: then the update card is made the same way
+on that tree, which holds those files as git marked them, its body names them for its builder to resolve and nothing
+else, and its delivery_updated event names them as ``conflicts``.
 :func:`hermes_cli.kanban_delivery.publish_step` calls :func:`update_step` once per pass, with the setting on only.
 """
 
@@ -59,13 +58,6 @@ _CONFLICT_BODY = _MOVED + (
     " Merging it with the approved change conflicts in these files: {conflicts}. This card's branch {branch} at "
     "{update} is on current main with the conflict marked. Resolve the marked conflicts in those files only, change "
     "nothing else, and hand over for review.")
-_DELETED_BODY = _MOVED + (
-    " Merging it with the approved change conflicts in these files, which main deleted and the approved change "
-    "modified: {deleted}. This card's branch {branch} at {update} is on current main and holds the approved change's "
-    "version of them, with no conflict markers: keep or delete each of them.{marked} Change nothing else, and hand "
-    "over for review.")
-_ALSO_MARKED = (" The merge also conflicts in these files, which the branch holds with the conflict marked: {marked}. "
-                "Resolve the marked conflicts in those files.")
 _RETURN_BODY = _MOVED + " {why} Bring the change up to date on main and hand it over for review again."
 _WHY = {
     "conflict": "Merging main and the approved head conflicts, so no update was made.",
@@ -122,13 +114,12 @@ def _update(db_path: Path, row: dict) -> Optional[str]:
         made = _made(conn, row, main)
     if made is not None:  # the kernel's record of the update card: nothing is computed or made again
         return _updated(db_path, row, facts, None)
-    merged = kd._run_git(root, "merge-tree", "--write-tree", "--name-only", "-z", main, head)
+    merged = kd._run_git(root, "merge-tree", "--write-tree", "-z", "--name-only", "--messages", main, head)
     if merged is None or merged.returncode not in (0, 1):
         raise kd.PublishRefused("no_update", f"git merge-tree of {main} and {head} did not run")
-    # Exit 1 is a conflict: the conflicted files follow the merged tree, raw and each ended by a NUL, read as _paths
-    # reads its names, up to the empty field before git's messages. Its update is made only as a clean one is, with
-    # those files inside the approved paths and each held in the merged tree as _held reads it; anything else sends it
-    # back as a conflict.
+    # Exit 1 is a conflict, read from git's own messages as _conflicts reads them, never from the merged files, its
+    # names raw as _paths reads its names. Its update is made only as a clean one is, with git naming content conflicts
+    # only, each in a file inside the approved and owned paths; anything else sends it back as a conflict.
     fields = merged.stdout.decode("utf-8", "surrogateescape").split("\0")
     reason = "conflict" if merged.returncode == 1 else "paths"
     with kb.connect_closing(db_path=db_path) as conn:
@@ -145,17 +136,13 @@ def _update(db_path: Path, row: dict) -> Optional[str]:
     if update != approved or not all(_owned(path, task.owned_paths) for path in update):
         return _returned(db_path, row, facts, reason)
     if merged.returncode == 1:
-        conflicts = fields[1:fields.index("", 1)] if "" in fields[1:] else []
+        conflicts, paths = _conflicts(fields) or ([], [])
         # A name that is no UTF-8 holds a lone surrogate here, which neither the event nor the body can store as text.
-        if not conflicts or not approved.issuperset(conflicts) or any(
-                path != path.encode("utf-8", "replace").decode("utf-8") for path in conflicts):
-            return _returned(db_path, row, facts, "conflict")
-        held = [_held(root, tree, head, main, path) for path in conflicts]
-        if None in held:
+        if not conflicts or not all(path in approved and _owned(path, task.owned_paths)
+                                    and path == path.encode("utf-8", "replace").decode("utf-8")
+                                    for path in conflicts + paths):
             return _returned(db_path, row, facts, "conflict")
         facts["conflicts"] = conflicts
-        if "deleted_on_main" in held:
-            facts["deleted_on_main"] = [path for path, kind in zip(conflicts, held) if kind == "deleted_on_main"]
     branch = _BRANCH.format(source=source, head=head[:12], main=main[:12])
     commit = _branch(root, branch, tree, head, main, _MESSAGE.format(**facts))
     return _updated(db_path, row, facts, (root, branch, commit))
@@ -244,27 +231,27 @@ def _paths(root: Path, old: str, new: str) -> Optional[frozenset]:
     return frozenset(path for path in changed.stdout.decode("utf-8", "surrogateescape").split("\0") if path)
 
 
-def _held(root: Path, tree: str, head: str, main: str, path: str) -> Optional[str]:
-    """How git's merged ``tree`` of main and H holds the conflicted ``path``, read through git objects and never from
-    the exit code alone: "deleted_on_main" when main holds nothing there and the tree exactly H's blob, as git leaves
-    a file main deleted and H modified; "marked" when the tree's blob holds git's conflict markers, a line starting
-    with each of <<<<<<<, ======= and >>>>>>>; None for anything else. Git takes everything after the first colon of
-    ``<commit or tree>:<path>`` as a literal path, so no name needs escaping."""
-    def read(*args: str) -> Optional[bytes]:
-        found = kd._run_git(root, *args)
-        return found.stdout if found is not None and found.returncode == 0 else None
-
-    blob = read("cat-file", "blob", f"{tree}:{path}")
-    if blob is None:
+def _conflicts(fields: list) -> Optional[tuple]:
+    """Git's own account of a conflicted ``git merge-tree --write-tree -z --name-only --messages``, its output split at
+    each NUL, never the merged files: the tree, each conflicted name, an empty field, then each of git's messages as
+    its number of paths, those paths, its stable type and its text ended by a newline, and the empty field after the
+    last NUL, names and paths raw. The conflicted names and the paths of the "CONFLICT (contents)" messages when the
+    output parses exactly so, every message is "Auto-merging" or "CONFLICT (contents)" and at least one is
+    "CONFLICT (contents)"; None for anything else, so any other type of conflict, an unknown one included."""
+    end = fields.index("", 1) if "" in fields[1:] else len(fields)
+    names, rest, paths = fields[1:end], fields[end + 1:], []
+    while len(rest) > 1:
+        count = int(rest[0]) if rest[0].isascii() and rest[0].isdigit() else 0
+        if not 0 < count < len(rest) - 3:
+            return None
+        message, kind, text, rest = rest[1:count + 1], rest[count + 1], rest[count + 2], rest[count + 3:]
+        if "" in message or not text.endswith("\n") or kind not in ("Auto-merging", "CONFLICT (contents)"):
+            return None
+        if kind == "CONFLICT (contents)":
+            paths += message
+    if rest != [""] or not paths:
         return None
-    on_main = kd._run_git(root, "rev-parse", "--verify", "--quiet", f"{main}:{path}")
-    in_head, in_tree = (read("rev-parse", "--verify", "--quiet", f"{commit}:{path}") for commit in (head, tree))
-    if on_main is not None and on_main.returncode == 1 and in_head is not None and in_head == in_tree:
-        return "deleted_on_main"
-    lines = blob.split(b"\n")
-    if all(any(line.startswith(marker) for line in lines) for marker in (b"<<<<<<<", b"=======", b">>>>>>>")):
-        return "marked"
-    return None
+    return names, paths
 
 
 def _owned(path: str, owned: Optional[list]) -> bool:
@@ -319,13 +306,10 @@ def _updated(db_path: Path, row: dict, facts: dict, update: Optional[tuple]) -> 
             if update is None:
                 return None
             root, branch, commit = update
-            deleted = facts.get("deleted_on_main", [])
-            marked = ", ".join(path for path in facts.get("conflicts", ()) if path not in deleted)
-            body = (_DELETED_BODY if deleted else _CONFLICT_BODY if "conflicts" in facts else _UPDATE_BODY).format(
+            body = (_CONFLICT_BODY if "conflicts" in facts else _UPDATE_BODY).format(
                 head=facts["head"], source=facts["source"], number=row["pull_request_number"],
                 repository=row["repository"], base=facts["base"], main=facts["main"], update=commit, branch=branch,
-                conflicts=", ".join(facts.get("conflicts", ())), deleted=", ".join(deleted),
-                marked=_ALSO_MARKED.format(marked=marked) if marked else "")
+                conflicts=", ".join(facts.get("conflicts", ())))
             made = kd._continuation(conn, db_path, {**row, "pull_request_head": commit}, body, (root, branch))
             # The kernel's scoped completion hands over only committed changes since the recorded base, so the
             # unchanged updated head is handed over against main, which it holds: exactly the approved paths.
@@ -336,7 +320,6 @@ def _updated(db_path: Path, row: dict, facts: dict, update: Optional[tuple]) -> 
                 update_task_id=made["rework"], update_head=commit, update_branch=branch,
                 **({"approved_base": facts["approved_base"]} if "approved_base" in facts else {}),
                 **({"conflicts": facts["conflicts"]} if "conflicts" in facts else {}),
-                **({"deleted_on_main": facts["deleted_on_main"]} if "deleted_on_main" in facts else {}),
                 **({"parked": made["parked"]} if made.get("parked") else {})))
         conn.execute("UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ?", (kd._UPDATED, row["id"]))
     return kd._UPDATED

@@ -10,8 +10,9 @@ since that base. Its builder hands that head over unchanged through the normal c
 nomination and route authority apply and only its own approval merges it. The kernel's delivery_updated event,
 written with the card, is the one proof of an update card. The old row is updated, and its
 pull request closes once the update is published. A changed set of paths goes back to the builder through the
-continuation card instead, and so does a conflict outside the approved paths; a conflict inside them gets the update
-card on main with the conflict marked. With the setting off a base_moved row stays where it is. Real boards and git
+continuation card instead, and so does a conflict outside the approved paths or of any type but git's content
+conflict; a content conflict inside them gets the update card on main with the conflict marked. With the setting off
+a base_moved row stays where it is. Real boards and git
 in temporary folders; GitHub is the real transport with only its exchange and App token replaced, so every call
 passes the allowlist, and its git origin is a local bare repository."""
 
@@ -532,12 +533,42 @@ def test_a_conflict_in_a_file_whose_name_git_quotes_gets_a_card_on_main(exact, n
     assert [payload["conflicts"] for payload in _updated(kb, tid)] == [[path]]
 
 
-def test_a_file_main_deleted_that_the_approved_change_modified_is_named_as_deleted_on_main(exact):
-    """The reviewed base holds src/impl/feature.py, H modifies it and main deletes it: git's merged tree holds H's
-    version, with no conflict markers. One pass makes one update card based on main, its branch head with H and main
-    as its parents and that version. Its body names the file as deleted on main, says the branch holds the approved
-    change's version and asks the builder to keep or delete it, never that a conflict is marked; the kernel's
-    delivery_updated event names it among the conflicts and as deleted on main."""
+def test_a_content_conflict_under_conflict_marker_size_3_gets_a_card_on_main(exact):
+    """The reviewed base sets ``*.py conflict-marker-size=3`` in .gitattributes and main moves on the approved change's
+    own file: git's own messages name a content conflict in it, inside the approved and owned paths, whatever marker
+    width git writes. One pass makes one update card for the builder based on main, with no return. Its branch head
+    has H and main as its parents and holds git's merged tree, here with git's 3-character markers, and the kernel's
+    delivery_updated event names the conflicted file."""
+    kb, root, repo, gh = exact
+    _main_moves(exact, ".gitattributes", "*.py conflict-marker-size=3\n", where="local")
+    tid, head, base = _approved_head(exact)
+    main = _main_moves(exact, "src/impl/feature.py", "ok = False\n")
+    _setting(root, "true")
+
+    _tick(kb)
+
+    db = kb.kanban_db_path()
+    assert (_state(kb, head), [task["branch_name"] for task in _raw(db, CONTINUED, tid)], _arms(gh)) == (
+        "updated", [], [])
+    card = _update(kb, tid)
+    update = _head(repo, card)
+    assert (card["status"], card["assignee"], card["head_commit"], card["base_commit"]) == (
+        "ready", IMPLEMENTER, None, main)
+    assert _parents(repo, update) == [head, main]
+    assert _git(repo, "show", f"{update}:src/impl/feature.py").splitlines() == [
+        f"<<< {main}", "ok = False", "===", "ok = True", f">>> {head}"]
+    assert set(_git(repo, "diff", "--name-only", main, update).split()) == {"src/impl/feature.py"}
+    assert [(payload["update_task_id"], payload["update_head"], payload["observed_main"], payload["reviewed_base"],
+             payload["conflicts"]) for payload in _updated(kb, tid)] == [
+        (card["id"], update, main, base, ["src/impl/feature.py"])]
+    assert [task["id"] for task in _raw(db, ON_UPDATE_BRANCHES, tid)] == [card["id"]]
+
+
+def test_a_modify_delete_conflict_on_an_owned_file_goes_back_to_the_builder(exact):
+    """The reviewed base holds src/impl/feature.py, H modifies it and main deletes it: git's own messages name a
+    modify/delete conflict, no content conflict, though the file lies inside the approved and owned paths. Only a
+    content conflict gets the update card, so it goes back to the builder as a conflict, as before this card, and no
+    update card is made."""
     kb, root, repo, gh = exact
     _main_moves(exact, "src/impl/feature.py", "ok = None\n", where="local")
     tid, head, base = _approved_head(exact)
@@ -546,23 +577,11 @@ def test_a_file_main_deleted_that_the_approved_change_modified_is_named_as_delet
     _git(repo, "push", "-q", str(gh["bare"]), "HEAD:refs/heads/main")
     main = gh["main"] = _git(repo, "rev-parse", "HEAD")
     _setting(root, "true")
+    branches = _branches(repo)
 
     _tick(kb)
 
-    db = kb.kanban_db_path()
-    assert (_state(kb, head), [task["branch_name"] for task in _raw(db, CONTINUED, tid)]) == ("updated", [])
-    card = _update(kb, tid)
-    update = _head(repo, card)
-    assert (card["status"], card["assignee"], card["base_commit"], _parents(repo, update)) == (
-        "ready", IMPLEMENTER, main, [head, main])
-    assert _git(repo, "show", f"{update}:src/impl/feature.py").splitlines() == ["ok = True"]
-    assert (f"main is at {main}. Merging it with the approved change conflicts in these files, which main deleted and "
-            f"the approved change modified: src/impl/feature.py. This card's branch {card['branch_name']} at {update} "
-            "is on current main and holds the approved change's version of them, with no conflict markers: keep or "
-            "delete each of them. Change nothing else, and hand over for review.") in card["body"]
-    assert "marked" not in card["body"]
-    assert [(payload["conflicts"], payload.get("deleted_on_main")) for payload in _updated(kb, tid)] == [
-        (["src/impl/feature.py"], ["src/impl/feature.py"])]
+    _returned(kb, repo, gh, tid, head, main, "conflict", branches)
 
 
 def test_a_conflict_in_a_file_whose_name_is_not_utf_8_goes_back_to_the_builder(exact):
