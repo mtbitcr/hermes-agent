@@ -194,6 +194,28 @@ def _passed(monkeypatch, gh, timing, conclusion=None):
     monkeypatch.setattr(transport, "_exchange", exchange)
 
 
+def _malformed(monkeypatch, gh, read, answer):
+    """Review 1128: while gh["malformed"] is set, as it is to start, GitHub answers ``read`` with 200 and ``answer``
+    of the table's own answer: H's runs listing ("runs"), or run 77's jobs of every attempt ("all") or its latest
+    jobs ("latest"). Returns the paths so answered, one per read."""
+    from hermes_cli import kanban_delivery_github as transport
+
+    table, served = transport._exchange, []  # the red fixture's, or a helper's over it
+    gh["malformed"] = True
+
+    def exchange(method, target, authorization, payload=None):
+        status, value = table(method, target, authorization, payload)
+        path, query = urlsplit(target).path, parse_qs(urlsplit(target).query)
+        if gh["malformed"] and (path == f"/repos/{REPO}/actions/runs" if read == "runs" else
+                                path == f"/repos/{REPO}/actions/runs/77/jobs" and query.get("filter") == [read]):
+            served.append(path)
+            return 200, answer(value)
+        return status, value
+
+    monkeypatch.setattr(transport, "_exchange", exchange)
+    return served
+
+
 def test_the_annotations_name_the_failed_tests_of_each_failed_test_job(red, monkeypatch):
     """decide_rerun gets every latest job of H's run that holds the red check; the failed slice job carries
     the test ids and the count its own check run's annotations name under the fixed title, and nothing
@@ -1158,3 +1180,92 @@ def test_nothing_is_recorded_or_made_when_the_pull_request_leaves_h_during_the_r
     _tick(kb)
     assert (len(_cards(kb)), [p["reason"] for p in _waited(kb, tid, "red_check_returned")]) == (
         (1, []) if word == "success" else (0, ["rerun_unsuccessful"]))
+
+
+@pytest.mark.parametrize("read, answer", [
+    ("latest", lambda value: {"total_count": 1, "jobs": []}),
+    ("latest", lambda value: {"total_count": 4, "jobs": value["jobs"][:1]}),
+    ("latest", lambda value: {"total_count": -1, "jobs": []}),
+    ("latest", lambda value: {"total_count": 1, "jobs": [dict(value["jobs"][0], id=0)]}),
+    ("latest", lambda value: {"total_count": 1, "jobs": [dict(value["jobs"][0], id=-1)]}),
+    ("runs", lambda value: dict(value, total_count=-1)),
+    ("runs", lambda value: dict(value, total_count=0)),
+    ("runs", lambda value: dict(value, total_count=len(value["workflow_runs"]) + 1)),
+    ("all", lambda value: dict(value, total_count=-1)),
+    ("all", lambda value: dict(value, total_count=0)),
+    ("all", lambda value: dict(value, total_count=len(value["jobs"]) + 1)),
+], ids=["latest_none_of_1", "latest_1_of_4", "latest_negative", "latest_id_0", "latest_id_negative",
+        "runs_negative", "runs_0", "runs_short", "all_negative", "all_0", "all_short"])
+@pytest.mark.parametrize("kind", ["flaky", "time_limit"])
+def test_a_malformed_rerun_attempt_listing_admits_no_review_until_a_valid_read(red, monkeypatch, kind, read, answer):
+    """Review 1128: H's required check is green after the one accepted rerun, and attempt 2 of run 77, the rerun's,
+    completed with success and its jobs, but GitHub answers 200 with a listing that is malformed, contradicts itself
+    or is cut short for H's runs listing, for every attempt's jobs of run 77 or for its latest jobs: a total count
+    that is negative or not the number of objects on its one page, or a job whose id is not positive. Each pass is
+    refused: nothing is recorded, no review card is made, no work returns and no second rerun call is sent. A later
+    pass that reads a valid answer gives H its review cards."""
+    kb, root, repo, gh = red
+    tid, head, tests = _rerun(red, monkeypatch, kind)
+    _passed(monkeypatch, gh, ("completed", "success"), "success")
+    served, events = _malformed(monkeypatch, gh, read, answer), _events(kb, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_events(kb, tid), _cards(kb), _state(kb, head), len(served)) == (events, [], "open", 2)
+    assert (_waited(kb, tid, "red_check_returned"), _raw(kb.kanban_db_path(), CONTINUED, tid), gh["reruns"]) == (
+        [], [], [RERUN])
+    gh["malformed"] = False
+    _tick(kb)
+    assert (len(_cards(kb)), _state(kb, head), gh["reruns"]) == (1, "review_cards_created", [RERUN])
+    assert (_waited(kb, tid, "red_check_returned"), _raw(kb.kanban_db_path(), CONTINUED, tid)) == ([], [])
+
+
+@pytest.mark.parametrize("kind", ["flaky", "time_limit"])
+def test_a_malformed_latest_jobs_answer_returns_no_work_until_a_valid_read(red, monkeypatch, kind):
+    """Review 1128 under the owner rule of 2026-10-16, round 2, rule 4: attempt 2 of run 77, the one rerun's, completed
+    with startup_failure and H's required check stays red, but GitHub answers 200 for its latest jobs with a total
+    count of 1 and no job. Each pass is refused: nothing is recorded, no work returns and no second rerun call is
+    sent. A later pass that reads the attempt's true answer, no jobs, returns the work once, the continuation's
+    body naming the conclusion and the missing jobs."""
+    kb, root, repo, gh = red
+    tid, head, tests = _rerun(red, monkeypatch, kind)
+    _attempt(monkeypatch, gh, "completed", "startup_failure")
+    served = _malformed(monkeypatch, gh, "latest", lambda value: {"total_count": 1, "jobs": []})
+    events = _events(kb, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_events(kb, tid), _waited(kb, tid, "red_check_returned"), len(served)) == (events, [], 2)
+    assert (_raw(kb.kanban_db_path(), CONTINUED, tid), gh["reruns"]) == ([], [RERUN])
+    gh["malformed"] = False
+    _tick(kb)
+    _tick(kb)
+    (item,) = _raw(kb.kanban_db_path(), CONTINUED, tid)
+    assert [(p["reason"], p["tests"], p["rework"]) for p in _waited(kb, tid, "red_check_returned")] == [
+        ("rerun_unsuccessful", tests, item["id"])]
+    assert ("(rerun_unsuccessful: attempt 2 of workflow run 77 completed with conclusion startup_failure and no jobs "
+            "after the one rerun)") in item["body"] and gh["reruns"] == [RERUN]
+
+
+@pytest.mark.parametrize("conclusion", [5, ["failure"]], ids=["number", "list"])
+@pytest.mark.parametrize("kind", ["flaky", "time_limit"])
+def test_a_rerun_attempt_conclusion_that_is_not_a_word_is_unreadable(red, monkeypatch, kind, conclusion):
+    """Review 1128: H's required check is green after the one accepted rerun, and GitHub shows attempt 2 of run 77,
+    the rerun's, completed with a conclusion that is neither a word nor null. Each pass is refused as unreadable:
+    the conclusion is not named "none", nothing is recorded, and no review card, return or continuation is made. A
+    later pass that reads the attempt completed with success gives H its review cards."""
+    kb, root, repo, gh = red
+    tid, head, tests = _rerun(red, monkeypatch, kind)
+    _passed(monkeypatch, gh, ("completed", conclusion), conclusion)
+    events = _events(kb, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_events(kb, tid), _cards(kb), _raw(kb.kanban_db_path(), CONTINUED, tid)) == (events, [], [])
+    gh.update(timing=("completed", "success"), conclusion="success")
+    _tick(kb)
+    assert (len(_cards(kb)), _state(kb, head), gh["reruns"]) == (1, "review_cards_created", [RERUN])
+    assert (_waited(kb, tid, "red_check_returned"), _raw(kb.kanban_db_path(), CONTINUED, tid)) == ([], [])
