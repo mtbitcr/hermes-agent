@@ -13415,14 +13415,14 @@ def _own_gateway_api_server() -> Tuple[Optional[int], Any]:
     included), legacy gateway.json and this process's environment. The port
     falls back as the adapter does (``API_SERVER_PORT``, then 8642) and is
     None when given but not an integer port. Raises when config.yaml or
-    gateway.json exists but cannot be read or parsed, which the loader only
-    logs.
+    gateway.json exists but cannot be read or parsed, or a managed file exists
+    but cannot be applied, which the loader only logs.
     """
     from gateway import config_loader
     from gateway.config import Platform, load_gateway_config
 
     home = get_hermes_home()
-    config_loader.read_yaml_layers(home)
+    config_loader.read_yaml_layers(home, strict=True)
     gateway_json = home / "gateway.json"
     if gateway_json.exists():
         with open(gateway_json, encoding="utf-8") as f:
