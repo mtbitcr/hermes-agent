@@ -7,6 +7,7 @@ from contextlib import contextmanager, suppress
 import contextvars
 import imaplib
 import logging
+import mimetypes
 import os
 import re
 import smtplib
@@ -317,9 +318,11 @@ def _extract_attachments(msg: email_lib.message.Message, skip_attachments: bool 
 
 
 def _attach_file(msg: MIMEMultipart, path: Path, filename: str) -> None:
-    """Attach *path* to *msg* as base64 application/octet-stream."""
+    """Attach *path* to *msg* as base64 (image/* when the name says image, else application/octet-stream)."""
+    guessed = (mimetypes.guess_type(filename)[0] or "").split("/")
+    maintype, subtype = guessed if guessed[0] == "image" and len(guessed) == 2 else ("application", "octet-stream")
     with open(path, "rb") as f:
-        part = MIMEBase("application", "octet-stream")
+        part = MIMEBase(maintype, subtype)
         part.set_payload(f.read())
         encoders.encode_base64(part)
         part.add_header("Content-Disposition", f"attachment; filename={filename}")
@@ -757,9 +760,16 @@ class EmailAdapter(BasePlatformAdapter):
         """Send a file as an email attachment."""
         return await self._run_send(self._send_email_with_attachment, (chat_id, caption or "", file_path, file_name), "[Email] Send document failed: %s")
 
+    async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
+                              reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None, **kwargs) -> SendResult:
+        """Send a local image as an email attachment (same single-attachment path as send_document)."""
+        return await self._run_send(self._send_email_with_attachment, (chat_id, caption or "", image_path, None), "[Email] Send image file failed: %s")
+
     def _send_email_with_attachment(self, to_addr: str, body: str, file_path: str, file_name: Optional[str] = None) -> str:
         """Send an email with a single file attachment via SMTP (raises if unattachable)."""
-        return self._send_with_files(to_addr, body, [(Path(file_path), file_name or Path(file_path).name)], lenient=False)
+        msg_id = self._send_with_files(to_addr, body, [(Path(file_path), file_name or Path(file_path).name)], lenient=False)
+        logger.info("[Email] Sent single-attachment email to %s", to_addr)
+        return msg_id
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic info about the email chat."""
