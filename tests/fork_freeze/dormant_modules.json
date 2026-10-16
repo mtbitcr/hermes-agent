@@ -4,6 +4,7 @@
   "cron/incidents.py": "f05e68ca50a8d8e1fbd9dde34d169a7b1f3d22b2e81b6f9d84c4332addd709c3",
   "cron/scheduler_detached_worker.py": "2954e83e282fb8bc132a6280235a14986f56406b320a5c53d9bd13a375993c16",
   "cron/scheduler_diagnostics.py": "f84fb06a2846ea0fe30b65a152b9fcdbcb74bc10fdaddf3a03703be1ff772c21",
+  "cron/scripts/release_reminder.py": "6282e8ffe3d6aa628b5e54d986dc2e41fbafb280610beecd0297e28c95146764",
   "gateway/browser_control_artifacts.py": "0c3d60897eac61450c07d1016b3719a5692ee4d75c9f4c9dedb72ae71f7062f8",
   "gateway/builtin_hooks/__init__.py": "2d6b6939f9548e4895aa12c9911a161c264a977f688b9996934f5df90e499e11",
   "gateway/kanban_watchers_common.py": "9a61517d38989925b0dc3c4b659a4614b15443ffbc63cb75bfbde0caae710823",
