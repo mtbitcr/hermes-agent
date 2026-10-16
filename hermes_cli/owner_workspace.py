@@ -4613,6 +4613,62 @@ def owner_project_name(value: Any) -> str:
     return check_owner_text(name, "project_name")
 
 
+def owner_run_status(status: Any) -> Any:
+    """A run status, or one of its events, as the owner reads it.
+
+    The failure reason (``error``, and the bare ``error_reason`` a refused
+    owner mutation adds) passes the owner-text policy's stored-failure check
+    (:func:`hermes_cli.owner_text.check_owner_text`): a reason it refuses is
+    replaced whole by the policy's fixed sentence. A new mapping is returned;
+    the transport status, the queued event and the durable row keep exactly
+    what they recorded.
+    """
+    if not isinstance(status, dict):
+        return status
+    return {
+        key: (
+            check_owner_text(value, "stored_failure")
+            if key in ("error", "error_reason") and isinstance(value, str)
+            else value
+        )
+        for key, value in status.items()
+    }
+
+
+# The fields of a structured planner reply that hold the planner's own prose.
+# Titles and Project names keep their own checks; routes, sizes, paths and
+# references are not prose.
+_OWNER_REPLY_PROSE_KEYS = frozenset({
+    "message", "summary", "specification", "current_milestone",
+    "owner_visible_result", "project_description", "impact",
+    "later_milestones", "body", "reason",
+})
+
+
+def owner_reply_prose(reply: Any) -> Any:
+    """A structured planner reply with its prose checked, field by field.
+
+    Every piece of planner prose, at any depth (a created task's ``body``, a
+    change's ``reason``), passes the owner-text policy's planner-prose check:
+    a field it refuses is replaced whole by the policy's fixed sentence, and
+    every other field is returned as it is. A new value is returned; ``reply``
+    itself, and so the stored transcript, is never changed.
+    """
+    def _checked(value: Any, prose: bool) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: _checked(item, key in _OWNER_REPLY_PROSE_KEYS)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [_checked(item, prose) for item in value]
+        if prose and isinstance(value, str) and value.strip():
+            return check_owner_text(value, "planner_prose")
+        return value
+
+    return _checked(reply, False)
+
+
 def _native_owner_title(value: Any, field: str) -> str:
     """Canonicalize one work-item title Hermes itself is about to write.
 
@@ -6933,6 +6989,24 @@ def _retry_refusal_reason(task: kanban_db.Task) -> str:
     return f"This work is {state} and has not stopped. " + retryable
 
 
+def _retry_refused(
+    task_id: str, task: Optional[kanban_db.Task], refusal: Any,
+) -> dict:
+    """The result of a retry that changed nothing, and why.
+
+    The reason passes the owner-text policy's retry-reason check
+    (:func:`hermes_cli.owner_text.check_owner_text`); a reason it refuses is
+    replaced whole by the policy's fixed sentence.
+    """
+    return {
+        "ok": False,
+        "error": "not_retryable",
+        "task_id": task_id,
+        "current_status": task.status if task else None,
+        "reason": check_owner_text(refusal, "retry_reason"),
+    }
+
+
 def _owner_provider_held_runs(
     conn: sqlite3.Connection, task_ids: Any,
 ) -> dict[str, sqlite3.Row]:
@@ -7261,15 +7335,7 @@ def retry_task(
                                 )
 
                 if retried is None:
-                    result = {
-                        "ok": False,
-                        "error": "not_retryable",
-                        "task_id": task_id,
-                        "current_status": (
-                            current_task.status if current_task else None
-                        ),
-                        "reason": refusal,
-                    }
+                    result = _retry_refused(task_id, current_task, refusal)
                 else:
                     # Both fields come from the committed event, so a replay
                     # reports the column this retry landed the work in and the
@@ -7382,7 +7448,11 @@ def _project_removal_state(
         "retained_copy_id": op["retained_copy_id"],
         "receipt_id": op["receipt_id"],
         "consequences_digest": op["consequences_digest"],
-        "last_error": op["last_error"],
+        # Checked as it is read; the stored operation keeps what it recorded.
+        "last_error": (
+            check_owner_text(op["last_error"], "stored_failure")
+            if op["last_error"] else op["last_error"]
+        ),
         "consequences": consequences,
     }
 
