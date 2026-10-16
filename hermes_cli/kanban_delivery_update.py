@@ -57,7 +57,9 @@ _UPDATE_BODY = _MOVED + (
 _CONFLICT_BODY = _MOVED + (
     " Merging it with the approved change conflicts in these files: {conflicts}. This card's branch {branch} at "
     "{update} is on current main with the conflict marked. Resolve the marked conflicts in those files only, change "
-    "nothing else, and hand over for review.")
+    "nothing else, and hand over for review. If your resolution leaves no change against main, the approved change "
+    "is no longer needed. Do not hand over. Block this card with the reason: The approved change is no longer needed "
+    "after a change on main.")
 _RETURN_BODY = _MOVED + " {why} Bring the change up to date on main and hand it over for review again."
 _WHY = {
     "conflict": "Merging main and the approved head conflicts, so no update was made.",

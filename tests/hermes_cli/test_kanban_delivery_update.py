@@ -50,6 +50,11 @@ ON_UPDATE_BRANCHES = ("SELECT * FROM tasks WHERE id IN (SELECT child_id FROM tas
 CONTINUED = ("SELECT * FROM tasks WHERE id IN (SELECT child_id FROM task_links WHERE parent_id = ?) "
              "AND branch_name LIKE 'delivery-return/%'")
 GOVERNANCE = ("execution_tier", "owner_receipt_bound", "provider_override", "model_override", "reasoning_effort")
+# The owner's round 3: what the update card with the conflict marked tells its builder when the resolution leaves no
+# change against main, word for word, and the reason it names.
+NO_LONGER_NEEDED = "The approved change is no longer needed after a change on main."
+NO_CHANGE_LEFT = ("If your resolution leaves no change against main, the approved change is no longer needed. Do not "
+                  f"hand over. Block this card with the reason: {NO_LONGER_NEEDED}")
 
 
 def _approved_head(scene, name="feature"):
@@ -474,6 +479,64 @@ def test_a_conflicting_update_goes_back_to_the_builder_with_no_card_in_review(ex
     assert _checkout(repo) == before and _branches(repo) == branches | {card["branch_name"]}
     _tick(kb)
     assert ([task["id"] for task in _raw(db, ON_UPDATE_BRANCHES, tid)], _raw(db, CONTINUED, tid)) == ([card["id"]], [])
+
+
+def test_a_conflicting_updates_card_says_to_block_it_when_the_resolution_leaves_no_change(exact):
+    """The owner's round 3: a resolution can leave no change against main, as when main made the same change, and the
+    kernel hands no empty change over. The body of the update card with the conflict marked keeps its instruction for
+    a resolution that leaves a change, then tells its builder, word for word, not to hand over in that case but to
+    block the card with the reason it names."""
+    kb, root, repo, gh = exact
+    tid, head, base, main = _moved_on(exact, path="src/impl/feature.py", text="ok = False\n")
+
+    _tick(kb)
+
+    card = _update(kb, tid)
+    assert [payload["conflicts"] for payload in _updated(kb, tid)] == [["src/impl/feature.py"]]
+    assert ("Resolve the marked conflicts in those files only, change nothing else, and hand over for review. "
+            f"{NO_CHANGE_LEFT}") in card["body"]
+
+
+def test_a_conflict_resolved_entirely_to_main_is_blocked_as_no_longer_needed(exact):
+    """Finding 2af0d62e of 1068: the update card's builder resolves the marked conflict entirely to main's version and
+    commits it, so nothing is left to change against main, and the kernel's guard still refuses that empty hand-over,
+    as it is. The builder then does what the card's body says: it blocks the card through the kernel call of the
+    worker's block tool, with the reason the body names. The card waits blocked with that reason for the owner,
+    nothing is in review, and another pass makes no other update card and no return."""
+    kb, root, repo, gh = exact
+    db = kb.kanban_db_path()
+    tid, head, base, main = _moved_on(exact, path="src/impl/feature.py", text="ok = False\n")
+    _tick(kb)
+    card = _update(kb, tid)
+    (root / "profiles" / IMPLEMENTER).mkdir(parents=True, exist_ok=True)
+    _tick(kb)  # the dispatcher claims the card for its builder at its branch
+    claimed = _task(kb, card["id"])
+    assert (claimed["status"], claimed["assignee"], claimed["base_commit"]) == ("running", IMPLEMENTER, main)
+    workspace = Path(claimed["workspace_path"])
+    assert _git(workspace, "rev-parse", "HEAD") == _head(repo, claimed)
+
+    _git(workspace, "checkout", main, "--", "src/impl/feature.py")  # main's version: no marker, no line of H
+    _git(workspace, "commit", "-q", "-m", "resolve src/impl/feature.py to main's version")
+
+    assert _git(workspace, "diff", "--name-only", main, "HEAD") == ""
+    conn = kb.connect()
+    try:
+        run = kb.get_task(conn, card["id"]).current_run_id
+        with pytest.raises(kb.WorktreeScopeError, match="mutating completion has no committed changes"):
+            kb.complete_task(conn, card["id"], summary="resolved to main's version", expected_run_id=run)
+        # the kernel call of the worker's kanban_block
+        assert kb.block_task(conn, card["id"], reason=NO_LONGER_NEEDED, kind=None, expected_run_id=run) is True
+    finally:
+        conn.close()
+    _tick(kb)
+
+    blocked = _raw(db, "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked'", card["id"])
+    assert (_task(kb, card["id"])["status"], [json.loads(event["payload"])["reason"] for event in blocked]) == (
+        "blocked", [NO_LONGER_NEEDED])
+    assert (_handovers(kb, card["id"]), _raw(db, "SELECT id FROM tasks WHERE status = 'review'")) == ([], [])
+    assert ([task["id"] for task in _raw(db, ON_UPDATE_BRANCHES, tid)], _raw(db, CONTINUED, tid)) == ([card["id"]], [])
+    assert (_update(kb, tid)["id"], _state(kb, head), _arms(gh)) == (card["id"], "updated", [])
+    assert NO_CHANGE_LEFT in card["body"]  # what the card's body tells its builder to do
 
 
 @pytest.mark.parametrize("conflict", ["added_on_both_sides", "deleted_under_the_base"])
