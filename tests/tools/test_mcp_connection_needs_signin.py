@@ -5,8 +5,9 @@ The gateway (token refresh, initial connect) and the dashboard
 recorded as a marker file beside the connection's token file. A refusal
 only counts against the tokens it refused: a newer sign-in saved meanwhile
 by another process stays connected, and obsolete work never changes the
-state of newer tokens. Every token here is an obvious fake inside a
-temporary HERMES_HOME.
+state of newer tokens. A failed owner transaction that restores refused
+tokens restores their refusal with them. Every token here is an obvious
+fake inside a temporary HERMES_HOME.
 """
 
 import asyncio
@@ -48,6 +49,39 @@ from tools.mcp_oauth import HermesTokenStorage
 asyncio.run(HermesTokenStorage("srv").set_tokens(OAuthToken(
     access_token="fake-new-access-token", token_type="Bearer",
     expires_in=3600, refresh_token="fake-new-refresh-token")))
+"""
+# Run in a second OS process: the gateway is refused the saved fake sign-in
+# whose tokens start with argv[3]. Its refresh ("refresh") or its MCP request
+# ("mcp") gets the answer argv[2]; only the network is fake.
+_REFUSE_SAVED_SIGN_IN = """
+import asyncio
+import sys
+from tools.mcp_oauth_manager import MCPOAuthManager
+from tools.mcp_tool import sdk_httpx
+
+async def refuse(path, status, prefix):
+    sdk = sdk_httpx()
+    url = "https://mcp.example.com/mcp"
+    provider = MCPOAuthManager().get_or_build_provider("srv", url, {})
+    if path == "refresh":
+        await provider._initialize()
+        request = await provider._refresh_token()
+        assert (prefix + "-refresh-token").encode() in request.content
+        response = sdk.Response(status, request=request, content=b'{"error": "invalid_grant"}')
+        assert await provider._handle_refresh_response(response) is False
+        return
+
+    def network(request):
+        # The MCP request and the SDK's retry, both sent with the saved token.
+        assert request.url == sdk.URL(url)
+        assert request.headers["Authorization"] == "Bearer " + prefix + "-access-token"
+        return sdk.Response(status)
+
+    async with sdk.AsyncClient(auth=provider, transport=sdk.MockTransport(network)) as client:
+        response = await client.post(url, json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+    assert response.status_code == status
+
+asyncio.run(refuse(sys.argv[1], int(sys.argv[2]), sys.argv[3]))
 """
 
 
@@ -241,6 +275,107 @@ async def _assert_cross_origin_refusal_keeps_connected(home, status: int) -> Non
     assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
     assert not _markers(home)
     assert token_file.read_bytes() == signed_in
+
+
+def _token_file(home) -> Path:
+    return home / "mcp-tokens" / f"{_SERVER}.json"
+
+
+def _configured(home) -> None:
+    """The connection is in config.yaml, as the owner's operations require."""
+    import yaml
+
+    (home / "config.yaml").write_text(
+        yaml.safe_dump({"mcp_servers": {_SERVER: dict(_OAUTH_CONFIG)}}), encoding="utf-8"
+    )
+
+
+def _refuse_in_another_process(home, path: str, status: int, prefix: str = "fake") -> None:
+    """The gateway, a second OS process, is refused the saved sign-in: its
+    refresh (``path="refresh"``) or its MCP request (``path="mcp"``) is
+    answered with ``status``."""
+    subprocess.run(
+        [sys.executable, "-c", _REFUSE_SAVED_SIGN_IN, path, str(status), prefix],
+        cwd=_REPO_ROOT,
+        env={**os.environ, "HERMES_HOME": str(home)},
+        check=True,
+        timeout=60,
+    )
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "needs_authorization"
+
+
+def _after_snapshot(monkeypatch, then=None) -> list:
+    """Record the snapshots an owner transaction takes, and run ``then`` right
+    after its snapshot, before its temporary removal."""
+    real_snapshot = HermesTokenStorage.snapshot
+    snapshots = []
+
+    def _snapshot(self):
+        snapshot = real_snapshot(self)
+        snapshots.append(snapshot)
+        if then is not None:
+            then()
+        return snapshot
+
+    monkeypatch.setattr(HermesTokenStorage, "snapshot", _snapshot)
+    return snapshots
+
+
+def _dashboard_sign_in_fails(home, monkeypatch) -> None:
+    """The dashboard's sign-in worker removes the saved sign-in, the owner's
+    new sign-in fails, and the worker rolls back."""
+    from hermes_cli import mcp_config, web_server
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+    def _authorization_fails(name, config, *, connect_timeout):
+        raise RuntimeError("fake: the new sign-in failed")
+
+    monkeypatch.setattr(mcp_config, "_authorize_oauth_server", _authorization_fails)
+    flow = DashboardOAuthFlow(
+        flow_id="flow-srv",
+        server_name=_SERVER,
+        profile=None,
+        hermes_home=str(home),
+        redirect_uri="https://agent.example/api/mcp/oauth/callback/srv",
+    )
+
+    web_server._run_dashboard_mcp_oauth(flow, dict(_OAUTH_CONFIG))
+
+    assert flow.status == "error"
+    assert "fake: the new sign-in failed" in flow.error
+
+
+def _removal_config_save_fails(home, monkeypatch) -> None:
+    """Connection removal clears the saved sign-in, the config save fails, and
+    the removal rolls back."""
+    from hermes_cli import mcp_config
+
+    def _save_fails(*args, **kwargs):
+        raise OSError("fake: config.yaml could not be written")
+
+    monkeypatch.setattr(mcp_config, "save_config", _save_fails)
+
+    with pytest.raises(OSError, match="fake: config.yaml"):
+        mcp_config._remove_mcp_server_and_credentials(_SERVER)
+
+
+async def _assert_failed_transaction_keeps_refusal(
+    home, monkeypatch, transaction, path: str, status: int
+) -> None:
+    """The gateway's refusal lands after the transaction's snapshot and before
+    its removal; the failed transaction restores the refused sign-in."""
+    await _signed_in()
+    _configured(home)
+    snapshots = _after_snapshot(
+        monkeypatch, lambda: _refuse_in_another_process(home, path, status)
+    )
+
+    transaction(home, monkeypatch)
+
+    [snapshot] = snapshots
+    assert not [name for name in snapshot if ".signin-rejected." in name]
+    assert _token_file(home).read_bytes() == snapshot[f"{_SERVER}.json"]
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "needs_authorization"
 
 
 # -- fail before, pass after -------------------------------------------------
@@ -483,6 +618,51 @@ async def test_cross_origin_redirect_refused_with_403_stays_connected(home):
     await _assert_cross_origin_refusal_keeps_connected(home, 403)
 
 
+# -- a failed owner transaction restores a refused sign-in with its refusal ----
+
+
+@pytest.mark.asyncio
+async def test_failed_dashboard_sign_in_keeps_refresh_400_refusal(home, monkeypatch):
+    await _assert_failed_transaction_keeps_refusal(
+        home, monkeypatch, _dashboard_sign_in_fails, "refresh", 400
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_dashboard_sign_in_keeps_refresh_401_refusal(home, monkeypatch):
+    await _assert_failed_transaction_keeps_refusal(
+        home, monkeypatch, _dashboard_sign_in_fails, "refresh", 401
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_dashboard_sign_in_keeps_mcp_403_refusal(home, monkeypatch):
+    await _assert_failed_transaction_keeps_refusal(
+        home, monkeypatch, _dashboard_sign_in_fails, "mcp", 403
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_connection_removal_keeps_refresh_400_refusal(home, monkeypatch):
+    await _assert_failed_transaction_keeps_refusal(
+        home, monkeypatch, _removal_config_save_fails, "refresh", 400
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_connection_removal_keeps_refresh_401_refusal(home, monkeypatch):
+    await _assert_failed_transaction_keeps_refusal(
+        home, monkeypatch, _removal_config_save_fails, "refresh", 401
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_connection_removal_keeps_mcp_403_refusal(home, monkeypatch):
+    await _assert_failed_transaction_keeps_refusal(
+        home, monkeypatch, _removal_config_save_fails, "mcp", 403
+    )
+
+
 # -- controls -------------------------------------------------------------------
 
 
@@ -548,3 +728,72 @@ async def test_same_origin_redirect_refused_with_401_needs_authorization(home):
 
     assert _markers(home)
     assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "needs_authorization"
+
+
+@pytest.mark.asyncio
+async def test_failed_dashboard_sign_in_keeps_refusal_recorded_before_snapshot(
+    home, monkeypatch
+):
+    await _signed_in()
+    _configured(home)
+    _refuse_in_another_process(home, "refresh", 400)
+    snapshots = _after_snapshot(monkeypatch)
+
+    _dashboard_sign_in_fails(home, monkeypatch)
+
+    [snapshot] = snapshots
+    assert _token_file(home).read_bytes() == snapshot[f"{_SERVER}.json"]
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "needs_authorization"
+
+
+@pytest.mark.asyncio
+async def test_failed_connection_removal_without_refusal_restores_connected(
+    home, monkeypatch
+):
+    await _signed_in()
+    _configured(home)
+    snapshots = _after_snapshot(monkeypatch)
+
+    _removal_config_save_fails(home, monkeypatch)
+
+    [snapshot] = snapshots
+    assert _token_file(home).read_bytes() == snapshot[f"{_SERVER}.json"]
+    assert not _markers(home)
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
+
+
+@pytest.mark.asyncio
+async def test_refusal_of_replacement_tokens_leaves_restored_sign_in_connected(
+    home, monkeypatch
+):
+    await _signed_in()
+    _configured(home)
+
+    def _replaced_then_refused():
+        # The gateway saves replacement tokens, and the provider refuses those.
+        _save_new_tokens_in_another_process(home)
+        _refuse_in_another_process(home, "refresh", 400, "fake-new")
+
+    snapshots = _after_snapshot(monkeypatch, _replaced_then_refused)
+
+    _dashboard_sign_in_fails(home, monkeypatch)
+
+    [snapshot] = snapshots
+    assert _token_file(home).read_bytes() == snapshot[f"{_SERVER}.json"]
+    assert _stored_tokens(home) == ("fake-access-token", "fake-refresh-token")
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
+
+
+@pytest.mark.asyncio
+async def test_successful_connection_removal_leaves_no_marker(home, monkeypatch):
+    from hermes_cli import mcp_config
+
+    await _signed_in()
+    _configured(home)
+    _after_snapshot(monkeypatch, lambda: _refuse_in_another_process(home, "mcp", 403))
+
+    assert mcp_config._remove_mcp_server_and_credentials(_SERVER) is True
+
+    assert not _markers(home)
+    assert not _token_file(home).exists()
+    assert _SERVER not in mcp_config._get_mcp_servers()

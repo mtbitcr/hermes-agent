@@ -453,6 +453,13 @@ def _create_marker(path: Path) -> None:
         pass  # the same refusal is already recorded
 
 
+# Resolved paths of the sign-in-rejected markers that remove() deleted in this
+# process. A failed transaction that restores the token file one of them names
+# brings that refusal back, even one recorded after the transaction's snapshot.
+# Entries are digest-named paths, holding no token data.
+_removed_sign_in_rejections: set[str] = set()
+
+
 # ---------------------------------------------------------------------------
 # HermesTokenStorage -- persistent token/client-info on disk
 # ---------------------------------------------------------------------------
@@ -640,12 +647,18 @@ class HermesTokenStorage:
     # -- cleanup -----------------------------------------------------------
 
     def remove(self) -> None:
-        """Delete all stored OAuth state for this server, all its markers included."""
+        """Delete all stored OAuth state for this server, all its markers included.
+
+        The markers are remembered before they are deleted, so ``restore()``
+        can bring a refusal back with the token file it names.
+        """
+        markers = self._sign_in_rejected_paths()
+        _removed_sign_in_rejections.update(str(p.resolve()) for p in markers)
         for p in (
             self._tokens_path(),
             self._client_info_path(),
             self._meta_path(),
-            *self._sign_in_rejected_paths(),
+            *markers,
         ):
             p.unlink(missing_ok=True)
 
@@ -678,10 +691,12 @@ class HermesTokenStorage:
     def restore(self, snapshot: dict[str, bytes], *, only_if_absent: bool = False) -> None:
         """Revert to a snapshot without overwriting a concurrent successful write.
 
-        A sign-in-rejected marker captured in the snapshot comes back, by
-        exclusive create, with the token file it names. The restore removes
-        no marker: each names one token file content, so a marker never
-        counts as newer state for ``only_if_absent``.
+        The sign-in-rejected marker of the restored token file comes back, by
+        exclusive create and before that token file, when the snapshot
+        captured it or ``remove()`` deleted it, so a refusal recorded after
+        the snapshot is kept too. The restore removes no marker: each names
+        one token file content, so a marker never counts as newer state for
+        ``only_if_absent``.
         """
         with _dashboard_oauth_persistence_guard(rollback=True):
             self._restore_snapshot(snapshot, only_if_absent=only_if_absent)
@@ -704,13 +719,20 @@ class HermesTokenStorage:
             return
         token_dir = _get_token_dir(self._hermes_home)
         token_dir.mkdir(parents=True, exist_ok=True)
+        tokens = snapshot.get(self._tokens_path().name)
+        if tokens is not None:
+            marker = self._sign_in_rejected_path(hashlib.sha256(tokens).hexdigest())
+            if marker.name in snapshot or str(marker.resolve()) in _removed_sign_in_rejections:
+                try:
+                    _create_marker(marker)
+                except OSError as exc:
+                    logger.warning("Failed to restore OAuth state %s: %s", marker.name, exc)
         marker_prefix = f"{self._server_name}.signin-rejected."
         for fname, data in snapshot.items():
+            if fname.startswith(marker_prefix):
+                continue  # restored above, before the token file it names
             path = token_dir / fname
             try:
-                if fname.startswith(marker_prefix):
-                    _create_marker(path)
-                    continue
                 fd = os.open(
                     str(path),
                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
