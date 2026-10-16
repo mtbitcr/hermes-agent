@@ -108,6 +108,7 @@ from hermes_cli.kanban_risk_tier import (
     requires_independent_review,
     review_run_box_seconds,
 )
+from hermes_cli.kanban_run_metadata_merge import merge_edited_run_metadata, strip_kernel_keys
 from hermes_cli.sqlite_util import (
     InitLockDirectoryAbsent,
     InitLockUnavailable,
@@ -23678,7 +23679,9 @@ def _stamp_run_receipt(
     stamped["worker_session_id"] = session_id
     receipt = _trusted_runtime_receipt(session_id, profile)
     if receipt is not None:
-        stamped["runtime_receipt"] = receipt
+        from tools.kanban_run_ending import with_ending_tool
+
+        stamped["runtime_receipt"] = with_ending_tool(receipt, run_id)
     return stamped
 
 
@@ -27266,7 +27269,7 @@ def edit_completed_task_result(
         )
         run = conn.execute(
             """
-            SELECT id FROM task_runs
+            SELECT id, metadata FROM task_runs
              WHERE task_id = ?
                AND outcome = 'completed'
              ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
@@ -27280,7 +27283,7 @@ def edit_completed_task_result(
                 conn, task_id,
                 outcome="completed",
                 summary=handoff_summary,
-                metadata=metadata,
+                metadata=strip_kernel_keys(metadata),
             )
         else:
             conn.execute(
@@ -27288,9 +27291,10 @@ def edit_completed_task_result(
                 (handoff_summary, run_id),
             )
             if metadata is not None:
+                merged = merge_edited_run_metadata(run["metadata"], metadata)
                 conn.execute(
                     "UPDATE task_runs SET metadata = ? WHERE id = ?",
-                    (json.dumps(metadata, ensure_ascii=False), run_id),
+                    (json.dumps(merged, ensure_ascii=False), run_id),
                 )
         _ev_lines = (handoff_summary or "").strip().splitlines()
         ev_summary = _ev_lines[0][:400] if _ev_lines else ""
