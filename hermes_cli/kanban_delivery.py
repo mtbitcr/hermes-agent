@@ -1066,21 +1066,23 @@ def _recorded(conn: sqlite3.Connection, source: str, code: str) -> list:
     return [payload for payload in payloads if payload.get("code") == code]
 
 
-def _failed_jobs(github, repository: str, head: str, red: set) -> Optional[list]:
+def _failed_jobs(github, repository: str, head: str, red: set) -> tuple:
     """Every latest job of H's workflow run that holds a red required check run (an Actions job is its
     check run), each failed slice job with the test ids and the count its own check run's annotations of
     the fixed title name, and each job that ended cancelled or timed_out with time_limit: whether one of its
-    check run's annotations is the runner's time-limit notice; None when no run of H on the one page read
-    holds one, or while that run runs."""
+    check run's annotations is the runner's time-limit notice, or None when no run of H on the one page read
+    holds one; and, for the owner rule of 2026-10-16, round 2, H's runs on that page, each one whose latest jobs
+    were read with their total count as latest_count. Both are None while the run that holds one still runs."""
     runs, _ = _page(github, f"/repos/{repository}/actions/runs", "workflow_runs", head_sha=head)
     for run in runs:
         jobs, count = _page(github, f"/repos/{repository}/actions/runs/{run['id']}/jobs", "jobs", filter="latest")
+        run["latest_count"] = count
         if not red & {job["id"] for job in jobs}:
             continue
         if count != len(jobs):  # every job of the run, whole on its one page
             raise PublishRefused("ci_unreadable", f"{count} jobs in run {run['id']}, {len(jobs)} in the answer")
         if any(job.get("status") != "completed" for job in jobs):
-            return None  # the run still runs (ci.yaml's timing report runs after the summary check): decide later
+            return None, None  # the run still runs (ci.yaml's timing report runs after the summary check): decide later
         for job in jobs:
             failed = job.get("name") in TEST_JOB_STEPS and job.get("conclusion") not in _PASSING
             stopped = job.get("conclusion") in ("cancelled", "timed_out")
@@ -1098,8 +1100,44 @@ def _failed_jobs(github, repository: str, head: str, red: set) -> Optional[list]
                 counts = [int(found[1]) for found in map(_FAILED_COUNT.fullmatch, notes) if found]
                 job.update(failed_tests=[note for note in notes if not _FAILED_COUNT.fullmatch(note)],
                            failed_count=counts[0] if len(counts) == 1 else None)
-        return jobs
-    return None
+        return jobs, runs
+    return None, runs
+
+
+def _unsuccessful_rerun(github, repository: str, runs: list, recorded: dict) -> Optional[Decision]:
+    """The owner rule of 2026-10-16, round 2: after H's one rerun, whose red_check_rerun record is ``recorded``
+    and whose calls were all accepted, the rerun attempt of the workflow run itself decides. That run is the one
+    of ``runs`` (H's runs on the page :func:`_failed_jobs` read) whose jobs of every attempt include each job the
+    record names; with no such run or more than one, nothing is decided, and an answer that cannot be read is
+    refused. Its run_attempt above the recorded attempt, completed with any conclusion but success (none
+    included) or with no latest jobs, is rerun_unsuccessful, naming GitHub's conclusion word as it is; anything
+    else is None, and the pass goes on as before. Nothing is read while no run of ``runs`` shows a newer attempt
+    completed."""
+    ids = set(recorded["jobs"])
+    if not ids or not any(run.get("status") == "completed" and type(run.get("run_attempt")) is int
+                          and run["run_attempt"] > recorded["attempt"] for run in runs):
+        return None  # no newer attempt of a run of H has completed
+    tied = []
+    for run in runs:
+        jobs, count = _page(github, f"/repos/{repository}/actions/runs/{run['id']}/jobs", "jobs", filter="all")
+        if ids <= {job["id"] for job in jobs}:
+            tied.append(run)
+        elif count != len(jobs):  # the rerun's jobs may be on a page not read
+            raise PublishRefused("ci_unreadable", f"{count} jobs in run {run['id']}, {len(jobs)} in the answer")
+    if len(tied) != 1:
+        return None  # no run of H, or more than one, holds the jobs of H's rerun
+    (run,) = tied
+    attempt, conclusion = run.get("run_attempt"), run.get("conclusion")
+    if type(attempt) is not int or attempt <= recorded["attempt"] or run.get("status") != "completed":
+        return None  # GitHub has not completed H's rerun attempt yet
+    if "latest_count" not in run:
+        run["latest_count"] = _page(github, f"/repos/{repository}/actions/runs/{run['id']}/jobs", "jobs",
+                                    filter="latest")[1]
+    if conclusion == "success" and run["latest_count"]:
+        return None  # the rerun attempt succeeded: H's required check decides, as before
+    word = conclusion if isinstance(conclusion, str) else "none"
+    return Decision(False, "rerun_unsuccessful", f"attempt {attempt} of workflow run {run['id']} completed with "
+                    f"conclusion {word}{'' if run['latest_count'] else ' and no jobs'} after the one rerun")
 
 
 def _rerun_or_return(db_path: Path, row: dict, read: tuple, github, repository: str, policy, red: set):
@@ -1111,8 +1149,11 @@ def _rerun_or_return(db_path: Path, row: dict, read: tuple, github, repository: 
     request, read after H's run, jobs and annotations, is still open at H; that read showing it closed outside
     the delivery step marks the open row closed outside instead (:func:`_review_pull`). Until GitHub shows a newer
     attempt than the rerun whose recorded outcome shows every call accepted, the pass waits; after a
-    refused or unanswered one, the pass reads the pull request again (owner rule 4). Returns the outcome
-    recorded, if any."""
+    refused or unanswered one, the pass reads the pull request again (owner rule 4). By the owner rule of
+    2026-10-16, round 2, the pass never waits on the attempt of that accepted rerun once GitHub shows it completed:
+    completed with any conclusion but success, or with no jobs, it returns the work once as rerun_unsuccessful,
+    with the failed tests the rerun record names (:func:`_unsuccessful_rerun`), and sends no second rerun.
+    Returns the outcome recorded, if any."""
     from hermes_cli.kanban_delivery_github import GitHubTransport
 
     source, head = row["source_task_id"], row["pull_request_head"]
@@ -1121,21 +1162,29 @@ def _rerun_or_return(db_path: Path, row: dict, read: tuple, github, repository: 
         answered = [record for record in _recorded(conn, source, "red_check_rerun_outcome") if record["head"] == head]
     if any(record["head"] == head for record in returned):
         return None  # H's work went back to its builder already
-    jobs = _failed_jobs(github, repository, head, red)
-    if jobs is None:
+    jobs, runs = _failed_jobs(github, repository, head, red)
+    if runs is None:
         return None
-    attempt = max((job["run_attempt"] for job in jobs if type(job.get("run_attempt")) is int), default=0)
-    if answered and any(record["head"] == head and attempt <= record["attempt"] for record in reruns):
-        return None  # H's rerun was accepted and GitHub has not started it yet
-    decision = decide_rerun(policy, repository, head, jobs, {"reruns": [record["head"] for record in reruns]})
-    if decision.allowed and decision.code != "rerun":
-        return None
+    attempt = max((job["run_attempt"] for job in jobs or () if type(job.get("run_attempt")) is int), default=0)
+    if jobs is None or answered and any(record["head"] == head and attempt <= record["attempt"] for record in reruns):
+        # No run of H holds the red check, or H's rerun was accepted and its jobs show no newer attempt: the pass
+        # waits, but not on a completed attempt of that rerun
+        recorded = next((record for record in reruns if record["head"] == head), None)
+        accepted = recorded is not None and bool(answered) and _rerun_reason(answered[0]["statuses"]) is None
+        decision = _unsuccessful_rerun(github, repository, runs, recorded) if accepted else None
+        if decision is None:
+            return None
+        tests = recorded["tests"]
+    else:
+        decision = decide_rerun(policy, repository, head, jobs, {"reruns": [record["head"] for record in reruns]})
+        if decision.allowed and decision.code != "rerun":
+            return None
+        tests = [test for job in jobs for test in job.get("failed_tests") or () if isinstance(test, str)]
     branch = None if decision.allowed else _return_branch(db_path, row)  # owner rule 2: the branch comes first
     at_head, stored = _review_pull(db_path, github, repository, row)
     if not at_head:
         return stored  # owner rule 1: the pull request left H or closed while H's run was read
     code = "red_check_rerun" if decision.allowed else "red_check_returned"
-    tests = [test for job in jobs for test in job.get("failed_tests") or () if isinstance(test, str)]
     ids = sorted({match["job_id"] for match in decision.matches})
     # Finding 164: the jobs the one rerun covers for their time limit, recorded only when there are any.
     stopped = sorted({match["job_id"] for match in decision.matches if match.get("time_limit") is True})

@@ -7,7 +7,7 @@ table (the world of test_kanban_delivery_review_cards.py), so every call passes 
 from __future__ import annotations
 
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -124,6 +124,33 @@ def _stopped(monkeypatch, notice=TIME_LIMIT, conclusion="cancelled", detector=Tr
         if (method, path) == ("GET", f"/repos/{REPO}/check-runs/903/annotations"):
             value = [{"path": ".github", "annotation_level": "failure", "title": "", "message": message,
                       "raw_details": ""} for message in (notice, "The operation was canceled.")]
+        return status, value
+
+    monkeypatch.setattr(transport, "_exchange", exchange)
+
+
+def _attempt(monkeypatch, gh, *run):
+    """The owner rule of 2026-10-16, round 2: after the one rerun, GitHub's runs listing shows H's run 77 at run
+    attempt 2 with gh["run"] as its status and conclusion (``run`` to start), its latest jobs (filter=latest) are
+    gh["latest"], none to start, as GitHub answered for attempt 2 of the incident's run 38736033219, and every
+    attempt's jobs (filter=all) are attempt 1's as the table answers them, or the status gh["all"] while it is set.
+    H's required check stays attempt 1's red check run 900."""
+    from hermes_cli import kanban_delivery_github as transport
+
+    table = transport._exchange  # the red fixture's, or _stopped's over it
+    gh.update(run=run, latest=[], all=None)
+
+    def exchange(method, target, authorization, payload=None):
+        status, value = table(method, target, authorization, payload)
+        path, query = urlsplit(target).path, parse_qs(urlsplit(target).query)
+        if (method, path) == ("GET", f"/repos/{REPO}/actions/runs"):
+            value = dict(value, workflow_runs=[dict(item, run_attempt=2, status=gh["run"][0], conclusion=gh["run"][1])
+                                               for item in value["workflow_runs"]])
+        if (method, path) == ("GET", f"/repos/{REPO}/actions/runs/77/jobs"):
+            if query.get("filter") == ["latest"]:
+                value = {"total_count": len(gh["latest"]), "jobs": gh["latest"]}
+            elif gh["all"]:
+                return gh["all"], None
         return status, value
 
     monkeypatch.setattr(transport, "_exchange", exchange)
@@ -808,3 +835,99 @@ def test_the_work_returns_on_the_ticked_board_under_the_worker_environment(red, 
     assert f"CI named these failed tests: {UNLISTED}." in item["body"]
     assert _raw(other_db, IDENTITY, tid, item["id"]) == _red_identity(kb, tid, head)
     assert gh["reruns"] == [] and not (profile_home / "kanban.db").exists()
+
+
+@pytest.mark.parametrize("stop", [True, False], ids=["time_limit", "flaky"])
+def test_the_rerun_attempt_completed_with_startup_failure_and_no_jobs_returns_the_work_once(red, monkeypatch, stop):
+    """The owner rule of 2026-10-16, round 2, as review 1078 found it: GitHub completes attempt 2 of run 77, the one
+    rerun's (of a job stopped at its time limit, or of a listed flaky failure), with startup_failure and no jobs, so
+    H's required check stays attempt 1's red check run. The work returns to its builder once, as rerun_unsuccessful
+    with the tests the rerun record names and one continuation card whose body names GitHub's conclusion word,
+    and no second rerun call is sent over four passes."""
+    kb, root, repo, gh = red
+    if stop:
+        _stopped(monkeypatch, notice=TIME_LIMIT_1M0S)
+    tid, head = _ready(red)
+    for _ in range(3):
+        _tick(kb)
+    _attempt(monkeypatch, gh, "completed", "startup_failure")
+
+    for _ in range(4):
+        _tick(kb)
+
+    returned, continued = _waited(kb, tid, "red_check_returned"), _raw(kb.kanban_db_path(), CONTINUED, tid)
+    assert (len(gh["reruns"]), len(returned), len(continued)) == (1, 1, 1)
+    (rerun,) = _waited(kb, tid, "red_check_rerun")
+    assert (returned[0]["reason"], returned[0]["tests"], returned[0]["rework"]) == (
+        "rerun_unsuccessful", rerun["tests"], continued[0]["id"])
+    assert ("(rerun_unsuccessful: attempt 2 of workflow run 77 completed with conclusion startup_failure and no jobs "
+            "after the one rerun)") in continued[0]["body"]
+    assert ("No failed test was named." if stop else f"CI named these failed tests: {FLAKY}.") in continued[0]["body"]
+
+
+def test_the_rerun_attempt_not_yet_completed_is_waited_on_without_a_second_rerun(red, monkeypatch):
+    """The owner rule of 2026-10-16, round 2, rule 2: while attempt 2 of run 77, the one rerun's, is queued and then in
+    progress, with no conclusion and no jobs yet, the pass waits as today: nothing is recorded, no work returns
+    and no second rerun call is sent; once the required check is green, H gets its review cards."""
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    for _ in range(3):
+        _tick(kb)
+    _attempt(monkeypatch, gh, "queued", None)
+    events = _events(kb, tid)
+
+    _tick(kb)
+    gh["run"] = ("in_progress", None)
+    _tick(kb)
+
+    assert (_events(kb, tid), gh["reruns"], _raw(kb.kanban_db_path(), CONTINUED, tid)) == (events, [RERUN], [])
+    gh["check"] = ("completed", "success")
+    _tick(kb)
+    assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created" and gh["reruns"] == [RERUN]
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled", "timed_out", "action_required", "neutral", "skipped",
+                                        "stale", None, "success"], ids=lambda conclusion: conclusion or "null")
+def test_the_rerun_attempt_completed_without_success_or_jobs_returns_the_work_once(red, monkeypatch, conclusion):
+    """The owner rule of 2026-10-16, round 2, rule 4: attempt 2 of run 77, the one rerun's, completed with no jobs,
+    whatever its conclusion (success too) or with none, returns the work once as rerun_unsuccessful, the
+    continuation's body naming GitHub's conclusion word as it is ("none" for no conclusion), with no second rerun."""
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    for _ in range(3):
+        _tick(kb)
+    _attempt(monkeypatch, gh, "completed", conclusion)
+
+    for _ in range(2):
+        _tick(kb)
+
+    returned, continued = _waited(kb, tid, "red_check_returned"), _raw(kb.kanban_db_path(), CONTINUED, tid)
+    assert [(payload["reason"], payload["tests"]) for payload in returned] == [("rerun_unsuccessful", [FLAKY])]
+    assert [item["id"] for item in continued] == [returned[0]["rework"]] and gh["reruns"] == [RERUN]
+    assert (f"(rerun_unsuccessful: attempt 2 of workflow run 77 completed with conclusion {conclusion or 'none'} "
+            "and no jobs after the one rerun)") in continued[0]["body"]
+
+
+def test_the_rerun_attempt_unreadable_decides_nothing_until_a_later_pass_reads_it(red, monkeypatch):
+    """The owner rule of 2026-10-16, round 2: while GitHub answers 500 for every attempt's jobs of run 77, the run of
+    the one rerun is not tied to it by its jobs, so nothing is recorded and no rerun call is sent; a later pass
+    that reads them returns the work once."""
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    for _ in range(3):
+        _tick(kb)
+    _attempt(monkeypatch, gh, "completed", "startup_failure")
+    gh["all"], events, reads = 500, _events(kb, tid), len(gh["queries"])
+
+    for _ in range(2):
+        _tick(kb)
+
+    assert (_events(kb, tid), gh["reruns"], _raw(kb.kanban_db_path(), CONTINUED, tid)) == (events, [RERUN], [])
+    assert [query["filter"] for _, query in gh["queries"][reads:] if "filter" in query].count(["all"]) == 2
+    gh["all"] = None
+    _tick(kb)
+    _tick(kb)
+    returned = _waited(kb, tid, "red_check_returned")
+    assert [payload["reason"] for payload in returned] == ["rerun_unsuccessful"] and gh["reruns"] == [RERUN]
+    (item,) = _raw(kb.kanban_db_path(), CONTINUED, tid)
+    assert returned[0]["rework"] == item["id"]
