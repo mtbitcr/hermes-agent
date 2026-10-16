@@ -398,6 +398,11 @@ def _dashboard_oauth_persistence_guard(*, rollback: bool = False):
         yield
 
 
+def _json_file_bytes(data: dict) -> bytes:
+    """Return the exact bytes ``_write_json`` writes for ``data``."""
+    return json.dumps(data, indent=2, default=str).encode("utf-8")
+
+
 def _write_json(path: Path, data: dict) -> None:
     """Write a dict as JSON with restricted permissions (0o600)."""
     with _dashboard_oauth_persistence_guard():
@@ -428,8 +433,8 @@ def _write_json_unchecked(path: Path, data: dict) -> None:
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
             stat.S_IRUSR | stat.S_IWUSR,
         )
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, default=str)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(_json_file_bytes(data))
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
@@ -520,7 +525,10 @@ class HermesTokenStorage:
         # on the next successful ``set_tokens``, which writes the new
         # ``expires_at`` field. The stored ``expires_at`` is stripped before
         # model_validate because it's not part of the SDK's OAuthToken schema.
+        # Neither is ``sign_in_id``, which only gives a save its own token
+        # file bytes (see ``set_tokens``).
         absolute_expiry = data.pop("expires_at", None)
+        data.pop("sign_in_id", None)
         if absolute_expiry is not None:
             data["expires_in"] = int(max(absolute_expiry - time.time(), 0))
         elif data.get("expires_in") is not None:
@@ -571,8 +579,14 @@ class HermesTokenStorage:
                 # Mock tokens or unusual shapes: skip the expires_at write
                 # rather than fail persistence.
                 pass
-        # A new token file leaves the markers of older token files behind; they
-        # name other content, so they no longer count.
+        # A provider can re-issue identical tokens without a lifetime. A save
+        # that would recreate the exact bytes of a refused token file gets its
+        # own identity, so the older refusal stops counting as for any new
+        # sign-in; set_tokens never touches a marker.
+        if self._sign_in_rejected_path(
+            hashlib.sha256(_json_file_bytes(payload)).hexdigest()
+        ).exists():
+            payload["sign_in_id"] = secrets.token_hex(16)
         _write_json(self._tokens_path(), payload)
         logger.debug("OAuth tokens saved for %s", self._server_name)
 

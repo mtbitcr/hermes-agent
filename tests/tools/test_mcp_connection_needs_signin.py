@@ -75,13 +75,20 @@ async def refuse(path, status, prefix):
         return
 
     def network(request):
+        if status == 401 and request.url != sdk.URL(url):
+            # The SDK answers a 401 with OAuth discovery, which fails to connect.
+            raise sdk.ConnectError("fake network: nothing after the refusal", request=request)
         # The MCP request and the SDK's retry, both sent with the saved token.
         assert request.url == sdk.URL(url)
         assert request.headers["Authorization"] == "Bearer " + prefix + "-access-token"
         return sdk.Response(status)
 
     async with sdk.AsyncClient(auth=provider, transport=sdk.MockTransport(network)) as client:
-        response = await client.post(url, json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        try:
+            response = await client.post(url, json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        except sdk.ConnectError:
+            assert status == 401
+            return
     assert response.status_code == status
 
 asyncio.run(refuse(sys.argv[1], int(sys.argv[2]), sys.argv[3]))
@@ -1052,3 +1059,172 @@ async def test_successful_connection_removal_leaves_no_marker(home, monkeypatch)
     assert not _markers(home)
     assert not _token_file(home).exists()
     assert _SERVER not in mcp_config._get_mcp_servers()
+
+
+# -- a successful new sign-in that receives the same tokens reads connected ----
+
+_STABLE_TOKEN_RESPONSE = {
+    "access_token": "fake-stable-access-token",
+    "refresh_token": "fake-stable-refresh-token",
+    "token_type": "Bearer",
+}
+
+
+def _stable_tokens_reissued() -> None:
+    """The owner's new sign-in completes: the token endpoint answers with the
+    same fake tokens, again without a lifetime, and the real provider's
+    successful token-response handler saves them. The client and server
+    metadata are saved again first, as the owner operation removed them."""
+    from tools.mcp_oauth import force_interactive_oauth
+    from tools.mcp_oauth_manager import get_manager
+    from tools.mcp_tool import sdk_httpx
+
+    async def _token_response_saved():
+        storage = HermesTokenStorage(_SERVER)
+        await storage.set_client_info(OAuthClientInformationFull(client_id="fake-client-id"))
+        storage.save_oauth_metadata(
+            OAuthMetadata(
+                issuer="https://auth.example.com",
+                authorization_endpoint="https://auth.example.com/authorize",
+                token_endpoint="https://auth.example.com/token",
+            )
+        )
+        provider = get_manager().get_or_build_provider(_SERVER, _URL, {})
+        await provider._initialize()
+        sdk = sdk_httpx()
+        request = sdk.Request("POST", "https://auth.example.com/token")
+        await provider._handle_token_response(
+            sdk.Response(200, request=request, json=_STABLE_TOKEN_RESPONSE)
+        )
+
+    with force_interactive_oauth():  # the owner's own sign-in
+        asyncio.run(_token_response_saved())
+
+
+@pytest.mark.parametrize("surface", ["dashboard", "cli", "desktop"])
+def test_successful_stable_re_sign_in_reads_connected(home, monkeypatch, surface):
+    from hermes_cli import mcp_config
+    from tools.mcp_oauth_manager import get_manager
+    from tools.mcp_tool import sdk_httpx
+
+    asyncio.run(_authorized_with_stable_tokens())
+    _refuse_in_another_process(home, "refresh", 400, "fake-stable")
+    marker_files = _marker_files(home)
+    assert len(marker_files) == 1
+    accepted = []
+
+    def _authorize(name, config, *, connect_timeout):
+        _stable_tokens_reissued()
+
+    def _probe(name, config, connect_timeout=None, *, details=None):
+        if surface == "desktop":
+            # The desktop path gets its tokens during the probe.
+            _stable_tokens_reissued()
+        sdk = sdk_httpx()
+
+        def _network(request):
+            assert request.headers["Authorization"] == "Bearer fake-stable-access-token"
+            accepted.append(request)
+            return sdk.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
+
+        async def _authenticated_request():
+            provider = get_manager().get_or_build_provider(_SERVER, _URL, {})
+            async with sdk.AsyncClient(
+                auth=provider, transport=sdk.MockTransport(_network)
+            ) as client:
+                response = await client.post(
+                    _URL, json={"jsonrpc": "2.0", "id": 1, "method": "ping"}
+                )
+            assert response.status_code == 200
+
+        asyncio.run(_authenticated_request())
+        return [("fake-tool", "A fake tool of the signed-in connection")]
+
+    monkeypatch.setattr(mcp_config, "_authorize_oauth_server", _authorize)
+    monkeypatch.setattr(mcp_config, "_probe_single_server", _probe)
+
+    if surface == "cli":
+        assert mcp_config._reauth_oauth_server(_SERVER, dict(_OAUTH_CONFIG)) is True
+    else:
+        from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+        flow = DashboardOAuthFlow(
+            flow_id=f"flow-srv-{surface}",
+            server_name=_SERVER,
+            profile=None,
+            hermes_home=str(home),
+            redirect_uri="https://agent.example/api/mcp/oauth/callback/srv",
+        )
+        if surface == "dashboard":
+            from hermes_cli import web_server
+
+            web_server._run_dashboard_mcp_oauth(flow, dict(_OAUTH_CONFIG))
+        else:
+            from tools.mcp_oauth import force_interactive_oauth
+            from tui_gateway.mcp_oauth_sessions import _probe_with_rollback
+
+            with force_interactive_oauth():
+                _probe_with_rollback(_SERVER, dict(_OAUTH_CONFIG), str(home), flow, False)
+        assert flow.status == "approved", flow.error
+
+    assert len(accepted) == 1
+    # Credentials, not file bytes: refused bytes under their kept marker never read connected.
+    assert _stored_tokens(home) == ("fake-stable-access-token", "fake-stable-refresh-token")
+    assert _SERVER in mcp_config._get_mcp_servers()
+    assert _marker_files(home) == marker_files
+    tokens = asyncio.run(HermesTokenStorage(_SERVER).get_tokens())
+    assert tokens.access_token == "fake-stable-access-token"
+    assert tokens.refresh_token == "fake-stable-refresh-token"
+    assert tokens.expires_in is None
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
+
+
+def test_refresh_that_reissues_refused_stable_tokens_reads_connected(home):
+    from tools.mcp_tool import sdk_httpx
+
+    asyncio.run(_authorized_with_stable_tokens())
+    _refuse_in_another_process(home, "mcp", 401, "fake-stable")
+    marker_files = _marker_files(home)
+
+    async def _refreshed():
+        # The refresh cures the 401, and the provider answers it with the same
+        # tokens, again without a lifetime.
+        provider = _provider()
+        await provider._initialize()
+        request = await provider._refresh_token()
+        assert b"fake-stable-refresh-token" in request.content
+        response = sdk_httpx().Response(200, request=request, json=_STABLE_TOKEN_RESPONSE)
+        return await provider._handle_refresh_response(response)
+
+    assert asyncio.run(_refreshed()) is True
+
+    assert _marker_files(home) == marker_files
+    assert _stored_tokens(home) == ("fake-stable-access-token", "fake-stable-refresh-token")
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
+
+
+def test_failed_dashboard_sign_in_after_stable_refusal_restores_refused_tokens(
+    home, monkeypatch
+):
+    asyncio.run(_authorized_with_stable_tokens())
+    _refuse_in_another_process(home, "refresh", 400, "fake-stable")
+    refused = _token_file(home).read_bytes()
+    marker_files = _marker_files(home)
+
+    _dashboard_sign_in_fails(home, monkeypatch)
+
+    assert _token_file(home).read_bytes() == refused
+    assert _marker_files(home) == marker_files
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "needs_authorization"
+
+
+def test_stable_tokens_saved_twice_without_refusal_write_identical_files(home):
+    asyncio.run(_authorized_with_stable_tokens())
+    first = _token_file(home).read_bytes()
+
+    _stable_tokens_reissued()
+
+    assert _token_file(home).read_bytes() == first
+    assert "sign_in_id" not in json.loads(first)
+    assert not _markers(home)
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
