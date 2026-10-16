@@ -113,6 +113,20 @@ def _is_synthetic_response(response: Any) -> bool:
     return isinstance(extensions, dict) and extensions.get(_SYNTHETIC_RESPONSE) is True
 
 
+def _answered_request_carries(response: Any, access_token: str) -> bool:
+    """Whether the request that ``response`` answers carried ``access_token``.
+
+    httpx follows redirects before it hands the answer back, so that request
+    is the last one sent; a redirect to another origin drops its
+    Authorization header. A response built without a request carries none.
+    """
+    try:
+        answered = response.request
+    except RuntimeError:
+        return False
+    return answered.headers.get("Authorization") == f"Bearer {access_token}"
+
+
 def _make_hermes_provider_class() -> Optional[type]:
     """Lazy-import the SDK base class and return our subclass.
 
@@ -598,9 +612,11 @@ def _make_hermes_provider_class() -> Optional[type]:
                         sent_tokens is not None
                         and getattr(incoming, "status_code", None) in (401, 403)
                         and not _is_synthetic_response(incoming)
+                        and _answered_request_carries(incoming, sent_tokens.access_token)
                     ):
-                        # The server refused the request: record it now, with
-                        # the credentials that request carried.
+                        # The server refused a request that carried the
+                        # credentials: record it now, with them. A refused
+                        # request without them records nothing.
                         storage = self.context.storage
                         from tools.mcp_oauth import HermesTokenStorage
                         if isinstance(storage, HermesTokenStorage):

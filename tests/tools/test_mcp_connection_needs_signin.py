@@ -191,6 +191,58 @@ async def _assert_late_refresh_refusal_keeps_new_sign_in(home, status: int) -> N
     assert _stored_tokens(home) == ("fake-new-access-token", "fake-new-refresh-token")
 
 
+async def _mcp_request_redirected_then_refused(
+    location: str, status: int, *, redirected_authorization: str | None
+) -> None:
+    """The gateway's MCP request goes out with the saved sign-in, is redirected
+    (302) to ``location``, and the redirected request is refused with ``status``.
+
+    The SDK's own HTTP client follows the redirect as production's does, and
+    drops the Authorization header on a redirect to another origin; only the
+    network is fake. Whatever the SDK sends after the refusal (OAuth discovery
+    after a 401, a retry after a 403) fails to connect.
+    """
+    from tools.mcp_tool import sdk_httpx
+
+    sdk = sdk_httpx()
+    refusals = []
+
+    def _network(request):
+        if refusals:
+            raise sdk.ConnectError("fake network: nothing after the refusal", request=request)
+        if request.url == sdk.URL(_URL):
+            assert request.headers["Authorization"] == "Bearer fake-access-token"
+            return sdk.Response(302, headers={"Location": location})
+        assert request.url == sdk.URL(location)
+        assert request.headers.get("Authorization") == redirected_authorization
+        refusals.append(request)
+        return sdk.Response(status)
+
+    async with sdk.AsyncClient(
+        auth=_provider(), follow_redirects=True, transport=sdk.MockTransport(_network)
+    ) as client:
+        with pytest.raises(sdk.ConnectError):
+            await client.post(_URL, json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+    assert len(refusals) == 1
+
+
+async def _assert_cross_origin_refusal_keeps_connected(home, status: int) -> None:
+    await asyncio.wait_for(_signed_in(), timeout=30)
+    token_file = home / "mcp-tokens" / f"{_SERVER}.json"
+    signed_in = token_file.read_bytes()
+
+    await asyncio.wait_for(
+        _mcp_request_redirected_then_refused(
+            "https://other.example.net/mcp", status, redirected_authorization=None
+        ),
+        timeout=30,
+    )
+
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
+    assert not _markers(home)
+    assert token_file.read_bytes() == signed_in
+
+
 # -- fail before, pass after -------------------------------------------------
 
 
@@ -418,6 +470,19 @@ async def test_synthetic_login_challenge_keeps_replacement_tokens_connected(
     assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
 
 
+# -- only a refused request that carried the sign-in refuses it ----------------
+
+
+@pytest.mark.asyncio
+async def test_cross_origin_redirect_refused_with_401_stays_connected(home):
+    await _assert_cross_origin_refusal_keeps_connected(home, 401)
+
+
+@pytest.mark.asyncio
+async def test_cross_origin_redirect_refused_with_403_stays_connected(home):
+    await _assert_cross_origin_refusal_keeps_connected(home, 403)
+
+
 # -- controls -------------------------------------------------------------------
 
 
@@ -463,4 +528,23 @@ async def test_refusal_recorded_while_set_tokens_saves_stays(home, monkeypatch):
 
     assert recorded == [True]
     assert _stored_tokens(home) == ("fake-new-access-token", "fake-new-refresh-token")
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "needs_authorization"
+
+
+@pytest.mark.asyncio
+async def test_same_origin_redirect_refused_with_401_needs_authorization(home):
+    await asyncio.wait_for(_signed_in(), timeout=30)
+
+    # The redirect stays on the server's origin, so the redirected request
+    # keeps the saved sign-in, and its refusal counts.
+    await asyncio.wait_for(
+        _mcp_request_redirected_then_refused(
+            "https://mcp.example.com/moved/mcp",
+            401,
+            redirected_authorization="Bearer fake-access-token",
+        ),
+        timeout=30,
+    )
+
+    assert _markers(home)
     assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "needs_authorization"
