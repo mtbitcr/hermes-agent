@@ -148,6 +148,8 @@ def _remove_mcp_server_and_credentials(name: str) -> bool:
     Credentials are cleared before the config entry so a cleanup failure can
     never be reported as a successful revoke. If the subsequent config save
     fails, the captured OAuth state and any cached provider are restored.
+    The connection's sign-in-rejected markers are deleted only once the config
+    entry is gone, so a removal that fails deletes no marker.
     """
     if name not in _get_mcp_servers():
         return False
@@ -168,6 +170,7 @@ def _remove_mcp_server_and_credentials(name: str) -> bool:
         storage.restore(snapshot, only_if_absent=True)
         manager.restore_entry(name, cached_entry, hermes_home=hermes_home)
         raise
+    storage.remove_sign_in_rejected_markers()
     return True
 
 

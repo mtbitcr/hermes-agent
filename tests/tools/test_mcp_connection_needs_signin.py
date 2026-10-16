@@ -5,15 +5,18 @@ The gateway (token refresh, initial connect) and the dashboard
 recorded as a marker file beside the connection's token file. A refusal
 only counts against the tokens it refused: a newer sign-in saved meanwhile
 by another process stays connected, and obsolete work never changes the
-state of newer tokens. A failed owner transaction that restores refused
-tokens restores their refusal with them. Every token here is an obvious
-fake inside a temporary HERMES_HOME.
+state of newer tokens. The marker files are the only record of refusals:
+the rollback of a failed owner operation restores only the token files it
+changed and never writes, deletes or restores a marker, and only a completed
+connection removal deletes them. Every token here is an obvious fake inside
+a temporary HERMES_HOME.
 """
 
 import asyncio
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import threading
@@ -82,6 +85,43 @@ async def refuse(path, status, prefix):
     assert response.status_code == status
 
 asyncio.run(refuse(sys.argv[1], int(sys.argv[2]), sys.argv[3]))
+"""
+# Run in a second OS process: an owner operation on the saved sign-in, the
+# dashboard's sign-in worker ("dashboard") or the connection removal
+# ("removal"). After its own snapshot and temporary removal, its failing step
+# writes a ready line, waits for a line on stdin, then fails, and the operation
+# rolls back. Only the failing step is replaced.
+_OWNER_OPERATION_WAITS_THEN_FAILS = """
+import os
+import sys
+from hermes_cli import mcp_config, web_server
+from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+def wait_then_fail(*args, **kwargs):
+    print("waiting at the failing step", flush=True)
+    sys.stdin.readline()
+    raise OSError("fake: the overlapping operation failed")
+
+if sys.argv[1] == "removal":
+    mcp_config.save_config = wait_then_fail
+    try:
+        mcp_config._remove_mcp_server_and_credentials("srv")
+    except OSError as exc:
+        assert "fake: the overlapping operation failed" in str(exc), exc
+    else:
+        raise AssertionError("the connection removal did not fail")
+else:
+    mcp_config._authorize_oauth_server = wait_then_fail
+    flow = DashboardOAuthFlow(
+        flow_id="flow-srv-overlapping",
+        server_name="srv",
+        profile=None,
+        hermes_home=os.environ["HERMES_HOME"],
+        redirect_uri="https://agent.example/api/mcp/oauth/callback/srv",
+    )
+    web_server._run_dashboard_mcp_oauth(flow, {"url": "https://mcp.example.com/mcp", "auth": "oauth"})
+    assert flow.status == "error", flow.status
+    assert "fake: the overlapping operation failed" in flow.error, flow.error
 """
 
 
@@ -321,13 +361,16 @@ def _after_snapshot(monkeypatch, then=None) -> list:
     return snapshots
 
 
-def _dashboard_sign_in_fails(home, monkeypatch) -> None:
+def _dashboard_sign_in_fails(home, monkeypatch, at_failing_step=None) -> None:
     """The dashboard's sign-in worker removes the saved sign-in, the owner's
-    new sign-in fails, and the worker rolls back."""
+    new sign-in fails (right after ``at_failing_step`` runs), and the worker
+    rolls back."""
     from hermes_cli import mcp_config, web_server
     from tools.mcp_dashboard_oauth import DashboardOAuthFlow
 
     def _authorization_fails(name, config, *, connect_timeout):
+        if at_failing_step is not None:
+            at_failing_step()
         raise RuntimeError("fake: the new sign-in failed")
 
     monkeypatch.setattr(mcp_config, "_authorize_oauth_server", _authorization_fails)
@@ -345,18 +388,114 @@ def _dashboard_sign_in_fails(home, monkeypatch) -> None:
     assert "fake: the new sign-in failed" in flow.error
 
 
-def _removal_config_save_fails(home, monkeypatch) -> None:
-    """Connection removal clears the saved sign-in, the config save fails, and
-    the removal rolls back."""
+def _removal_config_save_fails(home, monkeypatch, at_failing_step=None) -> None:
+    """Connection removal clears the saved sign-in, the config save fails
+    (right after ``at_failing_step`` runs), and the removal rolls back."""
     from hermes_cli import mcp_config
 
     def _save_fails(*args, **kwargs):
+        if at_failing_step is not None:
+            at_failing_step()
         raise OSError("fake: config.yaml could not be written")
 
     monkeypatch.setattr(mcp_config, "save_config", _save_fails)
 
     with pytest.raises(OSError, match="fake: config.yaml"):
         mcp_config._remove_mcp_server_and_credentials(_SERVER)
+
+
+_OWNER_OPERATION_FAILS = {
+    "dashboard": _dashboard_sign_in_fails,
+    "removal": _removal_config_save_fails,
+}
+
+
+def _owner_operation_waits_in_another_process(home, kind: str, children: list) -> None:
+    """A second owner operation (``kind``: "dashboard" or "removal") runs in
+    another OS process: it takes its own snapshot, does its temporary removal
+    and waits at its failing step. Returns once it is waiting there; the caller
+    reaps each entry of ``children`` with ``_overlapping_operation_fails``."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", _OWNER_OPERATION_WAITS_THEN_FAILS, kind],
+        cwd=_REPO_ROOT,
+        env={**os.environ, "HERMES_HOME": str(home)},
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    output, waiting = [], threading.Event()
+
+    def _read_lines():
+        for line in child.stdout:
+            output.append(line)
+            if line.strip() == "waiting at the failing step":
+                waiting.set()
+        waiting.set()  # end of output: the operation has exited
+
+    reader = threading.Thread(target=_read_lines, daemon=True)
+    reader.start()
+    children.append((child, reader, output))
+    # pytest.fail, not assert: the dashboard worker reports an AssertionError
+    # as its own error.
+    if not waiting.wait(timeout=120):
+        pytest.fail(f"the {kind} operation did not reach its failing step:\n{''.join(output)}")
+    if not any(line.strip() == "waiting at the failing step" for line in output):
+        pytest.fail(f"the {kind} operation exited before its failing step:\n{''.join(output)}")
+
+
+def _overlapping_operation_fails(child, reader, output) -> tuple:
+    """Let the waiting operation fail and roll back: send its continue line and
+    wait for it to exit, killing it if it does not. Returns its exit status and
+    its output."""
+    try:
+        child.stdin.write("continue\n")
+        child.stdin.close()
+    except OSError:
+        pass  # it has exited already
+    try:
+        child.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait(timeout=60)
+    reader.join(timeout=60)
+    return child.returncode, "".join(output)
+
+
+def _marker_files(home) -> list:
+    """Each marker file's name, bytes and inode."""
+    return [(m.name, m.read_bytes(), m.stat().st_ino) for m in _markers(home)]
+
+
+async def _authorized_with_stable_tokens() -> None:
+    """The owner signs in and adds the connection. The token endpoint answers
+    with fake tokens without a lifetime (no ``expires_in``), which the real
+    provider's successful token-response handler saves; then the connection is
+    saved in config.yaml. Only the token endpoint's answer is a fixture."""
+    from hermes_cli import mcp_config
+    from tools.mcp_oauth import force_interactive_oauth
+    from tools.mcp_oauth_manager import get_manager
+    from tools.mcp_tool import sdk_httpx
+
+    storage = HermesTokenStorage(_SERVER)
+    await storage.set_client_info(OAuthClientInformationFull(client_id="fake-client-id"))
+    storage.save_oauth_metadata(
+        OAuthMetadata(
+            issuer="https://auth.example.com",
+            authorization_endpoint="https://auth.example.com/authorize",
+            token_endpoint="https://auth.example.com/token",
+        )
+    )
+    with force_interactive_oauth():  # the owner's own sign-in, as the dashboard's
+        provider = get_manager().get_or_build_provider(_SERVER, _URL, {})
+        await provider._initialize()
+        stable = {
+            "access_token": "fake-stable-access-token",
+            "refresh_token": "fake-stable-refresh-token",
+            "token_type": "Bearer",
+        }
+        await provider._handle_token_response(sdk_httpx().Response(200, json=stable))
+    assert mcp_config._save_mcp_server(_SERVER, dict(_OAUTH_CONFIG)) is True
 
 
 async def _assert_failed_transaction_keeps_refusal(
@@ -618,7 +757,7 @@ async def test_cross_origin_redirect_refused_with_403_stays_connected(home):
     await _assert_cross_origin_refusal_keeps_connected(home, 403)
 
 
-# -- a failed owner transaction restores a refused sign-in with its refusal ----
+# -- a refusal recorded during a failed owner operation stays on disk ---------
 
 
 @pytest.mark.asyncio
@@ -660,6 +799,122 @@ async def test_failed_connection_removal_keeps_refresh_401_refusal(home, monkeyp
 async def test_failed_connection_removal_keeps_mcp_403_refusal(home, monkeypatch):
     await _assert_failed_transaction_keeps_refusal(
         home, monkeypatch, _removal_config_save_fails, "mcp", 403
+    )
+
+
+# -- a rollback never touches a marker; only a completed removal deletes them --
+
+
+@pytest.mark.parametrize("inner", ["dashboard", "removal"])
+@pytest.mark.parametrize("outer", ["dashboard", "removal"])
+@pytest.mark.asyncio
+async def test_overlapping_failed_owner_operations_keep_recorded_refusal(
+    home, monkeypatch, outer, inner
+):
+    from hermes_cli import mcp_config
+
+    await _signed_in()
+    _configured(home)
+    signed_in = _token_file(home).read_bytes()
+    marker = f"{_SERVER}.signin-rejected.{hashlib.sha256(signed_in).hexdigest()}"
+    children, while_inner_waits = [], []
+
+    def _refused_then_inner_operation_waits():
+        # The gateway records the refusal of the tokens on disk; then a second
+        # owner operation removes them and waits at its failing step.
+        _refuse_in_another_process(home, "refresh", 400)
+        _owner_operation_waits_in_another_process(home, inner, children)
+        while_inner_waits.append(
+            (_token_file(home).exists(), [m.name for m in _markers(home)])
+        )
+
+    _after_snapshot(monkeypatch, _refused_then_inner_operation_waits)
+    try:
+        _OWNER_OPERATION_FAILS[outer](home, monkeypatch)
+
+        assert while_inner_waits == [(False, [marker])]
+        assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "needs_authorization"
+    finally:
+        finished = [_overlapping_operation_fails(*child) for child in children]
+
+    assert [returncode for returncode, _ in finished] == [0], finished
+    assert _token_file(home).read_bytes() == signed_in
+    assert _SERVER in mcp_config._get_mcp_servers()
+    [path] = _markers(home)
+    assert path.name == marker
+    assert path.read_bytes() == b""
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "needs_authorization"
+
+
+@pytest.mark.parametrize("operation", ["dashboard", "removal"])
+@pytest.mark.asyncio
+async def test_rollback_after_completed_removal_and_stable_re_add_stays_connected(
+    home, monkeypatch, operation
+):
+    from hermes_cli import mcp_config
+
+    await _authorized_with_stable_tokens()
+    signed_in = _token_file(home).read_bytes()
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
+    _refuse_in_another_process(home, "refresh", 400, "fake-stable")
+
+    assert mcp_config._remove_mcp_server_and_credentials(_SERVER) is True
+    assert not _token_file(home).exists()
+    assert not _markers(home)
+    assert _SERVER not in mcp_config._get_mcp_servers()
+
+    # Tokens without a lifetime can be stable, so the new sign-in saves the
+    # same bytes under the same connection name.
+    await _authorized_with_stable_tokens()
+    assert _token_file(home).read_bytes() == signed_in
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
+    assert not _markers(home)
+
+    # No refusal arrives before, during or after the failed operation.
+    _OWNER_OPERATION_FAILS[operation](home, monkeypatch)
+
+    assert _token_file(home).read_bytes() == signed_in
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
+    assert not _markers(home)
+
+
+async def _assert_failed_operation_leaves_marker_files(home, monkeypatch, operation) -> None:
+    """Refusals of the signed-in tokens and of their replacement D are on disk;
+    the failed operation neither deletes, rewrites nor restores a marker file."""
+    await _signed_in()
+    _configured(home)
+    _refuse_in_another_process(home, "refresh", 400)
+    _save_new_tokens_in_another_process(home)
+    _refuse_in_another_process(home, "refresh", 400, "fake-new")
+    replacement = _token_file(home).read_bytes()
+    marker_files = _marker_files(home)
+    assert len(marker_files) == 2
+    at_failing_step = []
+
+    operation(
+        home,
+        monkeypatch,
+        lambda: at_failing_step.append((_token_file(home).exists(), _marker_files(home))),
+    )
+
+    assert at_failing_step == [(False, marker_files)]
+    assert _marker_files(home) == marker_files
+    assert _token_file(home).read_bytes() == replacement
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "needs_authorization"
+
+
+@pytest.mark.asyncio
+async def test_failed_dashboard_sign_in_leaves_marker_files_unchanged(home, monkeypatch):
+    await _assert_failed_operation_leaves_marker_files(
+        home, monkeypatch, _dashboard_sign_in_fails
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_connection_removal_leaves_marker_files_unchanged(home, monkeypatch):
+    await _assert_failed_operation_leaves_marker_files(
+        home, monkeypatch, _removal_config_save_fails
     )
 
 
