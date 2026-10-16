@@ -501,6 +501,107 @@ def test_a_conflict_outside_the_approved_paths_goes_back_to_the_builder(exact, c
     _returned(kb, repo, gh, tid, head, main, "conflict", branches)
 
 
+@pytest.mark.parametrize("name, continued", [("café", False), ('say"hi', False), ("back\\slash", True),
+                                             ("tab\there", True), ("new\nline", True)],
+                         ids=["unicode", "double_quote", "backslash", "tab", "newline"])
+def test_a_conflict_in_a_file_whose_name_git_quotes_gets_a_card_on_main(exact, name, continued):
+    """Git quotes such a name in its line output; the conflicted file is read as the same raw name _paths reads. Main
+    adds the approved change's own file too, so merging conflicts in it, inside the approved and owned paths: the
+    source card's own file, or the file a continuation adds on top of H. One pass makes one update card based on
+    main, its branch head with H and main as its parents and the conflict marked in that file, and the kernel's
+    delivery_updated event names the file by its raw name."""
+    kb, root, repo, gh = exact
+    path = f"src/impl/{name}.py"
+    if continued:
+        _, _, _, tid, head = _continued(exact, build=lambda workspace: _fix(workspace, path))
+    else:
+        tid, head, base = _approved_head(exact, name=name)
+    main = _main_moves(exact, path, "ok = False\n")
+    _setting(root, "true")
+
+    _tick(kb)
+
+    db = kb.kanban_db_path()
+    assert (_state(kb, head), [task["branch_name"] for task in _raw(db, CONTINUED, tid)]) == ("updated", [])
+    card = _update(kb, tid)
+    update = _head(repo, card)
+    assert (card["base_commit"], _parents(repo, update)) == (main, [head, main])
+    marked = _git(repo, "show", f"{update}:{path}").splitlines()
+    assert [line for line in marked if line.startswith(("<<<<<<<", "=======", ">>>>>>>"))] == [
+        f"<<<<<<< {main}", "=======", f">>>>>>> {head}"] and "ok = False" in marked
+    assert [payload["conflicts"] for payload in _updated(kb, tid)] == [[path]]
+
+
+def test_a_file_main_deleted_that_the_approved_change_modified_is_named_as_deleted_on_main(exact):
+    """The reviewed base holds src/impl/feature.py, H modifies it and main deletes it: git's merged tree holds H's
+    version, with no conflict markers. One pass makes one update card based on main, its branch head with H and main
+    as its parents and that version. Its body names the file as deleted on main, says the branch holds the approved
+    change's version and asks the builder to keep or delete it, never that a conflict is marked; the kernel's
+    delivery_updated event names it among the conflicts and as deleted on main."""
+    kb, root, repo, gh = exact
+    _main_moves(exact, "src/impl/feature.py", "ok = None\n", where="local")
+    tid, head, base = _approved_head(exact)
+    _git(repo, "rm", "-q", "src/impl/feature.py")
+    _git(repo, "commit", "-q", "-m", "main deletes src/impl/feature.py")
+    _git(repo, "push", "-q", str(gh["bare"]), "HEAD:refs/heads/main")
+    main = gh["main"] = _git(repo, "rev-parse", "HEAD")
+    _setting(root, "true")
+
+    _tick(kb)
+
+    db = kb.kanban_db_path()
+    assert (_state(kb, head), [task["branch_name"] for task in _raw(db, CONTINUED, tid)]) == ("updated", [])
+    card = _update(kb, tid)
+    update = _head(repo, card)
+    assert (card["status"], card["assignee"], card["base_commit"], _parents(repo, update)) == (
+        "ready", IMPLEMENTER, main, [head, main])
+    assert _git(repo, "show", f"{update}:src/impl/feature.py").splitlines() == ["ok = True"]
+    assert (f"main is at {main}. Merging it with the approved change conflicts in these files, which main deleted and "
+            f"the approved change modified: src/impl/feature.py. This card's branch {card['branch_name']} at {update} "
+            "is on current main and holds the approved change's version of them, with no conflict markers: keep or "
+            "delete each of them. Change nothing else, and hand over for review.") in card["body"]
+    assert "marked" not in card["body"]
+    assert [(payload["conflicts"], payload.get("deleted_on_main")) for payload in _updated(kb, tid)] == [
+        (["src/impl/feature.py"], ["src/impl/feature.py"])]
+
+
+def test_a_conflict_in_a_file_whose_name_is_not_utf_8_goes_back_to_the_builder(exact):
+    """A continuation adds a file on top of H whose name is no UTF-8, the bytes b"caf\\xe9", inside the approved and
+    owned paths, and main adds it too: no event or card body can hold that name as text, so the conflict goes back to
+    the builder as a conflict, with no update card and no error."""
+    kb, root, repo, gh = exact
+    path = b"src/impl/caf\xe9.py".decode("utf-8", "surrogateescape")  # as _paths decodes it
+    _, _, _, tid, head = _continued(exact, build=lambda workspace: _fix(workspace, path))
+    main = _main_moves(exact, path, "ok = False\n")
+    _setting(root, "true")
+    branches = _branches(repo)
+
+    _tick(kb)
+
+    _returned(kb, repo, gh, tid, head, main, "conflict", branches)
+
+
+def test_a_file_the_approved_change_deleted_and_main_modified_goes_back_to_the_builder(exact):
+    """The reviewed base holds src/impl/gone.py, a continuation deletes it on top of H and main modifies it: git leaves
+    main's version in the merged tree, so the update would not carry the approved change, and it goes back to the
+    builder as a conflict."""
+    kb, root, repo, gh = exact
+    _main_moves(exact, "src/impl/gone.py", "gone = False\n", where="local")
+
+    def deletes_its_file(workspace):
+        _git(workspace, "rm", "-q", "src/impl/gone.py")
+        _git(workspace, "commit", "-q", "-m", "delete src/impl/gone.py")
+
+    _, _, _, tid, head = _continued(exact, build=deletes_its_file)
+    main = _main_moves(exact, "src/impl/gone.py", "changed on main\n")
+    _setting(root, "true")
+    branches = _branches(repo)
+
+    _tick(kb)
+
+    _returned(kb, repo, gh, tid, head, main, "conflict", branches)
+
+
 def test_a_continued_delivery_is_brought_up_to_date_when_main_moves(exact):
     """H went back to its builder, and its continuation, reviewed on H, is approved and delivered on top. Main moves
     on an unrelated file, so the arm records base_moved. The approved change runs from where the chain started, H's
