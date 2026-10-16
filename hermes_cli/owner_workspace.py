@@ -82,7 +82,6 @@ import secrets
 import sqlite3
 import stat
 import time
-import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -96,6 +95,7 @@ from hermes_cli.kanban_risk_tier import (
     pinned_reasoning_effort,
     recovered_root_risk_tier,
 )
+from hermes_cli.owner_text import check_owner_text
 from hermes_cli.sqlite_util import write_txn
 from plugins.dashboard_auth.raphael_workspace.model_policy import (
     configured_assignment_for,
@@ -4536,78 +4536,25 @@ def owner_title(value: Any) -> str:
     See :func:`_owner_display_text` for the egress contract. A work-item
     title additionally loses the internal ``B03 — ``-style dispatcher prefix,
     which is Raphael's own bookkeeping and means nothing to the owner.
+
+    An empty title becomes :data:`_UNTITLED_WORK_ITEM`. A title failing the
+    owner-text policy's title check
+    (:func:`hermes_cli.owner_text.check_owner_text`) on the whole raw input —
+    before any line break is collapsed, its length included, so an overlong
+    title is refused rather than cut — or holding a private pattern or failing
+    the check once displayed, becomes the policy's fixed title sentence.
     """
+    raw = str(value or "")
+    if raw.strip() and check_owner_text(raw, "title") != raw:
+        return check_owner_text(None, "title")
     title = _owner_display_text(
         value, limit=_OWNER_TITLE_LIMIT, strip_internal_prefix=True
     )
-    if not title or any(
-        pattern.search(title) for pattern in _OWNER_PRIVATE_WORK_ITEM_PATTERNS
-    ):
+    if not title:
         return _UNTITLED_WORK_ITEM
-    return title
-
-
-# Worker stop text carries shapes a title never does, so only
-# :func:`owner_stop_reason` checks these, on top of the title patterns: this
-# kernel's own task ids (``kanban_db._new_task_id``); a full commit id; a
-# ``file:`` link; a drive-relative Windows path (a single letter starting a
-# word, a colon and no space after it, as in ``C:notes.txt``); this platform's
-# own Project ids (``projects_db._new_project_id`` and ``_derive_id``). Each is
-# matched wherever it sits, since an id wrapped in other characters is still an
-# id; a short commit id is :func:`_names_a_commit`'s. Both the cleaned and the
-# raw text are checked, so nothing past the display cut escapes the check. Paths are
-# refused by the characters a reason may hold rather than by shape: a reason
-# reaches the owner only when every character is a letter, mark or digit of any
-# script, a space, or plain punctuation (:data:`_OWNER_STOP_REASON_PUNCTUATION`),
-# so ``/``, ``\\``, every look-alike of either and every other symbol makes the
-# whole reason fall back. A mark counts as text unless its Unicode name says
-# COMBINING or VARIATION SELECTOR, or it encloses what precedes it.
-_OWNER_PRIVATE_STOP_REASON_PATTERNS = (
-    re.compile(r"t_[0-9a-f]{8}", re.IGNORECASE),
-    re.compile(r"[0-9a-f]{40}", re.IGNORECASE),
-    re.compile(r"\bfile:/", re.IGNORECASE),
-    re.compile(r"(?<!\w)[A-Za-z]:(?=\S)"),
-    re.compile(r"p_[0-9a-f]{8,}", re.IGNORECASE),
-)
-_OWNER_STOP_REASON_PUNCTUATION = frozenset(
-    ".,;:!?'\"()-%&"
-    "\u00ab\u00bb\u2013\u2014\u2018\u2019\u201c\u201d\u2026"
-    "\u3001\u3002\uff01\uff08\uff09\uff0c\uff1a\uff1b\uff1f"
-)
-
-
-def _plain_stop_text(text: str) -> bool:
-    """Whether every character of ``text`` is one a stop reason may show the owner.
-
-    Accents are composed into their letters first (NFC); a mark that remains
-    is refused when it encloses what precedes it or when its Unicode name says
-    COMBINING (every overlay) or VARIATION SELECTOR, so what stays is a
-    script's own vowel signs and the like.
-    """
-    for char in unicodedata.normalize("NFC", text):
-        category = unicodedata.category(char)
-        if char in _OWNER_STOP_REASON_PUNCTUATION or category[0] in "LN" or char.isspace():
-            continue
-        name = unicodedata.name(char, "COMBINING")
-        if category in ("Mn", "Mc") and "COMBINING" not in name and "VARIATION SELECTOR" not in name:
-            continue
-        return False
-    return True
-
-
-def _names_a_commit(text: str) -> bool:
-    """Whether ``text`` holds a commit id, full or short: seven or more hex
-    characters in any case that hold a digit, or that stand as a word of their
-    own (no letter or digit of any script beside them), so a word such as
-    "feedback" stays readable."""
-    for match in re.finditer(r"[0-9a-f]{7,}", text, re.IGNORECASE):
-        before = text[match.start() - 1] if match.start() else ""
-        after = text[match.end()] if match.end() < len(text) else ""
-        if any(char.isdigit() for char in match.group()) or not (
-            before.isalnum() or after.isalnum()
-        ):
-            return True
-    return False
+    if any(pattern.search(title) for pattern in _OWNER_PRIVATE_WORK_ITEM_PATTERNS):
+        return check_owner_text(None, "title")
+    return check_owner_text(title, "title")
 
 
 def owner_stop_reason(
@@ -4619,24 +4566,17 @@ def owner_stop_reason(
 
     Same egress contract as :func:`owner_title` — see
     :func:`_owner_display_text` — bounded at 500 code points. A reason that is
-    empty after cleaning, whose cleaned or raw text holds a character
-    :func:`_plain_stop_text` refuses or a commit id, or that carries a private
-    pattern (a title's, or one of :data:`_OWNER_PRIVATE_STOP_REASON_PATTERNS`)
-    in the cleaned OR the raw text, is replaced whole by the fixed
-    ``fallback`` sentence rather than shown in part.
+    empty after cleaning, or whose cleaned or raw text fails the owner-text
+    policy's stop-reason check (:func:`hermes_cli.owner_text.check_owner_text`),
+    is replaced whole by the fixed ``fallback`` sentence rather than shown in
+    part; checking the raw text too means nothing past the display cut escapes
+    the check. Both stop-reason kinds hold the same rules, so ``fallback``
+    alone decides which sentence the owner reads.
     """
     reason = _owner_display_text(value, limit=500)
-    raw = str(value or "")
-    texts = (reason, raw)
-    if not reason or not all(_plain_stop_text(text) for text in texts) or any(
-        _names_a_commit(text) for text in texts
-    ) or any(
-        pattern.search(text)
-        for text in texts
-        for pattern in (
-            *_OWNER_PRIVATE_WORK_ITEM_PATTERNS,
-            *_OWNER_PRIVATE_STOP_REASON_PATTERNS,
-        )
+    if any(
+        check_owner_text(text, "stop_reason_decision") != text
+        for text in (reason, str(value or ""))
     ):
         return fallback
     return reason
@@ -4656,41 +4596,37 @@ def owner_project_name(value: Any) -> str:
     Every owner-facing surface that shows a Project name projects it through
     here, so the name an owner reads in a Project list, a snapshot, a steward
     report or a decision cannot disagree between surfaces.
+
+    An empty name becomes :data:`_UNTITLED_PROJECT`. A name failing the
+    owner-text policy's project-name check
+    (:func:`hermes_cli.owner_text.check_owner_text`) on the whole raw input —
+    before any line break is collapsed, its length included, so an overlong
+    name is refused rather than cut — or on the displayed name becomes the
+    policy's fixed project-name sentence.
     """
-    return _owner_display_text(
-        value, limit=_OWNER_PROJECT_NAME_LIMIT
-    ) or _UNTITLED_PROJECT
+    raw = str(value or "")
+    if raw.strip() and check_owner_text(raw, "project_name") != raw:
+        return check_owner_text(None, "project_name")
+    name = _owner_display_text(value, limit=_OWNER_PROJECT_NAME_LIMIT)
+    if not name:
+        return _UNTITLED_PROJECT
+    return check_owner_text(name, "project_name")
 
 
 def _native_owner_title(value: Any, field: str) -> str:
     """Canonicalize one work-item title Hermes itself is about to write.
 
-    Hermes is not only a projection surface: ``owner_task_graph_commit`` and
-    ``owner_project_plan_commit`` write task titles straight into
-    ``kanban.db``, and every owner surface reads them back through
-    :func:`owner_title`. Canonicalizing at input — BEFORE the request digest,
-    the owner's approval description, persistence and the replay comparison
-    all bind to this exact string — is what keeps the stored title and its
-    projection the same text, so a caller that reaches this kernel directly
-    cannot store a title that only becomes safe on the way back out.
-
-    The ``limit`` is unchanged (:data:`_OWNER_TITLE_LIMIT`, still enforced by
-    :func:`_bounded_text` as a rejection, not a truncation, of raw input);
-    :func:`_owner_display_text` — the one core :func:`owner_title` projects
-    through — supplies the rest of the contract, including the same secret
-    redaction and the internal-prefix strip.
-
-    It is called directly rather than through :func:`owner_title` so that
-    emptiness is read from the canonical text itself. A value that
-    canonicalizes to nothing carries no owner-visible text at all — it was
-    invisible characters, or nothing but an internal dispatcher prefix — and
-    storing the read-side placeholder would record a title the owner never
-    wrote, so it is rejected. Testing the projection against that placeholder
-    instead would also reject ``Untitled work item`` as a literal title, which
-    is owner-visible text like any other and persists as written.
+    The stored title is :func:`owner_title`'s own answer for the whole raw
+    input, taken before the request digest, the owner's approval, persistence
+    and the replay comparison bind to it, so the stored and the shown title
+    cannot differ. A title that is missing, longer than
+    :data:`_OWNER_TITLE_LIMIT` once trimmed, without owner-visible text or
+    holding private operational detail is refused instead of stored.
     """
+    stored = owner_title(value)
+    raw = _bounded_text(value, field, limit=_OWNER_TITLE_LIMIT)
     title = _owner_display_text(
-        _bounded_text(value, field, limit=_OWNER_TITLE_LIMIT),
+        raw,
         limit=_OWNER_TITLE_LIMIT,
         strip_internal_prefix=True,
     )
@@ -4702,27 +4638,25 @@ def _native_owner_title(value: Any, field: str) -> str:
         raise OwnerWorkspaceError(
             "invalid_argument", f"{field} contains private operational detail",
         )
-    return title
+    return stored
 
 
 def _native_owner_project_name(value: Any, field: str) -> str:
     """Canonicalize one Project name Hermes itself is about to write.
 
-    Same native-write contract as :func:`_native_owner_title`, against the
-    core :func:`owner_project_name` projects through: the 160 code point bound,
-    no internal-prefix strip, and canonical emptiness rejected rather than
-    stored as the ``Untitled Project`` placeholder. A Project an owner really
-    named ``Untitled Project`` is owner text and is written as it stands.
+    Same contract as :func:`_native_owner_title`: the stored name is
+    :func:`owner_project_name`'s own answer for the whole raw input, and a
+    name that is missing, longer than :data:`_OWNER_PROJECT_NAME_LIMIT` once
+    trimmed or without owner-visible text is refused instead of stored.
     """
-    name = _owner_display_text(
-        _bounded_text(value, field, limit=_OWNER_PROJECT_NAME_LIMIT),
-        limit=_OWNER_PROJECT_NAME_LIMIT,
-    )
+    stored = owner_project_name(value)
+    raw = _bounded_text(value, field, limit=_OWNER_PROJECT_NAME_LIMIT)
+    name = _owner_display_text(raw, limit=_OWNER_PROJECT_NAME_LIMIT)
     if not name:
         raise OwnerWorkspaceError(
             "invalid_argument", f"{field} has no owner-visible text",
         )
-    return name
+    return stored
 
 
 def _open_read_only_sqlite(path, *, label: str) -> sqlite3.Connection:
