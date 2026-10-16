@@ -252,7 +252,7 @@ class TestOwnerWorkspaceRunContext:
             " https://deploy:hunter2verylongpassword@git.example.com/repo.git"
         )
         projected = (
-            "Workshop pilot https://***@git.example.com/repo.git"
+            "This project has a name Raphael cannot show here."
         )
         assert owner_project_name(unsafe) == projected
 
