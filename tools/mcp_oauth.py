@@ -36,6 +36,7 @@ Configuration in config.yaml::
 
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -397,6 +398,11 @@ def _dashboard_oauth_persistence_guard(*, rollback: bool = False):
         yield
 
 
+def _json_file_bytes(data: dict) -> bytes:
+    """Return the exact bytes ``_write_json`` writes for ``data``."""
+    return json.dumps(data, indent=2, default=str).encode("utf-8")
+
+
 def _write_json(path: Path, data: dict) -> None:
     """Write a dict as JSON with restricted permissions (0o600)."""
     with _dashboard_oauth_persistence_guard():
@@ -427,8 +433,8 @@ def _write_json_unchecked(path: Path, data: dict) -> None:
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
             stat.S_IRUSR | stat.S_IWUSR,
         )
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, default=str)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(_json_file_bytes(data))
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
@@ -438,6 +444,18 @@ def _write_json_unchecked(path: Path, data: dict) -> None:
         except OSError:
             pass
         raise
+
+
+# A sign-in-rejected marker is named by the SHA-256 of the token file it refuses.
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def _create_marker(path: Path) -> None:
+    """Create an empty marker file only by exclusive create; never rewrite one."""
+    try:
+        os.close(os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, stat.S_IRUSR | stat.S_IWUSR))
+    except FileExistsError:
+        pass  # the same refusal is already recorded
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +471,7 @@ class HermesTokenStorage:
         HERMES_HOME/mcp-tokens/<server_name>.json         -- tokens
         HERMES_HOME/mcp-tokens/<server_name>.client.json   -- client info
         HERMES_HOME/mcp-tokens/<server_name>.meta.json     -- oauth server metadata
+        HERMES_HOME/mcp-tokens/<server_name>.signin-rejected.<sha256> -- that token file was refused (empty)
     """
 
     def __init__(self, server_name: str, *, hermes_home: str | Path | None = None):
@@ -467,6 +486,21 @@ class HermesTokenStorage:
 
     def _meta_path(self) -> Path:
         return _get_token_dir(self._hermes_home) / f"{self._server_name}.meta.json"
+
+    def _sign_in_rejected_path(self, tokens_sha256: str) -> Path:
+        return _get_token_dir(self._hermes_home) / f"{self._server_name}.signin-rejected.{tokens_sha256}"
+
+    def _sign_in_rejected_paths(self) -> list[Path]:
+        """Every sign-in-rejected marker of this server, whatever token file it names."""
+        prefix = f"{self._server_name}.signin-rejected."
+        try:
+            entries = list(_get_token_dir(self._hermes_home).iterdir())
+        except OSError:
+            return []
+        return [
+            p for p in entries
+            if p.name.startswith(prefix) and _SHA256_HEX.fullmatch(p.name[len(prefix):])
+        ]
 
     # -- tokens ------------------------------------------------------------
 
@@ -491,7 +525,10 @@ class HermesTokenStorage:
         # on the next successful ``set_tokens``, which writes the new
         # ``expires_at`` field. The stored ``expires_at`` is stripped before
         # model_validate because it's not part of the SDK's OAuthToken schema.
+        # Neither is ``sign_in_id``, which only gives a save its own token
+        # file bytes (see ``set_tokens``).
         absolute_expiry = data.pop("expires_at", None)
+        data.pop("sign_in_id", None)
         if absolute_expiry is not None:
             data["expires_in"] = int(max(absolute_expiry - time.time(), 0))
         elif data.get("expires_in") is not None:
@@ -542,6 +579,14 @@ class HermesTokenStorage:
                 # Mock tokens or unusual shapes: skip the expires_at write
                 # rather than fail persistence.
                 pass
+        # A provider can re-issue identical tokens without a lifetime. A save
+        # that would recreate the exact bytes of a refused token file gets its
+        # own identity, so the older refusal stops counting as for any new
+        # sign-in; set_tokens never touches a marker.
+        if self._sign_in_rejected_path(
+            hashlib.sha256(_json_file_bytes(payload)).hexdigest()
+        ).exists():
+            payload["sign_in_id"] = secrets.token_hex(16)
         _write_json(self._tokens_path(), payload)
         logger.debug("OAuth tokens saved for %s", self._server_name)
 
@@ -609,19 +654,42 @@ class HermesTokenStorage:
     # -- cleanup -----------------------------------------------------------
 
     def remove(self) -> None:
-        """Delete all stored OAuth state for this server."""
-        for p in (self._tokens_path(), self._client_info_path(), self._meta_path()):
+        """Delete this server's token, client-info and metadata files.
+
+        Its sign-in-rejected markers stay: this is also the temporary removal
+        of an owner operation that can still roll back. Only a completed
+        connection removal deletes them, with ``remove_sign_in_rejected_markers()``.
+        """
+        for p in (
+            self._tokens_path(),
+            self._client_info_path(),
+            self._meta_path(),
+        ):
+            p.unlink(missing_ok=True)
+
+    def remove_sign_in_rejected_markers(self) -> None:
+        """Delete every sign-in-rejected marker of this server.
+
+        Only a completed connection removal calls this.
+        """
+        for p in self._sign_in_rejected_paths():
             p.unlink(missing_ok=True)
 
     def snapshot(self) -> dict[str, bytes]:
         """Capture on-disk OAuth state so a failed re-auth can restore it.
 
-        Maps filename -> bytes for whichever of the three state files exist.
-        Feed back to ``restore()`` to undo an intervening ``remove()`` when a
-        re-authentication attempt fails, so a still-valid token isn't destroyed.
+        Maps filename -> bytes for whichever of the token, client-info and
+        metadata files exist; no sign-in-rejected marker is captured. Feed
+        back to ``restore()`` to undo an intervening ``remove()`` when a
+        re-authentication attempt fails, so a still-valid token isn't
+        destroyed.
         """
         snap: dict[str, bytes] = {}
-        for p in (self._tokens_path(), self._client_info_path(), self._meta_path()):
+        for p in (
+            self._tokens_path(),
+            self._client_info_path(),
+            self._meta_path(),
+        ):
             try:
                 snap[p.name] = p.read_bytes()
             except OSError:
@@ -629,7 +697,12 @@ class HermesTokenStorage:
         return snap
 
     def restore(self, snapshot: dict[str, bytes], *, only_if_absent: bool = False) -> None:
-        """Revert to a snapshot without overwriting a concurrent successful write."""
+        """Revert to a snapshot without overwriting a concurrent successful write.
+
+        Restores only the token, client-info and metadata files. A rollback
+        never writes, deletes or restores a sign-in-rejected marker: a marker
+        on disk counts again once the token file it names is restored.
+        """
         with _dashboard_oauth_persistence_guard(rollback=True):
             self._restore_snapshot(snapshot, only_if_absent=only_if_absent)
 
@@ -645,7 +718,8 @@ class HermesTokenStorage:
                 self._server_name,
             )
             return
-        self.remove()
+        for path in (self._tokens_path(), self._client_info_path(), self._meta_path()):
+            path.unlink(missing_ok=True)
         if not snapshot:
             return
         token_dir = _get_token_dir(self._hermes_home)
@@ -701,6 +775,67 @@ class HermesTokenStorage:
     def has_cached_tokens(self) -> bool:
         """Return True if we have tokens on disk (may be expired)."""
         return self._tokens_path().exists()
+
+    def mark_sign_in_rejected(self, refused: "OAuthToken | None") -> bool:
+        """Record on disk that the provider refused the credentials ``refused``.
+
+        The dashboard reads it from another process and reports
+        ``needs_authorization`` while the token file holding ``refused`` is on
+        disk. The marker is an empty file named by the SHA-256 of that token
+        file (no token data), created only by exclusive create and never
+        rewritten, so a refusal never changes the marker of other token file
+        content, and a refusal of tokens that a newer sign-in has replaced,
+        in this or another process, never rejects the newer ones.
+        Best-effort: returns False when the token file no longer holds
+        ``refused`` or the marker cannot be written, so callers' auth handling
+        is unchanged.
+        """
+        try:
+            stored_bytes = self._tokens_path().read_bytes()
+            stored = json.loads(stored_bytes)
+        except (OSError, ValueError):
+            stored = None
+        # A refresh response may omit the refresh token; set_tokens then keeps
+        # the stored one, so only an in-memory refresh token must match.
+        if not (
+            refused is not None
+            and isinstance(stored, dict)
+            and stored.get("access_token") == refused.access_token
+            and (
+                refused.refresh_token is None
+                or stored.get("refresh_token") == refused.refresh_token
+            )
+        ):
+            logger.debug(
+                "Refused OAuth credentials for %s are no longer stored; not marked",
+                self._server_name,
+            )
+            return False
+        marker = self._sign_in_rejected_path(hashlib.sha256(stored_bytes).hexdigest())
+        try:
+            with _dashboard_oauth_persistence_guard():
+                _create_marker(marker)
+        except (OSError, RuntimeError) as exc:
+            logger.warning(
+                "Could not record the rejected sign-in for %s: %s",
+                self._server_name, exc,
+            )
+            return False
+        logger.debug("OAuth sign-in marked as rejected for %s", self._server_name)
+        return True
+
+    def is_sign_in_rejected(self) -> bool:
+        """Return True while a marker names the token file now on disk.
+
+        Only the marker of the current token file's SHA-256 is read; markers
+        of replaced token files are obsolete and ignored, whatever order the
+        processes wrote in.
+        """
+        try:
+            stored_bytes = self._tokens_path().read_bytes()
+        except OSError:
+            return False
+        return self._sign_in_rejected_path(hashlib.sha256(stored_bytes).hexdigest()).exists()
 
 
 # ---------------------------------------------------------------------------
