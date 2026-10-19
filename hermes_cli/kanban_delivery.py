@@ -1015,8 +1015,13 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
         if count > 100 or len(runs) != count:  # the one decision request, read last: whole on its one page
             raise PublishRefused("ci_unreadable", f"{count} check runs on {head}, {len(runs)} in the answer")
         named = {name: [run for run in runs if run.get("name") == name] for name in required}
+        for name, found in named.items():  # a later CI run of H holds a check again: the newest check suite decides
+            suites = [run["check_suite"].get("id") if isinstance(run.get("check_suite"), dict) else None
+                      for run in found]
+            if len(found) > 1 and all(type(suite) is int for suite in suites):  # a rerun keeps its run's older suite
+                named[name] = [run for run in found if run["check_suite"]["id"] == max(suites)]
         if not named or any(len(found) != 1 for found in named.values()):
-            return None  # a required check that is not in the answer exactly once decides nothing
+            return None  # a required check missing, or doubled in its newest suite or with no suite, decides nothing
         outcomes = {_required_check(name, head, {"check_runs": found, "statuses": []}) for name, found in named.items()}
         if outcomes & {"pending", "stale"}:
             return None  # CI on H still runs: a later step tries again
