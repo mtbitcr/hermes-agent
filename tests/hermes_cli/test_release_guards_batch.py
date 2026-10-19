@@ -145,6 +145,25 @@ def test_a_change_built_on_t0_and_merged_onto_m1_is_refused_by_g3_and_by_the_arm
     assert _g3(repo, t0, m2, [_record(repo, m1, t0, a), _record(repo, m2, t0, stale)]) is False
 
 
+def test_the_merge_of_a_clean_update_passes_g3(history):
+    """Card B: H was reviewed on T0, and main moved to M1 with a change H does not touch. The clean update U is
+    git's merge-tree of M1 and H, committed with H and M1 as its parents, and its publish binds U to M1. At U's arm
+    main is M1, its bound base, and GitHub's merge of exactly U, M2, passes G3 for T0..M2 in one batch with M1."""
+    from hermes_cli import kanban_delivery_update
+
+    repo, t0, change, merge = history
+    a = change(t0, "a")
+    m1 = merge(t0, a)
+    head = change(t0, "b")
+    tree = _git(repo, "merge-tree", "--write-tree", m1, head).splitlines()[0]
+    update = kanban_delivery_update._branch(repo, "delivery-update/b", tree, head, m1, "b on main\n")
+    assert _git(repo, "rev-list", "--parents", "-n", "1", update).split()[1:] == [head, m1]
+
+    assert kd.base_allows_merge(repo, m1, m1, update)
+    m2 = merge(m1, update)
+    assert _g3(repo, t0, m2, [_record(repo, m1, t0, a), _record(repo, m2, m1, update)]) is True
+
+
 @pytest.mark.parametrize("main, workdir", [("f" * 40, "repo"), ("main", None), ("main", "missing")],
                          ids=["unknown_commit", "no_repository", "missing_repository"])
 def test_any_doubt_about_containment_is_not_contained(history, tmp_path, main, workdir):

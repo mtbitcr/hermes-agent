@@ -240,6 +240,33 @@ def test_review_lane_gets_reserved_slot_under_ready_backlog(
     assert review_id in spawned_ids
 
 
+def test_a_review_that_can_start_still_gets_its_place_under_a_ready_backlog(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """A per-profile cap with room left keeps the review's reserved slot."""
+    import hermes_cli.config as cfgmod
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+
+    spawns: list = []
+    with kb.connect() as conn:
+        for title in ("ready-1", "ready-2", "ready-3"):
+            kb.create_task(conn, title=title, assignee="alice")
+        review_id = _park_in_review(conn, "review-me", "reviewer")
+        res = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
+            max_in_progress_per_profile=2,
+        )
+
+    spawned_ids = [s[0] for s in res.spawned]
+    # Alice's cap alone would let the ready lane take both slots; the
+    # reviewer has room, so its review keeps the held one.
+    assert len(spawned_ids) == 2
+    assert review_id in spawned_ids
+
+
 def test_review_reservation_released_when_no_review_work(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):

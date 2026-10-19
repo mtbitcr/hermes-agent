@@ -148,7 +148,7 @@ def _carrying(records, text):
 def _made_by_send_email(records):
     return [
         record for record in records
-        if record.funcName == "_send_email"
+        if record.funcName in ("_send_email", "_send_email_with_attachment")
         and os.path.normcase(os.path.abspath(record.pathname)) == EMAIL_ADAPTER_FILE
     ]
 
@@ -192,7 +192,7 @@ async def test_email_resend_logs_no_recipient(outbox, platforms, tmp_path, image
     runner = _runner(adapter)
 
     # The re-send as the gateway route runs it: claimed, then sent from a worker thread through the
-    # live adapter map while the gateway loop runs; the images go one fallback notice each.
+    # live adapter map while the gateway loop runs; each image goes as one message with an image attachment.
     with _every_record() as records:
         claim = await asyncio.to_thread(scheduler.claim_report_resend, execution_id, "placeholder-request-1")
         assert claim["claimed"] and claim["attempt"] is not None, claim
@@ -204,7 +204,7 @@ async def test_email_resend_logs_no_recipient(outbox, platforms, tmp_path, image
             loop=asyncio.get_running_loop(),
         )
 
-    # The mail really went out: the report, then one notice per image, each to RECIPIENT.
+    # The mail really went out: the report, then one message per image attachment, each to RECIPIENT.
     assert outbox == [RECIPIENT] * (1 + images)
     # The adapter's own send line was made for each of them, and captured.
     assert len(_made_by_send_email(records)) == 1 + images

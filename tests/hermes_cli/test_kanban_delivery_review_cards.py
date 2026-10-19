@@ -18,6 +18,7 @@ from tests.hermes_cli.test_kanban_delivery_github import REPO
 from tests.hermes_cli.test_kanban_delivery_publish_step import _approved, _events, _tick
 
 CHECK = "All required checks pass"
+OLDER, NEWER = 106302476821, 106302813422  # the check suites of two CI runs of one head, the older first
 ROUTE = {"provider_override": "openai-codex", "model_override": "gpt-6.1-sol", "reasoning_effort": "max"}
 PAGED = {"check_runs": "/check-runs"}
 
@@ -38,7 +39,8 @@ def world(board, monkeypatch):
     gh["pad"] puts 100 other items after the real ones of a collection, so its total_count is over one page;
     gh["short"] states one more than it holds; gh["broken"] answers 502. gh["each"] runs at every request,
     gh["during"] at the check-runs request, the one CI read, and gh["move_after"] at the request whose path
-    ends with it. gh["pull"] holds fields that replace the pull request's own, as GitHub shows it closed."""
+    ends with it. gh["pull"] holds fields that replace the pull request's own, as GitHub shows it closed.
+    A copy's third item, when it has one, is the id of the check suite that holds it."""
     kb, root, repo = board
     from hermes_cli import kanban_delivery_github as transport
 
@@ -72,8 +74,9 @@ def world(board, monkeypatch):
         if method == "GET" and path.endswith("/check-runs"):
             copies = [gh["check"]] if gh["copies"] is None else gh["copies"]
             return listed("check_runs", [{"id": 900 + n, "name": CHECK, "head_sha": path.split("/")[-2],
-                                          "status": status, "conclusion": conclusion}
-                                         for n, (status, conclusion) in enumerate(copies)], page)
+                                          "status": status, "conclusion": conclusion,
+                                          **({"check_suite": {"id": suite[0]}} if suite else {})}
+                                         for n, (status, conclusion, *suite) in enumerate(copies)], page)
         return 404, None
 
     def token(self):  # kept on the transport, as the real one is, so its answers are redacted of it
@@ -718,10 +721,10 @@ def test_a_retired_pull_request_reopened_by_its_owner_is_neither_read_nor_closed
 @pytest.mark.parametrize("answer, conclusion", [
     ("pad", "success"), ("pad", "failure"), ("short", "success"), ("broken", "success")])
 def test_a_decision_answer_over_100_check_runs_or_unreadable_waits_with_no_record(world, answer, conclusion):
-    """The decision is one request: H's check runs, latest, 100 per page. When its total_count is above 100
-    (the required check completed on that page among 99 others), it holds fewer than its total_count, or it
-    cannot be read, the pass records nothing and makes no card, and reads no other page. A later pass whose
-    one answer is whole decides."""
+    """The decision is one request per required check: H's check runs of that check, named in check_name,
+    latest, 100 per page. When its total_count is above 100 (the required check completed on that page among
+    99 others), it holds fewer than its total_count, or it cannot be read, the pass records nothing and makes
+    no card, and reads no other page. A later pass whose one answer is whole decides."""
     kb, root, repo, gh = world
     tid, head = _ready(world)
     gh[answer], gh["check"] = "check_runs", ("completed", conclusion)
@@ -732,17 +735,18 @@ def test_a_decision_answer_over_100_check_runs_or_unreadable_waits_with_no_recor
 
     assert (_cards(kb), _state(kb, head), _events(kb, tid)) == ([], "open", events)
     assert [query for path, query in gh["queries"] if path.endswith("/check-runs")] == [
-        {"filter": ["latest"], "per_page": ["100"]}] * 2
+        {"filter": ["latest"], "check_name": [CHECK], "per_page": ["100"]}] * 2
     gh[answer], gh["check"] = None, ("completed", "success")
     _tick(kb)
     assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created"
 
 
 @pytest.mark.parametrize("copies", [
-    [], [("completed", "success")] * 2, [("completed", "success"), ("completed", "failure")]])
+    [], [("completed", "success", OLDER)] * 2, [("completed", "success", OLDER), ("completed", "failure", OLDER)]])
 def test_the_required_check_must_appear_exactly_once_in_the_decision_answer(world, copies):
-    """Absent from the one decision answer, or in it twice (both green, or green and red), the required
-    check decides nothing: no card and no record. Once it appears exactly once, a later pass decides by it."""
+    """Absent from the one decision answer, or in it twice in one check suite (both green, or green and red),
+    the required check decides nothing: no card and no record. Once it appears exactly once, a later pass
+    decides by it. Copies in two check suites are decided by the newest suite's copy, as the tests below show."""
     kb, root, repo, gh = world
     tid, head = _ready(world)
     gh["copies"], events = copies, _events(kb, tid)
@@ -756,12 +760,130 @@ def test_the_required_check_must_appear_exactly_once_in_the_decision_answer(worl
     assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created"
 
 
+def test_a_newer_green_suite_beside_an_older_red_suite_gets_the_review_cards(world):
+    """A second CI run of H holds the required check again, in a newer check suite: the copy in the newest
+    suite decides, so H gets its review cards although the older suite's copy is red."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world)
+    gh["copies"] = [("completed", "failure", OLDER), ("completed", "success", NEWER)]
+
+    _tick(kb)
+
+    assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created"
+
+
+def test_a_newer_red_suite_beside_an_older_green_suite_is_red(world):
+    """The copy in the newest check suite decides red as one copy does: red_check_waiting once for H, with
+    that copy's id and conclusion only, and no card although the older suite's copy is green."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world)
+    gh["copies"], events = [("completed", "success", OLDER), ("completed", "failure", NEWER)], _events(kb, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert _events(kb, tid)[len(events):] == [("delivery_review_waiting", {
+        "delivery_id": 1, "head": head, "pull_request_number": 41, "code": "red_check_waiting",
+        "check_runs": [{"id": 901, "conclusion": "failure"}]})]
+    assert (_cards(kb), _state(kb, head)) == ([], "open")
+
+
+def test_a_newer_pending_suite_beside_an_older_green_suite_waits(world):
+    """While the copy in the newest check suite is in progress, the pass waits as for one pending copy: no card
+    and no record although the older suite's copy is green. Once that newer copy is green, a later pass makes
+    the cards."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world)
+    gh["copies"], events = [("completed", "success", OLDER), ("in_progress", None, NEWER)], _events(kb, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_cards(kb), _state(kb, head), _events(kb, tid)) == ([], "open", events)
+    gh["copies"] = [("completed", "success", OLDER), ("completed", "success", NEWER)]
+    _tick(kb)
+    assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created"
+
+
+def test_a_later_attempt_of_the_older_suite_does_not_beat_the_newer_suite(world):
+    """A rerun of the older CI run keeps that run's check suite: its later, red attempt of the required check
+    has the higher check run id (901) but the older suite, so the newer suite's green copy (900) decides."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world)
+    gh["copies"] = [("completed", "success", NEWER), ("completed", "failure", OLDER)]
+
+    _tick(kb)
+
+    assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created"
+
+
+def test_two_copies_in_the_newest_check_suite_still_decide_nothing(world):
+    """Copies in one check suite have no order: when the newest suite holds the required check twice (green
+    and red), beside an older suite's green copy, the pass decides nothing and records nothing."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world)
+    gh["copies"] = [("completed", "success", OLDER), ("completed", "success", NEWER), ("completed", "failure", NEWER)]
+    events = _events(kb, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_cards(kb), _state(kb, head), _events(kb, tid)) == ([], "open", events)
+
+
+def test_a_head_with_four_ci_runs_gets_its_cards_from_the_required_checks_own_answer(world, monkeypatch):
+    """GitHub answers the latest attempt of every check suite on H, and one CI run holds about 42 check runs, so
+    with four CI runs H's answer for all its check runs holds 168, more than its one page. The answer for the
+    required check alone holds its four copies, one in each run's check suite, the three older red and the newest
+    green: it is whole on its one page, and H gets its review cards."""
+    kb, root, repo, gh = world
+    from hermes_cli import kanban_delivery_github as transport
+
+    tid, head = _ready(world)
+    table = transport._exchange  # the world's: the pull request, each call and query kept
+    runs = [{"id": 2000 + 42 * n + job, "name": f"job {job}" if job else CHECK, "head_sha": head,
+             "status": "completed", "conclusion": "success" if job or suite == NEWER else "failure",
+             "check_suite": {"id": suite}} for n, suite in enumerate((OLDER - 2, OLDER - 1, OLDER, NEWER))
+            for job in range(42)]
+
+    def exchange(method, target, authorization, payload=None):
+        status, value = table(method, target, authorization, payload)
+        path, query = urlsplit(target).path, parse_qs(urlsplit(target).query)
+        if (method, path) != ("GET", f"/repos/{REPO}/commits/{head}/check-runs"):
+            return status, value
+        named = [run for run in runs if [run["name"]] == query.get("check_name", [run["name"]])]
+        return 200, {"total_count": len(named), "check_runs": named[:100]}  # one page, as GitHub lists them
+
+    monkeypatch.setattr(transport, "_exchange", exchange)
+    _tick(kb)
+
+    assert len(runs) == 168 and len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created"
+
+
+def test_the_check_runs_request_names_each_required_check_in_check_name(world):
+    """The review step reads H's check runs one required check of the delivery policy at a time: each request
+    names its check in the check_name query, beside filter latest and one page of 100."""
+    from hermes_cli.kanban_delivery import _POLICY_FILE
+    from hermes_cli.kanban_delivery_fences import load_policy
+
+    kb, root, repo, gh = world
+    tid, head = _ready(world)
+    required = load_policy(_POLICY_FILE.read_text(encoding="utf-8")).required_checks[REPO]
+
+    _tick(kb)
+
+    assert [(path, query) for path, query in gh["queries"] if path.endswith("/check-runs")] == [
+        (f"/repos/{REPO}/commits/{head}/check-runs", {"filter": ["latest"], "check_name": [name], "per_page": ["100"]})
+        for name in required]
+
+
 @pytest.mark.parametrize("conclusion", ["success", "failure"])
 def test_one_pass_decides_then_reads_the_pull_request_then_writes(world, conclusion):
-    """The order of one pass, after its first pull request read: the one decision request (H's check runs,
-    latest, 100 per page), then the final pull request read, then the write transaction: the cards or the
-    waiting record are stored after every read. After a red waiting record the pass reads H's workflow runs
-    once; this table answers 404, so it stops there. Nothing else is read from GitHub."""
+    """The order of one pass, after its first pull request read: the one decision request (H's check runs of
+    its one required check, named in check_name, latest, 100 per page), then the final pull request read, then
+    the write transaction: the cards or the waiting record are stored after every read. After a red waiting
+    record the pass reads H's workflow runs once; this table answers 404, so it stops there. Nothing else is
+    read from GitHub."""
     kb, root, repo, gh = world
     tid, head = _ready(world)
     gh["check"] = ("completed", conclusion)
@@ -773,7 +895,8 @@ def test_one_pass_decides_then_reads_the_pull_request_then_writes(world, conclus
     pull = f"/repos/{REPO}/pulls/41"
     red = [] if conclusion == "success" else [(f"/repos/{REPO}/actions/runs", {"head_sha": [head], "per_page": ["100"]})]
     assert gh["queries"] == [
-        (pull, {}), (f"/repos/{REPO}/commits/{head}/check-runs", {"filter": ["latest"], "per_page": ["100"]}),
+        (pull, {}),
+        (f"/repos/{REPO}/commits/{head}/check-runs", {"filter": ["latest"], "check_name": [CHECK], "per_page": ["100"]}),
         (pull, {})] + red
     assert (seen, _raw(kb.kanban_db_path(), stored)[0]["n"]) == ([0] * 3 + [1] * len(red), 1)
 
