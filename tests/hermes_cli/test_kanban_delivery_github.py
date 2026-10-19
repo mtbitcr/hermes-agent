@@ -1182,6 +1182,44 @@ def test_a_check_runs_read_keeps_each_check_runs_suite_by_its_id_only(monkeypatc
                                           "check_suite": {"id": 106302813422}}]}
 
 
+def test_a_check_name_outside_the_policys_characters_is_refused_before_any_socket_or_token(monkeypatch, tmp_path):
+    """The review step reads each required check's runs by name, so the check runs read takes check_name, its value
+    held to the characters the delivery policy's required check names use: ASCII letters and single spaces. A
+    value with any other character is refused before any socket or token; each name the policy requires is sent."""
+    from hermes_cli.kanban_delivery import _POLICY_FILE
+    from hermes_cli.kanban_delivery_fences import load_policy
+
+    mod = _module()
+    opened = _block_sockets(monkeypatch)
+    missing_key = tmp_path / "no-such-key.pem"  # minting would read it first, so a refusal here minted nothing
+    required = load_policy(_POLICY_FILE.read_text(encoding="utf-8")).required_checks
+    outside = ("Python tests / Run tests slice 1/12", "quality&filter=all", "quality\r\nX-Echo: 1", "quality#",
+               "quality%20", "quality+", "quality-check", "quality_check", "quality.", "quality*", "qualität",
+               "quality\t", "All\u00a0required checks pass", "\u212aelvin")  # a no-break space; a Kelvin sign
+    for repository in required:
+        transport = mod.GitHubTransport("read_checks", repository, key_path=missing_key)
+        for name in outside:
+            with pytest.raises(mod.GitHubTransportError) as refused:
+                transport.request("GET", f"/repos/{repository}/commits/{HEAD}/check-runs",
+                                  query={"filter": "latest", "check_name": name, "per_page": 100})
+            assert refused.value.reason == "query_not_allowed", (repository, name)
+    assert opened == []
+
+    sent = []
+    monkeypatch.setattr(mod, "_exchange", lambda method, target, authorization, payload=None: (
+        sent.append(target) or (200, {"total_count": 0, "check_runs": []})))
+    monkeypatch.setattr(mod.GitHubTransport, "_installation_token", lambda self: setattr(self, "_token", DUMMY) or DUMMY)
+    for repository, names in required.items():
+        for name in names:
+            mod.GitHubTransport("read_checks", repository).request(
+                "GET", f"/repos/{repository}/commits/{HEAD}/check-runs",
+                query={"filter": "latest", "check_name": name, "per_page": 100})
+
+    assert sent == [f"/repos/{repository}/commits/{HEAD}/check-runs?filter=latest&check_name={name.replace(' ', '+')}"
+                    "&per_page=100" for repository, names in required.items() for name in names]
+    assert {name for names in required.values() for name in names} == {"All required checks pass", "quality"}
+
+
 def test_the_merge_takes_only_its_exact_body_and_passes_on_only_githubs_status(github, monkeypatch):
     """Card 5's one write: the merge of a pull request at exactly H, as a merge commit. Its one body is the
     keys sha and merge_method only, the whole sha 40 lowercase hex and the method merge; any other body is
