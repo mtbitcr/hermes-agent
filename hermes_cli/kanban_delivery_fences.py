@@ -164,19 +164,25 @@ def classify_check(check: dict, head: str, is_run: bool) -> str:
     return _classify(check, head, check.get("conclusion") if is_run else check["state"], is_run)
 
 
-def decide_publish(approval: dict, ledger: dict, remote: dict) -> Decision:
+def decide_publish(approval: dict, ledger: dict, remote: dict, update: dict | None = None) -> Decision:
     """T1: may the kernel-approved head H become the card's one pull request?
 
     approval: source_done, approved_by_review_lane, head_commit (H), review_head (the latest
     review head provenance), bound_head, reviewer, implementer, reopened_after_approval, and
     git's head_exists, base and base_is_ancestor. ledger: the recorded pull_request (None when
-    none), its head and state, and head_is_ancestor (git: that head is an ancestor of H).
+    none), its head and state, and head_is_ancestor (git: that head is an ancestor of the bound head).
     remote: branch_head (None when the branch is absent) and open_pulls [{number, head}].
-    Owner rule 1: the flags and head_is_ancestor are bools, every head and the base 40-character
-    lowercase hex SHAs, pull_request and each number positive ints (numbers unique), reviewer,
-    implementer and state non-empty strs; head and state may be None only when pull_request is.
+    update (card B), for a bound head other than H: record, the kernel's clean-update record naming
+    the bound head (the source card's delivery_updated event, None when none), and git's parents
+    of the bound head. Only through that record is the bound head U admitted, never as reviewed,
+    as a clean update of the approval of H: clean exactly True, naming H, U and as main U's second
+    parent, U's first being H; the one pull request, recorded at H and left updated, then moves
+    to U by a fast-forward. Owner rule 1: the flags and head_is_ancestor are bools, every head
+    and the base 40-character lowercase hex SHAs, pull_request and each number positive ints
+    (numbers unique), reviewer, implementer and state non-empty strs; head and state may be None
+    only when pull_request is; record None or a dict, and parents a list of SHAs.
     """
-    fault = next((fact for fact, valid in _publish_facts(approval, ledger, remote) if not valid), None)
+    fault = next((fact for fact, valid in _publish_facts(approval, ledger, remote, update) if not valid), None)
     if fault:
         return _refuse("invalid_fact", f"{fault} is missing or does not have its documented type")
     head = approval["head_commit"]
@@ -186,10 +192,13 @@ def decide_publish(approval: dict, ledger: dict, remote: dict) -> Decision:
         return _refuse("reviewer_not_independent", "the reviewer is missing or is the implementer")
     if approval["reopened_after_approval"]:
         return _refuse("reopened_after_approval", "the card was reopened after the approval")
-    if head != approval["review_head"] or head != approval["bound_head"]:
+    on_record = update is not None and update["record"] is not None  # the kernel's record names the bound head
+    if head != approval["review_head"] or head != approval["bound_head"] and not on_record:
         return _refuse("head_moved", f"{head} is not both the reviewed head and the bound head")
     if not (approval["head_exists"] and approval["base_is_ancestor"] and approval["base"] != head):
         return _refuse("head_unconfirmed", "git does not confirm H with the base as a distinct ancestor")
+    if head != approval["bound_head"]:
+        return _clean_update(head, approval["bound_head"], update, ledger, remote)
     recorded, branch, pulls = ledger["pull_request"], remote["branch_head"], remote["open_pulls"]
     # A crash between opening the pull request and recording it leaves nothing recorded and exactly
     # one open pull request, at H, on the branch at H: the delivery's own, so it is adopted.
@@ -222,7 +231,33 @@ def decide_publish(approval: dict, ledger: dict, remote: dict) -> Decision:
     return _refuse("head_moved", "the branch or the pull request is at neither the recorded head nor H")
 
 
-def _publish_facts(approval: dict, ledger: dict, remote: dict):
+def _clean_update(head: str, updated: str, update: dict, ledger: dict, remote: dict) -> Decision:
+    # Card B: the bound head U only as the kernel's clean update of the approval of H, the pull request of H moved on.
+    record, parents = update["record"], update["parents"]
+    if record.get("clean") is not True or record.get("update_head") != updated:
+        return _refuse("not_clean_update", f"no clean-update record of the kernel names {updated}")
+    if record.get("head") != head or parents[:1] != [head]:
+        return _refuse("not_clean_update", f"the clean update to {updated} is not one of the approved head {head}")
+    if parents[1:] != [record.get("observed_main")]:
+        return _refuse("not_clean_update", f"the clean-update record names another main than {updated} is built on")
+    recorded, branch, pulls = ledger["pull_request"], remote["branch_head"], remote["open_pulls"]
+    if any(pull["number"] != recorded for pull in pulls):
+        return _refuse("second_pull_request", "an open pull request other than the recorded one exists")
+    if (ledger["head"], ledger["state"]) != (head, "updated"):
+        return _refuse("head_moved", f"the ledger does not record the pull request of {head} as updated")
+    if not pulls:
+        return _refuse("pull_request_not_open", "the recorded pull request is not open")
+    if not ledger["head_is_ancestor"]:
+        return _refuse("not_fast_forward", f"{head} is not an ancestor of {updated}")
+    admitted = f"{updated} is a clean update of the approval of {head} on main {parents[1]}, by the kernel's record"
+    if pulls[0]["head"] == head and branch == head:
+        return Decision(True, "push_fast_forward", f"push {updated} with a lease expecting exactly {head}: {admitted}")
+    if pulls[0]["head"] == updated and branch == updated:
+        return Decision(True, "adopt_fast_forward", f"the pull request already holds {updated}: {admitted}; record it")
+    return _refuse("head_moved", "the branch or the pull request is at neither the approved head nor its update")
+
+
+def _publish_facts(approval: dict, ledger: dict, remote: dict, update: dict | None = None):
     # Owner rule 1 for T1, checked once before any decision; a record's keys are read only after its shape.
     yield from _shape("approval", approval, "source_done approved_by_review_lane head_commit review_head bound_head"
                       " reviewer implementer reopened_after_approval head_exists base base_is_ancestor")
@@ -246,6 +281,11 @@ def _publish_facts(approval: dict, ledger: dict, remote: dict):
         yield from _shape(f"remote.open_pulls[{index}]", pull, "number head")
         yield f"remote.open_pulls[{index}].number", _has_unique_ids(pulls[: index + 1], "number")
         yield f"remote.open_pulls[{index}].head", _is_sha(pull["head"])
+    if update is not None:
+        yield from _shape("update", update, "record parents")
+        yield "update.record", update["record"] is None or type(update["record"]) is dict
+        yield from _shape("update.parents", update["parents"])
+        yield "update.parents", all(_is_sha(parent) for parent in update["parents"])
 
 
 def decide_rerun(policy: Policy, repo: str, head: str, jobs: list[dict], ledger: dict) -> Decision:
