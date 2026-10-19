@@ -75,6 +75,9 @@ _REPOSITORY = re.compile(r"[A-Za-z0-9-]+/(?!\.\.?$)[A-Za-z0-9_.-]+")
 _TOKEN = re.compile(r"[A-Za-z0-9_.-]+")  # it travels in a header, so nothing that could split one
 _SEGMENTS = {"number": r"[1-9][0-9]{0,9}", "id": r"[1-9][0-9]{0,19}", "sha": _SHA.pattern, "branch": _BRANCH.pattern}
 _PAGE = {"per_page": r"[1-9][0-9]?|100", "page": r"[1-9][0-9]{0,3}"}
+# The review step reads each required check of the delivery policy by its name, and those names ("All required
+# checks pass", "quality") are ASCII letters in words split by single spaces: a check_name holds nothing else.
+_CHECK_NAME = r"[A-Za-z]+(?: [A-Za-z]+)*"
 
 
 class Endpoint(NamedTuple):
@@ -117,7 +120,7 @@ REST_ALLOWLIST = (
     # T1's one branch read: the commit a head branch holds, and 404 when the branch does not exist.
     Endpoint("GET", "/repos/{repo}/git/ref/heads/{branch}", ("contents", "read")),
     Endpoint("GET", "/repos/{repo}/commits/{sha}/check-runs", ("checks", "read"),
-             MappingProxyType({"filter": "latest|all", **_PAGE})),
+             MappingProxyType({"filter": "latest|all", "check_name": _CHECK_NAME, **_PAGE})),
     # The failed tests a red slice job names on its own check run (an Actions job's id is its check run's).
     Endpoint("GET", "/repos/{repo}/check-runs/{id}/annotations", ("checks", "read"), MappingProxyType(_PAGE)),
     Endpoint("GET", "/repos/{repo}/actions/runs", ("actions", "read"),
@@ -135,7 +138,7 @@ REST_ALLOWLIST = (
 # title and message) and URLs never pass, nor headers.
 _FIELDS = frozenset({
     "id", "number", "name", "state", "status", "conclusion", "merged", "mergeable", "mergeable_state",
-    "sha", "head_sha", "merge_commit_sha", "commit_id", "ref", "head", "base", "app", "object",
+    "sha", "head_sha", "merge_commit_sha", "commit_id", "ref", "head", "base", "app", "object", "check_suite",
     "total_count", "check_runs", "workflow_runs", "jobs", "steps", "run_id", "run_attempt", "user", "login",
 })
 _MAX_TEXT = 256
