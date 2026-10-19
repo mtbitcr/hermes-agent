@@ -36760,9 +36760,7 @@ def _dispatch_once_locked(
     increments it in place as it spawns. Without it a listed profile is
     counted on this board only, like the shared per-profile cap.
     ``profile_running_unknown`` means some board's count could not be read
-    this tick: every listed profile's ready work is then held. The mapping
-    never holds the review lane, which keeps the shared per-profile cap only;
-    a review a listed profile starts still counts in its cross-board total.
+    this tick: every listed profile's work, ready or review, is then held.
 
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
@@ -36929,14 +36927,6 @@ def _dispatch_once_locked(
             return current
         return None
 
-    def _integer_capped_running(assignee):
-        """Like ``_capped_running`` for the review lane, which the mapping
-        never holds: only the shared per-profile cap applies there."""
-        if _per_profile_cap is None:
-            return None
-        current = _per_profile_running.get(assignee, 0)
-        return current if current >= _per_profile_cap else None
-
     def _reserve_listed(assignee):
         """Count a listed profile's claim in the cross-board total at once,
         before its workspace or spawn can fail, so a failure later in this
@@ -36964,9 +36954,11 @@ def _dispatch_once_locked(
     # from the ready loop so the review lane always gets a spawn
     # opportunity. The reservation is per-tick and self-releasing: with no
     # spawnable review work (or no cap at all) the ready loop keeps the
-    # full budget. "Spawnable" mirrors the review loop's own gate
-    # (assigned + real profile) so a review column full of human-pulled
-    # control-plane lanes doesn't permanently tax ready throughput.
+    # full budget. "Spawnable" mirrors the review loop's own gates (assigned,
+    # real profile, room under its per-profile cap, no file-scope conflict),
+    # read without writing anything, so neither human-pulled control-plane
+    # lanes nor a reviewer at its cap hold a slot no review can use this
+    # tick. The respawn guard and route checks stay with the loop.
     def _any_spawnable_review() -> bool:
         if not review_rows:
             return False
@@ -36974,10 +36966,14 @@ def _dispatch_once_locked(
             from hermes_cli.profiles import profile_exists as _rpe
         except Exception:
             # Profiles module unavailable (test stubs, exotic envs) —
-            # assume spawnable, matching the review loop's own fallback.
-            return any(row["assignee"] for row in review_rows)
+            # assume real profiles, matching the review loop's own fallback.
+            _rpe = None
         return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
+            row["assignee"]
+            and (_rpe is None or _rpe(row["assignee"]))
+            and _capped_running(row["assignee"]) is None
+            and not file_scope_conflicts(conn, row["id"])
+            for row in review_rows
         )
 
     ready_budget = spawn_budget
@@ -37283,8 +37279,8 @@ def _dispatch_once_locked(
     # changes without block-loop accounting, or escalate a genuine blocker.
     # Human-only boards can disable it with ``kanban.review_dispatch``.
     #
-    # ``review_rows`` was enumerated before the ready loop; when it is
-    # non-empty the ready loop ran against ``ready_budget`` (one slot held
+    # ``review_rows`` was enumerated before the ready loop; when one of them
+    # can start, the ready loop ran against ``ready_budget`` (one slot held
     # back) so this lane cannot be permanently starved by a sustained
     # ready backlog. The review loop itself still checks the FULL shared
     # ``spawn_budget`` — the reservation caps the ready lane, it does not
@@ -37302,7 +37298,7 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
-        current = _integer_capped_running(row["assignee"])
+        current = _capped_running(row["assignee"])
         if current is not None:
             result.skipped_per_profile_capped.append(
                 (row["id"], row["assignee"], current)
