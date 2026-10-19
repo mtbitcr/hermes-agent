@@ -9,7 +9,13 @@ update is then computed without touching any checkout: ``git merge-tree --write-
 change the same set of paths relative to main as H did relative to its reviewed base, and nothing outside the source
 card's owned paths. When H continues an earlier delivery, its reviewed base the head of a delivery of a task_links
 parent of its card or of a card its card replaced, the change is measured from where the chain started, which main
-and H must both hold. Then one update card is made per source card, H and main, through the card creation of
+and H must both hold. Card B: an update git merged with no conflict, while main changed none of the source card's
+owned paths since that start, test files included, is clean and makes no card. The write transaction that checks
+those paths records it in the source card's ``delivery_updated`` event, ``clean`` true, naming H, main and the
+updated head, beside a delivery row of the source card at the updated head. Only through that record does the publish
+fence move H's pull request to the updated head by a fast-forward, H being its first parent; CI, the tier's review
+cards, the arm and the merge then each run at exactly that head, which is never reported as reviewed. Otherwise
+one update card is made per source card, H and main, through the card creation of
 :func:`hermes_cli.kanban_delivery._continuation`: a task_links child of the source card for its builder, with the
 source's tier, route, effort, policy lock, owner receipt binding, risk tier and review requirement, on a branch at
 the updated head. Its builder hands that head over unchanged through the normal completion, so the kernel's own
@@ -33,6 +39,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -145,6 +152,10 @@ def _update(db_path: Path, row: dict) -> Optional[str]:
                                     for path in conflicts + paths):
             return _returned(db_path, row, facts, "conflict")
         facts["conflicts"] = conflicts
+    else:  # card B: what main changed since the approved start, which _updated checks against the owned paths
+        changed = _paths(root, start, main)
+        if changed is not None:
+            facts["main_changed"] = changed
     branch = _BRANCH.format(source=source, head=head[:12], main=main[:12])
     commit = _branch(root, branch, tree, head, main, _MESSAGE.format(**facts))
     return _updated(db_path, row, facts, (root, branch, commit))
@@ -296,15 +307,36 @@ def _still_moved(conn, row: dict) -> bool:
                                         row["pull_request_number"])).fetchone() is not None
 
 
+def _clean(conn, row: dict, facts: dict) -> bool:
+    """Card B, inside _updated's write transaction: the update is clean when git merged it with no conflict, H is
+    the source card's approved head, so the first parent of the updated head, and main changed none of the card's
+    owned paths since the approved start, test files included."""
+    task = kb.get_task(conn, row["source_task_id"])
+    return "main_changed" in facts and task is not None and bool(task.owned_paths) and kd._sha(
+        task.head_commit) == facts["head"] and not any(_owned(path, task.owned_paths) for path in facts["main_changed"])
+
+
 def _updated(db_path: Path, row: dict, facts: dict, update: Optional[tuple]) -> Optional[str]:
-    """One write transaction, while the row is still base_moved: unless the kernel's delivery_updated event of
-    this delivery, H and main records the update card already, the card is made through _continuation's card
-    creation at the updated head, so for the source's builder with the source's governance, its recorded base then
-    main, and that event names it; then the row is final, updated."""
+    """One write transaction, while the row is still base_moved. A clean update (:func:`_clean`, checked here) makes
+    no card: the source card gets a delivery row at the updated head carrying the approval of H, and the kernel's
+    delivery_updated event marks it clean, naming H, main and the updated head, the one record through which the
+    publish fence admits that head to H's pull request by a fast-forward. Otherwise, unless that event of this
+    delivery, H and main records the update card already, the card is made through _continuation's card creation at
+    the updated head, so for the source's builder with the source's governance, its recorded base then main, and
+    that event names it. Then the row is final, updated."""
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if not _still_moved(conn, row):
             return None
-        if _made(conn, row, facts["main"]) is None:
+        if update is not None and _clean(conn, row, facts):
+            branch, commit = update[1:]
+            conn.execute("INSERT OR IGNORE INTO kanban_deliveries (source_task_id, source_head, approval_run_id, "
+                         "created_at) SELECT source_task_id, ?, approval_run_id, ? FROM kanban_deliveries WHERE id = ?",
+                         (commit, int(time.time()), row["id"]))
+            kb._append_event(conn, row["source_task_id"], "delivery_updated", kd._outcome(
+                row, repository=row["repository"], reviewed_base=facts["base"], observed_main=facts["main"],
+                update_head=commit, update_branch=branch, clean=True,
+                **({"approved_base": facts["approved_base"]} if "approved_base" in facts else {})))
+        elif _made(conn, row, facts["main"]) is None:
             if update is None:
                 return None
             root, branch, commit = update
