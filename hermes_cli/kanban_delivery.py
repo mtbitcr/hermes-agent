@@ -825,6 +825,12 @@ _REVIEW_BODY = (
     "Source card: {source}\nHead: {head}\nBase commit: {base}\nRepository: {repository}\n"
     "Pull request: {number}\nBranch: {branch}\nRisk tier: {tier}\nCI on {head}: passed ({checks})\n"
 )
+# Card B, truth in reporting: added to the body of a clean update's cards only, from the kernel's record of it, so the
+# approval of the approved head is never reported as a review of the updated head.
+_REVIEW_CLEAN_UPDATE = (
+    "Clean update: the fence admitted the updated head {head}, on main {main}, as a clean update of the approval of "
+    "the approved head {approved}. The original card approval remains bound to {approved}.\n"
+)
 # Added once the card has its id: the line that ties the reviewer's GitHub review to this one card.
 _REVIEW_LINE = "Start your GitHub review body with this exact line:\nReview card {card}\n"
 # GitHub showed the open row's pull request closed, merged or not, outside the delivery step: final. An approval
@@ -1396,6 +1402,11 @@ def _create_review_cards(db_path, row, read, repository, base, checks, reviewer,
         text = {"source": source, "head": head, "base": base, "repository": repository, "checks": ", ".join(checks),
                 "number": row["pull_request_number"], "branch": row["pull_request_branch"], "title": task["title"],
                 "tier": tier if recorded else f"{tier}. {RISK_NOT_RECORDED}"}
+        # Card B: H and main come only from the kernel's clean-update record of this head, as _delivers reads it.
+        record = _clean_record(conn, source, head) if _sha(read[2]) != head else None
+        main = _sha(record.get("observed_main")) if record is not None and record.get("clean") is True and (
+            record.get("head") == _sha(read[2])) else None
+        clean = _REVIEW_CLEAN_UPDATE.format(head=head, main=main, approved=record["head"]) if main else ""
         lenses = _LENSES[tier]
         taken = sorted(card for responsibility in lenses for (card,) in conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ?", (review_key(source, head, responsibility),)))
@@ -1412,7 +1423,7 @@ def _create_review_cards(db_path, row, read, repository, base, checks, reviewer,
                     reviewer, route["provider_override"], route["model_override"],
                     route["reasoning_effort"], _REVIEW_TIER)
             card = kb.create_task(
-                conn, title=title, body=_REVIEW_BODY.format(lens=lens, **text), assignee=reviewer,
+                conn, title=title, body=_REVIEW_BODY.format(lens=lens, **text) + clean, assignee=reviewer,
                 responsibility=responsibility, created_by=_REVIEW_CREATOR, workspace_kind="worktree",
                 execution_tier=_REVIEW_TIER, board=_board_slug(db_path), project_id=task["project_id"],
                 project_source_task_id=source, owned_paths=[], parents=[source],

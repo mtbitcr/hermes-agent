@@ -476,7 +476,8 @@ def test_a_clean_update_fast_forwards_the_existing_pull_request_and_records_no_n
 def test_a_clean_update_merges_after_ci_and_the_security_review_at_exactly_the_updated_head(exact, monkeypatch):
     """After the fast-forward, CI on U is read, the tier's security review card is made for U on main, and once it is
     done and its lens approves U on GitHub, the arm sends GitHub's merge of exactly U, which is recorded with main as
-    U's reviewed base and taken by the release intake. The source's approval of H is all the card review there is."""
+    U's reviewed base and taken by the release intake. The source's approval of H is all the card review there is:
+    the card says the fence admitted U as a clean update of that approval, which stays bound to H."""
     kb, root, repo, gh = exact
     db = kb.kanban_db_path()
     tid, head, base = _approved_head(exact)
@@ -495,6 +496,12 @@ def test_a_clean_update_merges_after_ci_and_the_security_review_at_exactly_the_u
                    f"review:{tid}:{update}:%")
     assert [(card["idempotency_key"], f"Head: {update}\nBase commit: {main}\n" in card["body"])
             for card in reviews] == [(f"review:{tid}:{update}:R12", True)]
+    # Truth in reporting: its body names U, main and H as the kernel's clean-update record does, and U is never
+    # called reviewed: the fence admitted it as a clean update of the approval of H, which stays bound to H.
+    [body] = [card["body"] for card in reviews]
+    assert (f"the fence admitted the updated head {update}, on main {main}, as a clean update of the approval of the "
+            f"approved head {head}. The original card approval remains bound to {head}.\n") in body
+    assert not any(claim in body for claim in ("reviewed", f"approval of {update}", f"bound to {update}"))
     assert (_state(kb, update), _arms(gh)) == ("review_cards_created", [])
     _done(db)
     _reviews(gh, *_lenses(kb, update))
@@ -895,6 +902,11 @@ def test_the_old_pull_request_closes_once_the_update_is_published(exact):
     _publish(kb, gh, card["id"], update, 42)
     _tick(kb)
 
+    # A guard: the update card's own approval delivers U, an ordinary delivery, so its review card carries none of
+    # the clean-update text, though the source card's kernel event, not clean, names U.
+    [body] = [review["body"] for review in _raw(kb.kanban_db_path(), "SELECT body FROM tasks WHERE idempotency_key "
+                                                "LIKE ?", f"review:{card['id']}:{update}:%")]
+    assert "clean update" not in body.lower() and "admitted" not in body
     assert _closes(gh) == [("PATCH", f"/repos/{REPO}/pulls/41", {"state": "closed"})]
     assert _state(kb, head) == "replaced"
     replaced = [payload for kind, payload in _events(kb, tid) if kind == "delivery_replaced"]
