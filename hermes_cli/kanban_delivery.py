@@ -969,21 +969,13 @@ def review_step(db_path: Path) -> None:
 def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Optional[str]:
     """Card 2 for one published row: GitHub is read outside every transaction, and an
     outcome or a waiting reason is stored only while the row and its done source card
-<<<<<<< 1249bdf4b8291c8bdd5697e359f92b40af4978b9
     are as this pass read them before GitHub. The required checks on H, each by its name
-    in one request read right before the pull request is read again, alone decide green,
-    red or wait; a red decision's waiting record holds the id and conclusion of each red
-    required check run, as those requests answered them, before the red check is rerun or
-    returned. Owner rule 2
-=======
-    are as this pass read them before GitHub. The required check on H, in one request,
-    decides green, red or wait; after H's one accepted rerun, the workflow attempt of that
-    rerun gates green too (review 1098, :func:`_rerun_attempt`): green waits until it has
-    completed, and returns the work once when it completed unsuccessful. The pull request is
-    read again after the last of those reads. A red decision's waiting record holds the id
-    and conclusion of each red required check run, as that request answered them, before
-    the red check is rerun or returned. Owner rule 2
->>>>>>> f317fa20c7272d3b43e0405bddb07b160c46081d
+    in one request, decide green, red or wait; after H's one accepted rerun, the workflow
+    attempt of that rerun gates green too (review 1098, :func:`_rerun_attempt`): green waits
+    until it has completed, and returns the work once when it completed unsuccessful. The
+    pull request is read again after the last of those reads. A red decision's waiting
+    record holds the id and conclusion of each red required check run, as those requests
+    answered them, before the red check is rerun or returned. Owner rule 2
     of round 3: a recorded refused or unanswered rerun of H with no return recorded for H
     returns the work before CI on H is read, whatever it shows, in whatever phase the row
     is; such a row is read for nothing else. An open row whose pull request any read of this
