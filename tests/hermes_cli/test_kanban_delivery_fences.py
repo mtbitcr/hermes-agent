@@ -225,6 +225,56 @@ def test_publish_refuses_a_head_not_approved_by_the_kernel():
         assert (d.allowed, d.code) == (False, code), changes
 
 
+def test_publish_refuses_an_updated_head_without_the_kernels_clean_update_record():
+    """Card B: the one pull request, recorded at the approved head H and left updated, moves to the updated head U by
+    a fast-forward only through the kernel's clean-update record of H, main and U, U's parents being H and that main.
+    Without that record, or with one that is not clean or names another updated head, U is refused."""
+    updated, main = "e" * 40, "f" * 40
+    record = {"clean": True, "head": H, "observed_main": main, "update_head": updated}
+    facts = (approval(bound_head=updated), ledger(41, H, "updated", head_is_ancestor=True), remote(H, (41, H)))
+    d = fences.decide_publish(*facts, {"record": record, "parents": [H, main]})
+    assert (d.allowed, d.code) == (True, "push_fast_forward") and "clean update of the approval of " + H in d.detail
+    d = fences.decide_publish(*facts[:2], remote(updated, (41, updated)), {"record": record, "parents": [H, main]})
+    assert (d.allowed, d.code) == (True, "adopt_fast_forward")
+    d = fences.decide_publish(*facts)  # no record passed: a caller's own claim of the head counts for nothing
+    assert (d.allowed, d.code) == (False, "head_moved")
+    d = fences.decide_publish(*facts, {"record": None, "parents": [H, main]})
+    assert (d.allowed, d.code) == (False, "head_moved")
+    for other in ({**record, "clean": False}, {**record, "clean": "true"},
+                  {key: value for key, value in record.items() if key != "clean"}, {**record, "update_head": OTHER}):
+        d = fences.decide_publish(*facts, {"record": other, "parents": [H, main]})
+        assert (d.allowed, d.code) == (False, "not_clean_update"), other
+
+
+def test_publish_refuses_an_updated_head_whose_record_names_another_approved_head():
+    """The record names OLD, not the approved head H; or U's first parent is not H, so the approved head is not a
+    parent of the update commit: refused, whatever the ledger and GitHub hold."""
+    updated, main = "e" * 40, "f" * 40
+    record = {"clean": True, "head": H, "observed_main": main, "update_head": updated}
+    facts = (approval(bound_head=updated), ledger(41, H, "updated", head_is_ancestor=True), remote(H, (41, H)))
+    assert fences.decide_publish(*facts, {"record": record, "parents": [H, main]}).allowed
+    for other, parents in (({**record, "head": OLD}, [H, main]), (record, [OLD, main]), (record, [main, H]),
+                           ({**record, "head": OLD}, [OLD, main])):
+        d = fences.decide_publish(*facts, {"record": other, "parents": parents})
+        assert (d.allowed, d.code) == (False, "not_clean_update"), (other, parents)
+    d = fences.decide_publish(approval(bound_head=updated), ledger(41, OLD, "updated", head_is_ancestor=True),
+                              remote(OLD, (41, OLD)), {"record": {**record, "head": OLD}, "parents": [OLD, main]})
+    assert (d.allowed, d.code) == (False, "not_clean_update")
+
+
+def test_publish_refuses_an_updated_head_whose_record_names_another_main():
+    """The record names OTHER as main, but U's second parent is the main its path check never saw; or U has no
+    second parent at all: refused."""
+    updated, main = "e" * 40, "f" * 40
+    record = {"clean": True, "head": H, "observed_main": main, "update_head": updated}
+    facts = (approval(bound_head=updated), ledger(41, H, "updated", head_is_ancestor=True), remote(H, (41, H)))
+    assert fences.decide_publish(*facts, {"record": record, "parents": [H, main]}).allowed
+    for other, parents in (({**record, "observed_main": OTHER}, [H, main]), (record, [H, OTHER]), (record, [H]),
+                           (record, [H, main, OTHER])):
+        d = fences.decide_publish(*facts, {"record": other, "parents": parents})
+        assert (d.allowed, d.code) == (False, "not_clean_update"), (other, parents)
+
+
 def test_rerun_refuses_when_any_failed_test_is_off_the_flaky_list():
     for jobs in ([slice_job(3, 3, [FLAKY_46, UNLISTED])],
                  [slice_job(3, 3, [FLAKY_46]), slice_job(7, 7, [UNLISTED])]):

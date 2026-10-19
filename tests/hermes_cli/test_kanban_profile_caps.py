@@ -424,14 +424,15 @@ def test_unreadable_running_count_holds_listed_profile_for_that_tick(
     assert [(a, t) for _, a, t in spawns] == [(CAPPED, capped_next)]
 
 
-# F2. the mapping never holds the review lane: a listed profile's review
-# starts, and keeps its reservation, exactly as with the mapping unset
-def test_listed_cap_leaves_the_review_lane_as_without_the_mapping(
+# F2. the mapping holds the review lane as it holds ready work: a listed
+# profile at its own cap starts no review, and its review holds no place,
+# so the ready card gets the board's only slot
+def test_listed_cap_holds_the_review_lane_and_frees_its_place(
     kb, spawns, monkeypatch
 ):
     _running(kb, CAPPED, board=SECOND_BOARD)
     review = _in_review(kb, CAPPED)
-    _ready(kb, OTHER)
+    other_next = _ready(kb, OTHER)
 
     _run_dispatcher(
         monkeypatch,
@@ -440,6 +441,88 @@ def test_listed_cap_leaves_the_review_lane_as_without_the_mapping(
             "max_spawn": 1,
             "max_in_progress": 10,
             "max_in_progress_by_profile": {CAPPED: 1},
+        },
+        ticks=1,
+    )
+
+    assert [(a, t) for _, a, t in spawns] == [(OTHER, other_next)]
+    assert _status(kb, review) == "review"
+
+
+# a review whose reviewer is at its own cap, filled on another board, holds
+# no place: both ready builds start under max_spawn 2
+def test_a_review_whose_reviewer_is_at_its_cap_holds_no_place(
+    kb, spawns, monkeypatch
+):
+    _running(kb, CAPPED, board=SECOND_BOARD)
+    review = _in_review(kb, CAPPED)
+    builds = [_ready(kb, OTHER), _ready(kb, OTHER)]
+
+    _run_dispatcher(
+        monkeypatch,
+        {
+            "review_dispatch": True,
+            "max_spawn": 2,
+            "max_in_progress": 10,
+            "max_in_progress_by_profile": {CAPPED: 1},
+        },
+        ticks=1,
+    )
+
+    assert sorted((a, t) for _, a, t in spawns) == sorted(
+        (OTHER, build) for build in builds
+    )
+    assert _status(kb, review) == "review"
+
+
+# the reviewer's own cap covers card reviews, counted across boards: a task
+# running on another board fills a cap of one, so the review is skipped as
+# per-profile capped
+def test_a_reviewers_own_cap_covers_card_reviews(kb, spawns, monkeypatch):
+    _running(kb, CAPPED, board=SECOND_BOARD)
+    review = _in_review(kb, CAPPED)
+    real_dispatch_once = kb.dispatch_once
+    capped = []
+
+    def _recording_dispatch_once(*args, **kwargs):
+        res = real_dispatch_once(*args, **kwargs)
+        capped.extend(res.skipped_per_profile_capped)
+        return res
+
+    monkeypatch.setattr(kb, "dispatch_once", _recording_dispatch_once)
+    _run_dispatcher(
+        monkeypatch,
+        {
+            "review_dispatch": True,
+            "max_spawn": 1,
+            "max_in_progress": 10,
+            "max_in_progress_by_profile": {CAPPED: 1},
+        },
+        ticks=1,
+    )
+
+    assert spawns == []
+    assert capped == [(review, CAPPED, 1)]
+    assert _status(kb, review) == "review"
+
+
+# the reviewer's own cap replaces the shared cap for its reviews too: two
+# running tasks fill a shared cap of two but leave room under its own three
+def test_a_reviewers_own_cap_above_the_shared_cap_lets_reviews_start(
+    kb, spawns, monkeypatch
+):
+    _running(kb, CAPPED)
+    _running(kb, CAPPED)
+    review = _in_review(kb, CAPPED)
+
+    _run_dispatcher(
+        monkeypatch,
+        {
+            "review_dispatch": True,
+            "max_spawn": 3,
+            "max_in_progress": 10,
+            "max_in_progress_per_profile": 2,
+            "max_in_progress_by_profile": {CAPPED: 3},
         },
         ticks=1,
     )

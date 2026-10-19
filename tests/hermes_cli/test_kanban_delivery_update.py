@@ -9,8 +9,10 @@ branch at the updated head, main its recorded base, as the normal completion han
 since that base. Its builder hands that head over unchanged through the normal completion, so the kernel's reviewer
 nomination and route authority apply and only its own approval merges it. The kernel's delivery_updated event,
 written with the card, is the one proof of an update card. The old row is updated, and its
-pull request closes once the update is published. A conflict or a changed set of paths goes back to the builder
-through the continuation card instead. With the setting off a base_moved row stays where it is. Real boards and git
+pull request closes once the update is published. A changed set of paths goes back to the builder through the
+continuation card instead, and so does a conflict outside the approved paths or of any type but git's content
+conflict; a content conflict inside them gets the update card on main with the conflict marked. With the setting off
+a base_moved row stays where it is. Real boards and git
 in temporary folders; GitHub is the real transport with only its exchange and App token replaced, so every call
 passes the allowlist, and its git origin is a local bare repository."""
 
@@ -20,6 +22,7 @@ import json
 import sqlite3
 import subprocess
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -30,7 +33,7 @@ from tests.hermes_cli.test_kanban_delivery_auto_merge import (  # noqa: F401  (a
     _arms, _done, _lenses, _published_as, _reviews, armed,
 )
 from tests.hermes_cli.test_kanban_delivery_exact_base_arm import (  # noqa: F401  (exact is a fixture)
-    _fetches, _setting, exact,
+    _fetches, _intaken, _setting, exact,
 )
 from tests.hermes_cli.test_kanban_delivery_github import REPO
 from tests.hermes_cli.test_kanban_delivery_publish_step import _approved, _events, _tick
@@ -48,6 +51,11 @@ ON_UPDATE_BRANCHES = ("SELECT * FROM tasks WHERE id IN (SELECT child_id FROM tas
 CONTINUED = ("SELECT * FROM tasks WHERE id IN (SELECT child_id FROM task_links WHERE parent_id = ?) "
              "AND branch_name LIKE 'delivery-return/%'")
 GOVERNANCE = ("execution_tier", "owner_receipt_bound", "provider_override", "model_override", "reasoning_effort")
+# The owner's round 3: what the update card with the conflict marked tells its builder when the resolution leaves no
+# change against main, word for word, and the reason it names.
+NO_LONGER_NEEDED = "The approved change is no longer needed after a change on main."
+NO_CHANGE_LEFT = ("If your resolution leaves no change against main, the approved change is no longer needed. Do not "
+                  f"hand over. Block this card with the reason: {NO_LONGER_NEEDED}")
 
 
 def _approved_head(scene, name="feature"):
@@ -61,8 +69,9 @@ def _approved_head(scene, name="feature"):
     return tid, head, _git(repo, "rev-parse", "main")
 
 
-def _main_moves(scene, path="docs/other.md", text="other\n", where="github") -> str:
-    """main moves on with one commit writing ``path``. On GitHub only (``where`` "github"): made in a separate
+def _main_moves(scene, path="src/impl/other.py", text="other = 1\n", where="github") -> str:
+    """main moves on with one commit writing ``path``, by default a file inside the source card's owned paths that
+    H does not touch, so the update is not clean (card B). On GitHub only (``where`` "github"): made in a separate
     clone of GitHub's git origin and pushed there, so the registered checkout does not hold it; or ("local") made
     in the registered checkout's main and pushed. GitHub's main answer names it."""
     kb, root, repo, gh = scene
@@ -193,6 +202,32 @@ def _lands(scene, head, number) -> dict:
 
 def _closes(gh) -> list:
     return [write for write in gh["writes"] if write[0] == "PATCH"]
+
+
+def _on_github(scene, monkeypatch, tid, head):
+    """GitHub holds the source card's delivery branch, as the publish left it: its git origin holds the branch at
+    ``head``, and GitHub answers the branch's ref, its one open pull request 41 against main and pull request 41's
+    head from that branch, wherever a push moves it."""
+    kb, root, repo, gh = scene
+    from hermes_cli import kanban_delivery_github as transport
+
+    branch = f"delivery/{tid}"
+    _git(repo, "push", "-q", str(gh["bare"]), f"{head}:refs/heads/{branch}")
+    inner = transport._exchange
+
+    def exchange(method, target, authorization, payload=None):
+        path, held = urlsplit(target).path, _git(gh["bare"], "rev-parse", f"refs/heads/{branch}")
+        gh["pull_head"] = held
+        if (method, path) == ("GET", f"/repos/{REPO}/git/ref/heads/{branch}"):
+            return 200, {"ref": f"refs/heads/{branch}", "object": {"sha": held}}
+        if (method, path) == ("GET", f"/repos/{REPO}/pulls"):  # open: until GitHub shows it closed
+            return 200, [] if 41 in gh["ended"] else [{"number": 41, "head": {"sha": held}, "base": {"ref": "main"}}]
+        answer = inner(method, target, authorization, payload)
+        if (method, path) == ("GET", f"/repos/{REPO}/pulls/41") and isinstance(answer[1], dict):
+            return answer[0], {"base": {"ref": "main"}, **answer[1]}
+        return answer
+
+    monkeypatch.setattr(transport, "_exchange", exchange)
 
 
 def _returned(kb, repo, gh, tid, head, main, reason, branches):
@@ -357,12 +392,13 @@ def test_a_moved_branch_gets_one_update_card_based_on_current_main(exact):
 
 
 def test_an_updated_head_never_merges_without_its_own_approval(exact):
-    """Neither the source's approval of H nor the update card itself proves the updated head; its builder's normal
-    completion hands it to the reviewer the kernel nominates, and only that card's own approval delivers it."""
+    """An update that is not clean, as main changed a file inside the source card's owned paths: neither the
+    source's approval of H nor the update card itself proves the updated head; its builder's normal completion hands
+    it to the reviewer the kernel nominates, and only that card's own approval delivers it."""
     from hermes_cli import kanban_delivery as kd
 
     kb, root, repo, gh = exact
-    tid, head, base, main = _moved_on(exact)
+    tid, head, base, main = _moved_on(exact, path="src/impl/other.py")
     _tick(kb)
     card = _update(kb, tid)
     update = _head(repo, card)
@@ -398,6 +434,108 @@ def test_an_updated_head_never_merges_without_its_own_approval(exact):
     assert _arms(gh) == []
 
 
+def test_a_clean_update_fast_forwards_the_existing_pull_request_and_records_no_new_card(exact, monkeypatch):
+    """Card B: main moved on docs/other.md only, outside the source card's owned paths, and merges with H without a
+    conflict: a clean update. No card is made. The kernel's delivery_updated event records it clean, naming H, main
+    and the updated head U, whose parents are H and main, and the one pull request moves to U by a fast-forward of
+    its branch: no second pull request, no close. The approval stays the approval of H."""
+    from hermes_cli import kanban_delivery as kd
+
+    kb, root, repo, gh = exact
+    db = kb.kanban_db_path()
+    tid, head, base = _approved_head(exact)
+    _on_github(exact, monkeypatch, tid, head)
+    main = _main_moves(exact, "docs/other.md", "other\n")
+    _setting(root, "true")
+    tasks = _raw(db, "SELECT id FROM tasks ORDER BY id")
+
+    _tick(kb)
+
+    [updated] = _updated(kb, tid)
+    update = updated["update_head"]
+    assert (updated["clean"], updated["head"], updated["observed_main"], "update_task_id" in updated) == (
+        True, head, main, False)
+    assert _parents(repo, update) == [head, main]
+    assert _git(gh["bare"], "rev-parse", f"refs/heads/delivery/{tid}") == update  # H, its first parent, moved on
+    assert _raw(db, "SELECT id FROM tasks ORDER BY id") == tasks
+    assert (_raw(db, UPDATES, tid), _raw(db, ON_UPDATE_BRANCHES, tid), _raw(db, CONTINUED, tid)) == ([], [], [])
+    assert [tuple(row.values()) for row in _raw(
+        db, "SELECT source_head, pull_request_number, pull_request_head, pull_request_state FROM kanban_deliveries "
+        "WHERE source_task_id = ? ORDER BY id", tid)] == [(head, 41, head, "updated"), (update, 41, update, "open")]
+    published = [payload for kind, payload in _events(kb, tid) if kind == "delivery_published"][-1]
+    assert (published["head"], published["pull_request_number"], published["state"]) == (update, 41, "clean_update")
+    assert (_closes(gh), [call for call in gh["calls"] if call[0] == "POST"]) == ([], [])
+    conn = kb.connect()
+    try:
+        assert kd.approval_facts(conn, tid, update)["review_head"] == head
+        assert not kd.prove_approval(conn, tid, update).allowed
+    finally:
+        conn.close()
+
+
+def test_a_clean_update_merges_after_ci_and_the_security_review_at_exactly_the_updated_head(exact, monkeypatch):
+    """After the fast-forward, CI on U is read, the tier's security review card is made for U on main, and once it is
+    done and its lens approves U on GitHub, the arm sends GitHub's merge of exactly U, which is recorded with main as
+    U's reviewed base and taken by the release intake. The source's approval of H is all the card review there is:
+    the card says the fence admitted U as a clean update of that approval, which stays bound to H."""
+    kb, root, repo, gh = exact
+    db = kb.kanban_db_path()
+    tid, head, base = _approved_head(exact)
+    _on_github(exact, monkeypatch, tid, head)
+    main = _main_moves(exact, "docs/other.md", "other\n", where="local")
+    _setting(root, "true")
+    _tick(kb)
+    [updated] = _updated(kb, tid)
+    update = updated["update_head"]
+    assert _arms(gh) == []
+
+    _tick(kb)  # CI on U is green: U's review cards
+
+    # The tier's security review alone, of U on the main it was built on.
+    reviews = _raw(db, "SELECT idempotency_key, body FROM tasks WHERE idempotency_key LIKE ?",
+                   f"review:{tid}:{update}:%")
+    assert [(card["idempotency_key"], f"Head: {update}\nBase commit: {main}\n" in card["body"])
+            for card in reviews] == [(f"review:{tid}:{update}:R12", True)]
+    # Truth in reporting: its body names U, main and H as the kernel's clean-update record does, and U is never
+    # called reviewed: the fence admitted it as a clean update of the approval of H, which stays bound to H.
+    [body] = [card["body"] for card in reviews]
+    assert (f"the fence admitted the updated head {update}, on main {main}, as a clean update of the approval of the "
+            f"approved head {head}. The original card approval remains bound to {head}.\n") in body
+    assert not any(claim in body for claim in ("reviewed", f"approval of {update}", f"bound to {update}"))
+    assert (_state(kb, update), _arms(gh)) == ("review_cards_created", [])
+    _done(db)
+    _reviews(gh, *_lenses(kb, update))
+    landed = _lands(exact, update, 41)
+    _tick(kb)  # the arm: main is U's reviewed base
+    _tick(kb)  # the merge pass records it
+
+    assert _arms(gh) == [{"sha": update, "merge_method": "merge"}]
+    assert (_state(kb, update), _state(kb, head)) == ("merged", "updated")
+    assert _parents(repo, landed["merge"]) == [main, update]
+    assert _intaken(update) == [landed["merge"]] and _intaken(head) == []
+    assert _raw(db, "SELECT id FROM tasks WHERE status = 'review'") == []
+
+
+def test_an_update_where_main_changed_an_owned_test_file_still_goes_to_its_builder(exact):
+    """Owner question 1, a guard: main changed only a test file inside the source card's owned paths, which merges
+    with H without a conflict; that is not clean. The update card goes to the builder as before, with its own card
+    review, the kernel's event carries no clean mark, and no delivery row is made at the updated head."""
+    kb, root, repo, gh = exact
+    db = kb.kanban_db_path()
+    tid, head, base, main = _moved_on(exact, path="src/impl/tests/test_other.py", text="def test_other():\n    pass\n")
+
+    _tick(kb)
+
+    card = _update(kb, tid)
+    update = _head(repo, card)
+    assert (card["status"], card["assignee"], card["base_commit"]) == ("ready", IMPLEMENTER, main)
+    assert _parents(repo, update) == [head, main]
+    assert [(payload["update_task_id"], "clean" in payload) for payload in _updated(kb, tid)] == [(card["id"], False)]
+    assert [row["source_head"] for row in _raw(db, "SELECT source_head FROM kanban_deliveries WHERE source_task_id = ?",
+                                               tid)] == [head]
+    assert (_state(kb, head), _arms(gh), _closes(gh)) == ("updated", [], [])
+
+
 @pytest.mark.parametrize("change", ["main_holds_the_change", "main_rewritten_under_the_base"])
 def test_an_update_that_changes_other_paths_goes_back_to_the_builder(exact, change):
     """The update would change another set of paths relative to main than the approved change did relative to its
@@ -422,17 +560,259 @@ def test_an_update_that_changes_other_paths_goes_back_to_the_builder(exact, chan
     _returned(kb, repo, gh, tid, head, main, "paths", branches)
 
 
+def test_a_conflicting_update_gets_a_card_on_main_with_the_conflict_marked(exact):
+    """Main moves on the approved change's own file, so merging main and H conflicts in it, inside the approved paths
+    and the card's owned paths: one pass makes one update card for the builder based on main, with no return. Its
+    branch head has H and main as its parents and holds git's merged tree with the conflict marked, and the kernel's
+    delivery_updated event names the conflicted file."""
+    kb, root, repo, gh = exact
+    tid, head, base, main = _moved_on(exact, path="src/impl/feature.py", text="ok = False\n")
+
+    _tick(kb)
+
+    db = kb.kanban_db_path()
+    assert (_state(kb, head), [task["branch_name"] for task in _raw(db, CONTINUED, tid)], _arms(gh)) == (
+        "updated", [], [])
+    card = _update(kb, tid)
+    update = _head(repo, card)
+    assert (card["status"], card["assignee"], card["head_commit"], card["base_commit"]) == (
+        "ready", IMPLEMENTER, None, main)
+    assert _parents(repo, update) == [head, main]
+    marked = _git(repo, "show", f"{update}:src/impl/feature.py").splitlines()
+    assert [line for line in marked if line.startswith(("<<<<<<<", "=======", ">>>>>>>"))] == [
+        f"<<<<<<< {main}", "=======", f">>>>>>> {head}"] and "ok = False" in marked
+    assert set(_git(repo, "diff", "--name-only", main, update).split()) == {"src/impl/feature.py"}
+    assert [(payload["update_task_id"], payload["update_head"], payload["observed_main"], payload["reviewed_base"],
+             payload["conflicts"]) for payload in _updated(kb, tid)] == [
+        (card["id"], update, main, base, ["src/impl/feature.py"])]
+    assert [task["id"] for task in _raw(db, ON_UPDATE_BRANCHES, tid)] == [card["id"]]
+
+
 def test_a_conflicting_update_goes_back_to_the_builder_with_no_card_in_review(exact):
+    """The conflict goes back to the builder as that update card, ready for the builder and not in review: its body
+    names the conflicted file and asks for the marked conflicts in it resolved and nothing else changed. No checkout
+    moved, no branch but the update's was made, and another pass makes no other card and no return."""
     kb, root, repo, gh = exact
     tid, head, base, main = _moved_on(exact, path="src/impl/feature.py", text="ok = False\n")
     before, branches = _checkout(repo), _branches(repo)
 
     _tick(kb)
 
-    _returned(kb, repo, gh, tid, head, main, "conflict", branches)
-    assert _checkout(repo) == before
+    db = kb.kanban_db_path()
+    assert (_state(kb, head), [task["branch_name"] for task in _raw(db, CONTINUED, tid)]) == ("updated", [])
+    card = _update(kb, tid)
+    assert (card["status"], card["assignee"]) == ("ready", IMPLEMENTER)
+    assert (f"main is at {main}. Merging it with the approved change conflicts in these files: src/impl/feature.py. "
+            f"This card's branch {card['branch_name']} at {_head(repo, card)} is on current main with the conflict "
+            "marked. Resolve the marked conflicts in those files only, change nothing else, and hand over for review."
+            ) in card["body"] and "over unchanged" not in card["body"]
+    assert _raw(db, "SELECT id FROM tasks WHERE status = 'review'") == []
+    assert _checkout(repo) == before and _branches(repo) == branches | {card["branch_name"]}
     _tick(kb)
-    assert len(_raw(kb.kanban_db_path(), CONTINUED, tid)) == 1
+    assert ([task["id"] for task in _raw(db, ON_UPDATE_BRANCHES, tid)], _raw(db, CONTINUED, tid)) == ([card["id"]], [])
+
+
+def test_a_conflicting_updates_card_says_to_block_it_when_the_resolution_leaves_no_change(exact):
+    """The owner's round 3: a resolution can leave no change against main, as when main made the same change, and the
+    kernel hands no empty change over. The body of the update card with the conflict marked keeps its instruction for
+    a resolution that leaves a change, then tells its builder, word for word, not to hand over in that case but to
+    block the card with the reason it names."""
+    kb, root, repo, gh = exact
+    tid, head, base, main = _moved_on(exact, path="src/impl/feature.py", text="ok = False\n")
+
+    _tick(kb)
+
+    card = _update(kb, tid)
+    assert [payload["conflicts"] for payload in _updated(kb, tid)] == [["src/impl/feature.py"]]
+    assert ("Resolve the marked conflicts in those files only, change nothing else, and hand over for review. "
+            f"{NO_CHANGE_LEFT}") in card["body"]
+
+
+def test_a_conflict_resolved_entirely_to_main_is_blocked_as_no_longer_needed(exact):
+    """Finding 2af0d62e of 1068: the update card's builder resolves the marked conflict entirely to main's version and
+    commits it, so nothing is left to change against main, and the kernel's guard still refuses that empty hand-over,
+    as it is. The builder then does what the card's body says: it blocks the card through the kernel call of the
+    worker's block tool, with the reason the body names. The card waits blocked with that reason for the owner,
+    nothing is in review, and another pass makes no other update card and no return."""
+    kb, root, repo, gh = exact
+    db = kb.kanban_db_path()
+    tid, head, base, main = _moved_on(exact, path="src/impl/feature.py", text="ok = False\n")
+    _tick(kb)
+    card = _update(kb, tid)
+    (root / "profiles" / IMPLEMENTER).mkdir(parents=True, exist_ok=True)
+    _tick(kb)  # the dispatcher claims the card for its builder at its branch
+    claimed = _task(kb, card["id"])
+    assert (claimed["status"], claimed["assignee"], claimed["base_commit"]) == ("running", IMPLEMENTER, main)
+    workspace = Path(claimed["workspace_path"])
+    assert _git(workspace, "rev-parse", "HEAD") == _head(repo, claimed)
+
+    _git(workspace, "checkout", main, "--", "src/impl/feature.py")  # main's version: no marker, no line of H
+    _git(workspace, "commit", "-q", "-m", "resolve src/impl/feature.py to main's version")
+
+    assert _git(workspace, "diff", "--name-only", main, "HEAD") == ""
+    conn = kb.connect()
+    try:
+        run = kb.get_task(conn, card["id"]).current_run_id
+        with pytest.raises(kb.WorktreeScopeError, match="mutating completion has no committed changes"):
+            kb.complete_task(conn, card["id"], summary="resolved to main's version", expected_run_id=run)
+        # the kernel call of the worker's kanban_block
+        assert kb.block_task(conn, card["id"], reason=NO_LONGER_NEEDED, kind=None, expected_run_id=run) is True
+    finally:
+        conn.close()
+    _tick(kb)
+
+    blocked = _raw(db, "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked'", card["id"])
+    assert (_task(kb, card["id"])["status"], [json.loads(event["payload"])["reason"] for event in blocked]) == (
+        "blocked", [NO_LONGER_NEEDED])
+    assert (_handovers(kb, card["id"]), _raw(db, "SELECT id FROM tasks WHERE status = 'review'")) == ([], [])
+    assert ([task["id"] for task in _raw(db, ON_UPDATE_BRANCHES, tid)], _raw(db, CONTINUED, tid)) == ([card["id"]], [])
+    assert (_update(kb, tid)["id"], _state(kb, head), _arms(gh)) == (card["id"], "updated", [])
+    assert NO_CHANGE_LEFT in card["body"]  # what the card's body tells its builder to do
+
+
+@pytest.mark.parametrize("conflict", ["added_on_both_sides", "deleted_under_the_base"])
+def test_a_conflict_outside_the_approved_paths_goes_back_to_the_builder(exact, conflict):
+    """The reviewed base is a commit only the registered checkout holds, and it changes docs/kept.md, which main on
+    GitHub changes too and the approved change never touches: merging main and H conflicts in that file, outside the
+    approved paths, so it goes back to the builder as a conflict and no update card is made. Both add the file, so the
+    merged tree changes it relative to main as well; or the base deletes it while main changes it, so git leaves
+    main's version in the tree, and only the conflicted file lies outside the approved paths."""
+    kb, root, repo, gh = exact
+    if conflict == "deleted_under_the_base":
+        _main_moves(exact, "docs/kept.md", "kept\n", where="local")
+        _git(repo, "rm", "-q", "docs/kept.md")
+    else:
+        (repo / "docs").mkdir(exist_ok=True)
+        (repo / "docs" / "kept.md").write_text("in the reviewed base\n", encoding="utf-8")
+        _git(repo, "add", "docs/kept.md")
+    _git(repo, "commit", "-q", "-m", "the reviewed base changes docs/kept.md")
+    tid, head, base = _approved_head(exact)
+    main = _main_moves(exact, "docs/kept.md", "changed on main\n")
+    _setting(root, "true")
+    branches = _branches(repo)
+
+    _tick(kb)
+
+    _returned(kb, repo, gh, tid, head, main, "conflict", branches)
+
+
+@pytest.mark.parametrize("name, continued", [("café", False), ('say"hi', False), ("back\\slash", True),
+                                             ("tab\there", True), ("new\nline", True)],
+                         ids=["unicode", "double_quote", "backslash", "tab", "newline"])
+def test_a_conflict_in_a_file_whose_name_git_quotes_gets_a_card_on_main(exact, name, continued):
+    """Git quotes such a name in its line output; the conflicted file is read as the same raw name _paths reads. Main
+    adds the approved change's own file too, so merging conflicts in it, inside the approved and owned paths: the
+    source card's own file, or the file a continuation adds on top of H. One pass makes one update card based on
+    main, its branch head with H and main as its parents and the conflict marked in that file, and the kernel's
+    delivery_updated event names the file by its raw name."""
+    kb, root, repo, gh = exact
+    path = f"src/impl/{name}.py"
+    if continued:
+        _, _, _, tid, head = _continued(exact, build=lambda workspace: _fix(workspace, path))
+    else:
+        tid, head, base = _approved_head(exact, name=name)
+    main = _main_moves(exact, path, "ok = False\n")
+    _setting(root, "true")
+
+    _tick(kb)
+
+    db = kb.kanban_db_path()
+    assert (_state(kb, head), [task["branch_name"] for task in _raw(db, CONTINUED, tid)]) == ("updated", [])
+    card = _update(kb, tid)
+    update = _head(repo, card)
+    assert (card["base_commit"], _parents(repo, update)) == (main, [head, main])
+    marked = _git(repo, "show", f"{update}:{path}").splitlines()
+    assert [line for line in marked if line.startswith(("<<<<<<<", "=======", ">>>>>>>"))] == [
+        f"<<<<<<< {main}", "=======", f">>>>>>> {head}"] and "ok = False" in marked
+    assert [payload["conflicts"] for payload in _updated(kb, tid)] == [[path]]
+
+
+def test_a_content_conflict_under_conflict_marker_size_3_gets_a_card_on_main(exact):
+    """The reviewed base sets ``*.py conflict-marker-size=3`` in .gitattributes and main moves on the approved change's
+    own file: git's own messages name a content conflict in it, inside the approved and owned paths, whatever marker
+    width git writes. One pass makes one update card for the builder based on main, with no return. Its branch head
+    has H and main as its parents and holds git's merged tree, here with git's 3-character markers, and the kernel's
+    delivery_updated event names the conflicted file."""
+    kb, root, repo, gh = exact
+    _main_moves(exact, ".gitattributes", "*.py conflict-marker-size=3\n", where="local")
+    tid, head, base = _approved_head(exact)
+    main = _main_moves(exact, "src/impl/feature.py", "ok = False\n")
+    _setting(root, "true")
+
+    _tick(kb)
+
+    db = kb.kanban_db_path()
+    assert (_state(kb, head), [task["branch_name"] for task in _raw(db, CONTINUED, tid)], _arms(gh)) == (
+        "updated", [], [])
+    card = _update(kb, tid)
+    update = _head(repo, card)
+    assert (card["status"], card["assignee"], card["head_commit"], card["base_commit"]) == (
+        "ready", IMPLEMENTER, None, main)
+    assert _parents(repo, update) == [head, main]
+    assert _git(repo, "show", f"{update}:src/impl/feature.py").splitlines() == [
+        f"<<< {main}", "ok = False", "===", "ok = True", f">>> {head}"]
+    assert set(_git(repo, "diff", "--name-only", main, update).split()) == {"src/impl/feature.py"}
+    assert [(payload["update_task_id"], payload["update_head"], payload["observed_main"], payload["reviewed_base"],
+             payload["conflicts"]) for payload in _updated(kb, tid)] == [
+        (card["id"], update, main, base, ["src/impl/feature.py"])]
+    assert [task["id"] for task in _raw(db, ON_UPDATE_BRANCHES, tid)] == [card["id"]]
+
+
+def test_a_modify_delete_conflict_on_an_owned_file_goes_back_to_the_builder(exact):
+    """The reviewed base holds src/impl/feature.py, H modifies it and main deletes it: git's own messages name a
+    modify/delete conflict, no content conflict, though the file lies inside the approved and owned paths. Only a
+    content conflict gets the update card, so it goes back to the builder as a conflict, as before this card, and no
+    update card is made."""
+    kb, root, repo, gh = exact
+    _main_moves(exact, "src/impl/feature.py", "ok = None\n", where="local")
+    tid, head, base = _approved_head(exact)
+    _git(repo, "rm", "-q", "src/impl/feature.py")
+    _git(repo, "commit", "-q", "-m", "main deletes src/impl/feature.py")
+    _git(repo, "push", "-q", str(gh["bare"]), "HEAD:refs/heads/main")
+    main = gh["main"] = _git(repo, "rev-parse", "HEAD")
+    _setting(root, "true")
+    branches = _branches(repo)
+
+    _tick(kb)
+
+    _returned(kb, repo, gh, tid, head, main, "conflict", branches)
+
+
+def test_a_conflict_in_a_file_whose_name_is_not_utf_8_goes_back_to_the_builder(exact):
+    """A continuation adds a file on top of H whose name is no UTF-8, the bytes b"caf\\xe9", inside the approved and
+    owned paths, and main adds it too: no event or card body can hold that name as text, so the conflict goes back to
+    the builder as a conflict, with no update card and no error."""
+    kb, root, repo, gh = exact
+    path = b"src/impl/caf\xe9.py".decode("utf-8", "surrogateescape")  # as _paths decodes it
+    _, _, _, tid, head = _continued(exact, build=lambda workspace: _fix(workspace, path))
+    main = _main_moves(exact, path, "ok = False\n")
+    _setting(root, "true")
+    branches = _branches(repo)
+
+    _tick(kb)
+
+    _returned(kb, repo, gh, tid, head, main, "conflict", branches)
+
+
+def test_a_file_the_approved_change_deleted_and_main_modified_goes_back_to_the_builder(exact):
+    """The reviewed base holds src/impl/gone.py, a continuation deletes it on top of H and main modifies it: git leaves
+    main's version in the merged tree, so the update would not carry the approved change, and it goes back to the
+    builder as a conflict."""
+    kb, root, repo, gh = exact
+    _main_moves(exact, "src/impl/gone.py", "gone = False\n", where="local")
+
+    def deletes_its_file(workspace):
+        _git(workspace, "rm", "-q", "src/impl/gone.py")
+        _git(workspace, "commit", "-q", "-m", "delete src/impl/gone.py")
+
+    _, _, _, tid, head = _continued(exact, build=deletes_its_file)
+    main = _main_moves(exact, "src/impl/gone.py", "changed on main\n")
+    _setting(root, "true")
+    branches = _branches(repo)
+
+    _tick(kb)
+
+    _returned(kb, repo, gh, tid, head, main, "conflict", branches)
 
 
 def test_a_continued_delivery_is_brought_up_to_date_when_main_moves(exact):
@@ -522,6 +902,11 @@ def test_the_old_pull_request_closes_once_the_update_is_published(exact):
     _publish(kb, gh, card["id"], update, 42)
     _tick(kb)
 
+    # A guard: the update card's own approval delivers U, an ordinary delivery, so its review card carries none of
+    # the clean-update text, though the source card's kernel event, not clean, names U.
+    [body] = [review["body"] for review in _raw(kb.kanban_db_path(), "SELECT body FROM tasks WHERE idempotency_key "
+                                                "LIKE ?", f"review:{card['id']}:{update}:%")]
+    assert "clean update" not in body.lower() and "admitted" not in body
     assert _closes(gh) == [("PATCH", f"/repos/{REPO}/pulls/41", {"state": "closed"})]
     assert _state(kb, head) == "replaced"
     replaced = [payload for kind, payload in _events(kb, tid) if kind == "delivery_replaced"]
