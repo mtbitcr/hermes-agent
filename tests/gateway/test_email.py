@@ -432,6 +432,43 @@ class TestSendMethods(unittest.TestCase):
             os.unlink(tmp_path)
 
 
+    def test_send_image_file_attaches_png_without_fallback_notice(self):
+        """send_image_file sends one email with one image/png attachment, not a fallback notice."""
+        import asyncio
+        import tempfile
+        adapter = self._make_adapter()
+        png = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+               b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x00IEND\xaeB`\x82")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = os.path.join(tmp_dir, "chart.png")
+            with open(tmp_path, "wb") as f:
+                f.write(png)
+
+            with patch("smtplib.SMTP") as mock_smtp, \
+                 patch.object(adapter, "_send_media_fallback_notice", new=AsyncMock()) as fallback:
+                mock_server = MagicMock()
+                mock_smtp.return_value = mock_server
+
+                result = asyncio.run(
+                    adapter.send_image_file(
+                        "user@test.com", tmp_path, "Daily chart", metadata={"k": "v"}, extra="ignored"
+                    )
+                )
+
+            self.assertTrue(result.success)
+            fallback.assert_not_called()
+            mock_server.send_message.assert_called_once()
+            sent_msg = mock_server.send_message.call_args[0][0]
+            attachments = [
+                p for p in sent_msg.walk()
+                if "attachment" in str(p.get("Content-Disposition", ""))
+            ]
+            self.assertEqual(len(attachments), 1)
+            self.assertEqual(attachments[0].get_content_type(), "image/png")
+            self.assertEqual(attachments[0].get_filename(), "chart.png")
+            self.assertEqual(attachments[0].get_payload(decode=True), png)
+
     def test_get_chat_info(self):
         """get_chat_info should return email address as chat info."""
         import asyncio

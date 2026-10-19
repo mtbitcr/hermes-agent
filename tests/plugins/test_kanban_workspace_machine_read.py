@@ -383,7 +383,7 @@ def test_native_project_response_projects_an_unsafe_project_name(workspace_surfa
         "projects": [{
             "id": s["project_id"],
             "slug": PROJECT,
-            "name": "Raphael Workspace https://***@git.example.com/repo.git",
+            "name": "This project has a name Raphael cannot show here.",
         }]
     }
     name = project.json()["projects"][0]["name"]
@@ -419,7 +419,7 @@ def test_native_boards_response_projects_an_unsafe_board_name(workspace_surface)
     assert board_item["slug"] == BOARD
     assert (
         board_item["name"]
-        == "Raphael Board https://***@git.example.com/repo.git"
+        == "This project has a name Raphael cannot show here."
     )
     assert board_item["name"] == ow.owner_project_name(unsafe)
     for forbidden in (

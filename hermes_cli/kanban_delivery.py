@@ -969,6 +969,13 @@ def review_step(db_path: Path) -> None:
 def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Optional[str]:
     """Card 2 for one published row: GitHub is read outside every transaction, and an
     outcome or a waiting reason is stored only while the row and its done source card
+<<<<<<< 1249bdf4b8291c8bdd5697e359f92b40af4978b9
+    are as this pass read them before GitHub. The required checks on H, each by its name
+    in one request read right before the pull request is read again, alone decide green,
+    red or wait; a red decision's waiting record holds the id and conclusion of each red
+    required check run, as those requests answered them, before the red check is rerun or
+    returned. Owner rule 2
+=======
     are as this pass read them before GitHub. The required check on H, in one request,
     decides green, red or wait; after H's one accepted rerun, the workflow attempt of that
     rerun gates green too (review 1098, :func:`_rerun_attempt`): green waits until it has
@@ -976,6 +983,7 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
     read again after the last of those reads. A red decision's waiting record holds the id
     and conclusion of each red required check run, as that request answered them, before
     the red check is rerun or returned. Owner rule 2
+>>>>>>> f317fa20c7272d3b43e0405bddb07b160c46081d
     of round 3: a recorded refused or unanswered rerun of H with no return recorded for H
     returns the work before CI on H is read, whatever it shows, in whatever phase the row
     is; such a row is read for nothing else. An open row whose pull request any read of this
@@ -1016,12 +1024,21 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
         if not at_head:
             return stored  # the pull request closed outside the delivery step, or moved off H: no card for a stale head
         required = policy.required_checks[repository]
-        runs, count = _page(github, f"/repos/{repository}/commits/{head}/check-runs", "check_runs", filter="latest")
-        if count > 100 or len(runs) != count:  # the one decision request, read last: whole on its one page
-            raise PublishRefused("ci_unreadable", f"{count} check runs on {head}, {len(runs)} in the answer")
-        named = {name: [run for run in runs if run.get("name") == name] for name in required}
+        named = {}
+        for name in required:  # each required check by its name, so H's other CI runs never fill its one page
+            runs, count = _page(github, f"/repos/{repository}/commits/{head}/check-runs", "check_runs",
+                                filter="latest", check_name=name)
+            if count > 100 or len(runs) != count:  # each decision request, read last: whole on its one page
+                raise PublishRefused("ci_unreadable",
+                                     f"{count} check runs of {name} on {head}, {len(runs)} in the answer")
+            named[name] = [run for run in runs if run.get("name") == name]
+        for name, found in named.items():  # a later CI run of H holds a check again: the newest check suite decides
+            suites = [run["check_suite"].get("id") if isinstance(run.get("check_suite"), dict) else None
+                      for run in found]
+            if len(found) > 1 and all(type(suite) is int for suite in suites):  # a rerun keeps its run's older suite
+                named[name] = [run for run in found if run["check_suite"]["id"] == max(suites)]
         if not named or any(len(found) != 1 for found in named.values()):
-            return None  # a required check that is not in the answer exactly once decides nothing
+            return None  # a required check missing, or doubled in its newest suite or with no suite, decides nothing
         outcomes = {_required_check(name, head, {"check_runs": found, "statuses": []}) for name, found in named.items()}
         if outcomes & {"pending", "stale"}:
             return None  # CI on H still runs: a later step tries again
@@ -1037,7 +1054,7 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
         if outcomes == {"success"}:
             return _create_review_cards(db_path, row, read, repository, base, required, reviewer, route)
         failed = [{"id": run["id"], "conclusion": run.get("conclusion")} for (run,) in named.values()
-                  if run.get("conclusion") != "success"]  # the red required checks, as the decision request read them
+                  if run.get("conclusion") != "success"]  # the red required checks, as the decision requests read them
         with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
             if not delivery_settings() or not _unchanged(conn, row, read):
                 return None
