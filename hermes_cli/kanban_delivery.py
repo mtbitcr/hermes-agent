@@ -631,11 +631,18 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
         # Captured before the approval is proven, so the final write sees any later change.
         approved_source = _source_state(conn, source)
         approval = approval_facts(conn, source, record["source_head"])
-        # The approval half of T1 answers before GitHub is touched.
-        early = decide_publish(approval, dict(_NO_LEDGER), dict(_NO_REMOTE))
+        update = None
+        if approval["bound_head"] not in (None, approval["head_commit"]):
+            # Card B: a head other than H is admitted only as a clean update of H's approval, on the kernel's
+            # record of that update and git's parents of the head, both judged by the fence.
+            update = {"record": _clean_record(conn, source, approval["bound_head"]),
+                      "parents": _parents(workdir, approval["bound_head"])}
+        # The approval half of T1 answers before GitHub is touched: for a recorded clean update, H's approval.
+        early = decide_publish({**approval, "bound_head": approval["head_commit"]} if update and update["record"]
+                               else approval, dict(_NO_LEDGER), dict(_NO_REMOTE))
         if not early.allowed:
             raise PublishRefused(early.code, early.detail)
-        head = approval["head_commit"]
+        head = approval["head_commit"] if update is None else approval["bound_head"]
         approval_event = conn.execute(
             "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'completed'", (source,),
         ).fetchall()[0][0]
@@ -681,9 +688,11 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
             "branch_head": _branch_head(github, branch),  # None when GitHub has no such branch
             "open_pulls": open_pulls,
         }
-        decision = decide_publish(approval, ledger, remote)
+        decision = decide_publish(approval, ledger, remote, update)
         if not decision.allowed:
             raise PublishRefused(decision.code, decision.detail)
+        if update is not None:  # the fence's own words: the head it admitted as a clean update of H's approval
+            logger.info("kanban delivery: delivery %s: %s", delivery_id, decision.detail)
         if decision.code in ("push_and_create", "adopt_and_create"):
             state = "adopted"  # the branch already holds H, so nothing is pushed
             if decision.code == "push_and_create":
@@ -719,12 +728,13 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
                 raise _lease_refusal(
                     error, "head_moved", f"{branch} no longer holds {ledger['head']}",
                 ) from None
-            number, state = ledger["pull_request"], "fast_forwarded"
+            number, state = ledger["pull_request"], "fast_forwarded" if update is None else "clean_update"
         elif decision.code == "adopt_pull_request":  # no ledger, and one pull request open at H
             number, state = open_pulls[0]["number"], "adopted"
         else:  # already_published or adopt_fast_forward: GitHub already holds H
             number = ledger["pull_request"]
             state = "already_published" if decision.code == "already_published" else "fast_forwarded"
+            state = "clean_update" if update is not None else state
         if decision.code in (
             "push_and_create", "adopt_and_create", "push_fast_forward", "adopt_pull_request", "adopt_fast_forward",
         ):
@@ -762,10 +772,11 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
                     "publish_lease_until = NULL WHERE id = ?",
                     (number, head, branch, record["id"]),
                 )
+                # A clean update is bound to the main it was built on, the one its record names.
                 kb._append_event(conn, source, "delivery_bound", {
                     "source_task_id": source,
                     "head": head,
-                    "base_commit": approval["base"],
+                    "base_commit": approval["base"] if update is None else update["record"]["observed_main"],
                     "reviewer": approval["reviewer"],
                     "implementer": approval["implementer"],
                     "approval_event_id": approval_event,
@@ -881,6 +892,37 @@ def _source_read(conn: sqlite3.Connection, source: str) -> tuple:
     return (revision, *(task or (None, None, None)))
 
 
+def _clean_record(conn: sqlite3.Connection, source: str, head: str) -> Optional[dict]:
+    """Card B: the kernel's record of ``head`` as an update of an approved head of ``source``, the source card's
+    latest delivery_updated event naming it as its updated head, which the update step writes in the transaction
+    that checks the card's owned paths against what main changed. None when there is none."""
+    for (payload,) in conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind = 'delivery_updated' "
+                                   "ORDER BY id DESC", (source,)):
+        with contextlib.suppress(ValueError, TypeError):
+            record = json.loads(payload)
+            if isinstance(record, dict) and record.get("update_head") == head:
+                return record
+    return None
+
+
+def _parents(workdir: Optional[Path], head: str) -> list:
+    """git's parents of ``head`` in the card's own repository, first parent first; [] when git cannot say."""
+    listed = _run_git(workdir, "rev-list", "--parents", "-n", "1", head) if workdir is not None else None
+    if listed is None or listed.returncode != 0:
+        return []
+    return listed.stdout.decode("utf-8", "replace").split()[1:]
+
+
+def _delivers(conn: sqlite3.Connection, source: str, read: tuple, head: str) -> bool:
+    """The source card, as ``read``, is done at ``head``, or done at the approved head the kernel's record
+    (:func:`_clean_record`) names ``head`` a clean update of; that head is never reported as reviewed."""
+    if read[1] != "done":
+        return False
+    record = _clean_record(conn, source, head) if _sha(read[2]) != head else None
+    return _sha(read[2]) == head or record is not None and record.get("clean") is True and (
+        record.get("head") == _sha(read[2]))
+
+
 def _unchanged(conn: sqlite3.Connection, row: dict, read: tuple) -> bool:
     """The delivery row still names the pull request, head, state and lease this pass read,
     and the source card is as ``read``, its :func:`_source_read` before the network calls."""
@@ -987,8 +1029,9 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
             "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'delivery_bound' "
             "ORDER BY id DESC", (source,))]
         refused = _refused_rerun(conn, source, head)
-    if (read[1], _sha(read[2])) != ("done", head) or refused is None and row["pull_request_state"] != "open":
-        return None  # the source card is not done at H, or the row is past open and no return waits
+        delivers = _delivers(conn, source, read, head)
+    if not delivers or refused is None and row["pull_request_state"] != "open":
+        return None  # the source card is not done at H or its clean update, or the row is past open and no return waits
     repository = _origin_repository(_repository(task["workspace_path"])) if task is not None else None
     try:
         policy = load_policy(_POLICY_FILE.read_text(encoding="utf-8"))
@@ -1474,7 +1517,7 @@ def _approving_cards(conn: sqlite3.Connection, row: dict, read: tuple, returned:
     Each is its id, key, creator, status, own head and base, and event revision. With
     ``returned``, a card that returned changes counts too."""
     source, head = row["source_task_id"], row["pull_request_head"]
-    if (read[1], _sha(read[2])) != ("done", head):
+    if not _delivers(conn, source, read, head):
         return []
     try:
         tier = effective_risk_tier(read[3])
