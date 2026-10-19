@@ -9,7 +9,13 @@ update is then computed without touching any checkout: ``git merge-tree --write-
 change the same set of paths relative to main as H did relative to its reviewed base, and nothing outside the source
 card's owned paths. When H continues an earlier delivery, its reviewed base the head of a delivery of a task_links
 parent of its card or of a card its card replaced, the change is measured from where the chain started, which main
-and H must both hold. Then one update card is made per source card, H and main, through the card creation of
+and H must both hold. Card B: an update git merged with no conflict, while main changed none of the source card's
+owned paths since that start, test files included, is clean and makes no card. The write transaction that checks
+those paths records it in the source card's ``delivery_updated`` event, ``clean`` true, naming H, main and the
+updated head, beside a delivery row of the source card at the updated head. Only through that record does the publish
+fence move H's pull request to the updated head by a fast-forward, H being its first parent; CI, the tier's review
+cards, the arm and the merge then each run at exactly that head, which is never reported as reviewed. Otherwise
+one update card is made per source card, H and main, through the card creation of
 :func:`hermes_cli.kanban_delivery._continuation`: a task_links child of the source card for its builder, with the
 source's tier, route, effort, policy lock, owner receipt binding, risk tier and review requirement, on a branch at
 the updated head. Its builder hands that head over unchanged through the normal completion, so the kernel's own
@@ -19,9 +25,12 @@ to main in the same transaction: the handover is exactly the approved paths on m
 ``delivery_updated`` event of the source card, written in the transaction that creates the card, is the one record
 of it: an existing update card is accepted only through that event, never through a task's caller-chosen fields.
 The row is then final, ``updated``, and :func:`hermes_cli.kanban_delivery._replaced` closes its pull request once
-the update is published. A conflict or another set of paths goes back to the builder through H's continuation card
-instead. :func:`hermes_cli.kanban_delivery.publish_step` calls :func:`update_step` once per pass, with the setting
-on only.
+the update is published. Another set of paths goes back to the builder through H's continuation card instead. So
+does a conflict, unless git's merged tree passes the same checks and git's own messages, never the merged files, name
+only content conflicts, each in a file inside the approved and owned paths: then the update card is made the same way
+on that tree, which holds those files as git marked them, its body names them for its builder to resolve and nothing
+else, and its delivery_updated event names them as ``conflicts``.
+:func:`hermes_cli.kanban_delivery.publish_step` calls :func:`update_step` once per pass, with the setting on only.
 """
 
 from __future__ import annotations
@@ -30,6 +39,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -51,6 +61,12 @@ _UPDATE_BODY = _MOVED + (
     "recorded base is main, so it changes the same paths relative to main as the approved change did relative to its "
     "base, all within the source card's owned paths. Hand {update} over unchanged for review: the approval of {head} "
     "does not cover it, and only this card's own review delivers it.")
+_CONFLICT_BODY = _MOVED + (
+    " Merging it with the approved change conflicts in these files: {conflicts}. This card's branch {branch} at "
+    "{update} is on current main with the conflict marked. Resolve the marked conflicts in those files only, change "
+    "nothing else, and hand over for review. If your resolution leaves no change against main, the approved change "
+    "is no longer needed. Do not hand over. Block this card with the reason: The approved change is no longer needed "
+    "after a change on main.")
 _RETURN_BODY = _MOVED + " {why} Bring the change up to date on main and hand it over for review again."
 _WHY = {
     "conflict": "Merging main and the approved head conflicts, so no update was made.",
@@ -107,24 +123,39 @@ def _update(db_path: Path, row: dict) -> Optional[str]:
         made = _made(conn, row, main)
     if made is not None:  # the kernel's record of the update card: nothing is computed or made again
         return _updated(db_path, row, facts, None)
-    merged = kd._run_git(root, "merge-tree", "--write-tree", main, head)
+    merged = kd._run_git(root, "merge-tree", "--write-tree", "-z", "--name-only", "--messages", main, head)
     if merged is None or merged.returncode not in (0, 1):
         raise kd.PublishRefused("no_update", f"git merge-tree of {main} and {head} did not run")
-    if merged.returncode == 1:
-        return _returned(db_path, row, facts, "conflict")
+    # Exit 1 is a conflict, read from git's own messages as _conflicts reads them, never from the merged files, its
+    # names raw as _paths reads its names. Its update is made only as a clean one is, with git naming content conflicts
+    # only, each in a file inside the approved and owned paths; anything else sends it back as a conflict.
+    fields = merged.stdout.decode("utf-8", "surrogateescape").split("\0")
+    reason = "conflict" if merged.returncode == 1 else "paths"
     with kb.connect_closing(db_path=db_path) as conn:
         start = _approved_base(conn, source, base)
     if start != base:  # H continues an earlier delivery of the same work: approved from where the chain started
         if start is None or not (kd._git_proof(root, start, None)[0] and kd._git_proof(root, main, start)[1]
                                  and kd._git_proof(root, head, start)[1]):
-            return _returned(db_path, row, facts, "paths")
+            return _returned(db_path, row, facts, reason)
         facts["approved_base"] = start
-    tree = kd._sha(merged.stdout.decode().split("\n", 1)[0])
+    tree = kd._sha(fields[0])
     approved, update = _paths(root, start, head), _paths(root, main, tree)
     if tree is None or approved is None or update is None:
         raise kd.PublishRefused("no_update", f"the paths of {head} on {main} cannot be read")
     if update != approved or not all(_owned(path, task.owned_paths) for path in update):
-        return _returned(db_path, row, facts, "paths")
+        return _returned(db_path, row, facts, reason)
+    if merged.returncode == 1:
+        conflicts, paths = _conflicts(fields) or ([], [])
+        # A name that is no UTF-8 holds a lone surrogate here, which neither the event nor the body can store as text.
+        if not conflicts or not all(path in approved and _owned(path, task.owned_paths)
+                                    and path == path.encode("utf-8", "replace").decode("utf-8")
+                                    for path in conflicts + paths):
+            return _returned(db_path, row, facts, "conflict")
+        facts["conflicts"] = conflicts
+    else:  # card B: what main changed since the approved start, which _updated checks against the owned paths
+        changed = _paths(root, start, main)
+        if changed is not None:
+            facts["main_changed"] = changed
     branch = _BRANCH.format(source=source, head=head[:12], main=main[:12])
     commit = _branch(root, branch, tree, head, main, _MESSAGE.format(**facts))
     return _updated(db_path, row, facts, (root, branch, commit))
@@ -213,6 +244,29 @@ def _paths(root: Path, old: str, new: str) -> Optional[frozenset]:
     return frozenset(path for path in changed.stdout.decode("utf-8", "surrogateescape").split("\0") if path)
 
 
+def _conflicts(fields: list) -> Optional[tuple]:
+    """Git's own account of a conflicted ``git merge-tree --write-tree -z --name-only --messages``, its output split at
+    each NUL, never the merged files: the tree, each conflicted name, an empty field, then each of git's messages as
+    its number of paths, those paths, its stable type and its text ended by a newline, and the empty field after the
+    last NUL, names and paths raw. The conflicted names and the paths of the "CONFLICT (contents)" messages when the
+    output parses exactly so, every message is "Auto-merging" or "CONFLICT (contents)" and at least one is
+    "CONFLICT (contents)"; None for anything else, so any other type of conflict, an unknown one included."""
+    end = fields.index("", 1) if "" in fields[1:] else len(fields)
+    names, rest, paths = fields[1:end], fields[end + 1:], []
+    while len(rest) > 1:
+        count = int(rest[0]) if rest[0].isascii() and rest[0].isdigit() else 0
+        if not 0 < count < len(rest) - 3:
+            return None
+        message, kind, text, rest = rest[1:count + 1], rest[count + 1], rest[count + 2], rest[count + 3:]
+        if "" in message or not text.endswith("\n") or kind not in ("Auto-merging", "CONFLICT (contents)"):
+            return None
+        if kind == "CONFLICT (contents)":
+            paths += message
+    if rest != [""] or not paths:
+        return None
+    return names, paths
+
+
 def _owned(path: str, owned: Optional[list]) -> bool:
     """The kernel's owned path rule: "." owns the repository, every other entry one exact file or subtree.
     An unscoped card (None) or a read-only one owns nothing that can be shown."""
@@ -253,21 +307,43 @@ def _still_moved(conn, row: dict) -> bool:
                                         row["pull_request_number"])).fetchone() is not None
 
 
+def _clean(conn, row: dict, facts: dict) -> bool:
+    """Card B, inside _updated's write transaction: the update is clean when git merged it with no conflict, H is
+    the source card's approved head, so the first parent of the updated head, and main changed none of the card's
+    owned paths since the approved start, test files included."""
+    task = kb.get_task(conn, row["source_task_id"])
+    return "main_changed" in facts and task is not None and bool(task.owned_paths) and kd._sha(
+        task.head_commit) == facts["head"] and not any(_owned(path, task.owned_paths) for path in facts["main_changed"])
+
+
 def _updated(db_path: Path, row: dict, facts: dict, update: Optional[tuple]) -> Optional[str]:
-    """One write transaction, while the row is still base_moved: unless the kernel's delivery_updated event of
-    this delivery, H and main records the update card already, the card is made through _continuation's card
-    creation at the updated head, so for the source's builder with the source's governance, its recorded base then
-    main, and that event names it; then the row is final, updated."""
+    """One write transaction, while the row is still base_moved. A clean update (:func:`_clean`, checked here) makes
+    no card: the source card gets a delivery row at the updated head carrying the approval of H, and the kernel's
+    delivery_updated event marks it clean, naming H, main and the updated head, the one record through which the
+    publish fence admits that head to H's pull request by a fast-forward. Otherwise, unless that event of this
+    delivery, H and main records the update card already, the card is made through _continuation's card creation at
+    the updated head, so for the source's builder with the source's governance, its recorded base then main, and
+    that event names it. Then the row is final, updated."""
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if not _still_moved(conn, row):
             return None
-        if _made(conn, row, facts["main"]) is None:
+        if update is not None and _clean(conn, row, facts):
+            branch, commit = update[1:]
+            conn.execute("INSERT OR IGNORE INTO kanban_deliveries (source_task_id, source_head, approval_run_id, "
+                         "created_at) SELECT source_task_id, ?, approval_run_id, ? FROM kanban_deliveries WHERE id = ?",
+                         (commit, int(time.time()), row["id"]))
+            kb._append_event(conn, row["source_task_id"], "delivery_updated", kd._outcome(
+                row, repository=row["repository"], reviewed_base=facts["base"], observed_main=facts["main"],
+                update_head=commit, update_branch=branch, clean=True,
+                **({"approved_base": facts["approved_base"]} if "approved_base" in facts else {})))
+        elif _made(conn, row, facts["main"]) is None:
             if update is None:
                 return None
             root, branch, commit = update
-            body = _UPDATE_BODY.format(head=facts["head"], source=facts["source"], number=row["pull_request_number"],
-                                       repository=row["repository"], base=facts["base"], main=facts["main"],
-                                       update=commit, branch=branch)
+            body = (_CONFLICT_BODY if "conflicts" in facts else _UPDATE_BODY).format(
+                head=facts["head"], source=facts["source"], number=row["pull_request_number"],
+                repository=row["repository"], base=facts["base"], main=facts["main"], update=commit, branch=branch,
+                conflicts=", ".join(facts.get("conflicts", ())))
             made = kd._continuation(conn, db_path, {**row, "pull_request_head": commit}, body, (root, branch))
             # The kernel's scoped completion hands over only committed changes since the recorded base, so the
             # unchanged updated head is handed over against main, which it holds: exactly the approved paths.
@@ -277,6 +353,7 @@ def _updated(db_path: Path, row: dict, facts: dict, update: Optional[tuple]) -> 
                 row, repository=row["repository"], reviewed_base=facts["base"], observed_main=facts["main"],
                 update_task_id=made["rework"], update_head=commit, update_branch=branch,
                 **({"approved_base": facts["approved_base"]} if "approved_base" in facts else {}),
+                **({"conflicts": facts["conflicts"]} if "conflicts" in facts else {}),
                 **({"parked": made["parked"]} if made.get("parked") else {})))
         conn.execute("UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ?", (kd._UPDATED, row["id"]))
     return kd._UPDATED
