@@ -1164,6 +1164,24 @@ def test_a_reviews_read_keeps_each_reviews_author_login_state_commit_and_first_l
         {"user": {"login": "b"}, "state": "APPROVED", "commit_id": HEAD, "body": "Review card t_1"}]
 
 
+def test_a_check_runs_read_keeps_each_check_runs_suite_by_its_id_only(monkeypatch):
+    """A required check twice on one head is decided by its copy in the newest check suite, so a check run's
+    suite passes the transport, by its id only: neither the suite's node id and URL nor the run's URL pass."""
+    mod = _module()
+    run = {"id": 9, "name": "All required checks pass", "head_sha": HEAD, "status": "completed",
+           "conclusion": "success", "details_url": STRAY,
+           "check_suite": {"id": 106302813422, "node_id": "CS_kwDOOm", "url": STRAY}}
+    monkeypatch.setattr(mod, "_exchange", lambda method, target, authorization, payload=None: (
+        200, {"total_count": 1, "check_runs": [run]}))
+    monkeypatch.setattr(mod.GitHubTransport, "_installation_token", lambda self: setattr(self, "_token", DUMMY) or DUMMY)
+    github = mod.GitHubTransport("read_checks", REPO)
+    path = f"/repos/{REPO}/commits/{HEAD}/check-runs"
+    assert github.request("GET", path, query={"filter": "latest", "per_page": 100})["data"] == {
+        "total_count": 1, "check_runs": [{"id": 9, "name": "All required checks pass", "head_sha": HEAD,
+                                          "status": "completed", "conclusion": "success",
+                                          "check_suite": {"id": 106302813422}}]}
+
+
 def test_the_merge_takes_only_its_exact_body_and_passes_on_only_githubs_status(github, monkeypatch):
     """Card 5's one write: the merge of a pull request at exactly H, as a merge commit. Its one body is the
     keys sha and merge_method only, the whole sha 40 lowercase hex and the method merge; any other body is

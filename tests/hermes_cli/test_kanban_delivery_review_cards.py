@@ -18,6 +18,7 @@ from tests.hermes_cli.test_kanban_delivery_github import REPO
 from tests.hermes_cli.test_kanban_delivery_publish_step import _approved, _events, _tick
 
 CHECK = "All required checks pass"
+OLDER, NEWER = 106302476821, 106302813422  # the check suites of two CI runs of one head, the older first
 ROUTE = {"provider_override": "openai-codex", "model_override": "gpt-6.1-sol", "reasoning_effort": "max"}
 PAGED = {"check_runs": "/check-runs"}
 
@@ -38,7 +39,8 @@ def world(board, monkeypatch):
     gh["pad"] puts 100 other items after the real ones of a collection, so its total_count is over one page;
     gh["short"] states one more than it holds; gh["broken"] answers 502. gh["each"] runs at every request,
     gh["during"] at the check-runs request, the one CI read, and gh["move_after"] at the request whose path
-    ends with it. gh["pull"] holds fields that replace the pull request's own, as GitHub shows it closed."""
+    ends with it. gh["pull"] holds fields that replace the pull request's own, as GitHub shows it closed.
+    A copy's third item, when it has one, is the id of the check suite that holds it."""
     kb, root, repo = board
     from hermes_cli import kanban_delivery_github as transport
 
@@ -72,8 +74,9 @@ def world(board, monkeypatch):
         if method == "GET" and path.endswith("/check-runs"):
             copies = [gh["check"]] if gh["copies"] is None else gh["copies"]
             return listed("check_runs", [{"id": 900 + n, "name": CHECK, "head_sha": path.split("/")[-2],
-                                          "status": status, "conclusion": conclusion}
-                                         for n, (status, conclusion) in enumerate(copies)], page)
+                                          "status": status, "conclusion": conclusion,
+                                          **({"check_suite": {"id": suite[0]}} if suite else {})}
+                                         for n, (status, conclusion, *suite) in enumerate(copies)], page)
         return 404, None
 
     def token(self):  # kept on the transport, as the real one is, so its answers are redacted of it
@@ -739,10 +742,11 @@ def test_a_decision_answer_over_100_check_runs_or_unreadable_waits_with_no_recor
 
 
 @pytest.mark.parametrize("copies", [
-    [], [("completed", "success")] * 2, [("completed", "success"), ("completed", "failure")]])
+    [], [("completed", "success", OLDER)] * 2, [("completed", "success", OLDER), ("completed", "failure", OLDER)]])
 def test_the_required_check_must_appear_exactly_once_in_the_decision_answer(world, copies):
-    """Absent from the one decision answer, or in it twice (both green, or green and red), the required
-    check decides nothing: no card and no record. Once it appears exactly once, a later pass decides by it."""
+    """Absent from the one decision answer, or in it twice in one check suite (both green, or green and red),
+    the required check decides nothing: no card and no record. Once it appears exactly once, a later pass
+    decides by it. Copies in two check suites are decided by the newest suite's copy, as the tests below show."""
     kb, root, repo, gh = world
     tid, head = _ready(world)
     gh["copies"], events = copies, _events(kb, tid)
@@ -754,6 +758,77 @@ def test_the_required_check_must_appear_exactly_once_in_the_decision_answer(worl
     gh["copies"] = None
     _tick(kb)
     assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created"
+
+
+def test_a_newer_green_suite_beside_an_older_red_suite_gets_the_review_cards(world):
+    """A second CI run of H holds the required check again, in a newer check suite: the copy in the newest
+    suite decides, so H gets its review cards although the older suite's copy is red."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world)
+    gh["copies"] = [("completed", "failure", OLDER), ("completed", "success", NEWER)]
+
+    _tick(kb)
+
+    assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created"
+
+
+def test_a_newer_red_suite_beside_an_older_green_suite_is_red(world):
+    """The copy in the newest check suite decides red as one copy does: red_check_waiting once for H, with
+    that copy's id and conclusion only, and no card although the older suite's copy is green."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world)
+    gh["copies"], events = [("completed", "success", OLDER), ("completed", "failure", NEWER)], _events(kb, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert _events(kb, tid)[len(events):] == [("delivery_review_waiting", {
+        "delivery_id": 1, "head": head, "pull_request_number": 41, "code": "red_check_waiting",
+        "check_runs": [{"id": 901, "conclusion": "failure"}]})]
+    assert (_cards(kb), _state(kb, head)) == ([], "open")
+
+
+def test_a_newer_pending_suite_beside_an_older_green_suite_waits(world):
+    """While the copy in the newest check suite is in progress, the pass waits as for one pending copy: no card
+    and no record although the older suite's copy is green. Once that newer copy is green, a later pass makes
+    the cards."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world)
+    gh["copies"], events = [("completed", "success", OLDER), ("in_progress", None, NEWER)], _events(kb, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_cards(kb), _state(kb, head), _events(kb, tid)) == ([], "open", events)
+    gh["copies"] = [("completed", "success", OLDER), ("completed", "success", NEWER)]
+    _tick(kb)
+    assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created"
+
+
+def test_a_later_attempt_of_the_older_suite_does_not_beat_the_newer_suite(world):
+    """A rerun of the older CI run keeps that run's check suite: its later, red attempt of the required check
+    has the higher check run id (901) but the older suite, so the newer suite's green copy (900) decides."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world)
+    gh["copies"] = [("completed", "success", NEWER), ("completed", "failure", OLDER)]
+
+    _tick(kb)
+
+    assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created"
+
+
+def test_two_copies_in_the_newest_check_suite_still_decide_nothing(world):
+    """Copies in one check suite have no order: when the newest suite holds the required check twice (green
+    and red), beside an older suite's green copy, the pass decides nothing and records nothing."""
+    kb, root, repo, gh = world
+    tid, head = _ready(world)
+    gh["copies"] = [("completed", "success", OLDER), ("completed", "success", NEWER), ("completed", "failure", NEWER)]
+    events = _events(kb, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_cards(kb), _state(kb, head), _events(kb, tid)) == ([], "open", events)
 
 
 @pytest.mark.parametrize("conclusion", ["success", "failure"])
