@@ -135,7 +135,7 @@ REST_ALLOWLIST = (
 # title and message) and URLs never pass, nor headers.
 _FIELDS = frozenset({
     "id", "number", "name", "state", "status", "conclusion", "merged", "mergeable", "mergeable_state",
-    "sha", "head_sha", "merge_commit_sha", "commit_id", "ref", "head", "base", "app", "object",
+    "sha", "head_sha", "merge_commit_sha", "commit_id", "ref", "head", "base", "app", "object", "check_suite",
     "total_count", "check_runs", "workflow_runs", "jobs", "steps", "run_id", "run_attempt", "user", "login",
 })
 _MAX_TEXT = 256
