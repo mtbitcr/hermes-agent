@@ -33,6 +33,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 
@@ -57,6 +58,9 @@ from hermes_constants import get_default_hermes_root
 CONFIG_FILES = ("config.yaml", ".env")
 
 _ORIGIN_MAIN = "refs/heads/main"
+# GitHub can answer slowly: a read of origin main that fails or times out is made again after
+# each of these waits, in seconds, so it is made at most three times.
+_ORIGIN_MAIN_WAITS = (15, 30)
 _TIMEOUT_SECONDS = 60
 # Builder note: an open run is a run row still marked running, with no end time.
 _OPEN_RUNS_SQL = (
@@ -156,8 +160,18 @@ class LiveHostReader:
         return self._git("status", "--porcelain", "--untracked-files=normal").stdout == ""
 
     def origin_main(self) -> str:
-        # S-H: asked of the remote itself, so a stale origin/main cannot answer for it.
-        for line in self._git("ls-remote", "origin", _ORIGIN_MAIN).stdout.splitlines():
+        # S-H: asked of the remote itself, so a stale origin/main cannot answer for it. The first
+        # read that answers decides, with main or without; when the third read fails or times out
+        # too, its own error reaches the caller.
+        for seconds in _ORIGIN_MAIN_WAITS:
+            try:
+                answer = self._git("ls-remote", "origin", _ORIGIN_MAIN)
+                break
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                _wait(seconds)
+        else:
+            answer = self._git("ls-remote", "origin", _ORIGIN_MAIN)
+        for line in answer.stdout.splitlines():
             commit, _, ref = line.partition("\t")
             if ref == _ORIGIN_MAIN:
                 return commit
@@ -321,6 +335,11 @@ def _run(
         # error text can carry a URL with a credential in it.
         raise subprocess.CalledProcessError(done.returncode, list(argv))
     return done
+
+
+def _wait(seconds: float) -> None:
+    """Every wait between two reads of origin main goes through here, so a test can replace it."""
+    time.sleep(seconds)
 
 
 def _digests(files: Mapping[str, Path]) -> dict[str, str]:
