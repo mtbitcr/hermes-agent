@@ -371,11 +371,10 @@ class TestDeliverResultWrapping:
 
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: daily-report" in sent_content
-        assert "(job_id: test-job)" in sent_content
-        assert "-------------" in sent_content
-        assert "Here is today's summary." in sent_content
-        assert "To stop or manage this job" in sent_content
+        assert sent_content == (
+            "daily-report\n\nHere is today's summary.\n\n"
+            "You can pause or change this automation on the Automations page."
+        )
 
 
     def test_relay_fronted_home_uses_relay_config_and_live_adapter(self, monkeypatch, tmp_path):
@@ -509,6 +508,78 @@ class TestDeliverResultWrapping:
         adapter.send_voice.assert_called_once()
         voice_call = adapter.send_voice.call_args
         assert voice_call[1]["audio_path"] == str(media_path)
+
+
+def _scheduler_envelope(job, content, wrap):
+    """Text cron/scheduler.py's _deliver_result hands to the platform sender."""
+    from gateway.config import Platform
+
+    pconfig = MagicMock()
+    pconfig.enabled = True
+    mock_cfg = MagicMock()
+    mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+    with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+         patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": wrap}}), \
+         patch("tools.send_message_tool._send_to_platform",
+               new=AsyncMock(return_value={"success": True})) as send_mock:
+        _deliver_result(job, content)
+    send_mock.assert_called_once()
+    return send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+
+
+def _scheduler_delivery_envelope(job, content, wrap):
+    """Text cron/scheduler_delivery.py's _deliver_result hands to the per-target send."""
+    from cron import scheduler_delivery as sched_delivery
+
+    sent = []
+    target = {"platform": "telegram", "chat_id": "123", "thread_id": None}
+    with patch("gateway.config.load_gateway_config", return_value=MagicMock()), \
+         patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": wrap}}), \
+         patch.object(sched_delivery, "_resolve_delivery_targets", return_value=[target]), \
+         patch.object(sched_delivery, "_record_delivery_verification"), \
+         patch.object(sched_delivery, "_prepare_target_delivery",
+                      return_value=MagicMock(live_adapter_ready=False)), \
+         patch.object(sched_delivery, "_deliver_standalone",
+                      side_effect=lambda _t, text, *_a: sent.append(text)):
+        sched_delivery._deliver_result(job, content)
+    assert len(sent) == 1
+    return sent[0]
+
+
+_AUTOMATIONS_SENTENCE = "You can pause or change this automation on the Automations page."
+
+
+@pytest.mark.parametrize("envelope", [_scheduler_envelope, _scheduler_delivery_envelope],
+                         ids=["scheduler", "scheduler_delivery"])
+class TestDeliveryEnvelopePlainWords:
+    """Both delivery builders name the job in plain words, with no job id or chat command."""
+
+    JOB = {"id": "a1b2c3d4e5f6", "name": "daily-report", "deliver": "origin",
+           "origin": {"platform": "telegram", "chat_id": "123"}}
+
+    def test_wrapped_delivery_has_name_and_content_and_no_job_id(self, envelope):
+        sent = envelope(dict(self.JOB), "Here is today's summary.", True)
+        assert sent == f"daily-report\n\nHere is today's summary.\n\n{_AUTOMATIONS_SENTENCE}"
+        for absent in ("a1b2c3d4e5f6", "job_id", "-----", "stop reminder", "send me"):
+            assert absent not in sent
+
+    def test_wrapped_delivery_ends_with_automations_sentence(self, envelope):
+        sent = envelope(dict(self.JOB), "Here is today's summary.", True)
+        assert sent.endswith(f"\n\n{_AUTOMATIONS_SENTENCE}")
+
+    def test_unwrapped_delivery_sends_content_alone(self, envelope):
+        assert envelope(dict(self.JOB), "Here is today's summary.", False) == "Here is today's summary."
+
+
+@pytest.mark.parametrize("job", [
+    {"id": "a1b2c3d4e5f6", "name": "daily-report"},
+    {"id": "a1b2c3d4e5f6"},
+], ids=["named", "unnamed"])
+def test_both_builders_produce_identical_envelope(job):
+    job = dict(job, deliver="origin", origin={"platform": "telegram", "chat_id": "123"})
+    text = _scheduler_envelope(dict(job), "Body", True)
+    assert text == _scheduler_delivery_envelope(dict(job), "Body", True)
+    assert text.startswith(f"{job.get('name', job['id'])}\n\nBody\n\n")
 
 
 class TestDeliverResultErrorReturns:
