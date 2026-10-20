@@ -94,6 +94,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli import kanban_provider_stops as _provider_stops
+from hermes_cli.gitlock import clear_stale_index_lock
 from hermes_cli.kanban_archived_followups import archive_recorded_review_followups
 from hermes_cli.kanban_handover_guard import refuse_early, rollback_task_branch
 from hermes_cli.kanban_replaced_cards import replaced_task_ids
@@ -31568,7 +31569,7 @@ def set_branch_name(
 def _git_output(path: Path, *args: str, binary: bool = False) -> str | bytes:
     """Run one bounded read-only git command or raise a scope error."""
     result = subprocess.run(
-        ["git", "-C", str(path), *args],
+        ["git", "-C", str(path), "--no-optional-locks", *args],
         capture_output=True,
         text=not binary,
         encoding=None if binary else "utf-8",
@@ -31588,6 +31589,9 @@ def _git_output(path: Path, *args: str, binary: bool = False) -> str | bytes:
 
 def _git_mutation(path: Path, *args: str) -> str:
     """Run one bounded kernel-owned git mutation or fail closed."""
+    git_dir = _git_dir(path)
+    if git_dir is not None and os.path.lexists(git_dir / "index.lock"):
+        clear_stale_index_lock(git_dir)
     result = subprocess.run(
         [
             "git",

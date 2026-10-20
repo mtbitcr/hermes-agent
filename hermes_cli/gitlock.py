@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -44,6 +45,24 @@ def _git_proc_running() -> bool:
         return False
 
 
+def _git_proc_running_strict() -> bool:
+    """Fail-closed sibling of :func:`_git_proc_running`: True unless the probe shows that no ``git`` process runs.
+
+    Any probe error, timeout, missing tool or unexpected exit status counts as running.
+    """
+    try:
+        if os.name == "nt":
+            proc = subprocess.run(["tasklist", "/FI", "IMAGENAME eq git.exe", "/FO", "CSV"],
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
+            return proc.returncode != 0 or "git.exe" in proc.stdout.lower()
+        proc = subprocess.run(["pgrep", "-x", "git"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=10)
+        return proc.returncode != 1  # pgrep exits 1 only when it looked and matched nothing
+    except Exception:
+        logger.debug("git process probe failed; assuming git may be running", exc_info=True)
+        return True
+
+
 def _sweep_stale(directory: Path, candidates: Callable[[], Iterable[Path]], *, min_age_seconds: Optional[int],
                  default_age: int, skip_msg: str, log_removed: Callable[[Path, int], None]) -> List[str]:
     """Shared guard + age-floor sweep. Never raises; skips anything it cannot stat/unlink."""
@@ -78,6 +97,37 @@ def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = N
         skip_msg="git process running; skipping stale-lock sweep",
         log_removed=lambda p, _size: logger.info("Removed stale git lock %s", p),
     )
+
+
+def clear_stale_index_lock(git_dir: Path, *, min_age_seconds: Optional[int] = None) -> bool:
+    """Remove an abandoned ``index.lock`` from one git folder, such as a linked worktree's own; True only if removed.
+
+    Looks only at ``git_dir / "index.lock"``. Removes it only when it is a regular file (not a symlink), at least the
+    age floor old, the strict probe shows no git process running, and a final ``lstat`` right before the unlink shows
+    the same inode and mtime as the first. Anything else leaves it alone. Never raises.
+    """
+    lock = Path(git_dir) / "index.lock"
+    min_age = min_age_seconds if min_age_seconds is not None else STALE_LOCK_MIN_AGE_SECONDS
+    try:
+        first = lock.lstat()
+        age = time.time() - first.st_mtime
+        if not stat.S_ISREG(first.st_mode) or age < min_age:
+            return False
+        if _git_proc_running_strict():
+            logger.debug("git process may be running; keeping %s", lock)
+            return False
+        last = lock.lstat()
+        if (last.st_ino, last.st_mtime_ns) != (first.st_ino, first.st_mtime_ns):
+            logger.debug("%s changed while it was checked; keeping it", lock)
+            return False
+        lock.unlink()
+    except FileNotFoundError:
+        return False
+    except Exception:
+        logger.debug("Could not clear %s (keeping it)", lock, exc_info=True)
+        return False
+    logger.warning("Removed stale git index lock %s (%d s old, no git process running)", lock, age)
+    return True
 
 
 def clear_stale_tmp_packs(repo_root: Path, *, min_age_seconds: Optional[int] = None) -> List[str]:
