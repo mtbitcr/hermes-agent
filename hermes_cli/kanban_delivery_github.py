@@ -62,7 +62,8 @@ _MAIN_TRACKING = "refs/remotes/origin/main"
 # On GitHub write includes read, and every token gets metadata read without asking.
 STEP_PERMISSIONS = MappingProxyType({
     "publish": MappingProxyType({"contents": "write", "pull_requests": "write"}),  # T1
-    "read_checks": MappingProxyType({"checks": "read", "actions": "read", "pull_requests": "read"}),  # T2
+    "read_checks": MappingProxyType({  # T2; contents read: card A's read of main's ref before CI on the head is read
+        "checks": "read", "actions": "read", "pull_requests": "read", "contents": "read"}),
     "rerun_flaky": MappingProxyType({"actions": "write"}),  # T3
     "merge": MappingProxyType({"contents": "write", "pull_requests": "write"}),  # T6
     "handoff": MappingProxyType({"pull_requests": "read"}),  # T7

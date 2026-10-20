@@ -37,6 +37,10 @@ new card branch of a policy repository at the main GitHub holds now, fetched
 through the publish step's transport; a failed fetch starts it at HEAD as before
 and :func:`base_fallback` records why, after the base.
 
+With the same setting, :func:`review_step` reads main before any check of a published head, as the arm
+reads it: when main is neither the reviewed base nor in the head, it makes no review card and records
+the row base_moved, so the update step brings the head up to date before any test wait or review.
+
 With the same setting, :func:`arm_step` merges only on the base review saw: under one merge lock per
 repository, a file under the kanban root that every board and process shares, it reads main (an answer
 naming another ref than main is no read), merges when main is the reviewed base or is already in the
@@ -1053,6 +1057,31 @@ def _review_pull(db_path: Path, github, repository: str, row: dict) -> tuple:
     return _open_at_head(github, repository, row, pull), None
 
 
+def _review_base(db_path: Path, github, repository: str, row: dict, read: tuple) -> tuple:
+    """Card A: with ``kanban.delivery.exact_base``, a review pass reads main as the arm reads it, before any check of
+    H, since GitHub starts no CI run on a pull request that conflicts with main. ``(H is reviewed, the state
+    stored)``, always reviewed with the setting off: a main neither the reviewed base nor in H gets no review card,
+    only the arm's base_moved record with no cards, so the update step brings H up to date first; no main shown
+    stores nothing."""
+    if not exact_base_settings():
+        return True, None
+    source, head = row["source_task_id"], row["pull_request_head"]
+    main = _branch_head(github, _PULL_REQUEST_BASE, named=True)
+    if main is None:
+        return False, None
+    with kb.connect_closing(db_path=db_path) as conn:
+        reviewed_base, workdir = _reviewed(conn, source, head)
+    if base_allows_merge(workdir, reviewed_base, main, head):
+        return True, None
+    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+        if not delivery_settings() or not _unchanged(conn, row, read):
+            return False, None  # the row or its source card changed while GitHub was read: nothing is stored
+        conn.execute("UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ?", (_BASE_MOVED, row["id"]))
+        kb._append_event(conn, source, f"delivery_{_BASE_MOVED}", _outcome(
+            row, repository=repository, reviewed_base=reviewed_base, observed_main=main, cards=[]))
+    return False, _BASE_MOVED
+
+
 def review_step(db_path: Path) -> None:
     """Card 2 on the board whose file is ``db_path``: each published head whose CI is
     green gets its review cards; one whose CI still runs or is red waits, and a later
@@ -1100,7 +1129,8 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
     is; such a row is read for nothing else. An open row whose pull request any read of this
     pass (:func:`_review_pull`: the first, the one after CI, the one before a rerun or a
     return) shows closed, merged or not, is marked closed outside, and nothing more is read,
-    recorded or sent. Returns the state or the red outcome stored, if any."""
+    recorded or sent. Card A: with exact_base, main is read after the first pull request read
+    and before any check of H (:func:`_review_base`). Returns the state or the red outcome stored, if any."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     source, head = row["source_task_id"], row["pull_request_head"]
@@ -1135,6 +1165,9 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
         at_head, stored = _review_pull(db_path, github, repository, row)
         if not at_head:
             return stored  # the pull request closed outside the delivery step, or moved off H: no card for a stale head
+        on_base, stored = _review_base(db_path, github, repository, row, read)
+        if not on_base:
+            return stored  # GitHub shows no main, or H's change goes to the update step first: no check of H is read
         required = policy.required_checks[repository]
         named = {}
         for name in required:  # each required check by its name, so H's other CI runs never fill its one page
