@@ -638,6 +638,17 @@ def publish_step(db_path: Optional[Path]) -> Optional[dict]:
             if refusal.code not in _RETRIED and (leased[0] != adopt or refusal.code != "head_moved"):
                 with contextlib.suppress(PublishRefused):  # a lease that ran out parks nothing
                     _park(db_path, *leased, refusal)
+            elif refusal.code == "source_changed":
+                # Nothing was stored: free the lease at once, so the next pass proves the approval again on
+                # the new state. A lease this pass no longer holds, run out or taken over, is left as it is.
+                with contextlib.suppress(PublishRefused):
+                    with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
+                        _held(conn, *leased)
+                        conn.execute(
+                            "UPDATE kanban_deliveries SET publish_lease = NULL, publish_lease_until = NULL "
+                            "WHERE id = ?",
+                            (leased[0],),
+                        )
     except Exception:
         # The tick goes on; a row this pass leased is tried again once its lease runs out.
         logger.exception("kanban delivery: the publish step failed")
