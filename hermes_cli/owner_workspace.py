@@ -4840,7 +4840,7 @@ def project_steward_snapshot(
 ) -> dict:
     """Return one bounded, owner-safe Project health snapshot without writes.
 
-    The Project binding is resolved from the active profile's projects.db and
+    The Project binding is resolved from the shared root's projects.db and
     checked against the shared board's ownership metadata. Only task titles,
     owner-friendly states, and timestamps are projected: bodies, results,
     errors, assignees, paths, branches, task/run IDs, and raw events never
@@ -4867,8 +4867,10 @@ def project_steward_snapshot(
             "invalid_argument", "lookback_days must be an integer from 1 to 30"
         )
 
+    # Not projects_db.projects_db_path(): a job running as another profile
+    # (a scheduled planning job) holds an empty registry of its own.
     pconn = _open_read_only_sqlite(
-        projects_db.projects_db_path(), label="projects.db"
+        kanban_db.kanban_home() / "projects.db", label="projects.db"
     )
     try:
         project_columns = {

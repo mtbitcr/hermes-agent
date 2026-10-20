@@ -798,6 +798,7 @@ def test_a_worker_pinned_to_its_board_reads_every_projects_waits(
     and the Decisions list must still reach the OTHER Project's board and the
     root register from there.
     """
+    import sqlite3
     root = tmp_path / "hermes_root"
     profile_home = root / "profiles" / "worker"
     profile_home.mkdir(parents=True)
@@ -805,10 +806,15 @@ def test_a_worker_pinned_to_its_board_reads_every_projects_waits(
     monkeypatch.setenv("HERMES_HOME", str(root))
     kanban_db._INITIALIZED_PATHS.clear()
     kanban_db.init_db()
-    monkeypatch.setenv("HERMES_HOME", str(profile_home))
     owner = ow.resolve_owner_context()
     first = _project(owner, "First Pilot")
     second = _project(owner, "Second Pilot")
+    # The Projects live in the root registry. The Decisions list still reads
+    # the active profile's own registry, so the worker holds a copy of it.
+    with contextlib.closing(sqlite3.connect(root / "projects.db")) as source:
+        with contextlib.closing(sqlite3.connect(profile_home / "projects.db")) as target:
+            source.backup(target)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
     with _board(first) as conn:
         pinned = _stopped(
             conn, first, "Book the placeholder room", kind="capability",
