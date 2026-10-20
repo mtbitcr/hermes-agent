@@ -275,6 +275,87 @@ def test_publish_refuses_an_updated_head_whose_record_names_another_main():
         assert (d.allowed, d.code) == (False, "not_clean_update"), (other, parents)
 
 
+# Card B, a later update: the kernel's clean update moved the pull request of H to U1 on main M1 (FIRST), the
+# ledger then records that pull request as updated at U1, and the kernel's next clean update is U2 on M2 (LATER).
+U1, U2, M1, M2 = "e" * 40, "f" * 40, "1" * 40, "2" * 40
+FIRST = {"clean": True, "head": H, "observed_main": M1, "update_head": U1}
+LATER = {"clean": True, "head": H, "previous_update_head": U1, "observed_main": M2, "update_head": U2}
+
+
+def later_update(record=LATER, parents=(U1, M2), chain=None, recorded=U1, state="updated", shown=U1, ancestor=True):
+    """decide_publish of U2 for the approval of H: its record, git's parents of U2, the earlier links of its chain
+    newest first (FIRST by default), the ledger's head and state, and the head GitHub shows for pull request 41
+    and its branch."""
+    return fences.decide_publish(
+        approval(bound_head=U2), ledger(41, recorded, state, head_is_ancestor=ancestor), remote(shown, (41, shown)),
+        {"record": record, "parents": list(parents), "chain": [FIRST] if chain is None else chain})
+
+
+def test_publish_refuses_a_later_update_whose_first_parent_is_not_the_recorded_update_head():
+    """Test c. U2 is admitted only as a fast-forward of U1, the previous update head its record names: U2's first
+    parent is that U1, the ledger records the pull request of U1 as updated, and the push leases exactly U1. A first
+    parent other than the recorded U1, or a ledger, branch or pull request elsewhere, keeps U2 out."""
+    d = later_update()
+    assert (d.allowed, d.code) == (True, "push_fast_forward") and f"lease expecting exactly {U1}:" in d.detail
+    assert f"{U2} is a clean update of the approval of {H} on main {M2}" in d.detail
+    d = later_update(shown=U2)
+    assert (d.allowed, d.code) == (True, "adopt_fast_forward")
+    for parents in ((H, M2), (OTHER, M2), (M2, U1), ()):
+        d = later_update(parents=parents)
+        assert (d.allowed, d.code) == (False, "not_clean_update"), parents
+    # The record names OTHER as the head it updates, with a chain to match: U2's first parent U1 is not it.
+    d = later_update({**LATER, "previous_update_head": OTHER}, chain=[{**FIRST, "update_head": OTHER}])
+    assert (d.allowed, d.code) == (False, "not_clean_update")
+    for recorded, state, shown in ((H, "updated", H), (OTHER, "updated", OTHER), (U1, "base_moved", U1)):
+        d = later_update(recorded=recorded, state=state, shown=shown)
+        assert (d.allowed, d.code) == (False, "head_moved"), (recorded, state)
+    d = later_update(shown=H)
+    assert (d.allowed, d.code) == (False, "head_moved")
+    d = later_update(ancestor=False)
+    assert (d.allowed, d.code) == (False, "not_fast_forward")
+
+
+def test_publish_refuses_a_later_update_whose_chain_holds_a_record_that_is_not_clean():
+    """Test d. Every earlier link of U2's chain, newest first, is the kernel's clean-update record of the approval of
+    H naming as its update head the head before it, back to H's own update. A link that is not clean (the record of
+    an update card among them), one naming another update head, a link missing or one left over keeps U2 out, so it
+    stays on today's path, an update card."""
+    assert later_update().allowed
+    update_card = {**{key: value for key, value in FIRST.items() if key != "clean"}, "update_task_id": "t_update"}
+    for chain in ([{**FIRST, "clean": False}], [{**FIRST, "clean": "true"}], [update_card], [],
+                  [{**FIRST, "update_head": OTHER}]):
+        d = later_update(chain=chain)
+        assert (d.allowed, d.code) == (False, "not_clean_update"), chain
+    # A third update: U0 on M0 first, then U1 on M1, now U2 on M2.
+    u0, m0 = "3" * 40, "4" * 40
+    middle, oldest = {**FIRST, "previous_update_head": u0}, {"clean": True, "head": H, "observed_main": m0,
+                                                              "update_head": u0}
+    assert later_update(chain=[middle, oldest]).allowed
+    for chain in ([{**middle, "clean": False}, oldest], [middle, {**oldest, "clean": False}], [middle],
+                  [middle, oldest, FIRST], [oldest, middle]):
+        d = later_update(chain=chain)
+        assert (d.allowed, d.code) == (False, "not_clean_update"), chain
+    d = later_update({**LATER, "clean": False})
+    assert (d.allowed, d.code) == (False, "not_clean_update")
+    for chain in ("chain", (FIRST,), [None], [[FIRST]]):  # owner rule 1: a list of records, nothing else
+        d = later_update(chain=chain)
+        assert (d.allowed, d.code) == (False, "invalid_fact") and d.detail.startswith("update.chain "), chain
+
+
+def test_publish_refuses_a_later_update_through_a_record_of_another_approval():
+    """Test e. U2's record and every earlier link name the approved head H: a record or a link of another approval,
+    OLD's, keeps U2 out, and so does H's chain for an approval of another head."""
+    assert later_update().allowed
+    for record, chain in (({**LATER, "head": OLD}, [FIRST]), (LATER, [{**FIRST, "head": OLD}]),
+                          ({**LATER, "head": OLD}, [{**FIRST, "head": OLD}])):
+        d = later_update(record, chain=chain)
+        assert (d.allowed, d.code) == (False, "not_clean_update"), (record, chain)
+    d = fences.decide_publish(approval(head_commit=OLD, review_head=OLD, bound_head=U2),
+                              ledger(41, U1, "updated", head_is_ancestor=True), remote(U1, (41, U1)),
+                              {"record": LATER, "parents": [U1, M2], "chain": [FIRST]})
+    assert (d.allowed, d.code) == (False, "not_clean_update")
+
+
 def test_rerun_refuses_when_any_failed_test_is_off_the_flaky_list():
     for jobs in ([slice_job(3, 3, [FLAKY_46, UNLISTED])],
                  [slice_job(3, 3, [FLAKY_46]), slice_job(7, 7, [UNLISTED])]):
