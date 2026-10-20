@@ -64,7 +64,6 @@ STEP_PERMISSIONS = MappingProxyType({
     "publish": MappingProxyType({"contents": "write", "pull_requests": "write"}),  # T1
     "read_checks": MappingProxyType({  # T2; contents read: card A's read of main's ref before CI on the head is read
         "checks": "read", "actions": "read", "pull_requests": "read", "contents": "read"}),
-    "rerun_flaky": MappingProxyType({"actions": "write"}),  # T3
     "merge": MappingProxyType({"contents": "write", "pull_requests": "write"}),  # T6
     "handoff": MappingProxyType({"pull_requests": "read"}),  # T7
 })
@@ -130,7 +129,6 @@ REST_ALLOWLIST = (
              MappingProxyType({"filter": "latest|all", **_PAGE})),
     # GitHub answers with a redirect to signed log storage, which is never followed.
     Endpoint("GET", "/repos/{repo}/actions/jobs/{id}/logs", ("actions", "read")),
-    Endpoint("POST", "/repos/{repo}/actions/jobs/{id}/rerun", ("actions", "write")),
     _TOKEN_ENDPOINT,
 )
 

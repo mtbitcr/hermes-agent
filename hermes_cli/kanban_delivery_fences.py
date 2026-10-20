@@ -1,8 +1,8 @@
-"""Delivery fence core: pure decisions for publishing, rerunning, lens requests and merging.
+"""Delivery fence core: pure decisions for publishing, lens requests and merging.
 
 Each function decides from the facts its caller passes in and does nothing else: no file,
-network, process, environment, clock or database. The reviewed policy file is the only flaky
-list; the caller reads the installed file and passes its text to load_policy.
+network, process, environment, clock or database. The caller reads the installed policy file
+and passes its text to load_policy.
 """
 from __future__ import annotations
 
@@ -12,11 +12,10 @@ from dataclasses import dataclass, field
 
 from hermes_cli.kanban_pr_acceptance import _classify
 
-# The owner keeps these out of the policy file; each is the CI's literal text, so a renamed
-# job or a new slice count is refused until a reviewed change updates it here. The jobs API
-# names a called workflow's job "<calling job> / <called job>": tests.yml's slices carry
-# ci.yaml's "Python tests" prefix, their steps and ci.yaml's own summary job carry none.
-SUMMARY_CHECK = "All required checks pass"
+# The owner keeps this out of the policy file: tests.yml's slice jobs by the CI's literal text, so a
+# renamed job or a new slice count names no failed test until a reviewed change updates it here. The jobs
+# API names a called workflow's job "<calling job> / <called job>": tests.yml's slices carry ci.yaml's
+# "Python tests" prefix, their steps carry none.
 TEST_JOB_STEPS = {f"Python tests / Run tests slice {n}/12": f"Run tests (slice {n}/12)" for n in range(1, 13)}
 # The plan names no lenses, only "both lens verdicts", so the merge counts distinct lenses on H.
 LENS_COUNT = 2
@@ -28,8 +27,6 @@ _SHA = re.compile(r"[0-9a-f]{40}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 # kanban_pr_acceptance._REPO's shape; the owner allows only _classify to be imported from there.
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
-# One exact pytest node id: a .py path and at least one name, with no glob or parameter brackets.
-_NODE_ID = re.compile(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*[.]py(?:::[A-Za-z_][A-Za-z0-9_]*)+")
 _WILDCARDS = frozenset("*?[]")
 
 
@@ -46,11 +43,9 @@ class Decision:
 
 @dataclass(frozen=True)
 class Policy:
-    """The reviewed policy per repository: required check names, and exact flaky test ids
-    mapped to the finding that listed them."""
+    """The reviewed policy per repository: required check names."""
 
     required_checks: dict[str, tuple[str, ...]]
-    flaky_tests: dict[str, dict[str, int]]
 
 
 def _refuse(code: str, detail: str) -> Decision:
@@ -114,19 +109,18 @@ def _unique_keys(pairs: list[tuple[str, object]]) -> dict:
 
 def load_policy(text: str) -> Policy:
     """Parse the text the caller read from the installed policy file; any other shape is a
-    ValueError, so nothing but the reviewed entries can ever count as required or flaky."""
+    ValueError, so nothing but the reviewed entries can ever count as required."""
     document = json.loads(text, object_pairs_hook=_unique_keys)
     if not isinstance(document, dict):
         raise ValueError("the policy must be an object keyed by repository")
-    required_checks, flaky_tests = {}, {}
+    required_checks = {}
     for repo, entry in document.items():
         if not _REPO.fullmatch(repo):
             raise ValueError("a policy key is not an owner/name repository")
-        if not isinstance(entry, dict) or set(entry) != {"required_checks", "flaky_tests"}:
-            raise ValueError(f"{repo}: an entry holds exactly required_checks and flaky_tests")
+        if not isinstance(entry, dict) or set(entry) != {"required_checks"}:
+            raise ValueError(f"{repo}: an entry holds exactly required_checks")
         required_checks[repo] = _required_check_names(repo, entry["required_checks"])
-        flaky_tests[repo] = _flaky_test_findings(repo, entry["flaky_tests"])
-    return Policy(required_checks, flaky_tests)
+    return Policy(required_checks)
 
 
 def _required_check_names(repo: str, names: object) -> tuple[str, ...]:
@@ -137,25 +131,6 @@ def _required_check_names(repo: str, names: object) -> tuple[str, ...]:
     if len(set(names)) != len(names):
         raise ValueError(f"{repo}: a required check is listed twice")
     return tuple(names)
-
-
-def _flaky_test_findings(repo: str, entries: object) -> dict[str, int]:
-    if not isinstance(entries, list):
-        raise ValueError(f"{repo}: flaky_tests must be a list")
-    findings = {}
-    for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != {"test", "finding"}:
-            raise ValueError(f"{repo}: a flaky entry holds exactly test and finding")
-        test, finding = entry["test"], entry["finding"]
-        # Matching is exact equality, so an entry must name one test: no pattern, file or parameter set.
-        if not isinstance(test, str) or not _NODE_ID.fullmatch(test):
-            raise ValueError(f"{repo}: a flaky entry is not one exact test id")
-        if type(finding) is not int or finding < 1:
-            raise ValueError(f"{repo}: a flaky entry's finding is not a finding number")
-        if test in findings:
-            raise ValueError(f"{repo}: a flaky test is listed twice")
-        findings[test] = finding
-    return findings
 
 
 def classify_check(check: dict, head: str, is_run: bool) -> str:
@@ -313,105 +288,6 @@ def _publish_facts(approval: dict, ledger: dict, remote: dict, update: dict | No
         chain = update.get("chain", [])
         yield from _shape("update.chain", chain)
         yield "update.chain", all(type(link) is dict for link in chain)
-
-
-def decide_rerun(policy: Policy, repo: str, head: str, jobs: list[dict], ledger: dict) -> Decision:
-    """T3: may the failed jobs of H's workflow run be rerun once, as listed flaky failures?
-
-    jobs: every job of the run with id, name, head_sha, status, conclusion, run_attempt and
-    steps [{name, conclusion}]; a failed slice also carries failed_tests (the test ids its log
-    names) and failed_count (the count its pytest summary reports). ledger: {"reruns": [heads
-    already rerun]}. All or nothing: one ineligible failed job refuses the whole rerun.
-    Owner rule 1: repo, names, statuses and failed test ids are non-empty strs, a conclusion too
-    or None before its job or step completes, H and the heads SHAs, ids (unique), run_attempt and
-    failed_count positive ints; a failed slice is a TEST_JOB_STEPS job whose conclusion is not passing.
-    """
-    fault = next((fact for fact, valid in _rerun_facts(repo, head, jobs, ledger) if not valid), None)
-    if fault:
-        return _refuse("invalid_fact", f"{fault} is missing or does not have its documented type")
-    if repo not in policy.flaky_tests:
-        return _refuse("unknown_repository", "the policy has no entry for this repository")
-    if any(job["head_sha"] != head for job in jobs):
-        return _refuse("head_moved", f"a job ran on a head other than {head}")
-    if any(job["status"] != "completed" for job in jobs):
-        return _refuse("not_completed", "a job of the run has not completed")
-    failed = [job for job in jobs if job["conclusion"] not in _PASSING]
-    if not failed:
-        return Decision(True, "not_needed", "no job failed")
-    if head in ledger["reruns"] or any(job["run_attempt"] > 1 for job in jobs):
-        return _refuse("rerun_used", "H already had its one rerun")
-    # Owner decision 2: the summary check is a summary only beside other failed jobs that are all
-    # eligible. It is then not rerun itself; GitHub reruns it after the jobs it waits on. Only its
-    # ordinary failure summarises them: a cancelled, timed-out, missing or unknown end stops.
-    if any(job["conclusion"] != "failure" for job in failed if job["name"] == SUMMARY_CHECK):
-        return _refuse("summary_not_failure", "the summary check ended in something other than failure")
-    # Owner rule 3: it counts as a summary only when its only failed step is ci.yaml's "Evaluate job
-    # results", failed; with no failed step or any other failed step it is one more failed job,
-    # refused under the rule above.
-    others = [job for job in failed if job["name"] != SUMMARY_CHECK
-              or [(step["name"], step["conclusion"]) for step in job["steps"] if step["conclusion"] not in _PASSING]
-              != [("Evaluate job results", "failure")]]
-    if not others:
-        return _refuse("summary_failed_alone", "the summary check failed and no other job did")
-    flaky, matches = policy.flaky_tests[repo], []
-    for job in others:
-        if not _is_test_job(job):
-            return _refuse("not_test_job", f"job {job['id']} did not fail only at its test step")
-        named = job.get("failed_tests") or []
-        if not named:
-            return _refuse("no_failed_test", f"job {job['id']} names no failed test")
-        count = job.get("failed_count")
-        if type(count) is not int or count != len(named) or len(set(named)) != len(named):
-            return _refuse("count_mismatch", f"job {job['id']} does not prove its count of failed tests")
-        # Exact equality only: a test is flaky when this repository's list holds exactly that id.
-        if any(test not in flaky for test in named):
-            return _refuse("not_flaky", f"job {job['id']} failed a test the policy does not list as flaky")
-        matches += [{"job_id": job["id"], "test": test, "list_entry": {"test": test, "finding": flaky[test]}}
-                    for test in named]
-    ids = [job["id"] for job in others]
-    return Decision(True, "rerun", f"rerun jobs {ids} once; GitHub reruns the summary check after them", matches)
-
-
-def _rerun_facts(repo: str, head: str, jobs: list[dict], ledger: dict):
-    # Owner rule 1 for T3, checked once before any decision; a record's keys are read only after its shape.
-    yield "repo", _is_text(repo)
-    yield "head", _is_sha(head)
-    yield from _shape("jobs", jobs)
-    for index, job in enumerate(jobs):
-        name = f"jobs[{index}]"
-        yield from _shape(name, job, "id name head_sha status conclusion run_attempt steps")
-        yield f"{name}.id", _has_unique_ids(jobs[: index + 1])
-        yield f"{name}.name", _is_text(job["name"])
-        yield f"{name}.head_sha", _is_sha(job["head_sha"])
-        yield f"{name}.status", _is_text(job["status"])
-        yield f"{name}.conclusion", job["conclusion"] is None or _is_text(job["conclusion"])
-        yield f"{name}.run_attempt", _is_positive_int(job["run_attempt"])
-        yield from _shape(f"{name}.steps", job["steps"])
-        for step_index, step in enumerate(job["steps"]):
-            yield from _shape(f"{name}.steps[{step_index}]", step, "name conclusion")
-            yield f"{name}.steps[{step_index}].name", _is_text(step["name"])
-            yield f"{name}.steps[{step_index}].conclusion", step["conclusion"] is None or _is_text(step["conclusion"])
-        if job["name"] in TEST_JOB_STEPS and job["conclusion"] not in _PASSING:
-            yield from _shape(name, job, "failed_tests failed_count")
-            yield from _shape(f"{name}.failed_tests", job["failed_tests"])
-            yield f"{name}.failed_tests", all(_is_text(test) for test in job["failed_tests"])
-            yield f"{name}.failed_count", _is_positive_int(job["failed_count"])
-    yield from _shape("ledger", ledger, "reruns")
-    yield from _shape("ledger.reruns", ledger["reruns"])
-    for index, rerun_head in enumerate(ledger["reruns"]):
-        yield f"ledger.reruns[{index}]", _is_sha(rerun_head)
-
-
-def _is_test_job(job: dict) -> bool:
-    # Test shape: a slice job on the TEST_JOB_STEPS allowlist that failed with exactly one failed
-    # step, the slice's test step. The name must be a str key and the step's name a non-empty str
-    # equal to its value, so a job off the list never matches through a failed step with no name.
-    failed_steps = [step for step in job["steps"] if step["conclusion"] not in _PASSING]
-    return (isinstance(job["name"], str) and job["name"] in TEST_JOB_STEPS
-            and job["conclusion"] == "failure" and len(failed_steps) == 1
-            and failed_steps[0]["conclusion"] == "failure"
-            and isinstance(failed_steps[0]["name"], str) and failed_steps[0]["name"] != ""
-            and failed_steps[0]["name"] == TEST_JOB_STEPS[job["name"]])
 
 
 def decide_lens_request(head: str, pr_head: str, evidence: list[dict], existing_lens_cards: list[dict],
