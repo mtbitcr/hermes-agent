@@ -465,7 +465,7 @@ def red_run(world, monkeypatch):
         path, head = urlsplit(target).path, gh["head"]
         if gh["closes"] and path.endswith(gh["closes"][0]):
             gh["pull"] = _closed(gh["closes"][1])
-        job = {"head_sha": head, "status": "completed", "conclusion": "failure", "run_attempt": 1}
+        job = {"head_sha": head, "run_id": 77, "status": "completed", "conclusion": "failure", "run_attempt": 1}
         if (method, path) == ("GET", f"/repos/{REPO}/actions/runs"):
             return 200, {"total_count": 1, "workflow_runs": [{"id": 77, "head_sha": head}]}
         if (method, path) == ("GET", f"/repos/{REPO}/actions/runs/77/jobs"):
@@ -497,70 +497,29 @@ def red_run(world, monkeypatch):
 
 @pytest.mark.parametrize("answer", [403, None], ids=["refused", "unanswered"])
 @pytest.mark.parametrize("merged", [True, False], ids=["merged", "closed"])
-def test_a_pull_request_closed_while_a_refused_rerun_call_waits_is_closed_outside_by_that_pass(red_run, merged,
-                                                                                              answer):
-    """H's listed flaky failure is rerun once, and while the rerun call waits someone merges or closes the pull
-    request; the call is refused (403) or gets no answer. The read after it, which would return the work, marks the
-    row closed outside in that same pass with exactly one event naming the pull request, H and whether GitHub shows
-    it merged: no continuation and no red_check_returned. Later passes send no request."""
-    from tests.hermes_cli.test_kanban_delivery_red_check import FLAKY, RERUN
-    from tests.hermes_cli.test_kanban_delivery_review_return import CONTINUED
-
-    kb, root, repo, gh = red_run
-    tid, head = _ready_to_return(red_run)
-    gh.update(rerun=answer, closes=("/rerun", merged))
-    events = _events(kb, tid)
-
-    _tick(kb)
-
-    outcome = {"delivery_id": 1, "head": head, "pull_request_number": 41}
-    assert _events(kb, tid)[len(events):] == [
-        ("delivery_review_waiting", dict(outcome, code="red_check_waiting",
-                                         check_runs=[{"id": 900, "conclusion": "failure"}])),
-        ("delivery_review_waiting", dict(outcome, code="red_check_rerun", jobs=[903], tests=[FLAKY], attempt=1)),
-        ("delivery_review_waiting", dict(outcome, code="red_check_rerun_outcome", jobs=[903], statuses=[answer])),
-        ("delivery_closed_outside", dict(outcome, merged=merged))]
-    assert (_state(kb, head), _raw(kb.kanban_db_path(), CONTINUED, tid), _cards(kb)) == ("closed_outside", [], [])
-    assert (gh["reruns"], gh["calls"][-2:]) == ([RERUN], [("POST", RERUN), ("GET", f"/repos/{REPO}/pulls/41")])
-    calls, count = list(gh["calls"]), len(_events(kb, tid))
-    for _ in range(3):
-        _tick(kb)
-    assert (gh["calls"], _state(kb, head), len(_events(kb, tid))) == (calls, "closed_outside", count)
-
-
-@pytest.mark.parametrize("answer", [403, None], ids=["refused", "unanswered"])
-@pytest.mark.parametrize("merged", [True, False], ids=["merged", "closed"])
 def test_a_pull_request_closed_after_a_refused_rerun_is_closed_outside_by_the_pass_that_would_return_it(
         red_run, merged, answer):
-    """H's rerun call is refused (403) or unanswered and the pull request read after it fails, so that pass records
-    the rerun's outcome and ends with no return. Someone then merges or closes the pull request: the next pass,
-    which reads it only for that return, marks the row closed outside with exactly one event; no continuation, no
-    red_check_returned and one rerun call in all. Later passes send no request."""
-    from hermes_cli import kanban_delivery_github as transport
-    from tests.hermes_cli.test_kanban_delivery_red_check import RERUN, _waited
+    """An earlier pass recorded H's rerun call refused (403) or unanswered, and no return. Someone then merges or
+    closes the pull request: the next pass, whose first read of it would lead to the return, marks the row closed
+    outside with exactly one event; no continuation, no red_check_returned and no rerun call. Later passes send no
+    request."""
+    from tests.hermes_cli.test_kanban_delivery_red_check import FLAKY, _waited
     from tests.hermes_cli.test_kanban_delivery_review_return import CONTINUED
 
     kb, root, repo, gh = red_run
     tid, head = _ready_to_return(red_run)
-    pull, failed = ("GET", f"/repos/{REPO}/pulls/41"), []
-
-    def fail():  # the one pull request read after the rerun call
-        if gh["reruns"] and not failed:
-            failed.append(gh["calls"][-1])
-            raise transport.GitHubTransportError("network_error")
-
-    gh.update(rerun=answer, each=fail)
-    _tick(kb)
-    gh["each"] = None
-    assert (failed, _state(kb, head), [p["statuses"] for p in _waited(kb, tid, "red_check_rerun_outcome")]) == (
-        [pull], "open", [[answer]])
+    pull, outcome = ("GET", f"/repos/{REPO}/pulls/41"), {"delivery_id": 1, "head": head, "pull_request_number": 41}
+    with kb.connect_closing(db_path=kb.kanban_db_path()) as conn, kb.write_txn(conn):
+        for payload in (dict(outcome, code="red_check_waiting", check_runs=[{"id": 900, "conclusion": "failure"}]),
+                        dict(outcome, code="red_check_rerun", jobs=[903], tests=[FLAKY], attempt=1),
+                        dict(outcome, code="red_check_rerun_outcome", jobs=[903], statuses=[answer])):
+            kb._append_event(conn, tid, "delivery_review_waiting", payload)
     gh["pull"], calls, events = _closed(merged), list(gh["calls"]), _events(kb, tid)
 
     _tick(kb)
 
-    assert _events(kb, tid)[len(events):] == [("delivery_closed_outside", {
-        "delivery_id": 1, "head": head, "pull_request_number": 41, "merged": merged})]
-    assert (gh["calls"][len(calls):], _state(kb, head), gh["reruns"]) == ([pull], "closed_outside", [RERUN])
+    assert _events(kb, tid)[len(events):] == [("delivery_closed_outside", dict(outcome, merged=merged))]
+    assert (gh["calls"][len(calls):], _state(kb, head), gh["reruns"]) == ([pull], "closed_outside", [])
     assert (_waited(kb, tid, "red_check_returned"), _raw(kb.kanban_db_path(), CONTINUED, tid)) == ([], [])
     calls = list(gh["calls"])
     for _ in range(3):
@@ -572,13 +531,14 @@ def test_a_pull_request_closed_after_a_refused_rerun_is_closed_outside_by_the_pa
 @pytest.mark.parametrize("read, check, listed", [
     (PAGED["check_runs"], "success", True), (PAGED["check_runs"], "failure", True), ("/jobs", "failure", True),
     ("/annotations", "failure", True), ("/jobs", "failure", False), ("/annotations", "failure", False)],
-    ids=["ci_green", "ci_red", "jobs_rerun", "annotations_rerun", "jobs_return", "annotations_return"])
+    ids=["ci_green", "ci_red", "jobs_listed", "annotations_listed", "jobs_return", "annotations_return"])
 def test_a_pull_request_closed_while_ci_or_the_red_run_is_read_is_closed_outside_by_that_pass(red_run, read, check,
                                                                                             listed, merged):
     """Someone merges or closes the pull request while the pass reads CI on H, green or red, or the jobs or the
-    annotations of H's red run, whose failure is the listed flaky test to rerun or another test to return. The read
-    after CI, or the read after the return's branch, marks the row closed outside in that pass, once: no review card,
-    no waiting record past the red check's own, no rerun call and no continuation. Later passes send no request."""
+    annotations of H's red run, whose failure is a test the old flaky list named or another, the work to return.
+    The read after CI, or the read after the return's branch, marks the row closed outside in that pass, once: no
+    review card, no waiting record past the red check's own, no rerun call and no continuation. Later passes send
+    no request."""
     from tests.hermes_cli.test_kanban_delivery_red_check import FLAKY, UNLISTED
     from tests.hermes_cli.test_kanban_delivery_review_return import CONTINUED
 
@@ -603,13 +563,13 @@ def test_a_pull_request_closed_while_ci_or_the_red_run_is_read_is_closed_outside
 
 
 def test_a_row_closed_outside_stays_so_when_another_head_and_then_its_own_are_approved(red_run):
-    """H's row is closed outside with H's refused rerun outstanding: while the first pass's pull request read waits,
-    an overlapping native pass reruns H's listed flaky failure, someone merges the pull request while that call
-    waits, and GitHub refuses it (403). The owner then sends the source card back, a different head J is approved,
-    and H is approved again, all through the real lifecycle: H's row keeps closed_outside and its one closure event,
+    """H's row is closed outside before its red check's return: while the first pass's pull request read waits, an
+    overlapping native pass reaches the return of H's red check and someone merges the pull request while that
+    pass reads the failed slice's annotations. The owner then sends the source card back, a different head J is
+    approved, and H is approved again, all through the real lifecycle: H's row keeps closed_outside and its one closure event,
     and review passes, driven directly so that J's own publication sends nothing, send no request for it."""
     from hermes_cli.kanban_delivery import review_step
-    from tests.hermes_cli.test_kanban_delivery_red_check import RERUN, _waited
+    from tests.hermes_cli.test_kanban_delivery_red_check import _waited
 
     kb, root, repo, gh = red_run
     tid, head = _ready_to_return(red_run)
@@ -620,15 +580,14 @@ def test_a_row_closed_outside_stays_so_when_another_head_and_then_its_own_are_ap
             overlapped.append(gh["calls"][-1])
             _tick(kb)
 
-    gh.update(rerun=403, closes=("/rerun", True), each=overlap)
+    gh.update(closes=("/annotations", True), each=overlap)
     _tick(kb)
     gh["each"] = None
 
     closure = [("delivery_closed_outside", {
         "delivery_id": 1, "head": head, "pull_request_number": 41, "merged": True})]
     assert (overlapped, _state(kb, head), gh["reruns"], _waited(kb, tid, "red_check_returned")) == (
-        [pull], "closed_outside", [RERUN], [])
-    assert [p["statuses"] for p in _waited(kb, tid, "red_check_rerun_outcome")] == [[403]]
+        [pull], "closed_outside", [], [])
     assert [event for event in _events(kb, tid) if event[0] == "delivery_closed_outside"] == closure
 
     other = _rework(kb, repo, tid)  # the owner sends the card back and a different head J is approved
@@ -906,8 +865,8 @@ def test_a_red_check_waits_once_per_head_until_a_green_rerun(world, conclusion):
     """A required check completed on H with any conclusion other than success leaves the delivery waiting:
     red_check_waiting with that check run's id and conclusion from the decision request, once for H, with no
     POST, no jobs request and the source card unchanged. Each pass reads H's workflow runs once; this table
-    answers 404, so no rerun and no return is decided. Later passes read CI again, so a green rerun on the
-    code host gets H its review cards."""
+    answers 404, which never stops the return, but no project folder holds H, so each pass refuses the return
+    and records nothing. Later passes read CI again, so a green rerun on the code host gets H its review cards."""
     kb, root, repo, gh = world
     tid, head = _ready(world)
     gh["check"] = ("completed", conclusion)

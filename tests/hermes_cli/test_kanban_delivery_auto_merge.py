@@ -226,9 +226,10 @@ def test_the_allowlist_holds_exactly_the_three_new_entries_and_refuses_every_oth
         ("GET", "/repos/{repo}/pulls"), ("POST", "/repos/{repo}/pulls"), ("GET", "/repos/{repo}/pulls/{number}"),
         ("GET", "/repos/{repo}/git/ref/heads/{branch}"), ("GET", "/repos/{repo}/commits/{sha}/check-runs"),
         ("GET", "/repos/{repo}/actions/runs"), ("GET", "/repos/{repo}/actions/runs/{id}/jobs"),
-        ("GET", "/repos/{repo}/actions/jobs/{id}/logs"), ("POST", "/repos/{repo}/actions/jobs/{id}/rerun"),
+        ("GET", "/repos/{repo}/actions/jobs/{id}/logs"),
         ("POST", "/app/installations/{installation}/access_tokens"),  # the twelve before card 5 less the two
-        # unused ones the owner removed on 2026-10-04, card 5's three, and the red check's annotations read:
+        # unused ones the owner removed on 2026-10-04 and the rerun removed on 2026-10-20, card 5's three, and
+        # the red check's annotations read:
         ("GET", "/repos/{repo}/pulls/{number}/reviews"), ("PATCH", "/repos/{repo}/pulls/{number}"),
         ("PUT", "/repos/{repo}/pulls/{number}/merge"), ("GET", "/repos/{repo}/check-runs/{id}/annotations")}
     refused = [
@@ -258,10 +259,28 @@ def test_the_allowlist_holds_exactly_the_three_new_entries_and_refuses_every_oth
         with pytest.raises(transport.GitHubTransportError):
             github.request(method, path, body=body)
     assert len(sent) == 4
-    for step in ("read_checks", "rerun_flaky", "handoff"):  # no step that cannot write contents can merge
+    for step in ("read_checks", "handoff"):  # no step that cannot write contents can merge
         with pytest.raises(transport.GitHubTransportError):
             transport.GitHubTransport(step, REPO).request("PUT", f"/repos/{REPO}/pulls/41/merge", body=merge)
     assert len(sent) == 4
+
+
+def test_the_transport_refuses_the_rerun_endpoint_and_no_step_holds_actions_write(monkeypatch):
+    """Owner decision 2026-10-20: nothing reruns a check. No step holds actions write, and every step's
+    transport refuses the rerun call before anything is sent."""
+    from hermes_cli import kanban_delivery_github as transport
+
+    sent = []
+    monkeypatch.setattr(transport, "_exchange", lambda method, target, authorization, payload=None: (
+        sent.append((method, target, payload)) or (201, None)))
+    monkeypatch.setattr(transport.GitHubTransport, "_installation_token", lambda self: setattr(self, "_token", "ghs_0") or "ghs_0")
+
+    assert [step for step, permissions in transport.STEP_PERMISSIONS.items() if permissions.get("actions") == "write"] == []
+    for step in transport.STEP_PERMISSIONS:
+        with pytest.raises(transport.GitHubTransportError) as refused:
+            transport.GitHubTransport(step, REPO).request("POST", f"/repos/{REPO}/actions/jobs/903/rerun")
+        assert refused.value.reason == "endpoint_not_allowed"
+    assert sent == []
 
 
 @pytest.mark.parametrize("tier", [0, 2])
