@@ -439,9 +439,16 @@ def _waiting_and_refused(root: Path, owner: ow.OwnerContext) -> dict:
     sits on a board of its own, so its worker env is pinned away from the
     Project's board.
     """
+    import sqlite3
+    profile_home = Path(os.environ["HERMES_HOME"])
     with pytest.MonkeyPatch.context() as shared_root:
         shared_root.setenv("HERMES_HOME", str(root))
         project = _project(owner, "Wait Pilot")
+        # The Project lives in the root registry. Card creation and the owner's
+        # calls still use the steward's own registry, so the steward holds a copy.
+        with contextlib.closing(sqlite3.connect(root / "projects.db")) as source:
+            with contextlib.closing(sqlite3.connect(profile_home / "projects.db")) as target:
+                source.backup(target)
     board = project["board"]
     with _board(board) as conn:
         waiting = _card(conn, project, "Draft the placeholder brief")
