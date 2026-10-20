@@ -2690,9 +2690,10 @@ class ResponseStore:
             # Last valid structured assistant message before the next owner
             # turn is the authoritative final reply for that turn.
             from hermes_cli.kanban_db import redact_review_value
+            from hermes_cli.owner_workspace import owner_reply_prose
 
             projected_text = json.dumps(
-                redact_review_value(candidate), ensure_ascii=False,
+                redact_review_value(owner_reply_prose(candidate)), ensure_ascii=False,
             )
             if (
                 len(text) > _OWNER_HISTORY_RAPHAEL_MAX_CHARS
@@ -4565,7 +4566,8 @@ class ResponseStore:
             )
         ):
             return None
-        return value
+        from hermes_cli.owner_workspace import owner_run_status
+        return owner_run_status(value)
 
     @_owner_authority
     @_response_store_locked
@@ -15433,7 +15435,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
             )
-        return web.json_response(status)
+        from hermes_cli.owner_workspace import owner_run_status
+        return web.json_response(owner_run_status(status))
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
@@ -15451,6 +15454,7 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
+        from hermes_cli.owner_workspace import owner_run_status
         q = self._run_streams[run_id]
         self._run_stream_subscribers.add(run_id)
 
@@ -15475,7 +15479,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     # Run finished — send final SSE comment and close
                     await response.write(b": stream closed\n\n")
                     break
-                payload = _sse_frame(event)
+                payload = _sse_frame(owner_run_status(event))
                 await response.write(payload)
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
