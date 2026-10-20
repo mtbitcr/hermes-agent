@@ -14,6 +14,11 @@ while the run stays linked to the parent changes nothing. A call from a
 process with no injected run, such as an owner agent or an operator command,
 marks nothing, so a run the kernel or another agent ends lists exactly its
 session's tools.
+
+The mark is made only in the worker's dispatcher-owned execution
+(``agent.delegation_context.is_dispatcher_owned_worker_context``): a cron run
+or a delegate_task child inside a worker process marks nothing, although it
+inherits the worker's environment.
 """
 
 from __future__ import annotations
@@ -22,6 +27,8 @@ import contextvars
 import functools
 import os
 from typing import Callable, Optional
+
+from agent.delegation_context import is_dispatcher_owned_worker_context
 
 # The run the calling worker was launched for and the name of its call ending it.
 _ENDING_TOOL: contextvars.ContextVar[Optional[tuple[int, str]]] = (
@@ -32,10 +39,11 @@ _ENDING_TOOL: contextvars.ContextVar[Optional[tuple[int, str]]] = (
 def _injected_run_id() -> Optional[int]:
     """The run the dispatcher launched this worker process for, or ``None``.
 
-    Taken only inside a worker (``HERMES_KANBAN_TASK`` set), from the
-    ``HERMES_KANBAN_RUN_ID`` the dispatcher injects at the spawn.
+    Taken only inside a worker (``HERMES_KANBAN_TASK`` set) and in its
+    dispatcher-owned execution, from the ``HERMES_KANBAN_RUN_ID`` the
+    dispatcher injects at the spawn.
     """
-    if not os.environ.get("HERMES_KANBAN_TASK"):
+    if not os.environ.get("HERMES_KANBAN_TASK") or not is_dispatcher_owned_worker_context():
         return None
     try:
         return int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))

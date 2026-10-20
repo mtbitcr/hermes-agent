@@ -14,7 +14,9 @@ tools, as before. The mark is bound to the run the dispatcher launched the
 worker for (owner rule of 2026-10-15), not to a session: an ending another
 agent calls on the worker's card from outside any worker adds nothing, and
 a reviewer whose session a context compression rotated before its verdict
-still names it.
+still names it. An ending called inside the worker's process by code the
+worker does not own, such as a cron run, adds nothing either, although that
+code inherits the worker's whole environment.
 
 The worker side of every scenario runs in the exact environment the
 dispatcher gives the worker it launches. It is taken from
@@ -748,3 +750,252 @@ def test_a_stop_for_repeated_findings_after_compression_names_kanban_review_find
     assert out["outcome"] == "owner_decision_blocked"
     assert kb.get_task(conn, task_id).status == "blocked"
     _assert_receipt_names_the_verdict(root, review.current_run_id, state_db)
+
+
+# The worker's session while code it does not own runs in its process.
+INHERITING_SESSION = "builder-inheriting-session"
+# Each ending called from such code: its handler and the card's status after it.
+_ENDINGS = {
+    "kanban_complete": ("_handle_complete", "done"),
+    "kanban_request_review": ("_handle_request_review", "review"),
+}
+
+
+def _hermes_environ() -> dict:
+    """This process's Hermes variables, the worker's pins and session id among them."""
+    return {name: value for name, value in os.environ.items() if name.startswith("HERMES_")}
+
+
+def _linked_worker(ending: str, request, root: Path, tmp_path: Path, monkeypatch):
+    """Launch the run's worker; its heartbeat links the run to its session.
+
+    ``kanban_request_review`` ends the run of the scoped build that needs
+    review, ``kanban_complete`` that of a plain build. Returns the board
+    connection, the card, its run and the worker's session store.
+    """
+    from tools import kanban_tools as kt
+
+    if ending == "kanban_request_review":
+        build = request.getfixturevalue("review_build")
+        conn, task_id, run_id = build["conn"], build["task"], build["run"]
+    else:
+        conn = request.getfixturevalue("board")
+        task_id = kb.create_task(conn, title="plain build", assignee=IMPLEMENTER)
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        (root / "profiles" / IMPLEMENTER).mkdir(parents=True)
+        _launch_worker(conn, claimed, root, tmp_path, monkeypatch)
+
+    state_db = _record_session(
+        INHERITING_SESSION, IMPLEMENTER, EARLIER_CALLS + (("kanban_heartbeat", {}),),
+    )
+    # The worker's agent publishes its own session id once it starts.
+    monkeypatch.setenv("HERMES_SESSION_ID", INHERITING_SESSION)
+    assert json.loads(kt._handle_heartbeat({}))["ok"] is True
+    return conn, task_id, run_id, state_db
+
+
+def _assert_receipt_lists_only_the_worker_session(
+    root: Path, run_id: int, state_db: Path, ending: str,
+) -> None:
+    """The run stays linked to the worker's session, and its receipt lists
+    exactly that session's tools, without the ending."""
+    board_db = root / "kanban" / "boards" / SLUG / "kanban.db"
+    with closing(sqlite3.connect(board_db)) as db:
+        (raw,) = db.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+    assert json.loads(raw)["worker_session_id"] == INHERITING_SESSION
+    session_tools = _session_tool_names(state_db, INHERITING_SESSION)
+    assert session_tools == {name for name, _ in EARLIER_CALLS} | {"kanban_heartbeat"}
+    capability = _stored_capability(root, run_id)
+    assert ending not in capability["tools"], capability["tools"]
+    assert capability["tools"] == sorted(session_tools)
+    assert len(capability["tools"]) == len(session_tools)
+
+
+@pytest.mark.parametrize("ending", ["kanban_complete", "kanban_request_review"])
+def test_an_ending_from_an_inherited_context_adds_nothing_to_the_worker_receipt(
+    root, tmp_path, monkeypatch, request, ending,
+):
+    """Review finding: code the worker does not own names nothing in its run.
+
+    The worker runs under the exact environment the dispatcher injects, and
+    its heartbeat links the run to its session. Code running in the worker's
+    process outside its dispatcher-owned execution inherits every pin and the
+    worker's session id, and ends the card by naming it explicitly. The call
+    is allowed as before, and the run's receipt lists exactly the worker
+    session's tools.
+    """
+    from agent.delegation_context import non_dispatcher_owned_context
+    from tools import kanban_tools as kt
+
+    conn, task_id, run_id, state_db = _linked_worker(
+        ending, request, root, tmp_path, monkeypatch,
+    )
+    handler, status = _ENDINGS[ending]
+    # The environment is process-global, so that code inherits it whole.
+    assert os.environ["HERMES_KANBAN_TASK"] == task_id
+    assert os.environ["HERMES_KANBAN_RUN_ID"] == str(run_id)
+    assert os.environ["HERMES_SESSION_ID"] == INHERITING_SESSION
+    with non_dispatcher_owned_context():
+        out = json.loads(getattr(kt, handler)(
+            {"board": SLUG, "task_id": task_id, "summary": "ended from inherited code"}
+        ))
+    assert out.get("ok") is True, out
+    assert out["run_id"] == run_id
+    assert kb.get_task(conn, task_id).status == status
+    _assert_receipt_lists_only_the_worker_session(root, run_id, state_db, ending)
+
+
+def _end_from_native_cron(ending: str, task_id: str, state_db: Path, monkeypatch) -> dict:
+    """A cron job fired in the worker's process ends the worker's card.
+
+    ``cron.scheduler.run_job`` runs for real: it enters the
+    non-dispatcher-owned context, resolves the job's toolsets from the
+    profile's configuration, opens the profile's session store and builds
+    the cron agent with both. Only the model is stood in for: the agent
+    records its own cron session in that store, publishes it to its call
+    and ends the card, naming it explicitly, through
+    ``model_tools.handle_function_call``. Returns what the agent saw.
+    """
+    from unittest import mock
+
+    import cron.scheduler as sched
+    import hermes_state
+    import model_tools
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+    from gateway import session_context
+    from hermes_cli import runtime_provider
+    from tools.registry import invalidate_check_fn_cache
+
+    # The profile legitimately enables the kanban toolset for its agents. Its
+    # model's context length is configured, so no model catalog is fetched.
+    (Path(os.environ["HERMES_HOME"]) / "config.yaml").write_text(
+        "model:\n  default: cron-model\n  context_length: 200000\n"
+        "toolsets:\n  - hermes-cli\n  - kanban\n",
+        encoding="utf-8",
+    )
+    # The worker's process opens its own profile's session store by default.
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", state_db)
+    # No model provider is reached: no credentials, no network.
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", lambda **_kw: {
+        "provider": "test", "api_key": "k", "base_url": "http://test.local",
+        "api_mode": "chat_completions",
+    })
+    # run_job binds session variables; the process-wide latch ends with this test.
+    monkeypatch.setattr(
+        session_context, "_session_context_engaged",
+        session_context.session_context_engaged(),
+    )
+    arguments = {"board": SLUG, "task_id": task_id, "summary": "ended from a cron run"}
+    seen: dict = {}
+
+    class CronAgent:
+        """Stands in for the model; what it calls is the real code."""
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.session_id = kwargs["session_id"]
+
+        def run_conversation(self, prompt, **_kw):
+            toolsets = {
+                "enabled_toolsets": self.kwargs["enabled_toolsets"],
+                "disabled_toolsets": self.kwargs["disabled_toolsets"],
+            }
+            seen["owned"] = is_dispatcher_owned_worker_context()
+            seen["environ"] = _hermes_environ()
+            seen["tools"] = {
+                tool["function"]["name"]
+                for tool in model_tools.get_tool_definitions(**toolsets, quiet_mode=True)
+            }
+            db = self.kwargs["session_db"]
+            db.create_session(
+                self.session_id, source="cron", model=self.kwargs["model"],
+                profile_name=IMPLEMENTER,
+            )
+            db.append_message(
+                self.session_id, "assistant", content="",
+                tool_calls=[_tool_call("cron-ending", ending, arguments)],
+            )
+            # Published task-locally: the real agent's init also writes the
+            # process-wide HERMES_SESSION_ID, which this stand-in leaves to
+            # the worker.
+            with session_context.scoped_current_session_id(self.session_id):
+                seen["published"] = session_context.get_session_env("HERMES_SESSION_ID")
+                out = model_tools.handle_function_call(
+                    ending, arguments, tool_call_id="cron-ending",
+                    session_id=self.session_id, **toolsets,
+                )
+            db.append_message(
+                self.session_id, "tool", content=out, tool_name=ending,
+                tool_call_id="cron-ending",
+            )
+            seen["session"], seen["out"] = self.session_id, json.loads(out)
+            return {"final_response": "ended the card", "messages": []}
+
+        def get_activity_summary(self):
+            return {"seconds_since_activity": 0.0}
+
+        def close(self):
+            pass
+
+    stand_in = type(sys)("run_agent")
+    stand_in.AIAgent = CronAgent
+    monkeypatch.setitem(sys.modules, "run_agent", stand_in)
+    job = {
+        "id": "kanban-closer", "name": "close the worker card",
+        "prompt": "Close the worker's card.", "schedule_display": "manual",
+    }
+    invalidate_check_fn_cache()
+    try:
+        # run_job binds its context variables in the context it runs in, and
+        # exports the profile's terminal settings to the environment.
+        with mock.patch.dict(os.environ):
+            success, *_, error = contextvars.copy_context().run(sched.run_job, job)
+    finally:
+        invalidate_check_fn_cache()
+    assert success is True, error
+    return seen
+
+
+@pytest.mark.parametrize("ending", ["kanban_complete", "kanban_request_review"])
+def test_a_native_cron_run_ending_the_card_adds_nothing_to_the_worker_receipt(
+    root, tmp_path, monkeypatch, request, ending,
+):
+    """Review finding: a cron run inside the worker's process names nothing.
+
+    The profile enables the kanban toolset for its agents, so the cron agent
+    is offered the ending and calls it through the tool registry from its own
+    published session, naming the worker's card explicitly, while the
+    worker's environment pins stay set. The call is allowed as before, and
+    the worker run's receipt lists exactly the worker session's tools.
+    """
+    conn, task_id, run_id, state_db = _linked_worker(
+        ending, request, root, tmp_path, monkeypatch,
+    )
+    inherited = _hermes_environ()
+    assert inherited["HERMES_KANBAN_TASK"] == task_id
+    assert inherited["HERMES_KANBAN_RUN_ID"] == str(run_id)
+    assert inherited["HERMES_SESSION_ID"] == INHERITING_SESSION
+    seen = _end_from_native_cron(ending, task_id, state_db, monkeypatch)
+
+    # The cron agent ran outside the dispatcher-owned execution, with every
+    # pin of the worker set, and its toolsets offered it the ending.
+    assert seen["owned"] is False
+    assert seen["environ"] == inherited
+    assert ending in seen["tools"]
+    # Its own session was published to the call and recorded beside the
+    # worker's in the profile's session store.
+    assert seen["published"] == seen["session"] != INHERITING_SESSION
+    with closing(sqlite3.connect(state_db)) as db:
+        sessions = dict(db.execute("SELECT id, source FROM sessions"))
+    assert sessions == {INHERITING_SESSION: "kanban", seen["session"]: "cron"}
+    assert _session_tool_names(state_db, seen["session"]) == {ending}
+
+    out = seen["out"]
+    assert out.get("ok") is True, out
+    assert out["run_id"] == run_id
+    assert kb.get_task(conn, task_id).status == _ENDINGS[ending][1]
+    _assert_receipt_lists_only_the_worker_session(root, run_id, state_db, ending)
