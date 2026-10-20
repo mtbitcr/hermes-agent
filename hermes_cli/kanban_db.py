@@ -110,6 +110,7 @@ from hermes_cli.kanban_risk_tier import (
     review_run_box_seconds,
 )
 from hermes_cli.kanban_run_metadata_merge import merge_edited_run_metadata, strip_kernel_keys
+from hermes_cli.kanban_schedule_stop import capture_worker, stop_after_commit
 from hermes_cli.sqlite_util import (
     InitLockDirectoryAbsent,
     InitLockUnavailable,
@@ -33225,6 +33226,7 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
+        captured = capture_worker(conn, task_id) if expected_run_id is None else None
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -33254,7 +33256,8 @@ def schedule_task(
                 summary=reason,
             )
         _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
-        return True
+    stop_after_commit(captured)
+    return True
 
 
 # Dispatcher (one-shot pass)
