@@ -548,7 +548,7 @@ class HermesTokenStorage:
             logger.warning("Corrupt tokens at %s -- ignoring: %s", self._tokens_path(), exc)
             return None
 
-    async def set_tokens(self, tokens: "OAuthToken") -> None:
+    async def set_tokens(self, tokens: "OAuthToken", *, new_sign_in: bool = False) -> None:
         payload = tokens.model_dump(mode="json", exclude_none=True)
         # RFC 6749 section 6: if the authorization server's refresh response
         # omits ``refresh_token``, the client must keep using the previously
@@ -579,11 +579,13 @@ class HermesTokenStorage:
                 # Mock tokens or unusual shapes: skip the expires_at write
                 # rather than fail persistence.
                 pass
-        # A provider can re-issue identical tokens without a lifetime. A save
-        # that would recreate the exact bytes of a refused token file gets its
-        # own identity, so the older refusal stops counting as for any new
-        # sign-in; set_tokens never touches a marker.
-        if self._sign_in_rejected_path(
+        # A provider can re-issue identical tokens without a lifetime. The
+        # owner's new sign-in (``new_sign_in``) always gets its own identity,
+        # so a refusal writer that read older bytes, even one that has not
+        # created its marker yet, never matches the new file. Any other save
+        # that would recreate the exact bytes of a refused token file gets
+        # its own identity too; set_tokens never touches a marker.
+        if new_sign_in or self._sign_in_rejected_path(
             hashlib.sha256(_json_file_bytes(payload)).hexdigest()
         ).exists():
             payload["sign_in_id"] = secrets.token_hex(16)

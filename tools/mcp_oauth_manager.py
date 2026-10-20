@@ -271,7 +271,15 @@ def _make_hermes_provider_class() -> Optional[type]:
                     raise OAuthTokenError("Invalid token response") from None
                 self.context.current_tokens = token_response
                 self.context.update_token_expiry(token_response)
-                await self.context.storage.set_tokens(token_response)
+                # A token response answers the authorization-code grant: the
+                # owner's own sign-in, which always saves new token file
+                # bytes. Refreshes save through _handle_refresh_response.
+                storage = self.context.storage
+                from tools.mcp_oauth import HermesTokenStorage
+                if isinstance(storage, HermesTokenStorage):
+                    await storage.set_tokens(token_response, new_sign_in=True)
+                else:
+                    await storage.set_tokens(token_response)
                 return
 
             from mcp.client.auth.oauth2 import OAuthTokenError

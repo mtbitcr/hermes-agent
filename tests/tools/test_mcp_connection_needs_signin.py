@@ -8,11 +8,13 @@ by another process stays connected, and obsolete work never changes the
 state of newer tokens. The marker files are the only record of refusals:
 the rollback of a failed owner operation restores only the token files it
 changed and never writes, deletes or restores a marker, and only a completed
-connection removal deletes them. Every token here is an obvious fake inside
-a temporary HERMES_HOME.
+connection removal deletes them. Every successful owner sign-in saves token
+file bytes of its own, so no refusal of earlier bytes matches it. Every token
+here is an obvious fake inside a temporary HERMES_HOME.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -55,12 +57,28 @@ asyncio.run(HermesTokenStorage("srv").set_tokens(OAuthToken(
 """
 # Run in a second OS process: the gateway is refused the saved fake sign-in
 # whose tokens start with argv[3]. Its refresh ("refresh") or its MCP request
-# ("mcp") gets the answer argv[2]; only the network is fake.
+# ("mcp") gets the answer argv[2]; only the network is fake. With argv[4]
+# "pause", the writer matches the refusal to the token file bytes on disk,
+# writes a ready line and waits for a line on stdin before it creates their
+# marker; nothing it sends after the refusal connects.
 _REFUSE_SAVED_SIGN_IN = """
 import asyncio
 import sys
+from tools import mcp_oauth
 from tools.mcp_oauth_manager import MCPOAuthManager
 from tools.mcp_tool import sdk_httpx
+
+pause = sys.argv[4:] == ["pause"]
+create_marker = mcp_oauth._create_marker
+
+def create_marker_after_pause(path):
+    mcp_oauth._create_marker = create_marker
+    print("paused before the marker", flush=True)
+    sys.stdin.readline()
+    create_marker(path)
+
+if pause:
+    mcp_oauth._create_marker = create_marker_after_pause
 
 async def refuse(path, status, prefix):
     sdk = sdk_httpx()
@@ -73,21 +91,24 @@ async def refuse(path, status, prefix):
         response = sdk.Response(status, request=request, content=b'{"error": "invalid_grant"}')
         assert await provider._handle_refresh_response(response) is False
         return
+    refused = []
 
     def network(request):
-        if status == 401 and request.url != sdk.URL(url):
-            # The SDK answers a 401 with OAuth discovery, which fails to connect.
+        if (status == 401 and request.url != sdk.URL(url)) or (pause and refused):
+            # The SDK answers a 401 with OAuth discovery, which fails to connect;
+            # a paused writer's retry would go out after the owner's sign-in.
             raise sdk.ConnectError("fake network: nothing after the refusal", request=request)
         # The MCP request and the SDK's retry, both sent with the saved token.
         assert request.url == sdk.URL(url)
         assert request.headers["Authorization"] == "Bearer " + prefix + "-access-token"
+        refused.append(request)
         return sdk.Response(status)
 
     async with sdk.AsyncClient(auth=provider, transport=sdk.MockTransport(network)) as client:
         try:
             response = await client.post(url, json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
         except sdk.ConnectError:
-            assert status == 401
+            assert status == 401 or pause
             return
     assert response.status_code == status
 
@@ -862,7 +883,6 @@ async def test_rollback_after_completed_removal_and_stable_re_add_stays_connecte
     from hermes_cli import mcp_config
 
     await _authorized_with_stable_tokens()
-    signed_in = _token_file(home).read_bytes()
     assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
     _refuse_in_another_process(home, "refresh", 400, "fake-stable")
 
@@ -872,16 +892,16 @@ async def test_rollback_after_completed_removal_and_stable_re_add_stays_connecte
     assert _SERVER not in mcp_config._get_mcp_servers()
 
     # Tokens without a lifetime can be stable, so the new sign-in saves the
-    # same bytes under the same connection name.
+    # same credentials under the same connection name.
     await _authorized_with_stable_tokens()
-    assert _token_file(home).read_bytes() == signed_in
+    assert _stored_tokens(home) == ("fake-stable-access-token", "fake-stable-refresh-token")
     assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
     assert not _markers(home)
 
     # No refusal arrives before, during or after the failed operation.
     _OWNER_OPERATION_FAILS[operation](home, monkeypatch)
 
-    assert _token_file(home).read_bytes() == signed_in
+    assert _stored_tokens(home) == ("fake-stable-access-token", "fake-stable-refresh-token")
     assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
     assert not _markers(home)
 
@@ -1218,13 +1238,176 @@ def test_failed_dashboard_sign_in_after_stable_refusal_restores_refused_tokens(
     assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "needs_authorization"
 
 
-def test_stable_tokens_saved_twice_without_refusal_write_identical_files(home):
+def test_two_owner_saves_of_identical_credentials_write_different_files(home):
     asyncio.run(_authorized_with_stable_tokens())
     first = _token_file(home).read_bytes()
+    first_tokens = asyncio.run(HermesTokenStorage(_SERVER).get_tokens())
 
     _stable_tokens_reissued()
 
-    assert _token_file(home).read_bytes() == first
-    assert "sign_in_id" not in json.loads(first)
+    assert asyncio.run(HermesTokenStorage(_SERVER).get_tokens()) == first_tokens
     assert not _markers(home)
     assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
+    assert _token_file(home).read_bytes() != first
+
+
+# -- a refusal writer paused before its marker never matches a new sign-in ----
+
+
+@contextlib.contextmanager
+def _refusal_paused_before_its_marker(home, path: str, status: int):
+    """The gateway, a second OS process, is refused the saved stable sign-in:
+    its refresh (``path="refresh"``) or its MCP request (``path="mcp"``) is
+    answered with ``status``. It matches the refusal to the token file bytes on
+    disk and pauses just before it creates their marker; leaving the block
+    releases it, and it must then exit 0."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", _REFUSE_SAVED_SIGN_IN, path, str(status), "fake-stable", "pause"],
+        cwd=_REPO_ROOT,
+        env={**os.environ, "HERMES_HOME": str(home)},
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    output, paused = [], threading.Event()
+
+    def _read_lines():
+        for line in child.stdout:
+            output.append(line)
+            if line.strip() == "paused before the marker":
+                paused.set()
+        paused.set()  # end of output: the writer has exited
+
+    reader = threading.Thread(target=_read_lines, daemon=True)
+    reader.start()
+    try:
+        if not paused.wait(timeout=120):
+            pytest.fail(f"the refusal writer did not pause:\n{''.join(output)}")
+        if not any(line.strip() == "paused before the marker" for line in output):
+            pytest.fail(f"the refusal writer exited before its marker:\n{''.join(output)}")
+        yield
+    finally:
+        try:
+            child.stdin.write("released\n")
+            child.stdin.close()
+        except OSError:
+            pass  # it has exited already
+        try:
+            child.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=60)
+        reader.join(timeout=60)
+    assert child.returncode == 0, "".join(output)
+
+
+def _stored_sign_in_accepted() -> None:
+    """An MCP request through the SDK's own HTTP client carries the stored
+    stable sign-in, and the fake network accepts it."""
+    from tools.mcp_oauth_manager import get_manager
+    from tools.mcp_tool import sdk_httpx
+
+    sdk = sdk_httpx()
+    accepted = []
+
+    def _network(request):
+        assert request.headers["Authorization"] == "Bearer fake-stable-access-token"
+        accepted.append(request)
+        return sdk.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
+
+    async def _authenticated_request():
+        provider = get_manager().get_or_build_provider(_SERVER, _URL, {})
+        async with sdk.AsyncClient(auth=provider, transport=sdk.MockTransport(_network)) as client:
+            return await client.post(_URL, json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+
+    response = asyncio.run(asyncio.wait_for(_authenticated_request(), timeout=30))
+    assert response.status_code == 200
+    assert len(accepted) == 1
+
+
+def _owner_signs_in_again(home, monkeypatch, entry: str) -> None:
+    """The owner's successful new sign-in through the real entry point: the
+    dashboard's sign-in worker, the CLI's reauthorization, the desktop's
+    reauthorization, or a completed connection removal and the dashboard's
+    add and sign-in. The token endpoint answers with the same stable tokens,
+    and the probe's authenticated request is accepted."""
+    from hermes_cli import mcp_config, web_server
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+    from tools.mcp_oauth import force_interactive_oauth
+    from tui_gateway.mcp_oauth_sessions import _probe_with_rollback
+
+    def _authorize(name, config, *, connect_timeout):
+        _stable_tokens_reissued()
+
+    def _probe(name, config, connect_timeout=None, *, details=None):
+        if entry == "desktop":
+            # The desktop path gets its tokens during the probe.
+            _stable_tokens_reissued()
+        _stored_sign_in_accepted()
+        return [("fake-tool", "A fake tool of the signed-in connection")]
+
+    monkeypatch.setattr(mcp_config, "_authorize_oauth_server", _authorize)
+    monkeypatch.setattr(mcp_config, "_probe_single_server", _probe)
+
+    if entry == "cli":
+        assert mcp_config._reauth_oauth_server(_SERVER, dict(_OAUTH_CONFIG)) is True
+        return
+    if entry == "removal_and_readd":
+        assert mcp_config._remove_mcp_server_and_credentials(_SERVER) is True
+        assert not _token_file(home).exists()
+        assert _SERVER not in mcp_config._get_mcp_servers()
+        assert mcp_config._save_mcp_server(_SERVER, dict(_OAUTH_CONFIG)) is True
+    flow = DashboardOAuthFlow(
+        flow_id=f"flow-srv-{entry}",
+        server_name=_SERVER,
+        profile=None,
+        hermes_home=str(home),
+        redirect_uri="https://agent.example/api/mcp/oauth/callback/srv",
+    )
+    if entry == "desktop":
+        with force_interactive_oauth():
+            _probe_with_rollback(_SERVER, dict(_OAUTH_CONFIG), str(home), flow, False)
+    else:
+        web_server._run_dashboard_mcp_oauth(flow, dict(_OAUTH_CONFIG))
+    assert flow.status == "approved", flow.error
+
+
+def _listed_connection_status() -> str:
+    """The connection's status in the dashboard's authenticated server list."""
+    from starlette.testclient import TestClient
+
+    from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN, app
+
+    client = TestClient(app)
+    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
+    response = client.get("/api/mcp/servers")
+    assert response.status_code == 200, response.text
+    [server] = [s for s in response.json()["servers"] if s["name"] == _SERVER]
+    return server["connection_status"]
+
+
+@pytest.mark.parametrize(
+    "path, status", [("refresh", 400), ("refresh", 401), ("mcp", 401), ("mcp", 403)]
+)
+@pytest.mark.parametrize("entry", ["dashboard", "cli", "desktop", "removal_and_readd"])
+def test_delayed_refusal_writer_keeps_new_owner_sign_in_connected(
+    home, monkeypatch, entry, path, status
+):
+    asyncio.run(_authorized_with_stable_tokens())
+    signed_in = _token_file(home).read_bytes()
+    marker = f"{_SERVER}.signin-rejected.{hashlib.sha256(signed_in).hexdigest()}"
+
+    with _refusal_paused_before_its_marker(home, path, status):
+        assert _token_file(home).read_bytes() == signed_in
+        assert not _markers(home)
+        _owner_signs_in_again(home, monkeypatch, entry)
+    # Released after the owner's save, the writer publishes the marker of the
+    # bytes it matched.
+
+    assert [m.name for m in _markers(home)] == [marker]
+    assert _stored_tokens(home) == ("fake-stable-access-token", "fake-stable-refresh-token")
+    _stored_sign_in_accepted()
+    assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
+    if entry == "removal_and_readd":
+        assert _listed_connection_status() == "connected"
