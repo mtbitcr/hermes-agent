@@ -465,7 +465,7 @@ def red_run(world, monkeypatch):
         path, head = urlsplit(target).path, gh["head"]
         if gh["closes"] and path.endswith(gh["closes"][0]):
             gh["pull"] = _closed(gh["closes"][1])
-        job = {"head_sha": head, "status": "completed", "conclusion": "failure", "run_attempt": 1}
+        job = {"head_sha": head, "run_id": 77, "status": "completed", "conclusion": "failure", "run_attempt": 1}
         if (method, path) == ("GET", f"/repos/{REPO}/actions/runs"):
             return 200, {"total_count": 1, "workflow_runs": [{"id": 77, "head_sha": head}]}
         if (method, path) == ("GET", f"/repos/{REPO}/actions/runs/77/jobs"):

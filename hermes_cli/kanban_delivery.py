@@ -1201,7 +1201,8 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
             _waiting(conn, row, "red_check_waiting", check_runs=failed)
             read = _source_read(conn, source)  # the record just written moved the source card's revision
         return _return_red_check(db_path, row, read, github, repository, {
-            run["id"]: name for name, (run,) in named.items() if run.get("conclusion") != "success"})
+            run["id"]: (name, run.get("conclusion")) for name, (run,) in named.items()
+            if run.get("conclusion") != "success"})
     except GitHubTransportError as error:
         raise _transport_refusal(error) from None
 
@@ -1231,26 +1232,41 @@ def _recorded(conn: sqlite3.Connection, source: str, code: str) -> list:
     return [payload for payload in payloads if payload.get("code") == code]
 
 
-def _failed_jobs(github, repository: str, head: str, red: set) -> Optional[list]:
+def _failed_jobs(github, repository: str, head: str, red: dict) -> Optional[list]:
     """The failed latest jobs of H's workflow run that holds a red required check run (an Actions job is its
     check run), each failed slice job with the test ids its own check run's annotations of the fixed title
-    name; None only while GitHub shows that run still in progress. Read only to fill the return's reason:
-    no job ([]) when no run of H on the one page read holds one, or an answer cannot be read, is malformed
-    or contradicts another."""
+    name. Owner rule of round 1: that run is a run of H (head_sha exactly H) on the one page read whose jobs
+    with a red required check run's id are each its own (head_sha H, run_id its id), completed, and of the
+    name and conclusion the decision requests read (``red``: each id's name and conclusion). None only while
+    GitHub shows that run still in progress: its own status exactly queued or in_progress, or, unless the run
+    says completed, one of its own jobs'. Read only to fill the return's reason, from its own jobs completed
+    with a name and a conclusion not passing: no job ([]) when no run is that run, or an answer cannot be
+    read or is not whole on its one page; any other field, missing, malformed or contradicting, is dropped
+    and never waits."""
     from hermes_cli.kanban_delivery_github import GitHubTransportError
 
     try:
         runs, _ = _page(github, f"/repos/{repository}/actions/runs", "workflow_runs", head_sha=head)
         for run in runs:
-            jobs, count = _page(github, f"/repos/{repository}/actions/runs/{run['id']}/jobs", "jobs", filter="latest")
-            if not red & {job["id"] for job in jobs}:
-                continue
-            if any(job.get("status") in ("queued", "in_progress", "waiting", "requested", "pending") for job in jobs):
+            if run.get("head_sha") != head:
+                continue  # a run of another head is not H's
+            page, count = _page(github, f"/repos/{repository}/actions/runs/{run['id']}/jobs", "jobs", filter="latest")
+            jobs = [job for job in page if job.get("head_sha") == head and type(job.get("run_id")) is int
+                    and job["run_id"] == run["id"]]  # the run's own jobs of H
+            own = {job["id"] for job in jobs}
+            checks = [job for job in page if job["id"] in red]
+            if not checks or any(job["id"] not in own or (job.get("name"), job.get("status"), job.get("conclusion"))
+                                 != (red[job["id"]][0], "completed", red[job["id"]][1]) for job in checks):
+                continue  # the run holds no red required check run of H, or one other than the decision read it
+            running = ("queued", "in_progress")  # exactly; a run that says completed contradicts a job said running
+            if run.get("status") in running or (run.get("status") != "completed" and any(
+                    job.get("status") in running for job in jobs)):
                 return None  # GitHub shows the run still running (ci.yaml's timing report runs after the summary
                 # check): return later
-            failed = [job for job in jobs if job.get("conclusion") not in _PASSING]
-            if count != len(jobs) or not all(isinstance(job.get("name"), str) for job in failed):
-                return []  # not every job of the run whole and named on its one page
+            failed = [job for job in jobs if job.get("status") == "completed" and isinstance(job.get("name"), str)
+                      and isinstance(job.get("conclusion"), str) and job["conclusion"] not in _PASSING]
+            if count != len(page):
+                return []  # not every job of the run whole on its one page
             for job in failed:
                 if job["name"] in TEST_JOB_STEPS:
                     job["failed_tests"] = _failed_tests(github, repository, job["id"])
@@ -1261,8 +1277,9 @@ def _failed_jobs(github, repository: str, head: str, red: set) -> Optional[list]
 
 
 def _failed_tests(github, repository: str, job: int) -> list:
-    """The test ids a failed slice job's own check run names under the fixed title, after its one count;
-    none when that answer cannot be read, is malformed, or names more tests than its count."""
+    """The test ids a failed slice job's own check run names under the fixed title, after its one count (a
+    blank message is no test id); none when that answer cannot be read, is malformed, or names more tests
+    than its count."""
     from hermes_cli.kanban_delivery_github import GitHubTransportError
 
     try:
@@ -1273,7 +1290,7 @@ def _failed_tests(github, repository: str, job: int) -> list:
     if answer["status"] != 200 or not isinstance(answer["data"], list):
         return []
     notes = [note["message"] for note in answer["data"]
-             if note["title"] == _FAILED_TEST and isinstance(note["message"], str)]
+             if note["title"] == _FAILED_TEST and isinstance(note["message"], str) and note["message"].strip()]
     counts = [int(found[1]) for found in map(_FAILED_COUNT.fullmatch, notes) if found]
     tests = [note for note in notes if not _FAILED_COUNT.fullmatch(note)]
     return tests if len(counts) == 1 and len(set(tests)) == len(tests) <= counts[0] else []
@@ -1282,7 +1299,7 @@ def _failed_tests(github, repository: str, job: int) -> list:
 def _return_red_check(db_path: Path, row: dict, read: tuple, github, repository: str, red: dict):
     """A red required check on H returns the work once for H: red_check_returned and one continuation card
     for the builder, whose reason names the failed jobs of H's run and the failed tests CI names
-    (:func:`_failed_jobs`), or ``red``'s red required checks when those jobs cannot be read. Only GitHub
+    (:func:`_failed_jobs`), or the names of ``red``'s red required checks when no such job remains. Only GitHub
     showing H's run still in progress makes the pass wait. Earlier passes' red_check_rerun and
     red_check_rerun_outcome records of H neither block nor repeat the return. Nothing is recorded unless the
     pull request, read after H's run, jobs and annotations, is still open at H; that read showing it closed
@@ -1292,11 +1309,11 @@ def _return_red_check(db_path: Path, row: dict, read: tuple, github, repository:
     with kb.connect_closing(db_path=db_path) as conn:
         if any(record["head"] == head for record in _recorded(conn, source, "red_check_returned")):
             return None  # H's work went back to its builder already
-    jobs = _failed_jobs(github, repository, head, set(red))
+    jobs = _failed_jobs(github, repository, head, red)
     if jobs is None:
         return None
     reason = (f"failed jobs: {', '.join(job['name'] for job in jobs)}" if jobs
-              else f"red required check: {', '.join(red.values())}")
+              else f"red required check: {', '.join(name for name, _ in red.values())}")
     branch = _return_branch(db_path, row)  # owner rule 2: the branch comes first
     at_head, stored = _review_pull(db_path, github, repository, row)
     if not at_head:

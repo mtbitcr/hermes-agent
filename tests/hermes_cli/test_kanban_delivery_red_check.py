@@ -44,24 +44,26 @@ def red(world, monkeypatch):
     runs after the summary, at gh["timing"] (status, conclusion). Job 903's check run carries the count
     (gh["count"], else the number of gh["tests"]) and then each of gh["tests"] under the fixed title, beside
     one annotation of another title. Each rerun call is kept in gh["reruns"] and answered gh["rerun"] (201),
-    or not at all when None. With gh["closed"], the pull request is closed at H from gh["move_after"] on."""
+    or not at all when None. With gh["closed"], the pull request is closed at H from gh["move_after"] on.
+    gh["run"] replaces fields of run 77 (it lists no status unless set), gh["jobs"] fields of each job by its id."""
     kb, root, repo, gh = world
     from hermes_cli import kanban_delivery_github as transport
 
     table = transport._exchange  # the world's: the pull request and H's check runs
     gh.update(check=("completed", "failure"), attempt=1, tests=[FLAKY], count=None, reruns=[],
-              timing=("completed", "success"), rerun=201, closed=False)
+              timing=("completed", "success"), rerun=201, closed=False, run={}, jobs={})
 
     def exchange(method, target, authorization, payload=None):
         status, value = table(method, target, authorization, payload)
         path, head = urlsplit(target).path, gh["head"]
         if path == f"/repos/{REPO}/pulls/41" and gh["closed"] and gh["pull_head"]:
             return 200, dict(value, state="closed", head={"sha": head})
-        job = {"head_sha": head, "status": "completed", "conclusion": "failure", "run_attempt": gh["attempt"]}
+        job = {"head_sha": head, "run_id": 77, "status": "completed", "conclusion": "failure",
+               "run_attempt": gh["attempt"]}
         if (method, path) == ("GET", f"/repos/{REPO}/actions/runs"):
-            return 200, {"total_count": 1, "workflow_runs": [{"id": 77, "head_sha": head}]}
+            return 200, {"total_count": 1, "workflow_runs": [dict({"id": 77, "head_sha": head}, **gh["run"])]}
         if (method, path) == ("GET", f"/repos/{REPO}/actions/runs/77/jobs"):
-            return 200, {"total_count": 4, "jobs": [
+            return 200, {"total_count": 4, "jobs": [dict(each, **gh["jobs"].get(each["id"], {})) for each in (
                 dict(job, id=900, name=CHECK, steps=[{"name": "Evaluate job results", "conclusion": "failure"}]),
                 dict(job, id=901, name="Python tests / Run tests slice 1/12", conclusion="success",
                      steps=[{"name": "Run tests (slice 1/12)", "conclusion": "success"}]),
@@ -69,7 +71,7 @@ def red(world, monkeypatch):
                     {"name": "Checkout code", "conclusion": "success"},
                     {"name": "Run tests (slice 3/12)", "conclusion": "failure"}]),
                 dict(job, id=904, name="CI timing report", status=gh["timing"][0], conclusion=gh["timing"][1],
-                     steps=[])]}
+                     steps=[]))]}
         if (method, path) == ("GET", f"/repos/{REPO}/check-runs/903/annotations"):
             count = len(gh["tests"]) if gh["count"] is None else gh["count"]
             return 200, [{"path": ".github", "annotation_level": "notice", "title": "Failed test",
@@ -660,3 +662,157 @@ def test_guard_a_pull_request_closed_outside_the_step_is_marked_closed_outside(r
     assert [payload for kind, payload in _events(kb, tid) if kind == "delivery_closed_outside"] == [
         {"delivery_id": 1, "head": head, "pull_request_number": 41, "merged": False}]
     assert (_waited(kb, tid, "red_check_returned"), _raw(kb.kanban_db_path(), CONTINUED, tid)) == ([], [])
+
+
+# Owner rule of round 1: the return depends only on the red required check and on H's run still in progress; every
+# other field is best-effort reason text, dropped when malformed or contradictory.
+
+JOBS = (900, 901, 903, 904)
+SLICE = "Python tests / Run tests slice 3/12"
+UNNAMED = "No failed test was named. The job's CI log has the complete list."
+
+
+def _returned_once(kb, tid, reason, tests):
+    """The work went back once for H: one red_check_returned of ``reason`` and ``tests``, and its one continuation."""
+    (item,) = _raw(kb.kanban_db_path(), CONTINUED, tid)
+    assert [(p["reason"], p["tests"], p["rework"]) for p in _waited(kb, tid, "red_check_returned")] == [
+        (reason, tests, item["id"])]
+    return item
+
+
+def test_a_job_conclusion_of_the_wrong_type_neither_blocks_the_return_nor_names_its_tests(red):
+    """Owner rule 3: slice 3's conclusion is a list. That field is dropped, so slice 3 is no failed job and no
+    annotation of it is read; the red check's own job is still named, and the work returns once naming no test."""
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    gh["jobs"] = {903: {"conclusion": []}}
+
+    for _ in range(3):
+        _tick(kb)
+
+    item = _returned_once(kb, tid, f"failed jobs: {CHECK}", [])
+    assert item["body"].endswith(UNNAMED) and gh["reruns"] == []
+    assert [path for _, path in gh["calls"] if path.endswith("/annotations")] == []
+
+
+@pytest.mark.parametrize("running", [True, False], ids=["a_job_in_progress", "all_jobs_completed"])
+@pytest.mark.parametrize("where", ["run", "jobs"])
+def test_a_run_or_jobs_of_another_head_neither_wait_nor_name_failed_jobs(red, where, running):
+    """Owner rules 2 and 3: GitHub lists run 77, or each of its jobs, under another head than H, once while the
+    timing report says in progress and once when every job has completed. That run is not H's: nothing waits on it,
+    none of its jobs or tests is named, and the work returns once naming the red required check."""
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    if where == "run":
+        gh["run"] = {"head_sha": OTHER}
+    else:
+        gh["jobs"] = {job: {"head_sha": OTHER} for job in JOBS}
+    if running:
+        gh["timing"] = ("in_progress", None)
+
+    for _ in range(3):
+        _tick(kb)
+
+    item = _returned_once(kb, tid, f"red required check: {CHECK}", [])
+    assert item["body"].endswith(UNNAMED) and gh["reruns"] == []
+
+
+@pytest.mark.parametrize("job, timing, reason, tests", [
+    (904, ("in_progress", None), f"failed jobs: {CHECK}, {SLICE}", [FLAKY]),
+    (903, ("completed", "success"), f"failed jobs: {CHECK}", [])], ids=["running_timing_report", "failed_slice"])
+def test_one_job_of_another_head_is_dropped_alone(red, job, timing, reason, tests):
+    """Owner rule 3: of run 77's jobs only one names another head, the timing report while it says in progress or
+    the failed slice 3. That job alone is dropped: nothing waits on it and none of its tests is named, while the
+    run's other jobs of H still fill the reason of the one return."""
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    gh.update(jobs={job: {"head_sha": OTHER}}, timing=timing)
+
+    for _ in range(3):
+        _tick(kb)
+
+    _returned_once(kb, tid, reason, tests)
+    assert gh["reruns"] == []
+
+
+def test_a_completed_run_with_a_job_that_says_in_progress_returns_the_work_once(red):
+    """Owner rule 2: run 77 says completed while its timing report says in progress. The two answers contradict
+    each other, so nothing waits: the work returns once, and the job said in progress is named no failed job."""
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    gh.update(run={"status": "completed"}, timing=("in_progress", None))
+
+    for _ in range(3):
+        _tick(kb)
+
+    _returned_once(kb, tid, f"failed jobs: {CHECK}, {SLICE}", [FLAKY])
+    assert gh["reruns"] == []
+
+
+@pytest.mark.parametrize("running", [True, False], ids=["a_job_in_progress", "all_jobs_completed"])
+def test_jobs_whose_run_id_names_another_run_neither_wait_nor_name_failed_jobs(red, running):
+    """Owner rules 2 and 3: every job GitHub lists for run 77 names run 88. None is that run's: nothing waits on
+    them, none of them or their tests is named, and the work returns once naming the red required check."""
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    gh["jobs"] = {job: {"run_id": 88} for job in JOBS}
+    if running:
+        gh["timing"] = ("in_progress", None)
+
+    for _ in range(3):
+        _tick(kb)
+
+    item = _returned_once(kb, tid, f"red required check: {CHECK}", [])
+    assert item["body"].endswith(UNNAMED) and gh["reruns"] == []
+
+
+@pytest.mark.parametrize("field", [{"name": "Python tests / Run tests slice 2/12"}, {"conclusion": "success"},
+                                   {"conclusion": "cancelled"}], ids=["name", "success", "cancelled"])
+def test_a_red_check_job_that_disagrees_with_the_decision_names_no_failed_job(red, field):
+    """Owner rule 3: job 900, the red required check run, carries another name or conclusion than the decision
+    requests read for it. Run 77 is then not shown to hold that check: none of its jobs or tests is named, and the
+    work returns once naming the red required check from the decision."""
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    gh["jobs"] = {900: field}
+
+    for _ in range(3):
+        _tick(kb)
+
+    item = _returned_once(kb, tid, f"red required check: {CHECK}", [])
+    assert item["body"].endswith(UNNAMED) and gh["reruns"] == []
+
+
+@pytest.mark.parametrize("status", ["in_progress", "queued"])
+def test_a_run_in_progress_with_its_jobs_completed_waits_then_returns_the_work_once(red, status):
+    """Owner rule 2: run 77 itself says in progress (or queued) while every job it lists, the red check's included,
+    has completed. Passes wait and record no return; once the run says completed, the work returns exactly once."""
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    gh["run"] = {"status": status}
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_waited(kb, tid, "red_check_returned"), _raw(kb.kanban_db_path(), CONTINUED, tid)) == ([], [])
+    assert len(_waited(kb, tid, "red_check_waiting")) == 1
+    gh["run"] = {"status": "completed"}
+    for _ in range(3):
+        _tick(kb)
+    _returned_once(kb, tid, f"failed jobs: {CHECK}, {SLICE}", [FLAKY])
+    assert gh["reruns"] == []
+
+
+@pytest.mark.parametrize("blank", ["", " \t "], ids=["empty", "whitespace"])
+def test_a_count_1_annotation_with_a_blank_message_names_no_failed_test(red, blank):
+    """Owner rule 3: slice 3's check run carries "count 1" and one failed-test annotation whose message is blank.
+    A blank message is no test name: no test is named, and the continuation says so and points to the CI log."""
+    kb, root, repo, gh = red
+    tid, head = _ready(red)
+    gh.update(tests=[blank], count=1)
+
+    for _ in range(3):
+        _tick(kb)
+
+    item = _returned_once(kb, tid, f"failed jobs: {CHECK}, {SLICE}", [])
+    assert item["body"].endswith(UNNAMED) and "CI named" not in item["body"]
