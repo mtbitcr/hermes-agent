@@ -265,7 +265,7 @@ def test_active_work_lists_running_then_review_then_ready_and_planned_is_not_com
         project_id=quiet["project_id"], owner_waiting=True,
     )
     assert quiet_steward["active_work"] == []
-    assert quiet_steward["execution"]["state"] == "working"
+    assert quiet_steward["execution"]["state"] == "waiting_for_approval"
     assert quiet_steward["execution"]["state"] != "complete"
 
 
