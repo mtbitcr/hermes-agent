@@ -471,7 +471,7 @@ class HermesTokenStorage:
         HERMES_HOME/mcp-tokens/<server_name>.json         -- tokens
         HERMES_HOME/mcp-tokens/<server_name>.client.json   -- client info
         HERMES_HOME/mcp-tokens/<server_name>.meta.json     -- oauth server metadata
-        HERMES_HOME/mcp-tokens/<server_name>.signin-rejected.<sha256> -- that token file was refused (empty)
+        HERMES_HOME/mcp-tokens/<sha256 of server_name>.signin-rejected.<sha256> -- that token file was refused (empty)
     """
 
     def __init__(self, server_name: str, *, hermes_home: str | Path | None = None):
@@ -487,12 +487,22 @@ class HermesTokenStorage:
     def _meta_path(self) -> Path:
         return _get_token_dir(self._hermes_home) / f"{self._server_name}.meta.json"
 
+    def _sign_in_rejected_prefix(self) -> str:
+        """Name prefix of this server's sign-in-rejected markers.
+
+        The key is the SHA-256 of the server's file name, so every marker name
+        has 145 ASCII bytes, within the filename limit whatever the length or
+        script of the server name.
+        """
+        key = hashlib.sha256(self._server_name.encode("utf-8")).hexdigest()
+        return f"{key}.signin-rejected."
+
     def _sign_in_rejected_path(self, tokens_sha256: str) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.signin-rejected.{tokens_sha256}"
+        return _get_token_dir(self._hermes_home) / f"{self._sign_in_rejected_prefix()}{tokens_sha256}"
 
     def _sign_in_rejected_paths(self) -> list[Path]:
         """Every sign-in-rejected marker of this server, whatever token file it names."""
-        prefix = f"{self._server_name}.signin-rejected."
+        prefix = self._sign_in_rejected_prefix()
         try:
             entries = list(_get_token_dir(self._hermes_home).iterdir())
         except OSError:

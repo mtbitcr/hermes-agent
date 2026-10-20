@@ -174,7 +174,8 @@ def _fake_token(prefix: str = "fake") -> OAuthToken:
 
 
 def _markers(home) -> list:
-    return sorted((home / "mcp-tokens").glob(f"{_SERVER}.signin-rejected*"))
+    prefix = HermesTokenStorage(_SERVER)._sign_in_rejected_prefix()
+    return sorted((home / "mcp-tokens").glob(f"{prefix}*"))
 
 
 def _stored_tokens(home) -> tuple:
@@ -591,7 +592,7 @@ async def test_new_sign_in_after_refusal_reads_connected(home):
     tokens_sha256 = hashlib.sha256(
         (home / "mcp-tokens" / f"{_SERVER}.json").read_bytes()
     ).hexdigest()
-    (home / "mcp-tokens" / f"{_SERVER}.signin-rejected.{tokens_sha256}").touch()
+    storage._sign_in_rejected_path(tokens_sha256).touch()
 
     await storage.set_tokens(_fake_token("fake-new"))
 
@@ -844,7 +845,9 @@ async def test_overlapping_failed_owner_operations_keep_recorded_refusal(
     await _signed_in()
     _configured(home)
     signed_in = _token_file(home).read_bytes()
-    marker = f"{_SERVER}.signin-rejected.{hashlib.sha256(signed_in).hexdigest()}"
+    marker = HermesTokenStorage(_SERVER)._sign_in_rejected_path(
+        hashlib.sha256(signed_in).hexdigest()
+    ).name
     children, while_inner_waits = [], []
 
     def _refused_then_inner_operation_waits():
@@ -1396,7 +1399,9 @@ def test_delayed_refusal_writer_keeps_new_owner_sign_in_connected(
 ):
     asyncio.run(_authorized_with_stable_tokens())
     signed_in = _token_file(home).read_bytes()
-    marker = f"{_SERVER}.signin-rejected.{hashlib.sha256(signed_in).hexdigest()}"
+    marker = HermesTokenStorage(_SERVER)._sign_in_rejected_path(
+        hashlib.sha256(signed_in).hexdigest()
+    ).name
 
     with _refusal_paused_before_its_marker(home, path, status):
         assert _token_file(home).read_bytes() == signed_in
@@ -1411,3 +1416,156 @@ def test_delayed_refusal_writer_keeps_new_owner_sign_in_connected(
     assert _mcp_connection_status(_SERVER, _OAUTH_CONFIG) == "connected"
     if entry == "removal_and_readd":
         assert _listed_connection_status() == "connected"
+
+
+# -- markers of long multibyte connection names fit the filename limit --------
+
+# Connection names the dashboard's create path and the config save accept. In
+# UTF-8 the CJK and accented-Latin names take 192 and 180 bytes: their token
+# files fit the filename limit, and their markers must fit it too. The ASCII
+# name is the control.
+_ACCEPTED_NAMES = [
+    pytest.param("a" * 128, id="ascii-control"),
+    pytest.param("\u754c" * 64, id="cjk"),
+    pytest.param("\u00e9" * 90, id="accented-latin"),
+]
+
+
+def _accepted_connection(name: str) -> HermesTokenStorage:
+    """The owner adds the OAuth connection ``name`` as the dashboard does."""
+    from hermes_cli import mcp_config
+    from hermes_cli.web_models import MCPServerCreate
+    from hermes_cli.web_server_mcp import _normalize_mcp_server_create
+
+    created, config, _ = _normalize_mcp_server_create(
+        MCPServerCreate(name=name, url=_URL, auth="oauth")
+    )
+    assert (created, config) == (name, _OAUTH_CONFIG)
+    assert mcp_config._save_mcp_server(name, config) is True
+    assert name in mcp_config._get_mcp_servers()
+    return HermesTokenStorage(name)
+
+
+def _fits_name_max(path: Path) -> bool:
+    return len(os.fsencode(path.name)) <= os.pathconf(path.parent, "PC_NAME_MAX")
+
+
+async def _owner_signs_in_to(name: str, prefix: str = "fake"):
+    """The owner signs in to ``name``: the real provider's successful
+    token-response handler saves fake tokens. Returns that provider."""
+    from tools.mcp_oauth import force_interactive_oauth
+    from tools.mcp_oauth_manager import MCPOAuthManager
+    from tools.mcp_tool import sdk_httpx
+
+    storage = HermesTokenStorage(name)
+    await storage.set_client_info(OAuthClientInformationFull(client_id="fake-client-id"))
+    storage.save_oauth_metadata(
+        OAuthMetadata(
+            issuer="https://auth.example.com",
+            authorization_endpoint="https://auth.example.com/authorize",
+            token_endpoint="https://auth.example.com/token",
+        )
+    )
+    with force_interactive_oauth():  # the owner's own sign-in
+        provider = MCPOAuthManager().get_or_build_provider(name, _URL, {})
+        await provider._initialize()
+        tokens = _fake_token(prefix).model_dump(exclude_none=True)
+        await provider._handle_token_response(sdk_httpx().Response(200, json=tokens))
+    assert _fits_name_max(storage._tokens_path())
+    return provider
+
+
+async def _refresh_refused(provider, status: int) -> None:
+    """The provider refuses the refresh of the saved sign-in with ``status``."""
+    from tools.mcp_tool import sdk_httpx
+
+    request = await provider._refresh_token()
+    response = sdk_httpx().Response(
+        status, request=request, content=b'{"error": "invalid_grant"}'
+    )
+    assert await provider._handle_refresh_response(response) is False
+
+
+def _profile_markers(home) -> list:
+    """The names of the markers of every connection in the profile."""
+    return sorted(p.name for p in (home / "mcp-tokens").glob("*.signin-rejected.*"))
+
+
+@pytest.mark.parametrize("name", _ACCEPTED_NAMES)
+@pytest.mark.asyncio
+async def test_owner_sign_in_of_accepted_name_reads_connected(home, name):
+    _accepted_connection(name)
+
+    await _owner_signs_in_to(name)
+
+    assert _mcp_connection_status(name, _OAUTH_CONFIG) == "connected"
+
+
+@pytest.mark.parametrize("name", _ACCEPTED_NAMES)
+@pytest.mark.asyncio
+async def test_successful_refresh_of_accepted_name_saves_new_grant(home, name):
+    from tools.mcp_tool import sdk_httpx
+
+    storage = _accepted_connection(name)
+    provider = await _owner_signs_in_to(name)
+    request = await provider._refresh_token()
+    assert b"fake-refresh-token" in request.content
+    refreshed = _fake_token("fake-refreshed").model_dump(exclude_none=True)
+
+    response = sdk_httpx().Response(200, request=request, json=refreshed)
+    assert await provider._handle_refresh_response(response) is True
+
+    tokens = await storage.get_tokens()
+    assert tokens.access_token == "fake-refreshed-access-token"
+    assert tokens.refresh_token == "fake-refreshed-refresh-token"
+    assert _mcp_connection_status(name, _OAUTH_CONFIG) == "connected"
+
+
+@pytest.mark.parametrize("name", _ACCEPTED_NAMES)
+@pytest.mark.asyncio
+async def test_refusal_of_accepted_name_is_recorded_and_removed_with_it(home, name):
+    from hermes_cli import mcp_config
+
+    storage = _accepted_connection(name)
+    provider = await _owner_signs_in_to(name)
+    refused = storage._tokens_path().read_bytes()
+
+    await _refresh_refused(provider, 400)
+
+    assert _mcp_connection_status(name, _OAUTH_CONFIG) == "needs_authorization"
+    marker = storage._sign_in_rejected_path(hashlib.sha256(refused).hexdigest())
+    assert storage._sign_in_rejected_paths() == [marker]
+    assert _profile_markers(home) == [marker.name]
+    assert _fits_name_max(marker)
+
+    await _owner_signs_in_to(name, "fake-new")
+    assert _mcp_connection_status(name, _OAUTH_CONFIG) == "connected"
+
+    assert mcp_config._remove_mcp_server_and_credentials(name) is True
+    assert _profile_markers(home) == []
+    assert not storage._tokens_path().exists()
+    assert name not in mcp_config._get_mcp_servers()
+
+
+@pytest.mark.asyncio
+async def test_markers_of_names_differing_only_in_last_character_stay_apart(home):
+    from hermes_cli import mcp_config
+
+    first, second = "\u754c" * 64, "\u754c" * 63 + "\u4e16"
+    first_storage, second_storage = _accepted_connection(first), _accepted_connection(second)
+    provider = await _owner_signs_in_to(first)
+    await _owner_signs_in_to(second)
+    refused = first_storage._tokens_path().read_bytes()
+
+    await _refresh_refused(provider, 401)
+
+    assert _mcp_connection_status(first, _OAUTH_CONFIG) == "needs_authorization"
+    assert _mcp_connection_status(second, _OAUTH_CONFIG) == "connected"
+    marker = first_storage._sign_in_rejected_path(hashlib.sha256(refused).hexdigest())
+    assert first_storage._sign_in_rejected_paths() == [marker]
+    assert second_storage._sign_in_rejected_paths() == []
+
+    assert mcp_config._remove_mcp_server_and_credentials(second) is True
+
+    assert _profile_markers(home) == [marker.name]
+    assert _mcp_connection_status(first, _OAUTH_CONFIG) == "needs_authorization"
