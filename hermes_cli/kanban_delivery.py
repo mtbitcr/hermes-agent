@@ -380,6 +380,16 @@ _LEASE_SECONDS = 600
 # again once its lease runs out. Any other refusal parks the row, recorded once.
 _RETRIED = frozenset({"delivery_disabled", "transport_failed", "lease_lost", "source_changed"})
 
+# GitHub moves a pull request to a head pushed to its branch a few seconds after the push, so after a clean
+# update's push the pull request and the branch are read up to six times, these pauses apart, until one monotonic
+# deadline _SETTLE_SECONDS after the first read: no read or pause starts once it is reached, a pause asks for at
+# most the time left, and only reads answered before it are a success. The pauses add up to less than
+# _SETTLE_SECONDS, so a sixth pair of quick reads starts before the deadline. The clock and the sleep are seams:
+# tests wait in no real time.
+_SETTLE_PAUSES = (2, 4, 8, 16, 29)
+_SETTLE_SECONDS = 60
+_clock, _sleep = time.monotonic, time.sleep
+
 # Transport reasons that are GitHub's own answer, one the step cannot use: a
 # successful status whose body is not a JSON object or list, or a token of
 # another scope. They are refusals. Every other reason is a request that did not
@@ -526,18 +536,20 @@ def _branch_head(github, branch: str, *, named: bool = False) -> Optional[str]:
     return sha
 
 
-def _take_lease(db_path: Path) -> Optional[tuple]:
+def _take_lease(db_path: Path, adopt: Optional[int] = None) -> Optional[tuple]:
     """Lease the oldest delivery row still to publish: no pull request
-    recorded, not returned for changes, not parked, and no lease that still
-    holds. Returns ``(delivery_id, holder)``, or ``None``."""
+    recorded, not returned for changes, not parked unless it is row ``adopt``
+    parked with head_moved, and no lease that still holds. Returns
+    ``(delivery_id, holder)``, or ``None``."""
     holder, now = secrets.token_hex(16), int(time.time())
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         row = conn.execute(
             "SELECT id FROM kanban_deliveries WHERE pull_request_number IS NULL "
-            "AND pull_request_state IS NULL AND publish_refusal IS NULL "
+            "AND pull_request_state IS NULL AND (publish_refusal IS NULL "
+            "OR publish_refusal = 'head_moved' AND id = ?) "
             "AND (publish_lease_until IS NULL OR publish_lease_until <= ?) "
             "ORDER BY id LIMIT 1",
-            (now,),
+            (adopt, now),
         ).fetchone()
         if row is None:
             return None
@@ -566,10 +578,38 @@ def _park(db_path: Path, delivery_id: int, holder: str, refusal: PublishRefused)
         })
 
 
+def _adoptable(db_path: Path) -> Optional[int]:
+    """The oldest delivery row parked with head_moved, its lease run out, that GitHub now shows published:
+    the source card's recorded pull request open at the row's head and its branch at that head, read through
+    the fenced publish transport. Only such a row may be leased again, to be adopted. Returns its id, or ``None``."""
+    from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
+
+    with kb.connect_closing(db_path=db_path) as conn:
+        rows = [dict(row) for row in conn.execute(
+            f"SELECT d.id, d.source_task_id, d.source_head AS pull_request_head, l.pull_request_number, "
+            f"{_RECEIPT.format('l')} AS repository FROM kanban_deliveries AS d JOIN kanban_deliveries AS l "
+            "ON l.id = (SELECT MAX(id) FROM kanban_deliveries WHERE source_task_id = d.source_task_id "
+            "AND pull_request_number IS NOT NULL) WHERE d.publish_refusal = 'head_moved' "
+            "AND d.pull_request_number IS NULL AND d.pull_request_state IS NULL "
+            "AND (d.publish_lease_until IS NULL OR d.publish_lease_until <= ?) ORDER BY d.id",
+            (int(time.time()),))]
+    policy = _policy_repositories() if rows else frozenset()
+    for row in rows:
+        if row["repository"] not in policy:  # no record of the repository, or one the policy does not list
+            continue
+        with contextlib.suppress(PublishRefused, GitHubTransportError):  # unreadable: not adopted on this pass
+            github = GitHubTransport("publish", row["repository"])
+            if _open_at_head(github, row["repository"], row) and _branch_head(
+                    github, delivery_branch(row["source_task_id"])) == row["pull_request_head"]:
+                return row["id"]
+    return None
+
+
 def publish_step(db_path: Optional[Path]) -> Optional[dict]:
     """The dispatcher's delivery step for the board whose file is ``db_path``: act on the
-    published heads whose CI is done, then lease at most one approved delivery row and
-    publish it. Raises no error, so the tick goes on."""
+    published heads whose CI is done, then lease at most one approved delivery row, or one
+    parked with head_moved that GitHub now shows published, and publish it. Raises no
+    error, so the tick goes on."""
     if db_path is None or not delivery_settings():
         return None
     review_step(db_path)
@@ -580,7 +620,8 @@ def publish_step(db_path: Optional[Path]) -> Optional[dict]:
 
         update_step(db_path)
     try:
-        leased = _take_lease(db_path)
+        adopt = _adoptable(db_path)
+        leased = _take_lease(db_path, adopt)
         if leased is None:
             return None
         try:
@@ -590,7 +631,8 @@ def publish_step(db_path: Optional[Path]) -> Optional[dict]:
                 "kanban delivery: delivery %s not published: %s (%s)",
                 leased[0], refusal.code, refusal.detail,
             )
-            if refusal.code not in _RETRIED:
+            # A row not adopted after all stays parked with head_moved; only another refusal parks it again.
+            if refusal.code not in _RETRIED and (leased[0] != adopt or refusal.code != "head_moved"):
                 with contextlib.suppress(PublishRefused):  # a lease that ran out parks nothing
                     _park(db_path, *leased, refusal)
     except Exception:
@@ -608,7 +650,9 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
     outside every transaction and connection, and the ledger and the events are
     stored only if the delivery records, the lease and the source card are
     unchanged (C4), and only once GitHub, read again after any push or creation,
-    shows the pull request open at H on the branch at H.
+    shows the pull request open at H on the branch at H. A row parked with
+    head_moved is only adopted, where GitHub already holds H, with one event
+    naming that refusal.
     """
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
@@ -691,6 +735,9 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
         decision = decide_publish(approval, ledger, remote, update)
         if not decision.allowed:
             raise PublishRefused(decision.code, decision.detail)
+        # A row parked with head_moved is only adopted, where GitHub already holds its head: nothing is pushed.
+        if record["publish_refusal"] is not None and decision.code != "adopt_fast_forward":
+            raise PublishRefused("head_moved", f"GitHub does not show {head} on {branch} and its pull request")
         if update is not None:  # the fence's own words: the head it admitted as a clean update of H's approval
             logger.info("kanban delivery: delivery %s: %s", delivery_id, decision.detail)
         if decision.code in ("push_and_create", "adopt_and_create"):
@@ -740,16 +787,29 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
         ):
             # GitHub changed or holds an unrecorded pull request, so both are read again, outside every
             # transaction: only the pull request open at H against main on the branch at H is a success.
-            again = _answered(github.request("GET", f"{pulls_path}/{number}"))
-            reread = again["data"] if again["status"] == 200 and isinstance(again["data"], dict) else {}
-            reread_head = reread["head"].get("sha") if isinstance(reread.get("head"), dict) else None
-            reread_base = reread["base"].get("ref") if isinstance(reread.get("base"), dict) else None
-            if (reread.get("state"), reread_head, reread_base, _branch_head(github, branch)) != (
-                    "open", head, _PULL_REQUEST_BASE, head):
-                raise PublishRefused(
-                    "head_moved",
-                    f"pull request {number} or {branch} is not open at {head} after the publish",
-                )
+            # After a clean update's push GitHub moves the pull request a little later, so it is read again, until
+            # the deadline: no read starts once it is reached, and only a pair answered before it is a success.
+            pauses = _SETTLE_PAUSES if update is not None and decision.code == "push_fast_forward" else ()
+            deadline = _clock() + _SETTLE_SECONDS if pauses else float("inf")  # no wait: one pair, as before
+            moved = PublishRefused(
+                "head_moved", f"pull request {number} or {branch} is not open at {head} after the publish",
+            )
+            for pause in (*pauses, None):
+                if _clock() >= deadline:
+                    raise moved
+                again = _answered(github.request("GET", f"{pulls_path}/{number}"))
+                reread = again["data"] if again["status"] == 200 and isinstance(again["data"], dict) else {}
+                reread_head = reread["head"].get("sha") if isinstance(reread.get("head"), dict) else None
+                reread_base = reread["base"].get("ref") if isinstance(reread.get("base"), dict) else None
+                if _clock() >= deadline:
+                    raise moved
+                shown = (reread.get("state"), reread_head, reread_base, _branch_head(github, branch))
+                left = deadline - _clock()
+                if left > 0 and shown == ("open", head, _PULL_REQUEST_BASE, head):
+                    break
+                if pause is None or left <= 0:
+                    raise moved
+                _sleep(min(pause, left))
     except GitHubTransportError as error:
         raise _transport_refusal(error) from None
 
@@ -769,9 +829,20 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
                 conn.execute(
                     "UPDATE kanban_deliveries SET pull_request_number = ?, pull_request_head = ?, "
                     "pull_request_state = 'open', pull_request_branch = ?, publish_lease = NULL, "
-                    "publish_lease_until = NULL WHERE id = ?",
+                    "publish_lease_until = NULL, publish_refusal = NULL WHERE id = ?",
                     (number, head, branch, record["id"]),
                 )
+                if record["publish_refusal"] is not None:  # adopted: the one event naming the refusal it parked with
+                    kb._append_event(conn, source, "delivery_adopted", {
+                        "delivery_id": record["id"],
+                        "head": head,
+                        "pull_request_number": number,
+                        "refusal": record["publish_refusal"],
+                        "refusal_event_id": conn.execute(
+                            "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'delivery_refused' "
+                            "AND json_extract(payload, '$.delivery_id') = ?", (source, record["id"]),
+                        ).fetchone()[0],
+                    })
                 # A clean update is bound to the main it was built on, the one its record names.
                 kb._append_event(conn, source, "delivery_bound", {
                     "source_task_id": source,
