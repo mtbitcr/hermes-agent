@@ -381,9 +381,12 @@ _LEASE_SECONDS = 600
 _RETRIED = frozenset({"delivery_disabled", "transport_failed", "lease_lost", "source_changed"})
 
 # GitHub moves a pull request to a head pushed to its branch a few seconds after the push, so after a clean
-# update's push the pull request and the branch are read up to six times, these pauses apart, and no read starts
-# later than _SETTLE_SECONDS after the first. The clock and the sleep are seams: tests wait in no real time.
-_SETTLE_PAUSES = (2, 4, 8, 16, 30)
+# update's push the pull request and the branch are read up to six times, these pauses apart, until one monotonic
+# deadline _SETTLE_SECONDS after the first read: no read or pause starts once it is reached, a pause asks for at
+# most the time left, and only reads answered before it are a success. The pauses add up to less than
+# _SETTLE_SECONDS, so a sixth pair of quick reads starts before the deadline. The clock and the sleep are seams:
+# tests wait in no real time.
+_SETTLE_PAUSES = (2, 4, 8, 16, 29)
 _SETTLE_SECONDS = 60
 _clock, _sleep = time.monotonic, time.sleep
 
@@ -784,23 +787,28 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
         ):
             # GitHub changed or holds an unrecorded pull request, so both are read again, outside every
             # transaction: only the pull request open at H against main on the branch at H is a success.
-            # After a clean update's push GitHub moves the pull request a little later, so it is read again.
+            # After a clean update's push GitHub moves the pull request a little later, so it is read again, until
+            # the deadline: no read starts once it is reached, and only a pair answered before it is a success.
             pauses = _SETTLE_PAUSES if update is not None and decision.code == "push_fast_forward" else ()
-            deadline = _clock() + _SETTLE_SECONDS
+            deadline = _clock() + _SETTLE_SECONDS if pauses else float("inf")  # no wait: one pair, as before
+            moved = PublishRefused(
+                "head_moved", f"pull request {number} or {branch} is not open at {head} after the publish",
+            )
             for pause in (*pauses, None):
+                if _clock() >= deadline:
+                    raise moved
                 again = _answered(github.request("GET", f"{pulls_path}/{number}"))
                 reread = again["data"] if again["status"] == 200 and isinstance(again["data"], dict) else {}
                 reread_head = reread["head"].get("sha") if isinstance(reread.get("head"), dict) else None
                 reread_base = reread["base"].get("ref") if isinstance(reread.get("base"), dict) else None
-                if (reread.get("state"), reread_head, reread_base, _branch_head(github, branch)) == (
-                        "open", head, _PULL_REQUEST_BASE, head):
-                    break
+                if _clock() >= deadline:
+                    raise moved
+                shown = (reread.get("state"), reread_head, reread_base, _branch_head(github, branch))
                 left = deadline - _clock()
+                if left > 0 and shown == ("open", head, _PULL_REQUEST_BASE, head):
+                    break
                 if pause is None or left <= 0:
-                    raise PublishRefused(
-                        "head_moved",
-                        f"pull request {number} or {branch} is not open at {head} after the publish",
-                    )
+                    raise moved
                 _sleep(min(pause, left))
     except GitHubTransportError as error:
         raise _transport_refusal(error) from None

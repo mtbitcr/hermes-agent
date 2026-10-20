@@ -605,8 +605,9 @@ def test_a_clean_update_whose_pull_request_shows_the_pushed_head_on_the_third_re
 def test_a_clean_update_whose_pull_request_never_shows_the_pushed_head_within_the_bound_is_parked_head_moved(
         exact, monkeypatch):
     """GitHub's pull request never shows U, and each read takes a second: the step reads the pull request and the
-    branch six times, the last no later than 60 seconds after the first, then parks U with head_moved, recorded
-    once, as before the wait."""
+    branch five times, 2, 4, 8 and 16 seconds apart, and its fifth pause asks for the 20 seconds left, so it ends at
+    the deadline, 60 seconds after the first read, where no sixth pair starts. Then it parks U with head_moved,
+    recorded once, as before the wait."""
     kb, root, repo, gh = exact
     tid, head, main, lag = _lags(exact, monkeypatch, stale=99, latency=1)
 
@@ -615,8 +616,104 @@ def test_a_clean_update_whose_pull_request_never_shows_the_pushed_head_within_th
     [updated] = _updated(kb, tid)
     update = updated["update_head"]
     assert lag["pushes"] == [(f"delivery/{tid}", update, head)]
-    assert (len(lag["pulls"]), len(lag["branches"]), len(lag["pauses"])) == (6, 6, 5)
+    assert (len(lag["pulls"]), len(lag["branches"]), len(lag["pauses"])) == (5, 5, 5)
     assert sum(lag["pauses"]) <= 60 and lag["pulls"][-1] - lag["pulls"][0] <= 60
+    first = lag["pulls"][0]
+    assert ([at - first for at in lag["pulls"]], [at - first for at in lag["branches"]], lag["pauses"]) == (
+        [0, 4, 10, 20, 38], [1, 5, 11, 21, 39], [2, 4, 8, 16, 20])
+    assert lag["now"] - first == 60
+    assert _ledger(kb, tid) == [(head, 41, head, "updated", None, None), (update, None, None, None, None, "head_moved")]
+    assert [(kind, payload["code"], payload["head"]) for kind, payload in _events(kb, tid)
+            if kind in ("delivery_refused", "delivery_adopted") or payload.get("head") == update] == [
+        ("delivery_refused", "head_moved", update)]
+
+
+@pytest.mark.parametrize("stale, latency, pulls, branches, pauses, elapsed", [
+    # the review's two reproductions: U would show on a read starting at the deadline
+    (1, 29, [0], [29], [2], 60),
+    (5, 1, [0, 4, 10, 20, 38], [1, 5, 11, 21, 39], [2, 4, 8, 16, 20], 60),
+    (2, 9, [0, 20, 42], [9, 29, 51], [2, 4], 60),  # both reads of the third pair show U, the branch's at the deadline
+])
+def test_a_clean_update_whose_reads_show_the_pushed_head_only_from_the_deadline_on_is_parked_head_moved(
+        exact, monkeypatch, stale, latency, pulls, branches, pauses, elapsed):
+    """Late success: reads that show U only at or after the deadline, 60 seconds after the first read after the
+    push, record nothing. In the review's reproductions the read that would show U would start at the deadline, so
+    it never starts; in the third case both reads of a pair show U, but the branch answers at the deadline, not
+    before it. U is parked with head_moved, recorded once, as when GitHub never shows it."""
+    kb, root, repo, gh = exact
+    tid, head, main, lag = _lags(exact, monkeypatch, stale=stale, latency=latency)
+
+    _tick(kb)
+
+    [updated] = _updated(kb, tid)
+    update = updated["update_head"]
+    assert lag["pushes"] == [(f"delivery/{tid}", update, head)]
+    first = lag["pulls"][0]
+    assert ([at - first for at in lag["pulls"]], [at - first for at in lag["branches"]], lag["pauses"]) == (
+        pulls, branches, pauses)
+    assert lag["now"] - first == elapsed
+    assert _ledger(kb, tid) == [(head, 41, head, "updated", None, None), (update, None, None, None, None, "head_moved")]
+    assert [(kind, payload["code"], payload["head"]) for kind, payload in _events(kb, tid)
+            if kind in ("delivery_refused", "delivery_adopted") or payload.get("head") == update] == [
+        ("delivery_refused", "head_moved", update)]
+
+
+@pytest.mark.parametrize("latency, pulls, branches, pauses, elapsed", [
+    (0, [0, 2, 6, 14, 30, 59], [0, 2, 6, 14, 30, 59], [2, 4, 8, 16, 29], 59),  # six pairs, the last 1 s before it
+    (20, [0, 42], [20], [2], 62),  # the second read of the pull request answers H 2 seconds after the deadline
+])
+def test_a_clean_update_whose_pull_request_still_shows_the_old_head_at_the_deadline_is_parked_head_moved(
+        exact, monkeypatch, latency, pulls, branches, pauses, elapsed):
+    """GitHub's pull request still shows H when the time is used up. With instant reads the six pairs are all read,
+    the sixth a second before the deadline, as the pauses add up to 59 seconds; with reads of 20 seconds the second
+    read of the pull request answers H after the deadline, and the branch is not read then. No read starts at or
+    after the deadline, 60 seconds after the first read after the push, and U is parked with head_moved, recorded
+    once."""
+    kb, root, repo, gh = exact
+    tid, head, main, lag = _lags(exact, monkeypatch, stale=99, latency=latency)
+
+    _tick(kb)
+
+    [updated] = _updated(kb, tid)
+    update = updated["update_head"]
+    assert lag["pushes"] == [(f"delivery/{tid}", update, head)]
+    first = lag["pulls"][0]
+    assert ([at - first for at in lag["pulls"]], [at - first for at in lag["branches"]], lag["pauses"]) == (
+        pulls, branches, pauses)
+    assert lag["now"] - first == elapsed
+    assert _ledger(kb, tid) == [(head, 41, head, "updated", None, None), (update, None, None, None, None, "head_moved")]
+    assert [(kind, payload["code"], payload["head"]) for kind, payload in _events(kb, tid)
+            if kind in ("delivery_refused", "delivery_adopted") or payload.get("head") == update] == [
+        ("delivery_refused", "head_moved", update)]
+
+
+def test_a_pause_that_overshoots_the_deadline_starts_no_read_after_it_and_the_clean_update_is_parked_head_moved(
+        exact, monkeypatch):
+    """Each read takes a second and each pause ends 0.1 seconds later than it asked, as a busy scheduler wakes the
+    step: the fifth pause asks for the 19.6 seconds left and ends 0.1 seconds after the deadline, 60 seconds after
+    the first read after the push. No read starts then, so the sixth read of the pull request, which would show U,
+    is never made and nothing is accepted after the deadline: U is parked with head_moved, recorded once."""
+    from hermes_cli import kanban_delivery as kd
+
+    kb, root, repo, gh = exact
+    tid, head, main, lag = _lags(exact, monkeypatch, stale=5, latency=1)
+
+    def sleep(seconds):
+        lag["pauses"].append(seconds)
+        lag["now"] += seconds + 0.1
+
+    monkeypatch.setattr(kd, "_sleep", sleep)
+
+    _tick(kb)
+
+    [updated] = _updated(kb, tid)
+    update = updated["update_head"]
+    assert lag["pushes"] == [(f"delivery/{tid}", update, head)]
+    first = lag["pulls"][0]
+    assert [at - first for at in lag["pulls"]] == pytest.approx([0, 4.1, 10.2, 20.3, 38.4])
+    assert [at - first for at in lag["branches"]] == pytest.approx([1, 5.1, 11.2, 21.3, 39.4])
+    assert lag["pauses"] == pytest.approx([2, 4, 8, 16, 19.6])
+    assert lag["now"] - first == pytest.approx(60.1)
     assert _ledger(kb, tid) == [(head, 41, head, "updated", None, None), (update, None, None, None, None, "head_moved")]
     assert [(kind, payload["code"], payload["head"]) for kind, payload in _events(kb, tid)
             if kind in ("delivery_refused", "delivery_adopted") or payload.get("head") == update] == [
