@@ -268,6 +268,7 @@ class TestSWRRefreshOwnership:
         for home in homes.values():
             home.mkdir()
         both_started = _threading.Barrier(2, timeout=5)
+        release_refreshes = _threading.Event()
         calls = []
 
         def fake_live(provider, force_refresh=False):
@@ -276,17 +277,23 @@ class TestSWRRefreshOwnership:
             # Hold each refresh open until BOTH are in flight, so a
             # cross-profile dedupe would deadlock this barrier and fail.
             both_started.wait()
+            # Keep both in flight until every repeat call below has been made,
+            # so a slow runner cannot let them finish first.
+            release_refreshes.wait(timeout=5)
             return [f"model-for-{get_hermes_home().name}"]
 
         monkeypatch.setattr(mod, "provider_model_ids", fake_live)
-        for home in homes.values():
-            token = set_hermes_home_override(str(home))
-            try:
-                mod._spawn_swr_refresh("openai-codex")
-                # Same home, same key: still deduped while in flight.
-                mod._spawn_swr_refresh("openai-codex")
-            finally:
-                reset_hermes_home_override(token)
+        try:
+            for home in homes.values():
+                token = set_hermes_home_override(str(home))
+                try:
+                    mod._spawn_swr_refresh("openai-codex")
+                    # Same home, same key: still deduped while in flight.
+                    mod._spawn_swr_refresh("openai-codex")
+                finally:
+                    reset_hermes_home_override(token)
+        finally:
+            release_refreshes.set()
         assert self._wait_for_idle(mod), "background refreshes did not finish"
 
         assert sorted(calls) == sorted(str(home) for home in homes.values())
