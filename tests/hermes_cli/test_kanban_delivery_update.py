@@ -457,6 +457,29 @@ def test_a_moved_branch_gets_one_update_card_based_on_current_main(exact):
     assert _checkout(repo) == before and not (repo / ".worktrees" / card["id"]).exists()
 
 
+def test_a_row_the_review_step_left_base_moved_is_brought_up_to_date_before_any_review(exact):
+    """Card A: main moves on after H is published, before any review card of H, and the setting is exactly true. The
+    review step reads no check of H, makes no review card and leaves the row base_moved, its event naming no card;
+    the update step of that same pass gives it its one update card on current main, as for a row the arm left."""
+    kb, root, repo, gh = exact
+    tid, head = _ready(exact)
+    base, main = _git(repo, "rev-parse", "main"), _main_moves(exact)
+    _setting(root, "true")
+
+    _tick(kb)
+
+    assert [(payload["reviewed_base"], payload["observed_main"], payload["cards"]) for kind, payload in _events(
+        kb, tid) if kind == "delivery_base_moved"] == [(base, main, [])]
+    reviews = _raw(kb.kanban_db_path(), "SELECT id FROM tasks WHERE idempotency_key LIKE 'review:%'")
+    assert (reviews, [path for _, path in gh["calls"] if path.endswith("/check-runs")]) == ([], [])
+    card = _update(kb, tid)
+    assert (card["status"], card["assignee"], card["base_commit"]) == ("ready", IMPLEMENTER, main)
+    assert _parents(repo, _head(repo, card)) == [head, main]
+    assert (_state(kb, head), _arms(gh)) == ("updated", [])
+    assert [(payload["update_task_id"], payload["observed_main"], payload["reviewed_base"])
+            for payload in _updated(kb, tid)] == [(card["id"], main, base)]
+
+
 def test_an_updated_head_never_merges_without_its_own_approval(exact):
     """An update that is not clean, as main changed a file inside the source card's owned paths: neither the
     source's approval of H nor the update card itself proves the updated head; its builder's normal completion hands
