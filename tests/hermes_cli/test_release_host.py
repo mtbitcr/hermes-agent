@@ -144,6 +144,37 @@ def _repository(tmp_path):
     return checkout, git(checkout, "rev-parse", "HEAD"), merges
 
 
+def _origin_read(checkout):
+    """One read of origin main as the reader makes it today, written out by hand: its argv, which
+    asks the remote itself, and its time limit in seconds."""
+    argv = ["git", "-C", str(checkout), "--no-optional-locks", "ls-remote", "origin", "refs/heads/main"]
+    return argv, 60
+
+
+def _origin_reads(monkeypatch, *failures):
+    """Records each read of origin main, and each wait between two reads instead of sleeping it.
+    The first reads go wrong as *failures* say, in order: "times out" raises what subprocess.run
+    raises past a call's time limit, and "exits 128" exits as git does when it cannot reach the
+    remote. Every later read, and every other call, is real. Returns (reads, waits): each read's
+    argv and time limit, and each wait's seconds."""
+    real, reads, waits, outcomes = subprocess.run, [], [], iter(failures)
+
+    def run(argv, **options):
+        if "ls-remote" not in argv:
+            return real(argv, **options)
+        reads.append((argv, options["timeout"]))
+        failure = next(outcomes, "answers")
+        if failure == "times out":
+            raise subprocess.TimeoutExpired(argv, options["timeout"])
+        if failure == "exits 128":
+            return subprocess.CompletedProcess(argv, 128, "", "")
+        return real(argv, **options)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(release_host, "_wait", waits.append)
+    return reads, waits
+
+
 def _systemctl(tmp_path, monkeypatch):
     """A stand-in systemctl first on PATH: it logs its arguments and answers `show` for KillSignal
     and KillMode; it prints nothing for any other property."""
@@ -310,6 +341,58 @@ def test_git_reads_fetch_nothing_from_a_promisor_remote(tmp_path):
         host.commit_tree(new)
     assert set(packs.iterdir()) == pack_files
     assert _tree_bytes(checkout) == before
+
+
+def test_origin_main_uses_the_answer_of_its_first_read_as_before(tmp_path, monkeypatch):
+    checkout, _prev, (_m1, m2) = _repository(tmp_path)
+    reads, waits = _origin_reads(monkeypatch)
+
+    assert _reader(tmp_path, tmp_path / "root").origin_main() == m2
+    assert reads == [_origin_read(checkout)]  # one read, as today, and no wait
+    assert waits == []
+
+
+@pytest.mark.parametrize("failures", [["times out"], ["exits 128"], ["times out", "exits 128"]], ids=", ".join)
+def test_origin_main_reads_again_after_a_read_that_times_out_or_fails(tmp_path, monkeypatch, failures):
+    checkout, _prev, (_m1, m2) = _repository(tmp_path)
+    reads, waits = _origin_reads(monkeypatch, *failures)
+
+    # The read after them answers from origin itself; its answer is used, and no read follows.
+    assert _reader(tmp_path, tmp_path / "root").origin_main() == m2
+    assert reads == [_origin_read(checkout)] * (len(failures) + 1)
+    assert waits == [15, 30][: len(failures)]  # 15 seconds after the first, 30 after the second
+
+
+@pytest.mark.parametrize(
+    "failures", [["times out", "times out", "times out"], ["times out", "times out", "exits 128"]], ids=", ".join
+)
+def test_origin_main_refuses_as_today_once_three_reads_time_out_or_fail(tmp_path, monkeypatch, failures):
+    checkout, _prev, _merges = _repository(tmp_path)
+    reads, waits = _origin_reads(monkeypatch, *failures)
+
+    with pytest.raises(subprocess.SubprocessError) as refused:
+        _reader(tmp_path, tmp_path / "root").origin_main()
+    argv, _limit = _origin_read(checkout)
+    today = {
+        "times out": f"TimeoutExpired: Command '{argv}' timed out after 60 seconds",
+        "exits 128": f"CalledProcessError: Command '{argv}' returned non-zero exit status 128.",
+    }
+    # The refusal carries the third read's own error, named as one such read names it today.
+    assert f"{type(refused.value).__name__}: {refused.value}" == today[failures[-1]]
+    assert reads == [_origin_read(checkout)] * 3  # origin would answer a fourth; none is made
+    assert waits == [15, 30]
+
+
+def test_origin_main_refuses_at_once_when_origin_answers_without_main(tmp_path, monkeypatch):
+    checkout, _prev, _merges = _repository(tmp_path)
+    git(tmp_path / "origin.git", "branch", "-m", "main", "trunk")  # origin answers, and has no main
+    reads, waits = _origin_reads(monkeypatch)
+
+    with pytest.raises(LookupError) as refused:
+        _reader(tmp_path, tmp_path / "root").origin_main()
+    assert f"{type(refused.value).__name__}: {refused.value}" == "LookupError: origin has no refs/heads/main"
+    assert reads == [_origin_read(checkout)]  # one read, and no wait
+    assert waits == []
 
 
 def test_unit_property_returns_signal_names(tmp_path, monkeypatch):
