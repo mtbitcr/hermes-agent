@@ -1058,3 +1058,123 @@ def test_cards_land_on_the_ticked_board_under_the_worker_environment(world, monk
     assert [(c["project_id"], c["workspace_path"]) for c in cards] == [
         ("delivery-project", str(source.parent / c["id"])) for c in cards]
     assert _state(kb, head, other_db) == "review_cards_created"
+
+
+@pytest.fixture
+def on_main(world, monkeypatch):
+    """The world with ``kanban.delivery.exact_base`` exactly true, where GitHub also answers main's ref, as the exact
+    base arm card's ``exact`` fixture serves it: at the board repository's main, or gh["main_answer"] when set
+    ("timeout": no answer). Each read of main is in gh["calls"] and gh["queries"]."""
+    kb, root, repo, gh = world
+    from hermes_cli import kanban_delivery_github as transport
+    from tests.hermes_cli.test_kanban_delivery_exact_base_arm import MAIN, _setting
+
+    table = transport._exchange  # the world's: the pull request and H's check runs, each call and query kept
+    gh["main_answer"] = None
+
+    def exchange(method, target, authorization, payload=None):
+        status, value = table(method, target, authorization, payload)
+        if (method, urlsplit(target).path) != ("GET", MAIN):
+            return status, value
+        if gh["main_answer"] == "timeout":
+            raise transport.GitHubTransportError("network_error")
+        return gh["main_answer"] or (200, {"ref": "refs/heads/main", "object": {"sha": _git(repo, "rev-parse", "main")}})
+
+    monkeypatch.setattr(transport, "_exchange", exchange)
+    _setting(root, "true")
+    return world
+
+
+@pytest.mark.parametrize("copies", [None, []], ids=["ci_green", "no_ci_run"])
+def test_a_moved_main_gets_no_review_card_and_is_left_base_moved(on_main, copies):
+    """Card A: with exact_base on, main is read before any check of H. Main left the reviewed base and is not in H,
+    while H's required check is green, or while H has no CI run at all, as GitHub starts none on a pull request that
+    conflicts with main: no check is read and no review card is made. The row is base_moved, with one
+    delivery_base_moved naming the repository, the reviewed base and the observed main as the arm's does, and no
+    cards, for the update step. Later passes read and record nothing more."""
+    from tests.hermes_cli.test_kanban_delivery_exact_base_arm import MAIN, _moved
+
+    kb, root, repo, gh = on_main
+    tid, head = _ready(on_main)
+    base, events = _git(repo, "rev-parse", "main"), _events(kb, tid)
+    gh["copies"], moved = copies, _moved(repo)
+
+    _tick(kb)
+
+    assert (_cards(kb), _state(kb, head)) == ([], "base_moved")
+    assert _events(kb, tid)[len(events):] == [("delivery_base_moved", {
+        "delivery_id": 1, "head": head, "pull_request_number": 41, "repository": REPO, "reviewed_base": base,
+        "observed_main": moved, "cards": []})]
+    assert gh["calls"] == [("GET", f"/repos/{REPO}/pulls/41"), ("GET", MAIN)]
+    calls, events = list(gh["calls"]), _events(kb, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (gh["calls"], _cards(kb), _state(kb, head), _events(kb, tid)) == (calls, [], "base_moved", events)
+
+
+def test_a_main_still_at_the_reviewed_base_gets_its_review_cards(on_main):
+    """Card A: with exact_base on and main still the reviewed base, main is read right after the first pull request
+    read and before CI on H; the pass then goes on as today and H gets its review cards."""
+    from tests.hermes_cli.test_kanban_delivery_exact_base_arm import MAIN
+
+    kb, root, repo, gh = on_main
+    tid, head = _ready(on_main)
+    events = _events(kb, tid)
+
+    _tick(kb)
+
+    cards = _cards(kb)
+    assert [(c["idempotency_key"], c["status"]) for c in cards] == [(f"review:{tid}:{head}:R12", "ready")]
+    assert (_state(kb, head), _events(kb, tid)[len(events):]) == ("review_cards_created", [
+        ("delivery_review_cards_created", {"delivery_id": 1, "head": head, "pull_request_number": 41,
+                                           "cards": [cards[0]["id"]]})])
+    pull = f"/repos/{REPO}/pulls/41"
+    assert gh["queries"] == [
+        (pull, {}), (MAIN, {}),
+        (f"/repos/{REPO}/commits/{head}/check-runs", {"filter": ["latest"], "check_name": [CHECK], "per_page": ["100"]}),
+        (pull, {})]
+
+
+@pytest.mark.parametrize("answer", [
+    "timeout", (404, None), (502, None), (200, {"ref": "refs/heads/other", "object": {"sha": "a" * 40}})],
+    ids=["timeout", "no_main", "5xx", "other_ref"])
+def test_an_unreadable_main_creates_no_review_and_records_nothing(on_main, answer):
+    """Card A: with exact_base on, main's read gets no answer, GitHub shows no main, answers an outage, or answers
+    for another ref: the pass reads no check of H, makes no card and records nothing, and the row stays open. The
+    next pass reads main again, so once GitHub shows main at the reviewed base, H gets its review cards."""
+    kb, root, repo, gh = on_main
+    tid, head = _ready(on_main)
+    gh["main_answer"], events = answer, _events(kb, tid)
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_cards(kb), _state(kb, head), _events(kb, tid)) == ([], "open", events)
+    assert [path for _, path in gh["calls"] if path.endswith("/check-runs")] == []
+    gh["main_answer"] = None
+    _tick(kb)
+    assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created"
+
+
+@pytest.mark.parametrize("value", [None, "false", '"true"'], ids=["absent", "false", "quoted_true"])
+def test_with_exact_base_off_review_cards_are_made_as_before(on_main, value):
+    """With exact_base anything but exactly true, main is never read: although main left the reviewed base and is
+    not in H, the pass reads the pull request, CI on H and the pull request again, as today, and H gets its review
+    cards."""
+    from tests.hermes_cli.test_kanban_delivery_exact_base_arm import _moved, _setting
+
+    kb, root, repo, gh = on_main
+    tid, head = _ready(on_main)
+    _moved(repo)
+    _setting(root, value)
+
+    _tick(kb)
+
+    assert (len(_cards(kb)), _state(kb, head)) == (1, "review_cards_created")
+    pull = f"/repos/{REPO}/pulls/41"
+    assert gh["queries"] == [
+        (pull, {}),
+        (f"/repos/{REPO}/commits/{head}/check-runs", {"filter": ["latest"], "check_name": [CHECK], "per_page": ["100"]}),
+        (pull, {})]
