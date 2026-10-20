@@ -17,8 +17,8 @@ name: CI
 on:
   workflow_dispatch:
   pull_request:
-  push:
-    branches: [main]
+  schedule:
+    - cron: '17 3 * * *'
 
 permissions:
   contents: read
@@ -33,8 +33,8 @@ concurrency:
 jobs:
   # ─────────────────────────────────────────────────────────────────────
   # detect: run the classifier once. Every downstream job reads its outputs
-  # to decide whether to run. On push/dispatch the classifier fails open
-  # (all lanes true) so post-merge validation is never weakened.
+  # to decide whether to run. On schedule/dispatch the classifier fails open
+  # (all lanes true) so the nightly validation of main is never weakened.
   # ─────────────────────────────────────────────────────────────────────
   detect:
     name: Detect affected areas
@@ -234,7 +234,7 @@ jobs:
   # the live comment poller can list failed jobs in the PR comment.
   # ─────────────────────────────────────────────────────────────────────
   all-checks-pass:
-    # Manual validation must not satisfy the PR/push branch-protection context.
+    # Manual validation must not satisfy the PR branch-protection context.
     name: ${{ github.event_name == 'workflow_dispatch' && 'Manual validation checks pass' || 'All required checks pass' }}
     needs:
       - detect
@@ -301,7 +301,7 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # CI timing report: collect per-job/step durations from the GitHub API,
-  # cache them on main (as a baseline), and on PRs generate an HTML diff
+  # cache them nightly on main (as a baseline), and on PRs generate an HTML diff
   # report with a gantt chart + per-step breakdown. The report is uploaded
   # as an artifact and a markdown summary is written to $GITHUB_STEP_SUMMARY.
   #
@@ -381,7 +381,7 @@ jobs:
           cat ci-timings-summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save baseline cache (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'schedule'
         run: |
           # Degraded runs (API rate-limited) produce no ci-timings.json —
           # skip rather than fail, and never cache an empty baseline.
@@ -392,7 +392,7 @@ jobs:
           fi
 
       - name: Upload baseline to cache (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('ci-timings-baseline.json') != ''
+        if: github.event_name == 'schedule' && hashFiles('ci-timings-baseline.json') != ''
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ci-timings-baseline.json
