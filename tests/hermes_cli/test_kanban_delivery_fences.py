@@ -2,10 +2,9 @@
 
 Tests 1 to 14 are plan section 8's, adapted as the owner directs: load_policy takes the
 policy text, and the merge reads the security reviewer's own approval (no mirror). The
-four tests after them show owner cases that tests 1 to 14 do not show in full, the next
-four are regressions for the first independent review's findings 1 to 4, the next is
-the regression for the latest review's finding: an unknown job's unnamed failed step, and the
-last six are regressions for security findings 1 to 6 on pull request 140.
+tests after them show owner cases that tests 1 to 14 do not show in full, then regressions
+for the first independent review's findings and for security findings 1 to 6 on pull request
+140. Owner decision 2026-10-20 removed the rerun fence and its tests: nothing reruns a check.
 """
 import ast
 import json
@@ -23,27 +22,12 @@ DIGEST = "e" * 64
 PLATFORM = "mtbitcr/hermes-agent"
 WORKSPACE = "mtbitcr/raphael-workspace"
 GATE = "All required checks pass"
-FLAKY_46 = ("tests/tools/test_zombie_process_cleanup.py::TestDelegationCleanup::"
-            "test_timed_out_child_keeps_relay_session_until_its_turn_exits")
-FLAKY_100 = ("tests/tui_gateway/test_compute_host_turn_protocol.py::"
-             "test_turn_start_streams_deltas_then_turn_end_with_history_identity")
-ROOM_DRIVER = "tests/tui_gateway/test_hosted_room_driver_runtime.py::"
-FLAKY_139 = (ROOM_DRIVER + "test_waiting_room_does_not_block_an_independent_local_room",
-             ROOM_DRIVER + "test_deadline_releases_worker_capacity_for_later_room",
-             ROOM_DRIVER + "test_rotated_bounded_scheduler_eventually_runs_later_room")
-UNLISTED = "tests/tools/test_example.py::test_unlisted"
 SECURITY = "security-reviewer"
 # Test data in the policy file's shape; only test 13 reads the real file.
-POLICY_TEXT = json.dumps({
-    PLATFORM: {"required_checks": [GATE], "flaky_tests": [
-        {"test": FLAKY_46, "finding": 46}, {"test": FLAKY_100, "finding": 100}]},
-    WORKSPACE: {"required_checks": ["quality"], "flaky_tests": []},
-})
+POLICY_TEXT = json.dumps({PLATFORM: {"required_checks": [GATE]}, WORKSPACE: {"required_checks": ["quality"]}})
 # Kernel record ids order the merge facts: H's check evidence (20, see checks) precedes both approvals.
 LENSES = ({"id": 30, "lens": "first-lens", "head": H, "verdict": "approve"},
           {"id": 31, "lens": "second-lens", "head": H, "verdict": "approve"})
-# Owner rule 3: the summary check counts only with this one failed step, ci.yaml's "Evaluate job results".
-EVALUATE = {"name": "Evaluate job results", "conclusion": "failure"}
 
 
 def policy():
@@ -65,25 +49,6 @@ def ledger(pull_request=None, head=None, state=None, head_is_ancestor=False):
 def remote(branch_head=None, *open_pulls):
     return {"branch_head": branch_head,
             "open_pulls": [{"number": number, "head": head} for number, head in open_pulls]}
-
-
-def job(job_id, name, conclusion="success", **facts):
-    return {"id": job_id, "name": name, "head_sha": H, "status": "completed",
-            "conclusion": conclusion, "run_attempt": 1,
-            "steps": [{"name": "Set up job", "conclusion": "success"}], **facts}
-
-
-def slice_job(job_id, n, tests, failed_count=None, step=None):
-    steps = [{"name": "Checkout code", "conclusion": "success"},
-             {"name": step or f"Run tests (slice {n}/12)", "conclusion": "failure"},
-             {"name": "Upload per-slice durations", "conclusion": "skipped"}]
-    # The jobs API names a called workflow's job "<calling job> / <called job>" (review finding 1).
-    return job(job_id, f"Python tests / Run tests slice {n}/12", "failure", steps=steps, failed_tests=list(tests),
-               failed_count=len(tests) if failed_count is None else failed_count)
-
-
-def rerun(jobs, reruns=(), repo=PLATFORM):
-    return fences.decide_rerun(policy(), repo, H, list(jobs), {"reruns": list(reruns)})
 
 
 def evidence(record_id, overall="success", head=H, **changes):
@@ -356,78 +321,6 @@ def test_publish_refuses_a_later_update_through_a_record_of_another_approval():
     assert (d.allowed, d.code) == (False, "not_clean_update")
 
 
-def test_rerun_refuses_when_any_failed_test_is_off_the_flaky_list():
-    for jobs in ([slice_job(3, 3, [FLAKY_46, UNLISTED])],
-                 [slice_job(3, 3, [FLAKY_46]), slice_job(7, 7, [UNLISTED])]):
-        d = rerun(jobs)
-        assert (d.allowed, d.code, d.matches) == (False, "not_flaky", [])
-        assert UNLISTED not in d.detail
-
-
-def test_rerun_refuses_a_failed_job_that_names_no_test():
-    assert rerun([slice_job(3, 3, [FLAKY_46, FLAKY_100])]).allowed
-    # Owner rule 1: failed_count is a positive int, so the empty list keeps a count of 1, and a None
-    # failed_tests or failed_count is a malformed fact.
-    for facts, code in ((slice_job(3, 3, [], failed_count=1), "no_failed_test"),
-                        ({**slice_job(3, 3, [], failed_count=1), "failed_tests": None}, "invalid_fact")):
-        d = rerun([facts])
-        assert (d.allowed, d.code) == (False, code)
-    for facts, code in ((slice_job(3, 3, [FLAKY_46], failed_count=2), "count_mismatch"),
-                        (slice_job(3, 3, [FLAKY_46, FLAKY_100], failed_count=1), "count_mismatch"),
-                        (slice_job(3, 3, [FLAKY_46, FLAKY_46]), "count_mismatch"),
-                        ({**slice_job(3, 3, [FLAKY_46]), "failed_count": None}, "invalid_fact")):
-        d = rerun([facts])
-        assert (d.allowed, d.code) == (False, code)
-
-
-def test_rerun_refuses_a_second_rerun():
-    flaky = slice_job(3, 3, [FLAKY_46])
-    assert rerun([flaky], reruns=[OLD]).allowed
-    d = rerun([flaky], reruns=[H])
-    assert (d.allowed, d.code) == (False, "rerun_used")
-    # The label-triggered "gh run rerun --failed" leaves run_attempt 2 on the jobs of H.
-    for jobs in ([{**flaky, "run_attempt": 2}], [flaky, job(5, "Python lints", run_attempt=2)]):
-        d = rerun(jobs)
-        assert (d.allowed, d.code) == (False, "rerun_used")
-
-
-def test_rerun_refuses_any_other_failed_job():
-    flaky = slice_job(3, 3, [FLAKY_46])
-    test_step = {"name": "Run tests (slice 3/12)", "conclusion": "failure"}
-    others = [job(5, "Python lints", "failure"),
-              {**flaky, "conclusion": "cancelled"},
-              {**flaky, "conclusion": "timed_out"},
-              slice_job(3, 3, [FLAKY_46], step="Install dependencies"),
-              slice_job(3, 3, [FLAKY_46], step="Run tests (slice 4/12)"),
-              {**flaky, "steps": [test_step, {"name": "Upload per-slice durations", "conclusion": "failure"}]},
-              {**flaky, "steps": [{**test_step, "conclusion": "cancelled"}]}]
-    for other in others:
-        d = rerun([other])
-        assert (d.allowed, d.code) == (False, "not_test_job"), other
-
-
-def test_rerun_with_several_failed_jobs_is_all_or_nothing():
-    eligible = [slice_job(3, 3, [FLAKY_46]), slice_job(7, 7, [FLAKY_100])]
-    d = rerun(eligible + [job(1, "Python lints")])
-    assert (d.allowed, d.code) == (True, "rerun")
-    assert d.matches == [
-        {"job_id": 3, "test": FLAKY_46, "list_entry": {"test": FLAKY_46, "finding": 46}},
-        {"job_id": 7, "test": FLAKY_100, "list_entry": {"test": FLAKY_100, "finding": 100}}]
-    for ineligible in (job(5, "Python lints", "failure"), slice_job(9, 9, [UNLISTED]), slice_job(9, 9, [])):
-        d = rerun(eligible + [ineligible])
-        assert (d.allowed, d.matches) == (False, [])
-
-
-def test_rerun_gate_job_follows_the_owner_decision():
-    # Beside eligible slices the gate is their summary: it neither stops the rerun nor is rerun.
-    # Owner rule 3: the gate is a summary only with its failed "Evaluate job results" step.
-    d = rerun([slice_job(3, 3, [FLAKY_46]), slice_job(7, 7, [FLAKY_100]), job(99, GATE, "failure", steps=[EVALUATE])])
-    assert (d.allowed, d.code) == (True, "rerun")
-    assert {match["job_id"] for match in d.matches} == {3, 7}
-    d = rerun([job(3, "Python tests / Run tests slice 3/12"), job(99, GATE, "failure", steps=[EVALUATE])])
-    assert (d.allowed, d.code, d.matches) == (False, "summary_failed_alone", [])
-
-
 def test_lens_request_refuses_without_check_evidence():
     d = lens_request([evidence(1)])
     assert (d.allowed, d.code) == (True, "request")
@@ -529,26 +422,15 @@ def test_merge_refuses_when_a_required_check_is_not_passing():
 def test_policy_file_loads_and_matches_exactly():
     text = Path(fences.__file__).with_name("kanban_delivery_policy.json").read_text(encoding="utf-8")
     loaded = fences.load_policy(text)
-    assert loaded.required_checks == {PLATFORM: (GATE,), WORKSPACE: ("quality",)}
-    assert loaded.flaky_tests == {PLATFORM: {FLAKY_46: 46, FLAKY_100: 100, **dict.fromkeys(FLAKY_139, 139)},
-                                  WORKSPACE: {}}
+    assert loaded == fences.Policy({PLATFORM: (GATE,), WORKSPACE: ("quality",)})
     seeded = json.loads(POLICY_TEXT)
     entry = seeded[PLATFORM]
-    first = {"test": FLAKY_46, "finding": 46}
     invalid = [[seeded], {**seeded, "version": 1}, {"mtbitcr/*": entry},
                {PLATFORM: {**entry, "gate_job": GATE}},
+               {PLATFORM: {**entry, "flaky_tests": []}},  # owner decision 2026-10-20: no flaky list
                {PLATFORM: {**entry, "required_checks": []}},
                {PLATFORM: {**entry, "required_checks": [GATE, GATE]}},
-               {PLATFORM: {**entry, "required_checks": ["Run tests slice */12"]}},
-               {PLATFORM: {**entry, "flaky_tests": [{**first, "pattern": True}]}},
-               {PLATFORM: {**entry, "flaky_tests": [{"test": FLAKY_46}]}},
-               {PLATFORM: {**entry, "flaky_tests": [{**first, "finding": "46"}]}},
-               {PLATFORM: {**entry, "flaky_tests": [{**first, "finding": 0}]}},
-               {PLATFORM: {**entry, "flaky_tests": [first, {**first, "finding": 47}]}}]
-    patterns = [FLAKY_46 + "*", FLAKY_46 + "[1]", FLAKY_46.replace("Delegation", "?elegation"),
-                "tests/tools/*", "tests/tools/test_zombie_process_cleanup.py::*",
-                "tests/tools/test_zombie_process_cleanup.py", FLAKY_46.rsplit("::", 1)[1], "re:" + FLAKY_46]
-    invalid += [{PLATFORM: {**entry, "flaky_tests": [{"test": test, "finding": 46}]}} for test in patterns]
+               {PLATFORM: {**entry, "required_checks": ["Run tests slice */12"]}}]
     for document in invalid:
         with pytest.raises(ValueError):
             fences.load_policy(json.dumps(document))
@@ -578,87 +460,14 @@ def test_fences_have_no_io():
 
 
 def test_summary_check_failing_alone_stops_the_flow():
-    # Owner rule 3: the summary check failed at its "Evaluate job results" step.
-    d = rerun([job(3, "Python tests / Run tests slice 3/12"), job(5, "Python lints"), job(99, GATE, "failure", steps=[EVALUATE])])
-    assert (d.allowed, d.code, d.matches) == (False, "summary_failed_alone", [])
     d = merge(check_facts=checks(check_run(99, conclusion="failure")))
     assert (d.allowed, d.code) == (False, "check_failure")
-
-
-def test_summary_check_with_only_listed_flaky_failures_is_a_summary():
-    flaky = [slice_job(3, 3, [FLAKY_46]), slice_job(7, 7, [FLAKY_100])]
-    # Owner rule 3: each failed summary check failed at its "Evaluate job results" step.
-    d = rerun(flaky + [job(99, GATE, "failure", steps=[EVALUATE])])
-    assert (d.allowed, d.code) == (True, "rerun")
-    assert 99 not in {match["job_id"] for match in d.matches}
-    # The section 11 rerun rule still applies around the summary.
-    for gate, reruns, code in ((job(99, GATE, "failure", run_attempt=2, steps=[EVALUATE]), (), "rerun_used"),
-                               (job(99, GATE, "failure", steps=[EVALUATE]), (H,), "rerun_used"),
-                               (job(99, GATE, "failure", head_sha=OLD, steps=[EVALUATE]), (), "head_moved"),
-                               (job(99, GATE, None, status="in_progress"), (), "not_completed")):
-        d = rerun(flaky + [gate], reruns=reruns)
-        assert (d.allowed, d.code) == (False, code)
 
 
 def test_summary_check_with_any_other_failure_is_a_real_failure():
-    for other, code in ((slice_job(3, 3, [UNLISTED]), "not_flaky"),
-                        (slice_job(3, 3, [FLAKY_46, UNLISTED]), "not_flaky"),
-                        (job(5, "Python lints", "failure"), "not_test_job"),
-                        # Owner rule 1: failed_count is a positive int, so the empty list keeps a count of 1.
-                        (slice_job(3, 3, [], failed_count=1), "no_failed_test")):
-        # Owner rule 3: the summary check failed at its "Evaluate job results" step.
-        d = rerun([slice_job(7, 7, [FLAKY_100]), other, job(99, GATE, "failure", steps=[EVALUATE])])
-        assert (d.allowed, d.code, d.matches) == (False, code, [])
     # The gate stays failed on a real failure, so the merge is refused.
     d = merge(check_facts=checks(check_run(99, conclusion="failure")))
     assert (d.allowed, d.code) == (False, "check_failure")
-
-
-def test_a_test_not_in_the_policy_is_never_flaky():
-    near_misses = [FLAKY_46.upper(), FLAKY_46 + "_slow", "x" + FLAKY_46, FLAKY_46 + "[1]", FLAKY_46 + " ",
-                   FLAKY_46.rsplit("::", 1)[0], "tests/tools/test_zombie_process_cleanup.py"]
-    for test in near_misses:
-        d = rerun([slice_job(3, 3, [test])])
-        assert (d.allowed, d.code, d.matches) == (False, "not_flaky", [])
-    # One repository's list never applies to another, and an unlisted repository has none.
-    d = rerun([slice_job(3, 3, [FLAKY_46])], repo=WORKSPACE)
-    assert (d.allowed, d.code) == (False, "not_flaky")
-    d = rerun([slice_job(3, 3, [FLAKY_46])], repo="mtbitcr/unlisted-repo")
-    assert (d.allowed, d.code) == (False, "unknown_repository")
-
-
-def test_rerun_knows_test_slices_by_the_job_names_github_reports():
-    # Finding 1: ci.yaml's "Python tests" job calls tests.yml, so the jobs API reports each slice as
-    # "Python tests / Run tests slice N/12", while its test step keeps the name "Run tests (slice N/12)".
-    live = slice_job(3, 3, [FLAKY_46])
-    assert (live["name"], live["steps"][1]["name"]) == ("Python tests / Run tests slice 3/12", "Run tests (slice 3/12)")
-    # Owner rule 3: each summary check below failed at its "Evaluate job results" step.
-    d = rerun([live, job(99, GATE, "failure", steps=[EVALUATE])])
-    assert (d.allowed, d.code) == (True, "rerun")
-    assert d.matches == [{"job_id": 3, "test": FLAKY_46, "list_entry": {"test": FLAKY_46, "finding": 46}}]
-    for n in range(1, 13):
-        assert rerun([slice_job(n, n, [FLAKY_100])]).allowed, n
-    # Every other name is an unknown job, the bare called-job name included.
-    for name in ("Run tests slice 3/12", "Python tests / Generate slices", "OS-specific tests / Windows-only tests",
-                 "Python tests / Run tests slice 13/12", "Python tests / Run tests slice 3/8"):
-        d = rerun([{**live, "name": name}, job(99, GATE, "failure", steps=[EVALUATE])])
-        assert (d.allowed, d.code, d.matches) == (False, "not_test_job", []), name
-    # Under its full name a slice still has to fail at its own test step and nowhere else.
-    for step in ("Install dependencies", "Run tests (slice 4/12)", "Python tests / Run tests (slice 3/12)"):
-        d = rerun([slice_job(3, 3, [FLAKY_46], step=step), job(99, GATE, "failure", steps=[EVALUATE])])
-        assert (d.allowed, d.code, d.matches) == (False, "not_test_job", []), step
-
-
-def test_summary_check_counts_only_when_it_ended_in_failure():
-    # Finding 2: only the summary job's ordinary failure summarises the jobs it waits on; any other
-    # end refuses the rerun, beside an eligible slice or alone.
-    flaky, passed = slice_job(3, 3, [FLAKY_46]), job(3, "Python tests / Run tests slice 3/12")
-    for conclusion in ("cancelled", "timed_out", "action_required", "startup_failure", "stale", None, "unknown"):
-        decisions = [rerun([other, job(99, GATE, conclusion)]) for other in (flaky, passed)]
-        assert [(d.allowed, d.code, d.matches) for d in decisions] == [(False, "summary_not_failure", [])] * 2, conclusion
-    # Owner rule 3: the summary check failed at its "Evaluate job results" step.
-    d = rerun([flaky, job(99, GATE, "failure", steps=[EVALUATE])])
-    assert (d.allowed, d.code) == (True, "rerun")
 
 
 def test_merge_follows_the_kernel_record_order():
@@ -716,22 +525,6 @@ def test_merge_refuses_a_check_on_another_head_whatever_its_name():
         assert (d.allowed, d.code) == (False, code), facts
 
 
-@pytest.mark.parametrize("name", ["Python lints", "Run tests slice 3/12"])
-def test_rerun_refuses_an_unknown_job_whose_failed_step_has_no_name(name):
-    # The latest review's finding: a job off the allowlist is no test job even when its failed step
-    # has no name, whether it is unrelated or the bare slice name, which the jobs API never reports
-    # (it reports "Python tests / Run tests slice N/12"). The valid full-name control first.
-    d = rerun([slice_job(3, 3, [FLAKY_46])])
-    assert (d.allowed, d.code) == (True, "rerun")
-    # The reviewer's reproduction.
-    bad = slice_job(3, 3, [FLAKY_46])
-    bad["name"] = name
-    bad["steps"][1]["name"] = None
-    d = rerun([bad])
-    # Owner rule 1: a step name is a non-empty str, so a null one is a malformed fact.
-    assert (d.allowed, d.code, d.matches) == (False, "invalid_fact", [])
-
-
 def test_malformed_facts_refuse_as_invalid_fact():
     # Security finding 1: a fact without its documented type refuses with invalid_fact instead of passing
     # as truthy, falsy, equal or distinct. The reviewer's reproductions, fence by fence.
@@ -739,14 +532,6 @@ def test_malformed_facts_refuse_as_invalid_fact():
                     {"reviewer": 1, "implementer": 2}):
         d = fences.decide_publish(approval(**changes), ledger(), remote())
         assert (d.allowed, d.code) == (False, "invalid_fact"), changes
-    flaky = slice_job(3, 3, [FLAKY_46])
-    for head, jobs, reruns in ((H, [{**flaky, "run_attempt": True}], []),
-                               (H, [{**flaky, "run_attempt": 1.0}], []),
-                               (H, [flaky], {}),
-                               (H, [{**flaky, "failed_tests": {FLAKY_46: None}, "failed_count": 1}], []),
-                               (None, [{**flaky, "head_sha": None}], [])):
-        d = fences.decide_rerun(policy(), PLATFORM, head, jobs, {"reruns": reruns})
-        assert (d.allowed, d.code) == (False, "invalid_fact"), (head, jobs, reruns)
     d = fences.decide_lens_request(None, None, [evidence(1, head=None)], [], "reviewer-profile", "worker-profile")
     assert (d.allowed, d.code) == (False, "invalid_fact")
     null_heads = [{**verdict, "head": None} for verdict in LENSES]
@@ -764,12 +549,10 @@ def test_malformed_facts_refuse_as_invalid_fact():
     upper = dict.fromkeys(("head_commit", "review_head", "bound_head"), H.upper())
     reproductions = [
         fences.decide_publish(approval(), ledger(7, OLD, "returned_for_changes", "false"), remote(OLD, (7, OLD))),
-        rerun([{**slice_job(3, 3, [FLAKY_46]), "id": None}]),
         merge(pr_facts=pr(merged="false")),
         merge(check_facts=checks(check_run(), evidence_id=0)),
         merge(check_facts=checks(check_run(), last_rerun_id=-1)),
         merge(verdicts=[{**v, "id": 30} for v in LENSES]),
-        fences.decide_rerun(policy(), PLATFORM, H, (flaky,), {"reruns": []}),
         fences.decide_merge(policy(), PLATFORM, H, pr(), {**checks(check_run()), "check_runs": (check_run(),)},
                             list(LENSES), [review(10, "APPROVED")], SECURITY),
         fences.decide_lens_request(H, H, (evidence(1),), [], "reviewer-profile", "worker-profile"),
@@ -778,9 +561,6 @@ def test_malformed_facts_refuse_as_invalid_fact():
         lens_request([evidence(1)], reviewer=""),
         merge(security_reviewer=""),
         fences.decide_publish(approval(**upper), ledger(), remote()),
-        rerun([slice_job(3, 3, [FLAKY_46], failed_count=0)]),
-        rerun([{**flaky, "failed_count": None}]),
-        rerun([slice_job(3, 3, [])]),
         merge(check_facts=checks(statuses=[status(1, "failure"), status(2, "success")])),
         merge(verdicts=[first, first]),
         merge(verdicts=[first, second, {**second, "verdict": "changes"}]),
@@ -810,32 +590,6 @@ def test_malformed_facts_refuse_as_invalid_fact():
                        ("remote.open_pulls[0].number", {"remote": remote(OLD, (True, OLD))}),
                        ("remote.open_pulls[1].number", {"remote": remote(OLD, (7, OLD), (7, OLD))}),
                        ("remote.open_pulls[0].head", {"remote": remote(OLD, (7, OLD[:39]))})]
-    summary = job(99, GATE, "failure", steps=[EVALUATE])
-    rerun_base = {"policy": policy(), "repo": PLATFORM, "head": H, "jobs": [flaky, summary], "ledger": {"reruns": [OLD]}}
-    rerun_faults = [("repo", {"repo": None}),
-                    ("head", {"head": H.upper()}),
-                    ("jobs", {"jobs": (flaky, summary)}),
-                    ("jobs[0]", {"jobs": [list(flaky.items()), summary]}),
-                    ("jobs[0].id", {"jobs": [{**flaky, "id": "3"}, summary]}),
-                    ("jobs[1].id", {"jobs": [flaky, {**summary, "id": 3}]}),
-                    ("jobs[0].name", {"jobs": [{**flaky, "name": None}, summary]}),
-                    ("jobs[0].head_sha", {"jobs": [{**flaky, "head_sha": None}, summary]}),
-                    ("jobs[0].status", {"jobs": [{**flaky, "status": ""}, summary]}),
-                    ("jobs[0].conclusion", {"jobs": [{**flaky, "conclusion": 0}, summary]}),
-                    ("jobs[0].run_attempt", {"jobs": [{**flaky, "run_attempt": 1.0}, summary]}),
-                    ("jobs[0].steps", {"jobs": [without(flaky, "steps"), summary]}),
-                    ("jobs[1].steps", {"jobs": [flaky, {**summary, "steps": (EVALUATE,)}]}),
-                    ("jobs[1].steps[0]", {"jobs": [flaky, {**summary, "steps": [("Evaluate job results", "failure")]}]}),
-                    ("jobs[1].steps[0].name", {"jobs": [flaky, {**summary, "steps": [{**EVALUATE, "name": ""}]}]}),
-                    ("jobs[1].steps[0].conclusion", {"jobs": [flaky, {**summary, "steps": [{**EVALUATE, "conclusion": 1}]}]}),
-                    ("jobs[0].failed_tests", {"jobs": [{**flaky, "failed_tests": (FLAKY_46,)}, summary]}),
-                    ("jobs[0].failed_tests", {"jobs": [{**flaky, "failed_tests": [None]}, summary]}),
-                    ("jobs[0].failed_count", {"jobs": [{**flaky, "failed_count": True}, summary]}),
-                    ("jobs[0].failed_count", {"jobs": [without(flaky, "failed_count"), summary]}),
-                    ("ledger", {"ledger": [OLD]}),
-                    ("ledger.reruns", {"ledger": {}}),
-                    ("ledger.reruns", {"ledger": {"reruns": (OLD,)}}),
-                    ("ledger.reruns[0]", {"ledger": {"reruns": [OLD.upper()]}})]
     card = {"lens": "first-lens", "task_id": "t1", "head": OLD}
     lens_base = {"head": H, "pr_head": H, "evidence": [rerun_record(1), evidence(2)], "existing_lens_cards": [card],
                  "reviewer": "reviewer-profile", "implementer": "worker-profile"}
@@ -907,7 +661,6 @@ def test_malformed_facts_refuse_as_invalid_fact():
                     ("security_reviewer", {"security_reviewer": [SECURITY]}),
                     ("rerun_attempt", {"rerun_attempt": "1"})]
     for fence, base, faults in ((fences.decide_publish, publish, publish_faults),
-                                (fences.decide_rerun, rerun_base, rerun_faults),
                                 (fences.decide_lens_request, lens_base, lens_faults),
                                 (fences.decide_merge, merge_base, merge_faults)):
         assert fence(**base).allowed, fence.__name__
@@ -920,10 +673,8 @@ def test_malformed_facts_refuse_as_invalid_fact():
             if outcome != (False, "invalid_fact", fact):
                 failures.append((fence.__name__, fact, outcome))
     # Controls: each documented None decides as before.
-    in_progress = job(5, "Python lints", None, status="in_progress", steps=[{"name": "Set up job", "conclusion": None}])
     controls = [(fences.decide_publish(approval(), ledger(), remote()), (True, "push_and_create")),
                 (fences.decide_publish(approval(), ledger(), remote(None, (8, H))), (False, "second_pull_request")),
-                (rerun([flaky, in_progress]), (False, "not_completed")),
                 (lens_request([evidence(1)], reviewer=None), (False, "reviewer_not_independent")),
                 (merge(), (True, "merge")),
                 (fences.decide_merge(**{**merge_base, "rerun_attempt": None,
@@ -969,24 +720,6 @@ def test_check_kind_comes_from_its_list():
     contradictory = {**status(1, "failure"), "conclusion": "success", "status": "completed"}
     d = merge(check_facts=checks(check_run(2, name="Python lints"), statuses=[contradictory]))
     assert (d.allowed, d.code) == (False, "check_failure")
-
-
-def test_summary_check_is_a_summary_only_when_its_evaluate_step_failed():
-    # Security finding 5: failed at "Set up job", the summary check is one more failed job and refuses the
-    # rerun; failed at its "Evaluate job results" step it still summarises the eligible slices.
-    flaky = slice_job(3, 3, [FLAKY_46])
-    setup = job(99, GATE, "failure", steps=[{"name": "Set up job", "conclusion": "failure"}])
-    d = rerun([flaky, setup])
-    assert (d.allowed, d.code, d.matches) == (False, "not_test_job", [])
-    # Card review finding 2: with no failed step, only a successful "Set up job" or a successful "Evaluate job
-    # results", it proves no failure at its evaluation either, so it is one more failed job.
-    decisions = [rerun([flaky, job(99, GATE, "failure", steps=steps)])
-                 for steps in ([], [{"name": "Set up job", "conclusion": "success"}], [{**EVALUATE, "conclusion": "success"}])]
-    assert [(d.allowed, d.code, d.matches) for d in decisions] == [(False, "not_test_job", [])] * 3
-    evaluate = job(99, GATE, "failure", steps=[{"name": "Set up job", "conclusion": "success"},
-                                               {"name": "Evaluate job results", "conclusion": "failure"}])
-    d = rerun([flaky, evaluate])
-    assert (d.allowed, d.code) == (True, "rerun")
 
 
 def test_merge_after_a_rerun_needs_required_checks_from_a_later_attempt():
