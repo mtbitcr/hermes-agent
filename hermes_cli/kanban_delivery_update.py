@@ -16,8 +16,10 @@ updated head, beside a delivery row of the source card at the updated head. Only
 fence move H's pull request to the updated head by a fast-forward, H being its first parent; CI, the tier's review
 cards, the arm and the merge then each run at exactly that head, which is never reported as reviewed. When main
 moves again, the row at that head is updated the same way, main's change still measured from H's approved start; its
-record names H as head and the head before as ``previous_update_head``, the first parent the fence requires. Otherwise
-one update card is made per source card, H and main, through the card creation of
+record names H as head and the head before as ``previous_update_head``, the first parent the fence requires. Such a
+later update is clean only while H itself passes the approval proof the publish fence applies to it, so once the
+kernel's event retention removed H's review, every later update makes the update card, whatever the chain shows.
+Otherwise one update card is made per source card, H and main, through the card creation of
 :func:`hermes_cli.kanban_delivery._continuation`: a task_links child of the source card for its builder, with the
 source's tier, route, effort, policy lock, owner receipt binding, risk tier and review requirement, on a branch at
 the updated head. Its builder hands that head over unchanged through the normal completion, so the kernel's own
@@ -34,8 +36,9 @@ on that tree, which holds those files as git marked them, its body names them fo
 else, and its delivery_updated event names them as ``conflicts``. Every text written here, each card body, return
 reason and commit message, names H and its reviewed base only as the kernel's approval record of the source card names
 them, never as the chain of clean records or the row's head would: past H, the row's head is named only as the
-delivered head, on the main it was built on, and when that record names no H, the text says that the approval could
-not be confirmed and names no head as approved. The chain decides only whether a later update may be clean.
+delivered head, on the main it was built on, each commit message naming H as the approved head and the base of its
+original review, and when that record names no H, the text says that the approval could not be confirmed and names no
+head as approved. The chain, with H's approval proof, decides only whether a later update may be clean.
 :func:`hermes_cli.kanban_delivery.publish_step` calls :func:`update_step` once per pass, with the setting on only.
 """
 
@@ -62,7 +65,8 @@ _MESSAGE = ("{head} of {source} brought up to date on main {main}\n\nThe change 
             "{reviewed}, merged with main at {main}: git merge-tree --write-tree of main and the approved head.\n")
 _LATER = ("{approved} of {source} brought up to date on main {main}\n\nThe change approved at {approved}, at the "
           "delivered head {head} on the main it was built on, {base}, merged with main at {main}: git merge-tree "
-          "--write-tree of main and the delivered head.\n")
+          "--write-tree of main and the delivered head. The kernel's approval record of {source} names the approved "
+          "head {approved} and the base of its original review, {reviewed}.\n")
 _UNCONFIRMED = ("{head} of {source} brought up to date on main {main}\n\nThe approval could not be confirmed, so no "
                 "head is named as approved. The delivered head {head}, on the main it was built on, {base}, merged with "
                 "main at {main}: git merge-tree --write-tree of main and the delivered head.\n")
@@ -380,14 +384,20 @@ def _clean_start(conn, row: dict) -> Optional[list]:
 def _clean(conn, row: dict, facts: dict) -> Optional[str]:
     """Card B, inside _updated's write transaction: the source card's approved head H when the update is clean, so
     when git merged it with no conflict, H is the first parent of the updated head or the row a clean start
-    (:func:`_clean_start`), and main changed none of the card's owned paths since the approved start, test files
-    included. None otherwise."""
+    (:func:`_clean_start`) while H itself passes the approval proof the publish fence applies to it
+    (:func:`hermes_cli.kanban_delivery.prove_approval`), and main changed none of the card's owned paths since the
+    approved start, test files included. None otherwise."""
     task = kb.get_task(conn, row["source_task_id"])
     approved = kd._sha(task.head_commit) if task is not None else None
     if "main_changed" not in facts or approved is None or not task.owned_paths or any(
             _owned(path, task.owned_paths) for path in facts["main_changed"]):
         return None
-    return approved if approved == facts["head"] or _clean_start(conn, row) is not None else None
+    if approved == facts["head"]:
+        return approved
+    # Past H the publish fence admits the update on H's own approval only: once H no longer passes that proof, as
+    # after the kernel's event retention removed its review, the update card is made instead, whatever the chain shows.
+    return approved if _clean_start(conn, row) is not None and kd.prove_approval(
+        conn, row["source_task_id"], approved).allowed else None
 
 
 def _updated(db_path: Path, row: dict, facts: dict, update: Optional[tuple]) -> Optional[str]:
