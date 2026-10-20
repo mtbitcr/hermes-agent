@@ -230,6 +230,72 @@ def _on_github(scene, monkeypatch, tid, head):
     monkeypatch.setattr(transport, "_exchange", exchange)
 
 
+def _lagging(scene, monkeypatch, tid, head, stale, broken=None, latency=0):
+    """After _on_github: once a push moved the delivery branch on from ``head``, GitHub's first ``stale`` reads of
+    pull request 41 still show it at ``head``, each read of it or of the branch takes ``latency`` seconds, and with
+    ``broken`` ("pull_request" or "branch") every read of that one after the first answers what the step cannot use.
+    The publish step's clock and sleep are the test's own, so a pause only moves that clock on. Returns what was
+    seen after the push, the clock at each read of the pull request and of the branch, the pauses and every push;
+    its ``stale`` and ``broken`` may be changed."""
+    kb, root, repo, gh = scene
+    from hermes_cli import kanban_delivery as kd
+    from hermes_cli import kanban_delivery_github as transport
+
+    branch = f"delivery/{tid}"
+    reads = {f"/repos/{REPO}/pulls/41": "pulls", f"/repos/{REPO}/git/ref/heads/{branch}": "branches"}
+    lag = {"stale": stale, "broken": broken, "now": 1000.0, "pulls": [], "branches": [], "pauses": [], "pushes": []}
+    inner, push = transport._exchange, transport.GitHubTransport.push
+
+    def exchange(method, target, authorization, payload=None):
+        read = reads.get(urlsplit(target).path) if method == "GET" else None
+        if read is None or _git(gh["bare"], "rev-parse", f"refs/heads/{branch}") == head:
+            return inner(method, target, authorization, payload)
+        lag[read].append(lag["now"])
+        lag["now"] += latency
+        if (lag["broken"], read) == ("branch", "branches") and len(lag["pulls"]) > 1:
+            return 200, {"ref": f"refs/heads/{branch}", "object": {"sha": "not-a-sha"}}
+        if (lag["broken"], read) == ("pull_request", "pulls") and len(lag["pulls"]) > 1:
+            raise transport.GitHubTransportError("bad_response")  # what a 2xx body of no JSON object or list raises
+        status, answer = inner(method, target, authorization, payload)
+        if read == "pulls" and len(lag["pulls"]) <= lag["stale"]:
+            answer = {**answer, "head": {"sha": head}}
+        return status, answer
+
+    def pushed(self, worktree, to, sha, *, expected):
+        lag["pushes"].append((to, sha, expected))
+        return push(self, worktree, to, sha, expected=expected)
+
+    def sleep(seconds):
+        lag["pauses"].append(seconds)
+        lag["now"] += seconds
+
+    monkeypatch.setattr(transport, "_exchange", exchange)
+    monkeypatch.setattr(transport.GitHubTransport, "push", pushed)
+    monkeypatch.setattr(kd, "_clock", lambda: lag["now"])
+    monkeypatch.setattr(kd, "_sleep", sleep)
+    return lag
+
+
+def _lags(scene, monkeypatch, **lagging):
+    """Card B's clean update of an approved head H, GitHub's pull request 41 lagging behind its push as _lagging
+    makes it. Returns the card, H, main and what _lagging saw."""
+    kb, root, repo, gh = scene
+    tid, head, base = _approved_head(scene)
+    _on_github(scene, monkeypatch, tid, head)
+    lag = _lagging(scene, monkeypatch, tid, head, **lagging)
+    main = _main_moves(scene, "docs/other.md", "other\n")
+    _setting(root, "true")
+    return tid, head, main, lag
+
+
+def _ledger(kb, tid) -> list:
+    """The source card's delivery rows, oldest first: the head, its pull request's number, head and state, the
+    publish lease and the refusal."""
+    return [tuple(row.values()) for row in _raw(
+        kb.kanban_db_path(), "SELECT source_head, pull_request_number, pull_request_head, pull_request_state, "
+        "publish_lease, publish_refusal FROM kanban_deliveries WHERE source_task_id = ? ORDER BY id", tid)]
+
+
 def _returned(kb, repo, gh, tid, head, main, reason, branches):
     """H went back to its builder: one continuation card for the builder on a branch at H, no update card, no
     card in review and no other branch, nothing merged, and the row returned for changes. The card's body says why
@@ -514,6 +580,107 @@ def test_a_clean_update_merges_after_ci_and_the_security_review_at_exactly_the_u
     assert _parents(repo, landed["merge"]) == [main, update]
     assert _intaken(update) == [landed["merge"]] and _intaken(head) == []
     assert _raw(db, "SELECT id FROM tasks WHERE status = 'review'") == []
+
+
+def test_a_clean_update_whose_pull_request_shows_the_pushed_head_on_the_third_read_is_recorded(exact, monkeypatch):
+    """GitHub moves the pull request a few seconds after the push to its branch: the first two reads after the
+    clean update's push still show H. The step reads the pull request and the branch again after a pause, and
+    records U at the third read, as it records a clean update GitHub showed at once."""
+    kb, root, repo, gh = exact
+    tid, head, main, lag = _lags(exact, monkeypatch, stale=2)
+
+    _tick(kb)
+
+    [updated] = _updated(kb, tid)
+    update = updated["update_head"]
+    assert lag["pushes"] == [(f"delivery/{tid}", update, head)]
+    assert (len(lag["pulls"]), len(lag["branches"]), len(lag["pauses"])) == (3, 3, 2)
+    assert 0 < lag["pulls"][-1] - lag["pulls"][0] <= 60
+    assert _ledger(kb, tid) == [(head, 41, head, "updated", None, None), (update, 41, update, "open", None, None)]
+    published = [payload for kind, payload in _events(kb, tid) if kind == "delivery_published"][-1]
+    assert (published["head"], published["pull_request_number"], published["state"]) == (update, 41, "clean_update")
+    assert [kind for kind, _ in _events(kb, tid) if kind in ("delivery_refused", "delivery_adopted")] == []
+
+
+def test_a_clean_update_whose_pull_request_never_shows_the_pushed_head_within_the_bound_is_parked_head_moved(
+        exact, monkeypatch):
+    """GitHub's pull request never shows U, and each read takes a second: the step reads the pull request and the
+    branch six times, the last no later than 60 seconds after the first, then parks U with head_moved, recorded
+    once, as before the wait."""
+    kb, root, repo, gh = exact
+    tid, head, main, lag = _lags(exact, monkeypatch, stale=99, latency=1)
+
+    _tick(kb)
+
+    [updated] = _updated(kb, tid)
+    update = updated["update_head"]
+    assert lag["pushes"] == [(f"delivery/{tid}", update, head)]
+    assert (len(lag["pulls"]), len(lag["branches"]), len(lag["pauses"])) == (6, 6, 5)
+    assert sum(lag["pauses"]) <= 60 and lag["pulls"][-1] - lag["pulls"][0] <= 60
+    assert _ledger(kb, tid) == [(head, 41, head, "updated", None, None), (update, None, None, None, None, "head_moved")]
+    assert [(kind, payload["code"], payload["head"]) for kind, payload in _events(kb, tid)
+            if kind in ("delivery_refused", "delivery_adopted") or payload.get("head") == update] == [
+        ("delivery_refused", "head_moved", update)]
+
+
+def test_a_head_moved_clean_update_is_adopted_on_the_next_pass_once_github_shows_its_head(exact, monkeypatch):
+    """U parked with head_moved stays parked while GitHub's pull request still shows H. Once the pull request and
+    the branch both show U, the next pass adopts it: one delivery_adopted event naming the earlier head_moved
+    refusal, then U recorded as a clean update of pull request 41, as if it had been recorded at once, with nothing
+    pushed or opened again. A later pass adopts nothing more."""
+    kb, root, repo, gh = exact
+    db = kb.kanban_db_path()
+    tid, head, main, lag = _lags(exact, monkeypatch, stale=99)
+    _tick(kb)
+    update = _updated(kb, tid)[0]["update_head"]
+    parked, events = _ledger(kb, tid), _events(kb, tid)
+    assert parked == [(head, 41, head, "updated", None, None), (update, None, None, None, None, "head_moved")]
+
+    _tick(kb)  # GitHub still shows H on the pull request: nothing changes
+
+    assert (_ledger(kb, tid), _events(kb, tid)) == (parked, events)
+    lag["stale"] = 0  # GitHub moved the pull request to U
+
+    _tick(kb)
+
+    [row] = _raw(db, "SELECT id FROM kanban_deliveries WHERE source_head = ?", update)
+    [refused] = _raw(db, "SELECT id FROM task_events WHERE task_id = ? AND kind = 'delivery_refused'", tid)
+    assert _ledger(kb, tid) == [(head, 41, head, "updated", None, None), (update, 41, update, "open", None, None)]
+    adopted = _events(kb, tid)[len(events):]
+    assert [(kind, payload["head"]) for kind, payload in adopted] == [
+        ("delivery_adopted", update), ("delivery_bound", update), ("delivery_published", update)]
+    assert adopted[0][1] == {"delivery_id": row["id"], "head": update, "pull_request_number": 41,
+                             "refusal": "head_moved", "refusal_event_id": refused["id"]}
+    assert (adopted[1][1]["base_commit"], adopted[2][1]["pull_request_number"], adopted[2][1]["state"]) == (
+        main, 41, "clean_update")
+    assert (lag["pushes"], _closes(gh)) == ([(f"delivery/{tid}", update, head)], [])
+
+    _tick(kb)
+
+    assert [kind for kind, _ in _events(kb, tid)].count("delivery_adopted") == 1
+    assert len(lag["pushes"]) == 1
+
+
+@pytest.mark.parametrize("read, code", [("pull_request", "bad_response"), ("branch", "branch_unreadable")])
+def test_a_clean_update_parked_for_any_other_reason_stays_parked_on_the_next_pass(exact, monkeypatch, read, code):
+    """While the step waits for GitHub to show U, the pull request (``read`` "pull_request") or the branch answers
+    what the step cannot use: U is parked with that refusal, not head_moved. Once GitHub shows U on both, later
+    passes leave it parked and read nothing for it: only head_moved is adopted."""
+    kb, root, repo, gh = exact
+    tid, head, main, lag = _lags(exact, monkeypatch, stale=1, broken=read)
+    _tick(kb)
+    update = _updated(kb, tid)[0]["update_head"]
+    parked, events, reads = _ledger(kb, tid), _events(kb, tid), (len(lag["pulls"]), len(lag["branches"]))
+    assert parked == [(head, 41, head, "updated", None, None), (update, None, None, None, None, code)]
+    assert [(payload["code"], payload["head"]) for kind, payload in events if kind == "delivery_refused"] == [
+        (code, update)]
+    lag.update(stale=0, broken=None)  # GitHub shows U on the pull request and the branch
+
+    _tick(kb)
+    _tick(kb)
+
+    assert (_ledger(kb, tid), _events(kb, tid)) == (parked, events)
+    assert ((len(lag["pulls"]), len(lag["branches"])), lag["pushes"]) == (reads, [(f"delivery/{tid}", update, head)])
 
 
 def test_an_update_where_main_changed_an_owned_test_file_still_goes_to_its_builder(exact):
