@@ -95,6 +95,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli import kanban_provider_stops as _provider_stops
 from hermes_cli.kanban_archived_followups import archive_recorded_review_followups
+from hermes_cli.kanban_handover_guard import refuse_early, rollback_task_branch
 from hermes_cli.kanban_replaced_cards import replaced_task_ids
 from hermes_cli.kanban_risk_tier import (
     active_run_box_seconds,
@@ -25921,12 +25922,13 @@ def _review_approval_head(
 
 
 class _SavedResultHandoverRefused(Exception):
-    """Internal: the review transition refused a saved-result handover.
+    """Internal: :func:`complete_task` refused a saved-result handover.
 
     Raised by :func:`complete_task` in place of ``False``, and only for the
     kernel's saved-patch handovers (:func:`_hand_over_saved_patch` and
-    :func:`_complete_run_handover_before_timeout`), so that each records
-    :func:`request_review`'s own reason rather than a bare refusal.
+    :func:`_complete_run_handover_before_timeout`), so that each records the
+    refusal's own reason rather than a bare refusal: :func:`request_review`'s,
+    or that of a refusal made before anything is written (``refuse_early``).
     """
 
 
@@ -26048,7 +26050,9 @@ def complete_task(
     park hands it on unchanged to :func:`request_review`, which records that
     handover in the transaction that parks the card. When that review
     transition refuses, :class:`_SavedResultHandoverRefused` carries
-    ``request_review``'s reason instead of ``False``.
+    ``request_review``'s reason instead of ``False``, and the two refusals
+    made before anything is written (a parent card not finished, no reviewer
+    the card can be parked for) carry their own.
 
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
@@ -26066,7 +26070,9 @@ def complete_task(
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
-        return False
+        return refuse_early(
+            "a parent card is not finished", _saved_result_attachment_id,
+        )
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -26112,7 +26118,7 @@ def complete_task(
             _log.warning(
                 "kanban: refusing review handover for %s: %s", task_id, unassignable,
             )
-            return False
+            return refuse_early(unassignable, _saved_result_attachment_id)
 
     # ... and WHAT this call is, likewise, before any of it is acted on. The
     # human approval of a card parked for review is classified HERE, ahead of
@@ -31627,11 +31633,10 @@ def _rollback_worktree_materialization(
     — so no successor can be claimed between that check and the reset: the
     write lock is the lease.
 
-    ``materialized_head`` is the commit this call itself produced. When it is
-    given and the worktree has moved on since — a different HEAD, or
-    uncommitted changes — nothing is touched, and the branch is moved back
-    with an old-value check (``git update-ref``), so a HEAD that moved after
-    that check is never reset either.
+    The restore itself is :func:`rollback_task_branch` on ``task.branch_name``:
+    only the task branch moves back, with an old-value check against
+    ``materialized_head`` (the commit this call itself produced), and the
+    worktree is reset only when it has that branch checked out and is clean.
     """
     task = get_task(conn, task_id)
     if task is None or not task.workspace_path:
@@ -31643,52 +31648,10 @@ def _rollback_worktree_materialization(
         ).fetchone()
         if later_run is not None:
             return
-    workspace = Path(task.workspace_path).expanduser()
-    if materialized_head is not None:
-        current_head = str(
-            _git_output(workspace, "rev-parse", "--verify", "HEAD")
-        ).strip()
-        moved_on = current_head != materialized_head or bool(
-            _git_output(workspace, "status", "--porcelain=v1", "-z", binary=True)
-        )
-        if moved_on:
-            return
-    try:
-        if materialized_head is not None:
-            try:
-                _git_mutation(
-                    workspace, "update-ref", "-m", "kanban: roll back materialization",
-                    "HEAD", original_head, materialized_head,
-                )
-            except WorktreeScopeError:
-                current_head = str(
-                    _git_output(workspace, "rev-parse", "--verify", "HEAD")
-                ).strip()
-                if current_head != materialized_head:
-                    return
-                raise
-            _git_mutation(workspace, "reset", "--hard")
-        else:
-            subprocess.run(
-                ["git", "-C", str(workspace), "merge", "--abort"],
-                capture_output=True,
-                timeout=30,
-                check=False,
-            )
-            _git_mutation(workspace, "reset", "--hard", original_head)
-        dirty = _git_output(
-            workspace, "status", "--porcelain=v1", "-z", binary=True
-        )
-        if dirty:
-            raise WorktreeScopeError(
-                "isolated worktree remained dirty after kernel rollback"
-            )
-    except WorktreeScopeError:
-        raise
-    except Exception as exc:
-        raise WorktreeScopeError(
-            f"could not restore isolated worktree after failed handoff: {exc}"
-        ) from exc
+    rollback_task_branch(
+        Path(task.workspace_path).expanduser(), task.branch_name,
+        original_head, materialized_head,
+    )
 
 
 def _record_kernel_created_commit(task: Any, workspace: Path, *, kind: str) -> str:
