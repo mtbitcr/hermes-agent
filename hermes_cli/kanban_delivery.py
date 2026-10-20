@@ -682,9 +682,11 @@ def publish_delivery(db_path: Path, delivery_id: int, holder: str) -> dict:
         update = None
         if approval["bound_head"] not in (None, approval["head_commit"]):
             # Card B: a head other than H is admitted only as a clean update of H's approval, on the kernel's
-            # record of that update and git's parents of the head, both judged by the fence.
-            update = {"record": _clean_record(conn, source, approval["bound_head"]),
-                      "parents": _parents(workdir, approval["bound_head"])}
+            # record of that update, its records of the update heads before it and git's parents of the head,
+            # all judged by the fence.
+            clean = _clean_record(conn, source, approval["bound_head"])
+            update = {"record": clean, "parents": _parents(workdir, approval["bound_head"]),
+                      "chain": _update_chain(conn, source, clean)}
         # The approval half of T1 answers before GitHub is touched: for a recorded clean update, H's approval.
         early = decide_publish({**approval, "bound_head": approval["head_commit"]} if update and update["record"]
                                else approval, dict(_NO_LEDGER), dict(_NO_REMOTE))
@@ -984,6 +986,22 @@ def _clean_record(conn: sqlite3.Connection, source: str, head: str) -> Optional[
             if isinstance(record, dict) and record.get("update_head") == head:
                 return record
     return None
+
+
+def _update_chain(conn: sqlite3.Connection, source: str, record: Optional[dict]) -> list:
+    """Card B: the kernel's records (:func:`_clean_record`) of each earlier update head that ``record`` names as its
+    previous_update_head, newest first, which the fence reads back to the approved head. The walk ends at a record
+    that names none, a head with no record or a head named twice."""
+    chain, named = [], set()
+    previous = record.get("previous_update_head") if isinstance(record, dict) else None
+    while isinstance(previous, str) and previous not in named:
+        named.add(previous)
+        link = _clean_record(conn, source, previous)
+        if link is None:
+            break
+        chain.append(link)
+        previous = link.get("previous_update_head")
+    return chain
 
 
 def _parents(workdir: Optional[Path], head: str) -> list:

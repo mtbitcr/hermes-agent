@@ -173,14 +173,19 @@ def decide_publish(approval: dict, ledger: dict, remote: dict, update: dict | No
     none), its head and state, and head_is_ancestor (git: that head is an ancestor of the bound head).
     remote: branch_head (None when the branch is absent) and open_pulls [{number, head}].
     update (card B), for a bound head other than H: record, the kernel's clean-update record naming
-    the bound head (the source card's delivery_updated event, None when none), and git's parents
-    of the bound head. Only through that record is the bound head U admitted, never as reviewed,
-    as a clean update of the approval of H: clean exactly True, naming H, U and as main U's second
-    parent, U's first being H; the one pull request, recorded at H and left updated, then moves
-    to U by a fast-forward. Owner rule 1: the flags and head_is_ancestor are bools, every head
-    and the base 40-character lowercase hex SHAs, pull_request and each number positive ints
-    (numbers unique), reviewer, implementer and state non-empty strs; head and state may be None
-    only when pull_request is; record None or a dict, and parents a list of SHAs.
+    the bound head (the source card's delivery_updated event, None when none), git's parents
+    of the bound head, and chain, the kernel's records of each earlier update head the record
+    names as its previous_update_head, newest first ([] when it names none). Only through that
+    record is the bound head U admitted, never as reviewed, as a clean update of the approval of
+    H: clean exactly True, naming H, U and as main U's second parent, U's first being H; the one
+    pull request, recorded at H and left updated, then moves to U by a fast-forward. A later
+    update moves on the same way from the update head U1 its record names: U's first parent is
+    U1, the pull request is recorded at U1 and left updated, and every link of the chain is such
+    a clean record of the approval of H, each naming the head before it, back to H. Owner rule 1:
+    the flags and head_is_ancestor are bools, every head and the base 40-character lowercase hex
+    SHAs, pull_request and each number positive ints (numbers unique), reviewer, implementer and
+    state non-empty strs; head and state may be None only when pull_request is; record None or a
+    dict, parents a list of SHAs, and chain, when given, a list of dicts.
     """
     fault = next((fact for fact, valid in _publish_facts(approval, ledger, remote, update) if not valid), None)
     if fault:
@@ -233,28 +238,47 @@ def decide_publish(approval: dict, ledger: dict, remote: dict, update: dict | No
 
 def _clean_update(head: str, updated: str, update: dict, ledger: dict, remote: dict) -> Decision:
     # Card B: the bound head U only as the kernel's clean update of the approval of H, the pull request of H moved on.
+    # A later one moves on from the update head its record names, U's first parent, through a clean chain back to H.
     record, parents = update["record"], update["parents"]
     if record.get("clean") is not True or record.get("update_head") != updated:
         return _refuse("not_clean_update", f"no clean-update record of the kernel names {updated}")
-    if record.get("head") != head or parents[:1] != [head]:
-        return _refuse("not_clean_update", f"the clean update to {updated} is not one of the approved head {head}")
+    previous = record.get("previous_update_head", head)
+    if record.get("head") != head or parents[:1] != [previous]:
+        return _refuse("not_clean_update", f"the clean update to {updated} is not one of the approved head {head}"
+                       + ("" if previous == head else f" by a fast-forward of {previous}"))
+    if not _clean_chain(head, previous, update.get("chain", [])):
+        return _refuse("not_clean_update", f"the update heads before {updated} are not each a clean update of the "
+                       f"approval of {head} by the kernel's record")
     if parents[1:] != [record.get("observed_main")]:
         return _refuse("not_clean_update", f"the clean-update record names another main than {updated} is built on")
     recorded, branch, pulls = ledger["pull_request"], remote["branch_head"], remote["open_pulls"]
     if any(pull["number"] != recorded for pull in pulls):
         return _refuse("second_pull_request", "an open pull request other than the recorded one exists")
-    if (ledger["head"], ledger["state"]) != (head, "updated"):
-        return _refuse("head_moved", f"the ledger does not record the pull request of {head} as updated")
+    if (ledger["head"], ledger["state"]) != (previous, "updated"):
+        return _refuse("head_moved", f"the ledger does not record the pull request of {previous} as updated")
     if not pulls:
         return _refuse("pull_request_not_open", "the recorded pull request is not open")
     if not ledger["head_is_ancestor"]:
-        return _refuse("not_fast_forward", f"{head} is not an ancestor of {updated}")
+        return _refuse("not_fast_forward", f"{previous} is not an ancestor of {updated}")
     admitted = f"{updated} is a clean update of the approval of {head} on main {parents[1]}, by the kernel's record"
-    if pulls[0]["head"] == head and branch == head:
-        return Decision(True, "push_fast_forward", f"push {updated} with a lease expecting exactly {head}: {admitted}")
+    if pulls[0]["head"] == previous and branch == previous:
+        return Decision(True, "push_fast_forward",
+                        f"push {updated} with a lease expecting exactly {previous}: {admitted}")
     if pulls[0]["head"] == updated and branch == updated:
         return Decision(True, "adopt_fast_forward", f"the pull request already holds {updated}: {admitted}; record it")
-    return _refuse("head_moved", "the branch or the pull request is at neither the approved head nor its update")
+    return _refuse("head_moved", "the branch or the pull request is at neither "
+                   + ("the approved head" if previous == head else f"the update head {previous}") + " nor its update")
+
+
+def _clean_chain(head: str, previous: str, chain: list) -> bool:
+    # Card B: each earlier link, newest first, is the kernel's clean-update record of the approval of H whose update
+    # head is the head the link before it moved on from, back to H's own update: none missing, none left over.
+    for link in chain:
+        if previous == head or link.get("clean") is not True or (link.get("head"), link.get("update_head")) != (
+                head, previous):
+            return False
+        previous = link.get("previous_update_head", head)
+    return previous == head
 
 
 def _publish_facts(approval: dict, ledger: dict, remote: dict, update: dict | None = None):
@@ -286,6 +310,9 @@ def _publish_facts(approval: dict, ledger: dict, remote: dict, update: dict | No
         yield "update.record", update["record"] is None or type(update["record"]) is dict
         yield from _shape("update.parents", update["parents"])
         yield "update.parents", all(_is_sha(parent) for parent in update["parents"])
+        chain = update.get("chain", [])
+        yield from _shape("update.chain", chain)
+        yield "update.chain", all(type(link) is dict for link in chain)
 
 
 def decide_rerun(policy: Policy, repo: str, head: str, jobs: list[dict], ledger: dict) -> Decision:
