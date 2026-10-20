@@ -1,20 +1,12 @@
 {
   "_reasons": {
-<<<<<<< 7612462b908249e4effe5931c18cbf135c293318
     "gateway/platforms/api_server.py": "16182 to 16186: +4 lines, the measured net growth of card 2 (findings 106, 107). The failed run reason an owner reads, in the run status, the durable run status and the run events, and the planner prose of a readable history reply now pass the shared owner text policy, through four thin calls into hermes_cli/owner_workspace.py.",
-    "hermes_cli/kanban_db.py": "39491 to 39497: +6 lines, the measured net growth of card C1 (finding 116). A repeated needs_input owner question now stays blocked, waiting for the owner, instead of going to triage. Owner rule of 2026-10-13."
-  },
-  "cron/scheduler.py": 7520,
-  "gateway/platforms/api_server.py": 16186,
-  "hermes_cli/kanban_db.py": 39497,
-=======
     "hermes_cli/kanban_db.py": "39491 to 39497: +6 lines, the measured net growth of card C1 (finding 116). A repeated needs_input owner question now stays blocked, waiting for the owner, instead of going to triage. Owner rule of 2026-10-13. 39497 to 39499: +2 lines, the measured net growth of card 2 (findings 47 and 78). A result edit now keeps the platform-written run receipts; the merge lives in hermes_cli/kanban_run_metadata_merge.py. Owner rule of 2026-10-13. 39499 to 39501: +2 lines, the measured net growth of the round-2 rework of card 2 (finding 47). The ending mark is bound to the run, not to a session: a run's receipt names the tool call that ends it only when the worker's injected run is the run being stamped, also after a context compression; the check lives in tools/kanban_run_ending.py. Owner rule of 2026-10-15.",
     "tools/kanban_tools.py": "4921 to 4926: +5 lines, the measured net growth of card 2 (findings 47 and 78); the file went from 4879 to 4884 lines. Each run's receipt now names the tool call that ends the run; the mark lives in tools/kanban_run_ending.py. Owner rule of 2026-10-13."
   },
   "cron/scheduler.py": 7520,
-  "gateway/platforms/api_server.py": 16182,
+  "gateway/platforms/api_server.py": 16186,
   "hermes_cli/kanban_db.py": 39501,
->>>>>>> a32d763782b69868c735ed8fbe011e1c8f6278cc
   "plugins/kanban/dashboard/plugin_api.py": 4833,
   "tools/kanban_tools.py": 4926
 }
