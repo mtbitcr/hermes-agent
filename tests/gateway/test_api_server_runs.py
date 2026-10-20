@@ -35,7 +35,11 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from hermes_cli.owner_text import check_owner_text
 from tools import approval as approval_mod
+
+# The owner text policy's fixed sentence for a failure it does not show.
+_STORED_FAILURE = check_owner_text(None, "stored_failure")
 
 
 # ---------------------------------------------------------------------------
@@ -2736,7 +2740,10 @@ class TestRunsProviderAuthFailure:
                     await asyncio.sleep(0.05)
 
                 assert status["status"] == "failed"
-                assert status["error"] == "⚠️ Provider authentication failed: No credentials found for provider 'nous'"
+                # The owner reads the policy's sentence; the distinguished
+                # message stays in this process's transport status.
+                assert status["error"] == _STORED_FAILURE
+                assert adapter._run_statuses[run_id]["error"] == "⚠️ Provider authentication failed: No credentials found for provider 'nous'"
                 assert status["last_event"] == "run.failed"
 
 
@@ -3199,8 +3206,13 @@ class TestOrphanedRunRecovery:
 
         durable = store.run_idempotency_status("default", self._RUN_ID)
         assert durable["status"] == "failed"
-        # The bare reason, whole: the transport prefix is not part of the row.
-        assert durable["error"] == (
+        # The reason names an internal operation, so the owner reads the
+        # policy's sentence; the row itself keeps the bare reason, whole.
+        assert durable["error"] == _STORED_FAILURE
+        (stored,) = store._conn.execute(
+            "SELECT status_json FROM run_idempotency WHERE run_id = ?", (self._RUN_ID,),
+        ).fetchone()
+        assert json.loads(stored)["error"] == (
             "owner_project_plan_commit: changes declares repository ownership"
         )
         assert durable["error_code"] == "ownership_scope_unavailable"
