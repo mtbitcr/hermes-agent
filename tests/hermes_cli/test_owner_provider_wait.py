@@ -439,7 +439,9 @@ def _waiting_and_refused(root: Path, owner: ow.OwnerContext) -> dict:
     sits on a board of its own, so its worker env is pinned away from the
     Project's board.
     """
-    project = _project(owner, "Wait Pilot")
+    with pytest.MonkeyPatch.context() as shared_root:
+        shared_root.setenv("HERMES_HOME", str(root))
+        project = _project(owner, "Wait Pilot")
     board = project["board"]
     with _board(board) as conn:
         waiting = _card(conn, project, "Draft the placeholder brief")
