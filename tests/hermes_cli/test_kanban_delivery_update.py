@@ -308,6 +308,42 @@ def _cleanly_updated(scene, monkeypatch, times) -> tuple:
     return tid, head, base, updates
 
 
+def _retained(scene, monkeypatch) -> tuple:
+    """Attachment 1390's retention: card B's clean update of H to U1 on M1, then, 31 days on, of U1 to U2 on M2, main
+    moving on a docs file only each time; then the kernel's own event retention (kb.gc_events at its default 30 days)
+    removes the older events of the done source card, U1's clean record and the review handover among them, while U2's
+    own clean record stays. U2 is still delivered, but its chain no longer reaches H, so no later update of it may be
+    clean; the kernel's approval record still names H and its reviewed base on the source card. Returns the card, H,
+    its reviewed base (the base its publish bound it to), and U1 and U2 each beside the main it was built on."""
+    from hermes_cli import kanban_delivery as kd
+    from hermes_cli import kanban_delivery_update as updater
+
+    kb, root, repo, gh = scene
+    db = kb.kanban_db_path()
+    tid, head, first, lag = _lags(scene, monkeypatch, stale=0)
+    _tick(kb)  # the first clean update: pull request 41 at U1 on main M1
+    [earlier] = _updated(kb, tid)
+    [base] = [payload["base_commit"] for kind, payload in _events(kb, tid)
+              if kind == "delivery_bound" and payload["head"] == head]
+    now = kb.time.time()
+    monkeypatch.setattr(kb.time, "time", lambda: now + 31 * 24 * 3600)
+    second = _main_moves(scene, "docs/retention-second.md", "second\n")
+    _tick(kb)  # the second clean update: pull request 41 at U2 on main M2
+    later = _updated(kb, tid)[-1]
+    u1, u2 = earlier["update_head"], later["update_head"]
+    assert (later.get("clean"), later["head"], later["previous_update_head"]) == (True, head, u1)
+    with kb.connect_closing(db_path=db) as conn:
+        assert kb.gc_events(conn) > 0
+        assert (kd._clean_record(conn, tid, u1), kd._clean_record(conn, tid, u2)) == (None, later)
+        assert kd._delivers(conn, tid, kd._source_read(conn, tid), u2) is True
+        row = dict(conn.execute("SELECT *, ? AS repository FROM kanban_deliveries WHERE source_task_id = ? "
+                                "AND pull_request_head = ?", (REPO, tid, u2)).fetchone())
+        assert updater._clean_start(conn, row) is None
+        approval = kd.approval_facts(conn, tid, u2)
+    assert (approval["head_commit"], approval["base"], approval["review_head"]) == (head, base, None)
+    return tid, head, base, (u1, first), (u2, second)
+
+
 def _named(body) -> tuple:
     """What a card's body reports, each commit named in full: the commit after each "approved head", "approved at" and
     "approval of", what it calls approved; the commit after each "reviewed on", or "" for a "reviewed" naming none,
@@ -830,6 +866,125 @@ def test_each_card_after_the_first_clean_update_reports_only_the_approved_head_a
         "return": ("returned_for_changes", [])}[made]
     assert _named(card["body"]) == ({head}, {base}, {u1}) and base != first
     assert _approval(kb, tid, [u1]) == [(head, False)]
+
+
+@pytest.mark.parametrize("path, text, made, why", [
+    ("docs/retention-third.md", "third\n", "update", None),
+    ("src/impl/feature.py", "ok = False\n", "conflict", None),
+    ("src/impl/feature.py", "ok = True\n", "return", "would change another set of paths relative to main"),
+    ("src/impl/feature.py/inside.py", "inside = 1\n", "return",
+     "Merging main and the delivered head conflicts, so no update was made."),
+], ids=["update", "conflict", "return", "file-directory-return"])
+def test_after_retention_every_text_names_h_as_the_approved_head_and_u2_only_as_the_delivered_head(
+        exact, monkeypatch, tmp_path, path, text, made, why):
+    """Owner rules 1 to 6 of round 2, attachment 1390's four retention variants. After _retained, main moves once more:
+    on a docs file, which an incomplete chain still makes an update card for, as today; with the change's own file
+    written otherwise (a content conflict, the update card with the conflict marked); with the change's own contents,
+    so the update would change no path relative to main; or with a directory where U2 has its file, a conflict
+    otherwise than in content: the last two send U2 back to the builder through its continuation card, on a branch at
+    U2. One delivery pass runs under the exact environment the dispatcher injects into a worker of another board
+    (HERMES_KANBAN_DB and HERMES_KANBAN_BOARD pinned to proj-a, HERMES_KANBAN_TASK set, HERMES_HOME a profile home under
+    the root). Every text it writes names H as the approved head and H's reviewed base as the reviewed base, both as the
+    kernel's approval record of the source card names them, and U2 only as the delivered head, on the main it was built
+    on, M2: no text calls U2 or U1 approved, nor M2 or M1 reviewed, and the approval stays the approval of H. Read
+    straight off the board files and git: the independent count."""
+    from hermes_cli import kanban_delivery as kd
+
+    kb, root, repo, gh = exact
+    db = kb.kanban_db_path()
+    tid, head, base, (u1, first), (u2, second) = _retained(exact, monkeypatch)
+    main = _main_moves(exact, path, text)
+    kb.create_board("proj-a")
+    own_db = root / "kanban" / "boards" / "proj-a" / "kanban.db"
+    profile_home = root / "profiles" / IMPLEMENTER
+    profile_home.mkdir(parents=True, exist_ok=True)
+    _setting(profile_home, "true")
+    _registered(db, tid, repo, home=profile_home)  # projects live in the active profile's projects.db
+    conn = kb.connect(board="proj-a")
+    try:
+        work = kb.create_task(conn, title="other work", assignee=IMPLEMENTER)
+        claimed = kb.claim_task(conn, work, claimer=f"{IMPLEMENTER}:1")
+        env = _spawned_worker_env(kb, claimed, tmp_path / "work", "proj-a", monkeypatch)
+    finally:
+        conn.close()
+    assert (env["HERMES_KANBAN_DB"], env["HERMES_KANBAN_BOARD"], env["HERMES_KANBAN_TASK"], env["HERMES_HOME"]) == (
+        str(own_db), "proj-a", work, str(profile_home))
+    _become(env, monkeypatch)
+
+    kd.publish_step(db)  # the dispatcher's delivery step on the default board's file: review, update, publish
+
+    [card] = _raw(db, CONTINUED if made == "return" else UPDATES, tid)
+    body = card["body"]
+    assert (f"The change of {tid} was approved at {head}, reviewed on {base}. Main moved past the delivered head of "
+            f"{tid} (pull request #41 of {REPO}), update head {u2} on the main it was built on, {second}: main is at "
+            f"{main}.") in body
+    assert _named(body) == ({head}, {base}, {u2}) and base not in (first, second) and u1 not in body
+    assert _state(kb, u2, db) == ("returned_for_changes" if made == "return" else "updated")
+    if made == "return":
+        assert (card["base_commit"], card["branch_name"], _raw(db, UPDATES, tid)) == (
+            u2, f"delivery-return/{tid}-{u2[:12]}", [])
+        assert why in body
+    else:
+        update = _head(repo, card)
+        assert (card["base_commit"], _parents(repo, update), _raw(db, CONTINUED, tid)) == (main, [u2, main], [])
+        assert (f"Hand {update} over unchanged for review: the approval of {head} does not cover it" in body) is (
+            made == "update")
+        assert (NO_CHANGE_LEFT in body) is (made == "conflict")
+        message = _git(repo, "log", "-1", "--format=%B", update)
+        assert (f"The change approved at {head}, at the delivered head {u2} on the main it was built on, {second}, "
+                f"merged with main at {main}: git merge-tree --write-tree of main and the delivered head.") in message
+        assert _named(message)[:2] == ({head}, set()) and u1 not in message
+    with kb.connect_closing(db_path=db) as conn:
+        assert (kd.prove_approval(conn, tid, u2).allowed, kd.prove_approval(conn, tid, u1).allowed) == (False, False)
+    assert kb.kanban_home() == root and kb.register_db_path() == root / "kanban" / "board_register.db"
+    assert kb.get_register_entry("proj-a") is not None and kb.board_dir("proj-a") / "kanban.db" == own_db
+    assert _raw(own_db, "SELECT id FROM tasks") == [{"id": work}]
+    assert _raw(own_db, "SELECT COUNT(*) AS events FROM task_events WHERE kind LIKE 'delivery%'") == [{"events": 0}]
+    assert not (profile_home / "kanban.db").exists() and not (profile_home / "kanban").exists()
+
+
+@pytest.mark.parametrize("at", ["approved_head", "update_head"])
+def test_an_approval_record_that_cannot_name_the_approved_head_gives_the_unconfirmed_wording(exact, monkeypatch, at):
+    """Owner rule 3 of round 2. One pass leaves the row base_moved, at H itself or at the clean update head U1 of H,
+    when main moves inside the source card's owned paths, the update step held off for that pass; then the kernel's
+    approval record of the source card no longer names H, its head cleared. The next pass makes the update card as
+    today, and every text it writes says that the approval could not be confirmed and names no head as approved and no
+    base as reviewed: the row's head only as the delivered head, on the main it was built on."""
+    from hermes_cli import kanban_delivery as kd
+    from hermes_cli import kanban_delivery_update as updater
+
+    kb, root, repo, gh = exact
+    db = kb.kanban_db_path()
+    if at == "approved_head":
+        tid, head, built_on, main = _moved_on(exact)  # src/impl/other.py, inside the owned paths
+        delivered = head
+    else:
+        tid, head, base, [(delivered, built_on)] = _cleanly_updated(exact, monkeypatch, 1)
+        main = _main_moves(exact)  # src/impl/other.py, inside the owned paths
+    with monkeypatch.context() as held:
+        held.setattr(updater, "update_step", lambda db_path: None)
+        _tick(kb)
+    assert _state(kb, delivered) == "base_moved"
+    _raw(db, "UPDATE tasks SET head_commit = NULL WHERE id = ?", tid)
+    with kb.connect_closing(db_path=db) as conn:
+        assert kd.approval_facts(conn, tid, delivered)["head_commit"] is None
+
+    _tick(kb)
+
+    card = _update(kb, tid)
+    update = _head(repo, card)
+    [number] = [row["pull_request_number"] for row in _raw(
+        db, "SELECT pull_request_number FROM kanban_deliveries WHERE source_head = ?", delivered)]
+    assert (_state(kb, delivered), card["base_commit"], _parents(repo, update)) == ("updated", main, [delivered, main])
+    assert (f"The approval could not be confirmed, so no head is named as approved. Main moved past the delivered "
+            f"head {delivered} of {tid} (pull request #{number} of {REPO}), on the main it was built on, {built_on}: "
+            f"main is at {main}.") in card["body"]
+    assert f"Hand {update} over unchanged for review: no approval covers it" in card["body"]
+    assert _named(card["body"]) == (set(), set(), set())
+    message = _git(repo, "log", "-1", "--format=%B", update)
+    assert (f"The approval could not be confirmed, so no head is named as approved. The delivered head {delivered}, on "
+            f"the main it was built on, {built_on}, merged with main at {main}") in message
+    assert _named(message) == (set(), set(), set())
 
 
 def test_a_clean_update_merges_after_ci_and_the_security_review_at_exactly_the_updated_head(exact, monkeypatch):
