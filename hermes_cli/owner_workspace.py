@@ -3857,6 +3857,20 @@ def _owner_decision_reason(value: Any, *, fallback: str) -> str:
     return text[:500] or fallback
 
 
+# The title a capability suggestion gets when its own label cannot be shown,
+# by recommendation kind (``kanban_db.VALID_RECOMMENDATION_KINDS``), so the
+# owner never reads a placeholder there. Each passes the owner-text title check.
+_SUGGESTION_KIND_TITLES = {
+    "skill": "A suggested new skill",
+    "permission": "A suggested permission change",
+    "connection": "A suggested new connection",
+    "pipeline": "A suggested pipeline change",
+    "provider_model_policy": "A suggested model setting change",
+    "profile_setting": "A suggested team setting change",
+}
+_SUGGESTION_FALLBACK_TITLE = "A suggested capability change"
+
+
 def list_owner_decisions(ctx: OwnerContext, *, owner_waiting: bool = False) -> dict:
     """Project pending native gates into one owner-safe read-only inbox.
 
@@ -3913,7 +3927,7 @@ def list_owner_decisions(ctx: OwnerContext, *, owner_waiting: bool = False) -> d
                 "id", "title", "status", "created_at", "project_id",
                 "task_kind", "block_kind", "review_policy",
                 "recommendation_label", "recommendation_rationale",
-                "recommendation_decision",
+                "recommendation_decision", "recommendation_kind",
             }
             if not required <= columns:
                 raise OwnerWorkspaceError(
@@ -3922,7 +3936,8 @@ def list_owner_decisions(ctx: OwnerContext, *, owner_waiting: bool = False) -> d
             rows = conn.execute(
                 "SELECT id, title, status, created_at, task_kind, block_kind, "
                 "review_policy, recommendation_label, recommendation_rationale, "
-                "recommendation_decision FROM tasks WHERE project_id = ? AND ("
+                "recommendation_decision, recommendation_kind "
+                "FROM tasks WHERE project_id = ? AND ("
                 "(task_kind = 'work' AND status = 'blocked' "
                 "AND block_kind = 'needs_input') OR "
                 "(task_kind = 'recommendation' AND status = 'review' "
@@ -3938,7 +3953,8 @@ def list_owner_decisions(ctx: OwnerContext, *, owner_waiting: bool = False) -> d
                 capability_rows = conn.execute(
                     "SELECT id, title, status, created_at, task_kind, block_kind, "
                     "review_policy, recommendation_label, recommendation_rationale, "
-                    "recommendation_decision FROM tasks WHERE project_id = ? "
+                    "recommendation_decision, recommendation_kind "
+                    "FROM tasks WHERE project_id = ? "
                     "AND task_kind = 'work' AND status = 'blocked' "
                     "AND block_kind = 'capability' ORDER BY created_at DESC, id ASC",
                     (project_id,),
@@ -3971,7 +3987,33 @@ def list_owner_decisions(ctx: OwnerContext, *, owner_waiting: bool = False) -> d
             if task_kind == "recommendation":
                 authority = "recommendation"
                 kind = "capability"
-                title = owner_title(row["recommendation_label"])
+                raw_label = str(row["recommendation_label"] or "")
+                title = owner_title(raw_label)
+                # A label is shown only when the checker accepts it as given,
+                # its canonical text comes back unchanged and it is not one of
+                # the reserved placeholders; otherwise the kind names it.
+                label = _owner_display_text(
+                    raw_label,
+                    limit=_OWNER_TITLE_LIMIT,
+                    strip_internal_prefix=True,
+                )
+                reserved = {
+                    _owner_display_text(
+                        placeholder, limit=_OWNER_TITLE_LIMIT
+                    ).casefold()
+                    for placeholder in (
+                        _UNTITLED_WORK_ITEM, check_owner_text(None, "title"),
+                    )
+                }
+                if (
+                    not label
+                    or check_owner_text(raw_label, "title") != raw_label
+                    or title != label
+                    or label.casefold() in reserved
+                ):
+                    title = _SUGGESTION_KIND_TITLES.get(
+                        str(row["recommendation_kind"]), _SUGGESTION_FALLBACK_TITLE
+                    )
                 reason = _owner_decision_reason(
                     row["recommendation_rationale"],
                     fallback="Raphael has suggested a capability change for your review.",
@@ -4808,8 +4850,12 @@ def project_steward_snapshot(
     ``OWNER_WAITING_CAPABILITY``. Then ``active_work`` lists only running,
     review and ready work, in that order; rework a returned review opened is
     neither progress nor attention; a current capability stop waits on the
-    owner; and each decision carries its stop reason and waiting start. The
-    execution state still counts every open status as active work.
+    owner; and each decision carries its stop reason and waiting start.
+
+    The execution state reads ``working`` only while live work remains.
+    Parked work, and todo work whose every unfinished parent is itself
+    dormant, cannot move on its own: when only such work remains, the state
+    is ``waiting_for_approval``.
     """
     project_id = _bounded_text(project_id, "project_id", limit=100)
     if (
@@ -4904,11 +4950,21 @@ def project_steward_snapshot(
             )
         else:
             rows = kconn.execute(
-                "SELECT title, status, created_at, started_at, completed_at, block_kind "
-                "FROM tasks WHERE project_id = ? AND task_kind = 'work' "
+                "SELECT id, title, status, created_at, started_at, completed_at, "
+                "block_kind FROM tasks WHERE project_id = ? AND task_kind = 'work' "
                 "AND status != 'archived' ORDER BY created_at ASC",
                 (project_id,),
             ).fetchall()
+        # Each todo task's unfinished parents, to tell work that can still
+        # move from work that waits only on parked work.
+        waiting_links = kconn.execute(
+            "SELECT l.child_id, l.parent_id, p.status AS parent_status "
+            "FROM task_links l JOIN tasks c ON c.id = l.child_id "
+            "JOIN tasks p ON p.id = l.parent_id "
+            "WHERE c.project_id = ? AND c.status = 'todo' "
+            "AND p.status NOT IN ('done', 'archived')",
+            (project_id,),
+        ).fetchall()
     except sqlite3.Error as exc:
         raise OwnerWorkspaceError(
             "snapshot_unavailable", "the Project board could not be read"
@@ -4959,6 +5015,31 @@ def project_steward_snapshot(
         item for item in items
         if item["status"] in {"todo", "scheduled", "ready", "running", "review"}
     ]
+    # Dormant work cannot move on its own: parked work, then todo work whose
+    # every unfinished parent is dormant, grown until nothing more joins.
+    # Todo work with no unfinished parent stays live.
+    dormant_ids = {
+        str(row["id"]) for row in rows if row["status"] == kanban_db.PARKED_STATUS
+    } | {
+        str(link["parent_id"]) for link in waiting_links
+        if link["parent_status"] == kanban_db.PARKED_STATUS
+    }
+    waits_on: dict[str, set[str]] = {}
+    for link in waiting_links:
+        waits_on.setdefault(str(link["child_id"]), set()).add(str(link["parent_id"]))
+    grew = True
+    while grew:
+        joined = {
+            child for child, parents in waits_on.items()
+            if child not in dormant_ids and parents <= dormant_ids
+        }
+        dormant_ids |= joined
+        grew = bool(joined)
+    live_work = any(
+        row["status"] in {"todo", "ready", "running", "review"}
+        and str(row["id"]) not in dormant_ids
+        for row in rows
+    )
     shown_active_rows = active_rows
     if owner_waiting:
         # Rework a returned review opened is neither progress nor attention,
@@ -4979,8 +5060,7 @@ def project_steward_snapshot(
             and (item["block_kind"] == "needs_input" or _capability_wait(item))
         ]
         # Only work that is moving is shown as active: running, then being
-        # checked, then ready; started work first, newest first. The old
-        # active set above still decides the execution state.
+        # checked, then ready; started work first, newest first.
         shown_order = {"running": 0, "review": 1, "ready": 2}
         shown_active_rows = sorted(
             (item for item in active_rows if item["status"] in shown_order),
@@ -5086,12 +5166,15 @@ def project_steward_snapshot(
     elif attention_rows:
         execution_state = "needs_attention"
         execution_summary = "Raphael found a problem and is preparing the safest next step."
-    elif active_rows:
+    elif live_work:
         execution_state = "working"
         execution_summary = "Raphael is coordinating the approved milestone."
-    else:  # pragma: no cover - exhaustive state partition
-        execution_state = "complete"
-        execution_summary = "The approved work is complete."
+    else:
+        # Only dormant work remains: it waits for the owner's next approval.
+        execution_state = "waiting_for_approval"
+        execution_summary = (
+            "Raphael is waiting for an approved milestone before starting work."
+        )
     return {
         "schema_version": 2,
         "project": {"name": owner_project_name(project["name"])},
