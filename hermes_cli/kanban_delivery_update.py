@@ -31,7 +31,8 @@ the update is published. Another set of paths goes back to the builder through H
 does a conflict, unless git's merged tree passes the same checks and git's own messages, never the merged files, name
 only content conflicts, each in a file inside the approved and owned paths: then the update card is made the same way
 on that tree, which holds those files as git marked them, its body names them for its builder to resolve and nothing
-else, and its delivery_updated event names them as ``conflicts``.
+else, and its delivery_updated event names them as ``conflicts``. Each of these cards made past a clean update head
+names that head only as the update head, on the main it was built on: the approval and its reviewed base stay H's.
 :func:`hermes_cli.kanban_delivery.publish_step` calls :func:`update_step` once per pass, with the setting on only.
 """
 
@@ -67,18 +68,37 @@ _UPDATE_BODY = _MOVED + (
     "recorded base is main, so it changes the same paths relative to main as the approved change did relative to its "
     "base, all within the source card's owned paths. Hand {update} over unchanged for review: the approval of {head} "
     "does not cover it, and only this card's own review delivers it.")
-_CONFLICT_BODY = _MOVED + (
+_CONFLICT = (
     " Merging it with the approved change conflicts in these files: {conflicts}. This card's branch {branch} at "
     "{update} is on current main with the conflict marked. Resolve the marked conflicts in those files only, change "
     "nothing else, and hand over for review. If your resolution leaves no change against main, the approved change "
     "is no longer needed. Do not hand over. Block this card with the reason: The approved change is no longer needed "
     "after a change on main.")
-_RETURN_BODY = _MOVED + " {why} Bring the change up to date on main and hand it over for review again."
+_CONFLICT_BODY = _MOVED + _CONFLICT
+_RETURN = " {why} Bring the change up to date on main and hand it over for review again."
+_RETURN_BODY = _MOVED + _RETURN
 _WHY = {
     "conflict": "Merging main and the approved head conflicts, so no update was made.",
     "paths": ("The update on main would change another set of paths relative to main than the approved change "
               "did relative to its base, or paths outside the source card's owned paths, so no update was made."),
 }
+# Card B: the same cards past a clean update head U of H, which no review saw. U is named only as the update head, on
+# the main it was built on; the approval stays H's, on the base H was reviewed on, as the kernel's record of H's own
+# update names it.
+_LATER_MOVED = ("Main moved past the update head {head} of {source} (pull request #{number} of {repository}), "
+                "brought up to date cleanly on main {base} from the approved head {approved}, reviewed on {reviewed}: "
+                "main is at {main}.")
+_LATER_BODIES = {
+    _UPDATE_BODY: _LATER_MOVED + (
+        " This card carries that change brought up to date on main as {update}, on branch {branch}: git merge-tree "
+        "--write-tree of main and the update head, committed with the update head and main as its two parents. Its "
+        "recorded base is main, so it changes the same paths relative to main as the approved change did relative to "
+        "its base, all within the source card's owned paths. Hand {update} over unchanged for review: the approval "
+        "of {approved} does not cover it, and only this card's own review delivers it."),
+    _CONFLICT_BODY: _LATER_MOVED + _CONFLICT,
+    _RETURN_BODY: _LATER_MOVED + _RETURN,
+}
+_LATER_WHY = {**_WHY, "conflict": "Merging main and the update head conflicts, so no update was made."}
 
 
 def update_step(db_path: Path) -> None:
@@ -127,6 +147,8 @@ def _update(db_path: Path, row: dict) -> Optional[str]:
         raise kd.PublishRefused("no_repository", f"the project folder of {source} does not hold {head}, {base} "
                                 f"and {main} of {row['repository']}")
     facts = {"head": head, "base": base, "main": main, "source": source}
+    if chain:  # card B: the row is at an update head of H, whose approval and reviewed base its cards name
+        facts.update(approved=chain[0]["head"], reviewed=kd._sha(chain[-1].get("reviewed_base")))
     with kb.connect_closing(db_path=db_path) as conn:
         made = _made(conn, row, main)
     if made is not None:  # the kernel's record of the update card: nothing is computed or made again
@@ -167,7 +189,7 @@ def _update(db_path: Path, row: dict) -> Optional[str]:
         if changed is not None:
             facts["main_changed"] = changed
     branch = _BRANCH.format(source=source, head=head[:12], main=main[:12])
-    message = _LATER.format(approved=chain[0]["head"], **facts) if chain else _MESSAGE.format(**facts)
+    message = _LATER.format(**facts) if chain else _MESSAGE.format(**facts)
     commit = _branch(root, branch, tree, head, main, message)
     return _updated(db_path, row, facts, (root, branch, commit))
 
@@ -377,10 +399,8 @@ def _updated(db_path: Path, row: dict, facts: dict, update: Optional[tuple]) -> 
             if update is None:
                 return None
             root, branch, commit = update
-            body = (_CONFLICT_BODY if "conflicts" in facts else _UPDATE_BODY).format(
-                head=facts["head"], source=facts["source"], number=row["pull_request_number"],
-                repository=row["repository"], base=facts["base"], main=facts["main"], update=commit, branch=branch,
-                conflicts=", ".join(facts.get("conflicts", ())))
+            body = _body(_CONFLICT_BODY if "conflicts" in facts else _UPDATE_BODY, row, facts, update=commit,
+                         branch=branch, conflicts=", ".join(facts.get("conflicts", ())))
             made = kd._continuation(conn, db_path, {**row, "pull_request_head": commit}, body, (root, branch))
             # The kernel's scoped completion hands over only committed changes since the recorded base, so the
             # unchanged updated head is handed over against main, which it holds: exactly the approved paths.
@@ -404,10 +424,17 @@ def _returned(db_path: Path, row: dict, facts: dict, reason: str) -> Optional[st
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if not _still_moved(conn, row):
             return None
-        body = _RETURN_BODY.format(head=facts["head"], source=facts["source"], number=row["pull_request_number"],
-                                   repository=row["repository"], base=facts["base"], main=facts["main"],
-                                   why=_WHY[reason])
+        body = _body(_RETURN_BODY, row, facts, why=(_LATER_WHY if "approved" in facts else _WHY)[reason])
         kd._continuation(conn, db_path, row, body, branch)
         conn.execute("UPDATE kanban_deliveries SET pull_request_state = 'returned_for_changes' WHERE id = ?",
                      (row["id"],))
     return "returned_for_changes"
+
+
+def _body(template: str, row: dict, facts: dict, **text) -> str:
+    """The body of a card made past the row's head: ``template``, naming that head as the approved head, or, past a
+    clean update head of H (card B), its later form, naming that head only as the update head on the main it was built
+    on, and the approval and its reviewed base as H's."""
+    return (_LATER_BODIES[template] if "approved" in facts else template).format(
+        head=facts["head"], source=facts["source"], number=row["pull_request_number"], repository=row["repository"],
+        base=facts["base"], main=facts["main"], approved=facts.get("approved"), reviewed=facts.get("reviewed"), **text)
