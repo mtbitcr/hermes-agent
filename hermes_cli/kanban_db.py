@@ -19386,7 +19386,8 @@ def create_task(
     """Create a new task and optionally link it under parent tasks.
 
     Returns the new task id.  Status is ``ready`` when there are no
-    parents (or all parents already ``done``), otherwise ``todo``.
+    parents (or all are ``done`` and, outside a caller's transaction,
+    ``_parents_satisfied``), otherwise ``todo``.
     If ``triage=True``, status is forced to ``triage`` regardless of
     parents — a specifier/triager is expected to promote the task to
     ``todo`` once the spec is fleshed out.
@@ -19723,6 +19724,9 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    # Under a caller's transaction the card is complete only at that commit: the kernel names a card that carries
+    # its parent's change on after making it. So only a card this call commits is re-gated below (kanban_merge_gate).
+    composed = getattr(conn, "in_transaction", False)
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -19845,6 +19849,9 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                if task_status == "ready" and parents and not composed and not _parents_satisfied(conn, task_id):
+                    task_status = "todo"  # re-gated once its owned paths and parent links exist
+                    conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
                 # Notify-sub inheritance (ACK-edge: the originating channel
                 # still hears about a child that BLOCKs, not just the final
                 # fan-in) is handled by the single-owner helper below —
@@ -24275,7 +24282,8 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     return all(parent_satisfies(conn, parent, task_id) for parent in conn.execute(
         "SELECT p.id, p.status, p.owned_paths FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
-        f"WHERE l.child_id = ? AND p.task_kind IN {_DEPENDENCY_PARENT_KINDS}",
+        f"WHERE l.child_id = ? AND p.task_kind IN {_DEPENDENCY_PARENT_KINDS} "
+        "ORDER BY p.status IN ('done', 'archived')",  # an open parent answers before the setting is read
         (task_id,),
     ).fetchall())
 
@@ -28872,8 +28880,8 @@ def promote_task(
 
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
-    entry. Refuses to promote if any parent dep is not in a terminal
-    state (`done`/`archived`) unless ``force=True``. Does NOT change
+    entry. Refuses to promote while any parent dep does not satisfy it
+    (``kanban_merge_gate``) unless ``force=True``. Does NOT change
     assignee or claim state. Returns ``(True, None)`` on success and
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
@@ -28893,14 +28901,14 @@ def promote_task(
 
     if not force:
         parents = conn.execute(
-            "SELECT t.id, t.status FROM tasks t "
+            "SELECT t.id, t.status, t.owned_paths FROM tasks t "
             "JOIN task_links l ON l.parent_id = t.id "
             f"WHERE l.child_id = ? AND t.task_kind IN {_DEPENDENCY_PARENT_KINDS}",
             (task_id,),
         ).fetchall()
         unsatisfied = [
             p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
+            if not parent_satisfies(conn, p, task_id)
         ]
         if unsatisfied:
             return False, (

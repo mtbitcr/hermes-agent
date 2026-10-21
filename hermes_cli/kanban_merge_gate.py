@@ -5,11 +5,12 @@ whose owned paths overlap the parent's also waits until the parent's change has
 merged: the parent card, or a card that carries its change on, has a delivery row
 in state merged. A card's delivery_updated or review_followup_recorded event names
 the card that carries its change on; that chain is followed for at most eight links,
-and a card on it is never held by its own parent. A parent with no delivery row
-satisfies the child at approval, as before, and a change that can never merge holds
-the child: there is no timeout and no release. The four parent gates of
-hermes_cli/kanban_db.py ask this one predicate, so promotion and claim never
-disagree. The gate writes nothing.
+and a card on it is never held by its own parent. With delivery off the delivery
+ledger is not read; a parent with no delivery row, also on a board opened without
+that ledger, satisfies the child at approval, as before, and a change that can never
+merge holds the child: there is no timeout and no release. The four parent gates of
+hermes_cli/kanban_db.py, manual promotion and the ready decision of create_task ask
+this one predicate, so promotion and claim never disagree. The gate writes nothing.
 """
 
 from __future__ import annotations
@@ -52,11 +53,19 @@ def parent_satisfies(conn: sqlite3.Connection, parent: sqlite3.Row, child_id: st
     """Whether ``parent``, a tasks row with id, status and owned_paths, satisfies ``child_id``."""
     if parent["status"] not in ("done", "archived"):
         return False
+    # Late imports: the facade imports this module at load time.
+    from hermes_cli.kanban_delivery import delivery_settings
+
+    if not delivery_settings():
+        return True  # delivery off: satisfied at approval, as before, and the delivery schema is not read
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kanban_deliveries'"
+    ).fetchone() is None:
+        return True  # a board opened without the delivery ledger has no delivery row
     if conn.execute(
         "SELECT 1 FROM kanban_deliveries WHERE source_task_id = ? LIMIT 1", (parent["id"],),
     ).fetchone() is None:
         return True  # nothing of it is delivered: satisfied at approval, as before
-    # Late import: the facade imports this module at load time.
     from hermes_cli.kanban_db import _decode_owned_paths, _owned_path_scopes_overlap
 
     child = conn.execute("SELECT owned_paths FROM tasks WHERE id = ?", (child_id,)).fetchone()
@@ -79,7 +88,4 @@ def parent_satisfies(conn: sqlite3.Connection, parent: sqlite3.Row, child_id: st
         if not cards:
             break
         seen.update(cards)
-    # Only here can the switch change the answer: shared paths, and an unmerged change.
-    from hermes_cli.kanban_delivery import delivery_settings
-
-    return not delivery_settings()
+    return False
