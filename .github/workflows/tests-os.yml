@@ -149,15 +149,19 @@ jobs:
           # would still fail red, but the diagnostic would never print.
           # Desktop-update hand-off integration tests spawn the real
           # windows.ps1; deselect them unless the PR touched that surface
-          # (see the workflow_call input). ``--ignore-glob`` keeps the file
-          # list above intact, so a renamed test file still trips the
-          # zero-tests guard rather than silently vanishing.
+          # (see the workflow_call input). The deselection is name-based
+          # (``-k``) rather than ``--ignore-glob``: pytest applies
+          # ``--ignore``/``--ignore-glob`` only to paths it discovers while
+          # collecting, NOT to files named on the command line, and this
+          # lane names every selected file. ``-k`` keeps the file list above
+          # intact, so a renamed test file still trips the zero-tests guard
+          # rather than silently vanishing.
           # (bash 3.2 on the macOS runner: an empty array under ``set -u`` is
           # an unbound-variable error, hence the ``${arr[@]+...}`` idiom.)
           EXTRA_ARGS=()
           if [ "${{ inputs.desktop_updater }}" != "true" ]; then
             echo "desktop_updater lane off: skipping tests/test_desktop_update_windows_*.py"
-            EXTRA_ARGS+=(--ignore-glob='*test_desktop_update_windows_*.py')
+            EXTRA_ARGS+=(-k "not test_desktop_update_windows")
           fi
 
           status=0
