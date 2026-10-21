@@ -13041,6 +13041,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=404,
                 )
             from hermes_cli.owner_workspace import (
+                DELIVERY_STATE_CAPABILITY,
                 OWNER_PROJECT_PLANNING_CONTEXT_CAPABILITY,
                 OWNER_PROJECT_PLANNING_CONTEXT_V2_CAPABILITY,
                 OWNER_PROJECT_RUN_CONTEXT_CAPABILITY,
@@ -13059,11 +13060,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 else {}
             )
-            # The same for provider_wait_v1.
+            # The same for provider_wait_v1 and delivery_state_v1.
             if _owner_workspace_capability_requested(
                 request, PROVIDER_WAIT_CAPABILITY
             ):
                 waiting["provider_wait"] = True
+            if _owner_workspace_capability_requested(
+                request, DELIVERY_STATE_CAPABILITY
+            ):
+                waiting["delivery_state"] = True
             # And for planning_context_v2, which the kernel serves in place of
             # planning_context_v1 when a reader names both.
             planning_v2 = (

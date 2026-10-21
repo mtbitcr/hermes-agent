@@ -920,9 +920,10 @@ _REVIEW_CLEAN_UPDATE = (
 )
 # Added once the card has its id: the line that ties the reviewer's GitHub review to this one card.
 _REVIEW_LINE = "Start your GitHub review body with this exact line:\nReview card {card}\n"
-# GitHub showed the open row's pull request closed, merged or not, outside the delivery step: final. An approval
-# of another head of its source card leaves it as it is, the review step never reads that row again, and the merge
-# step, which reads armed or unknown arms only, never records it.
+# GitHub showed the row's pull request closed, merged or not, outside the delivery step: final. An approval of
+# another head of its source card leaves it as it is, no step reads that row again, and the merge step never
+# records it. Card C5: the review step closes an open row so, the arm step one with review cards created, and the
+# merge step a refused arm, a refused close or a base_moved row, and an armed or unknown arm closed unmerged.
 _CLOSED_OUTSIDE = "closed_outside"
 
 
@@ -1059,23 +1060,25 @@ def _waiting(conn: sqlite3.Connection, row: dict, code: str, **details) -> None:
 
 def _closed_outside(db_path: Path, row: dict, merged: bool) -> Optional[str]:
     """GitHub shows the row's pull request closed, merged or not, outside the delivery step. One write
-    transaction marks the row closed outside only while it is still open at the same head and pull request,
-    with one event on the source card naming them and whether GitHub shows it merged; a row changed
-    meanwhile gets nothing. Returns the state stored, if any."""
+    transaction marks the row closed outside only while it is still in the state it was read in (card C5: not
+    only open), at the same head and pull request, with one event on the source card naming them and whether
+    GitHub shows it merged; a row changed meanwhile gets nothing. Returns the state stored, if any."""
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if not delivery_settings() or not conn.execute(
-                "UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ? AND pull_request_state = 'open' "
+                "UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ? AND pull_request_state = ? "
                 "AND pull_request_head = ? AND pull_request_number = ?",
-                (_CLOSED_OUTSIDE, row["id"], row["pull_request_head"], row["pull_request_number"])).rowcount:
+                (_CLOSED_OUTSIDE, row["id"], row["pull_request_state"], row["pull_request_head"],
+                 row["pull_request_number"])).rowcount:
             return None  # the row moved on, or names another head or pull request, while GitHub was read
         kb._append_event(conn, row["source_task_id"], f"delivery_{_CLOSED_OUTSIDE}", _outcome(row, merged=merged))
     return _CLOSED_OUTSIDE
 
 
 def _review_pull(db_path: Path, github, repository: str, row: dict) -> tuple:
-    """A review pass's read of the row's pull request, through the fenced pull endpoint: ``(open at H, the state
-    stored)``. GitHub's pull request object with the row's own number, state closed and a boolean merged marks the
-    row closed outside (:func:`_closed_outside`); any other answer stores nothing."""
+    """A review or arm pass's read of the row's pull request, or the merge step's of a row only a close outside
+    ends (card C5), through the fenced pull endpoint: ``(open at H, the state stored)``. GitHub's pull request
+    object with the row's own number, state closed and a boolean merged marks the row closed outside
+    (:func:`_closed_outside`); any other answer stores nothing."""
     pull = _pull(github, repository, row)
     if (pull.get("number"), pull.get("state")) == (row["pull_request_number"], "closed") and type(
             pull.get("merged")) is bool:  # closed outside the delivery step: final, never read again
@@ -1735,8 +1738,9 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
     reviews, whole = [], False
     try:
         github = GitHubTransport("publish", repository)
-        if not _open_at_head(github, repository, row):
-            return None  # the pull request left H or is closed: nothing to arm
+        at_head, closed = _review_pull(db_path, github, repository, row)
+        if not at_head:
+            return closed  # the pull request left H, or is closed (card C5: then closed outside): nothing to arm
         for page in range(1, _REVIEW_PAGES + 1):  # oldest first; the last is not full or names no next page
             listed = _answered(github.request("GET", f"/repos/{repository}/pulls/{number}/reviews",
                                               query={"per_page": 100, "page": page}))
@@ -1965,14 +1969,16 @@ def merge_step(db_path: Path) -> None:
     unknown arm and, once GitHub shows it merged into main, add the merge to the waiting
     release decision and mark the row merged. A failure leaves the row as it was, so the next
     pass reads it again. With exact_base (card 2), each first-parent check an earlier pass left open is read
-    again first (:func:`_recheck`). Raises no error, so the tick goes on."""
+    again first (:func:`_recheck`). Card C5: the pull request of each refused arm, refused close or base_moved
+    row is read too, and the row closed outside once GitHub shows it closed. Raises no error, so the tick goes
+    on."""
     checks = _open_checks(db_path) if exact_base_settings() else []  # a check this pass opens waits for the next
     try:
         with kb.connect_closing(db_path=db_path) as conn:
             rows = [dict(row) for row in conn.execute(
                 f"SELECT d.*, {_RECEIPT.format('d')} AS repository FROM kanban_deliveries AS d "
-                "WHERE d.pull_request_number IS NOT NULL AND d.pull_request_state IN (?, ?) ORDER BY d.id",
-                (_ARMED, _ARM_UNKNOWN))]
+                "WHERE d.pull_request_number IS NOT NULL AND d.pull_request_state IN (?, ?, ?, ?, ?) ORDER BY d.id",
+                (_ARMED, _ARM_UNKNOWN, _ARM_REFUSED, _CLOSE_REFUSED, _BASE_MOVED))]
     except Exception:
         logger.exception("kanban delivery: the merge step failed")
         return
@@ -2000,7 +2006,10 @@ def _record_merge(db_path: Path, row: dict) -> Optional[str]:
     merge at exactly H counts: one at another head is not recorded, and the row stays as it is; one whose first
     parent is not the main the arm checked is recorded all the same, with one delivery_merged_off_base event,
     and one whose first parent git cannot read with one delivery_merged_off_base_unknown event, a check that
-    :func:`merge_step` reads again on later passes."""
+    :func:`merge_step` reads again on later passes. Card C5: an armed or unknown arm whose pull request GitHub
+    shows closed unmerged is closed outside, and a refused arm, refused close or base_moved row is only read for
+    a close outside (:func:`_review_pull`), merged or not, while it is still in that state at the same head and
+    pull request; it is never recorded merged."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
 
     head, number, repository = (row[key] for key in ("pull_request_head", "pull_request_number", "repository"))
@@ -2009,10 +2018,15 @@ def _record_merge(db_path: Path, row: dict) -> Optional[str]:
     if claimed or repository not in _policy_repositories() or _sha(head) != head:
         return None  # card 10's owner rule 1: another action holds it, read later; or no receipt in the policy
     try:
-        answer = _answered(GitHubTransport("read_checks", repository).request(
-            "GET", f"/repos/{repository}/pulls/{number}"))
+        github = GitHubTransport("read_checks", repository)
+        if row["pull_request_state"] not in (_ARMED, _ARM_UNKNOWN):
+            return _review_pull(db_path, github, repository, row)[1]
+        answer = _answered(github.request("GET", f"/repos/{repository}/pulls/{number}"))
     except GitHubTransportError as error:
         raise _transport_refusal(error) from None
+    pull = answer["data"] if answer["status"] == 200 and isinstance(answer["data"], dict) else {}
+    if (pull.get("number"), pull.get("state")) == (number, "closed") and pull.get("merged") is False:
+        return _closed_outside(db_path, row, False)  # closed without a merge outside the delivery step
     merge = _merge_commit(answer, number)
     exact = merge is not None and exact_base_settings()
     if merge is None or exact and _pull_head(answer, number) != head:
@@ -2027,6 +2041,23 @@ def _record_merge(db_path: Path, row: dict) -> Optional[str]:
         if off_base:
             _record_off_base(conn, row, merge, *off_base)
     return _merged(db_path, row, merge, attempt, row["pull_request_state"])
+
+
+def unfinished_delivery_task_ids(conn: sqlite3.Connection, task_ids) -> set:
+    """Card C5: those of ``task_ids`` whose delivery is unfinished on the board ``conn`` reads: a row with no pull
+    request yet, or a row open, with review cards created, with an auto-merge pending, armed, unknown or refused,
+    whose base moved, or whose close was refused. Every other state is finished. It only reads: a board with no
+    ledger has no unfinished delivery and gets no schema; any other database error is raised."""
+    ids = [str(task_id) for task_id in task_ids]
+    if not ids or conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kanban_deliveries'").fetchone() is None:
+        return set()
+    unfinished = ("open", "review_cards_created", _PENDING, _ARMED, _ARM_UNKNOWN, _ARM_REFUSED, _BASE_MOVED,
+                  _CLOSE_REFUSED)
+    return {str(row[0]) for row in conn.execute(
+        "SELECT DISTINCT source_task_id FROM kanban_deliveries WHERE source_task_id IN (SELECT value FROM "
+        "json_each(?)) AND ((pull_request_number IS NULL AND pull_request_state IS NULL) "
+        f"OR pull_request_state IN ({', '.join('?' * len(unfinished))}))", (json.dumps(ids), *unfinished))}
 
 
 def _off_base(db_path: Path, row: dict, merge: str) -> Optional[tuple]:

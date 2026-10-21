@@ -1064,13 +1064,14 @@ def test_a_moved_main_gets_no_review_card_and_is_left_base_moved(on_main, copies
     assert _events(kb, tid)[len(events):] == [("delivery_base_moved", {
         "delivery_id": 1, "head": head, "pull_request_number": 41, "repository": REPO, "reviewed_base": base,
         "observed_main": moved, "cards": []})]
-    assert gh["calls"] == [("GET", f"/repos/{REPO}/pulls/41"), ("GET", MAIN)]
+    assert gh["calls"] == [("GET", f"/repos/{REPO}/pulls/41"), ("GET", MAIN), ("GET", f"/repos/{REPO}/pulls/41")]
     calls, events = list(gh["calls"]), _events(kb, tid)
 
     _tick(kb)
     _tick(kb)
 
-    assert (gh["calls"], _cards(kb), _state(kb, head), _events(kb, tid)) == (calls, [], "base_moved", events)
+    assert (gh["calls"], _cards(kb), _state(kb, head), _events(kb, tid)) == (
+        calls + [("GET", f"/repos/{REPO}/pulls/41")] * 2, [], "base_moved", events)
 
 
 def test_a_main_still_at_the_reviewed_base_gets_its_review_cards(on_main):

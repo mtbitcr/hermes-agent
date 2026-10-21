@@ -2649,6 +2649,10 @@ OWNER_WAITING_CAPABILITY = "owner_waiting_v1"
 # A separately negotiated contour for work that waits for the AI provider.
 # Without it every payload and sentence keeps today's shape exactly.
 PROVIDER_WAIT_CAPABILITY = "provider_wait_v1"
+# A separately negotiated contour for finished work still being delivered
+# (card C5). Without it every card keeps today's shape exactly; only a reader
+# naming it gets each card's ``delivery``: "delivering" or None.
+DELIVERY_STATE_CAPABILITY = "delivery_state_v1"
 _OWNER_STOPPED_WORK_PROVIDER_WAIT = "provider_wait"
 _OWNER_PROVIDER_WAITING_SUMMARY = (
     "Waiting for the AI provider. Work resumes by itself after {time} UTC."
@@ -3387,6 +3391,7 @@ def read_project_snapshot(
     planning_context_v2: bool = False,
     owner_waiting: bool = False,
     provider_wait: bool = False,
+    delivery_state: bool = False,
 ) -> dict:
     """Return one bounded read-only surface for an exact receipt-owned Project.
 
@@ -3417,6 +3422,10 @@ def read_project_snapshot(
     the run it waits on reads ``waiting``; once that hold ends (an owner retry,
     the hold running out, or no cooldown) both read as today; it defaults off
     so every payload stays exactly today's; see ``PROVIDER_WAIT_CAPABILITY``.
+
+    ``delivery_state`` gives each card ``delivery``: ``"delivering"`` for a
+    done card whose delivery is unfinished, else None; it defaults off so the
+    card shape stays exactly today's; see ``DELIVERY_STATE_CAPABILITY``.
     """
     try:
         project_slug = projects_db.normalize_slug(project_slug) or ""
@@ -3535,6 +3544,13 @@ def read_project_snapshot(
         )
         for task_id in provider_waits:
             stopped_work[task_id] = _OWNER_STOPPED_WORK_PROVIDER_WAIT
+        delivering = set()
+        if delivery_state:
+            from hermes_cli.kanban_delivery import unfinished_delivery_task_ids
+
+            delivering = unfinished_delivery_task_ids(
+                conn, [task.id for task in tasks if task.status == "done"],
+            )
 
         columns = {status: [] for status in _OWNER_PROJECT_COLUMNS}
         for task in tasks:
@@ -3565,6 +3581,10 @@ def read_project_snapshot(
                     "since": _owner_timestamp(wait["since"]),
                     "reason": owner_stop_reason(wait["reason"]),
                 }
+            if delivery_state:
+                columns[task.status][-1]["delivery"] = (
+                    "delivering" if task.id in delivering else None
+                )
 
         worker_rows = kanban_db.verified_active_worker_rows(
             conn, project_id=project_id,
@@ -4856,6 +4876,10 @@ def project_steward_snapshot(
     Parked work, and todo work whose every unfinished parent is itself
     dormant, cannot move on its own: when only such work remains, the state
     is ``waiting_for_approval``.
+
+    Done work whose delivery is unfinished (card C5) is live active work,
+    listed as "Being delivered", so the state never reads ``complete`` while
+    any remains. A board with no delivery ledger has none.
     """
     project_id = _bounded_text(project_id, "project_id", limit=100)
     if (
@@ -4974,6 +4998,11 @@ def project_steward_snapshot(
             "AND p.status NOT IN ('done', 'archived')",
             (project_id,),
         ).fetchall()
+        from hermes_cli.kanban_delivery import unfinished_delivery_task_ids
+
+        delivering_ids = unfinished_delivery_task_ids(
+            kconn, [str(row["id"]) for row in rows if row["status"] == "done"],
+        )
     except sqlite3.Error as exc:
         raise OwnerWorkspaceError(
             "snapshot_unavailable", "the Project board could not be read"
@@ -5021,8 +5050,9 @@ def project_steward_snapshot(
         if item["status"] == "blocked" and item["block_kind"] == "needs_input"
     ]
     active_rows = [
-        item for item in items
+        item for item, row in zip(items, rows)
         if item["status"] in {"todo", "scheduled", "ready", "running", "review"}
+        or str(row["id"]) in delivering_ids
     ]
     # Dormant work cannot move on its own: parked work, then todo work whose
     # every unfinished parent is dormant, grown until nothing more joins.
@@ -5044,7 +5074,7 @@ def project_steward_snapshot(
         }
         dormant_ids |= joined
         grew = bool(joined)
-    live_work = any(
+    live_work = bool(delivering_ids) or any(
         row["status"] in {"todo", "ready", "running", "review"}
         and str(row["id"]) not in dormant_ids
         for row in rows
@@ -5069,8 +5099,9 @@ def project_steward_snapshot(
             and (item["block_kind"] == "needs_input" or _capability_wait(item))
         ]
         # Only work that is moving is shown as active: running, then being
-        # checked, then ready; started work first, newest first.
-        shown_order = {"running": 0, "review": 1, "ready": 2}
+        # checked, then ready, then being delivered (done, its delivery
+        # unfinished); started work first, newest first.
+        shown_order = {"running": 0, "review": 1, "ready": 2, "done": 3}
         shown_active_rows = sorted(
             (item for item in active_rows if item["status"] in shown_order),
             key=lambda item: (
@@ -5126,8 +5157,13 @@ def project_steward_snapshot(
             entry["waiting_since"] = _owner_timestamp(
                 wait["since"] if wait else item["created_at"]
             )
+    # Done work is active only while its delivery is unfinished.
     active_work = [
-        {"title": item["title"], "state": _OWNER_STATE_LABELS[item["status"]]}
+        {
+            "title": item["title"],
+            "state": "Being delivered" if item["status"] == "done"
+            else _OWNER_STATE_LABELS[item["status"]],
+        }
         for item in _bounded(shown_active_rows)
     ]
     stale_candidates = [
