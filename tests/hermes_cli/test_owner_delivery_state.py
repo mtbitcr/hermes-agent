@@ -189,6 +189,33 @@ def test_the_kernel_read_follows_exactly_the_state_lists(owner, state, unfinishe
         assert unfinished_delivery_task_ids(conn, []) == set()
 
 
+def _parked(project: dict, task_id: str, refusal) -> None:
+    """One row of ``task_id`` with no pull request yet, parked by the publish step with ``refusal`` (the columns
+    _park writes); a refusal of None is a row the publish step never parked."""
+    _delivery(project, task_id, NO_PULL_REQUEST)
+    with _board(project) as conn, kanban_db.write_txn(conn):
+        conn.execute(
+            "UPDATE kanban_deliveries SET publish_refusal = ?, publish_lease = NULL, publish_lease_until = NULL "
+            "WHERE source_task_id = ?", (refusal, task_id),
+        )
+
+
+@pytest.mark.parametrize("refusal, unfinished", [
+    ("repository_not_in_policy", False), ("no_repository", False), ("wrong_base", False), ("superseded", False),
+    ("delivery_disabled", False), (None, True), ("head_moved", True)])
+def test_a_row_without_a_pull_request_is_unfinished_only_while_it_may_still_publish(owner, refusal, unfinished):
+    """A row parked with a refusal never publishes, so it is finished; only one never parked, or parked with
+    head_moved (the one refusal a later pass may adopt), is unfinished."""
+    from hermes_cli.kanban_delivery import unfinished_delivery_task_ids
+
+    project = _project(owner, "Delivery Pilot")
+    task_id = _card(project, "Publish the launch page", status="done")
+    _parked(project, task_id, refusal)
+
+    with _board(project) as conn:
+        assert unfinished_delivery_task_ids(conn, [task_id]) == ({task_id} if unfinished else set())
+
+
 def test_an_older_returned_row_without_a_pull_request_is_finished_once_a_newer_row_merged(owner):
     """Owner rule of 2026-10-21, item 2: a row is unfinished by its state alone. A row returned for changes before
     the publish step took it has no pull request, and is finished: the card's newer row carries its delivery."""

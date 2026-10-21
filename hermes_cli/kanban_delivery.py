@@ -2047,8 +2047,9 @@ def _record_merge(db_path: Path, row: dict) -> Optional[str]:
 
 def unfinished_delivery_task_ids(conn: sqlite3.Connection, task_ids) -> set:
     """Card C5: those of ``task_ids`` whose delivery is unfinished on the board ``conn`` reads: a row with no pull
-    request yet, or a row open, with review cards created, with an auto-merge pending, armed, unknown or refused,
-    whose base moved, or whose close was refused. Every other state is finished. It only reads: a board with no
+    request yet that is not parked or is parked with head_moved (any other parked row never publishes), or a row
+    open, with review cards created, with an auto-merge pending, armed, unknown or refused, whose base moved, or
+    whose close was refused. Every other state is finished. It only reads: a board with no
     ledger has no unfinished delivery and gets no schema; any other database error is raised."""
     ids = [str(task_id) for task_id in task_ids]
     if not ids or conn.execute(
@@ -2058,7 +2059,8 @@ def unfinished_delivery_task_ids(conn: sqlite3.Connection, task_ids) -> set:
                   _CLOSE_REFUSED)
     return {str(row[0]) for row in conn.execute(
         "SELECT DISTINCT source_task_id FROM kanban_deliveries WHERE source_task_id IN (SELECT value FROM "
-        "json_each(?)) AND ((pull_request_number IS NULL AND pull_request_state IS NULL) "
+        "json_each(?)) AND ((pull_request_number IS NULL AND pull_request_state IS NULL "
+        "AND (publish_refusal IS NULL OR publish_refusal = 'head_moved')) "
         f"OR pull_request_state IN ({', '.join('?' * len(unfinished))}))", (json.dumps(ids), *unfinished))}
 
 
