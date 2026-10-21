@@ -25,7 +25,7 @@ def _frames(out: io.StringIO) -> list[dict]:
     return [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
 
 
-def _wait(out: io.StringIO, predicate, timeout: float = 5.0) -> dict:
+def _wait(out: io.StringIO, predicate, timeout: float = 30.0) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         for frame in _frames(out):
@@ -47,6 +47,15 @@ def turn_env(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "_tts_stream_begin", lambda: None)
     monkeypatch.setattr(server, "_sync_session_key_after_compress", lambda *a, **k: None)
     monkeypatch.setattr(server, "_get_usage", lambda agent: {})
+    # Everything after message.complete that scans skills / runs git / reads config, MCP status or
+    # persisted goal+loop state is slow on a loaded runner and irrelevant to the frame protocol.
+    # Split modules run on server.py's namespace (method_ctx.bind_module), so these reach every caller.
+    monkeypatch.setattr(server, "_session_info", lambda agent, session=None: {"model": "test-model"})
+    monkeypatch.setattr(server, "_reconcile_session_cwd_from_terminal", lambda session: False)
+    monkeypatch.setattr(server, "_active_goal_manager", lambda session: None)
+    monkeypatch.setattr(server, "_after_complete_turn", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_publish_session_control_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.mem_trim.trim_memory", lambda **k: False)
 
 
 def _agent(deltas: list[str], *, delay_s: float = 0.0, interrupt: threading.Event | None = None):
