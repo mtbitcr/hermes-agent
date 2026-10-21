@@ -1163,6 +1163,11 @@ _LITERAL_ROUTES = (
     ("POST", "/api/providers/oauth/anthropic/submit"),
     ("DELETE", "/api/providers/oauth/anthropic"),
     ("DELETE", "/api/providers/oauth/openai-codex"),
+    # The machine-wide build sign-in (a pasted Claude Code setup token) and the
+    # Claude usage left on the account; neither route ever answers the token.
+    ("PUT", "/api/providers/build-sign-in"),
+    ("GET", "/api/providers/build-sign-in"),
+    ("GET", "/api/providers/usage/anthropic"),
     ("GET", "/api/model/options"),
     ("GET", "/api/model/info"),
     ("PUT", "/api/profiles/raphael-planner/model"),
