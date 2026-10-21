@@ -98,6 +98,31 @@ _OWNED_PATHS = {
     ),
 }
 
+# The text files one created task needs from the owner. Optional, so a task
+# without it has no inputs and an older proposal replays unchanged; every rule
+# is enforced by hermes_cli.owner_named_inputs, which also derives each stored
+# file name (the name with hyphens for spaces, a dot and the type).
+_NAMED_INPUTS = {
+    "type": "array",
+    "minItems": 1,
+    "maxItems": 5,
+    "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "name": {"type": "string", "maxLength": 40},
+            "type": {"type": "string", "enum": ["txt", "md", "csv", "json"]},
+        },
+        "required": ["name", "type"],
+    },
+    "description": (
+        "Optional: the text files this task needs from the owner before it "
+        "can start, as plain names such as 'price list' (lowercase letters, "
+        "digits, single spaces and hyphens, starting with a letter, unique on "
+        "the task) and a type. Never a file name, path or extension."
+    ),
+}
+
 
 def _handle_bootstrap(args: dict, **kw) -> str:
     try:
@@ -453,6 +478,7 @@ registry.register(
                             "execution_tier": _EXECUTION_TIER,
                             "risk_tier": _RISK_TIER,
                             "owned_paths": _OWNED_PATHS,
+                            "inputs": _NAMED_INPUTS,
                             "parents": {
                                 "type": "array",
                                 "items": {"type": "integer", "minimum": 0},
@@ -513,6 +539,7 @@ _PROJECT_TASK_SPEC = {
         "execution_tier": _EXECUTION_TIER,
         "risk_tier": _RISK_TIER,
         "owned_paths": _OWNED_PATHS,
+        "inputs": _NAMED_INPUTS,
     },
     "required": [
         "title", "body", "assignee", "responsibility", "execution_tier",
@@ -550,6 +577,7 @@ _PROJECT_PRESERVED_TASK_SPEC = {
         "execution_tier": _EXECUTION_TIER,
         "risk_tier": _RISK_TIER,
         "owned_paths": _OWNED_PATHS,
+        "inputs": _NAMED_INPUTS,
     },
     "required": [
         "title", "body_mode", "assignee", "responsibility",

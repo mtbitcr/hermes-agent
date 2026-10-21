@@ -104,7 +104,16 @@ def test_hermes_and_workspace_agree_on_the_actionable_versions():
 
 @pytest.mark.parametrize(
     "proposal",
-    [_workspace_new_proposal(), _workspace_existing_proposal()],
+    [
+        _workspace_new_proposal(),
+        _workspace_existing_proposal(),
+        # A created task may name the text files it needs from the owner; the
+        # optional field changes no schema version.
+        _workspace_existing_proposal(changes=[{
+            **_workspace_existing_proposal()["changes"][0],
+            "inputs": [{"name": "price list", "type": "csv"}],
+        }]),
+    ],
 )
 def test_current_workspace_proposals_grant_commit_authority(proposal):
     assert _owner_final_proposal(_history(proposal)) == proposal

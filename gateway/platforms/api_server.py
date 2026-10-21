@@ -1472,11 +1472,12 @@ _OWNER_REVIEW_REFUSED_ASSIGNEES = frozenset({"raphael-planner", "raphael-verifie
 
 
 def _owner_current_task_shape(value: Any, expected_keys: frozenset[str]) -> bool:
-    # The review requirement is the one optional key of a current task shape:
-    # the Workspace admits it as a boolean and forwards it only when true.
+    # The optional keys of a current task shape: the review requirement, which
+    # the Workspace admits as a boolean and forwards only when true, and the
+    # named inputs, checked by _owner_named_inputs.
     return (
         isinstance(value, dict)
-        and set(value) - {"requires_review"} == expected_keys
+        and set(value) - {"requires_review", "inputs"} == expected_keys
         and isinstance(value.get("owned_paths"), list)
         and isinstance(value.get("requires_review", False), bool)
     )
@@ -1523,11 +1524,24 @@ def _owner_risk_tier(value: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("stored proposal change is invalid") from None
 
 
+def _owner_named_inputs(value: Dict[str, Any]) -> Dict[str, Any]:
+    """The named-inputs fragment of a created-task payload, only when stated."""
+    if "inputs" not in value:
+        return {}
+    from hermes_cli.owner_named_inputs import parse_named_inputs
+
+    try:
+        return {"inputs": parse_named_inputs(value["inputs"])}
+    except ValueError:
+        raise ValueError("stored proposal change is invalid") from None
+
+
 def _owner_task_payload(value: Dict[str, Any]) -> Dict[str, Any]:
     """The created-task shape as the Workspace forwards it in the run payload."""
     payload = {key: item for key, item in value.items() if key != "requires_review"}
     payload.update(_owner_review_requirement(value))
     payload.update(_owner_risk_tier(value))
+    payload.update(_owner_named_inputs(value))
     return payload
 
 
@@ -13584,6 +13598,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "owned_paths": clean(raw.get("owned_paths")),
                         **_owner_review_requirement(raw),
                         **_owner_risk_tier(raw),
+                        **_owner_named_inputs(raw),
                         "existing_parents": [native(ref) for ref in raw["existing_parent_refs"]],
                         "new_parents": clean(raw.get("new_parents")),
                     })

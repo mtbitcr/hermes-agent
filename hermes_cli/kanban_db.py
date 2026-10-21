@@ -91,7 +91,7 @@ import unicodedata
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from hermes_cli import kanban_provider_stops as _provider_stops
 from hermes_cli.gitlock import clear_stale_index_lock
@@ -29999,6 +29999,7 @@ def decompose_triage_task(
     receipt_owned: bool = False,
     parked: bool = False,
     park_generation: Optional[str] = None,
+    on_created: Optional[Callable[[sqlite3.Connection, list[str]], None]] = None,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -30039,7 +30040,9 @@ def decompose_triage_task(
     dispatcher tick can promote them in a gap. ``park_generation`` — required
     whenever ``parked`` is set — is the durable identity
     :func:`activate_owner_work` compare-and-swaps against, so only this
-    operation's own activation releases them afterwards.
+    operation's own activation releases them afterwards. ``on_created`` is
+    called with ``conn`` and the child ids as the transaction's last write, so
+    what it writes commits or rolls back with the children.
 
     A ``receipt_owned`` child that is build work also gets the build skill,
     derived here from its role and scope rather than read from ``children``
@@ -30374,6 +30377,8 @@ def decompose_triage_task(
             "root_assignee": root_assignee,
         })
         _append_event(conn, task_id, "decomposed", event_payload)
+        if on_created is not None:
+            on_created(conn, child_ids)
 
     # Outside the write_txn: promote parent-free children to 'ready'
     # so the dispatcher picks them up on its next tick. Same pattern
@@ -30593,6 +30598,7 @@ def apply_owner_project_plan(
     later_milestones: list[str],
     board: Optional[str] = None,
     parked: bool = True,
+    on_created: Optional[Callable[[sqlite3.Connection, list[str]], None]] = None,
 ) -> dict:
     """Atomically apply one bounded, already-normalized Project Steward plan.
 
@@ -30613,6 +30619,8 @@ def apply_owner_project_plan(
     postponed tasks also sit in ``scheduled`` and are NOT reported, and every
     row this plan parks carries this plan's own parking generation, so
     activation can only ever release what this exact receipt parked.
+    ``on_created`` is called with ``conn`` and ``created_task_ids`` as the
+    transaction's last write, so what it writes commits or rolls back with them.
     """
     generation = park_generation(
         actor=actor, profile=profile, idempotency_key=idempotency_key,
@@ -31050,6 +31058,8 @@ def apply_owner_project_plan(
                 "result": result,
             },
         )
+        if on_created is not None:
+            on_created(conn, created_task_ids)
 
     # No readiness recompute here when the plan parked its work: everything
     # this plan enabled — its own new/reactivated tasks AND the dependents the
