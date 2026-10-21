@@ -1982,7 +1982,8 @@ def test_a_public_card_with_the_update_key_is_no_update_card(exact):
 def test_an_unrelated_child_with_the_update_key_closes_no_pull_request(exact):
     """Finding 3 of 824: a separately built and approved child of the source, created through the public
     create_task with the key update:<source>:<H>:<commit>, is published as another pull request. No kernel event
-    names it an update card, so pull request 41 of H is not closed and its row stays as it is."""
+    names it an update card, so pull request 41 of H is not closed and its row stays as it is. The child owns
+    paths of its own: one that shares the source's waits until H merges (card D)."""
     kb, root, repo, gh = exact
     db = kb.kanban_db_path()
     tid, head = _ready(exact)
@@ -1991,7 +1992,7 @@ def test_an_unrelated_child_with_the_update_key_closes_no_pull_request(exact):
     conn = kb.connect()
     try:
         child = kb.create_task(conn, title="build unrelated", assignee=IMPLEMENTER, requires_review=True,
-                               owned_paths=["src/impl"], workspace_kind="worktree", workspace_path=str(repo),
+                               owned_paths=["src/unrelated"], workspace_kind="worktree", workspace_path=str(repo),
                                branch_name="feature/unrelated", parents=[tid],
                                idempotency_key=f"update:{tid}:{head}:{'f' * 40}")
         run = kb.claim_task(conn, child, claimer=f"{IMPLEMENTER}:1")
@@ -1999,9 +2000,9 @@ def test_an_unrelated_child_with_the_update_key_closes_no_pull_request(exact):
         kb.set_workspace_path(conn, child, workspace)
         kb.set_branch_name(conn, child, branch)
         kb.record_worktree_base(conn, child, workspace)
-        (Path(workspace) / "src" / "impl").mkdir(parents=True, exist_ok=True)
-        (Path(workspace) / "src" / "impl" / "unrelated.py").write_text("ok = True\n", encoding="utf-8")
-        _git(Path(workspace), "add", "src/impl/unrelated.py")
+        (Path(workspace) / "src" / "unrelated").mkdir(parents=True, exist_ok=True)
+        (Path(workspace) / "src" / "unrelated" / "unrelated.py").write_text("ok = True\n", encoding="utf-8")
+        _git(Path(workspace), "add", "src/unrelated/unrelated.py")
         _git(Path(workspace), "commit", "-q", "-m", "feat: unrelated")
         child_head = _git(Path(workspace), "rev-parse", "HEAD")
         assert kb.complete_task(conn, child, summary="unrelated", expected_run_id=run.current_run_id)

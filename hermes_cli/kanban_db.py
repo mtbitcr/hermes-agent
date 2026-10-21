@@ -97,6 +97,7 @@ from hermes_cli import kanban_provider_stops as _provider_stops
 from hermes_cli.gitlock import clear_stale_index_lock
 from hermes_cli.kanban_archived_followups import archive_recorded_review_followups
 from hermes_cli.kanban_handover_guard import refuse_early, rollback_task_branch
+from hermes_cli.kanban_merge_gate import parent_satisfies
 from hermes_cli.kanban_replaced_cards import replaced_task_ids
 from hermes_cli.kanban_risk_tier import (
     active_run_box_seconds,
@@ -24175,7 +24176,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote ``todo`` tasks to ``ready`` once ``_parents_satisfied`` holds.
 
     Returns the number of tasks promoted.  Opens its own IMMEDIATE txn, so it
     MUST be called OUTSIDE any open write transaction (plain ``write_txn``
@@ -24221,13 +24222,7 @@ def recompute_ready(
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
                 continue
-            parents = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                f"WHERE l.child_id = ? AND t.task_kind IN {_DEPENDENCY_PARENT_KINDS}",
-                (task_id,),
-            ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if _parents_satisfied(conn, task_id):
                 # Automatic promotion is a transition INTO an executable
                 # column, so it must prove this task's route authority first;
                 # an owner-governed row that cannot be proven is parked here
@@ -24276,15 +24271,13 @@ def recompute_ready(
 # ---------------------------------------------------------------------------
 
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return whether every direct parent is terminal for dependency gating."""
-    return conn.execute(
-        "SELECT 1 FROM task_links l "
+    """Return whether every direct parent satisfies the task (``kanban_merge_gate``)."""
+    return all(parent_satisfies(conn, parent, task_id) for parent in conn.execute(
+        "SELECT p.id, p.status, p.owned_paths FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? "
-        f"AND p.task_kind IN {_DEPENDENCY_PARENT_KINDS} "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        f"WHERE l.child_id = ? AND p.task_kind IN {_DEPENDENCY_PARENT_KINDS}",
         (task_id,),
-    ).fetchone() is None
+    ).fetchall())
 
 
 def _decode_owned_paths(raw: Any) -> Optional[list[str]]:
@@ -24469,21 +24462,14 @@ def claim_task(
                 {"source": "claim", "assignee": scope["assignee"]},
             )
         # Structural invariant: never transition ready -> running while any
-        # parent is not yet 'done'. This is the single enforcement point
+        # parent does not satisfy it yet. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
         # release_stale_claims, manual SQL) set status='ready'. If a racy
-        # writer promoted a task with undone parents, demote it back to
+        # writer promoted a task too early, demote it back to
         # 'todo' here — recompute_ready will re-promote when the parents
-        # actually finish. See RCA at
+        # satisfy it. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            f"WHERE l.child_id = ? AND p.task_kind IN {_DEPENDENCY_PARENT_KINDS} "
-            "AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if undone:
+        if not _parents_satisfied(conn, task_id):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready' AND task_kind = 'work'",
@@ -28987,7 +28973,7 @@ def _reclaim_dangling_run(
 
 
 def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str:
-    """Return ``'todo'`` if any parent isn't ``done`` yet, else ``'ready'``.
+    """Return ``'todo'`` until ``_parents_satisfied`` holds, else ``'ready'``.
 
     The parent-completion re-gate shared by :func:`unblock_task` and
     :func:`reopen_review_task`: flipping straight to ``ready`` would bypass the
@@ -28997,15 +28983,7 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md. Kept in one place
     so the two transitions can't drift.
     """
-    undone_parents = conn.execute(
-        "SELECT 1 FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? "
-        f"AND p.task_kind IN {_DEPENDENCY_PARENT_KINDS} "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    return "todo" if undone_parents else "ready"
+    return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
 # The two ways work STOPS without a human deciding to stop it, and the event
