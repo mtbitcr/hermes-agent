@@ -97,6 +97,7 @@ from hermes_cli import kanban_provider_stops as _provider_stops
 from hermes_cli.gitlock import clear_stale_index_lock
 from hermes_cli.kanban_archived_followups import archive_recorded_review_followups
 from hermes_cli.kanban_handover_guard import refuse_early, rollback_task_branch
+from hermes_cli.kanban_merge_gate import named_carrier, parent_satisfies
 from hermes_cli.kanban_replaced_cards import replaced_task_ids
 from hermes_cli.kanban_risk_tier import (
     active_run_box_seconds,
@@ -19385,7 +19386,7 @@ def create_task(
     """Create a new task and optionally link it under parent tasks.
 
     Returns the new task id.  Status is ``ready`` when there are no
-    parents (or all parents already ``done``), otherwise ``todo``.
+    parents (or all are ``done`` and ``_parents_satisfied``), otherwise ``todo``.
     If ``triage=True``, status is forced to ``triage`` regardless of
     parents — a specifier/triager is expected to promote the task to
     ``todo`` once the spec is fleshed out.
@@ -19844,6 +19845,9 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                if task_status == "ready" and parents and not _parents_satisfied(conn, task_id):
+                    task_status = "todo"  # re-gated once its owned paths and parent links exist
+                    conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
                 # Notify-sub inheritance (ACK-edge: the originating channel
                 # still hears about a child that BLOCKs, not just the final
                 # fan-in) is handled by the single-owner helper below —
@@ -23519,10 +23523,14 @@ def get_next_event_after(conn: sqlite3.Connection, task_id: str, after_id: int) 
     ``expected_revision + 1`` — it must ask for "whatever this task's very
     next event actually was", which is what this returns. Used by
     idempotent-replay callers (e.g. the owner-workspace kernel) to recognize
-    whether a specific past mutation on this task already committed.
+    whether a specific past mutation on this task already committed. It
+    passes over ``model_route_repinned``: an owner move that repins writes
+    that audit row ahead of its own event in the same transaction (see
+    :func:`_cas_transition_task_in_txn`), so a replay still finds that event.
     """
     row = conn.execute(
-        "SELECT * FROM task_events WHERE task_id = ? AND id > ? ORDER BY id ASC LIMIT 1",
+        "SELECT * FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind != 'model_route_repinned' ORDER BY id ASC LIMIT 1",
         (task_id, after_id),
     ).fetchone()
     if row is None:
@@ -23555,7 +23563,13 @@ def _append_event(
     events by attempt. For events that aren't scoped to a single run
     (task created/edited/archived, dependency promotion) leave it None
     and the row carries NULL.
+
+    A parent's record naming the card that carries its change on
+    (``kanban_merge_gate.named_carrier``) decides that card's readiness
+    again: a ``todo`` card it releases is promoted as ``recompute_ready`` does.
     """
+    carrier = named_carrier(kind, payload)
+    held = carrier is not None and not _parents_satisfied(conn, carrier)
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
     conn.execute(
@@ -23563,6 +23577,12 @@ def _append_event(
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    if held and _parents_satisfied(conn, carrier) and conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ? AND status = 'todo' AND task_kind = 'work'", (carrier,)
+    ).fetchone() and authorize_executable_transition(conn, carrier):
+        resume = _resume_status_from_events(conn, carrier)
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'", (resume, carrier))
+        _append_event(conn, carrier, "promoted", {"status": resume} if resume != "ready" else None)
 
 
 def _persisted_run_metadata(
@@ -24175,7 +24195,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote ``todo`` tasks to ``ready`` once ``_parents_satisfied`` holds.
 
     Returns the number of tasks promoted.  Opens its own IMMEDIATE txn, so it
     MUST be called OUTSIDE any open write transaction (plain ``write_txn``
@@ -24221,13 +24241,7 @@ def recompute_ready(
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
                 continue
-            parents = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                f"WHERE l.child_id = ? AND t.task_kind IN {_DEPENDENCY_PARENT_KINDS}",
-                (task_id,),
-            ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if _parents_satisfied(conn, task_id):
                 # Automatic promotion is a transition INTO an executable
                 # column, so it must prove this task's route authority first;
                 # an owner-governed row that cannot be proven is parked here
@@ -24276,15 +24290,14 @@ def recompute_ready(
 # ---------------------------------------------------------------------------
 
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return whether every direct parent is terminal for dependency gating."""
-    return conn.execute(
-        "SELECT 1 FROM task_links l "
+    """Return whether every direct parent satisfies the task (``kanban_merge_gate``)."""
+    return all(parent_satisfies(conn, parent, task_id) for parent in conn.execute(
+        "SELECT p.id, p.status, p.owned_paths FROM task_links l "
         "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? "
-        f"AND p.task_kind IN {_DEPENDENCY_PARENT_KINDS} "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        f"WHERE l.child_id = ? AND p.task_kind IN {_DEPENDENCY_PARENT_KINDS} "
+        "ORDER BY p.status IN ('done', 'archived')",  # an open parent answers before the setting is read
         (task_id,),
-    ).fetchone() is None
+    ).fetchall())
 
 
 def _decode_owned_paths(raw: Any) -> Optional[list[str]]:
@@ -24469,21 +24482,14 @@ def claim_task(
                 {"source": "claim", "assignee": scope["assignee"]},
             )
         # Structural invariant: never transition ready -> running while any
-        # parent is not yet 'done'. This is the single enforcement point
+        # parent does not satisfy it yet. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
         # release_stale_claims, manual SQL) set status='ready'. If a racy
-        # writer promoted a task with undone parents, demote it back to
+        # writer promoted a task too early, demote it back to
         # 'todo' here — recompute_ready will re-promote when the parents
-        # actually finish. See RCA at
+        # satisfy it. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            f"WHERE l.child_id = ? AND p.task_kind IN {_DEPENDENCY_PARENT_KINDS} "
-            "AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if undone:
+        if not _parents_satisfied(conn, task_id):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready' AND task_kind = 'work'",
@@ -28886,8 +28892,8 @@ def promote_task(
 
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
-    entry. Refuses to promote if any parent dep is not in a terminal
-    state (`done`/`archived`) unless ``force=True``. Does NOT change
+    entry. Refuses to promote while any parent dep does not satisfy it
+    (``kanban_merge_gate``) unless ``force=True``. Does NOT change
     assignee or claim state. Returns ``(True, None)`` on success and
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
@@ -28907,14 +28913,14 @@ def promote_task(
 
     if not force:
         parents = conn.execute(
-            "SELECT t.id, t.status FROM tasks t "
+            "SELECT t.id, t.status, t.owned_paths FROM tasks t "
             "JOIN task_links l ON l.parent_id = t.id "
             f"WHERE l.child_id = ? AND t.task_kind IN {_DEPENDENCY_PARENT_KINDS}",
             (task_id,),
         ).fetchall()
         unsatisfied = [
             p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
+            if not parent_satisfies(conn, p, task_id)
         ]
         if unsatisfied:
             return False, (
@@ -28987,7 +28993,7 @@ def _reclaim_dangling_run(
 
 
 def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str:
-    """Return ``'todo'`` if any parent isn't ``done`` yet, else ``'ready'``.
+    """Return ``'todo'`` until ``_parents_satisfied`` holds, else ``'ready'``.
 
     The parent-completion re-gate shared by :func:`unblock_task` and
     :func:`reopen_review_task`: flipping straight to ``ready`` would bypass the
@@ -28997,15 +29003,7 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md. Kept in one place
     so the two transitions can't drift.
     """
-    undone_parents = conn.execute(
-        "SELECT 1 FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? "
-        f"AND p.task_kind IN {_DEPENDENCY_PARENT_KINDS} "
-        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    return "todo" if undone_parents else "ready"
+    return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
 # The two ways work STOPS without a human deciding to stop it, and the event
@@ -29453,6 +29451,63 @@ def unblock_task(
         return True
 
 
+def _restored_implementer_sql(
+    conn: sqlite3.Connection, task_id: str, *, only_if_recorded: bool = False
+) -> tuple[Optional[str], str, tuple[Any, ...], Optional[dict]]:
+    """Render the hand-back to the implementer as a trailing SET fragment.
+
+    Returns ``(implementer, sql, params, repin)``: the newest
+    ``review_requested`` implementer, then its assignee, route and restored
+    write scope for the caller's ONE ``UPDATE``; when ``repin`` is not
+    ``None`` the caller appends ``model_route_repinned`` in the same
+    transaction. Shared by :func:`reopen_review_task` and the owner's move
+    out of review in :func:`_cas_transition_task_in_txn`, which passes
+    ``only_if_recorded``: a card no handover recorded an implementer for then
+    moves exactly as before instead of being refused by its own lock.
+    """
+    review_event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    try:
+        handoff = (
+            json.loads(review_event["payload"])
+            if review_event and review_event["payload"]
+            else {}
+        )
+    except (json.JSONDecodeError, TypeError):
+        handoff = {}
+    implementer = handoff.get("implementer")
+    if not isinstance(implementer, str) or not implementer.strip():
+        implementer = None
+    if implementer is None and only_if_recorded:
+        return None, "", (), None
+    # Handing the work back to the implementer is a role transition too, so
+    # it goes through the same lifetime assignment invariant as the
+    # changes-requested handback, and declares the same RETURN leg of the
+    # review round-trip — and, exactly as there, whatever the invariant
+    # hands back is written WITH the assignee, not discarded. Applying only
+    # the assignee left provider, model, effort, tier and lock still
+    # describing the reviewer, so the route no longer matched the role that
+    # held the card and the next implementation claim was refused by the
+    # task's own lock.
+    write = _authorized_assignment_write(
+        conn, task_id, implementer, review_round_trip=True
+    )
+    # The review run was read-only; the implementer gets its exact write
+    # boundary back in the same statement, from the park's provenance.
+    scope_sql, scope_params = _restored_implementation_scope_sql(conn, task_id)
+    lead: tuple[Any, ...] = (implementer,) if implementer else ()
+    return (
+        implementer,
+        (", assignee = ?" if implementer else "") + write.route_sql + scope_sql,
+        (*lead, *write.params, *scope_params),
+        write.repin,
+    )
+
+
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``review`` -> ready (or todo) so the implementer re-runs.
 
@@ -29480,62 +29535,23 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             note="invariant recovery on review reopen",
         )
         new_status = _landing_status_after_parents(conn, task_id)
-        review_event = conn.execute(
-            "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'review_requested' "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        try:
-            handoff = (
-                json.loads(review_event["payload"])
-                if review_event and review_event["payload"]
-                else {}
-            )
-        except (json.JSONDecodeError, TypeError):
-            handoff = {}
-        implementer = handoff.get("implementer")
-        if not isinstance(implementer, str) or not implementer.strip():
-            implementer = None
-        # Handing the work back to the implementer is a role transition too, so
-        # it goes through the same lifetime assignment invariant as the
-        # changes-requested handback, and declares the same RETURN leg of the
-        # review round-trip — and, exactly as there, whatever the invariant
-        # hands back is written WITH the assignee, not discarded. Applying only
-        # the assignee left provider, model, effort, tier and lock still
-        # describing the reviewer, so the route no longer matched the role that
-        # held the card and the next implementation claim was refused by the
-        # task's own lock.
-        write = _authorized_assignment_write(
-            conn, task_id, implementer, review_round_trip=True
+        implementer, handback_sql, handback_params, repin = (
+            _restored_implementer_sql(conn, task_id)
         )
-        route_sql, route_params, repin = write.route_sql, write.params, write.repin
-        # The review run was read-only; the implementer gets its exact write
-        # boundary back in the same statement, from the park's provenance.
-        scope_sql, scope_params = _restored_implementation_scope_sql(conn, task_id)
         if new_status in EXECUTABLE_STATUSES and not authorize_executable_transition(
             conn, task_id
         ):
             # Parked for re-approval rather than handed back into the pool.
             return False
-        assignee_sql = ", assignee = ?" if implementer else ""
-        lead: tuple[Any, ...] = (
-            (new_status, implementer) if implementer else (new_status,)
-        )
-        params: tuple[Any, ...] = (
-            *lead, *route_params, *scope_params, task_id,
-        )
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
             # consecutive_failures deliberately PRESERVED: review reopen is
             # not a success signal; only complete_task resets the breaker
             # counter (mirrors unblock_task, #35072).
-            + assignee_sql
-            + route_sql
-            + scope_sql
+            + handback_sql
             + " WHERE id = ? AND status = 'review' AND task_kind = 'work'",
-            params,
+            (new_status, *handback_params, task_id),
         )
         if cur.rowcount != 1:
             return False
@@ -30481,6 +30497,14 @@ def _cas_transition_task_in_txn(
             "status": current_status,
             "revision": current_revision,
         }
+    # An owner reactivating a review card hands it back to its implementer
+    # exactly as :func:`reopen_review_task` does; moving the status alone left
+    # the reviewer holding it, on the reviewer's route and read-only scope.
+    _, handback_sql, handback_params, repin = (
+        _restored_implementer_sql(conn, task_id, only_if_recorded=True)
+        if expected_status == "review" and to_status in ("ready", "todo")
+        else (None, "", (), None)
+    )
     # Any move THROUGH this generic path — including an owner's deliberate
     # postpone into ``scheduled`` — drops whatever parking generation the row
     # carried: it is no longer sitting where some earlier receipt left it, so
@@ -30494,9 +30518,10 @@ def _cas_transition_task_in_txn(
         )
     else:
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, park_generation = NULL "
-            "WHERE id = ? AND status = ?",
-            (to_status, task_id, expected_status),
+            "UPDATE tasks SET status = ?, park_generation = NULL"
+            + handback_sql
+            + " WHERE id = ? AND status = ?",
+            (to_status, *handback_params, task_id, expected_status),
         )
     if cur.rowcount != 1:
         return {
@@ -30528,6 +30553,10 @@ def _cas_transition_task_in_txn(
         event_payload = {
             **(event_payload or {}), "parked_dependents": parked_dependents,
         }
+    # Ahead of the transition's own event, which stays its last one: an owner
+    # receipt's replay reads that event's id as the revision it committed.
+    if repin is not None:
+        _append_event(conn, task_id, "model_route_repinned", repin)
     _append_event(conn, task_id, event_kind, event_payload, run_id=run_id)
     return {
         "moved": True,
