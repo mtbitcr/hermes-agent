@@ -7,6 +7,10 @@ steward snapshot must resolve them there, and only there.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
+import hashlib
+import json
 import os
 import sqlite3
 import threading
@@ -16,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db, owner_workspace as ow, projects_db
-from tools import approval
+from tools import approval, owner_workspace_tools
 
 PLANNER = "raphael-planner"
 
@@ -257,3 +261,195 @@ def test_default_profile_snapshot_is_unchanged(root, ctx):
     assert snapshot["decisions_needed"] == [
         {"title": "Choose the launch date", "state": "Waiting for your answer"}
     ]
+
+
+# What a planning profile's own home may hold where a registry would be: no
+# home at all, a home without one, a zero-byte file, the schema without any
+# Project, or bytes that are not SQLite.
+_PROFILE_REGISTRIES = ("no_home", "missing", "empty", "initialized", "corrupt")
+
+
+def _remove(ctx, project: dict) -> None:
+    """Remove the Project recoverably, as its owner, and let the real driver
+    carry the removal to Done on its own thread."""
+    key = "root-registry-removal-" + project["board"]
+    with projects_db.connect_closing() as conn:
+        revision = ow._project_lifecycle_revision(conn, ctx, project["project_id"])
+    request = {
+        "idempotency_key": key, "project_id": project["project_id"],
+        "expected_revision": revision, "action": "start",
+    }
+    owner = dataclasses.replace(ctx, authority=ow.OwnerProposalAuthority(
+        actor=ctx.actor, profile=ctx.profile, session=ctx.session,
+        conversation="conversation", response_id="response",
+        operation="owner_project_removal", idempotency_key=key,
+        payload_digest=ow._digest(request),
+    ))
+    approval.register_gateway_notify(ctx.session, lambda data: None)
+    approver = threading.Thread(target=_auto_approve, args=(ctx.session,))
+    approver.start()
+    started = ow.project_removal(owner, **request)
+    approver.join()
+    assert started["ok"], started
+    for thread in list(ow._removal_background_threads):
+        thread.join(timeout=60)
+
+
+@pytest.fixture
+def removed(root, ctx):
+    """A root Project whose recoverable removal reached Done, as the default
+    profile: its record and its removal stay in the root registry, its board
+    is gone."""
+    project = _bootstrap(ctx, "Garden Plan")
+    _remove(ctx, project)
+    return project
+
+
+def _lay_profile_registry(home: Path, state: str) -> None:
+    if state == "no_home":
+        return
+    home.mkdir(parents=True)
+    registry = home / "projects.db"
+    if state == "empty":
+        registry.write_bytes(b"")
+    elif state == "initialized":
+        with projects_db.connect_closing(registry):
+            pass
+    elif state == "corrupt":
+        registry.write_bytes(b"This is not a SQLite database.\n" * 64)
+
+
+def _entries(path: Path):
+    """Name -> (size, mtime, digest of the bytes) of a file, or of a folder
+    and everything under it, the folder itself as "."; None when the path
+    does not exist."""
+    if not path.exists():
+        return None
+    entries = {}
+    for entry in (path, *(sorted(path.rglob("*")) if path.is_dir() else ())):
+        info = entry.stat()
+        entries[entry.relative_to(path).as_posix()] = (
+            info.st_size if entry.is_file() else None,
+            info.st_mtime_ns,
+            hashlib.sha256(entry.read_bytes()).hexdigest()
+            if entry.is_file() else None,
+        )
+    return entries
+
+
+@contextlib.contextmanager
+def _unchanged(*paths: Path):
+    """Hold every path to its entries, whether the body answers or refuses."""
+    before = {path: _entries(path) for path in paths}
+    try:
+        yield
+    finally:
+        for path, entries in before.items():
+            assert _entries(path) == entries, path
+
+
+def _without_generated_at(snapshot: dict) -> dict:
+    return {key: value for key, value in snapshot.items() if key != "generated_at"}
+
+
+def _assert_removal_matches_root_registry(
+    removal_state: dict, root: Path, project_id: str,
+) -> None:
+    """Hold a served removal_state to the completed operation the root
+    registry records, read directly instead of through the code under test."""
+    columns = (
+        "phase", "mode", "retained_copy_id", "receipt_id", "consequences_digest",
+        "accepted_at", "applied_at", "completed_at",
+    )
+    [row] = _rows(
+        root / "projects.db",
+        "SELECT " + ", ".join(columns) + " FROM project_removal_operations "
+        "WHERE project_id = ?",
+        (project_id,),
+    )
+    recorded = dict(zip(columns, row))
+    assert recorded["phase"] == "done"
+    assert recorded["mode"] == "reversible" and recorded["retained_copy_id"]
+    assert removal_state["mode"] == "recoverable"
+    assert removal_state["restorable"] is True
+    assert {key: removal_state[key] for key in columns if key != "mode"} == {
+        key: value for key, value in recorded.items() if key != "mode"
+    }
+
+
+def _enter_worker_beside(ctx, monkeypatch, root: Path, removed: dict) -> None:
+    """Enter a planning worker pinned to its own board, then prove from the
+    stores that the removed Project is registered at the root and its board
+    is gone."""
+    worker = _bootstrap(ctx, "Planning Desk")
+    task_id = _planning_task(worker)
+    _enter_planning_worker(monkeypatch, root, worker["board"], task_id)
+
+    assert Path(os.environ["HERMES_KANBAN_DB"]).resolve() == (
+        _board_db(root, worker["board"]).resolve()
+    )
+    assert os.environ["HERMES_KANBAN_BOARD"] == worker["board"] != removed["board"]
+    assert _rows(
+        root / "projects.db",
+        "SELECT board_slug, archived FROM projects WHERE id = ?",
+        (removed["project_id"],),
+    ) == [(removed["board"], 0)]
+    assert not kanban_db.board_exists(removed["board"])
+    assert not _board_db(root, removed["board"]).exists()
+
+
+@pytest.mark.parametrize("owner_waiting", [False, True])
+@pytest.mark.parametrize("profile_registry", _PROFILE_REGISTRIES)
+def test_planning_worker_reads_a_removed_project_without_writing(
+    root, ctx, removed, monkeypatch, profile_registry, owner_waiting,
+):
+    """A root Project whose removal reached Done reads as deleted from a
+    planning worker exactly as it does for the default profile, whatever the
+    worker's own profile holds; that home gains no file and no byte, and the
+    root registry is only read."""
+    project_id = removed["project_id"]
+    default_snapshot = ow.project_steward_snapshot(
+        project_id=project_id, owner_waiting=owner_waiting,
+    )
+    assert default_snapshot["execution"]["state"] == "deleted"
+    profile_home = root / "profiles" / PLANNER
+    _lay_profile_registry(profile_home, profile_registry)
+    _enter_worker_beside(ctx, monkeypatch, root, removed)
+
+    with _unchanged(profile_home, root / "projects.db"):
+        snapshot = ow.project_steward_snapshot(
+            project_id=project_id, owner_waiting=owner_waiting,
+        )
+
+    assert snapshot["execution"]["state"] == "deleted"
+    assert _without_generated_at(snapshot) == _without_generated_at(default_snapshot)
+    [(name,)] = _rows(
+        root / "projects.db", "SELECT name FROM projects WHERE id = ?", (project_id,),
+    )
+    assert snapshot["project"] == {"name": name}
+    _assert_removal_matches_root_registry(snapshot["removal_state"], root, project_id)
+
+
+def test_steward_tool_reads_a_removed_project_from_a_planning_worker(
+    root, ctx, removed, monkeypatch,
+):
+    """The real tool adapter answers a planning worker whose profile has no
+    registry with the deleted projection, and writes nothing in that home."""
+    project_id = removed["project_id"]
+    default_snapshot = ow.project_steward_snapshot(project_id=project_id)
+    profile_home = root / "profiles" / PLANNER
+    _lay_profile_registry(profile_home, "missing")
+    _enter_worker_beside(ctx, monkeypatch, root, removed)
+
+    with _unchanged(profile_home, root / "projects.db"):
+        answer = json.loads(
+            owner_workspace_tools._handle_project_steward_snapshot(
+                {"project_id": project_id}
+            )
+        )
+
+    assert "error" not in answer, answer
+    assert answer["execution"]["state"] == "deleted"
+    assert _without_generated_at(answer) == _without_generated_at(default_snapshot)
+    assert list(profile_home.iterdir()) == []
+    _assert_removal_matches_root_registry(answer["removal_state"], root, project_id)

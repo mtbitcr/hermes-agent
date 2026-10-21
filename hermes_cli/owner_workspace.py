@@ -4869,9 +4869,8 @@ def project_steward_snapshot(
 
     # Not projects_db.projects_db_path(): a job running as another profile
     # (a scheduled planning job) holds an empty registry of its own.
-    pconn = _open_read_only_sqlite(
-        kanban_db.kanban_home() / "projects.db", label="projects.db"
-    )
+    registry = kanban_db.kanban_home() / "projects.db"
+    pconn = _open_read_only_sqlite(registry, label="projects.db")
     try:
         project_columns = {
             row["name"] for row in pconn.execute("PRAGMA table_info(projects)")
@@ -4905,8 +4904,16 @@ def project_steward_snapshot(
 
     board_slug = str(project["board_slug"])
     if not kanban_db.board_exists(board_slug):
-        removal_state = _completed_removal_state(project_id)
-        if removal_state is not None:
+        # The same root registry, read-only: _completed_removal_state opens
+        # the active profile's own through a connector that creates it.
+        try:
+            with contextlib.closing(
+                _open_read_only_sqlite(registry, label="projects.db")
+            ) as pconn:
+                removal_state = _project_removal_state(pconn, project_id, None)
+        except (OSError, sqlite3.Error, OwnerWorkspaceError):
+            removal_state = None
+        if removal_state is not None and removal_state["phase"] == "done":
             return _deleted_project_steward(
                 project["name"], lookback_days, removal_state,
             )
