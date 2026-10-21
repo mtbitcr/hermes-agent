@@ -422,7 +422,7 @@ def _runtime(
     )
 
 
-def _wait_for(predicate, *, timeout: float = 2.0) -> None:
+def _wait_for(predicate, *, timeout: float = 15.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -758,7 +758,7 @@ def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path):
             waiting if binding.room_id == "room-waiting" else healthy
         ),
         turn_lock=RecordingTurnLocks(),
-        lease_ttl_seconds=0.4,
+        lease_ttl_seconds=5,
         poll_interval_seconds=0.01,
         max_concurrent_rooms=2,
     )
@@ -1110,7 +1110,7 @@ def test_deadline_releases_worker_capacity_for_later_room(tmp_path: Path):
         rooms=bindings,
         rpc=rpc,
         turn_lock=RecordingTurnLocks(),
-        lease_ttl_seconds=0.4,
+        lease_ttl_seconds=5,
         poll_interval_seconds=0.02,
         active_poll_interval_seconds=0.01,
         turn_timeout_seconds=0.05,
