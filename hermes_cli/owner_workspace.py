@@ -95,6 +95,7 @@ from hermes_cli.kanban_risk_tier import (
     pinned_reasoning_effort,
     recovered_root_risk_tier,
 )
+from hermes_cli.owner_named_inputs import declare_named_inputs, parse_named_inputs
 from hermes_cli.owner_text import check_owner_text
 from hermes_cli.sqlite_util import write_txn
 from plugins.dashboard_auth.raphael_workspace.model_policy import (
@@ -1315,6 +1316,7 @@ def _normalize_graph_tasks(tasks: Any) -> list[dict]:
             entry["owned_paths"] = _normalize_ownership_scope(
                 raw.get("owned_paths"), f"tasks[{index}]",
             )
+        entry.update(_named_inputs_spec(raw, f"tasks[{index}]"))
         normalized.append(entry)
 
     # Reject the whole request before approval or persistence when sibling
@@ -1873,6 +1875,9 @@ def commit_task_graph(
                             "actor": ctx.actor,
                             "profile": ctx.profile,
                         },
+                        on_created=lambda conn, ids: _commit_named_inputs(
+                            conn, normalized_tasks, ids,
+                        ),
                     )
                 if child_ids is None or len(child_ids) != len(normalized_tasks):
                     raise OwnerWorkspaceError(
@@ -5309,19 +5314,20 @@ def _normalize_project_task_spec(
     body_mode = value.get("body_mode") if allow_body_mode and isinstance(value, dict) else None
     if body_mode == "preserve":
         required = {"title", "body_mode", "assignee", "execution_tier", "owned_paths"}
-        allowed = required | {"responsibility", "requires_review", "risk_tier"}
+        allowed = required | {"responsibility", "requires_review", "risk_tier", "inputs"}
     elif body_mode == "rewrite":
         required = {
             "title", "body_mode", "body", "assignee", "execution_tier",
             "owned_paths",
         }
-        allowed = required | {"responsibility", "requires_review", "risk_tier"}
+        allowed = required | {"responsibility", "requires_review", "risk_tier", "inputs"}
     else:
         required = {
             "title", "body", "assignee", "execution_tier",
         } | ({"parents"} if parent_limit is not None else set())
         allowed = required | {
             "responsibility", "owned_paths", "requires_review", "risk_tier",
+            "inputs",
         }
     if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(allowed):
         raise OwnerWorkspaceError(
@@ -5418,7 +5424,23 @@ def _normalize_project_task_spec(
                 )
             normalized_parents.append(parent)
         result["parents"] = normalized_parents
+    result.update(_named_inputs_spec(raw, field))
     return result
+
+
+def _named_inputs_spec(raw: dict, field: str) -> dict:
+    """The named inputs a created task carries: only when the proposal states
+    them, like ``owned_paths``, so a plan without them keeps its request digest.
+
+    Checked last, so every older refusal keeps its precedence; the one copy of
+    the rules is :mod:`hermes_cli.owner_named_inputs`.
+    """
+    if "inputs" not in raw:
+        return {}
+    try:
+        return {"inputs": parse_named_inputs(raw["inputs"])}
+    except ValueError as exc:
+        raise OwnerWorkspaceError("invalid_argument", f"{field}.inputs: {exc}") from None
 
 
 def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
@@ -5448,6 +5470,7 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
             }
             allowed = required | {
                 "responsibility", "owned_paths", "requires_review", "risk_tier",
+                "inputs",
             }
             if not required.issubset(item) or not set(item).issubset(allowed):
                 raise OwnerWorkspaceError(
@@ -5497,6 +5520,7 @@ def _normalize_project_changes(value: Any) -> tuple[list[dict], str]:
                         if "risk_tier" in raw
                         else {}
                     ),
+                    **({"inputs": raw["inputs"]} if "inputs" in raw else {}),
                 },
                 field,
                 parent_limit=None,
@@ -5670,6 +5694,23 @@ def _plan_created_task_specs(changes: list[dict]) -> list[dict]:
         elif action in {"replace", "merge"}:
             specs.append(change["replacement"])
     return specs
+
+
+def _commit_named_inputs(
+    kconn: sqlite3.Connection, specs: list[dict], task_ids: list[str],
+) -> None:
+    """Declare the approved named inputs on the cards this commit creates.
+
+    The kernel's ``on_created`` hook: the one ``named_inputs_declared`` event
+    per card is written on ``kconn`` inside the transaction that creates the
+    parked card, so no reader ever sees one without the other and a failed
+    write leaves neither. A replay recovers the committed cards without
+    creating them, so it declares nothing twice.
+    """
+    try:
+        declare_named_inputs(kconn, specs, task_ids)
+    except ValueError as exc:
+        raise OwnerWorkspaceError("crash_recovery_failed", str(exc)) from None
 
 
 def _commit_plan_review_requirements(
@@ -6527,6 +6568,9 @@ def commit_project_plan(
                             current_milestone=current_milestone,
                             later_milestones=normalized_later,
                             board=board_slug,
+                            on_created=lambda conn, ids: _commit_named_inputs(
+                                conn, _plan_created_task_specs(normalized_changes), ids,
+                            ),
                         )
 
                 if applied["applied"]:
