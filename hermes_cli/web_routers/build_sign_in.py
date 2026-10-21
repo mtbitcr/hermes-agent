@@ -126,10 +126,10 @@ async def build_sign_in_status(request: Request, profile: Optional[str] = None):
     return result
 
 
-def _percent_left(used) -> Optional[int]:
+def _percent_left(used) -> Optional[float]:
     if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used):
         return None
-    return max(0, min(100, round(100 - used)))
+    return max(0, min(100, 100 - used))
 
 
 def _resets_at(when) -> Optional[str]:

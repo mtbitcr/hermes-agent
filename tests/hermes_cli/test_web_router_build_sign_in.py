@@ -60,6 +60,7 @@ WINDOWS = (
         used_percent=82.4,
         reset_at=datetime(2026, 10, 24, 9, 30, tzinfo=timezone(timedelta(hours=2))),
     ),
+    AccountUsageWindow(label="Nearly spent week", used_percent=99.6),
     AccountUsageWindow(label="Opus week", used_percent=104.0),
     AccountUsageWindow(label="Sonnet week"),
     AccountUsageWindow(label="Unreadable week", used_percent=float("nan")),
@@ -69,7 +70,8 @@ USAGE_LEFT = {
     "state": "available",
     "windows": [
         {"label": "Current session", "percent_left": 63, "resets_at": "2026-10-21T15:00:00+00:00"},
-        {"label": "Current week", "percent_left": 18, "resets_at": "2026-10-24T07:30:00+00:00"},
+        {"label": "Current week", "percent_left": pytest.approx(17.6), "resets_at": "2026-10-24T07:30:00+00:00"},
+        {"label": "Nearly spent week", "percent_left": pytest.approx(0.4), "resets_at": None},
         {"label": "Opus week", "percent_left": 0, "resets_at": None},
         {"label": "Sonnet week", "percent_left": None, "resets_at": None},
         {"label": "Unreadable week", "percent_left": None, "resets_at": None},
