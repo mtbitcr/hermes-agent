@@ -32,6 +32,7 @@ from tests.hermes_cli.test_owner_workspace import (  # noqa: F401
     _commit_task_graph,
     _configured_provider,
     _configured_raphael_role,
+    _expire_lock,
     _install_profiles,
     _temporarily_patch,
     _with_approver,
@@ -153,10 +154,10 @@ def _assert_owner_move_hands_back(ctx, graph, to_status):
     # Assignee, route and write scope come back to the implementer together.
     assert _lane(moved) == _lane(implementation)
     assert kb.task_policy_lock_error(moved) is None
-    # The owner's own event stays the move's next event, which is how a
-    # replay of the receipt recognizes it; the repin lands with it.
-    assert [kind for kind, _ in events] == ["owner_move", "model_route_repinned"]
-    assert events[1][1]["assignee"] == IMPLEMENTER
+    # The repin lands ahead of the owner's own event, which stays the move's
+    # last event, so a replay of the receipt reads the revision it committed.
+    assert [kind for kind, _ in events] == ["model_route_repinned", "owner_move"]
+    assert events[0][1]["assignee"] == IMPLEMENTER
 
 
 def test_owner_move_review_to_ready_hands_the_card_back_to_its_implementer(
@@ -238,3 +239,54 @@ def test_reopen_review_task_gives_the_same_row_and_events_as_today(ctx, graph):
         }),
         ("review_reopened", {"status": "ready", "implementer": IMPLEMENTER}),
     ]
+
+
+@pytest.mark.parametrize("to_status", ["ready", "todo"])
+def test_owner_move_from_review_recovered_after_a_crash_keeps_its_revision(
+    ctx, graph, to_status,
+):
+    """A crash after the Kanban commit and before the owner receipt is
+    finalized: the identical retry recovers the move with the revision it
+    committed, so a later owner move using that revision is no conflict."""
+    task_id, _, _ = _parked_for_review(graph)
+    with kb.connect(board=graph["board"]) as conn:
+        revision = kb.task_event_revision(conn, task_id)
+    key = f"crash-review-to-{to_status}"
+    request = dict(
+        idempotency_key=key, task_id=task_id, to_status=to_status,
+        expected_status="review", expected_revision=revision,
+        project_id=graph["project_id"],
+    )
+
+    def crash(*_a, **_kw):
+        raise RuntimeError("crash after the Kanban commit, before finalize")
+
+    with _temporarily_patch(ow, "_finalize_receipt", crash):
+        approver = _with_approver(ctx.session)
+        with pytest.raises(RuntimeError):
+            ow.move_task(ctx, **request)
+        approver.join()
+    with kb.connect(board=graph["board"]) as conn:
+        committed = kb.task_event_revision(conn, task_id)
+        kinds = sorted(kind for kind, _ in _events_after(conn, task_id, revision))
+    # The move and its route repin really committed before the crash.
+    assert kinds == ["model_route_repinned", "owner_move"]
+
+    _expire_lock(ctx, key)
+    approver = _with_approver(ctx.session)
+    recovered = ow.move_task(ctx, **request)
+    approver.join()
+    assert recovered["ok"] is True, recovered
+    assert recovered["status"] == to_status
+    assert recovered["revision"] == committed
+
+    approver = _with_approver(ctx.session)
+    later = ow.move_task(
+        ctx, idempotency_key=f"after-{key}", task_id=task_id,
+        to_status="blocked", expected_status=to_status,
+        expected_revision=recovered["revision"],
+        project_id=graph["project_id"],
+    )
+    approver.join()
+    assert later["ok"] is True, later
+    assert later["status"] == "blocked"

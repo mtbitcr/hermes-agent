@@ -23523,10 +23523,14 @@ def get_next_event_after(conn: sqlite3.Connection, task_id: str, after_id: int) 
     ``expected_revision + 1`` — it must ask for "whatever this task's very
     next event actually was", which is what this returns. Used by
     idempotent-replay callers (e.g. the owner-workspace kernel) to recognize
-    whether a specific past mutation on this task already committed.
+    whether a specific past mutation on this task already committed. It
+    passes over ``model_route_repinned``: an owner move that repins writes
+    that audit row ahead of its own event in the same transaction (see
+    :func:`_cas_transition_task_in_txn`), so a replay still finds that event.
     """
     row = conn.execute(
-        "SELECT * FROM task_events WHERE task_id = ? AND id > ? ORDER BY id ASC LIMIT 1",
+        "SELECT * FROM task_events WHERE task_id = ? AND id > ? "
+        "AND kind != 'model_route_repinned' ORDER BY id ASC LIMIT 1",
         (task_id, after_id),
     ).fetchone()
     if row is None:
@@ -30549,11 +30553,11 @@ def _cas_transition_task_in_txn(
         event_payload = {
             **(event_payload or {}), "parked_dependents": parked_dependents,
         }
-    _append_event(conn, task_id, event_kind, event_payload, run_id=run_id)
-    # After the transition's own event, which an owner receipt's replay
-    # recognizes as this task's very next one.
+    # Ahead of the transition's own event, which stays its last one: an owner
+    # receipt's replay reads that event's id as the revision it committed.
     if repin is not None:
         _append_event(conn, task_id, "model_route_repinned", repin)
+    _append_event(conn, task_id, event_kind, event_payload, run_id=run_id)
     return {
         "moved": True,
         "status": to_status,
