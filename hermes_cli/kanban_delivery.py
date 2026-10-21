@@ -73,8 +73,9 @@ from typing import Optional
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_risk_tier import RISK_NOT_RECORDED, UNRECORDED_RISK_TIER, effective_risk_tier
 from hermes_cli.kanban_delivery_fences import (
-    _PASSING, TEST_JOB_STEPS, Decision, _required_check, decide_publish, load_policy,
+    _PASSING, TEST_JOB_STEPS, Decision, Policy, _required_check, decide_publish, load_policy,
 )
+from hermes_cli.kanban_delivery_owner_policy import combined_policy
 
 logger = logging.getLogger(__name__)
 
@@ -425,10 +426,21 @@ def _origin_repository(workdir: Optional[Path]) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def _policy_repositories() -> frozenset[str]:
-    """The repositories the reviewed policy lists; none when it cannot be read."""
+def _with_owner_list(policy: Policy) -> Policy:
+    """The reviewed policy united with the owner's delivery list (card A2), the reviewed entry winning; the
+    reviewed policy alone if the owner list's module raises."""
     try:
-        policy = load_policy(_POLICY_FILE.read_text(encoding="utf-8"))
+        return combined_policy(policy)
+    except Exception:
+        logger.exception("kanban delivery: the owner delivery list is not read")
+        return policy
+
+
+def _policy_repositories() -> frozenset[str]:
+    """The repositories the reviewed policy and the owner's delivery list name; none when the reviewed policy
+    cannot be read."""
+    try:
+        policy = _with_owner_list(load_policy(_POLICY_FILE.read_text(encoding="utf-8")))
     except (OSError, ValueError):
         return frozenset()
     return frozenset(policy.required_checks)
@@ -1163,7 +1175,7 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
         return None  # the source card is not done at H or its clean update, or the row is past open
     repository = _origin_repository(_repository(task["workspace_path"])) if task is not None else None
     try:
-        policy = load_policy(_POLICY_FILE.read_text(encoding="utf-8"))
+        policy = _with_owner_list(load_policy(_POLICY_FILE.read_text(encoding="utf-8")))
     except (OSError, ValueError):
         raise PublishRefused("policy_unreadable", "the delivery policy cannot be read") from None
     if repository not in policy.required_checks or _sha(head) != head:
