@@ -853,11 +853,12 @@ def test_one_pass_decides_then_reads_the_pull_request_then_writes(world, conclus
 
     pull = f"/repos/{REPO}/pulls/41"
     red = [] if conclusion == "success" else [(f"/repos/{REPO}/actions/runs", {"head_sha": [head], "per_page": ["100"]})]
+    arm = [(pull, {})] if conclusion == "success" else []  # card C5: then the arm step's read of the pull request
     assert gh["queries"] == [
         (pull, {}),
         (f"/repos/{REPO}/commits/{head}/check-runs", {"filter": ["latest"], "check_name": [CHECK], "per_page": ["100"]}),
-        (pull, {})] + red
-    assert (seen, _raw(kb.kanban_db_path(), stored)[0]["n"]) == ([0] * 3 + [1] * len(red), 1)
+        (pull, {})] + red + arm
+    assert (seen, _raw(kb.kanban_db_path(), stored)[0]["n"]) == ([0] * 3 + [1] * len(red + arm), 1)
 
 
 @pytest.mark.parametrize("conclusion", ["failure", "cancelled", "timed_out"])
@@ -921,7 +922,7 @@ def test_a_normal_pass_creates_the_cards_and_records_them_once(world):
     _tick(kb)
     _tick(kb)
 
-    assert (_cards(kb), len(gh["calls"]), _events(kb, tid)) == (cards, calls, events)  # no GitHub read either
+    assert (_cards(kb), len(gh["calls"]), _events(kb, tid)) == (cards, calls + 2, events)  # card C5: the arm's read
     assert [(kind, sorted(p["cards"])) for kind, p in events if kind.startswith("delivery_review")] == [
         ("delivery_review_cards_created", sorted(c["id"] for c in cards))]
 
@@ -1094,7 +1095,7 @@ def test_a_main_still_at_the_reviewed_base_gets_its_review_cards(on_main):
     assert gh["queries"] == [
         (pull, {}), (MAIN, {}),
         (f"/repos/{REPO}/commits/{head}/check-runs", {"filter": ["latest"], "check_name": [CHECK], "per_page": ["100"]}),
-        (pull, {})]
+        (pull, {}), (pull, {})]  # card C5: then the arm step's read of the pull request
 
 
 @pytest.mark.parametrize("answer", [
@@ -1137,4 +1138,4 @@ def test_with_exact_base_off_review_cards_are_made_as_before(on_main, value):
     assert gh["queries"] == [
         (pull, {}),
         (f"/repos/{REPO}/commits/{head}/check-runs", {"filter": ["latest"], "check_name": [CHECK], "per_page": ["100"]}),
-        (pull, {})]
+        (pull, {}), (pull, {})]  # card C5: then the arm step's read of the pull request

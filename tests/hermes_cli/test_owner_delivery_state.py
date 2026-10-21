@@ -189,6 +189,29 @@ def test_the_kernel_read_follows_exactly_the_state_lists(owner, state, unfinishe
         assert unfinished_delivery_task_ids(conn, []) == set()
 
 
+def test_an_older_returned_row_without_a_pull_request_is_finished_once_a_newer_row_merged(owner):
+    """Owner rule of 2026-10-21, item 2: a row is unfinished by its state alone. A row returned for changes before
+    the publish step took it has no pull request, and is finished: the card's newer row carries its delivery."""
+    from hermes_cli.kanban_delivery import unfinished_delivery_task_ids
+
+    project = _project(owner, "Delivery Pilot")
+    task_id = _card(project, "Publish the launch page", status="done")
+    with _board(project) as conn, kanban_db.write_txn(conn):
+        conn.execute(
+            "INSERT INTO kanban_deliveries (source_task_id, source_head, created_at, pull_request_state) "
+            "VALUES (?, ?, 0, 'returned_for_changes')", (task_id, "b" * 40),
+        )
+    _delivery(project, task_id, "merged")
+
+    with _board(project) as conn:
+        assert unfinished_delivery_task_ids(conn, [task_id]) == set()
+        assert conn.execute(_INDEPENDENT_COUNT, (project["project_id"], *UNFINISHED)).fetchone()[0] == 0
+    snapshot = ow.read_project_snapshot(owner, project["slug"], delivery_state=True)
+    for steward in (ow.project_steward_snapshot(project_id=project["project_id"]), snapshot["steward"]):
+        assert (steward["execution"]["state"], steward["active_work"]) == ("complete", [])
+    assert _cards(snapshot)["Publish the launch page"]["delivery"] is None
+
+
 def test_a_missing_ledger_reads_as_no_unfinished_delivery_and_creates_no_schema(owner, tmp_path):
     from hermes_cli.kanban_delivery import unfinished_delivery_task_ids
 

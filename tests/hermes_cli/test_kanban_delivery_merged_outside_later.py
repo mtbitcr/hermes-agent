@@ -63,6 +63,50 @@ def test_a_pull_request_merged_outside_after_review_cards_closes_the_row_outside
     _settled(armed, tid, head, len(events) + 1)
 
 
+def _left_ready(armed):
+    """A published head whose required review card is made and left ready: its review is unfinished."""
+    kb, root, repo, gh = armed
+    tid, head = _ready(armed)
+    _tick(kb)
+    assert ([card["status"] for card in _cards(kb)], _state(kb, head)) == (["ready"], "review_cards_created")
+    return tid, head
+
+
+def test_a_pull_request_merged_outside_while_a_review_card_is_unfinished_closes_the_row_outside(armed):
+    """Someone merges the pull request of H while its required review card is still unfinished: the arm step reads
+    the pull request before it waits for that card, so the next pass marks the row closed outside, merged, with one
+    event. While the pull request was open at H that read was all: no review was read and nothing was sent."""
+    kb, root, repo, gh = armed
+    tid, head = _left_ready(armed)
+    calls, events = len(gh["calls"]), _events(kb, tid)
+    _tick(kb)  # open at H: read, then the arm waits for the card
+    gh["ended"][41] = ARMED["sha"]  # merged into main outside the delivery step
+
+    _tick(kb)
+
+    assert (_state(kb, head), _events(kb, tid)[len(events):], gh["calls"][calls:], gh["writes"]) == (
+        "closed_outside", _closed_outside(head, True), [PULL, PULL], [])
+    assert [card["status"] for card in _cards(kb)] == ["ready"]
+    _settled(armed, tid, head, len(events) + 1)
+
+
+def test_a_pull_request_closed_without_merge_while_a_review_card_is_unfinished_closes_the_row_outside(armed):
+    """Someone closes the pull request of H unmerged while its required review card is still unfinished: the next
+    pass marks the row closed outside, not merged, with one event, and reads no review and sends nothing."""
+    kb, root, repo, gh = armed
+    tid, head = _left_ready(armed)
+    calls, events = len(gh["calls"]), _events(kb, tid)
+    _tick(kb)  # open at H: read, then the arm waits for the card
+    gh["ended"][41] = False  # closed unmerged outside the delivery step
+
+    _tick(kb)
+
+    assert (_state(kb, head), _events(kb, tid)[len(events):], gh["calls"][calls:], gh["writes"]) == (
+        "closed_outside", _closed_outside(head, False), [PULL, PULL], [])
+    assert [card["status"] for card in _cards(kb)] == ["ready"]
+    _settled(armed, tid, head, len(events) + 1)
+
+
 @pytest.mark.parametrize("answer, state", [((200, ARMED), "auto_merge_armed"), ("timeout", "auto_merge_unknown")],
                          ids=["armed", "unknown"])
 def test_an_armed_pull_request_closed_without_merge_closes_the_row_outside(armed, answer, state):

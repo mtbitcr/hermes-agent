@@ -1733,14 +1733,16 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
     with kb.connect_closing(db_path=db_path) as conn:
         evidence = _arm_evidence(conn, row)
         claimed = _claimed(conn, repository, number)
-    if claimed or not evidence[3] or repository not in _policy_repositories() or not delivery_settings():
-        return None  # claimed, a required card is missing or open, or no repository recorded
+    if claimed or repository not in _policy_repositories() or not delivery_settings():
+        return None  # claimed, or no repository recorded
     reviews, whole = [], False
     try:
         github = GitHubTransport("publish", repository)
         at_head, closed = _review_pull(db_path, github, repository, row)
         if not at_head:
             return closed  # the pull request left H, or is closed (card C5: then closed outside): nothing to arm
+        if not evidence[3]:
+            return None  # a required card is missing or open: after card C5's read, nothing more is read or written
         for page in range(1, _REVIEW_PAGES + 1):  # oldest first; the last is not full or names no next page
             listed = _answered(github.request("GET", f"/repos/{repository}/pulls/{number}/reviews",
                                               query={"per_page": 100, "page": page}))
