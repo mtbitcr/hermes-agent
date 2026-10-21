@@ -16,6 +16,9 @@ transport or push setting of the worktree can reach it.
 A fetch of main (GitHubTransport.fetch_main) runs the same way: the checkout's HEAD is copied in first,
 the git that carries the credential fetches main alone, and the commit goes on from that copy into the
 checkout's remote-tracking ref, with no credential.
+
+A clone of main (GitHubTransport.clone_main) fetches main the same way into a fresh copy, then clones that
+copy into a missing or empty folder, with no credential, and names the repository on GitHub as its origin.
 """
 from __future__ import annotations
 
@@ -57,6 +60,9 @@ _GIT_ENV_NAMES = ("PATH", "SYSTEMROOT", "COMSPEC", "TEMP", "TMP", "TMPDIR")
 # so the checkout's HEAD, branches, index and working tree never move.
 _MAIN = "refs/heads/main"
 _MAIN_TRACKING = "refs/remotes/origin/main"
+# The origin a clone names: the bound repository on GitHub, never the copy it was made from, a test's
+# GIT_ORIGIN or a credential.
+_CLONE_ORIGIN = "https://github.com/{repository}.git"
 
 # Callers name a step, never a permission map, so these are the only token requests there are.
 # On GitHub write includes read, and every token gets metadata read without asking.
@@ -66,6 +72,9 @@ STEP_PERMISSIONS = MappingProxyType({
         "checks": "read", "actions": "read", "pull_requests": "read", "contents": "read"}),
     "merge": MappingProxyType({"contents": "write", "pull_requests": "write"}),  # T6
     "handoff": MappingProxyType({"pull_requests": "read"}),  # T7
+    # The first commit of an empty repository (repo_bootstrap), owner decision D2: the only step that may
+    # write workflows, so publish and merge can never change the workflow file it writes.
+    "bootstrap": MappingProxyType({"contents": "write", "workflows": "write"}),
 })
 
 _COMPONENT = r"[A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?"
@@ -437,6 +446,63 @@ class GitHubTransport:
             copied = _run_git(copy, env) if sha else None
             if copied is None or copied.returncode != 0:
                 raise GitHubTransportError("fetch_failed")
+        finally:
+            shutil.rmtree(home, ignore_errors=True)  # the copy, the history fetched into it and the config
+        return sha
+
+    def clone_main(self, target: str | Path) -> str:
+        """Clone the commit main holds now into `target`, a folder that is missing or empty, and return it:
+        the clone's HEAD is its main at that commit, and its origin is the repository on GitHub with no
+        credential. fetch_main cannot do this, as it needs the HEAD a fresh clone does not have yet. As there,
+        the git that carries the credential fetches main alone into a fresh bare repository in a private
+        temporary directory, and the clone is made from that copy with no credential."""
+        if not _holds(self._permissions, ("contents", "read")):
+            raise GitHubTransportError("step_not_permitted")
+        url, scheme = self._push_url()  # the source, fixed before any credential exists
+        target = os.path.abspath(target)
+        try:
+            occupied = os.path.lexists(target) and bool(os.listdir(target))
+        except OSError:  # a file, or a folder that cannot be listed
+            occupied = True
+        if occupied:
+            raise GitHubTransportError("clone_target_not_empty")  # before any git runs or a token exists
+        try:
+            home = tempfile.mkdtemp(prefix="hermes-delivery-clone-")  # mode 0700, for this one clone
+        except OSError:
+            raise GitHubTransportError("clone_failed") from None
+        try:
+            env = _git_base_env(home)
+            repository = os.path.join(home, "clone.git")
+            try:
+                Path(env["GIT_CONFIG_GLOBAL"]).touch(exist_ok=False)  # the global configuration: empty
+            except OSError:
+                raise GitHubTransportError("clone_failed") from None
+            init = _run_git(["git", "init", "--bare", "--quiet", "--template=", repository], env)
+            if init is None or init.returncode != 0:
+                raise GitHubTransportError("clone_failed")
+            # Only GIT_ORIGIN's own protocol, one URL and one refspec, main alone, and no tag, FETCH_HEAD or
+            # maintenance run beside it.
+            argv = ["git", "-c", "protocol.allow=never", "-c", f"protocol.{scheme}.allow=always",
+                    "--git-dir", repository, "fetch", "--no-tags", "--no-write-fetch-head", "--no-auto-maintenance",
+                    url, f"{_MAIN}:{_MAIN}"]
+            fetched = _run_git(argv, self._git_env(_git_base_env(home)))  # the token is minted here
+            if fetched is None or fetched.returncode != 0:
+                raise GitHubTransportError("clone_failed")
+            sha = _commit_of(_run_git(["git", "--git-dir", repository, "rev-parse", "--verify", f"{_MAIN}^{{commit}}"],
+                                      env))
+            if not sha:
+                raise GitHubTransportError("clone_failed")
+            # Into the folder from that copy, with no credential: only the file protocol, main checked out, and an
+            # empty --template=, so no sample hook. A clone git cannot finish is removed by git itself. Then the
+            # copy's path, gone with this directory, gives way to GitHub's address as the origin.
+            clone = ["git", "-c", "protocol.allow=never", "-c", "protocol.file.allow=always", "clone", "--quiet",
+                     "--template=", "--branch", "main", repository, target]
+            origin = ["git", "-C", target, "remote", "set-url", "origin",
+                      _CLONE_ORIGIN.format(repository=self.repository)]
+            for argv in (clone, origin):
+                result = _run_git(argv, env)
+                if result is None or result.returncode != 0:
+                    raise GitHubTransportError("clone_failed")
         finally:
             shutil.rmtree(home, ignore_errors=True)  # the copy, the history fetched into it and the config
         return sha

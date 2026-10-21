@@ -41,6 +41,7 @@
   "hermes_cli/plugins_loader.py": "38280b9a7f83e6f4c0e03dbec91cd986c41b3f3a7eff05772c844e5d4b3c58ff",
   "hermes_cli/plugins_manifest.py": "0f104a0ee5577add9a6b4b3e8983a1e15fafd8b717612bd97ad7e4d83dfc8baf",
   "hermes_cli/plugins_state.py": "8769736eef903c9c68060d1775c5f2c6638567d3a6d2aca18c9297c26cb3bd3c",
+  "hermes_cli/repo_bootstrap.py": "50256862526c8a0063d8fb108374a1c3e45daeb11d0df9c9b583f2b338e93014",
   "hermes_cli/session_recap.py": "c3359e8434a0d0cea0a9c67c4e0c91df7c5a1e6ba25348d171c7acedaae94961",
   "hermes_cli/tools_config_cua.py": "63b5932dc157b6af3db4b9afad53f8fd8192ff30aab2a35a83a914f14b35f7b8",
   "hermes_cli/tools_config_mcp.py": "3f23e8841be6514703adf14ea16fc5c103eae59f604b6e58d17f614ab7a588da",

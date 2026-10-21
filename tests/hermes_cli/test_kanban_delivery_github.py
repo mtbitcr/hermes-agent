@@ -43,6 +43,7 @@ NESTED = b"[" * 100000 + b"]" * 100000  # a JSON body nested deeper than any par
 SAMPLE = {"repo": REPO, "number": "7", "sha": HEAD, "id": "9", "head_sha": HEAD, "installation": str(INSTALLATION),
           "branch": "card-1"}
 SECTION_4_PERMISSIONS = {"contents", "pull_requests", "checks", "actions"}
+BOOTSTRAP_PERMISSIONS = SECTION_4_PERMISSIONS | {"workflows"}  # the first commit's step alone may name workflows (D2)
 ADMIN_CALLS = [
     ("GET", f"/repos/{REPO}/branches/main/protection"),
     ("PUT", f"/repos/{REPO}/branches/main/protection"),
@@ -559,11 +560,11 @@ def test_no_token_request_names_administration(github, monkeypatch):
     with pytest.raises(TypeError):
         mod.STEP_PERMISSIONS["admin"] = {"administration": "write"}
 
-    transports = 0
+    steps = []  # each transport mints its one token in loop order, so the nth token request is the nth step's
     for repository in (REPO, SIBLING):
         for step in mod.STEP_PERMISSIONS:
             transport = mod.GitHubTransport(step, repository, key_path=github["key_file"])
-            transports += 1
+            steps.append(step)
             for entry in mod.REST_ALLOWLIST:  # every call the step may make shares its one token
                 try:
                     transport.request(entry.method, entry.template.format(**{**SAMPLE, "repo": repository}),
@@ -572,11 +573,12 @@ def test_no_token_request_names_administration(github, monkeypatch):
                     assert exc.reason in {"step_not_permitted", "endpoint_not_allowed", "body_not_allowed"}
 
     requests = github["token_requests"]
-    assert len(requests) == transports  # the stand-in's own count: one per step and repository
-    for body in requests:
+    assert len(requests) == len(steps)  # the stand-in's own count: one per step and repository
+    for step, body in zip(steps, requests):
         assert "administration" not in json.dumps(body).lower()
         assert set(body) == {"repositories", "permissions"} and len(body["repositories"]) == 1
-        assert body["permissions"] and set(body["permissions"]) <= SECTION_4_PERMISSIONS
+        permitted = BOOTSTRAP_PERMISSIONS if step == "bootstrap" else SECTION_4_PERMISSIONS
+        assert body["permissions"] and set(body["permissions"]) <= permitted, step
         assert set(body["permissions"].values()) <= {"read", "write"}
     assert {body["repositories"][0] for body in requests} == {"hermes-agent", "raphael-workspace"}
 
