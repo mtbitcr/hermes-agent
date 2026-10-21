@@ -11,6 +11,9 @@ that ledger, satisfies the child at approval, as before, and a change that can n
 merge holds the child: there is no timeout and no release. The four parent gates of
 hermes_cli/kanban_db.py, manual promotion and the ready decision of create_task ask
 this one predicate, so promotion and claim never disagree. The gate writes nothing.
+The kernel names a carrying card on its parent after making it, in the same
+transaction, so kanban_db._append_event decides that card's readiness again when
+it writes the record that names it (:func:`named_carrier`).
 """
 
 from __future__ import annotations
@@ -19,24 +22,31 @@ import json
 import sqlite3
 
 _LINKS = 8  # as far as kanban_delivery_update._approved_base follows its chain
+_CARRIER_KEYS = {"delivery_updated": "update_task_id", "review_followup_recorded": "followup_task_id"}
+
+
+def named_carrier(kind: str, record) -> str | None:
+    """The card that a parent card's own ``kind`` record names as carrying its change on: the update_task_id of a
+    delivery_updated event or the followup_task_id of a review_followup_recorded event. No other card is one."""
+    key = _CARRIER_KEYS.get(kind)
+    carrier = record.get(key) if key is not None and isinstance(record, dict) else None
+    return carrier if isinstance(carrier, str) else None
 
 
 def _carried_on_by(conn: sqlite3.Connection, card: str) -> list[str]:
     """The cards that ``card``'s own delivery_updated and review_followup_recorded events name."""
     named = []
-    for (payload,) in conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? "
+    for kind, payload in conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
         "AND kind IN ('delivery_updated', 'review_followup_recorded') ORDER BY id",
         (card,),
     ):
         try:
-            record = json.loads(payload)
+            carrier = named_carrier(kind, json.loads(payload))
         except (TypeError, ValueError):
             continue
-        if isinstance(record, dict):
-            carrier = record.get("update_task_id") or record.get("followup_task_id")
-            if isinstance(carrier, str):
-                named.append(carrier)
+        if carrier is not None:
+            named.append(carrier)
     return named
 
 

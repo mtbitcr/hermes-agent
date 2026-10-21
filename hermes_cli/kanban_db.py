@@ -97,7 +97,7 @@ from hermes_cli import kanban_provider_stops as _provider_stops
 from hermes_cli.gitlock import clear_stale_index_lock
 from hermes_cli.kanban_archived_followups import archive_recorded_review_followups
 from hermes_cli.kanban_handover_guard import refuse_early, rollback_task_branch
-from hermes_cli.kanban_merge_gate import parent_satisfies
+from hermes_cli.kanban_merge_gate import named_carrier, parent_satisfies
 from hermes_cli.kanban_replaced_cards import replaced_task_ids
 from hermes_cli.kanban_risk_tier import (
     active_run_box_seconds,
@@ -19386,8 +19386,7 @@ def create_task(
     """Create a new task and optionally link it under parent tasks.
 
     Returns the new task id.  Status is ``ready`` when there are no
-    parents (or all are ``done`` and, outside a caller's transaction,
-    ``_parents_satisfied``), otherwise ``todo``.
+    parents (or all are ``done`` and ``_parents_satisfied``), otherwise ``todo``.
     If ``triage=True``, status is forced to ``triage`` regardless of
     parents — a specifier/triager is expected to promote the task to
     ``todo`` once the spec is fleshed out.
@@ -19724,9 +19723,6 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
-    # Under a caller's transaction the card is complete only at that commit: the kernel names a card that carries
-    # its parent's change on after making it. So only a card this call commits is re-gated below (kanban_merge_gate).
-    composed = getattr(conn, "in_transaction", False)
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -19849,7 +19845,7 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
-                if task_status == "ready" and parents and not composed and not _parents_satisfied(conn, task_id):
+                if task_status == "ready" and parents and not _parents_satisfied(conn, task_id):
                     task_status = "todo"  # re-gated once its owned paths and parent links exist
                     conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
                 # Notify-sub inheritance (ACK-edge: the originating channel
@@ -23563,7 +23559,13 @@ def _append_event(
     events by attempt. For events that aren't scoped to a single run
     (task created/edited/archived, dependency promotion) leave it None
     and the row carries NULL.
+
+    A parent's record naming the card that carries its change on
+    (``kanban_merge_gate.named_carrier``) decides that card's readiness
+    again: a ``todo`` card it releases is promoted as ``recompute_ready`` does.
     """
+    carrier = named_carrier(kind, payload)
+    held = carrier is not None and not _parents_satisfied(conn, carrier)
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
     conn.execute(
@@ -23571,6 +23573,12 @@ def _append_event(
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    if held and _parents_satisfied(conn, carrier) and conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ? AND status = 'todo' AND task_kind = 'work'", (carrier,)
+    ).fetchone() and authorize_executable_transition(conn, carrier):
+        resume = _resume_status_from_events(conn, carrier)
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'", (resume, carrier))
+        _append_event(conn, carrier, "promoted", {"status": resume} if resume != "ready" else None)
 
 
 def _persisted_run_metadata(
