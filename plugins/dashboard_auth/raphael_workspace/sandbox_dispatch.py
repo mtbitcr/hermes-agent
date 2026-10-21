@@ -890,12 +890,26 @@ def _load_connection_secret() -> str:
 def _resolve_host_credential() -> str:
     """The existing host-owned Anthropic resolver — never a tool argument.
 
-    A long-lived setup token in ``CLAUDE_CODE_OAUTH_TOKEN`` comes first. It
+    The build sign-in file in the root Hermes home comes first, but only while
+    its token outlives the sandbox lease plus the safety buffer. A new
+    long-lived token then takes over for the next build just by replacing that
+    one file; were the environment token first, it could take over only once
+    the old line was taken out of the settings file, which is a terminal step.
+
+    A long-lived setup token in ``CLAUDE_CODE_OAUTH_TOKEN`` comes next. It
     needs no refresh, so two build machines provisioned at once never rotate
     the host sign-in under each other. The general resolver would prefer a
     refreshable Claude Code login over that token, which suits the gateway's
     own calls but not build machines.
     """
+    from plugins.dashboard_auth.raphael_workspace.build_sign_in_file import read_build_token
+
+    build_sign_in = read_build_token()
+    if build_sign_in is not None:
+        token, ends_at = build_sign_in
+        remaining = (ends_at - datetime.now(timezone.utc)).total_seconds()
+        if remaining >= SANDBOX_TIMEOUT_SECONDS + CREDENTIAL_SAFETY_BUFFER_SECONDS:
+            return token
     setup_token = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
     if setup_token:
         return setup_token
