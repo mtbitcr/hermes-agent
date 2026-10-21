@@ -6,6 +6,7 @@ transport tests' stand-in plays its token endpoint, recording each token request
 import importlib
 import re
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -142,7 +143,11 @@ def test_a_second_bootstrap_reports_no_success_even_on_the_same_commit_and_main_
     assert outcomes == [{"state": "pushed", "branch": "main", "head": first}, "push_lease_mismatch",
                         "push_lease_mismatch"]  # neither repeat reports success
     assert _remote_refs(bare) == ["refs/heads/main"] and _remote_head(bare, "main") == first
-    assert _git("--git-dir", str(bare), "log", "--format=%aI %cI", "main") == f"{once} {once}"  # dated as pinned
+    # Both dates as pinned, read back raw (epoch seconds and offset) as every git prints them: the strict ISO form of
+    # %aI and %cI differs between gits, whose newer releases print a zero offset as Z rather than +00:00.
+    pinned = datetime.fromisoformat(once)
+    raw = f"{int(pinned.timestamp())} {pinned:%z}"  # 1792584000 +0000
+    assert _git("--git-dir", str(bare), "log", "--date=raw", "--format=%ad %cd", "main") == f"{raw} {raw}"
 
 
 def test_clone_main_gives_mains_commit_with_no_credential_and_refuses_a_folder_that_is_not_empty(
