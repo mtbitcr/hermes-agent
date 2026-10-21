@@ -29447,6 +29447,63 @@ def unblock_task(
         return True
 
 
+def _restored_implementer_sql(
+    conn: sqlite3.Connection, task_id: str, *, only_if_recorded: bool = False
+) -> tuple[Optional[str], str, tuple[Any, ...], Optional[dict]]:
+    """Render the hand-back to the implementer as a trailing SET fragment.
+
+    Returns ``(implementer, sql, params, repin)``: the newest
+    ``review_requested`` implementer, then its assignee, route and restored
+    write scope for the caller's ONE ``UPDATE``; when ``repin`` is not
+    ``None`` the caller appends ``model_route_repinned`` in the same
+    transaction. Shared by :func:`reopen_review_task` and the owner's move
+    out of review in :func:`_cas_transition_task_in_txn`, which passes
+    ``only_if_recorded``: a card no handover recorded an implementer for then
+    moves exactly as before instead of being refused by its own lock.
+    """
+    review_event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    try:
+        handoff = (
+            json.loads(review_event["payload"])
+            if review_event and review_event["payload"]
+            else {}
+        )
+    except (json.JSONDecodeError, TypeError):
+        handoff = {}
+    implementer = handoff.get("implementer")
+    if not isinstance(implementer, str) or not implementer.strip():
+        implementer = None
+    if implementer is None and only_if_recorded:
+        return None, "", (), None
+    # Handing the work back to the implementer is a role transition too, so
+    # it goes through the same lifetime assignment invariant as the
+    # changes-requested handback, and declares the same RETURN leg of the
+    # review round-trip — and, exactly as there, whatever the invariant
+    # hands back is written WITH the assignee, not discarded. Applying only
+    # the assignee left provider, model, effort, tier and lock still
+    # describing the reviewer, so the route no longer matched the role that
+    # held the card and the next implementation claim was refused by the
+    # task's own lock.
+    write = _authorized_assignment_write(
+        conn, task_id, implementer, review_round_trip=True
+    )
+    # The review run was read-only; the implementer gets its exact write
+    # boundary back in the same statement, from the park's provenance.
+    scope_sql, scope_params = _restored_implementation_scope_sql(conn, task_id)
+    lead: tuple[Any, ...] = (implementer,) if implementer else ()
+    return (
+        implementer,
+        (", assignee = ?" if implementer else "") + write.route_sql + scope_sql,
+        (*lead, *write.params, *scope_params),
+        write.repin,
+    )
+
+
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``review`` -> ready (or todo) so the implementer re-runs.
 
@@ -29474,62 +29531,23 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             note="invariant recovery on review reopen",
         )
         new_status = _landing_status_after_parents(conn, task_id)
-        review_event = conn.execute(
-            "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'review_requested' "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        try:
-            handoff = (
-                json.loads(review_event["payload"])
-                if review_event and review_event["payload"]
-                else {}
-            )
-        except (json.JSONDecodeError, TypeError):
-            handoff = {}
-        implementer = handoff.get("implementer")
-        if not isinstance(implementer, str) or not implementer.strip():
-            implementer = None
-        # Handing the work back to the implementer is a role transition too, so
-        # it goes through the same lifetime assignment invariant as the
-        # changes-requested handback, and declares the same RETURN leg of the
-        # review round-trip — and, exactly as there, whatever the invariant
-        # hands back is written WITH the assignee, not discarded. Applying only
-        # the assignee left provider, model, effort, tier and lock still
-        # describing the reviewer, so the route no longer matched the role that
-        # held the card and the next implementation claim was refused by the
-        # task's own lock.
-        write = _authorized_assignment_write(
-            conn, task_id, implementer, review_round_trip=True
+        implementer, handback_sql, handback_params, repin = (
+            _restored_implementer_sql(conn, task_id)
         )
-        route_sql, route_params, repin = write.route_sql, write.params, write.repin
-        # The review run was read-only; the implementer gets its exact write
-        # boundary back in the same statement, from the park's provenance.
-        scope_sql, scope_params = _restored_implementation_scope_sql(conn, task_id)
         if new_status in EXECUTABLE_STATUSES and not authorize_executable_transition(
             conn, task_id
         ):
             # Parked for re-approval rather than handed back into the pool.
             return False
-        assignee_sql = ", assignee = ?" if implementer else ""
-        lead: tuple[Any, ...] = (
-            (new_status, implementer) if implementer else (new_status,)
-        )
-        params: tuple[Any, ...] = (
-            *lead, *route_params, *scope_params, task_id,
-        )
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
             # consecutive_failures deliberately PRESERVED: review reopen is
             # not a success signal; only complete_task resets the breaker
             # counter (mirrors unblock_task, #35072).
-            + assignee_sql
-            + route_sql
-            + scope_sql
+            + handback_sql
             + " WHERE id = ? AND status = 'review' AND task_kind = 'work'",
-            params,
+            (new_status, *handback_params, task_id),
         )
         if cur.rowcount != 1:
             return False
@@ -30475,6 +30493,14 @@ def _cas_transition_task_in_txn(
             "status": current_status,
             "revision": current_revision,
         }
+    # An owner reactivating a review card hands it back to its implementer
+    # exactly as :func:`reopen_review_task` does; moving the status alone left
+    # the reviewer holding it, on the reviewer's route and read-only scope.
+    _, handback_sql, handback_params, repin = (
+        _restored_implementer_sql(conn, task_id, only_if_recorded=True)
+        if expected_status == "review" and to_status in ("ready", "todo")
+        else (None, "", (), None)
+    )
     # Any move THROUGH this generic path — including an owner's deliberate
     # postpone into ``scheduled`` — drops whatever parking generation the row
     # carried: it is no longer sitting where some earlier receipt left it, so
@@ -30488,9 +30514,10 @@ def _cas_transition_task_in_txn(
         )
     else:
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, park_generation = NULL "
-            "WHERE id = ? AND status = ?",
-            (to_status, task_id, expected_status),
+            "UPDATE tasks SET status = ?, park_generation = NULL"
+            + handback_sql
+            + " WHERE id = ? AND status = ?",
+            (to_status, *handback_params, task_id, expected_status),
         )
     if cur.rowcount != 1:
         return {
@@ -30523,6 +30550,10 @@ def _cas_transition_task_in_txn(
             **(event_payload or {}), "parked_dependents": parked_dependents,
         }
     _append_event(conn, task_id, event_kind, event_payload, run_id=run_id)
+    # After the transition's own event, which an owner receipt's replay
+    # recognizes as this task's very next one.
+    if repin is not None:
+        _append_event(conn, task_id, "model_route_repinned", repin)
     return {
         "moved": True,
         "status": to_status,
