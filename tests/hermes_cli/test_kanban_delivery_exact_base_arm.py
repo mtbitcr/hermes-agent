@@ -268,7 +268,8 @@ def test_the_arm_sends_no_merge_and_records_base_moved_when_main_moved(exact, wh
     _tick(kb)
     _tick(kb)
 
-    assert (_arms(gh), _state(kb, head), _events(kb, tid), gh["calls"][calls:]) == ([], "base_moved", events, [])
+    assert (_arms(gh), _state(kb, head), _events(kb, tid), gh["calls"][calls:]) == (
+        [], "base_moved", events, [("GET", PULL)] * 2)
 
 
 @pytest.mark.parametrize("value", [None, "false", '"true"', "1", '"yes"'],
@@ -400,7 +401,7 @@ def test_a_documented_refusal_is_recorded_refused_without_a_read_back(exact, sta
     _tick(kb)
     _tick(kb)
 
-    assert (len(_arms(gh)), _state(kb, head), gh["calls"][calls:]) == (1, "auto_merge_refused", [])
+    assert (len(_arms(gh)), _state(kb, head), gh["calls"][calls:]) == (1, "auto_merge_refused", [("GET", PULL)] * 2)
 
 
 @pytest.mark.parametrize("answer, state", [

@@ -502,7 +502,7 @@ def test_every_review_page_is_read_up_to_ten_and_a_longer_history_refuses_h_once
     _tick(kb)
     assert (_events(kb, tid), _arms(gh), _state(kb, head)) == (events, arms, state)  # nothing more sent or recorded
     new = gh["calls"][calls:]
-    if outcome == "armed":  # card 10: an armed pull request is read once a pass to see whether it merged
+    if outcome in ("armed", "refused"):  # card 10: an armed pull request is read once a pass to see whether it merged
         assert new == [("GET", f"/repos/{REPO}/pulls/41")]
     else:
         assert (new == []) is (outcome is not None)  # only a waiting H is read again
@@ -572,7 +572,7 @@ def test_a_new_head_is_never_pushed_to_an_armed_pull_request_and_stays_parked(ar
     assert gh["calls"][:len(calls)] == calls and new and set(new) == {("GET", f"/repos/{REPO}/pulls/41")}
     # This stand-in's pull answer names no base and no merge commit, so H is never taken as merged into main
     # and stays armed; tests/hermes_cli/test_release_intake.py covers a merge.
-    assert _state(kb, head) == "auto_merge_armed"
+    assert _state(kb, head) == ("closed_outside" if ended is False else "auto_merge_armed")
     assert [(p["code"], p["head"]) for kind, p in _events(kb, tid) if kind == "delivery_refused"] == [
         ("auto_merge_armed", second)]
     assert _raw(kb.kanban_db_path(), "SELECT publish_refusal FROM kanban_deliveries WHERE source_head = ?",
@@ -686,7 +686,7 @@ def test_a_replacement_proof_that_changes_while_the_earlier_pull_request_is_read
     db = kb.kanban_db_path()
     first, delivered, rework = _continued(armed)
     task = "UPDATE tasks SET {} WHERE id = ?"
-    gh["hooks"]["PULL"] = {
+    hook = {
         None: lambda: None,
         "source_status": lambda: _raw(db, task.format("status = 'ready'"), first),
         "source_head": lambda: _raw(db, task.format("head_commit = ?"), OTHER, first),
@@ -695,6 +695,14 @@ def test_a_replacement_proof_that_changes_while_the_earlier_pull_request_is_read
         "rework_head": lambda: _raw(db, task.format("head_commit = ?"), OTHER, rework),
         "rework_delivery": lambda: _raw(db, "UPDATE kanban_deliveries SET source_head = ? WHERE source_task_id = ?",
                                         OTHER, rework)}[change]
+    pull, since = ("GET", f"/repos/{REPO}/pulls/41"), len(gh["calls"])
+
+    def close_read():
+        if gh["calls"][-1] == pull and gh["calls"][since:].count(pull) == 2:
+            return hook()
+        gh["hooks"]["PULL"] = close_read
+
+    gh["hooks"]["PULL"] = close_read  # card C5: fire at the close step's read of pull request 41
 
     _tick(kb)
 
