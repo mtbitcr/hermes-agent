@@ -95,7 +95,11 @@ from hermes_cli.kanban_risk_tier import (
     pinned_reasoning_effort,
     recovered_root_risk_tier,
 )
-from hermes_cli.owner_named_inputs import declare_named_inputs, parse_named_inputs
+from hermes_cli.owner_named_inputs import (
+    decision_missing_inputs,
+    declare_named_inputs,
+    parse_named_inputs,
+)
 from hermes_cli.owner_text import check_owner_text
 from hermes_cli.sqlite_util import write_txn
 from plugins.dashboard_auth.raphael_workspace.model_policy import (
@@ -2658,6 +2662,10 @@ PROVIDER_WAIT_CAPABILITY = "provider_wait_v1"
 # (card C5). Without it every card keeps today's shape exactly; only a reader
 # naming it gets each card's ``delivery``: "delivering" or None.
 DELIVERY_STATE_CAPABILITY = "delivery_state_v1"
+# A separately negotiated contour for the files a held card still needs from
+# the owner (card C2 of the named inputs plan). Without it every Decision keeps
+# today's keys exactly; only a reader naming it gets ``missing_inputs``.
+OWNER_INPUT_UPLOAD_CAPABILITY = "owner_input_upload_v1"
 _OWNER_STOPPED_WORK_PROVIDER_WAIT = "provider_wait"
 _OWNER_PROVIDER_WAITING_SUMMARY = (
     "Waiting for the AI provider. Work resumes by itself after {time} UTC."
@@ -3896,7 +3904,9 @@ _SUGGESTION_KIND_TITLES = {
 _SUGGESTION_FALLBACK_TITLE = "A suggested capability change"
 
 
-def list_owner_decisions(ctx: OwnerContext, *, owner_waiting: bool = False) -> dict:
+def list_owner_decisions(
+    ctx: OwnerContext, *, owner_waiting: bool = False, owner_input_upload: bool = False,
+) -> dict:
     """Project pending native gates into one owner-safe read-only inbox.
 
     Returns ``{"data": [...], "truncated": bool}``. The window is bounded both
@@ -3919,6 +3929,11 @@ def list_owner_decisions(ctx: OwnerContext, *, owner_waiting: bool = False) -> d
     inbox as owner input, merged in each Project's own order before that
     Project's window, and every owner-input item carries its own cleaned stop
     reason and the time its wait began.
+
+    ``owner_input_upload`` is set only for a reader that named
+    ``OWNER_INPUT_UPLOAD_CAPABILITY``. Each owner-input item of a card that
+    declares named inputs then carries ``missing_inputs``, the inputs the owner
+    has not given yet (see :func:`decision_missing_inputs`).
     """
     decisions: list[dict] = []
     truncated = False
@@ -3943,6 +3958,7 @@ def list_owner_decisions(ctx: OwnerContext, *, owner_waiting: bool = False) -> d
             board_path = kanban_db.board_dir(board_slug) / "kanban.db"
 
         waits: dict[str, dict] = {}
+        missing: dict[str, list[dict]] = {}
         conn = _open_read_only_sqlite(board_path, label="kanban.db")
         try:
             columns = {
@@ -3995,6 +4011,10 @@ def list_owner_decisions(ctx: OwnerContext, *, owner_waiting: bool = False) -> d
                     ],
                     key=lambda row: (-int(row["created_at"]), str(row["id"])),
                 )
+            if owner_input_upload:
+                missing = decision_missing_inputs(conn, [
+                    str(row["id"]) for row in rows[:_OWNER_DECISIONS_LIMIT]
+                ])
         except sqlite3.Error as exc:
             raise OwnerWorkspaceError(
                 "snapshot_unavailable", "the Project decisions could not be read"
@@ -4071,6 +4091,8 @@ def list_owner_decisions(ctx: OwnerContext, *, owner_waiting: bool = False) -> d
                 wait = waits[str(row["id"])]
                 decisions[-1]["reason"] = owner_stop_reason(wait["reason"])
                 decisions[-1]["created_at"] = _owner_timestamp(wait["since"])
+            if kind == "owner_input" and str(row["id"]) in missing:
+                decisions[-1]["missing_inputs"] = missing[str(row["id"])]
 
     authority_order = {"owner_input": 0, "capability": 1}
     decisions.sort(

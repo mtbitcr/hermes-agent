@@ -113,6 +113,7 @@ from hermes_cli.kanban_risk_tier import (
 )
 from hermes_cli.kanban_run_metadata_merge import merge_edited_run_metadata, strip_kernel_keys
 from hermes_cli.kanban_schedule_stop import capture_worker, stop_after_commit
+from hermes_cli.owner_named_inputs import InputHold
 from hermes_cli.sqlite_util import (
     InitLockDirectoryAbsent,
     InitLockUnavailable,
@@ -24459,7 +24460,7 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
+    with InputHold() as input_hold, write_txn(conn):
         assert_claimable_route(conn, task_id)
         scope = conn.execute(
             "SELECT assignee, owned_paths, integrates_parent_heads FROM tasks "
@@ -24499,6 +24500,9 @@ def claim_task(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
             )
+            return None
+        # Named inputs the owner has not all given hold the card (card C2).
+        if input_hold.hold(conn, task_id):
             return None
         conflicts = file_scope_conflicts(conn, task_id)
         if conflicts:

@@ -6,7 +6,9 @@ in the per-test home: ``GET /v1/owner-workspace/decisions`` over
 /v1/owner-workspace/decisions/{decision_ref}/{action}`` over
 ``decide_owner_suggestion``. The run-approval items come from the adapter's
 own in-memory run statuses, set as the run route sets them while a run waits
-for the owner's approval. What is asserted is described in
+for the owner's approval. The list read with ``owner_input_upload_v1`` holds a
+card the real apply path declared and the claim held for the owner's files
+(card C2 of the named inputs plan). What is asserted is described in
 tests/contracts/conftest.py.
 """
 
@@ -24,7 +26,8 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     _resolve_owner_workspace_run_context,
 )
-from hermes_cli import kanban_db, owner_workspace as ow
+from hermes_cli import kanban_db, owner_named_inputs as oni, owner_workspace as ow
+from plugins.dashboard_auth.raphael_workspace import model_policy
 from tests.contracts import conftest as contract
 from tests.gateway.test_api_server_owner_suggestion_decisions import (  # noqa: F401  (owner is a fixture)
     _ROUTES,
@@ -33,6 +36,8 @@ from tests.gateway.test_api_server_owner_suggestion_decisions import (  # noqa: 
     _write_owner_workspace_config,
     owner,
 )
+from tests.hermes_cli.test_owner_named_inputs import _apply, _authorize, _plan_change
+from tests.hermes_cli.test_owner_workspace import _configured_anthropic, _temporarily_patch
 
 FAMILY = "owner_decisions"
 # Each operation a waiting run can name in the inbox (api_server.py:13205-13213).
@@ -154,6 +159,59 @@ async def test_the_decision_examples_carry_every_item_kind_answer_and_error(
         for answer in answers.values():
             assert (answer["status"] >= 400) == ("error" in answer["body"])
         assert answers["invalid_request"]["body"]["error"]["code"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_decision_list_read_with_owner_input_upload_names_the_missing_inputs(
+    owner, owner_payload_example,
+):
+    ctx = ow.OwnerContext(actor=owner.actor, profile=owner.profile, session="run_owt")
+    project = _project(ctx, "Board Setup")
+    with _temporarily_patch(model_policy, "configured_assignment_for", _configured_anthropic):
+        applied = _apply(ctx, _authorize(
+            *_plan_change(project["project_id"], inputs=[
+                {"name": "price list", "type": "csv"},
+                {"name": "opening hours", "type": "txt"},
+            ]),
+            project_id=project["project_id"],
+        ))
+    (held,) = applied["created_task_ids"]
+    with contextlib.closing(kanban_db.connect(board=project["board"])) as conn:
+        # The owner gave the opening hours only.
+        kanban_db.store_attachment_bytes(
+            conn, held, "opening-hours.txt", b"Mon-Fri 9-17\n",
+            uploaded_by=oni.OWNER_UPLOADER, board=project["board"],
+        )
+        assert kanban_db.claim_task(conn, held) is None
+        question = kanban_db.create_task(
+            conn, title="Choose the opening date", assignee="default",
+            project_id=project["project_id"],
+        )
+        assert kanban_db.block_task(
+            conn, question, reason="Which date suits you?", kind="needs_input",
+        )
+    _adapter, app = _app()
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/v1/owner-workspace/decisions",
+            params={"capabilities": "owner_input_upload_v1"},
+        )
+        live = {"status": resp.status, "body": await resp.json()}
+
+    saved = owner_payload_example(FAMILY, "decision_list_owner_input_upload", live)
+
+    for answer in (live, saved):
+        assert answer["status"] == 200
+        (declaring,) = [item for item in answer["body"]["data"] if "missing_inputs" in item]
+        (plain,) = [item for item in answer["body"]["data"] if "missing_inputs" not in item]
+        assert declaring["kind"] == plain["kind"] == "owner_input"
+        assert set(declaring) == set(plain) | {"missing_inputs"}
+        # Only the input still missing, with its plain label and the size
+        # limit; never a file name.
+        assert declaring["missing_inputs"] == [{
+            "n": 1, "name": "price list",
+            "type_label": oni.TYPE_LABELS["csv"], "max_bytes": oni.MAX_INPUT_BYTES,
+        }]
 
 
 def test_the_decision_examples_keep_to_every_closed_vocabulary():

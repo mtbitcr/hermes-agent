@@ -13225,6 +13225,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=404,
                 )
             from hermes_cli.owner_workspace import (
+                OWNER_INPUT_UPLOAD_CAPABILITY,
                 OWNER_WAITING_CAPABILITY,
                 list_owner_decisions,
                 resolve_owner_context,
@@ -13239,6 +13240,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 else {}
             )
+            # The same for owner_input_upload_v1 and its keyword (card C2).
+            if _owner_workspace_capability_requested(
+                request, OWNER_INPUT_UPLOAD_CAPABILITY
+            ):
+                waiting["owner_input_upload"] = True
             owner = resolve_owner_context()
             projected = list_owner_decisions(owner, **waiting)
             decisions = list(projected["data"])

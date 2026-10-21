@@ -1,5 +1,5 @@
-"""The named input rules: one copy, shared by the authority, the apply path
-and, later, the missing-input hold and the upload route.
+"""The named input rules: one copy, shared by the authority, the apply path,
+the missing-input hold, the Decisions reader and, later, the upload route.
 
 An approved plan may name, on each task it creates, the text files that task
 needs from the owner: the optional ``inputs`` field, a list of one to five
@@ -10,7 +10,9 @@ chooses (named inputs plan, section 2 and card C1).
 
 The apply path records a card's inputs once, as the task event
 ``named_inputs_declared`` (no schema migration), and :func:`missing_inputs`
-reads that declaration back against the card's attachments.
+reads that declaration back against the card's attachments. ``claim_task``
+holds a card that still misses one (:class:`InputHold`), and the Decisions
+feed names what is missing (:func:`decision_missing_inputs`, card C2).
 """
 
 from __future__ import annotations
@@ -31,6 +33,16 @@ OWNER_UPLOADER = "owner"
 # The one owner reason of the missing-input hold (card C2). It passes the
 # owner text policy unchanged, so the shared policy copy never has to change.
 HOLD_SENTENCE = "Raphael needs a file from you before this work can start."
+# The plain words the owner app shows for each input type (card C2). Each
+# passes the owner text policy unchanged and is never a file name.
+TYPE_LABELS = {
+    "txt": "text file",
+    "md": "formatted text (Markdown)",
+    "csv": "spreadsheet (CSV)",
+    "json": "data file (JSON)",
+}
+# The largest file the owner may give for one input: 8 MiB.
+MAX_INPUT_BYTES = 8 * 1024 * 1024
 
 # Words of lowercase ASCII letters, digits and hyphens joined by single
 # spaces, starting with a letter: no dot, slash or extension can appear.
@@ -182,3 +194,88 @@ def missing_inputs(conn: sqlite3.Connection, task_id: str) -> list[dict]:
         for entry in declarations[-1]["inputs"]
         if entry["file"] not in present
     ]
+
+
+class InputHold:
+    """The missing-input hold of ``claim_task`` (card C2).
+
+    ``claim_task`` opens one around its write transaction and calls
+    :meth:`hold` after its parents check. A ready work card whose declared
+    inputs the owner has not all given is blocked ``needs_input`` with
+    :data:`HOLD_SENTENCE` in that same transaction, so no run starts and the
+    claim returns None. ``kanban_task_blocked`` fires once the transaction has
+    committed, as ``block_task`` fires it, and never when it rolled back.
+    """
+
+    def __init__(self) -> None:
+        self._held: tuple[str, dict] | None = None
+
+    def __enter__(self) -> "InputHold":
+        return self
+
+    def hold(self, conn: sqlite3.Connection, task_id: str) -> bool:
+        """Whether the card is held; *conn* is in the claim's transaction."""
+        from hermes_cli import kanban_db
+
+        declared = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ? AND status = 'ready' "
+            "AND task_kind = 'work' AND EXISTS (SELECT 1 FROM task_events "
+            "WHERE task_id = tasks.id AND kind = ?)",
+            (task_id, DECLARED_EVENT),
+        ).fetchone()
+        if declared is None or not missing_inputs(conn, task_id):
+            return False
+        blocked = kanban_db._block_task_within_txn(
+            conn, task_id, reason=HOLD_SENTENCE, kind="needs_input",
+            expected_run_id=None,
+        )
+        if blocked is not None:
+            self._held = (task_id, blocked)
+        return True
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if exc_type is not None or self._held is None:
+            return
+        from hermes_cli import kanban_db
+
+        task_id, blocked = self._held
+        kanban_db._fire_kanban_lifecycle_hook(
+            "kanban_task_blocked",
+            task_id,
+            board=kanban_db.get_current_board(),
+            assignee=blocked["assignee"],
+            run_id=blocked["run_id"],
+            reason=HOLD_SENTENCE,
+        )
+
+
+def decision_missing_inputs(
+    conn: sqlite3.Connection, task_ids: list[str],
+) -> dict[str, list[dict]]:
+    """The still-missing inputs of each declaring card among *task_ids*.
+
+    For a Decisions reader that names ``owner_input_upload_v1`` (card C2).
+    Each entry is ``{"n", "name", "type_label", "max_bytes"}``, in declaration
+    order: the input's plain :data:`TYPE_LABELS` word, never its file name,
+    and :data:`MAX_INPUT_BYTES`. A card without a declaration is left out.
+    Read only; *task_ids* is one Project's bounded Decisions window.
+    """
+    if not task_ids:
+        return {}
+    declaring = conn.execute(
+        "SELECT DISTINCT task_id FROM task_events WHERE kind = ? AND task_id IN "
+        f"({', '.join('?' for _ in task_ids)})",
+        (DECLARED_EVENT, *task_ids),
+    ).fetchall()
+    return {
+        row[0]: [
+            {
+                "n": entry["n"],
+                "name": entry["name"],
+                "type_label": TYPE_LABELS[entry["type"]],
+                "max_bytes": MAX_INPUT_BYTES,
+            }
+            for entry in missing_inputs(conn, row[0])
+        ]
+        for row in declaring
+    }
