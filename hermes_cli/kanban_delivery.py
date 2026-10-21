@@ -623,7 +623,8 @@ def _adoptable(db_path: Path) -> Optional[int]:
 def publish_step(db_path: Optional[Path]) -> Optional[dict]:
     """The dispatcher's delivery step for the board whose file is ``db_path``: act on the
     published heads whose CI is done, then lease at most one approved delivery row, or one
-    parked with head_moved that GitHub now shows published, and publish it. Raises no
+    parked with head_moved that GitHub now shows published, and publish it; a row whose source
+    card the owner replaced is parked with source_replaced instead (finding 183). Raises no
     error, so the tick goes on."""
     if db_path is None or not delivery_settings():
         return None
@@ -640,6 +641,11 @@ def publish_step(db_path: Optional[Path]) -> Optional[dict]:
         if leased is None:
             return None
         try:
+            with kb.connect_closing(db_path=db_path) as conn:
+                replacement = conn.execute(f"SELECT {_OWNER_REPLACEMENT.format('d')} FROM kanban_deliveries AS d "
+                                           "WHERE d.id = ?", (leased[0],)).fetchone()[0]
+            if replacement is not None:  # finding 183: the work of a card the owner replaced is never published
+                raise PublishRefused("source_replaced", f"the owner replaced the source card with {replacement}")
             return publish_delivery(db_path, *leased)
         except PublishRefused as refusal:
             logger.warning(
@@ -1580,13 +1586,21 @@ _REVIEW_PAGES = 10  # owner rule 2 of round 3: a pull request's reviews are read
 _RECEIPT = ("(SELECT json_extract(payload, '$.repository') FROM task_events WHERE task_id = {0}.source_task_id "
             "AND kind = 'delivery_published' AND json_extract(payload, '$.head') = {0}.pull_request_head "
             "AND json_extract(payload, '$.pull_request_number') = {0}.pull_request_number ORDER BY id DESC LIMIT 1)")
+# Finding 183: the card the owner replaced a row's source card with, as an owner replace leaves it: the source
+# archived, and its latest owner_project_plan_change event naming a replacement_task_id names it. Else NULL.
+_OWNER_REPLACEMENT = ("(SELECT json_extract(e.payload, '$.replacement_task_id') FROM task_events AS e "
+                      "JOIN tasks AS t ON t.id = e.task_id AND t.status = 'archived' "
+                      "WHERE e.task_id = {0}.source_task_id AND e.kind = 'owner_project_plan_change' "
+                      "AND json_type(e.payload, '$.replacement_task_id') = 'text' "
+                      "AND json_extract(e.payload, '$.replacement_task_id') != '' ORDER BY e.id DESC LIMIT 1)")
 
 
 def arm_step(db_path: Path) -> None:
     """Card 5 on the board whose file is ``db_path``: merge the pull request once at each
     head whose required review cards are done and approve it, and close once the pull
-    request of each head a rework card continues. GitHub merges exactly the approved head. Raises no error,
-    so the tick goes on. A head whose review requests changes returns to its builder instead."""
+    request of each head a rework card continues or whose card the owner replaced. GitHub merges exactly the
+    approved head. Raises no error, so the tick goes on. A head whose review requests changes returns to its
+    builder instead."""
     try:
         with kb.connect_closing(db_path=db_path) as conn:
             rows = [dict(row) for row in conn.execute(
@@ -1612,11 +1626,20 @@ def _replaced(conn: sqlite3.Connection, old_id: Optional[int] = None) -> list:
     another card's work continues: that card is a task_links child of the row's source card,
     its recorded base is the row's head or it is the row's update card (card 3), which only the
     kernel's delivery_updated event of the row and its head names, and its own
-    published pull request is another one of the same repository. The row is still the latest
-    on its pull request, and no close of it was sent; a merged row is final (card 10's owner
-    rule 2), and so is a row closed outside."""
+    published pull request is another one of the same repository. Finding 183: and each published
+    row whose source card the owner replaced (:data:`_OWNER_REPLACEMENT`), which the card the owner
+    named replaces, no link or pull request of it needed; a row a rework card continues keeps that
+    card. The row is still the latest on its pull request, and no close of it was sent; a merged row
+    is final (card 10's owner rule 2), and so is a row closed outside."""
     old, new, later = (_RECEIPT.format(name) for name in ("old", "new", "later"))
-    return [dict(row) for row in conn.execute(
+    closable = ("old.pull_request_number IS NOT NULL AND (? IS NULL OR old.id = ?) "
+                "AND IFNULL(old.pull_request_state, '') NOT IN (?, ?) "
+                "AND NOT EXISTS (SELECT 1 FROM kanban_deliveries AS later WHERE later.id > old.id "
+                f"AND later.pull_request_number = old.pull_request_number AND {later} = {old}) "
+                "AND NOT EXISTS (SELECT 1 FROM task_events WHERE task_id = old.source_task_id "
+                "AND kind = 'delivery_close_pending' AND json_extract(payload, '$.delivery_id') = old.id)")
+    params = (old_id, old_id, _MERGED, _CLOSED_OUTSIDE)
+    rows = [dict(row) for row in conn.execute(
         f"SELECT old.*, {old} AS repository, MIN(rework.id) AS replaced_by FROM kanban_deliveries AS old "
         "JOIN tasks AS rework ON (rework.base_commit = old.pull_request_head OR EXISTS (SELECT 1 FROM task_events "
         "WHERE task_id = old.source_task_id AND kind = 'delivery_updated' AND json_extract(payload, '$.delivery_id') "
@@ -1626,13 +1649,11 @@ def _replaced(conn: sqlite3.Connection, old_id: Optional[int] = None) -> list:
         "JOIN task_links AS link ON link.parent_id = old.source_task_id AND link.child_id = rework.id "
         "JOIN kanban_deliveries AS new ON new.source_task_id = rework.id AND new.pull_request_number IS NOT NULL "
         f"AND new.pull_request_number != old.pull_request_number AND {new} = {old} "
-        "WHERE old.pull_request_number IS NOT NULL AND (? IS NULL OR old.id = ?) "
-        "AND IFNULL(old.pull_request_state, '') NOT IN (?, ?) "
-        "AND NOT EXISTS (SELECT 1 FROM kanban_deliveries AS later WHERE later.id > old.id "
-        f"AND later.pull_request_number = old.pull_request_number AND {later} = {old}) "
-        "AND NOT EXISTS (SELECT 1 FROM task_events WHERE task_id = old.source_task_id "
-        "AND kind = 'delivery_close_pending' AND json_extract(payload, '$.delivery_id') = old.id) "
-        "GROUP BY old.id ORDER BY old.id", (old_id, old_id, _MERGED, _CLOSED_OUTSIDE))]
+        f"WHERE {closable} GROUP BY old.id ORDER BY old.id", params)]
+    continued, owner = {row["id"] for row in rows}, _OWNER_REPLACEMENT.format("old")
+    return rows + [dict(row) for row in conn.execute(
+        f"SELECT old.*, {old} AS repository, {owner} AS replaced_by FROM kanban_deliveries AS old "
+        f"WHERE {owner} IS NOT NULL AND {closable} ORDER BY old.id", params) if row["id"] not in continued]
 
 
 def _approving_cards(conn: sqlite3.Connection, row: dict, read: tuple, returned: bool = False) -> list:
@@ -1907,8 +1928,8 @@ def _claimed(conn: sqlite3.Connection, repository: str, number: int) -> bool:
 
 def _close_replaced(db_path: Path, row: dict) -> None:
     """Close, once, the pull request of a head a rework card continues (owner rules 2 and 3 of
-    round 2). GitHub must show it open at that head; one write transaction then reads the
-    replacement proof again, finds the pull request unclaimed and reserves the close
+    round 2), or whose card the owner replaced (finding 183). GitHub must show it open at that head; one write
+    transaction then reads the replacement proof again, finds the pull request unclaimed and reserves the close
     under this attempt, and the one call setting its state to closed follows. Done only when
     the answer shows that pull request closed; else a close refusal, which keeps an armed hold."""
     from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError
