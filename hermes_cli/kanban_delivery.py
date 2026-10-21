@@ -1109,7 +1109,7 @@ def _review_base(db_path: Path, github, repository: str, row: dict, read: tuple)
     H, since GitHub starts no CI run on a pull request that conflicts with main. ``(H is reviewed, the state
     stored)``, always reviewed with the setting off: a main neither the reviewed base nor in H gets no review card,
     only the arm's base_moved record with no cards, so the update step brings H up to date first; no main shown
-    stores nothing."""
+    stores nothing, and neither does a row held for its rework (:func:`_reworking`), whose checks are read as today."""
     if not exact_base_settings():
         return True, None
     source, head = row["source_task_id"], row["pull_request_head"]
@@ -1123,6 +1123,8 @@ def _review_base(db_path: Path, github, repository: str, row: dict, read: tuple)
     with kb.connect_closing(db_path=db_path) as conn, kb.write_txn(conn):
         if not delivery_settings() or not _unchanged(conn, row, read):
             return False, None  # the row or its source card changed while GitHub was read: nothing is stored
+        if _reworking(conn, source, head):
+            return True, None  # H's rework is in progress: nothing is stored, and H's checks are read as today
         conn.execute("UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ?", (_BASE_MOVED, row["id"]))
         kb._append_event(conn, source, f"delivery_{_BASE_MOVED}", _outcome(
             row, repository=repository, reviewed_base=reviewed_base, observed_main=main, cards=[]))
@@ -1382,6 +1384,12 @@ def _continued(conn: sqlite3.Connection, source: str, head: str) -> tuple:
     return identity, None, None
 
 
+def _reworking(conn: sqlite3.Connection, source: str, head: str) -> bool:
+    """A returned row is held while its rework is in progress: H's continuation (:func:`_continued`) is neither done
+    nor archived, so a moved main records nothing for the row."""
+    return _continued(conn, source, head)[2] not in ("done", "archived", None)
+
+
 def _return_branch(db_path: Path, row: dict) -> Optional[tuple]:
     """Owner rule 2: H's continuation branch, named from the source card and H only, made at H before the write
     transaction or reused when it points at H already, in the continuation's repository. By the owner's rule of
@@ -1624,14 +1632,15 @@ def arm_step(db_path: Path) -> None:
 def _replaced(conn: sqlite3.Connection, old_id: Optional[int] = None) -> list:
     """Each published row (or row ``old_id``) whose pull request, its repository and number,
     another card's work continues: that card is a task_links child of the row's source card,
-    its recorded base is the row's head or it is the row's update card (card 3), which only the
+    its recorded base is the row's head or the head of an earlier row of the same pull request (an
+    update moved it on), or it is the row's update card (card 3), which only the
     kernel's delivery_updated event of the row and its head names, and its own
     published pull request is another one of the same repository. Finding 183: and each published
     row whose source card the owner replaced (:data:`_OWNER_REPLACEMENT`), which the card the owner
     named replaces, no link or pull request of it needed; a row a rework card continues keeps that
     card. The row is still the latest on its pull request, and no close of it was sent; a merged row
     is final (card 10's owner rule 2), and so is a row closed outside."""
-    old, new, later = (_RECEIPT.format(name) for name in ("old", "new", "later"))
+    old, new, later, earlier = (_RECEIPT.format(name) for name in ("old", "new", "later", "earlier"))
     closable = ("old.pull_request_number IS NOT NULL AND (? IS NULL OR old.id = ?) "
                 "AND IFNULL(old.pull_request_state, '') NOT IN (?, ?) "
                 "AND NOT EXISTS (SELECT 1 FROM kanban_deliveries AS later WHERE later.id > old.id "
@@ -1644,7 +1653,10 @@ def _replaced(conn: sqlite3.Connection, old_id: Optional[int] = None) -> list:
         "JOIN tasks AS rework ON (rework.base_commit = old.pull_request_head OR EXISTS (SELECT 1 FROM task_events "
         "WHERE task_id = old.source_task_id AND kind = 'delivery_updated' AND json_extract(payload, '$.delivery_id') "
         "= old.id AND json_extract(payload, '$.head') = old.pull_request_head "
-        "AND json_extract(payload, '$.update_task_id') = rework.id)) "
+        "AND json_extract(payload, '$.update_task_id') = rework.id) "
+        "OR EXISTS (SELECT 1 FROM kanban_deliveries AS earlier WHERE earlier.id < old.id "
+        f"AND earlier.pull_request_number = old.pull_request_number AND {earlier} = {old} "
+        "AND earlier.pull_request_head = rework.base_commit)) "
         "AND rework.id != old.source_task_id "
         "JOIN task_links AS link ON link.parent_id = old.source_task_id AND link.child_id = rework.id "
         "JOIN kanban_deliveries AS new ON new.source_task_id = rework.id AND new.pull_request_number IS NOT NULL "
@@ -1822,6 +1834,8 @@ def _arm_delivery(db_path: Path, row: dict) -> Optional[str]:
                     row, repository=repository, status=None, reason="review_history_over_10_pages",
                     cards=[card[0] for card in evidence[2]]))
                 return _ARM_REFUSED
+            if moved and _reworking(conn, source, head):
+                return None  # H's rework is in progress: nothing is sent or recorded
             if moved:  # main left the base review saw and is not in H: nothing is sent, the lease is untouched
                 conn.execute("UPDATE kanban_deliveries SET pull_request_state = ? WHERE id = ?", (_BASE_MOVED, row["id"]))
                 kb._append_event(conn, source, f"delivery_{_BASE_MOVED}", _outcome(
