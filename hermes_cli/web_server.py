@@ -12022,6 +12022,8 @@ async def cancel_oauth_session(
         return {"ok": False, "message": "session not found"}
     return {"ok": True, "session_id": session_id}
 
+from hermes_cli.web_routers import build_sign_in as _build_sign_in_routes  # noqa: E402
+app.include_router(_build_sign_in_routes.router)
 
 # ---------------------------------------------------------------------------
 # Session detail endpoints
