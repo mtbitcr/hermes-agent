@@ -1425,6 +1425,161 @@ class TestCredentialPreflight:
 
 
 # ---------------------------------------------------------------------------
+# 6b. The build sign-in file in the root Hermes home is read first
+# ---------------------------------------------------------------------------
+
+
+BUILD_SIGN_IN_TOKEN = "sk-ant-oat01-BUILD-sign-in-file-token-in-the-root-home"
+ENV_SETUP_TOKEN = "sk-ant-oat01-LONG-LIVED-setup-token-from-the-environment"
+#: A setup token works for one year from when it was made.
+SETUP_TOKEN_LIFETIME = timedelta(days=365)
+
+
+def _days_ago(days: float) -> datetime:
+    return datetime.now(timezone.utc) - timedelta(days=days)
+
+
+def _failing_resolver():
+    raise RuntimeError("the general resolver failed")
+
+
+def _place_build_sign_in(
+    home: Path, made_at: datetime, *, mode: int = 0o600, body: bytes | None = None
+) -> Path:
+    """Put the build sign-in file in place under the root Hermes home *home*."""
+    path = home / "secrets" / "build-sign-in.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if body is None:
+        body = json.dumps(
+            {"token": BUILD_SIGN_IN_TOKEN, "made_at": made_at.isoformat()}
+        ).encode("utf-8")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(body)
+    os.chmod(path, mode)
+    return path
+
+
+@pytest.fixture
+def build_host(host, monkeypatch):
+    """The real resolver, with a setup token in the environment as today."""
+    import agent.anthropic_credentials as credentials
+
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", ENV_SETUP_TOKEN)
+    monkeypatch.setattr(sd, "_resolve_host_credential", _REAL_RESOLVE_HOST_CREDENTIAL)
+    monkeypatch.setattr(credentials, "resolve_anthropic_token", lambda: REAL_OAUTH)
+    return host
+
+
+class TestBuildSignInFileFirst:
+    def test_a_valid_file_made_ten_days_ago_is_used_over_the_environment_token(
+        self, build_host, sdk, refresh_spy, caplog
+    ):
+        _place_build_sign_in(build_host.home, _days_ago(10))
+
+        with caplog.at_level(logging.DEBUG):
+            out = _provision()
+
+        assert out["sandbox_id"] == "sbx-001"
+        assert refresh_spy.calls == []
+        box = FakeSandbox.created[0]
+        (cred,) = box.vault_calls[0]["credentials"]
+        assert cred.source.value == BUILD_SIGN_IN_TOKEN
+        # The machine itself still holds only the placeholder.
+        env = box.create_kwargs["env"]
+        assert env["ANTHROPIC_AUTH_TOKEN"] == sd.PLACEHOLDER_TOKEN
+        exposed = json.dumps(
+            {
+                "env": env,
+                "commands": box.commands_log,
+                "receipt": out,
+                "reservation": _reservation(build_host),
+            },
+            default=str,
+        )
+        for hidden in (BUILD_SIGN_IN_TOKEN, ENV_SETUP_TOKEN):
+            assert hidden not in exposed
+            assert hidden not in caplog.text
+
+    @pytest.mark.parametrize(
+        "spare_seconds,expected",
+        [(-60, ENV_SETUP_TOKEN), (60, BUILD_SIGN_IN_TOKEN)],
+        ids=["runs-out-too-soon-so-skipped", "outlives-the-lease-and-buffer"],
+    )
+    def test_a_file_is_used_only_while_it_outlives_the_lease_plus_the_buffer(
+        self, build_host, sdk, refresh_spy, spare_seconds, expected
+    ):
+        from plugins.dashboard_auth.raphael_workspace.build_sign_in_file import (
+            read_build_token,
+        )
+
+        required = sd.SANDBOX_TIMEOUT_SECONDS + sd.CREDENTIAL_SAFETY_BUFFER_SECONDS
+        ends_at = datetime.now(timezone.utc) + timedelta(seconds=required + spare_seconds)
+        _place_build_sign_in(build_host.home, ends_at - SETUP_TOKEN_LIFETIME)
+        # The file itself is sound; only its remaining life decides.
+        assert read_build_token()[0] == BUILD_SIGN_IN_TOKEN
+
+        out = _provision()
+
+        assert out["sandbox_id"] == "sbx-001"
+        assert refresh_spy.calls == []
+        (cred,) = FakeSandbox.created[0].vault_calls[0]["credentials"]
+        assert cred.source.value == expected
+
+    @pytest.mark.parametrize("kind", ["mode-0644", "symlink", "broken-content"])
+    def test_a_file_that_cannot_be_trusted_is_skipped_for_the_environment_token(
+        self, build_host, tmp_path, caplog, kind
+    ):
+        from plugins.dashboard_auth.raphael_workspace.build_sign_in_file import (
+            read_build_token,
+        )
+
+        if kind == "mode-0644":
+            _place_build_sign_in(build_host.home, _days_ago(10), mode=0o644)
+        elif kind == "symlink":
+            target = _place_build_sign_in(tmp_path / "elsewhere", _days_ago(10))
+            link = build_host.home / "secrets" / "build-sign-in.json"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(target)
+        else:
+            # Cut short after the token, as a half-written file would be.
+            body = json.dumps({"token": BUILD_SIGN_IN_TOKEN}).encode("utf-8")[:-1]
+            _place_build_sign_in(build_host.home, _days_ago(10), body=body + b', "made_at": ')
+
+        with caplog.at_level(logging.DEBUG):
+            assert read_build_token() is None
+            assert sd._resolve_host_credential() == ENV_SETUP_TOKEN
+        assert BUILD_SIGN_IN_TOKEN not in caplog.text
+        assert ENV_SETUP_TOKEN not in caplog.text
+
+    @pytest.mark.parametrize(
+        "env_token,general,expected",
+        [
+            (ENV_SETUP_TOKEN, lambda: REAL_OAUTH, ENV_SETUP_TOKEN),
+            ("", lambda: REAL_OAUTH, REAL_OAUTH),
+            ("", lambda: None, ""),
+            ("", _failing_resolver, ""),
+        ],
+        ids=[
+            "environment-token-first",
+            "then-the-general-resolver",
+            "then-nothing",
+            "a-failing-resolver-gives-nothing",
+        ],
+    )
+    def test_with_no_file_the_order_and_the_result_are_today_s(
+        self, build_host, monkeypatch, env_token, general, expected
+    ):
+        import agent.anthropic_credentials as credentials
+
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", env_token)
+        monkeypatch.setattr(credentials, "resolve_anthropic_token", general)
+        assert not (build_host.home / "secrets" / "build-sign-in.json").exists()
+
+        assert sd._resolve_host_credential() == expected
+
+
+# ---------------------------------------------------------------------------
 # 7. Failure handling and client-handle lifecycle
 # ---------------------------------------------------------------------------
 
