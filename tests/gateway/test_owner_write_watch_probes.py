@@ -50,6 +50,8 @@ RELEASE_ROUTES = tuple(
 # The default profile's other probed routes, and the Decisions feed the owner app reads.
 OTHER_ROUTES = (
     "GET /v1/owner-workspace/decisions", "POST /v1/runs", "POST /v1/runs/{run_id}/approval",
+    "POST /v1/owner-workspace/projects/{slug}/repository/check",
+    "POST /v1/owner-workspace/projects/{slug}/repository/connect",
 ) + RELEASE_ROUTES
 [DECISIONS] = [probe for probe in watch.PROBES["default"] if probe.name == "decisions"]
 RELEASE = [probe for probe in watch.PROBES["default"] if "/owner-workspace/release/" in probe.path]
