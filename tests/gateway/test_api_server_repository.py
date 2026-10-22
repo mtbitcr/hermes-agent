@@ -369,6 +369,33 @@ async def test_a_confirmation_write_that_raises_answers_503_and_the_retry_record
 
 
 @pytest.mark.asyncio
+async def test_a_policy_write_that_raises_after_the_append_answers_503_and_the_retry_lists_one_entry(
+        root, github, connects):
+    """The confirmation line is appended, then the policy cannot be written, so the connect answers the existing 503
+    sentence with the line appended and no entry listed. That is accepted by design: the retry with the same
+    repository and digest is a new confirmation by the owner, so it appends its own identical line and writes the
+    entry. The policy then holds exactly one entry for the repository, and the log two identical lines."""
+    owner_policy_path().mkdir(parents=True)  # the policy is a folder: the line is appended, then its write raises
+    body = {"repository": REPOSITORY, "digest": DIGEST}
+    async with _client() as client:
+        await _refused(await client.post(CONNECT, json=body, headers=OWNER), 503, "owner_workspace_unavailable")
+        assert len(_confirmations()) == 1 and not owner_policy_path().is_file()
+        owner_policy_path().rmdir()
+        retry = await client.post(CONNECT, json=body, headers=OWNER)
+        text = await retry.text()
+
+    assert retry.status == 200, text
+    assert json.loads(text) == {
+        "object": "hermes.owner_workspace.repository_receipt", "repository": REPOSITORY, "bootstrapped": True}
+    assert connects.calls == [("app", REPOSITORY)]
+    listed = json.loads(owner_policy_path().read_text(encoding="utf-8"))
+    assert listed == {REPOSITORY: {"required_checks": ["quality"]}}
+    # Two identical lines, each with the second its own confirmation was made in.
+    lines = [{key: value for key, value in line.items() if key != "confirmed_at"} for line in _confirmations()]
+    assert lines == [{"repository": REPOSITORY, "required_checks": ["quality"], "digest": DIGEST}] * 2
+
+
+@pytest.mark.asyncio
 async def test_a_true_repeat_appends_no_second_confirmation_line(root, github, connects, monkeypatch):
     """A repeat of a finished connect still runs every step: connect_repository is skipped, as the project's
     primary folder holds the repository, and record_confirmed_entry answers already_confirmed, so the repeat
@@ -391,6 +418,35 @@ async def test_a_true_repeat_appends_no_second_confirmation_line(root, github, c
     assert decisions == ["confirmed", "already_confirmed"]
     assert connects.calls == [("app", REPOSITORY)]
     assert len(_confirmations()) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spellings", [(REPOSITORY, "mtbitcr/Example-App"), ("mtbitcr/Example-App", REPOSITORY)],
+                         ids=["lowercase-first", "other-case-first"])
+async def test_a_repeat_in_another_letter_case_is_the_same_repeat(root, github, connects, spellings):
+    """The route takes the repository name in lowercase, as GitHub names are case-insensitive: each check answers
+    the lowercase name and its digest, and the connect with that digest answers the lowercase receipt. So whichever
+    spelling comes first, the connect in the other letter case is the same repeat: it writes nothing and answers the
+    same receipt, and the project holds one clone, one listed entry and one confirmation line."""
+    receipt = {"object": "hermes.owner_workspace.repository_receipt", "repository": REPOSITORY, "bootstrapped": True}
+    async with _client() as client:
+        for spelling in spellings:  # the first connects; the second is the repeat in the other letter case
+            before = _tree(root)
+            shown = await (await client.post(CHECK, json={"repository": spelling}, headers=OWNER)).json()
+            response = await client.post(
+                CONNECT, json={"repository": spelling, "digest": shown["digest"]}, headers=OWNER)
+            assert (shown["repository"], shown["digest"]) == (REPOSITORY, DIGEST)
+            assert (response.status, await response.json()) == (200, receipt)
+        view = await (await client.get(VIEW, headers=OWNER)).json()
+
+    assert _tree(root) == before  # the repeat's check and connect wrote nothing
+    assert view == {"object": "hermes.owner_workspace.repository", "state": "connected", "repository": REPOSITORY}
+    assert github.requests == [("read_checks", "GET", f"/repos/{REPOSITORY}/git/ref/heads/main")] * 2
+    assert connects.calls == [("app", REPOSITORY)]
+    [line] = _confirmations()
+    assert (line["repository"], line["required_checks"], line["digest"]) == (REPOSITORY, ["quality"], DIGEST)
+    listed = json.loads(owner_policy_path().read_text(encoding="utf-8"))
+    assert listed == {REPOSITORY: {"required_checks": ["quality"]}}
 
 
 WRONG_BODIES = [

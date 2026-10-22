@@ -9,6 +9,9 @@ unless the project's primary folder already holds the repository, then always re
 owner delivery list. Each step is idempotent, so a retry completes a step an earlier answer missed and a repeat
 writes nothing. The receipt is read from the clone, so a repeat answers the first receipt, also after a restart. No
 answer holds the clone's folder or a refusal's reason code; each refusal is one plain sentence.
+
+GitHub names are case-insensitive, so the check and the connect take the repository name in lowercase, as its clone's
+folder is named: another letter case is the same repository, and every answer names the lowercase form.
 """
 
 from __future__ import annotations
@@ -77,13 +80,14 @@ def route(adapter: Any, action: str):
             shown = action == "check" or (type(digest) is str and _DIGEST.fullmatch(digest))
             if err or set(body) != _FIELDS[action] or type(repository) is not str or not shown:
                 return _refusal(400, "Invalid repository request", "invalid_argument")
-            transport = GitHubTransport("read_checks", repository)  # refuses a name it does not take
+            GitHubTransport("read_checks", repository)  # refuses a name it does not take, as it was sent
+            repository = repository.lower()  # one repository identity, whatever letter case the owner typed
             if action == "check":
                 return web.json_response({
                     "object": "hermes.owner_workspace.repository_check",
                     "repository": repository,
                     "required_checks": list(_REQUIRED_CHECKS),
-                    "main_empty": await asyncio.to_thread(_main_empty, transport),
+                    "main_empty": await asyncio.to_thread(_main_empty, GitHubTransport("read_checks", repository)),
                     "digest": entry_digest(repository, list(_REQUIRED_CHECKS)),
                 })
             if digest != entry_digest(repository, list(_REQUIRED_CHECKS)):
@@ -142,7 +146,7 @@ def _connect(slug: str, repository: str, digest: str) -> Optional[bool]:
         if decision.allowed:  # a refused entry is never cloned, bound or recorded
             with pdb.connect_closing() as conn:
                 project = pdb.get_project(conn, slug)
-            if project is None or _held(project) != repository.lower():
+            if project is None or _held(project) != repository:
                 repo_connect.connect_repository(slug, repository)
             decision = record_confirmed_entry(repository, list(_REQUIRED_CHECKS), digest)
         if decision.code in ("confirmed", "already_confirmed"):  # a bound clone alone is no finished connect
