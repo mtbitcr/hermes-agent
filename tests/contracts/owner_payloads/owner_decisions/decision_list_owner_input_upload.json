@@ -1,0 +1,37 @@
+{
+  "body": {
+    "data": [
+      {
+        "authority": "task",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_621a7329549646f66e6e38f3d51d8a8b",
+        "kind": "owner_input",
+        "project_name": "Board Setup",
+        "project_slug": "board-setup",
+        "reason": "Raphael needs your answer before this work can continue.",
+        "title": "Choose the opening date"
+      },
+      {
+        "authority": "task",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_e48936278a00be70bf154e13ae421af6",
+        "kind": "owner_input",
+        "missing_inputs": [
+          {
+            "max_bytes": 8388608,
+            "n": 1,
+            "name": "price list",
+            "type_label": "spreadsheet (CSV)"
+          }
+        ],
+        "project_name": "Board Setup",
+        "project_slug": "board-setup",
+        "reason": "Raphael needs your answer before this work can continue.",
+        "title": "Publish the price page"
+      }
+    ],
+    "object": "hermes.owner_workspace.decision_list",
+    "truncated": false
+  },
+  "status": 200
+}
