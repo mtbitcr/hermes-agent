@@ -10,8 +10,9 @@ owner delivery list. Each step is idempotent, so a retry completes a step an ear
 writes nothing. The receipt is read from the clone, so a repeat answers the first receipt, also after a restart. No
 answer holds the clone's folder or a refusal's reason code; each refusal is one plain sentence.
 
-GitHub names are case-insensitive, so the check and the connect take the repository name in lowercase, as its clone's
-folder is named: another letter case is the same repository, and every answer names the lowercase form.
+The check and the connect accept only a repository name in lowercase letters, and every step uses it exactly as given,
+as the transport checks the repository its token names exactly. A name with a capital letter is refused before any
+call, clone or record; a repository whose name on GitHub has capital letters is renamed there first.
 """
 
 from __future__ import annotations
@@ -50,6 +51,8 @@ _REFUSALS = {
 _TRANSPORT = "GitHub did not complete the request for this repository."
 _CHANGED = "The repository check changed after it was shown, so nothing was connected."
 _NOT_LISTED = "This repository cannot be added to the delivery list, so the connection was not completed."
+_LOWERCASE = ("Use the repository name in lowercase letters. "
+              "If its name on GitHub has capital letters, rename it on GitHub first.")
 # One connect at a time in this gateway: a second click waits, then finds the repository the first one bound,
 # and the owner list is never rewritten by two records at once.
 _CONNECTING = threading.Lock()
@@ -81,7 +84,8 @@ def route(adapter: Any, action: str):
             if err or set(body) != _FIELDS[action] or type(repository) is not str or not shown:
                 return _refusal(400, "Invalid repository request", "invalid_argument")
             GitHubTransport("read_checks", repository)  # refuses a name it does not take, as it was sent
-            repository = repository.lower()  # one repository identity, whatever letter case the owner typed
+            if repository != repository.lower():  # only a lowercase name, then used exactly as given
+                return _refusal(400, _LOWERCASE, "invalid_argument")
             if action == "check":
                 return web.json_response({
                     "object": "hermes.owner_workspace.repository_check",
@@ -175,8 +179,8 @@ def _git(folder: Path, *args: str) -> str:
 
 
 def _held(project: Any) -> Optional[str]:
-    """The repository whose clone is the project's primary folder, named as its folder is (lowercased); None when
-    the primary folder is not such a clone."""
+    """The repository whose clone is the project's primary folder, named as its folder is: in lowercase letters, the
+    only name the routes accept. None when the primary folder is not such a clone."""
     if not project.primary_path:
         return None
     path = Path(project.primary_path)

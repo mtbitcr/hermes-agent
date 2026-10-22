@@ -263,6 +263,8 @@ async def test_a_repeat_connect_writes_nothing(root, github, connects):
     assert _tree(root) == before
     assert connects.calls == [("app", REPOSITORY)]
     assert len(_confirmations()) == 1
+    listed = json.loads(owner_policy_path().read_text(encoding="utf-8"))
+    assert listed == {REPOSITORY: {"required_checks": ["quality"]}}
 
 
 @pytest.mark.asyncio
@@ -421,32 +423,39 @@ async def test_a_true_repeat_appends_no_second_confirmation_line(root, github, c
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("spellings", [(REPOSITORY, "mtbitcr/Example-App"), ("mtbitcr/Example-App", REPOSITORY)],
-                         ids=["lowercase-first", "other-case-first"])
-async def test_a_repeat_in_another_letter_case_is_the_same_repeat(root, github, connects, spellings):
-    """The route takes the repository name in lowercase, as GitHub names are case-insensitive: each check answers
-    the lowercase name and its digest, and the connect with that digest answers the lowercase receipt. So whichever
-    spelling comes first, the connect in the other letter case is the same repeat: it writes nothing and answers the
-    same receipt, and the project holds one clone, one listed entry and one confirmation line."""
-    receipt = {"object": "hermes.owner_workspace.repository_receipt", "repository": REPOSITORY, "bootstrapped": True}
-    async with _client() as client:
-        for spelling in spellings:  # the first connects; the second is the repeat in the other letter case
-            before = _tree(root)
-            shown = await (await client.post(CHECK, json={"repository": spelling}, headers=OWNER)).json()
-            response = await client.post(
-                CONNECT, json={"repository": spelling, "digest": shown["digest"]}, headers=OWNER)
-            assert (shown["repository"], shown["digest"]) == (REPOSITORY, DIGEST)
-            assert (response.status, await response.json()) == (200, receipt)
-        view = await (await client.get(VIEW, headers=OWNER)).json()
+@pytest.mark.parametrize("path,body", [
+    (CHECK, {"repository": "mtbitcr/Example-App"}),
+    (CONNECT, {"repository": "mtbitcr/Example-App", "digest": entry_digest("mtbitcr/Example-App", ["quality"])}),
+], ids=["check", "connect"])
+async def test_a_name_with_a_capital_letter_is_refused_before_any_call_clone_or_record(
+        root, github, connects, monkeypatch, path, body):
+    """The route accepts only an all-lowercase repository name, and uses it exactly as given. A name with a capital
+    letter, the connect's with the digest of that exact name, answers one plain 400 sentence before GitHub is asked
+    for a token or a request, and nothing is cloned, bound or recorded."""
+    called = []
 
-    assert _tree(root) == before  # the repeat's check and connect wrote nothing
-    assert view == {"object": "hermes.owner_workspace.repository", "state": "connected", "repository": REPOSITORY}
-    assert github.requests == [("read_checks", "GET", f"/repos/{REPOSITORY}/git/ref/heads/main")] * 2
-    assert connects.calls == [("app", REPOSITORY)]
-    [line] = _confirmations()
-    assert (line["repository"], line["required_checks"], line["digest"]) == (REPOSITORY, ["quality"], DIGEST)
-    listed = json.loads(owner_policy_path().read_text(encoding="utf-8"))
-    assert listed == {REPOSITORY: {"required_checks": ["quality"]}}
+    def refuse(name):
+        def call(transport, *_args, **_options):
+            called.append(name)
+            raise AssertionError(f"GitHubTransport.{name} was called")
+        return call
+
+    monkeypatch.setattr(GitHubTransport, "request", refuse("request"))
+    monkeypatch.setattr(GitHubTransport, "_mint", refuse("_mint"))
+    client = _client()  # the adapter makes its own response store first
+    before = _tree(root)
+    async with client:
+        message = await _refused(await client.post(path, json=body, headers=OWNER), 400, "invalid_argument")
+
+    assert message == ("Use the repository name in lowercase letters. "
+                       "If its name on GitHub has capital letters, rename it on GitHub first.")
+    assert called == []
+    assert connects.calls == []
+    assert _tree(root) == before
+    assert not confirmations_path().exists() and not owner_policy_path().exists()
+    with pdb.connect_closing() as conn:
+        project = pdb.get_project(conn, "app")
+    assert project.primary_path is None and project.folders == []
 
 
 WRONG_BODIES = [
