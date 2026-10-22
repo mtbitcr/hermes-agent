@@ -130,6 +130,10 @@ PROBES: Dict[str, tuple] = {
               "/p/default/v1/owner-workspace/release/0/defer", {}, 400, "invalid_argument"),
         Probe("release_start", "Starting a release", "POST",
               "/p/default/v1/owner-workspace/release/0/start", {}, 400, "invalid_argument"),
+        Probe("repository_check", "Checking a repository before it is connected", "POST",
+              "/p/default/v1/owner-workspace/projects/0/repository/check", {}, 400, "invalid_argument"),
+        Probe("repository_connect", "Connecting a repository to a project", "POST",
+              "/p/default/v1/owner-workspace/projects/0/repository/connect", {}, 400, "invalid_argument"),
     ),
     "raphael-planner": (
         Probe("planner_turn", "Conversation and automation planning (routes 2, 3)", "POST",
