@@ -27338,6 +27338,7 @@ def _block_task_within_txn(
     reason: Optional[str],
     kind: Optional[str],
     expected_run_id: Optional[int],
+    synthesize_run: bool = True,
 ) -> Optional[dict]:
     """The body of :func:`block_task`, run inside the caller's open write
     transaction: the routing, the compare-and-swapped status update, the
@@ -27345,6 +27346,8 @@ def _block_task_within_txn(
 
     Shared with :func:`submit_review_findings`, whose repeated-findings stop
     must decide the block together with its own event in ONE transaction.
+    The missing-input hold passes ``synthesize_run=False``: it must create no
+    run, not even a closed one.
     Returns ``{"run_id", "assignee"}`` for the post-commit lifecycle hook the
     caller fires, or ``None`` when the task was not in a blockable state (or
     ``expected_run_id`` is no longer its current run): nothing was written.
@@ -27411,7 +27414,7 @@ def _block_task_within_txn(
             outcome="blocked", status="blocked",
             summary=reason,
         )
-        if run_id is None and reason:
+        if synthesize_run and run_id is None and reason:
             run_id = _synthesize_ended_run(
                 conn, task_id, outcome="blocked", summary=reason,
             )
@@ -27463,7 +27466,7 @@ def _block_task_within_txn(
             outcome="blocked", status="blocked",
             summary=reason,
         )
-        if run_id is None and reason:
+        if synthesize_run and run_id is None and reason:
             run_id = _synthesize_ended_run(
                 conn, task_id, outcome="blocked", summary=reason,
             )
@@ -27519,7 +27522,7 @@ def _block_task_within_txn(
         )
         # Synthesize a run when blocking a never-claimed task so the
         # reason is preserved in attempt history.
-        if run_id is None and reason:
+        if synthesize_run and run_id is None and reason:
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="blocked",

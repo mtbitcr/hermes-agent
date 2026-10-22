@@ -202,7 +202,7 @@ class InputHold:
     ``claim_task`` opens one around its write transaction and calls
     :meth:`hold` after its parents check. A ready work card whose declared
     inputs the owner has not all given is blocked ``needs_input`` with
-    :data:`HOLD_SENTENCE` in that same transaction, so no run starts and the
+    :data:`HOLD_SENTENCE` in that same transaction, so no run is made and the
     claim returns None. ``kanban_task_blocked`` fires once the transaction has
     committed, as ``block_task`` fires it, and never when it rolled back.
     """
@@ -227,7 +227,7 @@ class InputHold:
             return False
         blocked = kanban_db._block_task_within_txn(
             conn, task_id, reason=HOLD_SENTENCE, kind="needs_input",
-            expected_run_id=None,
+            expected_run_id=None, synthesize_run=False,
         )
         if blocked is not None:
             self._held = (task_id, blocked)

@@ -126,8 +126,18 @@ def _events(conn, task_id: str, kind: str) -> list:
     return [event for event in kb.list_events(conn, task_id) if event.kind == kind]
 
 
+def _runs(conn, task_id: str) -> list[dict]:
+    """The card's attempt history: each of its task_runs rows, oldest first."""
+    return [
+        dict(run)
+        for run in conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (task_id,),
+        )
+    ]
+
+
 def _assert_held(conn, task_id: str) -> None:
-    """The card waits blocked ``needs_input`` for the owner; no run started."""
+    """The card, never claimed, waits blocked ``needs_input``; no run exists."""
     row = conn.execute(
         "SELECT status, block_kind, current_run_id, started_at, claim_lock "
         "FROM tasks WHERE id = ?",
@@ -136,15 +146,9 @@ def _assert_held(conn, task_id: str) -> None:
     assert tuple(row) == ("blocked", "needs_input", None, None, None)
     assert _events(conn, task_id, "claimed") == []
     assert _events(conn, task_id, "blocked")[-1].payload["reason"] == oni.HOLD_SENTENCE
-    # As block_task does for a card never claimed, each hold keeps its reason
-    # in the attempt history as one closed record of no length: never a run
-    # that started.
-    for run in conn.execute(
-        "SELECT status, outcome, summary, started_at = ended_at, claim_lock, "
-        "worker_pid FROM task_runs WHERE task_id = ?",
-        (task_id,),
-    ):
-        assert tuple(run) == ("blocked", "blocked", oni.HOLD_SENTENCE, 1, None, None)
+    # Unlike block_task on a card never claimed, the hold writes no run row,
+    # not even a closed one of no length, however often the card is held.
+    assert _runs(conn, task_id) == []
 
 
 # ---------------------------------------------------------------------------
@@ -157,10 +161,12 @@ def test_a_ready_card_missing_an_input_is_held_and_no_run_starts(ctx, fired_hook
     with contextlib.closing(kb.connect(board=setup["board"])) as conn:
         fired_hooks.store = _store_file(conn)
         assert _status(conn, task_id) == "ready"
+        assert _runs(conn, task_id) == []
 
         assert kb.claim_task(conn, task_id) is None
 
         _assert_held(conn, task_id)
+        assert _runs(conn, task_id) == []
         (blocked,) = _events(conn, task_id, "blocked")
         assert blocked.payload == {
             "reason": oni.HOLD_SENTENCE,
@@ -168,9 +174,11 @@ def test_a_ready_card_missing_an_input_is_held_and_no_run_starts(ctx, fired_hook
             "recurrences": 1,
             "source_status": "ready",
         }
+        # There is no run, so the event names none.
+        assert blocked.run_id is None
         assignee = kb.get_task(conn, task_id).assignee
     # Fired once, as block_task fires it, and after the commit: another
-    # connection already saw the card blocked.
+    # connection already saw the card blocked. No run id is invented.
     assert fired_hooks.fired == [(
         "kanban_task_blocked",
         {
@@ -178,7 +186,7 @@ def test_a_ready_card_missing_an_input_is_held_and_no_run_starts(ctx, fired_hook
             "profile_name": get_active_profile_name(),
             "board": kb.get_current_board(),
             "assignee": assignee,
-            "run_id": blocked.run_id,
+            "run_id": None,
             "reason": oni.HOLD_SENTENCE,
         },
         "blocked",
@@ -193,7 +201,8 @@ def test_the_same_card_is_claimed_once_the_owner_gave_each_file(ctx, fired_hooks
         assert kb.claim_task(conn, task_id) is None
         _assert_held(conn, task_id)
 
-        # One file given: the card is held again for the other.
+        # One file given: the card is held again for the other, and this hold
+        # adds no run row either.
         _give(conn, board, task_id, "price-list.csv")
         assert kb.unblock_task(conn, task_id) is True
         assert kb.claim_task(conn, task_id) is None
@@ -206,6 +215,11 @@ def test_the_same_card_is_claimed_once_the_owner_gave_each_file(ctx, fired_hooks
 
         assert claimed is not None and claimed.status == "running"
         assert _status(conn, task_id) == "running"
+        # Its one run is the claimed one; the two holds left none behind.
+        (run,) = _runs(conn, task_id)
+        assert (run["id"], run["status"], run["ended_at"]) == (
+            claimed.current_run_id, "running", None,
+        )
         assert [event.payload["recurrences"] for event in _events(conn, task_id, "blocked")] == [1, 2]
         assert len(_events(conn, task_id, "claimed")) == 1
     assert [(hook, status) for hook, _fields, status in fired_hooks.fired] == [
@@ -283,6 +297,22 @@ def test_a_running_card_is_never_held(ctx, fired_hooks):
         assert _status(conn, task_id) == "running"
         assert _events(conn, task_id, "blocked") == []
     assert [hook for hook, _fields, _status in fired_hooks.fired] == ["kanban_task_claimed"]
+
+
+def test_block_task_still_records_one_closed_attempt_for_a_card_never_claimed(ctx):
+    # Only the hold leaves the attempt history empty: block_task keeps the
+    # default and keeps its reason there as one closed record of no length.
+    setup, task_id = _card(ctx)
+    reason = "Which venue should we book?"
+    with contextlib.closing(kb.connect(board=setup["board"])) as conn:
+        assert _runs(conn, task_id) == []
+
+        assert kb.block_task(conn, task_id, reason=reason, kind="needs_input") is True
+
+        (run,) = _runs(conn, task_id)
+        assert (run["status"], run["outcome"], run["summary"]) == ("blocked", "blocked", reason)
+        assert run["started_at"] == run["ended_at"]
+        assert _events(conn, task_id, "blocked")[-1].run_id == run["id"]
 
 
 # ---------------------------------------------------------------------------
