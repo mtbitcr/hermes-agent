@@ -139,6 +139,119 @@ def test_default_profile_probes_the_two_repository_routes():
     assert len({probe.name for probe in watch.PROBES["default"]}) == len(watch.PROBES["default"])
 
 
+def test_default_profile_probes_the_input_upload_route():
+    """The default profile's table holds one probe for the owner upload route of a card that waits for a
+    file, with the exact path under /p/default, no payload at all (None) and the healthy answer 404
+    decision_not_found. The Decisions probe is still the first probe on a decisions path."""
+    probes = [probe for probe in watch.PROBES["default"] if "/inputs/" in probe.path]
+    assert [(probe.method, probe.path, probe.body, probe.status, probe.code) for probe in probes] == [
+        ("POST", f"/p/default/v1/owner-workspace/decisions/decision_{'0' * 32}/inputs/1", None, 404,
+         "decision_not_found"),
+    ]
+    assert all(probe.message is None and probe.label for probe in probes)
+    assert decisions_probe().name == "decisions"
+    assert len({probe.name for probe in watch.PROBES["default"]}) == len(watch.PROBES["default"])
+
+
+@pytest.mark.asyncio
+async def test_the_input_upload_probe_gets_its_healthy_refusal_from_the_real_route(monkeypatch):
+    """Sent by the check's own sender to the real upload route under /p/default, on a loopback server
+    in this test's home with the owner workspace switched on, the probe's empty body gets 404
+    decision_not_found with the route's own sentence, and the probe passes."""
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+
+    [probe] = [probe for probe in watch.PROBES["default"] if "/inputs/" in probe.path]
+    key = "probe-inputs-" + "4b7d19e2" * 4
+    # gateway.run pins its config home at import; read this test's home instead.
+    monkeypatch.setattr("gateway.run._hermes_home", get_hermes_home())
+    (get_hermes_home() / "config.yaml").write_text(
+        json.dumps({"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}), encoding="utf-8")
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": key}))
+    app = web.Application()
+    for method, path, handler in adapter._http_route_table():
+        if "/inputs/" in path:
+            app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+    async with TestServer(app, host="127.0.0.1") as server:
+        status, payload = await asyncio.to_thread(
+            watch._http_send, probe.method, str(server.make_url(probe.path)), probe.body, key)
+
+    assert (status, payload["error"]["code"]) == (404, "decision_not_found")
+    assert payload["error"]["message"] == "This request is no longer waiting for a file."
+    assert watch.classify(probe, status, payload) == watch.PASS
+
+
+@pytest.mark.asyncio
+async def test_the_input_upload_probe_puts_a_truly_empty_body_on_the_wire(monkeypatch):
+    """A loopback relay records the bytes the check's own sender puts on the wire on their way to the real
+    upload route: the upload probe sends an empty body (b''), with no JSON content type, and still gets
+    404 decision_not_found; a probe with a JSON body still sends that JSON."""
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+
+    [probe] = [probe for probe in watch.PROBES["default"] if "/inputs/" in probe.path]
+    json_probe = next(probe for probe in watch.PROBES["default"] if probe.name == "repository_check")
+    key = "probe-inputs-" + "6c2e8f05" * 4
+    monkeypatch.setattr("gateway.run._hermes_home", get_hermes_home())
+    (get_hermes_home() / "config.yaml").write_text(
+        json.dumps({"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}), encoding="utf-8")
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": key}))
+    app = web.Application()
+    for method, path, handler in adapter._http_route_table():
+        if path.endswith(("/inputs/{n}", "/repository/check")):
+            app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+    requests = []
+
+    async def relay(reader, writer):
+        """Pass one connection through to the route, keeping every byte the sender wrote."""
+        upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", server.port)
+        sent = bytearray()
+        requests.append(sent)
+
+        async def pump(source, sink, kept=None):
+            while chunk := await source.read(65536):
+                if kept is not None:
+                    kept.extend(chunk)
+                sink.write(chunk)
+                await sink.drain()
+            sink.close()
+
+        await asyncio.gather(pump(reader, upstream_writer, sent), pump(upstream_reader, writer))
+
+    async with TestServer(app, host="127.0.0.1") as server:
+        wire = await asyncio.start_server(relay, "127.0.0.1", 0)
+        base = f"http://127.0.0.1:{wire.sockets[0].getsockname()[1]}"
+        async with wire:
+            answers = [
+                await asyncio.to_thread(watch._http_send, sent.method, base + sent.path, sent.body, key)
+                for sent in (probe, json_probe)
+            ]
+
+    def split(request):
+        head, _, body = bytes(request).partition(b"\r\n\r\n")
+        return {line.split(b":", 1)[0].strip().lower(): line.split(b":", 1)[1].strip()
+                for line in head.split(b"\r\n")[1:]}, body
+
+    (headers, body), (json_headers, json_body) = (split(request) for request in requests)
+    assert body == b""
+    assert headers.get(b"content-length", b"0") == b"0" and b"content-type" not in headers
+    status, payload = answers[0]
+    assert (status, payload["error"]["code"]) == (404, "decision_not_found")
+    assert watch.classify(probe, status, payload) == watch.PASS
+    assert json.loads(json_body) == json_probe.body == {}
+    assert json_headers[b"content-type"] == b"application/json"
+    # Every other probe keeps its JSON body.
+    assert [other.name for table in watch.PROBES.values() for other in table if not isinstance(other.body, dict)] == [
+        "input_upload",
+    ]
+
+
 @pytest.mark.parametrize("status,code", REFUSALS)
 def test_1_a_refusal_on_any_probed_route_counts_as_a_failure(status, code):
     """A refusal on any probed route counts as a failure: 401 gateway_auth_failed, 403

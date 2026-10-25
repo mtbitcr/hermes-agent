@@ -72,7 +72,7 @@ class Probe:
     label: str
     method: str
     path: str
-    body: Dict[str, Any]
+    body: Optional[Dict[str, Any]]  # None sends no payload at all: an empty body
     status: int
     code: Optional[str] = None
     # The platform sends no code with these 400s, so the exact message is compared instead.
@@ -134,6 +134,8 @@ PROBES: Dict[str, tuple] = {
               "/p/default/v1/owner-workspace/projects/0/repository/check", {}, 400, "invalid_argument"),
         Probe("repository_connect", "Connecting a repository to a project", "POST",
               "/p/default/v1/owner-workspace/projects/0/repository/connect", {}, 400, "invalid_argument"),
+        Probe("input_upload", "Giving a waiting card the file it asks for", "POST",
+              f"/p/default/v1/owner-workspace/decisions/{_DECISION}/inputs/1", None, 404, "decision_not_found"),
     ),
     "raphael-planner": (
         Probe("planner_turn", "Conversation and automation planning (routes 2, 3)", "POST",
@@ -493,7 +495,7 @@ def _listener_base() -> str:
     return f"http://{DEFAULT_HOST}:{port}"
 
 
-def _http_send(method: str, url: str, body: Dict[str, Any], key: str):
+def _http_send(method: str, url: str, body: Optional[Dict[str, Any]], key: str):
     import httpx
 
     try:

@@ -1,5 +1,5 @@
 """The named input rules: one copy, shared by the authority, the apply path,
-the missing-input hold, the Decisions reader and, later, the upload route.
+the missing-input hold, the Decisions reader and the upload route.
 
 An approved plan may name, on each task it creates, the text files that task
 needs from the owner: the optional ``inputs`` field, a list of one to five
@@ -12,11 +12,14 @@ The apply path records a card's inputs once, as the task event
 ``named_inputs_declared`` (no schema migration), and :func:`missing_inputs`
 reads that declaration back against the card's attachments. ``claim_task``
 holds a card that still misses one (:class:`InputHold`), and the Decisions
-feed names what is missing (:func:`decision_missing_inputs`, card C2).
+feed names what is missing (:func:`decision_missing_inputs`, card C2). The
+owner upload route stores each file the owner gives and releases the card
+once none is missing (:func:`accept_upload`, card C3).
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from typing import Any
@@ -43,6 +46,14 @@ TYPE_LABELS = {
 }
 # The largest file the owner may give for one input: 8 MiB.
 MAX_INPUT_BYTES = 8 * 1024 * 1024
+# The Content-Type an upload for each input type may carry (card C3); the
+# first is the declared one, which the stored file gets.
+_MEDIA_TYPES = {
+    "txt": ("text/plain",),
+    "md": ("text/markdown", "text/plain"),
+    "csv": ("text/csv", "text/plain"),
+    "json": ("application/json",),
+}
 
 # Words of lowercase ASCII letters, digits and hyphens joined by single
 # spaces, starting with a letter: no dot, slash or extension can appear.
@@ -279,3 +290,68 @@ def decision_missing_inputs(
         ]
         for row in declaring
     }
+
+
+def accept_upload(
+    conn: sqlite3.Connection,
+    task_id: str,
+    n: int,
+    data: bytes,
+    content_type: str,
+    *,
+    board: str,
+) -> str:
+    """Store the file the owner gave for input *n* of a held card (card C3).
+
+    For the owner upload route, which resolved *task_id* through the owner's
+    own Decisions feed. Checks, in the plan's order and before any byte is
+    stored: the card is still held ``needs_input`` and *n* is one of its
+    still-missing inputs; *data* is not empty and at most
+    :data:`MAX_INPUT_BYTES`; *content_type* is one the input's type takes; the
+    file is strict UTF-8 without a NUL byte, and parses for type json. Then
+    ``store_owner_input`` stores the file, uploaded by :data:`OWNER_UPLOADER`
+    under its derived name and with the declared type, and once no input is
+    missing releases the card as ``unblock_task`` does, to todo while a parent
+    is not done, all in one write transaction that leaves no file behind when
+    it fails.
+
+    Returns "released" or "stored", or a refusal: "not_waiting", "empty",
+    "too_big", "wrong_type", "type_mismatch" or "not_text", and then nothing
+    was written.
+    """
+    from hermes_cli import kanban_db
+
+    held = conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ? AND status = 'blocked' "
+        "AND block_kind = 'needs_input' AND task_kind = 'work'",
+        (task_id,),
+    ).fetchone()
+    entry = next(
+        (entry for entry in missing_inputs(conn, task_id) if entry["n"] == n), None,
+    ) if held else None
+    if entry is None:
+        return "not_waiting"
+    if not data:
+        return "empty"
+    if len(data) > MAX_INPUT_BYTES:
+        return "too_big"
+    media_type = content_type.split(";")[0].strip().lower()
+    if not any(media_type in types for types in _MEDIA_TYPES.values()):
+        return "wrong_type"
+    if media_type not in _MEDIA_TYPES[entry["type"]]:
+        return "type_mismatch"
+    try:
+        text = data.decode("utf-8")
+        if entry["type"] == "json":
+            json.loads(text)
+    except (ValueError, RecursionError):  # bad UTF-8 or JSON, or JSON nested too deep
+        return "not_text"
+    if "\x00" in text:
+        return "not_text"
+    released = kanban_db.store_owner_input(
+        conn, task_id, entry["file"], data,
+        content_type=_MEDIA_TYPES[entry["type"]][0], board=board,
+    )
+    if released is None:  # the card stopped waiting for this file meanwhile
+        return "not_waiting"
+    return "released" if released else "stored"

@@ -463,9 +463,10 @@ class TestExactMethodRouteRules:
 
     @pytest.mark.asyncio
     async def test_owner_suggestion_decisions_are_admitted_only_by_their_own_rules(self):
-        """Accept, reject and defer each record an owner decision, so the
-        read-only Decisions feed rule admits none of them: each is admitted
-        only when its own rule is listed next to the feed."""
+        """Accept, reject and defer each record an owner decision, and the
+        input upload stores a file, so the read-only Decisions feed rule
+        admits none of them: each is admitted only when its own rule is
+        listed next to the feed."""
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
         feed = "/v1/owner-workspace/decisions"
         rows = [
@@ -476,7 +477,7 @@ class TestExactMethodRouteRules:
         assert rows == [
             ("POST", f"{feed}/{{decision_ref}}/{action}")
             for action in ("accept", "reject", "defer")
-        ]
+        ] + [("POST", f"{feed}/{{ref}}/inputs/{{n}}")]
 
         async def ok(_request):
             return web.json_response({"ok": True})
@@ -492,7 +493,7 @@ class TestExactMethodRouteRules:
                 _write_config({"gateway": {"api_server": {"allowed_routes": rules}}})
                 assert (await client.get(feed)).status == 200
                 for method, path in rows:
-                    url = path.replace("{decision_ref}", key)
+                    url = path.replace("{decision_ref}", key).replace("{ref}", key).replace("{n}", "1")
                     expected = 200 if (method, path) == admitted else 403
                     assert (await client.request(method, url)).status == expected
 
