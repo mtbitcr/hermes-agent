@@ -6954,6 +6954,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "/v1/owner-workspace/projects/{slug}/repository/connect",
                 __import__("gateway.platforms.api_server_repository", fromlist=["route"]).route(self, "connect"),
             ),
+            (
+                "POST",
+                "/v1/owner-workspace/decisions/{ref}/inputs/{n}",
+                __import__("gateway.platforms.api_server_owner_inputs", fromlist=["route"]).route(self),
+            ),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),

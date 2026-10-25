@@ -113,7 +113,7 @@ from hermes_cli.kanban_risk_tier import (
 )
 from hermes_cli.kanban_run_metadata_merge import merge_edited_run_metadata, strip_kernel_keys
 from hermes_cli.kanban_schedule_stop import capture_worker, stop_after_commit
-from hermes_cli.owner_named_inputs import InputHold
+from hermes_cli.owner_named_inputs import OWNER_UPLOADER, InputHold, missing_inputs
 from hermes_cli.sqlite_util import (
     InitLockDirectoryAbsent,
     InitLockUnavailable,
@@ -29380,82 +29380,129 @@ def unblock_task(
     """
     now = int(time.time())
     with write_txn(conn):
-        evidence = None
-        if owner_retry is not None:
-            evidence = stopped_work_retry_evidence(conn, task_id)
-            if evidence is None:
-                return False
-        current = conn.execute(
-            "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'",
-            (task_id,),
-        ).fetchone()
-        resume_status = (
-            _resume_status_from_events(conn, task_id)
-            if current and current["status"] == "blocked"
-            else "ready"
-        )
-        _reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
-            note="invariant recovery on unblock",
-        )
-        # Re-gate on parent completion before restoring the source phase.
-        landing_status = _landing_status_after_parents(conn, task_id)
-        new_status = (
-            "review"
-            if landing_status == "ready" and resume_status == "review"
-            else landing_status
-        )
-        if new_status in EXECUTABLE_STATUSES and not authorize_executable_transition(
-            conn, task_id
-        ):
-            # Parked for re-approval instead of unblocked into the work pool.
+        return _unblock_task_within_txn(conn, task_id, now, owner_retry=owner_retry)
+
+
+def _unblock_task_within_txn(
+    conn: sqlite3.Connection, task_id: str, now: int, *, owner_retry: Optional[dict] = None,
+) -> bool:
+    """The body of :func:`unblock_task`, inside the caller's write transaction."""
+    evidence = None
+    if owner_retry is not None:
+        evidence = stopped_work_retry_evidence(conn, task_id)
+        if evidence is None:
             return False
-        # NOTE: deliberately does NOT touch ``block_recurrences`` or
-        # ``block_kind``. Resetting the recurrence counter on unblock is exactly
-        # the amnesia that let a cron unblock → worker re-block loop run
-        # unbounded (Dale's report). The counter survives the unblock so that a
-        # subsequent same-cause ``block_task`` can detect the loop and route to
-        # triage at ``BLOCK_RECURRENCE_LIMIT``. It is reset to 0 only on a
-        # successful completion (see ``complete_task``). ``consecutive_failures``
-        # (the *dispatcher* spawn/crash/timeout counter — a different signal) is
-        # still reset here, which is correct: a deliberate unblock is a fresh
-        # start for the dispatcher's retry budget.
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled') "
-            "AND task_kind = 'work'",
-            (new_status, task_id),
-        )
-        if cur.rowcount != 1:
-            return False
+    current = conn.execute(
+        "SELECT status FROM tasks WHERE id = ? AND task_kind = 'work'",
+        (task_id,),
+    ).fetchone()
+    resume_status = (
+        _resume_status_from_events(conn, task_id)
+        if current and current["status"] == "blocked"
+        else "ready"
+    )
+    _reclaim_dangling_run(
+        conn, task_id, statuses=("blocked", "scheduled"), now=now,
+        note="invariant recovery on unblock",
+    )
+    # Re-gate on parent completion before restoring the source phase.
+    landing_status = _landing_status_after_parents(conn, task_id)
+    new_status = (
+        "review"
+        if landing_status == "ready" and resume_status == "review"
+        else landing_status
+    )
+    if new_status in EXECUTABLE_STATUSES and not authorize_executable_transition(
+        conn, task_id
+    ):
+        # Parked for re-approval instead of unblocked into the work pool.
+        return False
+    # NOTE: deliberately does NOT touch ``block_recurrences`` or
+    # ``block_kind``. Resetting the recurrence counter on unblock is exactly
+    # the amnesia that let a cron unblock → worker re-block loop run
+    # unbounded (Dale's report). The counter survives the unblock so that a
+    # subsequent same-cause ``block_task`` can detect the loop and route to
+    # triage at ``BLOCK_RECURRENCE_LIMIT``. It is reset to 0 only on a
+    # successful completion (see ``complete_task``). ``consecutive_failures``
+    # (the *dispatcher* spawn/crash/timeout counter — a different signal) is
+    # still reset here, which is correct: a deliberate unblock is a fresh
+    # start for the dispatcher's retry budget.
+    cur = conn.execute(
+        "UPDATE tasks SET status = ?, current_run_id = NULL, "
+        "consecutive_failures = 0, last_failure_error = NULL "
+        "WHERE id = ? AND status IN ('blocked', 'scheduled') "
+        "AND task_kind = 'work'",
+        (new_status, task_id),
+    )
+    if cur.rowcount != 1:
+        return False
+    _append_event(
+        conn, task_id, "unblocked",
+        (
+            {"status": new_status, "resume_status": resume_status}
+            if new_status != "ready" or resume_status != "ready"
+            else None
+        ),
+    )
+    if owner_retry is not None:
+        # The owner's reason and the transition it authorised are ONE
+        # durable fact, so they commit together or not at all. The landing
+        # column travels in the payload too: a receipt replay after a
+        # crash must report the column THIS retry landed the work in, not
+        # wherever the work has since moved on to.
         _append_event(
-            conn, task_id, "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
+            conn, task_id, OWNER_RETRY_EVENT_KIND,
+            {
+                "reason": owner_retry.get("reason"),
+                "actor": owner_retry.get("actor"),
+                "profile": owner_retry.get("profile"),
+                "idempotency_key": owner_retry.get("idempotency_key"),
+                "stopped_because": evidence["kind"],
+                "status": new_status,
+            },
+            run_id=evidence["run_id"],
         )
-        if owner_retry is not None:
-            # The owner's reason and the transition it authorised are ONE
-            # durable fact, so they commit together or not at all. The landing
-            # column travels in the payload too: a receipt replay after a
-            # crash must report the column THIS retry landed the work in, not
-            # wherever the work has since moved on to.
-            _append_event(
-                conn, task_id, OWNER_RETRY_EVENT_KIND,
-                {
-                    "reason": owner_retry.get("reason"),
-                    "actor": owner_retry.get("actor"),
-                    "profile": owner_retry.get("profile"),
-                    "idempotency_key": owner_retry.get("idempotency_key"),
-                    "stopped_because": evidence["kind"],
-                    "status": new_status,
-                },
-                run_id=evidence["run_id"],
+    return True
+
+
+def store_owner_input(
+    conn: sqlite3.Connection, task_id: str, filename: str, data: bytes, *, content_type: str, board: Optional[str],
+) -> Optional[bool]:
+    """Store the owner's file for a missing named input of a held card and release the card once none is missing.
+
+    For the owner upload route (card C3), whose checks run in ``accept_upload`` first. One write transaction re-reads
+    that the card is held ``needs_input`` and still misses *filename*, writes the file, records it as the owner's
+    attachment, checks the missing inputs again and, when none is left, releases the card through the body of
+    :func:`unblock_task`. Returns None, having written nothing, when the card no longer waits for *filename*, and else
+    whether the card was released. A failed transaction removes the new file.
+    """
+    now, dest_path = int(time.time()), None
+    try:
+        with write_txn(conn):
+            held = conn.execute(
+                "SELECT 1 FROM tasks WHERE id = ? AND status = 'blocked' "
+                "AND block_kind = 'needs_input' AND task_kind = 'work'",
+                (task_id,),
+            ).fetchone()
+            if held is None or filename not in {entry["file"] for entry in missing_inputs(conn, task_id)}:
+                return None
+            dest_dir = task_attachments_dir(task_id, board=board)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_path = _collision_free_path(dest_dir, _safe_attachment_name(filename))
+            dest_path.write_bytes(data)
+            _add_attachment_row(
+                conn, task_id, filename=dest_path.name, stored_path=str(dest_path.resolve()),
+                content_type=content_type, size=len(data), uploaded_by=OWNER_UPLOADER,
+                requested_filename=_safe_attachment_name(filename),
             )
-        return True
+            if missing_inputs(conn, task_id):
+                return False
+            return _unblock_task_within_txn(conn, task_id, now)
+    except Exception:
+        if dest_path is not None:
+            with contextlib.suppress(OSError):
+                dest_path.unlink(missing_ok=True)
+        raise
 
 
 def _restored_implementer_sql(
