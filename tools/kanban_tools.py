@@ -2972,8 +2972,8 @@ def _handle_read(args: dict, **kw) -> str:
     Read-only counterpart to the attachment listing: that names a file and
     its path, this hands back the text itself in slices the caller controls,
     so a worker with no general file-reading tool can still follow the
-    pointer. ``attachment_id`` selects an attachment of this task or of a
-    task directly linked to it (a parent or a child) on the same board;
+    pointer. ``attachment_id`` selects an attachment of this task, of a task
+    its current run depends on, or of a direct child, on the same board;
     ``record`` selects the text ``kanban_show`` returns; omitting both reads
     the task body. Storage identity and path containment
     are enforced by the same ``read_attachment_bytes`` the download path
@@ -3037,7 +3037,9 @@ def _handle_read(args: dict, **kw) -> str:
                     )
                 att = kb.get_attachment(conn, att_key)
                 if att is None or att.task_id not in (
-                    tid, *kb.parent_ids(conn, tid), *kb.child_ids(conn, tid)
+                    tid,
+                    *kb.claimed_artifact_input_ids(conn, tid, task.current_run_id),
+                    *kb.child_ids(conn, tid),
                 ):
                     return tool_error(
                         f"attachment {att_key} not found on task {tid}"
@@ -4178,8 +4180,8 @@ KANBAN_READ_SCHEMA = {
         "neither. Returns at most `limit` characters starting at `offset`, "
         "plus the total size and whether more remains, so you can page "
         "through a large file the attachment listing only gives you a path "
-        "to. The attachment may belong to your task or to a task directly "
-        "linked to it (a parent or a child). Read-only."
+        "to. The attachment may belong to your task, to a task it depends "
+        "on, or to a direct child. Read-only."
     ),
     "parameters": {
         "type": "object",
@@ -4191,9 +4193,9 @@ KANBAN_READ_SCHEMA = {
             "attachment_id": {
                 "type": "integer",
                 "description": (
-                    "Id of an attachment on this task or on a task directly "
-                    "linked to it, a parent or a child (from the attachment "
-                    "listing). Omit to read the task's body instead."
+                    "Id of an attachment on this task, on a task it depends "
+                    "on, or on a direct child (from the attachment listing). "
+                    "Omit to read the task's body instead."
                 ),
             },
             "record": {
