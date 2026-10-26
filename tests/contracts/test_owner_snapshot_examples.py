@@ -32,6 +32,7 @@ from tests.gateway.test_api_server_owner_suggestion_decisions import (  # noqa: 
     owner,
 )
 from tests.gateway.test_api_server_runs import _capability_stopped_task
+from tests.hermes_cli.test_kanban_delivery_outcome import _delivery, _red_check_returned
 from tests.hermes_cli.test_owner_project_removal import (
     _call,
     _n,
@@ -274,6 +275,39 @@ async def test_the_provider_wait_example_carries_the_held_card_and_its_waiting_r
             _tasks(answer), ("stopped_work",))
         assert "waiting" in contract.closed_values(
             answer["body"]["data"]["runs"], ("receipt", "outcome"))
+
+
+@pytest.mark.asyncio
+async def test_the_delivery_outcome_example_carries_every_outcome_state(
+    owner, owner_payload_example,
+):
+    project = _project(owner, "Website Pilot")
+    board, slug = project["board"], _slug(owner, project)
+    rows = {"merged": "merged", "returned": "replaced", "open": "auto_merge_armed",
+            "closed": "closed_outside"}
+    cards = {state: _task(board, project, f"Publish the {state} page") for state in rows}
+    _task(board, project, "Plan the follow-up")  # a card with no delivery row
+    # Done work whose delivery is unfinished is listed as "Being delivered", a
+    # label the active_work vocabulary does not hold, so the open card stays ready.
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        for state in ("merged", "returned", "closed"):
+            assert kanban_db.complete_task(conn, cards[state], result="Done.")
+    for number, (state, row_state) in enumerate(rows.items(), start=41):
+        row_id = _delivery(project, cards[state], row_state, number=number)
+        if state == "returned":
+            _red_check_returned(project, cards[state], row_id, number=number)
+
+    async with TestClient(TestServer(_app())) as client:
+        live = await _snapshot(client, slug, f"{V1},{ow.DELIVERY_OUTCOME_CAPABILITY}")
+
+    saved = owner_payload_example(FAMILY, "delivery_outcome", live)
+    for answer in (live, saved):
+        outcomes = [task["delivery_outcome"] for task in _tasks(answer)]
+        assert None in outcomes
+        assert contract.closed_values(_tasks(answer), ("delivery_outcome", "state")) == set(rows)
+        for outcome in filter(None, outcomes):
+            assert outcome["url"] == (
+                f"https://github.com/{outcome['repository']}/pull/{outcome['pull_request']}")
 
 
 def test_the_run_receipt_examples_carry_every_outcome_and_summary(owner_payload_example):

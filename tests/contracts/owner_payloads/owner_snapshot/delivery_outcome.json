@@ -1,0 +1,382 @@
+{
+  "body": {
+    "data": {
+      "attachments": [],
+      "board": {
+        "counts": {
+          "archived": 0,
+          "blocked": 0,
+          "done": 3,
+          "ready": 2,
+          "review": 0,
+          "running": 0,
+          "scheduled": 0,
+          "todo": 0,
+          "triage": 0
+        },
+        "name": "Website Pilot",
+        "project_id": "p_d344fc1dce5d93161778049b",
+        "slug": "website-pilot",
+        "total": 5
+      },
+      "columns": [
+        {
+          "name": "triage",
+          "tasks": []
+        },
+        {
+          "name": "todo",
+          "tasks": []
+        },
+        {
+          "name": "scheduled",
+          "tasks": []
+        },
+        {
+          "name": "ready",
+          "tasks": [
+            {
+              "assignee_name": "default",
+              "child_ids": [],
+              "delivery_outcome": null,
+              "event_revision": 6,
+              "id": "t_0d869764",
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "none",
+              "risk_tier": null,
+              "risk_tier_raised": false,
+              "stopped_work": "none",
+              "title": "Plan the follow-up",
+              "updated_at": "2026-09-21T14:13:20Z"
+            },
+            {
+              "assignee_name": "default",
+              "child_ids": [],
+              "delivery_outcome": {
+                "pull_request": 43,
+                "repository": "studio/website",
+                "state": "open",
+                "url": "https://github.com/studio/website/pull/43"
+              },
+              "event_revision": 13,
+              "id": "t_112a104b",
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "none",
+              "risk_tier": null,
+              "risk_tier_raised": false,
+              "stopped_work": "none",
+              "title": "Publish the open page",
+              "updated_at": "2026-09-21T14:13:20Z"
+            }
+          ]
+        },
+        {
+          "name": "running",
+          "tasks": []
+        },
+        {
+          "name": "blocked",
+          "tasks": []
+        },
+        {
+          "name": "review",
+          "tasks": []
+        },
+        {
+          "name": "done",
+          "tasks": [
+            {
+              "assignee_name": "default",
+              "child_ids": [],
+              "delivery_outcome": {
+                "pull_request": 44,
+                "repository": "studio/website",
+                "state": "closed",
+                "url": "https://github.com/studio/website/pull/44"
+              },
+              "event_revision": 14,
+              "id": "t_09dfb269",
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "none",
+              "risk_tier": null,
+              "risk_tier_raised": false,
+              "stopped_work": "none",
+              "title": "Publish the closed page",
+              "updated_at": "2026-09-21T14:13:20Z"
+            },
+            {
+              "assignee_name": "default",
+              "child_ids": [],
+              "delivery_outcome": {
+                "pull_request": 41,
+                "repository": "studio/website",
+                "state": "merged",
+                "url": "https://github.com/studio/website/pull/41"
+              },
+              "event_revision": 10,
+              "id": "t_172f84a6",
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "none",
+              "risk_tier": null,
+              "risk_tier_raised": false,
+              "stopped_work": "none",
+              "title": "Publish the merged page",
+              "updated_at": "2026-09-21T14:13:20Z"
+            },
+            {
+              "assignee_name": "default",
+              "child_ids": [],
+              "delivery_outcome": {
+                "pull_request": 42,
+                "repository": "studio/website",
+                "state": "returned",
+                "url": "https://github.com/studio/website/pull/42"
+              },
+              "event_revision": 12,
+              "id": "t_cc2dc8d8",
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "none",
+              "risk_tier": null,
+              "risk_tier_raised": false,
+              "stopped_work": "none",
+              "title": "Publish the returned page",
+              "updated_at": "2026-09-21T14:13:20Z"
+            }
+          ]
+        }
+      ],
+      "planning_context": {
+        "actionable_count": 2,
+        "actionable_truncated": false,
+        "omitted_terminal_count": 0,
+        "relations_truncated": false,
+        "schema_version": 1,
+        "tasks": [
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 6,
+            "id": "t_0d869764",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "ready",
+            "title": "Plan the follow-up",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 13,
+            "id": "t_112a104b",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "ready",
+            "title": "Publish the open page",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 12,
+            "id": "t_cc2dc8d8",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "done",
+            "title": "Publish the returned page",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 10,
+            "id": "t_172f84a6",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "done",
+            "title": "Publish the merged page",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 14,
+            "id": "t_09dfb269",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "done",
+            "title": "Publish the closed page",
+            "updated_at": "2026-09-21T14:13:20Z"
+          }
+        ]
+      },
+      "project": {
+        "archived": false,
+        "board": "website-pilot",
+        "description": null,
+        "id": "p_d344fc1dce5d93161778049b",
+        "name": "Website Pilot",
+        "slug": "website-pilot"
+      },
+      "runs": [
+        {
+          "finished_at": "2026-09-21T14:13:20Z",
+          "has_newer_run": false,
+          "receipt": {
+            "cost": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative cost."
+            },
+            "evidence": {
+              "kind": "project_activity",
+              "state": "available"
+            },
+            "external_effect": {
+              "state": "unknown",
+              "summary": "This record does not confirm whether an external service changed."
+            },
+            "outcome": "completed",
+            "runtime": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative model route."
+            },
+            "summary": "Work finished."
+          },
+          "retry_origin": "none",
+          "started_at": "2026-09-21T14:13:20Z",
+          "task_title": "Publish the closed page"
+        },
+        {
+          "finished_at": "2026-09-21T14:13:20Z",
+          "has_newer_run": false,
+          "receipt": {
+            "cost": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative cost."
+            },
+            "evidence": {
+              "kind": "project_activity",
+              "state": "available"
+            },
+            "external_effect": {
+              "state": "unknown",
+              "summary": "This record does not confirm whether an external service changed."
+            },
+            "outcome": "completed",
+            "runtime": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative model route."
+            },
+            "summary": "Work finished."
+          },
+          "retry_origin": "none",
+          "started_at": "2026-09-21T14:13:20Z",
+          "task_title": "Publish the returned page"
+        },
+        {
+          "finished_at": "2026-09-21T14:13:20Z",
+          "has_newer_run": false,
+          "receipt": {
+            "cost": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative cost."
+            },
+            "evidence": {
+              "kind": "project_activity",
+              "state": "available"
+            },
+            "external_effect": {
+              "state": "unknown",
+              "summary": "This record does not confirm whether an external service changed."
+            },
+            "outcome": "completed",
+            "runtime": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative model route."
+            },
+            "summary": "Work finished."
+          },
+          "retry_origin": "none",
+          "started_at": "2026-09-21T14:13:20Z",
+          "task_title": "Publish the merged page"
+        }
+      ],
+      "steward": {
+        "active_work": [
+          {
+            "state": "Ready",
+            "title": "Plan the follow-up"
+          },
+          {
+            "state": "Ready",
+            "title": "Publish the open page"
+          }
+        ],
+        "counts": {
+          "awaiting_review": 0,
+          "completed_in_window": 3,
+          "needs_attention": 0,
+          "open": 2
+        },
+        "decisions_needed": [],
+        "execution": {
+          "paused": false,
+          "state": "waiting_for_approval",
+          "summary": "Raphael is waiting for an approved milestone before starting work."
+        },
+        "generated_at": "2026-09-21T14:13:20Z",
+        "lookback_days": 7,
+        "needs_attention": [],
+        "progress": [
+          {
+            "completed_at": "2026-09-21T14:13:20Z",
+            "title": "Publish the merged page"
+          },
+          {
+            "completed_at": "2026-09-21T14:13:20Z",
+            "title": "Publish the returned page"
+          },
+          {
+            "completed_at": "2026-09-21T14:13:20Z",
+            "title": "Publish the closed page"
+          }
+        ],
+        "project": {
+          "name": "Website Pilot"
+        },
+        "schema_version": 2,
+        "stale_candidates": [],
+        "truncated": {
+          "active_work": false,
+          "decisions_needed": false,
+          "needs_attention": false,
+          "progress": false,
+          "stale_candidates": false
+        }
+      },
+      "truncated": {
+        "attachments": false,
+        "runs": false,
+        "tasks": false,
+        "workers": false
+      },
+      "workers": []
+    },
+    "object": "hermes.owner_workspace.project_snapshot"
+  },
+  "status": 200
+}
