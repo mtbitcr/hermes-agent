@@ -30461,6 +30461,20 @@ def task_event_revision(conn: sqlite3.Connection, task_id: str) -> int:
     return int(row["rev"]) if row else 0
 
 
+def owner_plan_task_revision(conn: sqlite3.Connection, task_id: str) -> int:
+    """:func:`task_event_revision` without ``heartbeat`` events: the revision
+    an owner plan names a task by and is checked against when it applies. A
+    running worker heartbeats every few seconds, and counting those made a
+    plan that names its task out of date before the owner could approve it.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) AS rev FROM task_events "
+        "WHERE task_id = ? AND kind != 'heartbeat'",
+        (task_id,),
+    ).fetchone()
+    return int(row["rev"]) if row else 0
+
+
 def cas_transition_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -30530,6 +30544,7 @@ def _cas_transition_task_in_txn(
     event_payload: Optional[dict],
     park_newly_enabled_dependents: bool = False,
     park_generation: Optional[str] = None,
+    revision_of: Callable[[sqlite3.Connection, str], int] = task_event_revision,
 ) -> dict:
     """CAS helper for callers already holding the Kanban write transaction."""
     row = conn.execute(
@@ -30538,7 +30553,7 @@ def _cas_transition_task_in_txn(
     if row is None:
         raise ValueError(f"unknown task {task_id}")
     current_status = row["status"]
-    current_revision = task_event_revision(conn, task_id)
+    current_revision = revision_of(conn, task_id)
     if current_status != expected_status or current_revision != expected_revision:
         return {
             "moved": False,
@@ -30740,7 +30755,7 @@ def apply_owner_project_plan(
             if task_id in mutation_targets and row["task_kind"] != "work":
                 conflicts.append({"task_id": task_id, "status": None, "revision": None})
                 continue
-            revision = task_event_revision(conn, task_id)
+            revision = owner_plan_task_revision(conn, task_id)
             if row["status"] != wanted_status or revision != wanted_revision:
                 conflicts.append(
                     {"task_id": task_id, "status": row["status"], "revision": revision}
@@ -30753,6 +30768,9 @@ def apply_owner_project_plan(
         affected_task_ids: set[str] = set()
         parked_task_ids: list[str] = []
         add_output_by_change: dict[int, str] = {}
+        # Each task a replace, split or merge of this plan archived, mapped to
+        # what replaced it: a later add naming it waits for that instead.
+        replaced_by: dict[str, list[str]] = {}
         internal_targets: dict[str, tuple[str, int]] = {}
 
         def expected_target(ref: dict) -> tuple[str, int]:
@@ -30840,7 +30858,9 @@ def apply_owner_project_plan(
 
             if action == "add":
                 parent_task_ids = [
-                    ref["task_id"] for ref in change["existing_parents"]
+                    parent_id
+                    for ref in change["existing_parents"]
+                    for parent_id in replaced_by.get(ref["task_id"], [ref["task_id"]])
                 ]
                 for parent_change_index in change["new_parents"]:
                     try:
@@ -30899,11 +30919,13 @@ def apply_owner_project_plan(
                     to_status="archived",
                     event_kind="owner_project_plan_change",
                     event_payload={**event_base, "replacement_task_ids": replacement_ids},
+                    revision_of=owner_plan_task_revision,
                 )
                 if not snapshot["moved"]:
                     raise RuntimeError("preflighted split target changed inside transaction")
                 affected_task_ids.add(source_id)
                 archived_task_ids.append(source_id)
+                replaced_by[source_id] = leaf_ids
                 continue
 
             if action == "replace":
@@ -30937,6 +30959,7 @@ def apply_owner_project_plan(
                     to_status="archived",
                     event_kind="owner_project_plan_change",
                     event_payload={**event_base, "replacement_task_id": replacement_id},
+                    revision_of=owner_plan_task_revision,
                 )
                 if not snapshot["moved"]:
                     raise RuntimeError(
@@ -30944,6 +30967,7 @@ def apply_owner_project_plan(
                     )
                 affected_task_ids.add(source_id)
                 archived_task_ids.append(source_id)
+                replaced_by[source_id] = [replacement_id]
                 continue
 
             if action == "merge":
@@ -30985,11 +31009,13 @@ def apply_owner_project_plan(
                         to_status="archived",
                         event_kind="owner_project_plan_change",
                         event_payload={**event_base, "replacement_task_id": replacement_id},
+                        revision_of=owner_plan_task_revision,
                     )
                     if not snapshot["moved"]:
                         raise RuntimeError("preflighted merge target changed inside transaction")
                     affected_task_ids.add(ref["task_id"])
                     archived_task_ids.append(ref["task_id"])
+                    replaced_by[ref["task_id"]] = [replacement_id]
                 continue
 
             ref = change["target"]
@@ -31028,6 +31054,7 @@ def apply_owner_project_plan(
                 to_status=to_status,
                 event_kind="owner_project_plan_change",
                 event_payload=event_base,
+                revision_of=owner_plan_task_revision,
             )
             if not snapshot["moved"]:
                 raise RuntimeError(
