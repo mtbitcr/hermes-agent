@@ -1162,7 +1162,9 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
     outcome or a waiting reason is stored only while the row and its done source card
     are as this pass read them before GitHub. The required checks on H, each by its name
     in one request read right before the pull request is read again, alone decide green,
-    red or wait; a red decision's waiting record holds the id and conclusion of each red
+    red or wait, but a cancelled one waits while GitHub shows any workflow run of H not
+    completed (a close and reopen cancels H's older CI run before its newer run makes the
+    check again); a red decision's waiting record holds the id and conclusion of each red
     required check run, as those requests answered them, before the work is returned. An
     open row whose pull request any read of this
     pass (:func:`_review_pull`: the first, the one after CI, the one before a
@@ -1222,6 +1224,11 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
         outcomes = {_required_check(name, head, {"check_runs": found, "statuses": []}) for name, found in named.items()}
         if outcomes & {"pending", "stale"}:
             return None  # CI on H still runs: a later step tries again
+        if any(run.get("conclusion") == "cancelled" for (run,) in named.values()):  # H's newer CI run may make it again
+            with contextlib.suppress(PublishRefused, GitHubTransportError):  # H's runs unread: red, as before
+                workflow_runs, _ = _page(github, f"/repos/{repository}/actions/runs", "workflow_runs", head_sha=head)
+                if any(run.get("head_sha") == head and run.get("status") != "completed" for run in workflow_runs):
+                    return None  # a run of H not completed: wait, as for a pending check
         at_head, stored = _review_pull(db_path, github, repository, row)
         if not at_head:
             return stored  # the pull request closed outside the delivery step, or left H, while CI was read
