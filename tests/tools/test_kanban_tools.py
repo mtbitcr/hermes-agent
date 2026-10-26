@@ -2598,11 +2598,11 @@ def test_read_a_child_reads_its_parents_attachment(monkeypatch, tmp_path):
     root = _status_report_env(
         monkeypatch, tmp_path, profile="worker", has_kanban_toolset=False
     )
-    _seed_board("own-board", [{"title": "the check card", "status": "running"}])
+    _seed_board("own-board", [{"title": "the check card"}])
     own_db = kb.kanban_db_path(board="own-board")
     data = "".join(f"finding {i:03d}\n" for i in range(300)).encode("utf-8")
     with kb.connect_closing(board="own-board") as conn:
-        tid = kb.list_tasks(conn, status="running")[0].id
+        tid = kb.list_tasks(conn, status="ready")[0].id
         parent = kb.create_task(
             conn, title="the writer card", assignee="worker", board="own-board"
         )
@@ -2611,6 +2611,10 @@ def test_read_a_child_reads_its_parents_attachment(monkeypatch, tmp_path):
             conn, parent, "report.md", data,
             content_type="text/plain", uploaded_by="worker", board="own-board",
         )
+        # The writer finishes before the check card is claimed, so the claim
+        # freezes it as an input of the check card's run.
+        assert kb.complete_task(conn, parent, fire_lifecycle_hook=False)
+        assert kb.claim_task(conn, tid) is not None
 
     profile_home = root / "profiles" / "worker"
     profile_home.mkdir(parents=True)
@@ -2673,7 +2677,8 @@ def test_read_refuses_an_unlinked_tasks_attachment(worker_env):
 
 
 def test_read_refuses_a_grandparents_attachment(worker_env):
-    """Only a direct link counts: a parent's parent gets the same refusal."""
+    """A parent's parent linked after the claim is not among the inputs the
+    claim froze: same refusal."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
 
@@ -2713,6 +2718,199 @@ def test_read_refuses_a_siblings_attachment(worker_env):
     out = json.loads(kt._handle_read({"attachment_id": sib_att}))
     assert out == {"error": f"attachment {sib_att} not found on task {worker_env}"}
     assert secret not in json.dumps(out)
+
+
+def _claimed_check_task(monkeypatch):
+    """structure -> copy -> check, run as the dispatcher runs it: both inputs
+    are done before check is claimed, so the claim freezes both as its run's
+    inputs. Makes this worker check's and returns the three ids."""
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect_closing() as conn:
+        structure = kb.create_task(conn, title="structure", assignee="someone-else")
+        assert kb.complete_task(conn, structure, fire_lifecycle_hook=False)
+        copy = kb.create_task(
+            conn, title="copy", assignee="someone-else", parents=[structure]
+        )
+        assert kb.complete_task(conn, copy, fire_lifecycle_hook=False)
+        check = kb.create_task(
+            conn, title="check", assignee="test-worker", parents=[copy]
+        )
+        run_id = kb.claim_task(conn, check).current_run_id
+        assert kb.claimed_artifact_input_ids(conn, check, run_id) == sorted(
+            [structure, copy]
+        )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", check)
+    return structure, copy, check
+
+
+def test_read_reads_an_ancestor_two_links_away_that_its_run_inputs_hold(
+    worker_env, monkeypatch
+):
+    """The claimed check task reads the structure task's document: a
+    grandparent, held by the inputs its run's claim froze."""
+    from tools import kanban_tools as kt
+
+    structure, _, check = _claimed_check_task(monkeypatch)
+    text = "".join(f"section {i:03d}\n" for i in range(200))
+    att_id = _attach_text(structure, "structure.md", text)
+
+    d = json.loads(kt._handle_read({"attachment_id": att_id}))
+    assert d.get("ok") is True, d
+    assert (d["task_id"], d["source"], d["attachment_id"], d["filename"]) == (
+        check, "attachment", att_id, "structure.md"
+    )
+    assert d["content"] == text
+    assert d["total"] == len(text)
+
+
+@pytest.mark.parametrize(
+    "relation",
+    ["sibling", "unrelated", "grandchild", "ancestor linked after the claim"],
+)
+def test_read_refuses_a_task_outside_its_run_inputs_and_children(
+    worker_env, monkeypatch, relation
+):
+    """With copy and structure frozen as its run's inputs, the check task still
+    gets the existing refusal, and none of the content, for a sibling, an
+    unrelated task, a grandchild and an ancestor linked after the claim."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    structure, copy, check = _claimed_check_task(monkeypatch)
+    with kb.connect_closing() as conn:
+        if relation == "sibling":
+            target = kb.create_task(
+                conn, title="sibling", assignee="someone-else", parents=[copy]
+            )
+        elif relation == "unrelated":
+            target = kb.create_task(conn, title="unrelated", assignee="someone-else")
+        elif relation == "grandchild":
+            child = kb.create_task(
+                conn, title="child", assignee="someone-else", parents=[check]
+            )
+            target = kb.create_task(
+                conn, title="grandchild", assignee="someone-else", parents=[child]
+            )
+        else:
+            # A grandparent now, as structure is, but not frozen into the run.
+            target = kb.create_task(conn, title="late", assignee="someone-else")
+            kb.link_tasks(conn, target, copy)
+            assert kb.parent_ids(conn, copy) == sorted([structure, target])
+            run_id = kb.get_task(conn, check).current_run_id
+            assert target not in kb.claimed_artifact_input_ids(conn, check, run_id)
+    secret = f"{relation.upper()} SECRET"
+    att_id = _attach_text(target, "theirs.md", secret)
+
+    out = json.loads(kt._handle_read({"attachment_id": att_id}))
+    assert out == {"error": f"attachment {att_id} not found on task {check}"}
+    assert secret not in json.dumps(out)
+
+
+def test_read_with_an_unreadable_claim_reads_only_its_own_and_its_children(
+    worker_env, monkeypatch
+):
+    """A run whose claim payload cannot be read fails closed: the task reads
+    its own and its direct children's attachments and nothing else, not even
+    its direct parent's."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    structure, copy, check = _claimed_check_task(monkeypatch)
+    with kb.connect_closing() as conn:
+        child = kb.create_task(
+            conn, title="child", assignee="someone-else", parents=[check]
+        )
+        run_id = kb.get_task(conn, check).current_run_id
+        conn.execute(
+            "UPDATE task_events SET payload = '{not json' "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'claimed'",
+            (check, run_id),
+        )
+        conn.commit()
+        assert kb.claimed_artifact_input_ids(conn, check, run_id) == []
+    readable = {check: "OWN TEXT", child: "CHILD TEXT"}
+    refused = {copy: "PARENT SECRET", structure: "GRANDPARENT SECRET"}
+    att_ids = {
+        task: _attach_text(task, "doc.md", text)
+        for task, text in {**readable, **refused}.items()
+    }
+
+    for task, text in readable.items():
+        d = json.loads(kt._handle_read({"attachment_id": att_ids[task]}))
+        assert (d.get("ok"), d.get("content")) == (True, text), d
+    for task, secret in refused.items():
+        att_id = att_ids[task]
+        out = json.loads(kt._handle_read({"attachment_id": att_id}))
+        assert out == {"error": f"attachment {att_id} not found on task {check}"}
+        assert secret not in json.dumps(out)
+
+
+def test_read_a_grandparents_document_in_the_dispatcher_environment(
+    monkeypatch, tmp_path
+):
+    """As the dispatcher runs a worker: pinned DB and board, own task, profile
+    home under the root. The check task reads the structure task's document,
+    two links away on its own board, and gets back exactly the bytes written
+    here."""
+    from hermes_cli import kanban_db as kb
+    from tools.registry import registry
+
+    root = _status_report_env(
+        monkeypatch, tmp_path, profile="worker", has_kanban_toolset=False
+    )
+    _seed_board("own-board", [])
+    own_db = kb.kanban_db_path(board="own-board")
+    data = "".join(f"section {i:03d}\n" for i in range(300)).encode("utf-8")
+    with kb.connect_closing(board="own-board") as conn:
+        structure = kb.create_task(
+            conn, title="structure", assignee="worker", board="own-board"
+        )
+        att_id = kb.store_attachment_bytes(
+            conn, structure, "structure.md", data,
+            content_type="text/plain", uploaded_by="worker", board="own-board",
+        )
+        assert kb.complete_task(conn, structure, fire_lifecycle_hook=False)
+        copy = kb.create_task(
+            conn, title="copy", assignee="worker", board="own-board",
+            parents=[structure],
+        )
+        assert kb.complete_task(conn, copy, fire_lifecycle_hook=False)
+        tid = kb.create_task(
+            conn, title="check", assignee="worker", board="own-board",
+            parents=[copy],
+        )
+        run_id = kb.claim_task(conn, tid).current_run_id
+    # The run's inputs, read straight from the claim row on disk.
+    raw = sqlite3.connect(str(own_db))
+    try:
+        payload = raw.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'claimed'",
+            (tid, run_id),
+        ).fetchone()[0]
+    finally:
+        raw.close()
+    assert sorted(json.loads(payload)["artifact_input_task_ids"]) == sorted(
+        [structure, copy]
+    )
+
+    profile_home = root / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(own_db))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "own-board")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+
+    d = json.loads(registry.dispatch("kanban_read", {"attachment_id": att_id}))
+    assert d.get("ok") is True, d
+    assert (d["task_id"], d["source"], d["attachment_id"], d["filename"]) == (
+        tid, "attachment", att_id, "structure.md"
+    )
+    # The independent count: the bytes this test wrote, all of them.
+    assert d["content"].encode("utf-8") == data
+    assert d["total"] == len(data)
+    assert d["has_more"] is False
 
 
 def test_read_is_present_for_exactly_the_kanban_show_audience(worker_env, monkeypatch):
