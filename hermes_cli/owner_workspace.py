@@ -3292,13 +3292,12 @@ def owner_project_planning_context(
     if selected_ids:
         selected_slots = ",".join("?" for _ in selected_ids)
         for row in conn.execute(
-            f"SELECT task_id, MAX(created_at) AS latest, MAX(id) AS revision "
+            f"SELECT task_id, MAX(created_at) AS latest "
             f"FROM task_events WHERE task_id IN ({selected_slots}) GROUP BY task_id",
             selected_ids,
         ):
             event_state[str(row["task_id"])] = {
                 "latest": int(row["latest"]),
-                "revision": int(row["revision"]),
             }
         for row in conn.execute(
             "SELECT l.child_id AS task_id, COUNT(*) AS n FROM task_links l "
@@ -3350,7 +3349,7 @@ def owner_project_planning_context(
             "updated_at": _owner_timestamp(
                 state["latest"] if state else task.created_at
             ),
-            "event_revision": state["revision"] if state else 0,
+            "event_revision": kanban_db.owner_plan_task_revision(conn, task.id),
             "parent_ids": parent_map[task.id],
             "child_ids": child_map[task.id],
             "omitted_parent_count": omitted_parents,
