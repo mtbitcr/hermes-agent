@@ -195,12 +195,6 @@ _NAME_JOINER = f"[{_SPACE_CHARS}._-]*"
 # After a name may come version digits, or a plural ending and then a boundary.
 _NAME_END = "(?:[0-9]|(?:[Ee]?[Ss])?(?![0-9A-Za-z]))"
 _WORD_END = "(?:[0-9]|(?![0-9A-Za-z]))"
-# No name starts at the product name Claude Design, which the owner connects
-# themselves (owner decision of 2026-10-26): its two words joined by exactly
-# one space, in any letter case, then a boundary. Claude in every other form
-# stays a name; check_owner_text also checks the text as given, so a line
-# break standing for that space keeps Claude hidden.
-_CLAUDE_DESIGN = f"{_cased('claude design')}(?!{_ALNUM})"
 # What may stand between a word and a capitalized everyday word after it:
 # spaces, markup, quotes, brackets, commas and semicolons, but no sentence
 # end and no dash or bar, so "Gluten-Free" and "Shop - Free Delivery" stay
@@ -305,7 +299,7 @@ _GROUPS = {
     },
     "model_names": {
         "name": _rule(
-            f"(?<!{_ALNUM})(?!{_CLAUDE_DESIGN})(?:{_any_of(_NAMES)}){_NAME_END}"
+            f"(?<!{_ALNUM})(?:{_any_of(_NAMES)}){_NAME_END}"
         ),
         "compound_name": _rule(
             f"(?<!{_ALNUM})(?:{'|'.join(_joined(words) for words in _COMPOUND_NAMES)})"
@@ -743,6 +737,22 @@ OWNER_TEXT_POLICY: dict[str, Any] = {
             "(?<![.\\u2024\\u3002\\ufe12\\ufe52\\uff0e\\uff61])"
             "[ \\t\\u00ad]*(?:\\r\\n|[\\n\\r\\u000b\\u000c\\u0085\\u2028\\u2029])[ \\t\\u00ad]*"
         ),
+        # The product name Claude Design, which the owner connects themselves
+        # (owner decisions of 2026-10-26), reads where the text as given holds
+        # it: a match of "pattern" with no letter or digit in the code point
+        # right before it or right after it. A code point of one of
+        # "letter_or_digit_categories" counts as one: a letter or number of
+        # any script, a mark, which belongs to the letter before it, and an
+        # unassigned, private-use or surrogate code point, which may be a
+        # letter where the owner reads it.
+        "claude_design": {
+            "pattern": _cased("claude design"),
+            "flags": "u",
+            "letter_or_digit_categories": [
+                "Cn", "Co", "Cs", "Ll", "Lm", "Lo", "Lt", "Lu", "Mc", "Me", "Mn",
+                "Nd", "Nl", "No",
+            ],
+        },
         # A kind's "max_length" counts the code points of the text as given,
         # before any change: len(text) in Python, [...text].length in
         # JavaScript. Longer text is refused, never cut.
@@ -787,9 +797,15 @@ OWNER_TEXT_POLICY: dict[str, Any] = {
                 "word stays readable in its ordinary lowercase use; it is refused "
                 "capitalized after a word or next to another script, with a "
                 "version, or before a colon or slash, and inside a compound name. "
-                "The product name Claude Design, its two words joined by exactly "
-                "one space in the text as given, reads in any letter case; a line "
-                "break there, with or without a space, keeps it hidden."
+                "The product name Claude Design reads in any letter case where "
+                "the text as given holds it as \"claude_design\" says. Those "
+                "occurrences are found once, before any line-break form is made; "
+                "in every form, a match of a \"model_names\" rule that starts "
+                "where one of them starts and ends within it is passed over, and "
+                "an occurrence starts in a form where the same form of the text "
+                "before it ends. So a line break between the two words, with or "
+                "without a space, keeps Claude hidden, and one after Design does "
+                "not."
             ),
         },
     },
@@ -821,13 +837,15 @@ _KINDS = {
     kind: (
         spec,
         tuple(
-            _compile(rule)
+            (_compile(rule), group == "model_names")
             for group in spec["groups"]
             for rule in _RULES["groups"][group].values()
         ),
     )
     for kind, spec in _RULES["kinds"].items()
 }
+_CLAUDE_DESIGN = _compile(_RULES["claude_design"])
+_LETTER_OR_DIGIT = frozenset(_RULES["claude_design"]["letter_or_digit_categories"])
 
 
 def owner_text_policy_json() -> str:
@@ -869,6 +887,50 @@ def _with_word_stand_ins(text: str) -> str:
     )
 
 
+def _claude_designs(text: str) -> list[tuple[int, int]]:
+    """Where ``text`` holds the product name Claude Design that reads."""
+    return [
+        match.span()
+        for match in _CLAUDE_DESIGN.finditer(text)
+        if not any(
+            unicodedata.category(char) in _LETTER_OR_DIGIT
+            for char in text[max(match.start() - 1, 0) : match.start()]
+            + text[match.end() : match.end() + 1]
+        )
+    ]
+
+
+def _line_break_form(
+    text: str,
+    line_break: re.Pattern[str],
+    joint: str,
+    names: list[tuple[int, int]],
+) -> tuple[str, dict[int, int]]:
+    """``text`` with each ``line_break`` replaced by ``joint``, and where the
+    spans ``names`` start and end in it. A line break never touches one of
+    them, so each only moves by what the line breaks before it change."""
+    breaks = [
+        (match.start(), len(joint) - len(match.group()))
+        for match in line_break.finditer(text)
+    ]
+    moved, shift, index = {}, 0, 0
+    for start, end in names:
+        while index < len(breaks) and breaks[index][0] < start:
+            shift += breaks[index][1]
+            index += 1
+        moved[start + shift] = end + shift
+    return line_break.sub(joint, text), moved
+
+
+def _matches(pattern: re.Pattern[str], form: str, passed: dict[int, int]) -> bool:
+    """Whether ``pattern`` matches ``form`` other than within a span of
+    ``passed``, which maps each start to its end, from that start."""
+    match = pattern.search(form)
+    while match and match.end() <= passed.get(match.start(), -1):
+        match = pattern.search(form, match.start() + 1)
+    return match is not None
+
+
 def check_owner_text(text: Any, kind: str) -> str:
     """Return ``text`` when the policy lets the owner see it as ``kind``.
 
@@ -877,10 +939,12 @@ def check_owner_text(text: Any, kind: str) -> str:
     than the kind allows, holding a character the kind refuses or matching a
     rule in one of the kind's groups. A kind that joins wrapped lines checks the
     text as given, then with each line break closed up and again with each
-    shown as a space, so a path or id split across lines is still caught and a
-    line break never passes for the one space of Claude Design. The length bound
-    counts code points of ``text`` as given. An unknown ``kind`` raises
-    :class:`KeyError`.
+    shown as a space, so a path or id split across lines is still caught. The
+    occurrences of Claude Design that read are found once, in the text as
+    given, and the model-name rules pass over exactly those in every form, so
+    no form makes a line break pass for their one space or takes one of them
+    away by joining the next line to Design. The length bound counts code
+    points of ``text`` as given. An unknown ``kind`` raises :class:`KeyError`.
     """
     spec, patterns = _KINDS[kind]
     sentence = _SENTENCES[kind]
@@ -889,14 +953,21 @@ def check_owner_text(text: Any, kind: str) -> str:
     limit = spec["max_length"]
     if limit is not None and len(text) > limit:
         return sentence
-    forms = [text]
+    names = _claude_designs(text)
+    forms = [(text, dict(names))]
     if spec["join_wrapped_lines"]:
-        forms += [_WRAPPED_LINE_BREAK.sub("", text), _LINE_BREAK.sub(" ", text)]
-    for form in forms:
+        forms += [
+            _line_break_form(text, _WRAPPED_LINE_BREAK, "", names),
+            _line_break_form(text, _LINE_BREAK, " ", names),
+        ]
+    for form, passed in forms:
         if spec["characters"] and not _plain_characters(form):
             return sentence
         if spec["word_stand_ins"]:
             form = _with_word_stand_ins(form)
-        if any(pattern.search(form) for pattern in patterns):
+        if any(
+            _matches(pattern, form, passed if model_names else {})
+            for pattern, model_names in patterns
+        ):
             return sentence
     return text
