@@ -30753,6 +30753,9 @@ def apply_owner_project_plan(
         affected_task_ids: set[str] = set()
         parked_task_ids: list[str] = []
         add_output_by_change: dict[int, str] = {}
+        # Each task a replace, split or merge of this plan archived, mapped to
+        # what replaced it: a later add naming it waits for that instead.
+        replaced_by: dict[str, list[str]] = {}
         internal_targets: dict[str, tuple[str, int]] = {}
 
         def expected_target(ref: dict) -> tuple[str, int]:
@@ -30840,7 +30843,9 @@ def apply_owner_project_plan(
 
             if action == "add":
                 parent_task_ids = [
-                    ref["task_id"] for ref in change["existing_parents"]
+                    parent_id
+                    for ref in change["existing_parents"]
+                    for parent_id in replaced_by.get(ref["task_id"], [ref["task_id"]])
                 ]
                 for parent_change_index in change["new_parents"]:
                     try:
@@ -30904,6 +30909,7 @@ def apply_owner_project_plan(
                     raise RuntimeError("preflighted split target changed inside transaction")
                 affected_task_ids.add(source_id)
                 archived_task_ids.append(source_id)
+                replaced_by[source_id] = leaf_ids
                 continue
 
             if action == "replace":
@@ -30944,6 +30950,7 @@ def apply_owner_project_plan(
                     )
                 affected_task_ids.add(source_id)
                 archived_task_ids.append(source_id)
+                replaced_by[source_id] = [replacement_id]
                 continue
 
             if action == "merge":
@@ -30990,6 +30997,7 @@ def apply_owner_project_plan(
                         raise RuntimeError("preflighted merge target changed inside transaction")
                     affected_task_ids.add(ref["task_id"])
                     archived_task_ids.append(ref["task_id"])
+                    replaced_by[ref["task_id"]] = [replacement_id]
                 continue
 
             ref = change["target"]
