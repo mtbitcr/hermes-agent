@@ -2662,6 +2662,11 @@ PROVIDER_WAIT_CAPABILITY = "provider_wait_v1"
 # (card C5). Without it every card keeps today's shape exactly; only a reader
 # naming it gets each card's ``delivery``: "delivering" or None.
 DELIVERY_STATE_CAPABILITY = "delivery_state_v1"
+# A separately negotiated contour for where a finished change was delivered.
+# Without it every card keeps today's shape exactly; only a reader naming it
+# gets each card's ``delivery_outcome``: what happened to its latest delivered
+# change, with the repository, pull request and link, or None.
+DELIVERY_OUTCOME_CAPABILITY = "delivery_outcome_v1"
 # A separately negotiated contour for the files a held card still needs from
 # the owner (card C2 of the named inputs plan). Without it every Decision keeps
 # today's keys exactly; only a reader naming it gets ``missing_inputs``.
@@ -3405,6 +3410,7 @@ def read_project_snapshot(
     owner_waiting: bool = False,
     provider_wait: bool = False,
     delivery_state: bool = False,
+    delivery_outcome: bool = False,
 ) -> dict:
     """Return one bounded read-only surface for an exact receipt-owned Project.
 
@@ -3439,6 +3445,12 @@ def read_project_snapshot(
     ``delivery_state`` gives each card ``delivery``: ``"delivering"`` for a
     done card whose delivery is unfinished, else None; it defaults off so the
     card shape stays exactly today's; see ``DELIVERY_STATE_CAPABILITY``.
+
+    ``delivery_outcome`` gives each card ``delivery_outcome``: what happened
+    to the change its latest delivery row carries (merged, returned, open or
+    closed), its repository, pull request and link, else None; it defaults
+    off so the card shape stays exactly today's; see
+    ``DELIVERY_OUTCOME_CAPABILITY``.
     """
     try:
         project_slug = projects_db.normalize_slug(project_slug) or ""
@@ -3564,6 +3576,11 @@ def read_project_snapshot(
             delivering = unfinished_delivery_task_ids(
                 conn, [task.id for task in tasks if task.status == "done"],
             )
+        outcomes = {}
+        if delivery_outcome:
+            from hermes_cli.kanban_delivery_outcome import delivery_outcomes
+
+            outcomes = delivery_outcomes(conn, task_ids)
 
         columns = {status: [] for status in _OWNER_PROJECT_COLUMNS}
         for task in tasks:
@@ -3598,6 +3615,8 @@ def read_project_snapshot(
                 columns[task.status][-1]["delivery"] = (
                     "delivering" if task.id in delivering else None
                 )
+            if delivery_outcome:
+                columns[task.status][-1]["delivery_outcome"] = outcomes.get(task.id)
 
         worker_rows = kanban_db.verified_active_worker_rows(
             conn, project_id=project_id,

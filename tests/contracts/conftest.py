@@ -104,6 +104,8 @@ CLOSED_VOCABULARIES = (
     ("owner_snapshot", ("review_state",), _REVIEW_STATES),
     # kanban_db.py:28848-28850; owner_workspace.py:2621
     ("owner_snapshot", ("stopped_work",), _KERNEL_STOPPED_WORK | {"provider_wait"}),
+    # kanban_delivery_outcome.py:44-45, with delivery_outcome_v1
+    ("owner_snapshot", ("delivery_outcome", "state"), frozenset({"merged", "returned", "open", "closed"})),
     # kanban_db.py:25137-25140
     ("owner_snapshot", ("retry_origin",),
      frozenset({"none", "automatic", "owner", "unattributed"})),

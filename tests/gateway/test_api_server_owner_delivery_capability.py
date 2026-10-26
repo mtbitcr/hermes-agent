@@ -52,3 +52,31 @@ async def test_the_snapshot_forwards_delivery_state_only_when_asked(query, run_c
 
     assert resp.status == 200
     read.assert_called_once_with(ANY, "shoe-shop", run_context=run_context, planning_context=False, **forwarded)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query, run_context, forwarded", [
+    ("", False, {}),
+    ("?capabilities=delivery_outcome_v1", False, {"delivery_outcome": True}),
+    ("?capabilities=run_task_context,delivery_outcome_v1", True, {"delivery_outcome": True}),
+    ("?capabilities=delivery_state_v1,delivery_outcome_v1", False, {"delivery_state": True, "delivery_outcome": True}),
+    ("?capabilities=delivery_state_v1", False, {"delivery_state": True}),
+    ("?capabilities=delivery_outcome_v2", False, {}),
+    ("?capabilities=delivery_outcome", False, {}),
+    ("?capabilities=delivery_outcome_v1&capabilities=delivery_outcome_v1", False, {}),
+    ("?capabilities=delivery_state_v1&capabilities=delivery_outcome_v1", False, {}),
+])
+async def test_the_snapshot_forwards_delivery_outcome_only_when_asked(query, run_context, forwarded):
+    """Only a reader that names ``delivery_outcome_v1`` in ONE ``capabilities`` parameter makes the kernel call
+    with ``delivery_outcome=True``; every other request makes exactly today's call."""
+    config = {"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}
+    with (
+        patch("gateway.run._load_gateway_config", return_value=config),
+        patch("hermes_cli.owner_workspace.resolve_owner_context", return_value=object()),
+        patch("hermes_cli.owner_workspace.read_project_snapshot", return_value={}) as read,
+    ):
+        async with TestClient(TestServer(_app())) as client:
+            resp = await client.get(f"/v1/owner-workspace/projects/shoe-shop/snapshot{query}")
+
+    assert resp.status == 200
+    read.assert_called_once_with(ANY, "shoe-shop", run_context=run_context, planning_context=False, **forwarded)
