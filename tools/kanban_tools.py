@@ -2972,7 +2972,8 @@ def _handle_read(args: dict, **kw) -> str:
     Read-only counterpart to the attachment listing: that names a file and
     its path, this hands back the text itself in slices the caller controls,
     so a worker with no general file-reading tool can still follow the
-    pointer. ``attachment_id`` selects one of this task's own attachments;
+    pointer. ``attachment_id`` selects an attachment of this task or of a
+    task directly linked to it (a parent or a child) on the same board;
     ``record`` selects the text ``kanban_show`` returns; omitting both reads
     the task body. Storage identity and path containment
     are enforced by the same ``read_attachment_bytes`` the download path
@@ -3035,7 +3036,9 @@ def _handle_read(args: dict, **kw) -> str:
                         f"(got {att_id!r})"
                     )
                 att = kb.get_attachment(conn, att_key)
-                if att is None or att.task_id != tid:
+                if att is None or att.task_id not in (
+                    tid, *kb.parent_ids(conn, tid), *kb.child_ids(conn, tid)
+                ):
                     return tool_error(
                         f"attachment {att_key} not found on task {tid}"
                     )
@@ -4169,13 +4172,14 @@ KANBAN_ATTACHMENTS_SCHEMA = {
 KANBAN_READ_SCHEMA = {
     "name": "kanban_read",
     "description": (
-        "Read a bounded window of your own task's text: an attachment's "
+        "Read a bounded window of task text: an attachment's "
         "content when you name an attachment id, the record kanban_show "
         "returns when you set `record`, or the task body when you do "
         "neither. Returns at most `limit` characters starting at `offset`, "
         "plus the total size and whether more remains, so you can page "
         "through a large file the attachment listing only gives you a path "
-        "to. Read-only."
+        "to. The attachment may belong to your task or to a task directly "
+        "linked to it (a parent or a child). Read-only."
     ),
     "parameters": {
         "type": "object",
@@ -4187,7 +4191,8 @@ KANBAN_READ_SCHEMA = {
             "attachment_id": {
                 "type": "integer",
                 "description": (
-                    "Id of an attachment on this task (from the attachment "
+                    "Id of an attachment on this task or on a task directly "
+                    "linked to it, a parent or a child (from the attachment "
                     "listing). Omit to read the task's body instead."
                 ),
             },
