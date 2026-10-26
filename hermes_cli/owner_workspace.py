@@ -3450,7 +3450,8 @@ def read_project_snapshot(
     to the change its latest delivery row carries (merged, returned, open or
     closed), its repository, pull request and link, else None; it defaults
     off so the card shape stays exactly today's; see
-    ``DELIVERY_OUTCOME_CAPABILITY``.
+    ``DELIVERY_OUTCOME_CAPABILITY``. Each run then carries the same value for
+    its own task, found by the run's native task id and never by title.
     """
     try:
         project_slug = projects_db.normalize_slug(project_slug) or ""
@@ -3680,6 +3681,11 @@ def read_project_snapshot(
             if provider_wait
             else ()
         )
+        run_outcomes = (
+            delivery_outcomes(conn, {str(run.task_id) for run in bounded_run_objects})
+            if delivery_outcome
+            else {}
+        )
         runs: list[dict] = []
         task_ids_with_newer_run: set[str] = set()
         for row, run in zip(run_rows[:_OWNER_PROJECT_MAX_RUNS], bounded_run_objects):
@@ -3700,6 +3706,8 @@ def read_project_snapshot(
                     provider_resume_at=provider_resume_times.get(int(row["id"])),
                 )
             )
+            if delivery_outcome:
+                runs[-1]["delivery_outcome"] = run_outcomes.get(run_task_id)
             task_ids_with_newer_run.add(run_task_id)
     except OwnerWorkspaceError:
         raise

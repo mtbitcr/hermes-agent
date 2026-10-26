@@ -234,6 +234,12 @@
       },
       "runs": [
         {
+          "delivery_outcome": {
+            "pull_request": 44,
+            "repository": "studio/website",
+            "state": "closed",
+            "url": "https://github.com/studio/website/pull/44"
+          },
           "finished_at": "2026-09-21T14:13:20Z",
           "has_newer_run": false,
           "receipt": {
@@ -261,6 +267,12 @@
           "task_title": "Publish the closed page"
         },
         {
+          "delivery_outcome": {
+            "pull_request": 42,
+            "repository": "studio/website",
+            "state": "returned",
+            "url": "https://github.com/studio/website/pull/42"
+          },
           "finished_at": "2026-09-21T14:13:20Z",
           "has_newer_run": false,
           "receipt": {
@@ -288,6 +300,12 @@
           "task_title": "Publish the returned page"
         },
         {
+          "delivery_outcome": {
+            "pull_request": 41,
+            "repository": "studio/website",
+            "state": "merged",
+            "url": "https://github.com/studio/website/pull/41"
+          },
           "finished_at": "2026-09-21T14:13:20Z",
           "has_newer_run": false,
           "receipt": {

@@ -308,6 +308,18 @@ async def test_the_delivery_outcome_example_carries_every_outcome_state(
         for outcome in filter(None, outcomes):
             assert outcome["url"] == (
                 f"https://github.com/{outcome['repository']}/pull/{outcome['pull_request']}")
+        # Each run carries the outcome of its own task, which is its card's outcome.
+        card_outcome = {task["title"]: task["delivery_outcome"] for task in _tasks(answer)}
+        runs = answer["body"]["data"]["runs"]
+        assert {run["task_title"] for run in runs} == {f"Publish the {state} page" for state in cards if state != "open"}
+        for run in runs:
+            assert run["delivery_outcome"] == card_outcome[run["task_title"]] is not None
+        assert contract.closed_values(runs, ("delivery_outcome", "state")) == set(rows) - {"open"}
+        for run in runs:
+            assert set(run) == {
+                "task_title", "has_newer_run", "retry_origin", "started_at", "finished_at", "receipt",
+                "delivery_outcome"}
+        assert not any(task_id in json.dumps(runs) for task_id in cards.values())
 
 
 def test_the_run_receipt_examples_carry_every_outcome_and_summary(owner_payload_example):
