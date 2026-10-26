@@ -1,13 +1,14 @@
 """A required check cancelled on H while a newer CI run of H is still to make it again: a close and reopen of the
 pull request starts a new CI run of the same head and cancels the old one, and until the new run creates the check,
 the old run's cancelled check is the only one of its name. The review step then reads H's workflow runs, by
-head_sha, and waits as for a pending check while GitHub shows any of them not completed; a cancelled check with
-every run of H completed, and a failed check, are red as before. The review cards world, whose GitHub table here
-also answers H's workflow runs."""
+head_sha and page by page, and waits as for a pending check while GitHub shows any of them not completed, on any
+page; a cancelled check with every run of H completed, and a failed check, are red as before, and a listing of H's
+runs not read whole decides nothing. The review cards world, whose GitHub table here also answers H's workflow
+runs."""
 
 from __future__ import annotations
 
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -23,21 +24,25 @@ PULL, RUNS = f"/repos/{REPO}/pulls/41", f"/repos/{REPO}/actions/runs"
 
 @pytest.fixture
 def runs(world, monkeypatch):
-    """The review cards world, whose table also answers H's workflow runs from gh["runs"], newest first: each a run
-    of H (ids from 700) with the fields it lists, which may name another head. None answers 404, as the world's
-    table does."""
+    """The review cards world, whose table also answers H's workflow runs from gh["runs"], newest first, as GitHub
+    lists them: 100 a page, the page the request names (the first by default), and total_count the number of all
+    of them. Each is a run of H (ids from 700) with the fields it lists, which may name another head. None answers
+    404, as the world's table does; gh["runs_page"] maps a page's number to the answer that page gets instead."""
     kb, root, repo, gh = world
     from hermes_cli import kanban_delivery_github as transport
 
     table = transport._exchange  # the world's: it records every call, and answers 404 for H's workflow runs
-    gh["runs"] = None
+    gh["runs"], gh["runs_page"] = None, {}
 
     def exchange(method, target, authorization, payload=None):
         answer = table(method, target, authorization, payload)
         if (method, urlsplit(target).path) != ("GET", RUNS) or gh["runs"] is None:
             return answer
+        page = int(parse_qs(urlsplit(target).query).get("page", ["1"])[0])
+        if page in gh["runs_page"]:
+            return gh["runs_page"][page]
         found = [{"id": 700 + n, "head_sha": gh["head"], **run} for n, run in enumerate(gh["runs"])]
-        return 200, {"total_count": len(found), "workflow_runs": found}
+        return 200, {"total_count": len(found), "workflow_runs": found[(page - 1) * 100:page * 100]}
 
     monkeypatch.setattr(transport, "_exchange", exchange)
     return world
@@ -132,3 +137,68 @@ def test_a_failed_check_is_red_even_while_a_run_of_h_is_running(runs):
     assert _events(kb, tid)[len(events):] == _red(head, "failure")
     assert (_cards(kb), _state(kb, head), _source(kb, tid)) == ([], "open", source)
     assert [path for _, path in gh["calls"]][:4] == [PULL, f"/repos/{REPO}/commits/{head}/check-runs", PULL, RUNS]
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress"])
+def test_a_cancelled_check_waits_while_a_run_of_h_beyond_the_first_100_is_not_completed(runs, status):
+    """E: GitHub lists H's 102 runs over two pages, 100 completed ones first, then the newer run of H ``status``
+    and the older run, completed and cancelled: each pass reads the first page, by head_sha, then the second, and
+    stops there as a pending check's pass does: no waiting record, no review card, the row open, the source card
+    unchanged, no POST and no other request."""
+    kb, root, repo, gh = runs
+    tid, head = _ready(runs)
+    gh["copies"] = [("completed", "cancelled", OLDER)]
+    gh["runs"] = [{"status": "completed", "conclusion": "success"}] * 100 + [
+        {"status": status, "conclusion": None}, {"status": "completed", "conclusion": "cancelled"}]
+    events, source = _events(kb, tid), _source(kb, tid)
+
+    for _ in range(3):
+        _tick(kb)
+
+    assert (_events(kb, tid)[len(events):], _cards(kb), _state(kb, head), _source(kb, tid)) == ([], [], "open", source)
+    assert gh["queries"] == [
+        (PULL, {}),
+        (f"/repos/{REPO}/commits/{head}/check-runs",
+         {"filter": ["latest"], "check_name": [CHECK], "per_page": ["100"]}),
+        (RUNS, {"head_sha": [head], "per_page": ["100"]}),
+        (RUNS, {"head_sha": [head], "per_page": ["100"], "page": ["2"]})] * 3
+    assert [call for call in gh["calls"] if call[0] != "GET"] == [] and set(gh["steps"]) == {"read_checks"}
+
+
+def test_a_cancelled_check_is_red_when_every_run_of_h_over_two_pages_is_completed(runs):
+    """F: GitHub lists H's 102 runs over two pages, every one completed, the cancelled run last, so the cancelled
+    check is red, as before: red_check_waiting with its id and conclusion, once for H, no card and the source card
+    unchanged."""
+    kb, root, repo, gh = runs
+    tid, head = _ready(runs)
+    gh["copies"] = [("completed", "cancelled", OLDER)]
+    gh["runs"] = [{"status": "completed", "conclusion": "success"}] * 101 + [
+        {"status": "completed", "conclusion": "cancelled"}]
+    events, source = _events(kb, tid), _source(kb, tid)
+
+    for _ in range(3):
+        _tick(kb)
+
+    assert _events(kb, tid)[len(events):] == _red(head, "cancelled")
+    assert (_cards(kb), _state(kb, head), _source(kb, tid)) == ([], "open", source)
+
+
+@pytest.mark.parametrize("answer", [(404, None), (200, {"total_count": 102, "workflow_runs": []})],
+                         ids=["page_2_unreadable", "page_2_without_runs"])
+def test_a_listing_of_the_runs_of_h_not_read_whole_decides_nothing(runs, answer):
+    """G: the first page lists 100 completed runs of H and a total_count of 102, but the second cannot be read or
+    holds no run, so the listing is not read whole and no pass decides, red or otherwise: no waiting record, no
+    review card, the row open, the source card unchanged and no POST; a later pass reads it again."""
+    kb, root, repo, gh = runs
+    tid, head = _ready(runs)
+    gh["copies"] = [("completed", "cancelled", OLDER)]
+    gh["runs"] = [{"status": "completed", "conclusion": "success"}] * 101 + [
+        {"status": "completed", "conclusion": "cancelled"}]
+    gh["runs_page"] = {2: answer}
+    events, source = _events(kb, tid), _source(kb, tid)
+
+    for _ in range(3):
+        _tick(kb)
+
+    assert (_events(kb, tid)[len(events):], _cards(kb), _state(kb, head), _source(kb, tid)) == ([], [], "open", source)
+    assert [call for call in gh["calls"] if call[0] != "GET"] == []

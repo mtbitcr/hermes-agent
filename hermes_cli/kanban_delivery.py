@@ -1225,10 +1225,8 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
         if outcomes & {"pending", "stale"}:
             return None  # CI on H still runs: a later step tries again
         if any(run.get("conclusion") == "cancelled" for (run,) in named.values()):  # H's newer CI run may make it again
-            with contextlib.suppress(PublishRefused, GitHubTransportError):  # H's runs unread: red, as before
-                workflow_runs, _ = _page(github, f"/repos/{repository}/actions/runs", "workflow_runs", head_sha=head)
-                if any(run.get("head_sha") == head and run.get("status") != "completed" for run in workflow_runs):
-                    return None  # a run of H not completed: wait, as for a pending check
+            if _run_not_completed(github, repository, head):
+                return None  # a run of H not completed: wait, as for a pending check
         at_head, stored = _review_pull(db_path, github, repository, row)
         if not at_head:
             return stored  # the pull request closed outside the delivery step, or left H, while CI was read
@@ -1246,6 +1244,35 @@ def _review_delivery(db_path: Path, row: dict, reviewer: str, route: dict) -> Op
             if run.get("conclusion") != "success"})
     except GitHubTransportError as error:
         raise _transport_refusal(error) from None
+
+
+_RUN_PAGES = 10  # GitHub lists at most 1,000 workflow runs for one head_sha query: up to 10 pages of 100
+
+
+def _run_not_completed(github, repository: str, head: str) -> bool:
+    """Whether GitHub shows a workflow run of H not completed: H's runs, by head_sha, page by page until a page
+    lists one or the distinct run ids read reach the first page's total_count. A first page that cannot be read
+    shows none (red, as before). After a readable one, a listing not read whole within :data:`_RUN_PAGES` pages,
+    or with a later page that cannot be read, states another total_count, holds no run or repeats a run already
+    read, is a refusal: the pass decides nothing and the next one reads it again."""
+    from hermes_cli.kanban_delivery_github import GitHubTransportError
+
+    path, read = f"/repos/{repository}/actions/runs", set()
+    try:
+        runs, total = _page(github, path, "workflow_runs", head_sha=head)
+    except (PublishRefused, GitHubTransportError):
+        return False  # H's runs unread: red, as before
+    for page in range(1, _RUN_PAGES + 1):
+        if page > 1:  # the listing's next page, by the same read
+            runs, count = _page(github, path, "workflow_runs", head_sha=head, page=page)
+        if any(run.get("head_sha") == head and run.get("status") != "completed" for run in runs):
+            return True  # on any page: wait, as for a pending check
+        if page > 1 and (count != total or not runs or read & {run["id"] for run in runs}):
+            break  # a later page with another total_count, no run or a run already read: the listing moved
+        read |= {run["id"] for run in runs}
+        if len(read) >= total:
+            return False  # every run listed read, each of H completed: red
+    raise PublishRefused("ci_unreadable", f"{total} workflow runs of {head}, not read whole")
 
 
 # The one title tests.yml gives every annotation a failed slice job writes on its own check run: first
