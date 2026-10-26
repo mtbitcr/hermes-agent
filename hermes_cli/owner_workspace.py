@@ -3681,11 +3681,14 @@ def read_project_snapshot(
             if provider_wait
             else ()
         )
-        run_outcomes = (
-            delivery_outcomes(conn, {str(run.task_id) for run in bounded_run_objects})
-            if delivery_outcome
-            else {}
-        )
+        # A run reuses the outcome its card already carries (None included), so
+        # a commit between the two reads cannot split them; only tasks the card
+        # read never covered (archived, past the task bound) are queried.
+        run_outcomes = dict(outcomes)
+        if delivery_outcome:
+            run_outcomes.update(delivery_outcomes(conn, {
+                str(run.task_id) for run in bounded_run_objects
+            } - outcomes.keys()))
         runs: list[dict] = []
         task_ids_with_newer_run: set[str] = set()
         for row, run in zip(run_rows[:_OWNER_PROJECT_MAX_RUNS], bounded_run_objects):

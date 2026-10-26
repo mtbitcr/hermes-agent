@@ -384,3 +384,82 @@ def test_without_the_capability_no_run_carries_delivery_outcome(owner):
         runs = _runs(owner, project, **options)
         assert len(runs) == 2
         assert all("delivery_outcome" not in run for run in runs)
+
+
+def _commit_after_first_outcomes_read(monkeypatch, change) -> list:
+    """Wrap delivery_outcomes so ``change`` commits through a second connection right after its first call."""
+    from hermes_cli import kanban_delivery_outcome as kdo
+
+    real, calls = kdo.delivery_outcomes, []
+
+    def wrapped(conn, task_ids):
+        result = real(conn, task_ids)
+        calls.append(sorted(str(task_id) for task_id in task_ids))
+        if len(calls) == 1:
+            change()
+        return result
+
+    monkeypatch.setattr(kdo, "delivery_outcomes", wrapped)
+    return calls
+
+
+def _assert_runs_match_their_cards(snapshot: dict, expected: dict) -> None:
+    cards = _cards(snapshot)
+    runs = {run["task_title"]: run for run in snapshot["runs"]}
+    assert set(cards) == set(runs) == set(expected)
+    for title, outcome in expected.items():
+        assert cards[title]["delivery_outcome"] == outcome
+        assert runs[title]["delivery_outcome"] == cards[title]["delivery_outcome"]
+
+
+def test_a_state_change_between_the_reads_leaves_card_and_run_in_agreement(owner, monkeypatch):
+    project = _project(owner, "Website Pilot")
+    task_id = _card(project, "Publish the site", status="done")
+    row_id = _delivery(project, task_id, "open", number=7)
+    calls = _commit_after_first_outcomes_read(monkeypatch, lambda: _set_state(project, row_id, "merged"))
+
+    snapshot = ow.read_project_snapshot(owner, project["slug"], delivery_outcome=True, run_context=True)
+
+    assert len(calls) >= 1
+    _assert_runs_match_their_cards(snapshot, {"Publish the site": _outcome("open", 7)})
+    assert _outcomes(owner, project) == {"Publish the site": _outcome("merged", 7)}
+
+
+def test_a_first_row_inserted_between_the_reads_leaves_card_and_run_in_agreement(owner, monkeypatch):
+    project = _project(owner, "Website Pilot")
+    task_id = _card(project, "Publish the site", status="done")
+    calls = _commit_after_first_outcomes_read(
+        monkeypatch, lambda: _delivery(project, task_id, "merged", number=7))
+
+    snapshot = ow.read_project_snapshot(owner, project["slug"], delivery_outcome=True, run_context=True)
+
+    assert len(calls) >= 1
+    _assert_runs_match_their_cards(snapshot, {"Publish the site": None})
+    assert _outcomes(owner, project) == {"Publish the site": _outcome("merged", 7)}
+
+
+def test_a_newer_row_inserted_between_the_reads_leaves_card_and_run_in_agreement(owner, monkeypatch):
+    project = _project(owner, "Website Pilot")
+    task_id = _card(project, "Publish the site", status="done")
+    _delivery(project, task_id, "open", number=16, head="a" * 40)
+    calls = _commit_after_first_outcomes_read(
+        monkeypatch, lambda: _delivery(project, task_id, "open", number=17, head="b" * 40))
+
+    snapshot = ow.read_project_snapshot(owner, project["slug"], delivery_outcome=True, run_context=True)
+
+    assert len(calls) >= 1
+    _assert_runs_match_their_cards(snapshot, {"Publish the site": _outcome("open", 16)})
+    assert _outcomes(owner, project) == {"Publish the site": _outcome("open", 17)}
+
+
+def test_a_run_of_an_archived_card_is_still_looked_up(owner):
+    project = _project(owner, "Website Pilot")
+    task_id = _card(project, "Publish the site", status="done")
+    _delivery(project, task_id, "merged", number=7)
+    with _board(project) as conn:
+        assert kanban_db.archive_task(conn, task_id) is True
+
+    snapshot = ow.read_project_snapshot(owner, project["slug"], delivery_outcome=True)
+
+    assert _cards(snapshot) == {}
+    assert [run["delivery_outcome"] for run in snapshot["runs"]] == [_outcome("merged", 7)]
