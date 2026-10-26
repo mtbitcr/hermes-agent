@@ -350,7 +350,7 @@ _REGISTERED_NAMES = [
     "Kilo Code", "KiloCode", "OpenCode", "CommandCode", "Nebius",
     "Upstage Solar", "Fireworks AI", "Together AI", "Actual Computer",
     "Ramp Router", "Meta AI", "Muse Spark", "Vercel", "DashScope", "Alibaba",
-    "GitHub", "Sonnet", "Opus", "Haiku",
+    "Sonnet", "Opus", "Haiku",
 ]
 
 
@@ -384,6 +384,33 @@ def test_registered_model_and_provider_names_are_hidden_in_any_form(name):
 def test_names_are_hidden_in_lowercase_too(name):
     _refused_everywhere(f"ask {name} for the draft")
     _refused_everywhere(f"ask {name}2 for the draft")
+
+
+# The owner connects GitHub and Claude Design themselves, so both read
+# (owner decision of 2026-10-26).
+@pytest.mark.parametrize("name", ["GitHub", "github", "GITHUB"])
+def test_github_is_readable_in_planner_prose(name):
+    text = f"I opened the pull request on {name} for you."
+    assert check_owner_text(text, "planner_prose") == text
+
+
+@pytest.mark.parametrize("name", ["Claude Design", "claude design", "CLAUDE DESIGN"])
+def test_claude_design_is_readable(name):
+    text = f"I drew the first screens in {name} for you."
+    assert check_owner_text(text, "planner_prose") == text
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["Claude", "Claude 4", "Claude Opus", "Claude  Design", "Claude Designer"],
+    ids=["alone", "version", "model-family", "two-spaces", "longer-word"],
+)
+def test_claude_in_every_other_form_stays_hidden(name):
+    text = f"I drew the first screens in {name} for you."
+    assert check_owner_text(text, "planner_prose") == _SENTENCES["planner_prose"]
+    # The same sentence naming Claude Design reads, so the form alone hides it.
+    shown = text.replace(name, "Claude Design")
+    assert check_owner_text(shown, "planner_prose") == shown
 
 
 @pytest.mark.parametrize(
@@ -422,6 +449,16 @@ def test_everyday_words_are_hidden_in_their_product_forms(word):
     ],
 )
 def test_bare_web_addresses_are_refused_without_a_list_of_endings(text):
+    _refused_everywhere(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Read github.com today", "Open https://github.com/example/shop today"],
+    ids=["bare-host", "full-address"],
+)
+def test_a_github_com_web_address_stays_hidden(text):
+    # GitHub reads as a name; its web addresses stay hidden by the address rules.
     _refused_everywhere(text)
 
 

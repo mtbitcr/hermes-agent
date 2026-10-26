@@ -114,11 +114,13 @@ _LEGACY_NAMES = _any_of(
 # boundary. A name made of several words is also refused written as one word
 # or joined by a space, dot, hyphen or underscore. "bedrock" stays a name, not
 # an everyday word, because owner titles have always refused it in any case.
+# "github" is left out because the owner connects GitHub themselves (owner
+# decision of 2026-10-26).
 _NAMES = [
     "aci", "actualcomputer", "alibaba", "amazon", "anthropic", "arcee", "aws",
     "azure", "bedrock", "chatgpt", "claude", "codex", "commandcode", "copilot", "dashscope",
     "deepinfra", "deepseek", "devstral", "doubao", "gcp", "gemini", "gemma",
-    "github", "glm", "gmi", "google", "gpt", "grok", "haiku", "hermes", "hf",
+    "glm", "gmi", "google", "gpt", "grok", "haiku", "hermes", "hf",
     "huggingface", "kilocode", "kimi", "llama", "llamacpp", "mimo", "minimax",
     "mistral", "mixtral", "msl", "nebius", "nemotron", "novita", "nvidia",
     "o1", "o3", "o4", "ollama", "openai", "opencode", "openrouter", "opus",
@@ -191,6 +193,11 @@ _NAME_JOINER = f"[{_SPACE_CHARS}._-]*"
 # After a name may come version digits, or a plural ending and then a boundary.
 _NAME_END = "(?:[0-9]|(?:[Ee]?[Ss])?(?![0-9A-Za-z]))"
 _WORD_END = "(?:[0-9]|(?![0-9A-Za-z]))"
+# No name starts at the product name Claude Design, which the owner connects
+# themselves (owner decision of 2026-10-26): its two words joined by exactly
+# one space, in any letter case, then a boundary. Claude in every other form
+# stays a name.
+_CLAUDE_DESIGN = f"{_cased('claude design')}(?!{_ALNUM})"
 # What may stand between a word and a capitalized everyday word after it:
 # spaces, markup, quotes, brackets, commas and semicolons, but no sentence
 # end and no dash or bar, so "Gluten-Free" and "Shop - Free Delivery" stay
@@ -294,7 +301,9 @@ _GROUPS = {
         "process_id": _rule(f"(?<!{_WORD}){_cased('pid')}[ :=]+[0-9]"),
     },
     "model_names": {
-        "name": _rule(f"(?<!{_ALNUM})(?:{_any_of(_NAMES)}){_NAME_END}"),
+        "name": _rule(
+            f"(?<!{_ALNUM})(?!{_CLAUDE_DESIGN})(?:{_any_of(_NAMES)}){_NAME_END}"
+        ),
         "compound_name": _rule(
             f"(?<!{_ALNUM})(?:{'|'.join(_joined(words) for words in _COMPOUND_NAMES)})"
             f"{_NAME_END}"
@@ -774,7 +783,9 @@ OWNER_TEXT_POLICY: dict[str, Any] = {
                 "other than an ASCII letter or digit is a boundary. An everyday "
                 "word stays readable in its ordinary lowercase use; it is refused "
                 "capitalized after a word or next to another script, with a "
-                "version, or before a colon or slash, and inside a compound name."
+                "version, or before a colon or slash, and inside a compound name. "
+                "The product name Claude Design, its two words joined by exactly "
+                "one space, reads in any letter case."
             ),
         },
     },
