@@ -350,7 +350,7 @@ _REGISTERED_NAMES = [
     "Kilo Code", "KiloCode", "OpenCode", "CommandCode", "Nebius",
     "Upstage Solar", "Fireworks AI", "Together AI", "Actual Computer",
     "Ramp Router", "Meta AI", "Muse Spark", "Vercel", "DashScope", "Alibaba",
-    "GitHub", "Sonnet", "Opus", "Haiku",
+    "Sonnet", "Opus", "Haiku",
 ]
 
 
@@ -384,6 +384,153 @@ def test_registered_model_and_provider_names_are_hidden_in_any_form(name):
 def test_names_are_hidden_in_lowercase_too(name):
     _refused_everywhere(f"ask {name} for the draft")
     _refused_everywhere(f"ask {name}2 for the draft")
+
+
+# The owner connects GitHub and Claude Design themselves, so both read
+# (owner decision of 2026-10-26).
+@pytest.mark.parametrize("name", ["GitHub", "github", "GITHUB"])
+def test_github_is_readable_in_planner_prose(name):
+    text = f"I opened the pull request on {name} for you."
+    assert check_owner_text(text, "planner_prose") == text
+
+
+@pytest.mark.parametrize("name", ["Claude Design", "claude design", "CLAUDE DESIGN"])
+def test_claude_design_is_readable(name):
+    text = f"I drew the first screens in {name} for you."
+    assert check_owner_text(text, "planner_prose") == text
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["Claude", "Claude 4", "Claude Opus", "Claude  Design", "Claude Designer"],
+    ids=["alone", "version", "model-family", "two-spaces", "longer-word"],
+)
+def test_claude_in_every_other_form_stays_hidden(name):
+    text = f"I drew the first screens in {name} for you."
+    assert check_owner_text(text, "planner_prose") == _SENTENCES["planner_prose"]
+    # The same sentence naming Claude Design reads, so the form alone hides it.
+    shown = text.replace(name, "Claude Design")
+    assert check_owner_text(shown, "planner_prose") == shown
+
+
+# GitHub reads, but the GitHub Models provider aliases
+# (plugins/model-providers/copilot) stay hidden.
+@pytest.mark.parametrize(
+    "alias",
+    ["github-models", "github-model", "GitHub Models", "GitHub Model",
+     "GITHUB-MODELS", "github-models4"],
+)
+def test_github_models_provider_aliases_stay_hidden(alias):
+    text = f"I used {alias} for your draft."
+    _refused_everywhere(text)
+    # The same sentence naming GitHub alone reads, so the alias alone hides it.
+    shown = text.replace(alias, "GitHub")
+    for kind in ("title", "project_name", "planner_prose"):
+        assert check_owner_text(shown, kind) == shown, kind
+
+
+# Every line break the checker knows: the policy's "line_break".
+_LINE_BREAKS = {
+    "lf": "\n", "cr": "\r", "crlf": "\r\n", "vertical-tab": "\u000b",
+    "form-feed": "\u000c", "next-line": "\u0085", "line-separator": "\u2028",
+    "paragraph-separator": "\u2029",
+}
+
+
+def test_the_line_breaks_are_every_one_the_checker_knows():
+    every_character = "".join(map(chr, range(0x110000)))
+    line_break = OWNER_TEXT_POLICY["rules"]["line_break"]
+    assert set(re.findall(line_break, every_character)) | {"\r\n"} == set(
+        _LINE_BREAKS.values()
+    )
+
+
+# Claude Design reads only where the text as given joins its two words with
+# one space; a line break in that place, alone or beside a space, hides it.
+@pytest.mark.parametrize(
+    "joint", ["{}", " {}", "{} "], ids=["alone", "space-before", "space-after"]
+)
+@pytest.mark.parametrize(
+    "line_break", list(_LINE_BREAKS.values()), ids=list(_LINE_BREAKS)
+)
+def test_a_line_break_between_claude_and_design_keeps_it_hidden(line_break, joint):
+    text = "I drew the first screens in Claude{}Design for you."
+    _refused_everywhere(text.format(joint.format(line_break)))
+    # In the same sentence one space reads and two spaces stay hidden.
+    one_space = text.format(" ")
+    for kind in ("title", "project_name", "planner_prose"):
+        assert check_owner_text(one_space, kind) == one_space, kind
+    _refused_everywhere(text.format("  "))
+
+
+# Which Claude Design reads is decided once, from the text as given, before
+# any line-break form is made (owner rule, round 2): a form never takes it
+# away and never grants it.
+_JOINTS = {"alone": "{}", "space-before": " {}", "space-after": "{} "}
+_CHECKED_KINDS = ["planner_prose", "title", "project_name"]
+
+
+@pytest.mark.parametrize("kind", _CHECKED_KINDS)
+@pytest.mark.parametrize("joint", list(_JOINTS.values()), ids=list(_JOINTS))
+@pytest.mark.parametrize(
+    "line_break", list(_LINE_BREAKS.values()), ids=list(_LINE_BREAKS)
+)
+def test_claude_design_at_the_end_of_a_line_reads(line_break, joint, kind):
+    text = "I drew the screens in Claude Design{}for you."
+    at_the_end = text.format(joint.format(line_break))
+    assert check_owner_text(at_the_end, kind) == at_the_end
+    # The same break between the two words keeps Claude hidden.
+    between = "I drew the screens in Claude{}Design for you.".format(
+        joint.format(line_break)
+    )
+    assert check_owner_text(between, kind) == _SENTENCES[kind]
+
+
+@pytest.mark.parametrize("kind", _CHECKED_KINDS)
+@pytest.mark.parametrize("joint", list(_JOINTS.values()), ids=list(_JOINTS))
+@pytest.mark.parametrize(
+    "line_break", list(_LINE_BREAKS.values()), ids=list(_LINE_BREAKS)
+)
+def test_a_claude_design_only_a_line_break_form_makes_stays_hidden(
+    line_break, joint, kind
+):
+    # Closed up, this reads "Claude Design", but the text as given holds no
+    # Claude Design.
+    text = "I drew the screens in Clau{}de Design for you.".format(
+        joint.format(line_break)
+    )
+    assert check_owner_text(text, kind) == _SENTENCES[kind]
+
+
+# A letter, digit or mark of any script right after Design or right before
+# Claude is no boundary.
+_LETTERS_AND_DIGITS = {
+    "ascii-letters": "er", "ascii-digit": "2", "accented-letter": "\u00e9",
+    "cjk-letter": "\u65e5", "dotless-i": "\u0131", "arabic-indic-digit": "\u0663",
+    "fullwidth-digit": "\uff12", "superscript-digit": "\u00b2",
+    "combining-mark": "\u0301",
+}
+
+
+@pytest.mark.parametrize("kind", _CHECKED_KINDS)
+@pytest.mark.parametrize(
+    "after", list(_LETTERS_AND_DIGITS.values()), ids=list(_LETTERS_AND_DIGITS)
+)
+def test_a_letter_or_digit_right_after_design_keeps_claude_hidden(after, kind):
+    text = f"I drew the screens in Claude Design{after}{{}}for you."
+    for rest in [" ", *_LINE_BREAKS.values()]:
+        assert check_owner_text(text.format(rest), kind) == _SENTENCES[kind], rest
+
+
+@pytest.mark.parametrize("kind", _CHECKED_KINDS)
+@pytest.mark.parametrize(
+    "before",
+    ["\u00e9", "e\u0301", "\u65e5\u672c", "\u0663"],
+    ids=["accented-letter", "letter-and-mark", "cjk-letters", "arabic-indic-digit"],
+)
+def test_a_letter_or_digit_right_before_claude_keeps_it_hidden(before, kind):
+    text = f"I drew the screens in {before}Claude Design for you."
+    assert check_owner_text(text, kind) == _SENTENCES[kind]
 
 
 @pytest.mark.parametrize(
@@ -422,6 +569,16 @@ def test_everyday_words_are_hidden_in_their_product_forms(word):
     ],
 )
 def test_bare_web_addresses_are_refused_without_a_list_of_endings(text):
+    _refused_everywhere(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Read github.com today", "Open https://github.com/example/shop today"],
+    ids=["bare-host", "full-address"],
+)
+def test_a_github_com_web_address_stays_hidden(text):
+    # GitHub reads as a name; its web addresses stay hidden by the address rules.
     _refused_everywhere(text)
 
 
@@ -469,6 +626,7 @@ def _policy_patterns():
     rules = OWNER_TEXT_POLICY["rules"]
     yield "line_break", {"pattern": rules["line_break"], "flags": "u"}
     yield "wrapped_line_break", {"pattern": rules["wrapped_line_break"], "flags": "u"}
+    yield "claude_design", rules["claude_design"]
     for group, group_rules in rules["groups"].items():
         for name, rule in group_rules.items():
             yield f"{group}.{name}", rule
