@@ -2588,6 +2588,133 @@ def test_read_refuses_a_foreign_task_id_named_with_its_own_attachment(worker_env
     assert secret not in json.dumps(out)
 
 
+def test_read_a_child_reads_its_parents_attachment(monkeypatch, tmp_path):
+    """As the dispatcher runs a worker: pinned DB and board, own task, profile
+    home. The check task reads the document its parent wrote on the same board,
+    and gets back exactly the bytes written here."""
+    from hermes_cli import kanban_db as kb
+    from tools.registry import registry
+
+    root = _status_report_env(
+        monkeypatch, tmp_path, profile="worker", has_kanban_toolset=False
+    )
+    _seed_board("own-board", [{"title": "the check card", "status": "running"}])
+    own_db = kb.kanban_db_path(board="own-board")
+    data = "".join(f"finding {i:03d}\n" for i in range(300)).encode("utf-8")
+    with kb.connect_closing(board="own-board") as conn:
+        tid = kb.list_tasks(conn, status="running")[0].id
+        parent = kb.create_task(
+            conn, title="the writer card", assignee="worker", board="own-board"
+        )
+        kb.link_tasks(conn, parent, tid)
+        att_id = kb.store_attachment_bytes(
+            conn, parent, "report.md", data,
+            content_type="text/plain", uploaded_by="worker", board="own-board",
+        )
+
+    profile_home = root / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(own_db))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "own-board")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+
+    d = json.loads(registry.dispatch("kanban_read", {"attachment_id": att_id}))
+    assert d.get("ok") is True, d
+    assert (d["task_id"], d["source"], d["attachment_id"], d["filename"]) == (
+        tid, "attachment", att_id, "report.md"
+    )
+    # The independent count: the bytes this test wrote, all of them.
+    assert d["content"].encode("utf-8") == data
+    assert d["total"] == len(data)
+    assert d["has_more"] is False
+
+
+def test_read_a_parent_reads_its_childs_attachment(worker_env):
+    """A milestone root reads the document its child wrote."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    text = "".join(f"child result {i:03d}\n" for i in range(100))
+    with kb.connect_closing() as conn:
+        child = kb.create_task(
+            conn, title="child", assignee="someone-else", parents=[worker_env]
+        )
+    att_id = _attach_text(child, "result.md", text)
+
+    d = json.loads(kt._handle_read({"attachment_id": att_id}))
+    assert d.get("ok") is True, d
+    assert (d["task_id"], d["source"], d["attachment_id"], d["filename"]) == (
+        worker_env, "attachment", att_id, "result.md"
+    )
+    assert d["content"] == text
+    assert d["total"] == len(text)
+
+
+def test_read_refuses_an_unlinked_tasks_attachment(worker_env):
+    """With a parent and a child linked, a task linked to neither gets the
+    same refusal as another task's attachment, and none of its content."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    secret = "UNLINKED TASK SECRET"
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="someone-else")
+        kb.link_tasks(conn, parent, worker_env)
+        kb.create_task(
+            conn, title="child", assignee="someone-else", parents=[worker_env]
+        )
+        other = kb.create_task(conn, title="unlinked", assignee="someone-else")
+    other_att = _attach_text(other, "theirs.txt", secret)
+
+    out = json.loads(kt._handle_read({"attachment_id": other_att}))
+    assert out == {"error": f"attachment {other_att} not found on task {worker_env}"}
+    assert secret not in json.dumps(out)
+
+
+def test_read_refuses_a_grandparents_attachment(worker_env):
+    """Only a direct link counts: a parent's parent gets the same refusal."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    secret = "GRANDPARENT SECRET"
+    with kb.connect_closing() as conn:
+        grandparent = kb.create_task(
+            conn, title="grandparent", assignee="someone-else"
+        )
+        parent = kb.create_task(
+            conn, title="parent", assignee="someone-else", parents=[grandparent]
+        )
+        kb.link_tasks(conn, parent, worker_env)
+        assert kb.parent_ids(conn, worker_env) == [parent]
+        assert kb.parent_ids(conn, parent) == [grandparent]
+    gp_att = _attach_text(grandparent, "plan.md", secret)
+
+    out = json.loads(kt._handle_read({"attachment_id": gp_att}))
+    assert out == {"error": f"attachment {gp_att} not found on task {worker_env}"}
+    assert secret not in json.dumps(out)
+
+
+def test_read_refuses_a_siblings_attachment(worker_env):
+    """A task that only shares a parent is not linked: same refusal."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    secret = "SIBLING SECRET"
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="someone-else")
+        kb.link_tasks(conn, parent, worker_env)
+        sibling = kb.create_task(
+            conn, title="sibling", assignee="someone-else", parents=[parent]
+        )
+        assert kb.child_ids(conn, parent) == sorted([worker_env, sibling])
+    sib_att = _attach_text(sibling, "notes.md", secret)
+
+    out = json.loads(kt._handle_read({"attachment_id": sib_att}))
+    assert out == {"error": f"attachment {sib_att} not found on task {worker_env}"}
+    assert secret not in json.dumps(out)
+
+
 def test_read_is_present_for_exactly_the_kanban_show_audience(worker_env, monkeypatch):
     """Same availability check as kanban_show: present wherever that tool is,
     absent wherever it isn't."""
