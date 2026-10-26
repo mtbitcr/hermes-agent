@@ -115,7 +115,8 @@ _LEGACY_NAMES = _any_of(
 # or joined by a space, dot, hyphen or underscore. "bedrock" stays a name, not
 # an everyday word, because owner titles have always refused it in any case.
 # "github" is left out because the owner connects GitHub themselves (owner
-# decision of 2026-10-26).
+# decision of 2026-10-26); the provider aliases github-model and github-models
+# stay compound names.
 _NAMES = [
     "aci", "actualcomputer", "alibaba", "amazon", "anthropic", "arcee", "aws",
     "azure", "bedrock", "chatgpt", "claude", "codex", "commandcode", "copilot", "dashscope",
@@ -129,7 +130,8 @@ _NAMES = [
 ]
 _COMPOUND_NAMES = [
     ["actual", "computer"], ["ai", "gateway"], ["arcee", "ai"], ["command", "code"],
-    ["deep", "infra"], ["deep", "seek"], ["fireworks", "ai"], ["gmi", "cloud"],
+    ["deep", "infra"], ["deep", "seek"], ["fireworks", "ai"], ["github", "model"],
+    ["github", "models"], ["gmi", "cloud"],
     ["hugging", "face"], ["kilo", "code"], ["kilo", "gateway"], ["llama", "cpp"],
     ["meta", "ai"], ["mini", "max"], ["minimax", "ai"], ["model", "api"],
     ["moonshot", "ai"], ["muse", "spark"], ["nous", "portal"], ["nous", "research"],
@@ -196,7 +198,8 @@ _WORD_END = "(?:[0-9]|(?![0-9A-Za-z]))"
 # No name starts at the product name Claude Design, which the owner connects
 # themselves (owner decision of 2026-10-26): its two words joined by exactly
 # one space, in any letter case, then a boundary. Claude in every other form
-# stays a name.
+# stays a name; check_owner_text also checks the text as given, so a line
+# break standing for that space keeps Claude hidden.
 _CLAUDE_DESIGN = f"{_cased('claude design')}(?!{_ALNUM})"
 # What may stand between a word and a capitalized everyday word after it:
 # spaces, markup, quotes, brackets, commas and semicolons, but no sentence
@@ -785,7 +788,8 @@ OWNER_TEXT_POLICY: dict[str, Any] = {
                 "capitalized after a word or next to another script, with a "
                 "version, or before a colon or slash, and inside a compound name. "
                 "The product name Claude Design, its two words joined by exactly "
-                "one space, reads in any letter case."
+                "one space in the text as given, reads in any letter case; a line "
+                "break there, with or without a space, keeps it hidden."
             ),
         },
     },
@@ -872,8 +876,9 @@ def check_owner_text(text: Any, kind: str) -> str:
     string or is blank, for every text of a ``fixed`` kind, and for text longer
     than the kind allows, holding a character the kind refuses or matching a
     rule in one of the kind's groups. A kind that joins wrapped lines checks the
-    text with each line break closed up and again with each shown as a space,
-    so a path or id split across lines is still caught. The length bound
+    text as given, then with each line break closed up and again with each
+    shown as a space, so a path or id split across lines is still caught and a
+    line break never passes for the one space of Claude Design. The length bound
     counts code points of ``text`` as given. An unknown ``kind`` raises
     :class:`KeyError`.
     """
@@ -886,7 +891,7 @@ def check_owner_text(text: Any, kind: str) -> str:
         return sentence
     forms = [text]
     if spec["join_wrapped_lines"]:
-        forms = [_WRAPPED_LINE_BREAK.sub("", text), _LINE_BREAK.sub(" ", text)]
+        forms += [_WRAPPED_LINE_BREAK.sub("", text), _LINE_BREAK.sub(" ", text)]
     for form in forms:
         if spec["characters"] and not _plain_characters(form):
             return sentence

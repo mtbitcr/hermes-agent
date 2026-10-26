@@ -413,6 +413,56 @@ def test_claude_in_every_other_form_stays_hidden(name):
     assert check_owner_text(shown, "planner_prose") == shown
 
 
+# GitHub reads, but the GitHub Models provider aliases
+# (plugins/model-providers/copilot) stay hidden.
+@pytest.mark.parametrize(
+    "alias",
+    ["github-models", "github-model", "GitHub Models", "GitHub Model",
+     "GITHUB-MODELS", "github-models4"],
+)
+def test_github_models_provider_aliases_stay_hidden(alias):
+    text = f"I used {alias} for your draft."
+    _refused_everywhere(text)
+    # The same sentence naming GitHub alone reads, so the alias alone hides it.
+    shown = text.replace(alias, "GitHub")
+    for kind in ("title", "project_name", "planner_prose"):
+        assert check_owner_text(shown, kind) == shown, kind
+
+
+# Every line break the checker knows: the policy's "line_break".
+_LINE_BREAKS = {
+    "lf": "\n", "cr": "\r", "crlf": "\r\n", "vertical-tab": "\u000b",
+    "form-feed": "\u000c", "next-line": "\u0085", "line-separator": "\u2028",
+    "paragraph-separator": "\u2029",
+}
+
+
+def test_the_line_breaks_are_every_one_the_checker_knows():
+    every_character = "".join(map(chr, range(0x110000)))
+    line_break = OWNER_TEXT_POLICY["rules"]["line_break"]
+    assert set(re.findall(line_break, every_character)) | {"\r\n"} == set(
+        _LINE_BREAKS.values()
+    )
+
+
+# Claude Design reads only where the text as given joins its two words with
+# one space; a line break in that place, alone or beside a space, hides it.
+@pytest.mark.parametrize(
+    "joint", ["{}", " {}", "{} "], ids=["alone", "space-before", "space-after"]
+)
+@pytest.mark.parametrize(
+    "line_break", list(_LINE_BREAKS.values()), ids=list(_LINE_BREAKS)
+)
+def test_a_line_break_between_claude_and_design_keeps_it_hidden(line_break, joint):
+    text = "I drew the first screens in Claude{}Design for you."
+    _refused_everywhere(text.format(joint.format(line_break)))
+    # In the same sentence one space reads and two spaces stay hidden.
+    one_space = text.format(" ")
+    for kind in ("title", "project_name", "planner_prose"):
+        assert check_owner_text(one_space, kind) == one_space, kind
+    _refused_everywhere(text.format("  "))
+
+
 @pytest.mark.parametrize(
     "word",
     ["Fireworks", "Vertex", "Router", "Custom", "Actual", "Local",
