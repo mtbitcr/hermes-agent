@@ -865,9 +865,10 @@ def test_one_pass_decides_then_reads_the_pull_request_then_writes(world, conclus
 def test_a_red_check_waits_once_per_head_until_a_green_rerun(world, conclusion):
     """A required check completed on H with any conclusion other than success leaves the delivery waiting:
     red_check_waiting with that check run's id and conclusion from the decision request, once for H, with no
-    POST, no jobs request and the source card unchanged. Each pass reads H's workflow runs once; this table
-    answers 404, which never stops the return, but no project folder holds H, so each pass refuses the return
-    and records nothing. Later passes read CI again, so a green rerun on the code host gets H its review cards."""
+    POST, no jobs request and the source card unchanged. Each pass reads H's workflow runs once, and a cancelled
+    check's pass once more first, for a newer CI run of H to wait for; this table answers 404, which never stops
+    the return, but no project folder holds H, so each pass refuses the return and records nothing. Later passes
+    read CI again, so a green rerun on the code host gets H its review cards."""
     kb, root, repo, gh = world
     tid, head = _ready(world)
     gh["check"] = ("completed", conclusion)
@@ -881,7 +882,8 @@ def test_a_red_check_waits_once_per_head_until_a_green_rerun(world, conclusion):
         "check_runs": [{"id": 900, "conclusion": conclusion}]})]
     assert (_cards(kb), _state(kb, head), _source(kb, tid)) == ([], "open", source)
     assert [call for call in gh["calls"] if call[0] != "GET"] == [] and set(gh["steps"]) == {"read_checks"}
-    assert [path for _, path in gh["calls"] if "/actions/" in path] == [f"/repos/{REPO}/actions/runs"] * 3  # no jobs
+    reads = 6 if conclusion == "cancelled" else 3  # a cancelled check's pass first reads them for a newer CI run of H
+    assert [path for _, path in gh["calls"] if "/actions/" in path] == [f"/repos/{REPO}/actions/runs"] * reads  # no jobs
     gh["check"] = ("completed", "success")
     _tick(kb)
     assert len(_cards(kb)) == 1 and _state(kb, head) == "review_cards_created"
