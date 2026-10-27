@@ -1511,3 +1511,334 @@ def test_open_task_is_recorded_under_the_worker_environment(root, owner, monkeyp
     assert {name: os.environ[name] for name in pinned} == pinned
     assert _rows(own_board, "SELECT id, title, status FROM tasks ORDER BY id") == own_cards
     assert _rows(profile_home / "projects.db", "SELECT count(*) FROM project_summary_state") == [(0,)]
+
+
+# Owner rule 2 of 2026-10-27: a failed task is archived first, then cleared and counted in one compare-and-set transaction.
+
+_FAILED_KINDS = ["blocked", "timed_out"]
+_ARCHIVE_FAULTS = {"locked": sqlite3.OperationalError, "dies_after": _ProcessDied}
+
+
+@contextlib.contextmanager
+def _archive_step_fails(monkeypatch, fault: str):
+    """Make every archive of a task fail: "locked" before anything is written, "dies_after" once it has committed."""
+    archive_task = kanban_db.archive_task
+
+    def archive(*args, **kwargs):
+        if fault == "locked":
+            raise sqlite3.OperationalError("database is locked")
+        archive_task(*args, **kwargs)
+        raise _ProcessDied
+
+    with monkeypatch.context() as patch:
+        patch.setattr(kanban_db, "archive_task", archive)
+        yield
+
+
+def _locked_write_txn(_conn):
+    raise sqlite3.OperationalError("database is locked")
+
+
+def _task_status(root: Path, task_id: str) -> str:
+    return _rows(_board_db(root, BOARD), "SELECT status FROM tasks WHERE id = ?", (task_id,))[0][0]
+
+
+def _published_and_failed(root: Path, owner, monkeypatch, how: str):
+    """A Project whose one summary task was published and has then failed as ``how`` says (it ends blocked)."""
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    _ops().summary_tick(now=T0)
+    [task] = _summary_tasks(root)
+    _fail(root, monkeypatch, task.id, how)
+    assert _task_status(root, task.id) == "blocked"
+    return project_id, task
+
+
+def _assert_counted_once(root: Path, project_id: str, failed, counted_at: int) -> None:
+    """The failed task is the Project's only task and is archived; its one failure was counted at ``counted_at``."""
+    state = _whole_state(root, project_id)
+    assert (state["open_task_id"], state["failures"], state["updated_at"]) == (None, 1, counted_at)
+    assert [(task.id, task.status) for task in _summary_tasks(root, archived=True)] == [(failed.id, "archived")]
+    assert _summary_of(root, project_id) is None
+
+
+def _assert_original_backoff(root: Path, monkeypatch, project_id: str, how: str, counted_at: int) -> None:
+    """A first failure counted at ``counted_at`` waits an hour, the second waits two, and the stop is not reached."""
+    ops = _ops()
+    [first] = _summary_tasks(root, archived=True)
+    ops.summary_tick(now=counted_at + HOUR - 1)
+    assert [task.id for task in _summary_tasks(root, archived=True)] == [first.id]
+    ops.summary_tick(now=counted_at + HOUR)
+    [second] = _summary_tasks(root)
+    assert second.id != first.id
+    assert _state(root, project_id)["open_task_id"] == second.id
+
+    _fail(root, monkeypatch, second.id, how)
+    second_counted = counted_at + HOUR + 10
+    ops.summary_tick(now=second_counted)
+    state = _state(root, project_id)
+    assert (state["open_task_id"], state["failures"]) == (None, 2)
+    ops.summary_tick(now=second_counted + 2 * HOUR - 1)
+    assert len(_summary_tasks(root, archived=True)) == 2
+    ops.summary_tick(now=second_counted + 2 * HOUR)
+    assert len(_summary_tasks(root, archived=True)) == 3
+    assert _state(root, project_id)["failures"] == 2 < ops.FAILURE_STOP
+    assert _summary_of(root, project_id) is None
+
+
+@pytest.mark.parametrize("how", _FAILED_KINDS)
+@pytest.mark.parametrize("stop", ["process_dies", "count_raises"])
+def test_stop_between_the_archive_and_the_count_leaves_the_failure_to_be_counted_once(
+    root, owner, monkeypatch, how, stop,
+):
+    ops = _ops()
+    project_id, task = _published_and_failed(root, owner, monkeypatch, how)
+    recorded = _whole_state(root, project_id)
+    assert (recorded["open_task_id"], recorded["failures"]) == (task.id, 0)
+
+    if stop == "process_dies":
+        with _archive_step_fails(monkeypatch, "dies_after"), pytest.raises(_ProcessDied):
+            ops.summary_tick(now=T0 + 10)
+    else:
+        with monkeypatch.context() as patch, pytest.raises(sqlite3.OperationalError):
+            patch.setattr(ops, "write_txn", _locked_write_txn)
+            ops.summary_tick(now=T0 + 10)
+
+    assert _task_status(root, task.id) == "archived"
+    assert _whole_state(root, project_id) == recorded
+    assert _summary_of(root, project_id) is None
+
+    ops.summary_tick(now=T0 + 20)
+
+    _assert_counted_once(root, project_id, task, T0 + 20)
+    _assert_original_backoff(root, monkeypatch, project_id, how, T0 + 20)
+
+
+@pytest.mark.parametrize("how", _FAILED_KINDS)
+@pytest.mark.parametrize("raising_ticks", [1, 2], ids=["raises_once", "raises_twice"])
+def test_temporary_archive_failure_changes_nothing_and_the_failure_is_counted_once(
+    root, owner, monkeypatch, how, raising_ticks,
+):
+    ops = _ops()
+    project_id, task = _published_and_failed(root, owner, monkeypatch, how)
+    recorded = _whole_state(root, project_id)
+
+    for attempt in range(1, raising_ticks + 1):
+        with _archive_step_fails(monkeypatch, "locked"), pytest.raises(sqlite3.OperationalError):
+            ops.summary_tick(now=T0 + 10 * attempt)
+        assert _task_status(root, task.id) == "blocked"
+        assert _whole_state(root, project_id) == recorded
+        assert _summary_of(root, project_id) is None
+
+    counted_at = T0 + 10 * (raising_ticks + 1)
+    ops.summary_tick(now=counted_at)
+
+    _assert_counted_once(root, project_id, task, counted_at)
+    _assert_original_backoff(root, monkeypatch, project_id, how, counted_at)
+
+
+def test_archive_that_does_not_take_counts_nothing_until_it_does(root, owner, monkeypatch):
+    ops = _ops()
+    project_id, task = _published_and_failed(root, owner, monkeypatch, "blocked")
+    recorded = _whole_state(root, project_id)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(kanban_db, "archive_task", lambda *_args, **_kwargs: False)
+        ops.summary_tick(now=T0 + 10)
+        ops.summary_tick(now=T0 + 20)
+
+    assert _task_status(root, task.id) == "blocked"
+    assert _whole_state(root, project_id) == recorded
+
+    ops.summary_tick(now=T0 + 30)
+
+    _assert_counted_once(root, project_id, task, T0 + 30)
+
+
+def test_two_ticks_that_settle_the_same_failed_task_count_one_failure(root, owner, monkeypatch):
+    ops = _ops()
+    project_id, task = _published_and_failed(root, owner, monkeypatch, "blocked")
+    parse = ops.parse_summary_result
+    raced = []
+
+    def parse_while_the_other_tick_runs(conn, task_id):
+        try:
+            return parse(conn, task_id)
+        finally:
+            if not raced:
+                raced.append(task_id)
+                ops.summary_tick(now=T0 + 10)
+
+    monkeypatch.setattr(ops, "parse_summary_result", parse_while_the_other_tick_runs)
+
+    ops.summary_tick(now=T0 + 11)
+
+    assert raced == [task.id]
+    _assert_counted_once(root, project_id, task, T0 + 10)
+
+
+def _leave_while_reading(monkeypatch, root: Path, project_id: str, read: str, how: str) -> list:
+    """Wrap the real route or snapshot read: once it has its normal result, the Project leaves."""
+    name = "_resolved_route_pin" if read == "route" else "project_steward_snapshot"
+    real = getattr(ow, name)
+    left: list = []
+
+    def read_then_leave(*args, **kwargs):
+        result = real(*args, **kwargs)
+        if not left:
+            left.append(read)
+            _leave(root, project_id, how)
+        return result
+
+    monkeypatch.setattr(ow, name, read_then_leave)
+    return left
+
+
+def _project_leaves_while_the_tick_reads(
+    root: Path, owner, monkeypatch, read: str, how: str, finished: bool,
+) -> None:
+    """The owner accepts that one task is made. Its harvest stores nothing, archives it and counts no failure."""
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    left = _leave_while_reading(monkeypatch, root, project_id, read, how)
+
+    assert ops.summary_tick(now=T0) == 1
+
+    assert left == [read]
+    [task] = _summary_tasks(root)
+    assert task.status == "ready"
+    assert _state(root, project_id)["open_task_id"] == task.id
+    if finished:
+        _finish(root, task.id, _valid())
+    row_before = _project_row(root, project_id)
+
+    ops.summary_tick(now=T0 + 10)
+    ops.summary_tick(now=T0 + 5 * HOUR)
+
+    assert _summary_of(root, project_id) is None
+    assert _project_row(root, project_id) == row_before
+    state = _state(root, project_id)
+    assert (state["open_task_id"], state["failures"]) == (None, 0)
+    assert _summary_tasks(root) == []
+    assert [(item.id, item.status) for item in _summary_tasks(root, archived=True)] == [(task.id, "archived")]
+
+
+@pytest.mark.parametrize("finished", [False, True], ids=["task_unstarted", "task_finished"])
+def test_project_archived_while_the_tick_reads_its_snapshot_gets_a_task_but_no_summary(
+    root, owner, monkeypatch, finished,
+):
+    _project_leaves_while_the_tick_reads(root, owner, monkeypatch, "snapshot", "archived", finished)
+
+
+@pytest.mark.parametrize("read", ["route", "snapshot"])
+@pytest.mark.parametrize("finished", [False, True], ids=["task_unstarted", "task_finished"])
+def test_project_whose_removal_starts_while_the_tick_reads_gets_a_task_but_no_summary(
+    root, owner, monkeypatch, read, finished,
+):
+    _project_leaves_while_the_tick_reads(root, owner, monkeypatch, read, "removal_started", finished)
+
+
+@pytest.mark.parametrize("fault", list(_ARCHIVE_FAULTS))
+def test_request_closed_for_a_project_that_left_is_archived_first_and_counts_no_failure(
+    root, owner, monkeypatch, fault,
+):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    ops.summary_tick(now=T0)
+    [task] = _summary_tasks(root)
+    _leave(root, project_id, "archived")
+    recorded = _whole_state(root, project_id)
+
+    with _archive_step_fails(monkeypatch, fault), pytest.raises(_ARCHIVE_FAULTS[fault]):
+        ops.summary_tick(now=T0 + 10)
+
+    assert _task_status(root, task.id) == ("archived" if fault == "dies_after" else "ready")
+    assert _whole_state(root, project_id) == recorded
+
+    ops.summary_tick(now=T0 + 20)
+
+    state = _whole_state(root, project_id)
+    assert (state["open_task_id"], state["failures"]) == (None, 0)
+    assert [(item.id, item.status) for item in _summary_tasks(root, archived=True)] == [(task.id, "archived")]
+    assert _summary_of(root, project_id) is None
+
+
+def test_stored_result_clears_the_open_task_and_the_failures_before_its_task_is_archived(root, owner, monkeypatch):
+    ops = _ops()
+    _clean(OUTCOME, NEXT_ACTION, DECISION)
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    ops.summary_tick(now=T0)
+    [task] = _summary_tasks(root)
+    _finish(root, task.id, _valid())
+    archive_task = kanban_db.archive_task
+    seen = []
+
+    def look_then_archive(conn, task_id):
+        seen.append((task_id, _rows(
+            root / "projects.db",
+            "SELECT open_task_id, failures FROM project_summary_state WHERE project_id = ?",
+            (project_id,),
+        )))
+        return archive_task(conn, task_id)
+
+    monkeypatch.setattr(kanban_db, "archive_task", look_then_archive)
+
+    ops.summary_tick(now=T0 + 10)
+
+    assert seen == [(task.id, [(None, 0)])]
+    assert _summary_of(root, project_id)["revision"] == 1
+    assert _task_status(root, task.id) == "archived"
+
+
+def test_failed_task_is_settled_once_under_the_worker_environment(root, owner, monkeypatch):
+    ops = _ops()
+    garden = _project(owner, "Garden Plan", _CARDS)
+    desk = _project(owner, "Planning Desk", _DESK_CARDS)
+    ops.summary_tick(now=T0)
+    tasks = {task.title: task for task in _summary_tasks(root)}
+    failed, waiting = tasks[TITLE + "Garden Plan"], tasks[TITLE + "Planning Desk"]
+    _fail(root, monkeypatch, failed.id, "blocked")
+    with _board(root, desk["board"]) as conn:
+        worker_task = kanban_db.create_task(
+            conn, title="Plan the next milestone", assignee=PLANNER, project_id=desk["project_id"],
+        )
+    profile_home = root / "profiles" / PLANNER
+    profile_home.mkdir(parents=True)
+    with projects_db.connect_closing(profile_home / "projects.db"):
+        pass
+    _enter_planning_worker(monkeypatch, root, desk["board"], worker_task)
+    pinned = {name: os.environ[name] for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD")}
+    own_board = _board_db(root, desk["board"])
+    assert Path(pinned["HERMES_KANBAN_DB"]).resolve() == own_board.resolve()
+    own_cards = _rows(own_board, "SELECT id, title, status FROM tasks ORDER BY id")
+
+    def stored_counts() -> list:
+        """What the root registry file holds, read on a separate read-only connection."""
+        return _rows(
+            root / "projects.db",
+            "SELECT project_id, open_task_id, failures FROM project_summary_state ORDER BY project_id",
+        )
+
+    def expected(garden_open, garden_failures) -> list:
+        return sorted(
+            [(garden["project_id"], garden_open, garden_failures), (desk["project_id"], waiting.id, 0)],
+            key=lambda row: row[0],
+        )
+
+    before = stored_counts()
+    assert before == expected(failed.id, 0)
+
+    with _archive_step_fails(monkeypatch, "dies_after"), pytest.raises(_ProcessDied):
+        ops.summary_tick(now=T0 + 10)
+
+    assert _task_status(root, failed.id) == "archived"
+    assert stored_counts() == before
+
+    ops.summary_tick(now=T0 + 20)
+
+    assert stored_counts() == expected(None, 1)
+    assert _task_status(root, waiting.id) == "ready"
+    assert _rows(root / "projects.db", "SELECT count(*) FROM project_summaries") == [(0,)]
+    assert len(_summary_tasks(root, archived=True)) == 2
+    assert _rows(own_board, "SELECT id, title, status FROM tasks ORDER BY id") == own_cards
+    assert _rows(profile_home / "projects.db", "SELECT count(*) FROM project_summary_state") == [(0,)]
+    assert {name: os.environ[name] for name in pinned} == pinned

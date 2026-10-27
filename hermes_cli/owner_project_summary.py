@@ -14,6 +14,8 @@ published, not the state row: a crash between ``create_task`` and the record, fo
 to change the key of the request and so publish a second task. A failure before a task is published therefore
 records the failure and nothing else.
 
+A failed summary task is archived first; only then does one transaction clear it and count the failure (owner rule 2).
+
 The task's time box is the kernel's pin for its class; this module names no limit.
 
 Every store is reached by an explicit path, so the tick still finds the root registry and every board
@@ -260,28 +262,45 @@ def _eligible(registry: sqlite3.Connection, project_id: str) -> bool:
     return removal is None or removal["phase"] in _REMOVAL_ENDED
 
 
+def _archive(board: sqlite3.Connection, task_id: str) -> bool:
+    """Archive the task and say whether it is archived now. An error is not caught: the caller then writes nothing."""
+    kanban_db.archive_task(board, task_id)
+    task = kanban_db.get_task(board, task_id)
+    if task is None or task.status == "archived":
+        return True
+    logger.warning("project summary: summary task %s could not be archived; nothing is changed for its Project", task_id)
+    return False
+
+
 def _retire(
     registry: sqlite3.Connection, board: Optional[sqlite3.Connection], project_id: str, task_id: str, now: int
 ) -> None:
     """Close the request of a Project that may not have a summary: nothing written, no failure, still wanted later."""
+    # Archive first: a stop before the clear leaves an archived task still recorded, which the next harvest clears.
+    if board is not None and not _archive(board, task_id):
+        return
     with write_txn(registry):
         registry.execute(
             "UPDATE project_summary_state SET open_task_id = NULL, pending = 1, updated_at = ? "
             "WHERE project_id = ? AND open_task_id = ?",
             (now, project_id, task_id),
         )
-    if board is not None:
-        kanban_db.archive_task(board, task_id)
     logger.info("project summary: Project %s may not have a summary now; its request was closed", project_id)
 
 
-def _record_failure(registry: sqlite3.Connection, project_id: str, now: int) -> None:
+def _record_failure(
+    registry: sqlite3.Connection, board: Optional[sqlite3.Connection], project_id: str, task_id: str, now: int
+) -> None:
     """One more failure in a row for a request that ended: no open task, a new request armed, nothing else touched."""
+    # Archive first: a stop before the count leaves an archived task still recorded, which the next harvest counts once.
+    if board is not None and not _archive(board, task_id):
+        return
+    # Compare-and-set on the recorded task, so two ticks that settle the same task count one failure.
     with write_txn(registry):
         registry.execute(
             "UPDATE project_summary_state SET open_task_id = NULL, failures = failures + 1, pending = 1, "
-            "updated_at = ? WHERE project_id = ?",
-            (now, project_id),
+            "updated_at = ? WHERE project_id = ? AND open_task_id = ?",
+            (now, project_id, task_id),
         )
 
 
@@ -326,7 +345,7 @@ def _harvest_one(
         return
     if board is None:
         logger.warning("project summary: the summary board is gone; nothing stored for Project %s", project_id)
-        _record_failure(registry, project_id, now)
+        _record_failure(registry, None, project_id, task_id, now)
         return
     task = kanban_db.get_task(board, task_id)
     if task is not None and task.status not in _SETTLED:
@@ -335,11 +354,11 @@ def _harvest_one(
         result = parse_summary_result(board, task_id)
     except SummaryRefused as exc:
         logger.warning("project summary: nothing stored for Project %s: %s", project_id, exc)
-        _record_failure(registry, project_id, now)
-    else:
-        if not _store_result(registry, project_id, result, now):
-            _retire(registry, board, project_id, task_id, now)
-            return
+        _record_failure(registry, board, project_id, task_id, now)
+        return
+    if not _store_result(registry, project_id, result, now):
+        _retire(registry, board, project_id, task_id, now)
+        return
     kanban_db.archive_task(board, task_id)
 
 
