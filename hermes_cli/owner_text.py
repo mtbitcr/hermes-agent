@@ -900,6 +900,9 @@ def _claude_designs(text: str) -> list[tuple[int, int]]:
     ]
 
 
+claude_designs = _claude_designs
+
+
 def _line_break_form(
     text: str,
     line_break: re.Pattern[str],

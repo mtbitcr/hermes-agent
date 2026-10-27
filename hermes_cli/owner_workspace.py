@@ -100,7 +100,7 @@ from hermes_cli.owner_named_inputs import (
     declare_named_inputs,
     parse_named_inputs,
 )
-from hermes_cli.owner_text import check_owner_text
+from hermes_cli.owner_text import check_owner_text, claude_designs
 from hermes_cli.sqlite_util import write_txn
 from plugins.dashboard_auth.raphael_workspace.model_policy import (
     configured_assignment_for,
@@ -4648,6 +4648,33 @@ def _owner_display_text(
     return strip_unicode_tags(text[:limit]).strip()
 
 
+def _holds_private_work_item_detail(given: str, title: str) -> bool:
+    """Whether ``title`` matches a private pattern outside ``given``'s Claude Designs."""
+    passed: dict[int, int] = {}
+    names = claude_designs(given)
+    if names:
+        flipped = list(given)
+        for start, end in names:
+            flipped[start:end] = given[start:end].swapcase()
+        # Display can make a name or break one; the flipped case marks those it kept.
+        shown = _owner_display_text(
+            "".join(flipped), limit=_OWNER_TITLE_LIMIT, strip_internal_prefix=True
+        )
+        if len(shown) == len(title):
+            passed = {
+                start: end
+                for start, end in claude_designs(title)
+                if shown[start:end] == title[start:end].swapcase()
+            }
+    for pattern in _OWNER_PRIVATE_WORK_ITEM_PATTERNS:
+        match = pattern.search(title)
+        while match and match.end() <= passed.get(match.start(), -1):
+            match = pattern.search(title, match.start() + 1)
+        if match:
+            return True
+    return False
+
+
 def owner_title(value: Any) -> str:
     """Return the canonical owner-safe, single-line work-item title.
 
@@ -4659,8 +4686,10 @@ def owner_title(value: Any) -> str:
     owner-text policy's title check
     (:func:`hermes_cli.owner_text.check_owner_text`) on the whole raw input —
     before any line break is collapsed, its length included, so an overlong
-    title is refused rather than cut — or holding a private pattern or failing
-    the check once displayed, becomes the policy's fixed title sentence.
+    title is refused rather than cut — or holding a private pattern, other
+    than within a Claude Design that check finds in the raw input and display
+    leaves whole, or failing the check once displayed, becomes the policy's
+    fixed title sentence.
     """
     raw = str(value or "")
     if raw.strip() and check_owner_text(raw, "title") != raw:
@@ -4670,7 +4699,7 @@ def owner_title(value: Any) -> str:
     )
     if not title:
         return _UNTITLED_WORK_ITEM
-    if any(pattern.search(title) for pattern in _OWNER_PRIVATE_WORK_ITEM_PATTERNS):
+    if _holds_private_work_item_detail(raw, title):
         return check_owner_text(None, "title")
     return check_owner_text(title, "title")
 
@@ -4808,7 +4837,7 @@ def _native_owner_title(value: Any, field: str) -> str:
         raise OwnerWorkspaceError(
             "invalid_argument", f"{field} has no owner-visible text",
         )
-    if any(pattern.search(title) for pattern in _OWNER_PRIVATE_WORK_ITEM_PATTERNS):
+    if _holds_private_work_item_detail(raw, title):
         raise OwnerWorkspaceError(
             "invalid_argument", f"{field} contains private operational detail",
         )
