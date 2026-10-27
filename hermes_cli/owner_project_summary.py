@@ -3,7 +3,9 @@
 The gateway's dispatcher runs ``summary_tick`` once per tick. It harvests the summary tasks that have
 finished, then opens one summary task on the ``project-summaries`` board for each live Project that needs
 one, at most ``MAX_NEW_PER_TICK`` per tick. A result is stored only after ``parse_summary_result`` accepts
-it; any other end of a step stores nothing, backs off, and stops after ``FAILURE_STOP`` failures in a row.
+it, and storing one resets the Project's failure count to zero. Any other end of a step stores nothing and backs
+off: an hour after the first failure, doubling after each, and a whole day (``MAX_BACKOFF_SECONDS``) from the
+``FAILURE_STOP``-th failure in a row on, however long the steps keep failing (owner rule 3 of 2026-10-27).
 
 One check decides whether a Project already has a summary task (owner rule 1 of 2026-10-27). It is the first
 thing in each Project's turn, before any route, snapshot or policy read: ``_find_open_task`` looks on the
@@ -43,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 HOUR = 3600
 MAX_NEW_PER_TICK = 3
-FAILURE_STOP = 3
+FAILURE_STOP = 3  # the failure limit: from this many failures in a row on, every wait is MAX_BACKOFF_SECONDS
 MAX_BACKOFF_SECONDS = 86400
 
 SUMMARY_BOARD = "project-summaries"
@@ -93,7 +95,9 @@ class SummaryResult:
 
 
 def backoff_seconds(failures: int) -> int:
-    """The wait after ``failures`` failures in a row: an hour, doubling, at most a day."""
+    """The wait after ``failures`` failures in a row: an hour, doubling, and a whole day from ``FAILURE_STOP`` on."""
+    if failures >= FAILURE_STOP:
+        return MAX_BACKOFF_SECONDS
     return min(HOUR * 2 ** (max(failures, 1) - 1), MAX_BACKOFF_SECONDS)
 
 
@@ -277,6 +281,8 @@ def _retire(
 ) -> None:
     """Close the request of a Project that may not have a summary: nothing written, no failure, still wanted later."""
     # Archive first: a stop before the clear leaves an archived task still recorded, which the next harvest clears.
+    # If the Project is live again by then, that harvest counts one failure for it. Owner rule 3 accepts that: it
+    # can only delay the next request, by the backoff and at most a day.
     if board is not None and not _archive(board, task_id):
         return
     with write_txn(registry):
@@ -318,7 +324,7 @@ def _record_failure_before_publishing(registry: sqlite3.Connection, project_id: 
 
 
 def _store_result(registry: sqlite3.Connection, project_id: str, result: SummaryResult, now: int) -> bool:
-    """Store the result unless the Project stopped being eligible; the check and the write share one transaction."""
+    """Store the result and zero the Project's failures unless it stopped being eligible, all in one transaction."""
     with write_txn(registry):
         if not _eligible(registry, project_id):
             return False
@@ -380,8 +386,9 @@ def _due(state: sqlite3.Row, now: int) -> bool:
 
     The hour runs from the last request. After a failure the backoff runs from the failure, which the
     failure recorders stamp in ``updated_at``, also while no request was ever made (``last_requested_at`` is NULL).
+    However often it failed, a Project is asked again when its backoff has passed; from ``FAILURE_STOP`` on, a day.
     """
-    if state["open_task_id"] is not None or not state["pending"] or state["failures"] >= FAILURE_STOP:
+    if state["open_task_id"] is not None or not state["pending"]:
         return False
     requested_at = state["last_requested_at"]
     if not state["failures"] and (requested_at is None or state["pending_urgent"]):

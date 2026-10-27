@@ -2,7 +2,8 @@
 
 The summary tick runs inside the gateway's dispatcher. For every live Project without a summary it opens one task for
 the planning role on a board of its own. It stores the typed result of a finished task only after the result passes
-every check, and a step that fails stores nothing, backs off, and stops after three failures in a row.
+every check, and a step that fails stores nothing and backs off: an hour, two hours, and a whole day from the third
+failure in a row on, for as long as the steps keep failing.
 
 Each test imports the module itself, so each one fails on its own before the change.
 """
@@ -30,6 +31,7 @@ PLANNER = "raphael-planner"
 BOARD = "project-summaries"
 TITLE = "Write the Project summary: "
 HOUR = 3600
+DAY = 24 * HOUR
 T0 = 1_900_000_000
 
 OUTCOME = "The room is booked for Tuesday at noon and the invitations are being written."
@@ -221,6 +223,41 @@ def _fail(root: Path, monkeypatch, task_id: str, how: str) -> None:
             assert kanban_db.get_task(conn, task_id).status == "blocked"
 
 
+def _wait_after(failures: int) -> int:
+    """The wait before the next request after ``failures`` in a row: the backoff, and a whole day from the limit on."""
+    ops = _ops()
+    return DAY if failures >= ops.FAILURE_STOP else ops.backoff_seconds(failures)
+
+
+def _fail_and_count(root: Path, monkeypatch, project_id: str, asked_at: int) -> int:
+    """Fail the one open request, asked for at ``asked_at``; return when its failure was counted (3 hours later)."""
+    ops = _ops()
+    failures = _state(root, project_id)["failures"]
+    [task] = _summary_tasks(root)
+    assert _state(root, project_id)["open_task_id"] == task.id
+    _fail(root, monkeypatch, task.id, "blocked")
+    counted_at = asked_at + 3 * HOUR
+    ops.summary_tick(now=counted_at)
+    state = _state(root, project_id)
+    assert (state["open_task_id"], state["failures"]) == (None, failures + 1)
+    return counted_at
+
+
+def _request_and_fail(root: Path, monkeypatch, project_id: str, asked_at: int) -> int:
+    """Ask for a summary at ``asked_at`` and fail that request; return when its failure was counted."""
+    _ops().summary_tick(now=asked_at)
+    return _fail_and_count(root, monkeypatch, project_id, asked_at)
+
+
+def _fail_in_a_row(root: Path, monkeypatch, project_id: str, count: int) -> int:
+    """Fail ``count`` requests in a row, each asked the moment its wait ended; return when the last was counted."""
+    asked_at = T0
+    for failures in range(1, count + 1):
+        counted_at = _request_and_fail(root, monkeypatch, project_id, asked_at)
+        asked_at = counted_at + _wait_after(failures)
+    return counted_at
+
+
 def test_new_project_gets_one_summary_task(root, owner):
     ops = _ops()
     project = _project(owner, "Garden Plan", _CARDS)
@@ -371,7 +408,7 @@ def test_invalid_result_stores_nothing(root, owner, metadata, reassigned_to):
 
 
 @pytest.mark.parametrize("how", ["blocked", "timed_out", "archived"])
-def test_failed_step_stores_nothing_backs_off_and_stops(root, owner, monkeypatch, how):
+def test_failed_step_stores_nothing_and_backs_off_up_to_a_day(root, owner, monkeypatch, how):
     ops = _ops()
     project_id = _project(owner, "Garden Plan")["project_id"]
     row_before = _project_row(root, project_id)
@@ -419,8 +456,15 @@ def test_failed_step_stores_nothing_backs_off_and_stops(root, owner, monkeypatch
     third_failed = third_at + 10
     ops.summary_tick(now=third_failed)
     check(failures=3, tasks=3)
-    ops.summary_tick(now=third_failed + 30 * 86_400)
+    ops.summary_tick(now=third_failed + DAY - 1)
     check(failures=3, tasks=3)
+
+    ops.summary_tick(now=third_failed + DAY)
+    assert created() == 4
+    [fourth] = _summary_tasks(root)
+    assert _state(root, project_id)["open_task_id"] == fourth.id
+    assert _summary_of(root, project_id) is None
+    assert _project_row(root, project_id) == row_before
 
 
 def test_timed_out_run_that_is_requeued_is_not_yet_a_failure(root, owner, monkeypatch):
@@ -1301,7 +1345,7 @@ def test_row_that_records_another_open_task_is_left_alone(root, owner, monkeypat
     assert reads.calls == []
 
 
-@pytest.mark.parametrize("why_not_asked", ["stopped_after_three_failures", "removal_started"])
+@pytest.mark.parametrize("why_not_asked", ["waiting_a_day_after_three_failures", "removal_started"])
 def test_open_task_on_the_board_is_recorded_though_no_new_one_could_be_asked_for(
     root, owner, monkeypatch, why_not_asked,
 ):
@@ -1392,25 +1436,25 @@ def test_failed_read_before_publishing_changes_only_failures_and_updated_at(root
     assert _state(root, project_id)["open_task_id"] == task.id
 
 
-def test_reads_that_keep_failing_stop_after_three_attempts_with_no_request_ever_made(root, owner, monkeypatch):
+def test_reads_that_keep_failing_are_tried_once_a_day_after_the_limit_with_no_request_ever_made(
+    root, owner, monkeypatch,
+):
     ops = _ops()
     project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
     reads = _Reads(monkeypatch)
     reads.failing = "snapshot"
     at = T0
 
-    for failures in (1, 2, 3):
+    for failures in range(1, ops.FAILURE_STOP + 2):
         ops.summary_tick(now=at)
         state = _state(root, project_id)
         assert (state["open_task_id"], state["failures"], state["last_requested_at"]) == (None, failures, None)
         assert len(reads.calls) == 2 * failures
-        wait = ops.backoff_seconds(failures)
+        wait = _wait_after(failures)
         ops.summary_tick(now=at + wait - 1)
         assert len(reads.calls) == 2 * failures
         at += wait
 
-    ops.summary_tick(now=at + 30 * 86_400)
-    assert len(reads.calls) == 6
     assert _summary_tasks(root, archived=True) == []
 
 
@@ -1562,7 +1606,7 @@ def _assert_counted_once(root: Path, project_id: str, failed, counted_at: int) -
 
 
 def _assert_original_backoff(root: Path, monkeypatch, project_id: str, how: str, counted_at: int) -> None:
-    """A first failure counted at ``counted_at`` waits an hour, the second waits two, and the stop is not reached."""
+    """A first failure counted at ``counted_at`` waits an hour, the second two, and the failure limit is not reached."""
     ops = _ops()
     [first] = _summary_tasks(root, archived=True)
     ops.summary_tick(now=counted_at + HOUR - 1)
@@ -1842,3 +1886,107 @@ def test_failed_task_is_settled_once_under_the_worker_environment(root, owner, m
     assert _rows(own_board, "SELECT id, title, status FROM tasks ORDER BY id") == own_cards
     assert _rows(profile_home / "projects.db", "SELECT count(*) FROM project_summary_state") == [(0,)]
     assert {name: os.environ[name] for name in pinned} == pinned
+
+
+# Owner rule 3 of 2026-10-27: the failure limit no longer stops summaries. From the limit on, the next request
+# waits a day after the last failure; a stored summary resets the count; a failure counted for a retired task
+# in a crash window is accepted, because it can only delay the next request.
+
+
+def test_after_the_failure_limit_the_next_request_comes_after_a_day_and_not_before(root, owner, monkeypatch):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    failed_at = _fail_in_a_row(root, monkeypatch, project_id, ops.FAILURE_STOP)
+
+    for failures in (ops.FAILURE_STOP, ops.FAILURE_STOP + 1):
+        assert _state(root, project_id)["failures"] == failures
+        made = len(_summary_tasks(root, archived=True))
+
+        assert ops.summary_tick(now=failed_at + DAY - 1) == 0
+        assert len(_summary_tasks(root, archived=True)) == made
+        assert _state(root, project_id)["open_task_id"] is None
+
+        asked_at = failed_at + DAY
+        assert ops.summary_tick(now=asked_at) == 1
+        [asked] = _summary_tasks(root)
+        assert len(_summary_tasks(root, archived=True)) == made + 1
+        assert _state(root, project_id)["open_task_id"] == asked.id
+        assert ops.summary_tick(now=asked_at + 1) == 0
+        assert len(_summary_tasks(root, archived=True)) == made + 1
+        assert _summary_of(root, project_id) is None
+
+        failed_at = _fail_and_count(root, monkeypatch, project_id, asked_at)
+
+
+@pytest.mark.parametrize("recorded", ["below_the_limit", "at_the_limit", "past_the_limit"])
+def test_stored_summary_resets_the_failure_count(root, owner, monkeypatch, recorded):
+    ops = _ops()
+    _clean(OUTCOME, NEXT_ACTION, DECISION)
+    failures = {
+        "below_the_limit": ops.FAILURE_STOP - 1,
+        "at_the_limit": ops.FAILURE_STOP,
+        "past_the_limit": ops.FAILURE_STOP + 1,
+    }[recorded]
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    failed_at = _fail_in_a_row(root, monkeypatch, project_id, failures)
+    assert _state(root, project_id)["failures"] == failures
+
+    asked_at = failed_at + _wait_after(failures)
+    assert ops.summary_tick(now=asked_at) == 1
+    [task] = _summary_tasks(root)
+    _finish(root, task.id, _valid())
+    ops.summary_tick(now=asked_at + 10)
+
+    assert _summary_of(root, project_id)["revision"] == 1
+    state = _state(root, project_id)
+    assert (state["open_task_id"], state["failures"]) == (None, 0)
+    assert _summary_tasks(root) == []
+    assert _task_status(root, task.id) == "archived"
+
+
+@pytest.mark.parametrize("how", ["archived", "removal_started"])
+def test_stop_after_the_archive_of_a_closed_request_delays_the_next_request_by_a_day_at_most(
+    root, owner, monkeypatch, how,
+):
+    ops = _ops()
+    _clean(OUTCOME, NEXT_ACTION, DECISION)
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    # One failure below the limit, so that a single miscount reaches it.
+    settled = ops.FAILURE_STOP - 1
+    failed_at = _fail_in_a_row(root, monkeypatch, project_id, settled)
+    assert _state(root, project_id)["failures"] == settled
+    asked_at = failed_at + _wait_after(settled)
+    assert ops.summary_tick(now=asked_at) == 1
+    [open_request] = _summary_tasks(root)
+    assert _state(root, project_id)["open_task_id"] == open_request.id
+
+    _leave(root, project_id, how)
+    recorded = _whole_state(root, project_id)
+    with _archive_step_fails(monkeypatch, "dies_after"), pytest.raises(_ProcessDied):
+        ops.summary_tick(now=asked_at + 10)
+    assert _task_status(root, open_request.id) == "archived"
+    assert _whole_state(root, project_id) == recorded
+
+    _leave(root, project_id, how, undo=True)
+    next_tick = asked_at + 20
+    ops.summary_tick(now=next_tick)
+
+    state = _state(root, project_id)
+    assert state["open_task_id"] is None
+    assert 0 <= state["failures"] - settled <= 1
+    made = len(_summary_tasks(root, archived=True))
+
+    assert ops.summary_tick(now=next_tick + DAY) == 1
+
+    [new_request] = _summary_tasks(root)
+    assert new_request.id != open_request.id
+    assert len(_summary_tasks(root, archived=True)) == made + 1
+    assert _state(root, project_id)["open_task_id"] == new_request.id
+    assert _summary_of(root, project_id) is None
+
+    _finish(root, new_request.id, _valid())
+    ops.summary_tick(now=next_tick + DAY + 10)
+
+    assert _summary_of(root, project_id)["revision"] == 1
+    state = _state(root, project_id)
+    assert (state["open_task_id"], state["failures"]) == (None, 0)
