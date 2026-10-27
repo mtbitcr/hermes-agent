@@ -12,6 +12,7 @@ import ssl
 import time
 
 from cryptography import x509
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.x509.oid import NameOID
@@ -72,16 +73,34 @@ def _load_or_create_key(path: Path) -> rsa.RSAPrivateKey:
     return key
 
 
-def _load_or_create_ca(state: Path, now: datetime) -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
-    cert_path, key_path = state / "ca.pem", state / "ca-key.pem"
-    if cert_path.exists() and key_path.exists():
-        ca_key = _load_private_key(key_path)
-        ca_cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
-        cert_path.chmod(0o644)
-        return ca_cert, ca_key
-    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+def _public_der(key_or_cert) -> bytes:
+    return key_or_cert.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+
+
+def _try_load_ca_key(path: Path) -> rsa.RSAPrivateKey | None:
+    if not path.exists():
+        return None
+    try:
+        key = _load_private_key(path)
+    except (ValueError, TypeError, UnsupportedAlgorithm):
+        return None
+    return key if isinstance(key, rsa.RSAPrivateKey) else None
+
+
+def _try_load_ca_cert(path: Path) -> x509.Certificate | None:
+    if not path.exists():
+        return None
+    try:
+        return x509.load_pem_x509_certificate(path.read_bytes())
+    except ValueError:
+        return None
+
+
+def _self_signed_ca(ca_key: rsa.RSAPrivateKey, now: datetime) -> x509.Certificate:
     ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Raphael Server 2 Test CA")])
-    ca_cert = (
+    return (
         x509.CertificateBuilder()
         .subject_name(ca_name)
         .issuer_name(ca_name)
@@ -92,7 +111,21 @@ def _load_or_create_ca(state: Path, now: datetime) -> tuple[x509.Certificate, rs
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .sign(ca_key, hashes.SHA256())
     )
-    _write_file(key_path, _key_pem(ca_key), 0o600)
+
+
+def _load_or_create_ca(state: Path, now: datetime) -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
+    cert_path, key_path = state / "ca.pem", state / "ca-key.pem"
+    ca_key = _try_load_ca_key(key_path)
+    ca_cert = _try_load_ca_cert(cert_path)
+    if ca_key is not None and ca_cert is not None and _public_der(ca_cert) == _public_der(ca_key):
+        cert_path.chmod(0o644)
+        return ca_cert, ca_key
+    # Key is written before the certificate, so an interruption between the two
+    # leaves a key without a matching certificate: keep the key, re-certify it.
+    if ca_key is None:
+        ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        _write_file(key_path, _key_pem(ca_key), 0o600)
+    ca_cert = _self_signed_ca(ca_key, now)
     _write_file(cert_path, ca_cert.public_bytes(serialization.Encoding.PEM), 0o644)
     return ca_cert, ca_key
 

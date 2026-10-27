@@ -9,28 +9,71 @@ import io
 import json
 import os
 from pathlib import Path
+import ssl
+import time
 import types
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.x509.oid import NameOID
 
 PROXY_PATH = Path(__file__).resolve().parents[2] / "scripts" / "journeys" / "synthetic_proxy.py"
 FROZEN_NOW = 1_700_000_000
 
 
-class _NoServer:
+class _InertServer:
     def __init__(self, *_args, **_kwargs):
-        raise AssertionError("proxy created a server at import time")
+        self.socket = object()
+
+    def serve_forever(self):
+        return None
+
+
+class _InertContext:
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def load_cert_chain(self, *_args, **_kwargs):
+        return None
+
+    def wrap_socket(self, sock, **_kwargs):
+        return sock
+
+
+def proxy_source_path() -> Path:
+    old = os.environ.get("SYNTHETIC_OLD_PROXY")
+    if old and Path(old).is_file():
+        return Path(old)
+    return PROXY_PATH
 
 
 def load_proxy(monkeypatch, state: Path):
+    """Exec the proxy source with server and TLS pieces replaced by inert stand-ins."""
     monkeypatch.setenv("SYNTHETIC_STATE", str(state))
-    monkeypatch.setattr(http.server, "ThreadingHTTPServer", _NoServer)
-    spec = importlib.util.spec_from_file_location("synthetic_proxy_under_test", PROXY_PATH)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    path = proxy_source_path()
+    module = types.ModuleType("synthetic_proxy_under_test")
+    module.__file__ = str(path)
+    code = compile(path.read_text(), str(path), "exec")
+    with monkeypatch.context() as patch:
+        patch.setattr(http.server, "ThreadingHTTPServer", _InertServer)
+        patch.setattr(ssl, "SSLContext", _InertContext)
+        exec(code, module.__dict__)
     return module
+
+
+def start_proxy(monkeypatch, state: Path):
+    """Start the proxy once. The old script starts at import; the new one in main()."""
+    module = load_proxy(monkeypatch, state)
+    if hasattr(module, "main"):
+        module.write_material()
+    return module
+
+
+def mint(module) -> str:
+    if hasattr(module, "mint_assertion"):
+        return module.mint_assertion()
+    return module.TOKEN
 
 
 def b64d(text: str) -> bytes:
@@ -92,42 +135,44 @@ def file_mode(path: Path) -> int:
 
 
 def test_second_start_reuses_authority_and_keys(monkeypatch, tmp_path):
-    module = load_proxy(monkeypatch, tmp_path)
-    module.write_material()
-    names = ("ca.pem", "ca-key.pem", "signing-key.pem")
-    first = {name: (tmp_path / name).read_bytes() for name in names}
-    first_jwk = module.JWK
+    first = start_proxy(monkeypatch, tmp_path)
+    first_ca = (tmp_path / "ca.pem").read_bytes()
+    first_jwk = dict(first.JWK)
+    names = ("ca-key.pem", "signing-key.pem")
+    first_keys = {name: (tmp_path / name).read_bytes() for name in names if (tmp_path / name).exists()}
 
-    module.write_material()
+    second = start_proxy(monkeypatch, tmp_path)
 
+    assert (tmp_path / "ca.pem").read_bytes() == first_ca
+    assert second.JWK == first_jwk
+    assert second.CA_PEM == first_ca
+    assert sorted(first_keys) == sorted(names)
     for name in names:
-        assert (tmp_path / name).read_bytes() == first[name], name
-    assert module.JWK == first_jwk
+        assert (tmp_path / name).read_bytes() == first_keys[name], name
     assert file_mode(tmp_path / "ca.pem") == 0o644
     for name in ("ca.pem", "ca-key.pem", "signing-key.pem", "server.pem", "server-key.pem"):
         assert (tmp_path / name).is_file()
 
 
 def test_assertion_fields_expiry_and_signature(monkeypatch, tmp_path):
-    module = load_proxy(monkeypatch, tmp_path)
-    _ca_pem, jwk = module.write_material()
+    module = start_proxy(monkeypatch, tmp_path)
+    before = int(time.time())
 
-    payload = verify_assertion(module.mint_assertion(now=FROZEN_NOW), {"keys": [jwk]})
+    payload = verify_assertion(mint(module), {"keys": [module.JWK]})
 
     assert payload["iss"] == "https://synthetic-team.cloudflareaccess.com"
     assert payload["aud"] == "raphael-server2-browser"
     assert payload["sub"] == "raphael-server2-owner"
     assert payload["type"] == "app"
     assert payload["email"] == "owner@server2.invalid"
-    assert payload["iat"] == FROZEN_NOW
-    assert payload["nbf"] == FROZEN_NOW - 30
-    assert payload["exp"] == FROZEN_NOW + 600
+    assert before - 5 <= payload["iat"] <= int(time.time()) + 5
+    assert payload["nbf"] == payload["iat"] - 30
+    assert payload["exp"] - payload["iat"] == 600
     assert set(payload) - {"iss", "aud", "sub", "type", "email", "iat", "nbf", "exp"} <= {"jti"}
 
 
 def test_two_requests_get_separately_minted_assertions(monkeypatch, tmp_path):
-    module = load_proxy(monkeypatch, tmp_path)
-    module.write_material()
+    module = start_proxy(monkeypatch, tmp_path)
     FakeConnection.recorded = []
     monkeypatch.setattr(http.client, "HTTPConnection", FakeConnection)
     # Freeze the clock so both tokens are issued within the same second.
@@ -150,6 +195,7 @@ def test_two_requests_get_separately_minted_assertions(monkeypatch, tmp_path):
         assert headers["host"] == "workspace.synthetic.test"
         assert headers["x-forwarded-proto"] == "https"
         assert not any(key.lower() == "connection" for key in headers)
+        assert headers["cf-access-jwt-assertion"] != "spoofed"
     tokens = [headers["cf-access-jwt-assertion"] for headers in sent]
     assert tokens[0] != tokens[1]
 
@@ -166,11 +212,13 @@ def test_two_requests_get_separately_minted_assertions(monkeypatch, tmp_path):
 
 
 def test_private_keys_not_readable_by_others(monkeypatch, tmp_path):
-    module = load_proxy(monkeypatch, tmp_path)
     old_umask = os.umask(0o000)
     try:
-        module.write_material()
-        for name in ("ca-key.pem", "signing-key.pem", "server-key.pem"):
+        module = start_proxy(monkeypatch, tmp_path)
+        for path in sorted(tmp_path.glob("*-key.pem")):
+            assert file_mode(path) & 0o077 == 0, path.name
+        for name in ("ca-key.pem", "signing-key.pem"):
+            assert (tmp_path / name).is_file(), name
             assert file_mode(tmp_path / name) & 0o077 == 0, name
         # A key left loose by something else is tightened on the next start.
         (tmp_path / "signing-key.pem").chmod(0o644)
@@ -182,9 +230,84 @@ def test_private_keys_not_readable_by_others(monkeypatch, tmp_path):
         os.umask(old_umask)
 
 
-def test_server_certificate_is_one_year_and_reissued_near_expiry(monkeypatch, tmp_path):
+def _write_old_proxy_state(state: Path) -> None:
+    """State as the previous proxy left it: ca.pem, server.pem, server-key.pem (no CA key)."""
+    now = datetime.now(timezone.utc)
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Raphael Server 2 Test CA")])
+    server_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "workspace.synthetic.test")])
+
+    def build(subject, public_key, days, ca):
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(ca_name)
+            .public_key(public_key)
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=1))
+            .not_valid_after(now + timedelta(days=days))
+        )
+        if ca:
+            builder = builder.add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        return builder.sign(ca_key, hashes.SHA256())
+
+    pem = serialization.Encoding.PEM
+    files = {
+        "ca.pem": build(ca_name, ca_key.public_key(), 1, True).public_bytes(pem),
+        "server.pem": build(server_name, server_key.public_key(), 1, False).public_bytes(pem),
+        "server-key.pem": server_key.private_bytes(
+            pem, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+        ),
+    }
+    for name, data in files.items():
+        (state / name).write_bytes(data)
+        (state / name).chmod(0o444)
+
+
+def test_interrupted_migration_from_old_state_recovers_on_restart(monkeypatch, tmp_path):
+    _write_old_proxy_state(tmp_path)
     module = load_proxy(monkeypatch, tmp_path)
-    module.write_material()
+
+    real_replace = os.replace
+    calls = []
+
+    def replace_then_die(src, dst):
+        calls.append(Path(dst).name)
+        if len(calls) == 2:
+            raise OSError("killed between CA key write and CA certificate write")
+        real_replace(src, dst)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", replace_then_die)
+        try:
+            module.write_material()
+        except OSError:
+            pass
+        else:
+            raise AssertionError("migration was not interrupted")
+    assert calls[:2] == ["ca-key.pem", "ca.pem"]
+    assert (tmp_path / "ca-key.pem").is_file()
+
+    restarted = start_proxy(monkeypatch, tmp_path)
+
+    ca_cert = x509.load_pem_x509_certificate((tmp_path / "ca.pem").read_bytes())
+    ca_key = serialization.load_pem_private_key((tmp_path / "ca-key.pem").read_bytes(), None)
+    server_cert = x509.load_pem_x509_certificate((tmp_path / "server.pem").read_bytes())
+    server_key = serialization.load_pem_private_key((tmp_path / "server-key.pem").read_bytes(), None)
+    assert ca_cert.public_key().public_numbers() == ca_key.public_key().public_numbers()
+    assert server_cert.public_key().public_numbers() == server_key.public_key().public_numbers()
+    server_cert.verify_directly_issued_by(ca_cert)
+    assert restarted.CA_PEM == (tmp_path / "ca.pem").read_bytes()
+
+    # A further restart keeps the recovered authority.
+    recovered_ca = (tmp_path / "ca.pem").read_bytes()
+    start_proxy(monkeypatch, tmp_path)
+    assert (tmp_path / "ca.pem").read_bytes() == recovered_ca
+
+
+def test_server_certificate_is_one_year_and_reissued_near_expiry(monkeypatch, tmp_path):
+    module = start_proxy(monkeypatch, tmp_path)
     ca_cert = x509.load_pem_x509_certificate((tmp_path / "ca.pem").read_bytes())
     server_pem = (tmp_path / "server.pem").read_bytes()
     server_cert = x509.load_pem_x509_certificate(server_pem)
