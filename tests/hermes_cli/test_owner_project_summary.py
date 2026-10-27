@@ -574,7 +574,7 @@ def test_planning_role_without_a_route_is_a_failure_that_backs_off(root, owner, 
 
     state = _state(root, project_id)
     assert (state["open_task_id"], state["failures"], state["pending"]) == (None, 1, 1)
-    assert state["last_requested_at"] == T0
+    assert state["last_requested_at"] is None
     assert _summary_tasks(root, archived=True) == []
 
     monkeypatch.setattr(model_policy, "configured_assignment_for", working_route)
@@ -1104,3 +1104,410 @@ def test_tick_under_the_worker_environment_reaches_every_store(root, owner, monk
     assert _rows(profile_home / "projects.db", "SELECT count(*) FROM project_summaries") == [(0,)]
     assert _rows(profile_home / "projects.db", "SELECT count(*) FROM project_summary_state") == [(0,)]
     assert {name: os.environ[name] for name in pinned} == pinned
+
+
+# Owner rule 1 of 2026-10-27: the one check. A task of the Project that is already on the summary board is the
+# Project's open task; a tick records it before it reads anything else, so no failure can lose its identity.
+
+
+def _crash_after_the_task_is_made(ops, monkeypatch, now: int) -> None:
+    """Interrupt a tick right after create_task commits and before the state row records the task."""
+    create_task = kanban_db.create_task
+
+    def create_then_die(*args, **kwargs):
+        create_task(*args, **kwargs)
+        raise _ProcessDied
+
+    monkeypatch.setattr(kanban_db, "create_task", create_then_die)
+    try:
+        with pytest.raises(_ProcessDied):
+            ops.summary_tick(now=now)
+    finally:
+        monkeypatch.setattr(kanban_db, "create_task", create_task)
+
+
+class _Reads:
+    """The two reads a tick makes before it publishes: counts them, and refuses the one named in ``failing``."""
+
+    def __init__(self, monkeypatch):
+        self.calls: list = []
+        self.failing: str | None = None
+        route, snapshot = ow._resolved_route_pin, ow.project_steward_snapshot
+
+        def read_route(*args, **kwargs):
+            self.calls.append(("route", None))
+            if self.failing == "route":
+                raise ow.OwnerWorkspaceError("invalid_model_route", "the planning role has no usable route")
+            return route(*args, **kwargs)
+
+        def read_snapshot(**kwargs):
+            self.calls.append(("snapshot", kwargs.get("project_id")))
+            if self.failing == "snapshot":
+                raise ow.OwnerWorkspaceError("snapshot_unavailable", "the Project board is unavailable")
+            return snapshot(**kwargs)
+
+        monkeypatch.setattr(ow, "_resolved_route_pin", read_route)
+        monkeypatch.setattr(ow, "project_steward_snapshot", read_snapshot)
+
+
+def _open_task_ids(root: Path, project_name: str) -> list:
+    """The summary tasks of one Project that are neither done nor archived, counted on a separate connection."""
+    return [
+        row[0]
+        for row in _rows(
+            _board_db(root, BOARD),
+            "SELECT id FROM tasks WHERE title = ? AND status NOT IN ('done', 'archived') ORDER BY created_at, id",
+            (TITLE + project_name,),
+        )
+    ]
+
+
+_WHOLE_STATE = (
+    "event_cursor", "delivery_cursor", "release_cursor", "pending", "pending_urgent",
+    "open_task_id", "last_requested_at", "failures", "updated_at",
+)
+
+
+def _whole_state(root: Path, project_id: str) -> dict | None:
+    rows = _rows(
+        root / "projects.db",
+        f"SELECT {', '.join(_WHOLE_STATE)} FROM project_summary_state WHERE project_id = ?",
+        (project_id,),
+    )
+    return dict(zip(_WHOLE_STATE, rows[0])) if rows else None
+
+
+def _seed_state(root: Path, project_id: str, updated_at: int, *, failures: int = 0) -> None:
+    """The state row an earlier tick left for a Project that waits for its first summary."""
+    with projects_db.connect_closing(root / "projects.db") as conn, projects_db.write_txn(conn):
+        conn.execute(
+            "INSERT INTO project_summary_state (project_id, failures, updated_at) VALUES (?, ?, ?)",
+            (project_id, failures, updated_at),
+        )
+
+
+def _summary_task_by_hand(
+    project_id: str, project_name: str, key_tail: str, *, created_at: int | None = None
+) -> str:
+    """A summary task of the Project as an earlier run left it on the board, known only by its key."""
+    kanban_db.init_db()
+    if not kanban_db.board_exists(BOARD):
+        kanban_db.create_board(slug=BOARD, name="Project summaries")
+    with kanban_db.connect_closing(board=BOARD) as conn:
+        task_id = kanban_db.create_task(
+            conn, title=TITLE + project_name, assignee=PLANNER, created_by="project-summary",
+            idempotency_key=f"project-summary:{project_id}:{key_tail}",
+        )
+        if created_at is not None:
+            with kanban_db.write_txn(conn):
+                conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (created_at, task_id))
+    return task_id
+
+
+@pytest.mark.parametrize("failing", ["route", "snapshot"])
+def test_task_made_before_a_restart_stays_the_only_open_task_when_a_read_fails_after_it(
+    root, owner, monkeypatch, failing,
+):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    reads = _Reads(monkeypatch)
+    _crash_after_the_task_is_made(ops, monkeypatch, T0)
+    [made] = _summary_tasks(root)
+    assert _state(root, project_id)["open_task_id"] is None
+    reads.calls.clear()
+
+    def only_the_made_task_is_open_and_recorded() -> None:
+        assert _open_task_ids(root, "Garden Plan") == [made.id]
+        state = _state(root, project_id)
+        assert (state["open_task_id"], state["failures"]) == (made.id, 0)
+        assert reads.calls == []
+
+    reads.failing = failing
+    ops.summary_tick(now=T0 + 5)
+    only_the_made_task_is_open_and_recorded()
+
+    reads.failing = None
+    ops.summary_tick(now=T0 + 5 + HOUR)
+    only_the_made_task_is_open_and_recorded()
+    assert len(_summary_tasks(root, archived=True)) == 1
+
+
+@pytest.mark.parametrize("has_row", [True, False], ids=["row_without_the_task", "no_row"])
+def test_open_task_on_the_board_is_recorded_without_any_other_read(root, owner, monkeypatch, has_row):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    reads = _Reads(monkeypatch)
+    if has_row:
+        _crash_after_the_task_is_made(ops, monkeypatch, T0)
+        [made] = [task.id for task in _summary_tasks(root)]
+    else:
+        made = _summary_task_by_hand(project_id, "Garden Plan", f"0:{T0}")
+    before = _state(root, project_id)
+    assert before is None or before["open_task_id"] is None
+    reads.calls.clear()
+
+    assert ops.summary_tick(now=T0 + 5) == 0
+
+    assert reads.calls == []
+    assert _open_task_ids(root, "Garden Plan") == [made]
+    recorded = {
+        "event_cursor": 0, "delivery_cursor": 0, "release_cursor": 0, "pending": 0, "pending_urgent": 0,
+        "open_task_id": made, "last_requested_at": T0 + 5, "failures": 0, "updated_at": T0 + 5,
+    }
+    assert _whole_state(root, project_id) == recorded
+
+    assert ops.summary_tick(now=T0 + 10) == 0
+    assert _whole_state(root, project_id) == recorded
+    assert reads.calls == []
+
+
+def test_oldest_open_task_of_the_project_is_the_one_recorded(root, owner, monkeypatch):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    _crash_after_the_task_is_made(ops, monkeypatch, T0)
+    [later] = _summary_tasks(root)
+    older = _summary_task_by_hand(
+        project_id, "Garden Plan", f"0:{T0 - 1}", created_at=later.created_at - 100,
+    )
+    assert _open_task_ids(root, "Garden Plan") == [older, later.id]
+
+    ops.summary_tick(now=T0 + 5)
+
+    assert _state(root, project_id)["open_task_id"] == older
+
+
+def test_row_that_records_another_open_task_is_left_alone(root, owner, monkeypatch):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    reads = _Reads(monkeypatch)
+    _crash_after_the_task_is_made(ops, monkeypatch, T0)
+    [recorded] = _summary_tasks(root)
+    older = _summary_task_by_hand(
+        project_id, "Garden Plan", f"0:{T0 - 1}", created_at=recorded.created_at - 100,
+    )
+    with projects_db.connect_closing(root / "projects.db") as conn, projects_db.write_txn(conn):
+        conn.execute(
+            "UPDATE project_summary_state SET open_task_id = ?, pending = 0, pending_urgent = 0, "
+            "last_requested_at = ?, updated_at = ? WHERE project_id = ?",
+            (recorded.id, T0, T0, project_id),
+        )
+    row_before = _whole_state(root, project_id)
+    assert _open_task_ids(root, "Garden Plan") == [older, recorded.id]
+    reads.calls.clear()
+
+    ops.summary_tick(now=T0 + 5)
+
+    assert _whole_state(root, project_id) == row_before
+    assert reads.calls == []
+
+
+@pytest.mark.parametrize("why_not_asked", ["stopped_after_three_failures", "removal_started"])
+def test_open_task_on_the_board_is_recorded_though_no_new_one_could_be_asked_for(
+    root, owner, monkeypatch, why_not_asked,
+):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    reads = _Reads(monkeypatch)
+    if why_not_asked == "removal_started":
+        _leave(root, project_id, "removal_started")
+    else:
+        _seed_state(root, project_id, updated_at=T0 - 100, failures=ops.FAILURE_STOP)
+    made = _summary_task_by_hand(project_id, "Garden Plan", f"0:{T0}")
+    before = _whole_state(root, project_id)
+
+    assert ops.summary_tick(now=T0 + 5) == 0
+
+    state = _whole_state(root, project_id)
+    assert state["open_task_id"] == made
+    assert (state["pending"], state["pending_urgent"], state["last_requested_at"]) == (0, 0, T0 + 5)
+    assert state["failures"] == (0 if before is None else before["failures"])
+    assert reads.calls == []
+
+    ops.summary_tick(now=T0 + 10)
+
+    assert reads.calls == []
+    assert len(_summary_tasks(root, archived=True)) == 1
+    if why_not_asked == "removal_started":
+        assert _open_task_ids(root, "Garden Plan") == []
+        assert _state(root, project_id)["open_task_id"] is None
+    else:
+        assert _open_task_ids(root, "Garden Plan") == [made]
+        assert _state(root, project_id)["open_task_id"] == made
+
+
+def test_finished_task_that_was_stored_but_not_archived_is_not_an_open_task(root, owner, monkeypatch):
+    ops = _ops()
+    _clean(OUTCOME, NEXT_ACTION, DECISION)
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    reads = _Reads(monkeypatch)
+    ops.summary_tick(now=T0)
+    [task] = _summary_tasks(root)
+    _finish(root, task.id, _valid())
+    archive_task = kanban_db.archive_task
+
+    def die_before_archiving(*_args, **_kwargs):
+        raise _ProcessDied
+
+    monkeypatch.setattr(kanban_db, "archive_task", die_before_archiving)
+    with pytest.raises(_ProcessDied):
+        ops.summary_tick(now=T0 + 10)
+    monkeypatch.setattr(kanban_db, "archive_task", archive_task)
+    assert _summary_of(root, project_id)["revision"] == 1
+    assert _rows(_board_db(root, BOARD), "SELECT status FROM tasks WHERE id = ?", (task.id,)) == [("done",)]
+    row_before = _whole_state(root, project_id)
+    reads.calls.clear()
+
+    assert ops.summary_tick(now=T0 + 20) == 0
+    assert ops.summary_tick(now=T0 + 30) == 0
+
+    assert _whole_state(root, project_id) == row_before
+    assert _summary_of(root, project_id)["revision"] == 1
+    assert reads.calls == []
+    assert len(_summary_tasks(root, archived=True)) == 1
+
+
+@pytest.mark.parametrize("failing", ["route", "snapshot"])
+def test_failed_read_before_publishing_changes_only_failures_and_updated_at(root, owner, monkeypatch, failing):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    _seed_state(root, project_id, updated_at=T0 - 100)
+    row_before = _whole_state(root, project_id)
+    reads = _Reads(monkeypatch)
+    reads.failing = failing
+
+    ops.summary_tick(now=T0)
+
+    assert _whole_state(root, project_id) == {**row_before, "failures": 1, "updated_at": T0}
+    assert _summary_tasks(root, archived=True) == []
+    assert [name for name, _ in reads.calls] == (["route"] if failing == "route" else ["route", "snapshot"])
+
+    reads.failing = None
+    reads.calls.clear()
+    ops.summary_tick(now=T0 + HOUR - 1)
+    assert _summary_tasks(root, archived=True) == []
+    assert reads.calls == []
+
+    ops.summary_tick(now=T0 + HOUR)
+    [task] = _summary_tasks(root)
+    assert _state(root, project_id)["open_task_id"] == task.id
+
+
+def test_reads_that_keep_failing_stop_after_three_attempts_with_no_request_ever_made(root, owner, monkeypatch):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    reads = _Reads(monkeypatch)
+    reads.failing = "snapshot"
+    at = T0
+
+    for failures in (1, 2, 3):
+        ops.summary_tick(now=at)
+        state = _state(root, project_id)
+        assert (state["open_task_id"], state["failures"], state["last_requested_at"]) == (None, failures, None)
+        assert len(reads.calls) == 2 * failures
+        wait = ops.backoff_seconds(failures)
+        ops.summary_tick(now=at + wait - 1)
+        assert len(reads.calls) == 2 * failures
+        at += wait
+
+    ops.summary_tick(now=at + 30 * 86_400)
+    assert len(reads.calls) == 6
+    assert _summary_tasks(root, archived=True) == []
+
+
+def test_project_ids_are_matched_literally_not_as_patterns(root):
+    ops = _ops()
+    with_underscore, lookalike = "p_aaaa1111", "pXaaaa1111"
+    with projects_db.connect_closing(root / "projects.db") as conn:
+        projects_db.create_project(conn, name="Garden Plan", id=with_underscore)
+        projects_db.create_project(conn, name="Planning Desk", id=lookalike)
+    lookalikes_task = _summary_task_by_hand(lookalike, "Planning Desk", f"0:{T0}")
+
+    ops.summary_tick(now=T0 + 5)
+
+    assert _state(root, lookalike)["open_task_id"] == lookalikes_task
+    garden = _state(root, with_underscore)
+    assert (garden["open_task_id"], garden["failures"]) == (None, 1)
+    assert _open_task_ids(root, "Planning Desk") == [lookalikes_task]
+    assert _open_task_ids(root, "Garden Plan") == []
+
+
+class _LockedBoard:
+    """A board connection that cannot be used: whatever is asked of it, the database is locked."""
+
+    def __getattr__(self, name):
+        raise sqlite3.OperationalError("database is locked")
+
+
+def test_check_that_cannot_be_made_publishes_nothing_and_changes_nothing(root, owner, monkeypatch):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    kanban_db.init_db()
+    kanban_db.create_board(slug=BOARD, name="Project summaries")
+    _seed_state(root, project_id, updated_at=T0 - 100)
+    row_before = _whole_state(root, project_id)
+    reads = _Reads(monkeypatch)
+    connect_closing = kanban_db.connect_closing
+
+    @contextlib.contextmanager
+    def locked_summary_board(*args, **kwargs):
+        if kwargs.get("board") != BOARD:
+            with connect_closing(*args, **kwargs) as conn:
+                yield conn
+        else:
+            yield _LockedBoard()
+
+    monkeypatch.setattr(kanban_db, "connect_closing", locked_summary_board)
+    with pytest.raises(sqlite3.OperationalError):
+        ops.summary_tick(now=T0)
+    monkeypatch.setattr(kanban_db, "connect_closing", connect_closing)
+
+    assert reads.calls == []
+    assert _summary_tasks(root, archived=True) == []
+    assert _whole_state(root, project_id) == row_before
+
+    assert ops.summary_tick(now=T0 + 10) == 1
+    [task] = _summary_tasks(root)
+    assert _state(root, project_id)["open_task_id"] == task.id
+
+
+def test_open_task_is_recorded_under_the_worker_environment(root, owner, monkeypatch):
+    ops = _ops()
+    projects = {
+        "Garden Plan": _project(owner, "Garden Plan", _CARDS),
+        "Planning Desk": _project(owner, "Planning Desk", _DESK_CARDS),
+    }
+    desk = projects["Planning Desk"]
+    reads = _Reads(monkeypatch)
+    _crash_after_the_task_is_made(ops, monkeypatch, T0)
+    [made] = _summary_tasks(root)
+    crashed = made.title[len(TITLE):]
+    other = next(name for name in projects if name != crashed)
+    with _board(root, desk["board"]) as conn:
+        worker_task = kanban_db.create_task(
+            conn, title="Plan the next milestone", assignee=PLANNER, project_id=desk["project_id"],
+        )
+    profile_home = root / "profiles" / PLANNER
+    profile_home.mkdir(parents=True)
+    with projects_db.connect_closing(profile_home / "projects.db"):
+        pass
+    _enter_planning_worker(monkeypatch, root, desk["board"], worker_task)
+    pinned = {name: os.environ[name] for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD")}
+    own_board = _board_db(root, desk["board"])
+    assert Path(pinned["HERMES_KANBAN_DB"]).resolve() == own_board.resolve()
+    own_cards = _rows(own_board, "SELECT id, title, status FROM tasks ORDER BY id")
+    reads.calls.clear()
+
+    ops.summary_tick(now=T0 + 5)
+
+    open_ids = {name: _open_task_ids(root, name) for name in projects}
+    assert {name: len(ids) for name, ids in open_ids.items()} == {"Garden Plan": 1, "Planning Desk": 1}
+    assert open_ids[crashed] == [made.id]
+    recorded = _rows(
+        root / "projects.db",
+        "SELECT project_id, open_task_id FROM project_summary_state WHERE open_task_id IS NOT NULL",
+    )
+    assert dict(recorded) == {projects[name]["project_id"]: ids[0] for name, ids in open_ids.items()}
+    assert [project for step, project in reads.calls if step == "snapshot"] == [projects[other]["project_id"]]
+    assert {name: os.environ[name] for name in pinned} == pinned
+    assert _rows(own_board, "SELECT id, title, status FROM tasks ORDER BY id") == own_cards
+    assert _rows(profile_home / "projects.db", "SELECT count(*) FROM project_summary_state") == [(0,)]

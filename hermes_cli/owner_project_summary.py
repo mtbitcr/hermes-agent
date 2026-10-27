@@ -5,6 +5,17 @@ finished, then opens one summary task on the ``project-summaries`` board for eac
 one, at most ``MAX_NEW_PER_TICK`` per tick. A result is stored only after ``parse_summary_result`` accepts
 it; any other end of a step stores nothing, backs off, and stops after ``FAILURE_STOP`` failures in a row.
 
+One check decides whether a Project already has a summary task (owner rule 1 of 2026-10-27). It is the first
+thing in each Project's turn, before any route, snapshot or policy read: ``_find_open_task`` looks on the
+summary board for a task of the Project, found by its idempotency key, that is neither done nor archived. A
+task it finds is recorded as the Project's open task and the tick goes on to the next Project. Only when none
+exists may the tick read the route and the snapshot and publish. The board is the proof that a task was
+published, not the state row: a crash between ``create_task`` and the record, followed by a failed read, used
+to change the key of the request and so publish a second task. A failure before a task is published therefore
+records the failure and nothing else.
+
+The task's time box is the kernel's pin for its class; this module names no limit.
+
 Every store is reached by an explicit path, so the tick still finds the root registry and every board
 under the pins the dispatcher gives a worker (``HERMES_KANBAN_DB``, ``HERMES_KANBAN_BOARD``, a profile
 ``HERMES_HOME``).
@@ -39,7 +50,6 @@ CREATED_BY = "project-summary"
 TITLE_PREFIX = "Write the Project summary: "
 EXECUTION_TIER = "routine"
 RISK_TIER = 0
-MAX_RUNTIME_SECONDS = 600  # a route-locked card gets the kernel's own time box instead (_pin_new_card)
 RESULT_KEY = "project_summary"
 
 # The text limits of the typed result; ``owner_decision`` is the only key that may be left out.
@@ -187,8 +197,50 @@ def _task_body(snapshot: dict) -> str:
 
 
 def _request_key(state: sqlite3.Row) -> str:
-    """The identity of one request, from the state row alone, so a restart adopts the task it already made."""
+    """The identity of one request, from the state row alone, so two writers of the same row make one task.
+
+    ``_find_open_task`` relies only on the front of it, the creator and the Project id.
+    """
     return f"{CREATED_BY}:{state['project_id']}:{state['failures']}:{state['last_requested_at']}"
+
+
+def _find_open_task(board: sqlite3.Connection, project_id: str) -> Optional[str]:
+    """The oldest summary task of the Project that is neither done nor archived, or None.
+
+    The prefix is compared with ``substr``, not LIKE: Project ids hold underscores, which LIKE reads as
+    wildcards, so one Project would find another's task. A failing query is not caught here; a tick that
+    cannot tell whether a task exists must publish nothing.
+    """
+    prefix = f"{CREATED_BY}:{project_id}:"
+    row = board.execute(
+        "SELECT id FROM tasks WHERE substr(idempotency_key, 1, ?) = ? AND status NOT IN ('done', 'archived') "
+        "ORDER BY created_at, id LIMIT 1",
+        (len(prefix), prefix),
+    ).fetchone()
+    return None if row is None else row["id"]
+
+
+def _record_open_task(registry: sqlite3.Connection, project_id: str, task_id: str, now: int) -> None:
+    """Record a task found on the board as the Project's open one, as the normal claim would.
+
+    A row that already records a task, this one or another, is left alone and nothing is written.
+    """
+    row = registry.execute(
+        "SELECT open_task_id FROM project_summary_state WHERE project_id = ?", (project_id,)
+    ).fetchone()
+    if row is not None and row["open_task_id"] is not None:
+        return
+    with write_txn(registry):
+        registry.execute(
+            "INSERT OR IGNORE INTO project_summary_state (project_id, updated_at) VALUES (?, ?)", (project_id, now)
+        )
+        recorded = registry.execute(
+            "UPDATE project_summary_state SET open_task_id = ?, pending = 0, pending_urgent = 0, "
+            "last_requested_at = ?, updated_at = ? WHERE project_id = ? AND open_task_id IS NULL",
+            (task_id, now, now, project_id),
+        ).rowcount
+    if recorded == 1:
+        logger.info("project summary: Project %s already has summary task %s; recorded it", project_id, task_id)
 
 
 def _eligible(registry: sqlite3.Connection, project_id: str) -> bool:
@@ -223,15 +275,26 @@ def _retire(
     logger.info("project summary: Project %s may not have a summary now; its request was closed", project_id)
 
 
-def _record_failure(
-    registry: sqlite3.Connection, project_id: str, now: int, *, requested_at: Optional[int] = None
-) -> None:
-    """One more failure in a row: no open task, a new request armed, nothing else touched."""
+def _record_failure(registry: sqlite3.Connection, project_id: str, now: int) -> None:
+    """One more failure in a row for a request that ended: no open task, a new request armed, nothing else touched."""
     with write_txn(registry):
         registry.execute(
             "UPDATE project_summary_state SET open_task_id = NULL, failures = failures + 1, pending = 1, "
-            "last_requested_at = COALESCE(?, last_requested_at), updated_at = ? WHERE project_id = ?",
-            (requested_at, now, project_id),
+            "updated_at = ? WHERE project_id = ?",
+            (now, project_id),
+        )
+
+
+def _record_failure_before_publishing(registry: sqlite3.Connection, project_id: str, now: int) -> None:
+    """One more failure in a row where no task was made: only the count and the clock move.
+
+    ``open_task_id`` and ``last_requested_at`` stay as they are (owner rule 1 of 2026-10-27), so nothing
+    that identifies a published task can move; the backoff runs from ``updated_at``.
+    """
+    with write_txn(registry):
+        registry.execute(
+            "UPDATE project_summary_state SET failures = failures + 1, updated_at = ? WHERE project_id = ?",
+            (now, project_id),
         )
 
 
@@ -296,13 +359,13 @@ def _harvest(registry: sqlite3.Connection, now: int) -> None:
 def _due(state: sqlite3.Row, now: int) -> bool:
     """The document's rule: nothing open, a request pending, and the hour, the backoff or an urgent flag allows it.
 
-    The hour runs from the last request. After a failure the backoff runs from the failure, which
-    ``_record_failure`` stamps in ``updated_at``, not from the request that failed.
+    The hour runs from the last request. After a failure the backoff runs from the failure, which the
+    failure recorders stamp in ``updated_at``, also while no request was ever made (``last_requested_at`` is NULL).
     """
     if state["open_task_id"] is not None or not state["pending"] or state["failures"] >= FAILURE_STOP:
         return False
     requested_at = state["last_requested_at"]
-    if requested_at is None or (state["pending_urgent"] and not state["failures"]):
+    if not state["failures"] and (requested_at is None or state["pending_urgent"]):
         return True
     since = state["updated_at"] if state["failures"] else requested_at
     return now - since >= backoff_seconds(state["failures"])
@@ -334,15 +397,16 @@ def _open_summary_task(
         route = owner_workspace._resolved_route_pin(PLANNING_ROLE, EXECUTION_TIER, "execution_tier")
     except owner_workspace.OwnerWorkspaceError as exc:
         logger.warning("project summary: no usable route for the planning role (%s)", exc.code)
-        _record_failure(registry, project.id, now, requested_at=now)
+        _record_failure_before_publishing(registry, project.id, now)
         return False
     try:
         snapshot = owner_workspace.project_steward_snapshot(project_id=project.id)
     except owner_workspace.OwnerWorkspaceError as exc:
         logger.warning("project summary: no steward snapshot for Project %s (%s)", project.id, exc.code)
-        _record_failure(registry, project.id, now, requested_at=now)
+        _record_failure_before_publishing(registry, project.id, now)
         return False
 
+    # No time box is passed: the kernel pins it for a route-locked card (_pin_new_card).
     task_id = kanban_db.create_task(
         board,
         title=TITLE_PREFIX + project.name,
@@ -354,7 +418,6 @@ def _open_summary_task(
         project_id=None,
         owned_paths=[],
         risk_tier=RISK_TIER,
-        max_runtime_seconds=MAX_RUNTIME_SECONDS,
         idempotency_key=_request_key(state),
         **route,
     )
@@ -380,12 +443,23 @@ def _open_summary_task(
 
 def _request(registry: sqlite3.Connection, now: int) -> int:
     states = {row["project_id"]: row for row in registry.execute("SELECT * FROM project_summary_state")}
+    path = _summary_board_path()
     asked = created = 0
+    ensured = False
     with contextlib.ExitStack() as stack:
         board: Optional[sqlite3.Connection] = None
         for project in projects_db.list_projects(registry):
             if asked >= MAX_NEW_PER_TICK:
                 break
+            # Owner rule 1 of 2026-10-27: the board, not the state row, proves that a task was published, so
+            # this comes before every other read of the turn. A task made before a crash is found whatever
+            # fails afterwards. The check never makes the board; a failing query ends the tick.
+            if board is None and path.exists():
+                board = stack.enter_context(kanban_db.connect_closing(path, board=SUMMARY_BOARD))
+            open_task = None if board is None else _find_open_task(board, project.id)
+            if open_task is not None:
+                _record_open_task(registry, project.id, open_task, now)
+                continue
             state = states.get(project.id)
             if state is not None and not _due(state, now):
                 continue
@@ -395,10 +469,11 @@ def _request(registry: sqlite3.Connection, now: int) -> int:
                 state = _new_state(registry, project.id, now)
                 if not _due(state, now):
                     continue
-            if board is None:
-                path = _ensure_summary_board()
-                if path is None:
+            if not ensured:
+                if _ensure_summary_board() is None:
                     break
+                ensured = True
+            if board is None:
                 board = stack.enter_context(kanban_db.connect_closing(path, board=SUMMARY_BOARD))
             asked += 1
             created += _open_summary_task(registry, board, project, state, now)
