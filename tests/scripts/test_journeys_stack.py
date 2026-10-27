@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tarfile
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 import yaml
@@ -126,8 +127,50 @@ def sha_tree(root: Path) -> dict[str, str]:
     return seen
 
 
+# The shell fakes (sleep, hostname, docker inspect, docker exec printenv) start in about a thousandth of
+# the time of a Python fake, so they read this bash-readable view of the state: ready-made docker outputs.
+VIEW_SOURCE = r'''
+
+def _q(text):
+    return "'" + str(text).replace("'", "'\\''") + "'"
+
+
+def render_view(state):
+    names = lambda items: "".join(item.split("=", 1)[0] + "\n" for item in items)
+    lines = ["declare -A IMG ENVN MTYPES MDEST ENVL RUN HEALTH POLLS IMGENV", "HOST=" + _q(state["hostname"])]
+    for name, box in state["containers"].items():
+        key = _q(name)
+        health = box.get("health") or ""
+        lines += [
+            "IMG[%s]=%s" % (key, _q(box["image"])),
+            "ENVN[%s]=%s" % (key, _q(names(box["env"]))),
+            "ENVL[%s]=%s" % (key, _q("\n".join(box["env"]))),
+            "MTYPES[%s]=%s" % (key, _q("".join("%s %s\n" % (m["type"], m.get("name", "")) for m in box["mounts"]))),
+            "MDEST[%s]=%s" % (key, _q("".join("%s %s\n" % (m.get("name", ""), m["dest"]) for m in box["mounts"]))),
+            "RUN[%s]=%s" % (key, 1 if box["running"] else 0),
+            "HEALTH[%s]=%s" % (key, _q(health)),
+            "POLLS[%s]=%d" % (key, box.get("starting_polls", 0) if health else 0),
+        ]
+    for image, entry in state["images"].items():
+        lines.append("IMGENV[%s]=%s" % (_q(image), _q(names(entry["env"]))))
+    return "\n".join(lines) + "\n"
+
+
+def write_view(state, root):
+    tmp = root / "state.sh.tmp"
+    tmp.write_text(render_view(state))
+    os.replace(tmp, root / "state.sh")
+    polls = root / "polls"
+    if polls.is_dir():
+        for leftover in polls.iterdir():
+            leftover.unlink()
+'''
+_view_namespace: dict = {"os": os, "Path": Path}
+exec(VIEW_SOURCE, _view_namespace)
+write_view = _view_namespace["write_view"]
+
 FAKE_COMMON = r'''
-import json, os, re, subprocess, sys, time
+import json, os, re, sys, time
 from pathlib import Path
 
 ROOT = Path(os.environ["FAKE_HOST_ROOT"])
@@ -143,6 +186,7 @@ def save(state):
     tmp = STATE.with_name("state.json.tmp")
     tmp.write_text(json.dumps(state))
     os.replace(tmp, STATE)
+    write_view(state, ROOT)
 
 
 def log(**record):
@@ -352,6 +396,7 @@ def container_env(entry, pairs):
 
 
 def d_exec(argv, args):
+    import subprocess
     interactive, user, i = False, None, 0
     while i < len(args) and args[i].startswith("-"):
         if args[i] in ("-i", "--interactive"):
@@ -386,6 +431,7 @@ def d_exec(argv, args):
 
 
 def d_run(argv, args):
+    import subprocess
     opts, flags, i = {}, set(), 0
     while i < len(args) and args[i].startswith("-"):
         if args[i] in ("--rm", "-i"):
@@ -491,6 +537,7 @@ if __name__ == "__main__":
 
 FAKE_TOOLS_SOURCE = (
     FAKE_COMMON
+    + VIEW_SOURCE
     + "".join("%s = %r\n" % (n, globals()[n])
               for n in ("F_IMAGE", "F_ENV_NAMES", "F_MOUNT_TYPES", "F_MOUNT_DEST", "F_STATE"))
     + FAKE_DOCKER
@@ -596,6 +643,124 @@ def docker_target(call: dict) -> tuple[str, str | None]:
     return sub, None
 
 
+FAKE_LIB_SH = r'''
+jesc() {
+  REPLY=${1//\\/\\\\}
+  REPLY=${REPLY//\"/\\\"}
+  REPLY=${REPLY//$'\n'/\\n}
+  REPLY=${REPLY//$'\t'/\\t}
+  REPLY=${REPLY//$'\r'/\\r}
+}
+
+plain() {
+  local t=${1//[$'\n\t\r']/}
+  [[ $t != *[[:cntrl:]]* ]]
+}
+
+# log_call TOOL RC STDOUT STDERR ARGV...: the same two JSON lines the Python fake writes
+log_call() {
+  local tool=$1 rc=$2 out=$3 err=$4 seq a args=""
+  shift 4
+  seq=${EPOCHREALTIME:-$SECONDS.$RANDOM}-$$
+  for a; do
+    jesc "$a"
+    args+="${args:+, }\"$REPLY\""
+  done
+  jesc "$out"
+  out=$REPLY
+  jesc "$err"
+  printf '{"seq": "%s", "tool": "%s", "argv": [%s]}\n{"seq": "%s", "end": true, "rc": %d, "stdout": "%s", "stderr": "%s"}\n' \
+    "$seq" "$tool" "$args" "$seq" "$rc" "$out" "$REPLY" >> "$FAKE_HOST_ROOT/calls.jsonl"
+}
+'''
+
+HOSTNAME_SH = '''#!/bin/bash
+. "$FAKE_HOST_ROOT/fake_lib.sh"
+. "$FAKE_HOST_ROOT/state.sh"
+printf '%s\\n' "$HOST"
+log_call hostname 0 "$HOST"$'\\n' "" "$@"
+'''
+
+SLEEP_SH = '''#!/bin/bash
+. "$FAKE_HOST_ROOT/fake_lib.sh"
+log_call sleep 0 "" "" "$@"
+'''
+
+# Read-only docker calls of exactly the shapes the scripts use run here; anything else goes to the
+# Python fake, which keeps the full behaviour (including its refusals).
+DOCKER_SH = r'''#!/bin/bash
+. "$FAKE_HOST_ROOT/fake_lib.sh"
+slow() { exec @PYEXE@ -S -E "$FAKE_HOST_ROOT/fake_tools.py" docker "$@"; }
+F_IMAGE=@F_IMAGE@
+F_ENV_NAMES=@F_ENV_NAMES@
+F_MOUNT_TYPES=@F_MOUNT_TYPES@
+F_MOUNT_DEST=@F_MOUNT_DEST@
+F_STATE=@F_STATE@
+[ -f "$FAKE_HOST_ROOT/state.sh" ] || slow "$@"
+. "$FAKE_HOST_ROOT/state.sh"
+for arg; do plain "$arg" || slow "$@"; done
+name_ok='^[A-Za-z0-9][A-Za-z0-9_.:@-]*$'
+out="" err="" rc=0
+if [ "$#" -eq 6 ] && [ "$1" = inspect ] && [ "$2" = --type ] && [ "$4" = --format ] && [[ $6 =~ $name_ok ]]; then
+  kind=$3 fmt=$5 name=$6
+  if [ "$kind" = container ]; then
+    case $fmt in "$F_IMAGE" | "$F_ENV_NAMES" | "$F_MOUNT_TYPES" | "$F_MOUNT_DEST" | "$F_STATE") ;; *) slow "$@" ;; esac
+    if [[ ! -v IMG[$name] ]]; then
+      rc=1 err="Error: No such container: $name"$'\n'
+    else
+      case $fmt in
+        "$F_IMAGE") out=${IMG[$name]}$'\n' ;;
+        "$F_ENV_NAMES") out=${ENVN[$name]} ;;
+        "$F_MOUNT_TYPES") out=${MTYPES[$name]} ;;
+        "$F_MOUNT_DEST") out=${MDEST[$name]} ;;
+        "$F_STATE")
+          health=${HEALTH[$name]} polls=${POLLS[$name]}
+          if [ -f "$FAKE_HOST_ROOT/polls/$name" ]; then read -r polls < "$FAKE_HOST_ROOT/polls/$name"; fi
+          if [ -n "$health" ] && [ "$polls" -gt 0 ]; then
+            mkdir -p "$FAKE_HOST_ROOT/polls"
+            echo $((polls - 1)) > "$FAKE_HOST_ROOT/polls/$name"
+            health=starting
+          fi
+          running=false
+          if [ "${RUN[$name]}" = 1 ]; then running=true; fi
+          out="$running ${health:-none}"$'\n'
+          ;;
+      esac
+      out+=$'\n'
+    fi
+  elif [ "$kind" = image ] && [ "$fmt" = "$F_ENV_NAMES" ]; then
+    if [[ ! -v IMGENV[$name] ]]; then
+      rc=1 err="Error: No such image: $name"$'\n'
+    else
+      out=${IMGENV[$name]}$'\n'
+    fi
+  else
+    slow "$@"
+  fi
+elif [ "$#" -eq 4 ] && [ "$1" = exec ] && [ "$3" = printenv ] && [[ $2 =~ $name_ok ]] && [[ $4 =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+  name=$2 var=$4
+  if [[ ! -v IMG[$name] ]]; then
+    rc=1 err="Error: No such container: $name"$'\n'
+  elif [ "${RUN[$name]}" != 1 ]; then
+    rc=1 err=$'Error response from daemon: container is not running\n'
+  else
+    found=0 value=""
+    while IFS= read -r line; do
+      if [[ $line == *=* ]]; then key=${line%%=*} val=${line#*=}; else key=$line val=""; fi
+      if [ "$key" = "$var" ]; then found=1 value=$val; fi
+    done <<<"${ENVL[$name]}"
+    if [ "$found" = 1 ]; then out=$value$'\n'; else rc=1; fi
+  fi
+else
+  slow "$@"
+fi
+printf '%s' "$out"
+printf '%s' "$err" >&2
+log_call docker "$rc" "$out" "$err" "$@"
+exit "$rc"
+'''
+
+
 class Host:
     """A fake Server 2: state file, volume folders, fake tools and a way to run the scripts."""
 
@@ -607,11 +772,11 @@ class Host:
     @classmethod
     def copy_of(cls, other: "Host", root: Path) -> "Host":
         """A second host with the same state and volumes, and an empty call log."""
-        shutil.copytree(other.root, root, symlinks=True)
+        records = {"calls.jsonl", "chown.log", "stdin", "polls", "interp.log"}
+        shutil.copytree(other.root, root, symlinks=True, ignore=lambda folder, names: [
+            name for name in names if Path(folder) == other.root and name in records])
         clone = cls(root, build=False)
         clone._write_tools()
-        clone.clear_calls()
-        (root / "interp.log").unlink(missing_ok=True)
         return clone
 
     @staticmethod
@@ -622,9 +787,16 @@ class Host:
     def _write_tools(self) -> None:
         root = self.root
         (root / "fake_tools.py").write_text(FAKE_TOOLS_SOURCE)
-        for tool in ("docker", "hostname", "curl", "sleep"):
-            self._exe(root / "bin" / tool,
-                      f'#!/bin/sh\nexec "{sys.executable}" "$FAKE_HOST_ROOT/fake_tools.py" {tool} "$@"\n')
+        (root / "fake_lib.sh").write_text(FAKE_LIB_SH)
+        quote = _view_namespace["_q"]
+        self._exe(root / "bin/curl",
+                  f'#!/bin/sh\nexec {quote(sys.executable)} -S -E "$FAKE_HOST_ROOT/fake_tools.py" curl "$@"\n')
+        self._exe(root / "bin/hostname", HOSTNAME_SH)
+        self._exe(root / "bin/sleep", SLEEP_SH)
+        docker = DOCKER_SH.replace("@PYEXE@", quote(sys.executable))
+        for name in ("F_IMAGE", "F_ENV_NAMES", "F_MOUNT_TYPES", "F_MOUNT_DEST", "F_STATE"):
+            docker = docker.replace(f"@{name}@", quote(globals()[name]))
+        self._exe(root / "bin/docker", docker)
         # Like the published image: a /bin/sh shim sits first on PATH and runs the venv binary,
         # whose shebang names the venv's own interpreter (a wrapper here, so the tests see its use).
         self._exe(root / "ctr/shim/hermes", '#!/bin/sh\nexec "$FAKE_HOST_ROOT/ctr/venv/hermes" "$@"\n')
@@ -654,7 +826,9 @@ class Host:
         key = root / "volumes" / PROXY_V / "signing-key.pem"
         key.write_bytes(signing_key_pem())
         key.chmod(0o644)
-        (root / "state.json").write_text(json.dumps(self._initial_state()))
+        state = self._initial_state()
+        (root / "state.json").write_text(json.dumps(state))
+        write_view(state, root)
 
     @staticmethod
     def _initial_state() -> dict:
@@ -710,6 +884,7 @@ class Host:
         state = self.state()
         mutate(state)
         (self.root / "state.json").write_text(json.dumps(state))
+        write_view(state, self.root)
 
     def vol(self, name: str) -> Path:
         return self.root / "volumes" / name
@@ -1034,9 +1209,24 @@ def parse_env_file(path: Path) -> tuple[list[str], dict[str, str]]:
     return [ln.partition("=")[0] for ln in lines], dict(ln.partition("=")[::2] for ln in lines)
 
 
-def test_reset_makes_a_fresh_home_and_token_folder(host: Host):
-    untouched = {v: sha_tree(host.vol(v)) for v in [PROXY_V] + DECOY_VOLUMES}
-    result = reset_ok(host)
+class SharedReset(NamedTuple):
+    host: Host
+    result: subprocess.CompletedProcess
+    untouched: dict
+    repo_before: dict
+
+
+@pytest.fixture(scope="module")
+def shared_reset(tmp_path_factory) -> SharedReset:
+    """One default reset, run once; the tests that only read its outcome share it (and never change it)."""
+    first = Host(tmp_path_factory.mktemp("after-reset") / "host")
+    untouched = {v: sha_tree(first.vol(v)) for v in [PROXY_V] + DECOY_VOLUMES}
+    repo_before = sha_tree(STACK_HOME)
+    return SharedReset(first, reset_ok(first), untouched, repo_before)
+
+
+def test_reset_makes_a_fresh_home_and_token_folder(shared_reset: SharedReset):
+    host, result, untouched = shared_reset.host, shared_reset.result, shared_reset.untouched
     home, tokens = host.vol(HOME_V), host.vol(TOKENS_V)
 
     assert not (home / "stale").exists() and not (home / "keep.txt").exists()
@@ -1076,9 +1266,10 @@ def test_reset_makes_a_fresh_home_and_token_folder(host: Host):
     assert_secret_free(host, result, generated_secrets(host))
 
 
-def test_reset_can_run_twice_and_makes_new_values(host: Host):
-    reset_ok(host)
-    first = generated_secrets(host)
+def test_reset_can_run_twice_and_makes_new_values(shared_reset: SharedReset, tmp_path: Path):
+    first = generated_secrets(shared_reset.host)
+    assert_secret_free(shared_reset.host, shared_reset.result, first)
+    host = Host.copy_of(shared_reset.host, tmp_path / "host")
     result = reset_ok(host)
     second = generated_secrets(host)
     assert len(second) == len(first)
@@ -1088,8 +1279,8 @@ def test_reset_can_run_twice_and_makes_new_values(host: Host):
     assert_secret_free(host, result, first + second)
 
 
-def test_reset_order_of_stops_writes_and_starts(host: Host):
-    reset_ok(host)
+def test_reset_order_of_stops_writes_and_starts(shared_reset: SharedReset):
+    host = shared_reset.host
     steps = []
     for call in host.calls("docker"):
         sub, target = docker_target(call)
@@ -1107,8 +1298,8 @@ def test_reset_order_of_stops_writes_and_starts(host: Host):
     assert set(steps[-2:]) == {("start", PROXY_C), ("start", BROWSER_C)}
 
 
-def test_reset_helpers_have_the_agreed_shape(host: Host):
-    reset_ok(host)
+def test_reset_helpers_have_the_agreed_shape(shared_reset: SharedReset):
+    host = shared_reset.host
     image = host.state()["containers"][DASH_C]["image"]
     runs = [c for c in host.calls("docker") if c["argv"][0] == "run"]
     assert sorted(mount_source(c) for c in runs) == sorted([HOME_V, TOKENS_V])
@@ -1130,8 +1321,8 @@ def test_reset_helpers_have_the_agreed_shape(host: Host):
             assert not call["stdin"]
 
 
-def test_reset_writers_run_as_uid_1000_with_values_only_on_stdin(host: Host):
-    reset_ok(host)
+def test_reset_writers_run_as_uid_1000_with_values_only_on_stdin(shared_reset: SharedReset):
+    host = shared_reset.host
     writers = [c for c in host.calls("docker") if docker_target(c)[0] == "exec" and "--user" in c["argv"]]
     assert len(writers) == 9
     for call in writers:
@@ -1148,8 +1339,8 @@ def test_reset_writers_run_as_uid_1000_with_values_only_on_stdin(host: Host):
     assert len(carrying) == 2 and all("-i" in c["argv"] for c in carrying)
 
 
-def test_reset_names_only_template_containers_and_volumes(host: Host):
-    reset_ok(host)
+def test_reset_names_only_template_containers_and_volumes(shared_reset: SharedReset):
+    host = shared_reset.host
     template = parse_template()
     allowed = set(template["containers"]) | set(template["volumes"])
     calls = host.calls("docker")
@@ -1235,33 +1426,41 @@ def test_reset_stops_when_a_token_cannot_be_issued(host: Host):
     assert_secret_free(host, result, [MODEL_TOKEN])
 
 
-def test_reset_prints_no_skip_line_when_the_model_token_is_written(host: Host):
-    result = reset_ok(host)
-    assert "skip" not in all_output(result).lower()
-    assert len(writer_calls(host)) == 9
+def test_reset_prints_no_skip_line_when_the_model_token_is_written(shared_reset: SharedReset):
+    assert "skip" not in all_output(shared_reset.result).lower()
+    assert len(writer_calls(shared_reset.host)) == 9
 
 
-def test_reset_leaves_the_repository_files_alone(host: Host):
-    before = sha_tree(STACK_HOME)
-    reset_ok(host)
-    assert sha_tree(STACK_HOME) == before
+def test_reset_leaves_the_repository_files_alone(shared_reset: SharedReset):
+    assert sha_tree(STACK_HOME) == shared_reset.repo_before
 
 
 # ------------------------------------------------------------------ isolation_check.sh
 
 
 @pytest.fixture(scope="module")
-def reset_tree(tmp_path_factory) -> Host:
-    """One reset stack, made once; each test below works on its own copy of it."""
-    first = Host(tmp_path_factory.mktemp("after-reset") / "host")
-    result = first.run(RESET, env={"JOURNEY_MODEL_TOKEN_FILE": str(first.model_token_file())})
-    assert result.returncode == 0, result.stdout + result.stderr
-    return first
+def reset_tree(shared_reset: SharedReset) -> Host:
+    """The reset stack that every check test below copies; it is never changed."""
+    return shared_reset.host
 
 
 @pytest.fixture
 def stack(reset_tree: Host, tmp_path: Path) -> Host:
     return Host.copy_of(reset_tree, tmp_path / "host")
+
+
+class CleanCheck(NamedTuple):
+    host: Host
+    before: dict
+    result: subprocess.CompletedProcess
+
+
+@pytest.fixture(scope="module")
+def clean_check(reset_tree: Host, tmp_path_factory) -> CleanCheck:
+    """One check run on a clean copy of the reset stack, shared by the tests that only read it."""
+    clean = Host.copy_of(reset_tree, tmp_path_factory.mktemp("clean-check") / "host")
+    before = snapshot(clean)
+    return CleanCheck(clean, before, run_check(clean))
 
 
 def run_check(host: Host, mode: str = "server2", **env) -> subprocess.CompletedProcess:
@@ -1438,17 +1637,16 @@ def test_check_server2_refuses_the_wrong_host_before_any_other_check(host: Host,
     assert STACK_HOST not in all_output(result)
 
 
-def test_check_server2_passes_every_check_on_a_clean_stack(stack: Host):
-    before = snapshot(stack)
-    result = run_check(stack)
+def test_check_server2_passes_every_check_on_a_clean_stack(clean_check: CleanCheck):
+    stack, before, result = clean_check
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.splitlines() == [f"PASS {name}" for name in CHECKS]
     assert result.stderr == ""
     assert snapshot(stack) == before
 
 
-def test_check_server2_names_only_template_entries(stack: Host):
-    result = run_check(stack)
+def test_check_server2_names_only_template_entries(clean_check: CleanCheck):
+    stack, _, result = clean_check
     assert result.returncode == 0, result.stdout
     template = parse_template()
     allowed = set(template["containers"]) | set(template["volumes"])
@@ -1463,9 +1661,8 @@ def test_check_server2_names_only_template_entries(stack: Host):
             assert call["argv"][-1] in images, "an image id that no template container uses"
 
 
-def test_check_reads_the_config_with_the_interpreter_of_the_hermes_command(stack: Host):
-    run_check(stack)
-    uses = (stack.root / "interp.log").read_text().splitlines()
+def test_check_reads_the_config_with_the_interpreter_of_the_hermes_command(clean_check: CleanCheck):
+    uses = (clean_check.host.root / "interp.log").read_text().splitlines()
     assert uses.count("-") >= 4, "the dispatcher and platform reads, for both profiles, use that interpreter"
 
 
@@ -1502,11 +1699,10 @@ def test_check_telegram_send_passes_only_when_delivery_fails(stack: Host, code: 
     assert failed_checks(result) == {"telegram-send-fails"}
 
 
-def test_check_production_get_uses_one_assertion_that_stays_off_every_command_line(stack: Host):
-    before = snapshot(stack)
-    result = run_check(stack)
+def test_check_production_get_uses_one_assertion_that_stays_off_every_command_line(clean_check: CleanCheck):
+    stack, before, result = clean_check
     assert result.returncode == 0, result.stdout + result.stderr
-    minting = [c for c in stack.calls("docker") if docker_target(c) == ("exec", PROXY_C)]
+    minting =[c for c in stack.calls("docker") if docker_target(c) == ("exec", PROXY_C)]
     assert len(minting) == 1
     argv = minting[0]["argv"]
     assert "-i" in argv and "--user" not in argv
@@ -1651,6 +1847,7 @@ def test_both_scripts_take_every_name_from_the_template(tmp_path: Path):
     for old, new in renames.items():
         text = text.replace(old, new)
     (alt.root / "state.json").write_text(text)
+    write_view(json.loads(text), alt.root)
     for folder in sorted((alt.root / "volumes").iterdir()):
         if folder.name.startswith("raphael-journeys-"):
             folder.rename(folder.with_name(folder.name.replace("raphael-journeys-", "alt-rig-")))
