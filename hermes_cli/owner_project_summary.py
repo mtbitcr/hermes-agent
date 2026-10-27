@@ -47,6 +47,8 @@ _TEXT_LIMITS = {"outcome": 400, "next_action": 240, "owner_decision": 240}
 _REQUIRED_KEYS = frozenset({"outcome", "next_action"})
 _STORE_PINS = ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD")
 _SETTLED = ("done", "blocked", "archived")
+_REMOVAL_ENDED = ("cancelled", "failed", "restored")  # removal phases after which the Project is live again
+_refused_boards: set[tuple[str, str]] = set()  # collisions already logged by this process
 
 INSTRUCTION = """\
 Write the short summary of one Project for its owner. The steward snapshot at the end of this task is everything you \
@@ -138,24 +140,87 @@ def _summary_board_path() -> Path:
     return kanban_db.board_dir(SUMMARY_BOARD) / "kanban.db"
 
 
-def _ensure_summary_board() -> Path:
+def _refuse_board(path: Path, meta: dict) -> None:
+    owner = meta.get("project_id") or "unreadable board.json"
+    if (str(path), owner) in _refused_boards:
+        return
+    _refused_boards.add((str(path), owner))
+    logger.warning(
+        "project summary: the board %r belongs to a Project (%s) or cannot be read; "
+        "no summary task is made until the owner resolves it",
+        SUMMARY_BOARD, owner,
+    )
+
+
+def _ensure_summary_board() -> Optional[Path]:
+    """The summary board's path, made and switched on when need be; None while a Project owns the slug.
+
+    A board that was made but never switched on is switched on here. The owner lifecycle always sets
+    ``dispatch_paused_by_owner`` when it stops a board, so a pause or an archive is never taken for that.
+    """
     path = _summary_board_path()
-    if not path.exists():
-        with _unpinned_stores():
-            kanban_db.create_board(
+    with _unpinned_stores():
+        meta = None
+        if kanban_db.board_exists(SUMMARY_BOARD):
+            meta = kanban_db.read_board_metadata(SUMMARY_BOARD)
+            if meta.get("project_id") or not kanban_db.board_ownership_verified(meta):
+                _refuse_board(path, meta)
+                return None
+        if meta is None or not path.exists():
+            meta = kanban_db.create_board(
                 SUMMARY_BOARD,
                 name="Project summaries",
                 description="Summary tasks for the planning role. Linked to no Project.",
             )
+        if (
+            meta.get("dispatch_enabled") is not True
+            and meta.get("dispatch_paused_by_owner") is not True
+            and meta.get("archived") is not True
+        ):
             kanban_db.write_board_dispatch_state(SUMMARY_BOARD, dispatch_enabled=True)
     return path
 
 
-def _task_body(snapshot: Optional[dict]) -> str:
-    if snapshot is None:
-        return INSTRUCTION + "\nSteward snapshot: none is available for this Project yet.\n"
+def _task_body(snapshot: dict) -> str:
     frozen = json.dumps(snapshot, indent=2, sort_keys=True, ensure_ascii=False)
     return INSTRUCTION + "\nSteward snapshot, frozen when this task was made:\n" + frozen + "\n"
+
+
+def _request_key(state: sqlite3.Row) -> str:
+    """The identity of one request, from the state row alone, so a restart adopts the task it already made."""
+    return f"{CREATED_BY}:{state['project_id']}:{state['failures']}:{state['last_requested_at']}"
+
+
+def _eligible(registry: sqlite3.Connection, project_id: str) -> bool:
+    """The one rule for a first summary: the Project exists, is not archived, and no removal has started.
+
+    A removal counts from its start to its end, a finished permanent one included (the registry keeps that
+    Project's row), until it is cancelled, fails or is restored.
+    """
+    project = registry.execute("SELECT archived FROM projects WHERE id = ?", (project_id,)).fetchone()
+    if project is None or project["archived"]:
+        return False
+    removal = registry.execute(
+        "SELECT phase FROM project_removal_operations WHERE project_id = ? "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (project_id,),
+    ).fetchone()
+    return removal is None or removal["phase"] in _REMOVAL_ENDED
+
+
+def _retire(
+    registry: sqlite3.Connection, board: Optional[sqlite3.Connection], project_id: str, task_id: str, now: int
+) -> None:
+    """Close the request of a Project that may not have a summary: nothing written, no failure, still wanted later."""
+    with write_txn(registry):
+        registry.execute(
+            "UPDATE project_summary_state SET open_task_id = NULL, pending = 1, updated_at = ? "
+            "WHERE project_id = ? AND open_task_id = ?",
+            (now, project_id, task_id),
+        )
+    if board is not None:
+        kanban_db.archive_task(board, task_id)
+    logger.info("project summary: Project %s may not have a summary now; its request was closed", project_id)
 
 
 def _record_failure(
@@ -170,8 +235,11 @@ def _record_failure(
         )
 
 
-def _store_result(registry: sqlite3.Connection, project_id: str, result: SummaryResult, now: int) -> None:
+def _store_result(registry: sqlite3.Connection, project_id: str, result: SummaryResult, now: int) -> bool:
+    """Store the result unless the Project stopped being eligible; the check and the write share one transaction."""
     with write_txn(registry):
+        if not _eligible(registry, project_id):
+            return False
         revision = projects_db.write_project_summary(
             registry,
             project_id,
@@ -184,11 +252,15 @@ def _store_result(registry: sqlite3.Connection, project_id: str, result: Summary
             (now, project_id),
         )
     logger.info("project summary: stored revision %d for Project %s", revision, project_id)
+    return True
 
 
 def _harvest_one(
     registry: sqlite3.Connection, board: Optional[sqlite3.Connection], project_id: str, task_id: str, now: int
 ) -> None:
+    if not _eligible(registry, project_id):
+        _retire(registry, board, project_id, task_id, now)
+        return
     if board is None:
         logger.warning("project summary: the summary board is gone; nothing stored for Project %s", project_id)
         _record_failure(registry, project_id, now)
@@ -202,7 +274,9 @@ def _harvest_one(
         logger.warning("project summary: nothing stored for Project %s: %s", project_id, exc)
         _record_failure(registry, project_id, now)
     else:
-        _store_result(registry, project_id, result, now)
+        if not _store_result(registry, project_id, result, now):
+            _retire(registry, board, project_id, task_id, now)
+            return
     kanban_db.archive_task(board, task_id)
 
 
@@ -220,13 +294,18 @@ def _harvest(registry: sqlite3.Connection, now: int) -> None:
 
 
 def _due(state: sqlite3.Row, now: int) -> bool:
-    """The document's rule: nothing open, a request pending, and the hour, the backoff or an urgent flag allows it."""
+    """The document's rule: nothing open, a request pending, and the hour, the backoff or an urgent flag allows it.
+
+    The hour runs from the last request. After a failure the backoff runs from the failure, which
+    ``_record_failure`` stamps in ``updated_at``, not from the request that failed.
+    """
     if state["open_task_id"] is not None or not state["pending"] or state["failures"] >= FAILURE_STOP:
         return False
     requested_at = state["last_requested_at"]
     if requested_at is None or (state["pending_urgent"] and not state["failures"]):
         return True
-    return now - requested_at >= backoff_seconds(state["failures"])
+    since = state["updated_at"] if state["failures"] else requested_at
+    return now - since >= backoff_seconds(state["failures"])
 
 
 def _new_state(registry: sqlite3.Connection, project_id: str, now: int) -> sqlite3.Row:
@@ -242,7 +321,11 @@ def _new_state(registry: sqlite3.Connection, project_id: str, now: int) -> sqlit
 
 
 def _open_summary_task(
-    registry: sqlite3.Connection, board: sqlite3.Connection, project: projects_db.Project, now: int
+    registry: sqlite3.Connection,
+    board: sqlite3.Connection,
+    project: projects_db.Project,
+    state: sqlite3.Row,
+    now: int,
 ) -> bool:
     # Imported here: the owner kernel is large, and the first import must not run on the event loop.
     from hermes_cli import owner_workspace
@@ -255,8 +338,10 @@ def _open_summary_task(
         return False
     try:
         snapshot = owner_workspace.project_steward_snapshot(project_id=project.id)
-    except owner_workspace.OwnerWorkspaceError:
-        snapshot = None
+    except owner_workspace.OwnerWorkspaceError as exc:
+        logger.warning("project summary: no steward snapshot for Project %s (%s)", project.id, exc.code)
+        _record_failure(registry, project.id, now, requested_at=now)
+        return False
 
     task_id = kanban_db.create_task(
         board,
@@ -270,17 +355,25 @@ def _open_summary_task(
         owned_paths=[],
         risk_tier=RISK_TIER,
         max_runtime_seconds=MAX_RUNTIME_SECONDS,
+        idempotency_key=_request_key(state),
         **route,
     )
+    # The claim holds only while the row is the one the key was made from. A loser archives its task only
+    # if the winner recorded another one, and decides that inside the transaction that nobody else can write.
     with write_txn(registry):
         claimed = registry.execute(
             "UPDATE project_summary_state SET open_task_id = ?, last_requested_at = ?, pending = 0, "
-            "pending_urgent = 0, updated_at = ? WHERE project_id = ? AND open_task_id IS NULL AND pending = 1",
-            (task_id, now, now, project.id),
+            "pending_urgent = 0, updated_at = ? WHERE project_id = ? AND open_task_id IS NULL AND pending = 1 "
+            "AND failures = ? AND last_requested_at IS ?",
+            (task_id, now, now, project.id, state["failures"], state["last_requested_at"]),
         ).rowcount
-    if claimed != 1:
-        kanban_db.archive_task(board, task_id)
-        return False
+        if claimed != 1:
+            recorded = registry.execute(
+                "SELECT open_task_id FROM project_summary_state WHERE project_id = ?", (project.id,)
+            ).fetchone()
+            if recorded is None or recorded["open_task_id"] != task_id:
+                kanban_db.archive_task(board, task_id)
+            return False
     logger.info("project summary: asked for the first summary of Project %s (task %s)", project.id, task_id)
     return True
 
@@ -296,16 +389,19 @@ def _request(registry: sqlite3.Connection, now: int) -> int:
             state = states.get(project.id)
             if state is not None and not _due(state, now):
                 continue
-            if projects_db.get_active_removal_operation(registry, project.id) is not None:
+            if not _eligible(registry, project.id):
                 continue
             if state is None:
                 state = _new_state(registry, project.id, now)
                 if not _due(state, now):
                     continue
             if board is None:
-                board = stack.enter_context(kanban_db.connect_closing(_ensure_summary_board(), board=SUMMARY_BOARD))
+                path = _ensure_summary_board()
+                if path is None:
+                    break
+                board = stack.enter_context(kanban_db.connect_closing(path, board=SUMMARY_BOARD))
             asked += 1
-            created += _open_summary_task(registry, board, project, now)
+            created += _open_summary_task(registry, board, project, state, now)
     return created
 
 

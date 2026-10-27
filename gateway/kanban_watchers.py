@@ -1850,9 +1850,11 @@ class GatewayKanbanWatchersMixin:
                         await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                     results = await asyncio.to_thread(_tick_once)
                     try:
-                        from hermes_cli import owner_project_summary as _summary
+                        # Asked again: a pause can start while the dispatch above runs.
+                        if _kanban_dispatch_allowed():
+                            from hermes_cli import owner_project_summary as _summary
 
-                        await asyncio.to_thread(_summary.summary_tick)
+                            await asyncio.to_thread(_summary.summary_tick)
                     except Exception:
                         logger.exception("kanban dispatcher: project summary tick failed")
                     any_spawned = False

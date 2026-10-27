@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from agent import estop
-from hermes_cli import kanban_db, owner_workspace as ow, projects_db
+from hermes_cli import kanban_db, kanban_risk_tier, owner_workspace as ow, projects_db
 from hermes_cli.owner_text import check_owner_text
 from plugins.dashboard_auth.raphael_workspace import model_policy
 
@@ -57,6 +57,10 @@ def _ops():
     from hermes_cli import owner_project_summary
 
     return owner_project_summary
+
+
+class _ProcessDied(BaseException):
+    """A gateway restart as the interrupted code sees it: nothing after this point runs."""
 
 
 @pytest.fixture
@@ -104,6 +108,10 @@ def _board_db(root: Path, slug: str) -> Path:
 def _board(root: Path, slug: str = BOARD):
     with kanban_db.connect_closing(_board_db(root, slug), board=slug) as conn:
         yield conn
+
+
+def _board_meta(root: Path, slug: str = BOARD) -> dict:
+    return json.loads((_board_db(root, slug).parent / "board.json").read_text(encoding="utf-8"))
 
 
 def _fill_board(project: dict, cards: dict) -> None:
@@ -303,9 +311,9 @@ def test_valid_result_is_stored_on_the_next_tick(root, owner):
     ],
     ids=["text", "null", "blank", "omitted"],
 )
-def test_owner_decision_is_optional(root, given, stored):
+def test_owner_decision_is_optional(root, owner, given, stored):
     ops = _ops()
-    project_id = _registry_project(root, "Garden Plan")
+    project_id = _project(owner, "Garden Plan")["project_id"]
     ops.summary_tick()
     [task] = _summary_tasks(root)
     summary = {"outcome": OUTCOME, "next_action": NEXT_ACTION, **given}
@@ -340,11 +348,11 @@ _INVALID = {
 
 
 @pytest.mark.parametrize(("metadata", "reassigned_to"), _INVALID.values(), ids=list(_INVALID))
-def test_invalid_result_stores_nothing(root, metadata, reassigned_to):
+def test_invalid_result_stores_nothing(root, owner, metadata, reassigned_to):
     ops = _ops()
     for text in (REFUSED, REFUSED_NEXT_ACTION, REFUSED_DECISION):
         assert check_owner_text(text, "planner_prose") != text
-    project_id = _registry_project(root, "Garden Plan")
+    project_id = _project(owner, "Garden Plan")["project_id"]
     ops.summary_tick(now=T0)
     [task] = _summary_tasks(root)
     row_before = _project_row(root, project_id)
@@ -363,9 +371,9 @@ def test_invalid_result_stores_nothing(root, metadata, reassigned_to):
 
 
 @pytest.mark.parametrize("how", ["blocked", "timed_out", "archived"])
-def test_failed_step_stores_nothing_backs_off_and_stops(root, monkeypatch, how):
+def test_failed_step_stores_nothing_backs_off_and_stops(root, owner, monkeypatch, how):
     ops = _ops()
-    project_id = _registry_project(root, "Garden Plan")
+    project_id = _project(owner, "Garden Plan")["project_id"]
     row_before = _project_row(root, project_id)
 
     def created() -> int:
@@ -383,38 +391,41 @@ def test_failed_step_stores_nothing_backs_off_and_stops(root, monkeypatch, how):
     [first] = _summary_tasks(root)
     _fail(root, monkeypatch, first.id, how)
 
-    ops.summary_tick(now=T0 + 10)
+    first_failed = T0 + 10
+    ops.summary_tick(now=first_failed)
     check(failures=1, tasks=1)
-    ops.summary_tick(now=T0 + HOUR - 1)
+    ops.summary_tick(now=first_failed + HOUR - 1)
     check(failures=1, tasks=1)
 
-    ops.summary_tick(now=T0 + HOUR)
+    second_at = first_failed + HOUR
+    ops.summary_tick(now=second_at)
     assert created() == 2
     [second] = _summary_tasks(root)
     assert _state(root, project_id)["open_task_id"] == second.id
     _fail(root, monkeypatch, second.id, how)
 
-    second_at = T0 + HOUR
-    ops.summary_tick(now=second_at + 10)
+    second_failed = second_at + 10
+    ops.summary_tick(now=second_failed)
     check(failures=2, tasks=2)
-    ops.summary_tick(now=second_at + 2 * HOUR - 1)
+    ops.summary_tick(now=second_failed + 2 * HOUR - 1)
     check(failures=2, tasks=2)
 
-    third_at = second_at + 2 * HOUR
+    third_at = second_failed + 2 * HOUR
     ops.summary_tick(now=third_at)
     assert created() == 3
     [third] = _summary_tasks(root)
     _fail(root, monkeypatch, third.id, how)
 
-    ops.summary_tick(now=third_at + 10)
+    third_failed = third_at + 10
+    ops.summary_tick(now=third_failed)
     check(failures=3, tasks=3)
-    ops.summary_tick(now=third_at + 30 * 86_400)
+    ops.summary_tick(now=third_failed + 30 * 86_400)
     check(failures=3, tasks=3)
 
 
-def test_timed_out_run_that_is_requeued_is_not_yet_a_failure(root, monkeypatch):
+def test_timed_out_run_that_is_requeued_is_not_yet_a_failure(root, owner, monkeypatch):
     ops = _ops()
-    project_id = _registry_project(root, "Garden Plan")
+    project_id = _project(owner, "Garden Plan")["project_id"]
     ops.summary_tick(now=T0)
     [task] = _summary_tasks(root)
     monkeypatch.setattr(kanban_db, "_pid_alive", lambda _pid: False)
@@ -466,14 +477,14 @@ def test_task_with_the_same_title_made_by_anyone_else_is_never_harvested(root, o
     assert _summary_of(root, project_id)["revision"] == 1
 
 
-def test_at_most_three_tasks_per_tick_and_none_for_projects_that_are_gone(root):
+def test_at_most_three_tasks_per_tick_and_none_for_projects_that_are_gone(root, owner):
     ops = _ops()
     live = ["Alpha", "Bravo", "Charlie", "Delta", "Echo"]
     for name in live[:4]:
-        _registry_project(root, name)
-    cancelled = _registry_project(root, "Echo")
-    archived = _registry_project(root, "Foxtrot")
-    removing = _registry_project(root, "Golf")
+        _project(owner, name)
+    cancelled = _project(owner, "Echo")["project_id"]
+    archived = _project(owner, "Foxtrot")["project_id"]
+    removing = _project(owner, "Golf")["project_id"]
     with projects_db.connect_closing(root / "projects.db") as conn:
         projects_db.archive_project(conn, archived)
         assert projects_db.record_removal_operation(
@@ -527,9 +538,9 @@ def test_project_that_already_has_a_summary_is_not_asked_for_a_first_one(root):
     assert _summary_of(root, project_id)["revision"] == 1
 
 
-def test_tick_that_loses_the_race_for_a_project_leaves_the_other_task_open(root, monkeypatch):
+def test_tick_that_loses_the_race_for_a_project_leaves_the_other_task_open(root, owner, monkeypatch):
     ops = _ops()
-    project_id = _registry_project(root, "Garden Plan")
+    project_id = _project(owner, "Garden Plan")["project_id"]
     create_task = kanban_db.create_task
 
     def create_then_lose(*args, **kwargs):
@@ -550,9 +561,9 @@ def test_tick_that_loses_the_race_for_a_project_leaves_the_other_task_open(root,
     assert len(_summary_tasks(root, archived=True)) == 1
 
 
-def test_planning_role_without_a_route_is_a_failure_that_backs_off(root, monkeypatch):
+def test_planning_role_without_a_route_is_a_failure_that_backs_off(root, owner, monkeypatch):
     ops = _ops()
-    project_id = _registry_project(root, "Garden Plan")
+    project_id = _project(owner, "Garden Plan")["project_id"]
     working_route = model_policy.configured_assignment_for
 
     def no_route(_profile):
@@ -575,9 +586,9 @@ def test_planning_role_without_a_route_is_a_failure_that_backs_off(root, monkeyp
     assert _state(root, project_id)["open_task_id"] == task.id
 
 
-def test_summary_board_that_is_gone_counts_as_a_failure(root):
+def test_summary_board_that_is_gone_counts_as_a_failure(root, owner):
     ops = _ops()
-    project_id = _registry_project(root, "Garden Plan")
+    project_id = _project(owner, "Garden Plan")["project_id"]
     ops.summary_tick(now=T0)
     shutil.rmtree(_board_db(root, BOARD).parent)
 
@@ -588,8 +599,319 @@ def test_summary_board_that_is_gone_counts_as_a_failure(root):
     assert _summary_of(root, project_id) is None
 
 
-def _drive_dispatcher(monkeypatch, *, ticks: int) -> dict:
-    """Run the gateway's embedded dispatcher loop for ``ticks`` iterations and count what each one runs."""
+def test_stored_runtime_cap_is_the_kernel_time_box_of_the_pinned_card(root, owner):
+    ops = _ops()
+    _project(owner, "Garden Plan", _CARDS)
+
+    ops.summary_tick(now=T0)
+
+    [task] = _summary_tasks(root)
+    assert task.model_policy_lock
+    kind = kanban_risk_tier.card_work_kind(PLANNER, [], "routine", False)
+    stored = _rows(
+        _board_db(root, BOARD), "SELECT max_runtime_seconds FROM tasks WHERE id = ?", (task.id,),
+    )
+    assert stored == [(kanban_risk_tier.pinned_time_box_seconds(kind),)]
+
+
+def test_task_made_before_it_was_recorded_is_adopted_after_a_restart(root, owner, monkeypatch):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    create_task = kanban_db.create_task
+
+    def create_then_die(*args, **kwargs):
+        create_task(*args, **kwargs)
+        raise _ProcessDied
+
+    monkeypatch.setattr(kanban_db, "create_task", create_then_die)
+    with pytest.raises(_ProcessDied):
+        ops.summary_tick(now=T0)
+    monkeypatch.setattr(kanban_db, "create_task", create_task)
+    [made] = _summary_tasks(root)
+    assert _state(root, project_id)["open_task_id"] is None
+
+    ops.summary_tick(now=T0 + 5)
+    ops.summary_tick(now=T0 + 10)
+
+    assert [task.id for task in _summary_tasks(root, archived=True)] == [made.id]
+    assert _summary_tasks(root)[0].status == "ready"
+    assert _state(root, project_id)["open_task_id"] == made.id
+
+
+def test_two_ticks_racing_for_one_project_keep_the_one_task_they_share(root, owner, monkeypatch):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    create_task = kanban_db.create_task
+    made = []
+
+    def create_while_the_other_tick_runs(*args, **kwargs):
+        task_id = create_task(*args, **kwargs)
+        if not made:
+            made.append(task_id)
+            ops.summary_tick(now=T0)
+        return task_id
+
+    monkeypatch.setattr(kanban_db, "create_task", create_while_the_other_tick_runs)
+
+    ops.summary_tick(now=T0)
+
+    assert [task.id for task in _summary_tasks(root, archived=True)] == made
+    [task] = _summary_tasks(root)
+    assert task.status == "ready"
+    assert _state(root, project_id)["open_task_id"] == task.id
+
+
+def test_board_made_but_never_switched_on_is_switched_on_after_a_restart(root, owner, monkeypatch):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    switch_on = kanban_db.write_board_dispatch_state
+
+    def die_before_the_switch(board, **_kwargs):
+        raise _ProcessDied
+
+    monkeypatch.setattr(kanban_db, "write_board_dispatch_state", die_before_the_switch)
+    with pytest.raises(_ProcessDied):
+        ops.summary_tick(now=T0)
+    monkeypatch.setattr(kanban_db, "write_board_dispatch_state", switch_on)
+    assert _board_db(root, BOARD).exists()
+    assert _board_meta(root)["dispatch_enabled"] is False
+    assert _summary_tasks(root) == []
+
+    ops.summary_tick(now=T0 + 5)
+
+    meta = _board_meta(root)
+    assert (meta["dispatch_enabled"], meta["dispatch_paused_by_owner"], meta["archived"]) == (
+        True, False, False,
+    )
+    assert meta["project_id"] is None
+    [task] = _summary_tasks(root)
+    assert _state(root, project_id)["open_task_id"] == task.id
+
+    kanban_db.write_board_dispatch_state(BOARD, dispatch_enabled=False, dispatch_paused_by_owner=True)
+    desk = _project(owner, "Planning Desk", _DESK_CARDS)
+    ops.summary_tick(now=T0 + 10)
+
+    meta = _board_meta(root)
+    assert (meta["dispatch_enabled"], meta["dispatch_paused_by_owner"]) == (False, True)
+    assert len(_summary_tasks(root)) == 2
+    assert _state(root, desk["project_id"])["open_task_id"] is not None
+
+
+def test_summary_board_that_belongs_to_a_project_is_refused_and_logged_once(root, owner, caplog):
+    ops = _ops()
+    colliding = _project(owner, "Project summaries")
+    garden = _project(owner, "Garden Plan", _CARDS)
+    assert colliding["board"] == BOARD
+    meta_before = _board_meta(root)
+    assert meta_before["project_id"] == colliding["project_id"]
+    boards_before = sorted(path.name for path in (root / "kanban" / "boards").iterdir())
+
+    with caplog.at_level(logging.WARNING):
+        ops.summary_tick(now=T0)
+        ops.summary_tick(now=T0 + HOUR)
+
+    assert [
+        task for task in _summary_tasks(root, archived=True) if task.title.startswith(TITLE)
+    ] == []
+    assert _board_meta(root) == meta_before
+    assert sorted(path.name for path in (root / "kanban" / "boards").iterdir()) == boards_before
+    for project_id in (colliding["project_id"], garden["project_id"]):
+        state = _state(root, project_id)
+        assert state is None or (state["open_task_id"], state["failures"]) == (None, 0)
+    refusals = [
+        record for record in caplog.records
+        if record.name == ops.logger.name and record.levelno >= logging.WARNING
+    ]
+    assert len(refusals) == 1
+    assert BOARD in refusals[0].getMessage()
+
+
+def test_summary_board_whose_owner_cannot_be_read_is_refused(root, owner, caplog):
+    ops = _ops()
+    _project(owner, "Garden Plan", _CARDS)
+    ops.summary_tick(now=T0)
+    desk = _project(owner, "Planning Desk", _DESK_CARDS)["project_id"]
+    (_board_db(root, BOARD).parent / "board.json").write_text("{not json", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        ops.summary_tick(now=T0 + 10)
+        ops.summary_tick(now=T0 + HOUR)
+
+    assert len(_summary_tasks(root, archived=True)) == 1
+    state = _state(root, desk)
+    assert state is None or (state["open_task_id"], state["failures"]) == (None, 0)
+    refusals = [
+        record for record in caplog.records
+        if record.name == ops.logger.name and record.levelno >= logging.WARNING
+    ]
+    assert len(refusals) == 1
+
+
+@pytest.mark.parametrize("delayed", [1, 2], ids=["first_failure", "second_failure"])
+def test_backoff_waits_from_the_failure_not_from_the_request(root, owner, monkeypatch, delayed):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    now = T0
+    ops.summary_tick(now=now)
+
+    for failure in range(1, delayed + 1):
+        [task] = _summary_tasks(root)
+        _fail(root, monkeypatch, task.id, "blocked")
+        failed_at = now + 3 * HOUR
+        ops.summary_tick(now=failed_at)
+
+        assert _state(root, project_id)["failures"] == failure
+        assert len(_summary_tasks(root, archived=True)) == failure
+        wait = ops.backoff_seconds(failure)
+        ops.summary_tick(now=failed_at + wait - 1)
+        assert len(_summary_tasks(root, archived=True)) == failure
+        ops.summary_tick(now=failed_at + wait)
+        assert len(_summary_tasks(root, archived=True)) == failure + 1
+        now = failed_at + wait
+
+
+@pytest.mark.parametrize("how", ["unavailable", "no_board"])
+def test_unreadable_steward_snapshot_is_a_failed_attempt_with_no_task(root, owner, monkeypatch, how):
+    ops = _ops()
+    if how == "unavailable":
+        project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+
+        def refuse(**_kwargs):
+            raise ow.OwnerWorkspaceError("snapshot_unavailable", "the Project board is unavailable")
+
+        monkeypatch.setattr(ow, "project_steward_snapshot", refuse)
+    else:
+        project_id = _registry_project(root, "Garden Plan")
+    row_before = _project_row(root, project_id)
+
+    ops.summary_tick(now=T0)
+
+    state = _state(root, project_id)
+    assert (state["open_task_id"], state["failures"], state["pending"]) == (None, 1, 1)
+    assert _summary_tasks(root, archived=True) == []
+    ops.summary_tick(now=T0 + HOUR - 1)
+    assert _state(root, project_id)["failures"] == 1
+    ops.summary_tick(now=T0 + HOUR)
+    assert _state(root, project_id)["failures"] == 2
+    assert _summary_tasks(root, archived=True) == []
+    assert _summary_of(root, project_id) is None
+    assert _project_row(root, project_id) == row_before
+
+
+def test_nothing_is_published_after_a_failed_snapshot_attempt(root, owner, monkeypatch):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+
+    def refuse(**_kwargs):
+        raise ow.OwnerWorkspaceError("snapshot_unavailable", "the Project board is unavailable")
+
+    monkeypatch.setattr(ow, "project_steward_snapshot", refuse)
+
+    ops.summary_tick(now=T0)
+    for task in _summary_tasks(root):
+        _finish(root, task.id, _valid())
+    ops.summary_tick(now=T0 + 10)
+
+    assert _summary_of(root, project_id) is None
+    assert _summary_tasks(root, archived=True) == []
+
+
+def _leave(root: Path, project_id: str, how: str, *, undo: bool = False) -> None:
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        if how == "archived":
+            assert (projects_db.restore_project if undo else projects_db.archive_project)(registry, project_id)
+        elif undo:
+            assert projects_db.record_removal_operation(
+                registry, project_id=project_id, idempotency_key="cancel-garden", action="remove",
+                phase="cancelled",
+            )
+        else:
+            assert projects_db.record_removal_operation(
+                registry, project_id=project_id, idempotency_key="remove-garden", action="remove",
+            )
+
+
+@pytest.mark.parametrize("how", ["archived", "removal_started"])
+def test_project_that_leaves_while_its_request_is_open_gets_no_summary(root, owner, how):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    ops.summary_tick(now=T0)
+    [task] = _summary_tasks(root)
+    _finish(root, task.id, _valid())
+    _leave(root, project_id, how)
+    row_before = _project_row(root, project_id)
+
+    ops.summary_tick(now=T0 + 10)
+    ops.summary_tick(now=T0 + 5 * HOUR)
+
+    assert _summary_of(root, project_id) is None
+    assert _project_row(root, project_id) == row_before
+    state = _state(root, project_id)
+    assert (state["open_task_id"], state["failures"]) == (None, 0)
+    assert _summary_tasks(root) == []
+    assert len(_summary_tasks(root, archived=True)) == 1
+
+    _leave(root, project_id, how, undo=True)
+    ops.summary_tick(now=T0 + 6 * HOUR)
+
+    [again] = _summary_tasks(root)
+    assert again.id != task.id
+    assert _state(root, project_id)["open_task_id"] == again.id
+    assert _summary_of(root, project_id) is None
+
+
+def test_project_archived_while_its_summary_is_being_stored_gets_none(root, owner, monkeypatch):
+    ops = _ops()
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    ops.summary_tick(now=T0)
+    [task] = _summary_tasks(root)
+    _finish(root, task.id, _valid())
+    parse = ops.parse_summary_result
+
+    def parse_then_archive(conn, task_id):
+        result = parse(conn, task_id)
+        _leave(root, project_id, "archived")
+        return result
+
+    monkeypatch.setattr(ops, "parse_summary_result", parse_then_archive)
+
+    ops.summary_tick(now=T0 + 10)
+
+    assert _summary_of(root, project_id) is None
+    state = _state(root, project_id)
+    assert (state["open_task_id"], state["failures"]) == (None, 0)
+    assert _summary_tasks(root) == []
+
+
+def test_project_whose_permanent_removal_has_finished_gets_no_summary(root, owner):
+    ops = _ops()
+    garden = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    desk = _project(owner, "Planning Desk", _DESK_CARDS)["project_id"]
+    ops.summary_tick(now=T0)
+    for task in _summary_tasks(root):
+        _finish(root, task.id, _valid())
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        assert projects_db.record_removal_operation(
+            registry, project_id=garden, idempotency_key="remove-garden", action="start",
+            phase="done", mode="permanent",
+        )
+        assert projects_db.get_active_removal_operation(registry, garden) is None
+
+    ops.summary_tick(now=T0 + 10)
+    ops.summary_tick(now=T0 + 5 * HOUR)
+
+    assert _summary_of(root, garden) is None
+    assert _summary_of(root, desk) is not None
+    state = _state(root, garden)
+    assert (state["open_task_id"], state["failures"]) == (None, 0)
+    assert _summary_tasks(root) == []
+
+
+def _drive_dispatcher(monkeypatch, *, ticks: int, after_dispatch=None) -> dict:
+    """Run the gateway's embedded dispatcher loop for ``ticks`` iterations and count what each one runs.
+
+    ``after_dispatch`` runs right after each dispatch pass returns, before the loop goes on.
+    """
     from gateway.run import GatewayRunner
     import hermes_cli.config as cfg_mod
 
@@ -607,7 +929,10 @@ def _drive_dispatcher(monkeypatch, *, ticks: int) -> dict:
             seen[name] += 1
         if name == "reap_worker_zombies" and seen[name] >= ticks:
             runner._running = False
-        return fn(*args, **kwargs)
+        result = fn(*args, **kwargs)
+        if name == "_tick_once" and after_dispatch is not None:
+            after_dispatch()
+        return result
 
     async def _sleep(_delay):
         return None
@@ -642,6 +967,23 @@ def test_dispatcher_does_not_run_the_summary_tick_while_paused(root, monkeypatch
         estop.disengage()
 
     assert seen["_tick_once"] == 0
+    assert calls == []
+
+
+def test_dispatcher_does_not_run_the_summary_tick_when_pause_comes_during_dispatch(root, monkeypatch):
+    ops = _ops()
+    calls = []
+    monkeypatch.setattr(ops, "summary_tick", lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(estop, "_logged_components", set())
+    try:
+        seen = _drive_dispatcher(
+            monkeypatch, ticks=1, after_dispatch=lambda: estop.engage(reason="test"),
+        )
+        assert estop.is_engaged()
+    finally:
+        estop.disengage()
+
+    assert seen["_tick_once"] == 1
     assert calls == []
 
 
@@ -689,6 +1031,9 @@ def test_tick_under_the_worker_environment_reaches_every_store(root, owner, monk
     _clean(garden_outcome, desk_outcome)
     garden = _project(owner, "Garden Plan", _CARDS)
     desk = _project(owner, "Planning Desk", _DESK_CARDS)
+    spare = _project(owner, "Spare Room")
+    attic = _project(owner, "Attic Annex")
+    _leave(root, attic["project_id"], "archived")
     with _board(root, desk["board"]) as conn:
         worker_task = kanban_db.create_task(
             conn, title="Plan the next milestone", assignee=PLANNER,
@@ -708,18 +1053,24 @@ def test_tick_under_the_worker_environment_reaches_every_store(root, owner, monk
     ops.summary_tick()
 
     by_title = {task.title: task for task in _summary_tasks(root)}
-    assert sorted(by_title) == [TITLE + "Garden Plan", TITLE + "Planning Desk"]
+    assert sorted(by_title) == [
+        TITLE + "Garden Plan", TITLE + "Planning Desk", TITLE + "Spare Room",
+    ]
     garden_task = by_title[TITLE + "Garden Plan"]
     desk_task = by_title[TITLE + "Planning Desk"]
+    spare_task = by_title[TITLE + "Spare Room"]
     assert "Publish the weekly summary" in garden_task.body
     assert "Order the desk lamp" not in garden_task.body
     assert "Order the desk lamp" in desk_task.body
     assert "Publish the weekly summary" not in desk_task.body
-    meta = json.loads((_board_db(root, BOARD).parent / "board.json").read_text(encoding="utf-8"))
+    meta = _board_meta(root)
     assert (meta["project_id"], meta["dispatch_enabled"]) == (None, True)
     assert _rows(own_board, "SELECT id, title, status FROM tasks ORDER BY id") == own_cards
     assert {name: os.environ[name] for name in pinned} == pinned
 
+    kanban_db.write_board_metadata(BOARD, dispatch_enabled=False)
+    _leave(root, spare["project_id"], "archived")
+    _leave(root, attic["project_id"], "archived", undo=True)
     _finish(root, garden_task.id, _valid(outcome=garden_outcome))
     _finish(root, desk_task.id, _valid(outcome=desk_outcome))
     ops.summary_tick()
@@ -733,10 +1084,23 @@ def test_tick_under_the_worker_environment_reaches_every_store(root, owner, monk
         (garden["project_id"], 1, garden_outcome, NEXT_ACTION, DECISION),
         (desk["project_id"], 1, desk_outcome, NEXT_ACTION, DECISION),
     ])
+    meta = _board_meta(root)
+    assert (meta["project_id"], meta["dispatch_enabled"]) == (None, True)
+    [attic_task] = _summary_tasks(root)
+    assert attic_task.title == TITLE + "Attic Annex"
     assert _rows(
         root / "projects.db",
-        "SELECT count(*) FROM project_summary_state WHERE open_task_id IS NOT NULL",
-    ) == [(0,)]
+        "SELECT project_id, open_task_id FROM project_summary_state WHERE open_task_id IS NOT NULL",
+    ) == [(attic["project_id"], attic_task.id)]
+    assert _rows(
+        root / "projects.db",
+        "SELECT open_task_id, failures FROM project_summary_state WHERE project_id = ?",
+        (spare["project_id"],),
+    ) == [(None, 0)]
+    assert _rows(_board_db(root, BOARD), "SELECT status FROM tasks WHERE id = ?", (spare_task.id,)) == [
+        ("archived",),
+    ]
+    assert _rows(own_board, "SELECT id, title, status FROM tasks ORDER BY id") == own_cards
     assert _rows(profile_home / "projects.db", "SELECT count(*) FROM project_summaries") == [(0,)]
     assert _rows(profile_home / "projects.db", "SELECT count(*) FROM project_summary_state") == [(0,)]
     assert {name: os.environ[name] for name in pinned} == pinned
