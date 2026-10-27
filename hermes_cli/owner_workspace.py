@@ -2667,6 +2667,11 @@ DELIVERY_STATE_CAPABILITY = "delivery_state_v1"
 # gets each card's ``delivery_outcome``: what happened to its latest delivered
 # change, with the repository, pull request and link, or None.
 DELIVERY_OUTCOME_CAPABILITY = "delivery_outcome_v1"
+# A separately negotiated contour for Raphael's own summary of a Project. The
+# oldest owner reader validates a closed snapshot schema, so a new key may not
+# appear unasked: without it the snapshot keeps today's shape exactly, and only
+# a reader naming it gets ``raphael_summary``, or None while none is stored.
+OWNER_PROJECT_SUMMARY_CAPABILITY = "project_summary"
 # A separately negotiated contour for the files a held card still needs from
 # the owner (card C2 of the named inputs plan). Without it every Decision keeps
 # today's keys exactly; only a reader naming it gets ``missing_inputs``.
@@ -3410,6 +3415,7 @@ def read_project_snapshot(
     provider_wait: bool = False,
     delivery_state: bool = False,
     delivery_outcome: bool = False,
+    project_summary: bool = False,
 ) -> dict:
     """Return one bounded read-only surface for an exact receipt-owned Project.
 
@@ -3451,6 +3457,12 @@ def read_project_snapshot(
     off so the card shape stays exactly today's; see
     ``DELIVERY_OUTCOME_CAPABILITY``. Each run then carries the same value for
     its own task, found by the run's native task id and never by title.
+
+    ``project_summary`` adds ``raphael_summary``: Raphael's summary of the
+    Project (the outcome now, the next action and, only when one waits, the
+    owner's decision), each text passed through the planner-prose check, or
+    None while none is stored; it defaults off so the snapshot stays exactly
+    today's; see ``OWNER_PROJECT_SUMMARY_CAPABILITY``.
     """
     try:
         project_slug = projects_db.normalize_slug(project_slug) or ""
@@ -3777,6 +3789,8 @@ def read_project_snapshot(
             ) from exc
         finally:
             planning_conn.close()
+    if project_summary:
+        result["raphael_summary"] = _owner_project_summary(project_id)
     return result
 
 
@@ -4888,6 +4902,38 @@ def _completed_removal_state(project_id: str) -> Optional[dict]:
     if state is not None and state["phase"] == "done":
         return state
     return None
+
+
+def _owner_project_summary(project_id: str) -> Optional[dict]:
+    """Raphael's summary of this Project as the owner may read it, or None.
+
+    Read from the registry file ``list_committed_projects`` reads, opened
+    read-only because no GET may migrate or mutate it. Each text passes the
+    owner-text policy's planner-prose check, and a refused one comes back as
+    that kind's fixed sentence. No decision waiting is absence rather than
+    text, so it stays None and never reaches the policy.
+    """
+    conn = _open_read_only_sqlite(projects_db.projects_db_path(), label="projects.db")
+    try:
+        stored = projects_db.get_project_summary(conn, project_id)
+    except sqlite3.Error as exc:
+        raise OwnerWorkspaceError(
+            "snapshot_unavailable", "the Project summary could not be read"
+        ) from exc
+    finally:
+        conn.close()
+    if stored is None:
+        return None
+    decision = stored["owner_decision"]
+    return {
+        "outcome": check_owner_text(stored["outcome"], "planner_prose"),
+        "next_action": check_owner_text(stored["next_action"], "planner_prose"),
+        "owner_decision": (
+            None if decision is None else check_owner_text(decision, "planner_prose")
+        ),
+        "written_at": stored["written_at"],
+        "revision": stored["revision"],
+    }
 
 
 def _deleted_project_steward(
