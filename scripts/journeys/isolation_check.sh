@@ -522,9 +522,10 @@ host_of() {
   HOST=$auth
 }
 
-# probe_production ORIGIN: one GET with one proxy assertion. The assertion and the address travel to curl
-# as its configuration on stdin, so neither is on a command line. Refused means 401, 403, or a redirect
-# to another host; curl is told not to follow it.
+# probe_production ORIGIN: one GET with one proxy assertion. No default curl configuration is read (curl
+# honours --disable only as its first argument), so an operator's curlrc cannot change the request. The
+# assertion and the address travel to curl as its one configuration, on stdin, so neither is on a command
+# line. Refused means 401, 403, or a redirect to another host; curl is told not to follow it.
 probe_production() {
   local origin=$1 jwt origin_host code redirect rc=0 out
   if [ ! -r "$PROXY_SOURCE" ]; then
@@ -540,7 +541,7 @@ probe_production() {
   host_of "$origin"
   origin_host=$HOST
   out=$(printf 'url = "%s"\nheader = "Cf-Access-Jwt-Assertion: %s"\n' "$origin" "$jwt" |
-    curl -K - --max-redirs 0 -o /dev/null --max-time 20 -w '%{http_code} %{redirect_url}' 2>/dev/null) || rc=$?
+    curl --disable -K - --max-redirs 0 -o /dev/null --max-time 20 -w '%{http_code} %{redirect_url}' 2>/dev/null) || rc=$?
   if [ "$rc" -ne 0 ]; then
     add_problem "the request to production failed (curl status $rc)"
     return 0

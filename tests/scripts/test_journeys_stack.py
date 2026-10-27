@@ -3,23 +3,31 @@
 The scripts run against a fake docker, hostname, curl and sleep that sit first on PATH in a temp
 folder. The "host" is a folder tree: containers and volumes are entries in a state file, volumes
 are plain folders, and the shell snippets the scripts send into containers really run locally on
-those folders. No docker, no network and no real Server 2 is involved.
+those folders. No docker, no real Server 2 and no outside network is involved. The fake curl never
+reads a default curl configuration, so two tests of the production probe put the real curl in its
+place (behind a wrapper that records its argument list) against a throw-away HTTPS endpoint on
+127.0.0.1, under a temporary HOME whose .curlrc asks for a POST.
 """
 
 from __future__ import annotations
 
 import base64
+import datetime
 import hashlib
+import http.server
 import io
+import ipaddress
 import json
 import os
 import re
 import shutil
+import ssl
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 from pathlib import Path
 from typing import NamedTuple
 
@@ -910,6 +918,19 @@ SLEEP_SH = '''#!/bin/bash
 log_call sleep 0 "" "" "$@"
 '''
 
+# The real curl behind a wrapper that only records the argument list (the start line of a call, without an
+# end line); it execs curl, so stdin, stdout and the exit status are curl's own.
+REAL_CURL_SH = r'''#!/bin/bash
+. "$FAKE_HOST_ROOT/fake_lib.sh"
+args=""
+for a; do
+  jesc "$a"
+  args+="${args:+, }\"$REPLY\""
+done
+printf '{"seq": "%s", "tool": "curl", "argv": [%s]}\n' "${EPOCHREALTIME:-$SECONDS.$RANDOM}-$$" "$args" >> "$FAKE_HOST_ROOT/calls.jsonl"
+exec @CURL@ "$@"
+'''
+
 # Read-only docker calls of exactly the shapes the scripts use run here; anything else goes to the
 # Python fake, which keeps the full behaviour (including its refusals).
 DOCKER_SH = r'''#!/bin/bash
@@ -1038,6 +1059,10 @@ class Host:
                   "import fake_tools\nsys.exit(fake_tools.hermes_main(sys.argv[1:]))\n")
         self._exe(root / "ctr/bin/chown",
                   f'#!/bin/sh\nexec {quote(sys.executable)} -S -E "$FAKE_HOST_ROOT/fake_tools.py" chown "$@"\n')
+
+    def use_real_curl(self, curl: str) -> None:
+        """Put the real curl (an absolute path) in place of the fake one, behind the recording wrapper."""
+        self._exe(self.root / "bin/curl", REAL_CURL_SH.replace("@CURL@", _view_namespace["_q"](curl)))
 
     def _build(self) -> None:
         root = self.root
@@ -2332,6 +2357,7 @@ def test_check_production_get_uses_one_assertion_that_stays_off_every_command_li
     curl = stack.calls("curl")
     assert len(curl) == 1
     flags = curl[0]["argv"]
+    assert flags[0] == "--disable", "curl reads a default configuration unless --disable is its first argument"
     assert flags[flags.index("-K") + 1] == "-"
     assert flags[flags.index("--max-redirs") + 1] == "0"
     assert flags[flags.index("-o") + 1] == "/dev/null"
@@ -2355,6 +2381,130 @@ def test_check_production_get_uses_one_assertion_that_stays_off_every_command_li
     key.public_key().verify(b64d(signature), f"{head}.{body}".encode(), padding.PKCS1v15(), hashes.SHA256())
     claims = json.loads(b64d(body))
     assert claims["iss"] == proxy_issuer() and claims["type"] == "app"
+
+
+# The production probe with the real curl: the fake curl never reads a default curl configuration, so these
+# tests send the probe to a throw-away HTTPS endpoint on 127.0.0.1 and hand curl a .curlrc through HOME.
+
+
+class Seen(NamedTuple):
+    method: str
+    assertion: str | None
+    body_bytes: int
+
+
+class Refusing(http.server.BaseHTTPRequestHandler):
+    """Answers every request, whatever its method, with 403 and no body, and records what arrived."""
+
+    def __getattr__(self, name):
+        if name.startswith("do_"):
+            return self.refuse
+        raise AttributeError(name)
+
+    def refuse(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.server.seen.append(Seen(self.command, self.headers.get("Cf-Access-Jwt-Assertion"), len(body)))
+        self.send_response(403)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+class LocalHttps(NamedTuple):
+    origin: str
+    ca_bundle: Path
+    seen: list[Seen]
+
+
+def write_local_certificates(folder: Path) -> tuple[Path, Path, Path]:
+    """A throw-away CA and a server certificate for 127.0.0.1 and localhost; returns the PEM files (ca, cert, key)."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    ca_key, server_key = ec.generate_private_key(ec.SECP256R1()), ec.generate_private_key(ec.SECP256R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "journeys isolation test CA")])
+    server_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    def issue(subject, key, *extensions):
+        builder = (
+            x509.CertificateBuilder().subject_name(subject).issuer_name(ca_name)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(hours=1)).not_valid_after(now + datetime.timedelta(days=1))
+        )
+        for extension, critical in extensions:
+            builder = builder.add_extension(extension, critical)
+        return builder.sign(ca_key, hashes.SHA256())
+
+    ca_cert = issue(ca_name, ca_key, (x509.BasicConstraints(ca=True, path_length=None), True))
+    server_cert = issue(
+        server_name, server_key,
+        (x509.BasicConstraints(ca=False, path_length=None), True),
+        (x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1")), x509.DNSName("localhost")]),
+         False),
+    )
+    folder.mkdir()
+    pem = serialization.Encoding.PEM
+    key_pem = server_key.private_bytes(pem, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    files = folder / "ca.pem", folder / "server.pem", folder / "server-key.pem"
+    for path, data in zip(files, (ca_cert.public_bytes(pem), server_cert.public_bytes(pem), key_pem)):
+        path.write_bytes(data)
+    return files
+
+
+@pytest.fixture
+def local_https(tmp_path: Path):
+    """The endpoint in a thread of the test process, on an ephemeral port, trusted through its own CA."""
+    ca, cert, key = write_local_certificates(tmp_path / "tls")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    server = http.server.HTTPServer(("127.0.0.1", 0), Refusing)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    server.seen = []
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+    thread.start()
+    try:
+        yield LocalHttps(f"https://127.0.0.1:{server.server_address[1]}", ca, server.seen)
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+
+@pytest.mark.parametrize("curlrc", ["", 'request = "POST"\ndata = "write=1"\n'],
+                         ids=["empty-default-config", "curlrc-requests-post"])
+def test_check_production_get_with_the_real_curl_is_one_get_whatever_the_default_curl_configuration(
+        stack: Host, local_https: LocalHttps, tmp_path: Path, curlrc: str):
+    curl = shutil.which("curl")
+    assert curl, "the real curl is not on PATH"
+    stack.use_real_curl(curl)
+    operator_home = tmp_path / "operator-home"
+    operator_home.mkdir()
+    (operator_home / ".curlrc").write_text(curlrc)
+
+    # A None value removes the variable from the environment of the check: no ambient setting decides the result.
+    env = dict.fromkeys(["SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_HOME", "XDG_CONFIG_HOME", "HTTPS_PROXY",
+                         "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"])
+    env.update(HOME=str(operator_home), CURL_CA_BUNDLE=str(local_https.ca_bundle),
+               NO_PROXY="127.0.0.1,localhost", JOURNEY_PRODUCTION_ORIGIN=local_https.origin)
+    result = run_check(stack, **env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert verdicts(result)["production-get-refused"] == "PASS"
+    minting = [c for c in stack.calls("docker") if docker_target(c) == ("exec", PROXY_C)]
+    assert len(minting) == 1
+    jwt = minting[0]["stdout"].strip()
+    assert re.fullmatch(r"[\w-]+\.[\w-]+\.[\w-]+", jwt)
+
+    assert [(s.method, s.body_bytes) for s in local_https.seen] == [("GET", 0)]
+    assert local_https.seen[0].assertion == jwt
+    assert len(stack.calls("curl")) == 1, "the wrapper did not record the one curl call"
+    assert jwt not in all_output(result), "the assertion was printed"
+    assert jwt not in argv_text(stack), "the assertion reached a command line"
 
 
 def test_check_never_creates_a_signing_key(stack: Host):
