@@ -1874,6 +1874,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     idempotency_key: Optional[str] = None,
+    project: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1938,6 +1939,8 @@ def create_job(
                 same key with the same normalized request returns the original
                 job; reusing it for a different request raises
                 ``JobIdempotencyConflict``.
+        project: Optional, already-validated Project slug stored on the job
+                record. Omitted => no ``project`` key is stored.
 
     Returns:
         The created job dict
@@ -1976,6 +1979,8 @@ def create_job(
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
     normalized_monitor_url = normalized_monitor_url or None
+    normalized_project = str(project).strip() if isinstance(project, str) else None
+    normalized_project = normalized_project or None
 
     # Monitor-mode validation: exactly one source, and monitor mode only
     # makes sense when there IS an agent to suppress/wake.
@@ -2055,6 +2060,10 @@ def create_job(
                 "monitor_url": normalized_monitor_url,
             }
         )
+        if normalized_project is not None:
+            request_hash = _job_creation_request_hash(
+                {"request": request_hash, "project": normalized_project}
+            )
         idempotency_metadata = {
             "key_hash": _idempotency_digest(normalized_idempotency_key),
             "request_hash": request_hash,
@@ -2112,6 +2121,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_project is not None:
+        job["project"] = normalized_project
     if idempotency_metadata is not None:
         job["idempotency"] = idempotency_metadata
 

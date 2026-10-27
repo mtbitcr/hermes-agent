@@ -142,13 +142,23 @@ cfg_get = late("cfg_get")
 _CRON_FIRE_RETRY_AFTER_SECONDS = 60
 
 
-async def list_cron_jobs(profile: str = "all"):
+async def list_cron_jobs(profile: str = "all", include_project: bool = False):
+    if include_project:
+        return await _run_cron_dashboard_io(_list_cron_jobs_sync, profile, True)
     return await _run_cron_dashboard_io(_list_cron_jobs_sync, profile)
+
+
+def _automation_project_requested(request: Request) -> bool:
+    """True only when ``?capabilities=`` is given exactly once and names it."""
+    raw_values = request.query_params.getlist("capabilities")
+    if len(raw_values) != 1 or len(raw_values[0]) > 256:
+        return False
+    return "automation_project" in {t.strip() for t in raw_values[0].split(",")}
 
 
 @router.get("/api/cron/jobs")
 async def list_cron_jobs_route(request: Request, profile: str = "all"):
-    result = await list_cron_jobs(profile)
+    result = await list_cron_jobs(profile, _automation_project_requested(request))
     _audit_automations_machine_success(request, action="list")
     return result
 

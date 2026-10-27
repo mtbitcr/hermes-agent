@@ -300,6 +300,7 @@ class CronJobCreate(BaseModel):
     max_turns: Optional[int] = None
     workdir: Optional[str] = None
     no_agent: bool = False
+    project: Optional[str] = None
 
 class CronJobUpdate(BaseModel):
     updates: dict
