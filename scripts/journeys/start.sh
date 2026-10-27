@@ -2,16 +2,17 @@
 # Start one run of the scripted owner journeys (card P-3) as the transient user service hermes-journeys.
 # Takes the run lock without waiting, refuses while the unit is still loaded (as the release unit does,
 # hermes_cli/release_unit.py), then asks the user manager for the service with a hard time limit.
-# Refusals print one "Refused: ..." line and exit 1. Nothing retries and nothing is printed but those lines.
-# Only names and addresses of the stack travel to the unit; no secret value is ever read or passed on.
+# Refusals print one fixed "Refused: ..." line and exit 1; a failed systemd-run prints that line only, never
+# its own words. Nothing retries and nothing is printed but those lines.
+# Only the owner-named settings listed in run_once.sh travel to the unit; no secret value is ever read or passed on.
 set -euo pipefail
 umask 077
 
 UNIT=hermes-journeys.service
 RUN_MAX_SECONDS=2700
-# Names the run reads from its environment (see run_once.sh and the two scripts it calls).
-PASS_ON=(PATH HERMES_HOME JOURNEY_STACK_HOST JOURNEY_PRODUCTION_ORIGIN JOURNEY_MODEL_TOKEN_FILE
-  JOURNEY_BASE_URL JOURNEY_PAGE_TEXT JOURNEY_RUNNER_SSH)
+# Names run_once.sh reads from its environment (its header says what each is and who installs it).
+PASS_ON=(PATH HOME HERMES_HOME JOURNEY_PAGE_TEXT JOURNEY_RUNNER_SSH JOURNEY_RUNNER_ENV
+  JOURNEY_S2_SCRIPTS_DIR JOURNEY_BROWSER_CONTAINER JOURNEY_BROWSER_DIR)
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 RUN_DIR=${HERMES_HOME:-$HOME/.hermes}/journeys
@@ -46,9 +47,8 @@ done
 # The run takes the lock itself and holds it to its end, so this call lets go of it first; a second
 # start in between is refused by the user manager, which loads one unit of that name only.
 exec 9>&-
-if ! failure=$(systemd-run --user "--unit=$UNIT" --collect "--property=RuntimeMaxSec=$RUN_MAX_SECONDS" \
-  "${setenv[@]}" -- "$HERE/run_once.sh" 2>&1 > /dev/null); then
-  printf 'Refused: the unit hermes-journeys could not be started.\n%s\n' "$failure"
-  exit 1
+if ! systemd-run --user "--unit=$UNIT" --collect "--property=RuntimeMaxSec=$RUN_MAX_SECONDS" \
+  "${setenv[@]}" -- "$HERE/run_once.sh" > /dev/null 2>&1; then
+  refuse "the unit hermes-journeys could not be started."
 fi
 printf 'Started the unit hermes-journeys (time limit %s seconds).\n' "$RUN_MAX_SECONDS"
