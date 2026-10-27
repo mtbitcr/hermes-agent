@@ -12837,21 +12837,26 @@ def _find_cron_job_profile(job_id: str) -> Optional[str]:
     return None
 
 
-def _list_cron_jobs_sync(profile: str = "all"):
+def _list_cron_jobs_sync(profile: str = "all", include_project: bool = False):
     requested = (profile or "all").strip()
     if requested.lower() != "all":
-        return _call_cron_for_profile(requested, "list_jobs", True)
-
-    jobs: List[Dict[str, Any]] = []
-    for item in _cron_profile_dicts():
-        name = str(item.get("name") or "")
-        if not name:
-            continue
-        try:
-            jobs.extend(_call_cron_for_profile(name, "list_jobs", True))
-        except Exception:
-            _log.exception("Failed to list cron jobs for profile %s", name)
-    return jobs
+        jobs = _call_cron_for_profile(requested, "list_jobs", True)
+    else:
+        jobs = []
+        for item in _cron_profile_dicts():
+            name = str(item.get("name") or "")
+            if not name:
+                continue
+            try:
+                jobs.extend(_call_cron_for_profile(name, "list_jobs", True))
+            except Exception:
+                _log.exception("Failed to list cron jobs for profile %s", name)
+    if include_project:
+        return jobs
+    return [
+        {k: v for k, v in job.items() if k != "project"} if "project" in job else job
+        for job in jobs
+    ]
 
 
 def _list_cron_executions_for_profile(profile: str, limit: int) -> List[Dict[str, Any]]:
@@ -13017,8 +13022,39 @@ def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: 
 
 
 
+def _resolve_cron_project_slug(project: Optional[str]) -> Optional[str]:
+    """Return the slug of a live (known, unarchived) Project, or refuse plainly."""
+    slug = (project or "").strip()
+    if not slug:
+        return None
+    from hermes_cli import owner_workspace, projects_db
+
+    refusal = HTTPException(
+        status_code=400,
+        detail="That Project does not exist or has been archived.",
+    )
+    try:
+        slug = projects_db.normalize_slug(slug) or ""
+    except ValueError:
+        raise refusal from None
+    try:
+        committed = owner_workspace.list_committed_projects(
+            owner_workspace.resolve_owner_context()
+        )
+    except Exception:
+        _log.exception("Project lookup for POST /api/cron/jobs failed")
+        raise HTTPException(
+            status_code=503,
+            detail="Projects are unavailable right now. Try again shortly.",
+        ) from None
+    if not any(p["slug"] == slug and not p["archived"] for p in committed):
+        raise refusal
+    return slug
+
+
 def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None, idempotency_key: Optional[str] = None):
     try:
+        project_slug = _resolve_cron_project_slug(body.project)
         profile_name, profile_home = _cron_profile_home(profile)
         script = _normalize_dashboard_cron_script(body.script, profile_home)
         skills = _cron_string_list(body.skills)
@@ -13049,6 +13085,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None, id
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
             idempotency_key=idempotency_key,
+            **({"project": project_slug} if project_slug else {}),
         )
     except HTTPException:
         raise
