@@ -56,6 +56,8 @@ is_listed() {
 fmt_image='{{.Image}}'
 fmt_dest='{{range .Mounts}}{{println .Name .Destination}}{{end}}'
 fmt_state='{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'
+fmt_home='{{range .Config.Env}}{{$p := split . "="}}{{if eq (index $p 0) "HERMES_HOME"}}{{index $p 1}}{{end}}{{end}}'
+fmt_hc='{{if .Config.Healthcheck}}{{index .Config.Healthcheck.Test 0}}{{else}}NONE{{end}}'
 
 inspect() { docker inspect --type container --format "$1" "$2"; }
 
@@ -113,6 +115,16 @@ for c in "${containers[@]}"; do
 done
 ((${#missing[@]} == 0)) || die "container not found: ${missing[*]}; nothing was changed"
 
+# A container answers when its own Docker health check says healthy, so every container must have one. The
+# shipped platform image declares none, and the facts give no port or probe command for the proxy, the
+# gateway API or the browser, so this script must not invent a probe: the operator's health check is the
+# contract. A container without a configured check (kind NONE, or one that cannot be read) is refused here.
+for c in "${containers[@]}"; do
+  kind=$(inspect "$fmt_hc" "$c" 2> /dev/null) || kind=""
+  [[ $kind == CMD || $kind == CMD-SHELL ]] ||
+    die "$c has no configured Docker health check; the operator must create it with a health check; nothing was changed"
+done
+
 for c in "$app_c" "$dash_c"; do
   state=$(inspect "$fmt_state" "$c") || die "cannot read the state of $c; nothing was changed"
   [[ $state == "true "* ]] || die "$c is not running; nothing was changed"
@@ -124,12 +136,36 @@ dash_tokens=$(mount_dest "$dash_c" "$tokens_v") ||
   die "$dash_c must mount the token volume exactly once; nothing was changed"
 dash_home=$(mount_dest "$dash_c" "$home_v") ||
   die "$dash_c must mount the home volume exactly once; nothing was changed"
-mount_dest "$gate_c" "$home_v" > /dev/null ||
+gate_home=$(mount_dest "$gate_c" "$home_v") ||
   die "$gate_c must mount the home volume exactly once; nothing was changed"
-hermes_home=$(docker exec "$dash_c" printenv HERMES_HOME 2> /dev/null) ||
-  die "cannot read HERMES_HOME in $dash_c; nothing was changed"
-[[ $hermes_home == "$dash_home" ]] ||
-  die "HERMES_HOME in $dash_c is not the home volume mount; nothing was changed"
+# The configured HERMES_HOME of each container must be where it mounts the home volume, or the reset
+# would empty one directory while the container keeps its state in another. Read for a stopped one too.
+for pair in "$dash_c|$dash_home" "$gate_c|$gate_home"; do
+  hermes_home=$(inspect "$fmt_home" "${pair%%|*}") ||
+    die "cannot read HERMES_HOME of ${pair%%|*}; nothing was changed"
+  [[ $hermes_home == "${pair#*|}" ]] ||
+    die "HERMES_HOME of ${pair%%|*} is not the home volume mount; nothing was changed"
+done
+
+# read_number CONTAINER COMMAND...: one positive whole number that the command prints inside the container.
+read_number() {
+  local out
+  out=$(docker exec "$@" 2> /dev/null) || return 1
+  [[ $out =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+  printf '%s' "$out"
+}
+
+# Two identities that must never be mixed: the owner app's user, and the platform's runtime account,
+# which is whoever owns the top folder of the home inside the running dashboard (the boot hook sets it).
+app_uid=$(read_number "$app_c" id -u) ||
+  die "the user id of $app_c is not a positive number; nothing was changed"
+app_gid=$(read_number "$app_c" id -g) ||
+  die "the group id of $app_c is not a positive number; nothing was changed"
+platform_owner=$(docker exec "$dash_c" stat -c %u:%g "$dash_home" 2> /dev/null) || platform_owner=""
+[[ $platform_owner =~ ^[1-9][0-9]{0,9}:[1-9][0-9]{0,9}$ ]] ||
+  die "the owner of the home folder in $dash_c is not two positive numbers; nothing was changed"
+platform_uid=${platform_owner%%:*} platform_gid=${platform_owner##*:}
+app_id=$app_uid:$app_gid platform_id=$platform_uid:$platform_gid
 
 # token_file_name VARIABLE: the file name the owner app expects directly under its token mount.
 token_file_name() {
@@ -190,7 +226,7 @@ set -e
 find /volume -mindepth 1 -delete
 tar -xf - -C /volume
 find /volume -name env.settings -exec sh -c 'set -e; for f; do grep -v "^[[:space:]]*#" "$f" > "${f%env.settings}.env" || [ $? -eq 1 ]; chmod 600 "${f%env.settings}.env"; rm "$f"; done' sh {} +
-chown -R 1000:1000 /volume
+chown -R @PLATFORM@ /volume
 chmod go-rwx /volume
 EOF
 )
@@ -198,10 +234,20 @@ tokens_script=$(
   cat <<'EOF'
 set -e
 find /volume -mindepth 1 -delete
-chown 1000:1000 /volume
+chown @PLATFORM@ /volume
 chmod 700 /volume
 EOF
 )
+handover_script=$(
+  cat <<'EOF'
+set -e
+chown -R @APP@ /volume
+EOF
+)
+# The ids were checked above to be plain numbers.
+home_script=${home_script//@PLATFORM@/$platform_id}
+tokens_script=${tokens_script//@PLATFORM@/$platform_id}
+handover_script=${handover_script//@APP@/$app_id}
 
 changed=1
 for c in "$gate_c" "$dash_c"; do
@@ -214,13 +260,13 @@ say "emptying the home volume $home_v and writing the home from stack-home"
 tar -C "$stack_home" -cf - . | run_helper "$home_v" "$home_script" -i > /dev/null ||
   die "cannot write the home volume $home_v"
 
-# --- Make the stack-only access values inside the dashboard container, as the owner app's user.
+# --- Make the stack-only access values inside the dashboard container, as the platform's runtime account.
 say "starting $dash_c"
 docker start "$dash_c" > /dev/null || die "cannot start $dash_c"
 
 for i in "${!surfaces[@]}"; do
   say "issuing the ${surfaces[i]} token"
-  docker exec --user 1000 "$dash_c" hermes kanban-workspace-token issue \
+  docker exec --user "$platform_id" "$dash_c" hermes kanban-workspace-token issue \
     --surface "${surfaces[i]}" --out "$dash_tokens/${token_file[${surface_env[i]}]}" > /dev/null 2>&1 ||
     die "cannot issue the ${surfaces[i]} token"
 done
@@ -228,7 +274,7 @@ done
 # new_api_key ENV_FILE TOKEN_FILE: the key is made inside the container, appended to the profile's
 # .env and written to the owner app's token file there; it never reaches this script.
 new_api_key() {
-  docker exec --user 1000 "$dash_c" sh -c 'set -e
+  docker exec --user "$platform_id" "$dash_c" sh -c 'set -e
 umask 077
 key=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d " \n")
 test "${#key}" -eq 64
@@ -239,7 +285,7 @@ printf "%s\n" "$key" > "$2"' sh "$1" "$2" "$api_key_var" > /dev/null 2>&1
 # add_model_token ENV_FILE: the value goes in on standard input only.
 add_model_token() {
   printf '%s=%s\n' "$model_var" "$model_token" |
-    docker exec -i --user 1000 "$dash_c" sh -c 'cat >> "$1"' sh "$1" > /dev/null 2>&1
+    docker exec -i --user "$platform_id" "$dash_c" sh -c 'cat >> "$1"' sh "$1" > /dev/null 2>&1
 }
 
 profile_label=(default "$planner_profile")
@@ -258,6 +304,10 @@ if [[ -n $model_token ]]; then
   done
 fi
 
+# --- The owner app reads the token files as its own user; the platform account needs them no more.
+say "handing the token volume $tokens_v to the owner app"
+run_helper "$tokens_v" "$handover_script" > /dev/null || die "cannot hand the token volume $tokens_v to the owner app"
+
 # --- Restart the owner app (it keeps token values in memory) and the dashboard, start the rest.
 say "restarting $app_c so that it reads the new token files"
 docker restart "$app_c" > /dev/null || die "cannot restart $app_c"
@@ -268,11 +318,11 @@ for c in "$gate_c" "$proxy_c" "$browser_c"; do
   docker start "$c" > /dev/null || die "cannot start $c"
 done
 
-# answers CONTAINER: it runs and, when it has a health check, that check passes.
+# answers CONTAINER: it runs and its health check reports healthy; starting, unhealthy and no status are not yet.
 answers() {
   local state
   state=$(inspect "$fmt_state" "$1" 2> /dev/null) || return 1
-  [[ $state == "true none" || $state == "true healthy" ]]
+  [[ $state == "true healthy" ]]
 }
 
 # One budget of 120 seconds for all containers, polled every 2 seconds.

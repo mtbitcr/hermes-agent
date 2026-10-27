@@ -61,14 +61,18 @@ read_template
 
 # The ORDER of the template's [containers] is the role of each entry.
 mapfile -t CONTAINERS < <(names_in containers)
+mapfile -t VOLUMES < <(names_in volumes)
 mapfile -t PRODUCTION < <(names_in production-container)
 mapfile -t PRODUCTION_VAR < <(names_in production-read-variable)
-if [ "${#CONTAINERS[@]}" -ne 5 ] || [ "${#PRODUCTION[@]}" -ne 1 ] || [ "${#PRODUCTION_VAR[@]}" -ne 1 ]; then
+if [ "${#CONTAINERS[@]}" -ne 5 ] || [ "${#VOLUMES[@]}" -lt 1 ] || [ "${#PRODUCTION[@]}" -ne 1 ] ||
+  [ "${#PRODUCTION_VAR[@]}" -ne 1 ]; then
   echo "isolation_check: the template does not have the expected container entries" >&2
   exit 2
 fi
 PROXY_C=${CONTAINERS[0]}
+DASH_C=${CONTAINERS[2]}
 GATE_C=${CONTAINERS[3]}
+HOME_V=${VOLUMES[0]}
 PROD_C=${PRODUCTION[0]}
 PROD_VAR=${PRODUCTION_VAR[0]}
 
@@ -103,6 +107,8 @@ require_stack_host() {
 F_IMAGE='{{.Image}}'
 F_ENV_NAMES='{{range .Config.Env}}{{println (index (split . "=") 0)}}{{end}}'
 F_MOUNT_TYPES='{{range .Mounts}}{{println .Type .Name}}{{end}}'
+F_MOUNT_DEST='{{range .Mounts}}{{println .Name .Destination}}{{end}}'
+F_HERMES_HOME='{{range .Config.Env}}{{$p := split . "="}}{{if eq (index $p 0) "HERMES_HOME"}}{{index $p 1}}{{end}}{{end}}'
 
 DK_OUT=""
 DK_RC=0
@@ -126,6 +132,34 @@ has_line() {
     *$'\n'"$2"$'\n'*) return 0 ;;
   esac
   return 1
+}
+
+# check_hermes_home NAME: the HERMES_HOME that the container is configured with is where it mounts the home
+# volume, so that the home this script reads is the home that the reset emptied.
+check_hermes_home() {
+  local c=$1 configured dest="" name where count=0
+  dk inspect --type container --format "$F_HERMES_HOME" "$c"
+  if [ "$DK_RC" -ne 0 ]; then
+    add_problem "the HERMES_HOME of $c cannot be read"
+    return 0
+  fi
+  configured=$DK_OUT
+  dk inspect --type container --format "$F_MOUNT_DEST" "$c"
+  if [ "$DK_RC" -ne 0 ]; then
+    add_problem "the mounts of $c cannot be read"
+    return 0
+  fi
+  while read -r name where; do
+    if [ "$name" = "$HOME_V" ]; then
+      dest=$where
+      count=$((count + 1))
+    fi
+  done <<<"$DK_OUT"
+  if [ "$count" -ne 1 ]; then
+    add_problem "container $c does not mount the home volume exactly once"
+  elif [ "$configured" != "$dest" ]; then
+    add_problem "the HERMES_HOME of $c is not where it mounts the home volume"
+  fi
 }
 
 # check_container NAME: the container exists, sets no variable name beyond its image's own names and the
@@ -166,6 +200,9 @@ check_container() {
       add_problem "container $c mounts the volume $vol, which is not on the template"
     fi
   done <<<"$DK_OUT"
+  case "$c" in
+    "$DASH_C" | "$GATE_C") check_hermes_home "$c" ;;
+  esac
 }
 
 # Runs in the gateway container. Prints "<profile> <NAME>" for each line of each settings file in the
@@ -221,11 +258,14 @@ check_names_on_template() {
     check_container "$c"
   done
   check_home_env_names
+  check_served_profiles
   verdict names-on-template
 }
 
-# The platform home's two profiles: the default one and the planner.
-PROFILES=(default raphael-planner)
+# The profiles that the stack permits. The profiles to check are these two plus any other profile that the
+# platform serves (check_served_profiles).
+PERMITTED=(default raphael-planner)
+PROFILES=("${PERMITTED[@]}")
 
 # Runs in the gateway container: $1 names the profile, whose folder becomes the platform home.
 PROFILE_SH='
@@ -275,6 +315,91 @@ profile_read() {
   dk exec -i "$GATE_C" sh -c "$PROFILE_SH$FIND_PY_SH" sh "$1" <<<"$2"
 }
 
+# in_list WORD ITEM...: succeeds when WORD is one of the items.
+in_list() {
+  local want=$1 item
+  shift
+  for item in "$@"; do
+    if [ "$item" = "$want" ]; then return 0; fi
+  done
+  return 1
+}
+
+# The platform's own enumeration of the profiles its gateway serves, as the gateway calls it (multiplex on,
+# no allowlist). A name that is not plain is printed as "?", so that no odd name reaches a shell.
+SERVED_PY='import re
+from hermes_cli.profiles import profiles_to_serve
+for name, _home in profiles_to_serve(True):
+    print("served", name if re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name) else "?")
+'
+
+# Runs in the gateway container: one line for every entry of the profiles folder of the platform home, of any
+# kind and dot names too, with a name that has an odd character printed as "?".
+ENTRIES_SH='
+[ -n "${HERMES_HOME-}" ] || exit 3
+if [ ! -e "$HERMES_HOME/profiles" ] && [ ! -L "$HERMES_HOME/profiles" ]; then exit 0; fi
+[ -d "$HERMES_HOME/profiles" ] && [ -r "$HERMES_HOME/profiles" ] || exit 4
+for e in "$HERMES_HOME"/profiles/* "$HERMES_HOME"/profiles/.[!.]* "$HERMES_HOME"/profiles/..?*; do
+  [ -e "$e" ] || [ -L "$e" ] || continue
+  n=${e##*/}
+  case "$n" in *[!A-Za-z0-9._-]*) n="?" ;; esac
+  printf "entry %s\n" "$n"
+done
+'
+
+# Sets PROFILES for the checks below and adds to PROBLEMS: any served profile beyond the two permitted ones,
+# and any entry of the profiles folder other than the planner (even one the enumeration skips), is a problem
+# that names it. When the enumeration cannot be read the two permitted profiles are checked.
+check_served_profiles() {
+  local line name seen_default=0 odd=0
+  local -a extra=()
+  PROFILES=("${PERMITTED[@]}")
+  profile_read default "$SERVED_PY"
+  if [ "$DK_RC" -ne 0 ]; then
+    add_problem "the served profiles cannot be read"
+  else
+    while IFS= read -r line; do
+      case "$line" in
+        "served ?") odd=$((odd + 1)) ;;
+        "served "*)
+          name=${line#served }
+          if [ "$name" = default ]; then seen_default=1; fi
+          if [[ $name =~ ^[a-z0-9][a-z0-9_-]*$ ]] && ! in_list "$name" "${PERMITTED[@]}"; then
+            extra+=("$name")
+          fi
+          ;;
+      esac
+    done <<<"$DK_OUT"
+    if [ "$seen_default" -ne 1 ]; then
+      add_problem "the served profiles cannot be read"
+    fi
+    if [ "$odd" -gt 0 ]; then
+      add_problem "the platform serves a profile whose name is not plain, which is not a stack profile"
+    fi
+    for name in "${extra[@]+"${extra[@]}"}"; do
+      [ -n "$name" ] || continue
+      add_problem "profile $name is served, which is not a stack profile"
+      PROFILES+=("$name")
+    done
+  fi
+  dk exec "$GATE_C" sh -c "$ENTRIES_SH"
+  if [ "$DK_RC" -ne 0 ]; then
+    add_problem "the profiles folder of the platform home cannot be read"
+    return 0
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      "entry ?") add_problem "the profiles folder holds an entry whose name is not plain, which is not a stack profile" ;;
+      "entry "*)
+        name=${line#entry }
+        if [ "$name" != raphael-planner ] && ! in_list "$name" "${extra[@]+"${extra[@]}"}"; then
+          add_problem "the profiles folder holds the entry $name, which is not a stack profile"
+        fi
+        ;;
+    esac
+  done <<<"$DK_OUT"
+}
+
 DISPATCH_PY='from hermes_cli.config import load_config
 kanban = load_config().get("kanban") or {}
 print("dispatcher", "off" if kanban.get("dispatch_in_gateway") is False else "on")
@@ -301,7 +426,7 @@ check_cron_lists_empty() {
   local p
   PROBLEMS=""
   for p in "${PROFILES[@]}"; do
-    dk exec "$GATE_C" sh -c "${PROFILE_SH}exec hermes cron list" sh "$p"
+    dk exec "$GATE_C" sh -c "${PROFILE_SH}exec hermes cron list --all" sh "$p"
     if [ "$DK_RC" -ne 0 ]; then
       add_problem "the cron job list of profile $p cannot be read"
     elif [ "$DK_OUT" != "$EMPTY_CRON" ]; then

@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 from pathlib import Path
 from typing import NamedTuple
 
@@ -54,6 +55,9 @@ DECOY_CONTAINERS = [
 DECOY_VOLUMES = ["raphael-s2-state", "raphael-s2-state-prod", "raphael-s2-pw"]
 # Profile folder names are platform data, not container or volume names.
 NOT_RESOURCE_NAMES = {"raphael-planner"}
+
+# Bytecode of the platform modules that the fake runs for real is cached here (compiling them takes seconds).
+REAL_PYC = Path(tempfile.gettempdir()) / f"journeys-stack-pyc-{os.getuid()}"
 
 STACK_HOST = "journeys-host.invalid"
 PROD_ORIGIN = "https://prod.example.invalid"
@@ -170,12 +174,86 @@ exec(VIEW_SOURCE, _view_namespace)
 write_view = _view_namespace["write_view"]
 
 FAKE_COMMON = r'''
-import json, os, re, sys, time
+import json, os, re, stat, sys, time
 from pathlib import Path
 
 ROOT = Path(os.environ["FAKE_HOST_ROOT"])
 STATE = ROOT / "state.json"
 LOG = ROOT / "calls.jsonl"
+OWNERS = ROOT / "owners.json"
+
+
+# The fake keeps who owns each entry of a volume in owners.json ("volume/relative/path" -> [uid, gid];
+# the folder itself is "volume"), next to the real mode bits of the temporary files. An entry that is
+# not listed belongs to root. A non-root user reaches a path only as the owner, group and other bits allow.
+def load_owners():
+    return json.loads(OWNERS.read_text()) if OWNERS.exists() else {}
+
+
+def save_owners(table):
+    tmp = OWNERS.with_name("owners.json.tmp")
+    tmp.write_text(json.dumps(table))
+    os.replace(tmp, OWNERS)
+
+
+def owner_key(path):
+    try:
+        return str(Path(os.path.abspath(path)).relative_to(ROOT / "volumes"))
+    except ValueError:
+        return None
+
+
+def owner_in(table, path):
+    return list(table.get(owner_key(path), [0, 0]))
+
+
+def tree_of(path):
+    found = [str(path)]
+    for base, dirs, files in os.walk(path):
+        found += [os.path.join(base, name) for name in dirs + files]
+    return found
+
+
+def bits_for(uid, gid, path, table):
+    mode = stat.S_IMODE(os.lstat(path).st_mode)
+    owner_uid, owner_gid = owner_in(table, path)
+    if uid == owner_uid:
+        return (mode >> 6) & 7
+    if gid == owner_gid:
+        return (mode >> 3) & 7
+    return mode & 7
+
+
+def reach(uid, gid, path, need, table=None):
+    """4 read, 2 write, 1 search: every folder above the path inside its volume needs search."""
+    if uid == 0 or owner_key(path) is None:
+        return True
+    table = load_owners() if table is None else table
+    path = Path(os.path.abspath(path))
+    top = ROOT / "volumes" / owner_key(path).split("/")[0]
+    above = [p for p in reversed(path.parents) if p == top or top in p.parents]
+    if not path.exists() and need & 2 and path.parent.exists():
+        return reach(uid, gid, path.parent, 3, table)
+    if not all(bits_for(uid, gid, p, table) & 1 for p in above):
+        return False
+    return not path.exists() or bits_for(uid, gid, path, table) & need == need
+
+
+def tool_chown(argv):
+    with open(ROOT / "chown.log", "a") as handle:
+        handle.write(" ".join(argv) + "\n")
+    args = list(argv)
+    recursive = args[:1] == ["-R"]
+    if recursive:
+        args = args[1:]
+    uid_text, _, gid_text = args[0].partition(":")
+    table = load_owners()
+    for path in args[1:]:
+        for target in (tree_of(path) if recursive else [path]):
+            if owner_key(target):
+                table[owner_key(target)] = [int(uid_text), int(gid_text)]
+    save_owners(table)
+    return 0
 
 
 def load():
@@ -286,6 +364,9 @@ F_ENV_NAMES = '{{range .Config.Env}}{{println (index (split . "=") 0)}}{{end}}'
 F_MOUNT_TYPES = "{{range .Mounts}}{{println .Type .Name}}{{end}}"
 F_MOUNT_DEST = "{{range .Mounts}}{{println .Name .Destination}}{{end}}"
 F_STATE = "{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}"
+F_HERMES_HOME = ('{{range .Config.Env}}{{$p := split . "="}}{{if eq (index $p 0) "HERMES_HOME"}}'
+                 '{{index $p 1}}{{end}}{{end}}')
+F_HEALTH_KIND = "{{if .Config.Healthcheck}}{{index .Config.Healthcheck.Test 0}}{{else}}NONE{{end}}"
 
 FAKE_DOCKER = r'''
 
@@ -342,6 +423,13 @@ def d_inspect(argv, args):
         out = "".join("%s %s\n" % (m["type"], m.get("name", "")) for m in entry["mounts"])
     elif fmt == F_MOUNT_DEST and kind == "container":
         out = "".join("%s %s\n" % (m.get("name", ""), m["dest"]) for m in entry["mounts"])
+    elif fmt == F_HERMES_HOME and kind == "container":
+        out = "".join(item.partition("=")[2] for item in entry["env"] if item.startswith("HERMES_HOME=")) + "\n"
+    elif fmt == F_HEALTH_KIND and kind == "container":
+        test = entry.get("healthcheck")  # the configured Healthcheck.Test: absent, empty or [kind, ...]
+        if test is not None and not test:
+            return finish(seq, 1, err=b"template: index out of range: 0\n")
+        out = (test[0] if test else "NONE") + "\n"
     elif fmt == F_STATE and kind == "container":
         health = entry.get("health") or "none"
         if entry.get("starting_polls", 0) > 0 and entry.get("health"):
@@ -352,6 +440,41 @@ def d_inspect(argv, args):
     else:
         return finish(seq, 97, err=b"fake docker: format not supported by the fake\n")
     return finish(seq, 0, (out + "\n").encode())
+
+
+BOOT_SUBS = ["cron", "sessions", "logs", "hooks", "memories", "skills", "skins", "plans", "workspace",
+             "home", "profiles", "pairing", "platforms/pairing", "lazy-packages"]
+
+
+def boot_ownership(entry):
+    """The image's boot hook (docker/stage2-hook.sh): at every start the home goes to the runtime account."""
+    runtime = entry.get("runtime")
+    value = dict(item.partition("=")[::2] for item in entry["env"]).get("HERMES_HOME")
+    if not runtime or not value:
+        return
+    home = Path(map_text(value, mount_pairs(entry)))
+    if owner_key(home) is None or not home.is_dir():
+        return
+    table, want = load_owners(), list(runtime)
+
+    def differs(path):
+        return any(owner_in(table, item) != want for item in tree_of(path))
+
+    def give(path):
+        for item in tree_of(path):
+            table[owner_key(item)] = want
+
+    if owner_in(table, home)[0] != want[0]:
+        table[owner_key(home)] = want
+        for sub in BOOT_SUBS:
+            if (home / sub).exists() and differs(home / sub):
+                give(home / sub)
+    if (home / "profiles").is_dir() and differs(home / "profiles"):
+        give(home / "profiles")
+    for name in (".env", "config.yaml"):
+        if (home / name).is_file() and not (home / name).is_symlink():
+            table[owner_key(home / name)] = want
+    save_owners(table)
 
 
 def d_lifecycle(argv, sub, args):
@@ -369,6 +492,7 @@ def d_lifecycle(argv, sub, args):
     if entry.get("fails_to_start"):
         return finish(seq, 1, err=b"Error: cannot start container\n")
     entry["running"] = not entry.get("stays_down")
+    boot_ownership(entry)
     if sub == "restart" and entry.get("health"):
         entry["starting_polls"] = entry.get("health_delay", 0)
     save(state)
@@ -383,8 +507,8 @@ def unmap(data, pairs):
     return text.encode()
 
 
-def container_env(entry, pairs):
-    env = {"PATH": "%s:%s:%s:/usr/bin:/bin" % (ROOT / "ctr" / "shim", ROOT / "ctr" / "venv",
+def container_env(entry, pairs, uid=0, gid=0):
+    env = {"FAKE_EXEC_UID": str(uid), "FAKE_EXEC_GID": str(gid), "PATH": "%s:%s:%s:/usr/bin:/bin" % (ROOT / "ctr" / "shim", ROOT / "ctr" / "venv",
                                                ROOT / "ctr" / "bin"),
            "FAKE_HOST_ROOT": str(ROOT), "PYTHONPATH": str(ROOT / "ctr" / "pkgs"),
            "PYTHONDONTWRITEBYTECODE": "1", "HOME": str(ROOT / "ctr" / "home")}
@@ -393,6 +517,20 @@ def container_env(entry, pairs):
         if key != "PATH":
             env[key] = map_text(value, pairs)
     return env
+
+
+def parse_user(text):
+    uid_text, _, gid_text = text.partition(":")
+    if not uid_text.isdigit() or (gid_text and not gid_text.isdigit()):
+        return None
+    return int(uid_text), int(gid_text or 0)  # docker: an id without a passwd entry gets group 0
+
+
+def redirect_targets(local):
+    """Paths that a `sh -c` script writes with > or >> to "$N" (N counts from the first argument)."""
+    if local[:2] != ["sh", "-c"] or len(local) < 3:
+        return []
+    return [local[3 + int(n)] for n in re.findall(r'>>?\s*"\$(\d)"', local[2]) if 3 + int(n) < len(local)]
 
 
 def d_exec(argv, args):
@@ -418,15 +556,38 @@ def d_exec(argv, args):
     if cmd[0] == "printenv" and len(cmd) == 2:
         value = dict(item.partition("=")[::2] for item in entry["env"]).get(cmd[1])
         return finish(seq, 1) if value is None else finish(seq, 0, (value + "\n").encode())
+    who = parse_user(user) if user is not None else tuple(entry.get("user", [0, 0]))
+    if who is None:
+        return finish(seq, 126, err=b"Error response from daemon: unable to find user: only numbers are modelled\n")
+    uid, gid = who
     pairs = mount_pairs(entry)
     local = [map_text(part, pairs) for part in cmd]
+    said = entry.get("answers", {}).get(" ".join(cmd))
+    if said is not None:
+        return finish(seq, 0, said.encode() + (b"\n" if said else b""))
+    if cmd in (["id", "-u"], ["id", "-g"]):
+        return finish(seq, 0, ("%d\n" % (uid if cmd[1] == "-u" else gid)).encode())
+    if cmd[:3] == ["stat", "-c", "%u:%g"] and len(cmd) == 4:
+        if not Path(local[3]).exists():
+            return finish(seq, 1, err=("stat: cannot statx '%s': No such file or directory\n" % cmd[3]).encode())
+        return finish(seq, 0, ("%d:%d\n" % tuple(owner_in(load_owners(), local[3]))).encode())
+    targets = redirect_targets(local)
+    for path in targets:
+        if not reach(uid, gid, path, 2):
+            return finish(seq, 2, err=("sh: 1: cannot create %s: Permission denied\n" % cmd[local.index(path)]).encode())
+    existing = {path for path in targets if Path(path).exists()}
     if local[0] in ("python3", "python"):
         local[0] = sys.executable
     try:
         done = subprocess.run(local, input=stdin_bytes or b"", capture_output=True,
-                              env=container_env(entry, pairs), cwd=str(ROOT / "ctr" / "home"))
+                              env=container_env(entry, pairs, uid, gid), cwd=str(ROOT / "ctr" / "home"))
     except FileNotFoundError:
         return finish(seq, 127, err=b"exec: command not found\n")
+    table = load_owners()
+    for path in targets:
+        if path not in existing and Path(path).exists() and owner_key(path):
+            table[owner_key(path)] = [uid, gid]
+    save_owners(table)
     return finish(seq, done.returncode, unmap(done.stdout, pairs), unmap(done.stderr, pairs))
 
 
@@ -477,7 +638,13 @@ EMPTY_CRON = ("No scheduled jobs.\n"
 SURFACES = {"workspace", "recommendations", "connections", "automations", "models"}
 
 
+def refused(message):
+    print("error: " + message)
+    return 2
+
+
 def issue_token(args):
+    """The checks of token_store's plaintext output writer and of the audit log, for the exec identity."""
     opts, i = {}, 0
     while i < len(args):
         if args[i] in ("--surface", "--out", "--ttl-days", "--ttl-hours") and i + 1 < len(args):
@@ -488,26 +655,58 @@ def issue_token(args):
     surface, out = opts.get("--surface"), opts.get("--out")
     if surface not in SURFACES or not out:
         return 2
+    uid, gid = int(os.environ.get("FAKE_EXEC_UID", "0")), int(os.environ.get("FAKE_EXEC_GID", "0"))
+    table = load_owners()
+    logs = Path(os.environ["HERMES_HOME"]) / "logs"
+    if not reach(uid, gid, logs if logs.exists() else logs.parent, 2 if logs.exists() else 3, table):
+        return refused("dashboard-auth audit log write failed: [Errno 13] Permission denied: %s" % logs)
     if load().get("hermes", {}).get("issue_fail") == surface:
-        sys.stderr.write("fake hermes: issue failed\n")
-        return 1
-    parent = Path(out).parent
-    if not parent.is_dir() or stat.S_IMODE(parent.stat().st_mode) & 0o077:
-        sys.stderr.write("fake hermes: parent folder must exist and be owner-only\n")
-        return 1
-    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        return refused("issue failed")
+    path = Path(out)
+    parent = path.parent
+    if parent.is_symlink() or not parent.is_dir():
+        return refused("parent directory %s must be an existing non-symlink directory" % parent)
+    if not reach(uid, gid, parent, 0, table):
+        return refused("parent directory %s cannot be read: [Errno 13] Permission denied" % parent)
+    if owner_in(table, parent)[0] != uid:
+        return refused("parent directory %s is not owned by the current user" % parent)
+    mode = stat.S_IMODE(parent.stat().st_mode)
+    if mode != 0o700:
+        return refused("parent directory %s is not owner-only (mode 0o%o) - mode must be exactly 0o700"
+                       % (parent, mode))
+    if path.exists() or path.is_symlink():
+        return refused("%s already exists - refusing to overwrite it" % path)
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w") as handle:
         handle.write("tok-%s-%s" % (surface, os.urandom(12).hex()))
     os.chmod(out, 0o600)
+    table[owner_key(path)] = [uid, gid]
+    save_owners(table)
     print("issued surface=%s" % surface)
     return 0
+
+
+CRON_LIST_PROGRAM = "import sys\nfrom hermes_cli.cron import cron_list\ncron_list(sys.argv[1] == '1')\n"
+
+
+def real_platform(program, *argv):
+    """Runs a program on the platform's own modules: the repository on PYTHONPATH, this folder as the home."""
+    import subprocess
+    env = {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "HERMES_HOME": os.environ["HERMES_HOME"],
+           "PYTHONPATH": REPO_ROOT, "PYTHONPYCACHEPREFIX": REAL_PYC, "AWS_EC2_METADATA_DISABLED": "true"}
+    return subprocess.run([sys.executable, "-c", program, *argv], env=env, capture_output=True, text=True)
 
 
 def hermes_main(args):
     spec = load().get("hermes", {})
     home = Path(os.environ["HERMES_HOME"])
+    if args[:2] == ["cron", "list"] and spec.get("real_platform"):
+        done = real_platform(CRON_LIST_PROGRAM, "1" if "--all" in args[2:] else "0")
+        sys.stdout.write(done.stdout)
+        return done.returncode
     if args[:2] == ["cron", "list"]:
-        profile = "planner" if home.name == "raphael-planner" else "default"
+        profile = "default" if home.parent.name != "profiles" else (
+            "planner" if home.name == "raphael-planner" else home.name)
         jobs = spec.get("cron_jobs", {}).get(profile, [])
         sys.stdout.write(EMPTY_CRON if not jobs else "".join("%s\n" % job for job in jobs))
         return spec.get("cron_rc", 0)
@@ -527,7 +726,7 @@ def hermes_main(args):
 
 def main():
     tools = {"docker": tool_docker, "hostname": tool_hostname, "sleep": tool_sleep,
-             "curl": tool_curl}
+             "curl": tool_curl, "chown": tool_chown}
     sys.exit(tools[sys.argv[1]](sys.argv[2:]))
 
 
@@ -539,7 +738,9 @@ FAKE_TOOLS_SOURCE = (
     FAKE_COMMON
     + VIEW_SOURCE
     + "".join("%s = %r\n" % (n, globals()[n])
-              for n in ("F_IMAGE", "F_ENV_NAMES", "F_MOUNT_TYPES", "F_MOUNT_DEST", "F_STATE"))
+              for n in ("F_IMAGE", "F_ENV_NAMES", "F_MOUNT_TYPES", "F_MOUNT_DEST", "F_STATE",
+                        "F_HERMES_HOME", "F_HEALTH_KIND"))
+    + "REPO_ROOT = %r\nREAL_PYC = %r\n" % (str(REPO), str(REAL_PYC))
     + FAKE_DOCKER
     + FAKE_PLATFORM
 )
@@ -566,6 +767,29 @@ def load_config():
         config.update({k: v for k, v in user.items() if k != "kanban"})
     return config
 ''',
+    "hermes_cli/profiles.py": '''
+import json, os, subprocess, sys
+from pathlib import Path
+
+PROGRAM = ("import json, sys\\nfrom hermes_cli.profiles import profiles_to_serve\\n"
+           "print(json.dumps([[n, str(p)] for n, p in profiles_to_serve(True, json.loads(sys.argv[1]))]))\\n")
+
+
+def profiles_to_serve(multiplex, profile_allowlist=None):
+    """The platform's own enumeration, run on its real modules with this home."""
+    state = json.loads((Path(os.environ["FAKE_HOST_ROOT"]) / "state.json").read_text())
+    if state.get("hermes", {}).get("serve_fail"):
+        raise RuntimeError("the enumeration cannot be read")
+    env = {"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "HERMES_HOME": os.environ["HERMES_HOME"],
+           "PYTHONPATH": @REPO@, "PYTHONPYCACHEPREFIX": @PYC@}
+    done = subprocess.run([sys.executable, "-c", PROGRAM, json.dumps(profile_allowlist)], env=env,
+                          capture_output=True, text=True)
+    if done.returncode:
+        raise RuntimeError("the enumeration failed")
+    served = [(name, Path(home)) for name, home in json.loads(done.stdout)]
+    return served + [(name, Path(os.environ["HERMES_HOME"]) / "profiles" / name)
+                     for name in state.get("hermes", {}).get("serve_extra", [])]
+'''.replace("@REPO@", repr(str(REPO))).replace("@PYC@", repr(str(REAL_PYC))),
     "hermes_cli/send_cmd.py": '''
 import os
 from pathlib import Path
@@ -696,6 +920,7 @@ F_ENV_NAMES=@F_ENV_NAMES@
 F_MOUNT_TYPES=@F_MOUNT_TYPES@
 F_MOUNT_DEST=@F_MOUNT_DEST@
 F_STATE=@F_STATE@
+F_HERMES_HOME=@F_HERMES_HOME@
 [ -f "$FAKE_HOST_ROOT/state.sh" ] || slow "$@"
 . "$FAKE_HOST_ROOT/state.sh"
 for arg; do plain "$arg" || slow "$@"; done
@@ -704,7 +929,7 @@ out="" err="" rc=0
 if [ "$#" -eq 6 ] && [ "$1" = inspect ] && [ "$2" = --type ] && [ "$4" = --format ] && [[ $6 =~ $name_ok ]]; then
   kind=$3 fmt=$5 name=$6
   if [ "$kind" = container ]; then
-    case $fmt in "$F_IMAGE" | "$F_ENV_NAMES" | "$F_MOUNT_TYPES" | "$F_MOUNT_DEST" | "$F_STATE") ;; *) slow "$@" ;; esac
+    case $fmt in "$F_IMAGE" | "$F_ENV_NAMES" | "$F_MOUNT_TYPES" | "$F_MOUNT_DEST" | "$F_STATE" | "$F_HERMES_HOME") ;; *) slow "$@" ;; esac
     if [[ ! -v IMG[$name] ]]; then
       rc=1 err="Error: No such container: $name"$'\n'
     else
@@ -713,6 +938,12 @@ if [ "$#" -eq 6 ] && [ "$1" = inspect ] && [ "$2" = --type ] && [ "$4" = --forma
         "$F_ENV_NAMES") out=${ENVN[$name]} ;;
         "$F_MOUNT_TYPES") out=${MTYPES[$name]} ;;
         "$F_MOUNT_DEST") out=${MDEST[$name]} ;;
+        "$F_HERMES_HOME")
+          value=""
+          while IFS= read -r line; do
+            if [[ $line == HERMES_HOME=* ]]; then value+=${line#*=}; fi
+          done <<<"${ENVL[$name]}"
+          out=$value$'\n' ;;
         "$F_STATE")
           health=${HEALTH[$name]} polls=${POLLS[$name]}
           if [ -f "$FAKE_HOST_ROOT/polls/$name" ]; then read -r polls < "$FAKE_HOST_ROOT/polls/$name"; fi
@@ -794,7 +1025,7 @@ class Host:
         self._exe(root / "bin/hostname", HOSTNAME_SH)
         self._exe(root / "bin/sleep", SLEEP_SH)
         docker = DOCKER_SH.replace("@PYEXE@", quote(sys.executable))
-        for name in ("F_IMAGE", "F_ENV_NAMES", "F_MOUNT_TYPES", "F_MOUNT_DEST", "F_STATE"):
+        for name in ("F_IMAGE", "F_ENV_NAMES", "F_MOUNT_TYPES", "F_MOUNT_DEST", "F_STATE", "F_HERMES_HOME"):
             docker = docker.replace(f"@{name}@", quote(globals()[name]))
         self._exe(root / "bin/docker", docker)
         # Like the published image: a /bin/sh shim sits first on PATH and runs the venv binary,
@@ -806,7 +1037,7 @@ class Host:
                   f"#!{root}/ctr/venv/python\nimport os, sys\nsys.path.insert(0, os.environ['FAKE_HOST_ROOT'])\n"
                   "import fake_tools\nsys.exit(fake_tools.hermes_main(sys.argv[1:]))\n")
         self._exe(root / "ctr/bin/chown",
-                  '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$FAKE_HOST_ROOT/chown.log"\nexit 0\n')
+                  f'#!/bin/sh\nexec {quote(sys.executable)} -S -E "$FAKE_HOST_ROOT/fake_tools.py" chown "$@"\n')
 
     def _build(self) -> None:
         root = self.root
@@ -829,6 +1060,7 @@ class Host:
         state = self._initial_state()
         (root / "state.json").write_text(json.dumps(state))
         write_view(state, root)
+        self.set_identities((1000, 1000), (10000, 10000))
 
     @staticmethod
     def _initial_state() -> dict:
@@ -850,19 +1082,25 @@ class Host:
         def vol(name, dest):
             return {"type": "volume", "name": name, "dest": dest}
 
+        checked = {"healthcheck": ["CMD-SHELL", "probe"], "health": "healthy"}
+
         def box(image, env, mounts, **extra):
-            return {"image": image, "env": img[image] + env, "mounts": mounts, "running": True, **extra}
+            own = {item.partition("=")[0] for item in env}  # like docker: the container's value replaces the image's
+            merged = [item for item in img[image] if item.partition("=")[0] not in own] + env
+            return {"image": image, "env": merged, "mounts": mounts, "running": True, **extra}
 
         containers = {
-            PROXY_C: box("sha256:img-proxy", ["SYNTHETIC_STATE=/state"], [vol(PROXY_V, "/state")]),
-            APP_C: box("sha256:img-app", app_env, [vol(TOKENS_V, "/run/tokens")]),
+            PROXY_C: box("sha256:img-proxy", ["SYNTHETIC_STATE=/state"], [vol(PROXY_V, "/state")], **checked),
+            APP_C: box("sha256:img-app", app_env, [vol(TOKENS_V, "/run/tokens")], user=[1000, 1000], **checked),
             DASH_C: box("sha256:img-hermes", ["HERMES_HOME=/opt/data"],
                         [vol(HOME_V, "/opt/data"), vol(TOKENS_V, "/tokens")],
-                        health="healthy", health_delay=1),
-            GATE_C: box("sha256:img-hermes", ["HERMES_HOME=/opt/data"], [vol(HOME_V, "/opt/data")]),
+                        health_delay=1, runtime=[10000, 10000], **checked),
+            GATE_C: box("sha256:img-hermes", ["HERMES_HOME=/opt/data"], [vol(HOME_V, "/opt/data")],
+                        runtime=[10000, 10000], **checked),
             BROWSER_C: box("sha256:img-browser",
                            ["JOURNEY_BASE_URL=https://workspace.synthetic.test",
-                            f"JOURNEY_PRODUCTION_ORIGIN={PROD_ORIGIN}", "PLAYWRIGHT_BROWSERS_PATH=/pw"], []),
+                            f"JOURNEY_PRODUCTION_ORIGIN={PROD_ORIGIN}", "PLAYWRIGHT_BROWSERS_PATH=/pw"], [],
+                           **checked),
             PROD_C: box("sha256:img-prod", [f"RAPHAEL_ACCESS_ISSUER={PROD_ISSUER}"], []),
         }
         for name in DECOY_CONTAINERS:
@@ -875,6 +1113,29 @@ class Host:
             "curl": {"code": 403, "redirect": "", "rc": 0},
             "hermes": {"cron_jobs": {}, "send_rc": 1, "cron_rc": 0},
         }
+
+    # --- who owns what in the fake volumes
+    def set_identities(self, app: tuple[int, int], platform: tuple[int, int]) -> None:
+        """The app user, the platform's runtime account, and the old volumes as the last boot left them."""
+        def mutate(state: dict) -> None:
+            state["containers"][APP_C]["user"] = list(app)
+            for name in (DASH_C, GATE_C):
+                state["containers"][name]["runtime"] = list(platform)
+        if (self.root / "state.json").exists():
+            self.update(mutate)
+        owners = {}
+        for volume, who in ((HOME_V, platform), (TOKENS_V, app)):
+            for path in [self.vol(volume), *self.vol(volume).rglob("*")]:
+                owners[str(path.relative_to(self.root / "volumes"))] = list(who)
+        (self.root / "owners.json").write_text(json.dumps(owners))
+
+    def owners(self) -> dict[str, list[int]]:
+        return json.loads((self.root / "owners.json").read_text())
+
+    def owner_of(self, path: Path) -> tuple[int, int]:
+        """Modelled owner (uid, gid) of an entry of a volume; entries that are not listed belong to root."""
+        found = self.owners().get(str(path.relative_to(self.root / "volumes")), [0, 0])
+        return found[0], found[1]
 
     # --- reading and changing the fake host
     def state(self) -> dict:
@@ -987,6 +1248,12 @@ def test_template_leaves_out_github_and_page_check_names():
     assert not every_name & {"RAPHAEL_GITHUB_APP_ID", "RAPHAEL_GITHUB_INSTALLATION_ID",
                              "RAPHAEL_GITHUB_PRIVATE_KEY_FILE", "RAPHAEL_PAGE_CHECK_COMMON_NAME"}
     assert not every_name & (set(DECOY_CONTAINERS) | set(DECOY_VOLUMES))
+
+
+def test_template_says_in_one_comment_line_that_every_container_needs_a_health_check():
+    lines = [line for line in TEMPLATE.read_text().splitlines() if "health check" in line.lower()]
+    assert len(lines) == 1 and lines[0].startswith("#"), lines
+    assert "docker" in lines[0].lower() and "every container" in lines[0].lower()
 
 
 def test_stack_home_sets_what_the_facts_say():
@@ -1177,14 +1444,71 @@ def test_reset_refuses_when_a_container_lacks_the_token_volume(host: Host, who: 
     assert_nothing_changed(host, before)
 
 
-def test_reset_refuses_when_hermes_home_is_not_the_home_mount(host: Host):
+def set_hermes_home(who: str, value: str):
     def mutate(state: dict) -> None:
-        box = state["containers"][DASH_C]
-        box["env"] = ["HERMES_HOME=/somewhere/else" if e.startswith("HERMES_HOME=") else e for e in box["env"]]
-    host.update(mutate)
+        box = state["containers"][who]
+        box["env"] = [f"HERMES_HOME={value}" if e.startswith("HERMES_HOME=") else e for e in box["env"]]
+    return mutate
+
+
+@pytest.mark.parametrize("value", ["/somewhere/else", "/opt/data/", "/opt/dat"])
+@pytest.mark.parametrize("who", [DASH_C, GATE_C])
+def test_reset_refuses_when_hermes_home_is_not_the_home_mount(host: Host, who: str, value: str):
+    host.update(set_hermes_home(who, value))
     before = snapshot(host)
     result = run_reset(host)
     assert result.returncode != 0
+    assert who in result.stderr and "nothing was changed" in result.stderr
+    assert_nothing_changed(host, before)
+
+
+def test_reset_refuses_a_gateway_home_that_is_another_directory_with_a_stale_state(host: Host):
+    other = host.root / "gateway-own-filesystem" / "data"
+    shutil.copytree(STACK_HOME, other)
+    (other / ".env").write_text("API_SERVER_KEY=stale-gateway-key-0123456789abcdef\n")
+    (other / "stale-state.db").write_text("sentinel rows that must stay\n")
+    host.update(set_hermes_home(GATE_C, str(other)))
+    before, stale = snapshot(host), sha_tree(other)
+    result = run_reset(host)
+    assert result.returncode != 0
+    assert GATE_C in result.stderr and "nothing was changed" in result.stderr
+    assert_nothing_changed(host, before)
+    assert sha_tree(other) == stale and (other / "stale-state.db").read_text() == "sentinel rows that must stay\n"
+
+
+def test_reset_reads_hermes_home_of_both_containers_with_one_inspect_format(shared_reset: SharedReset):
+    calls = shared_reset.host.calls("docker")
+    read = [c["argv"][-1] for c in calls if c["argv"][0] == "inspect" and F_HERMES_HOME in c["argv"]]
+    assert sorted(read) == sorted([DASH_C, GATE_C])
+    assert not [c for c in calls if c["argv"][0] == "exec" and "HERMES_HOME" in c["argv"]]
+
+
+def test_reset_does_not_refuse_a_stopped_gateway_whose_hermes_home_is_its_mount(host: Host):
+    host.update(lambda state: state["containers"][GATE_C].update(running=False))
+    result = run_reset(host)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "HERMES_HOME" not in all_output(result)
+
+
+def unreadable(who: str, command: str, text: str):
+    def mutate(state: dict) -> None:
+        state["containers"][who].setdefault("answers", {})[command] = text
+    return mutate
+
+
+@pytest.mark.parametrize("who, command, text", [
+    (APP_C, "id -u", "node"), (APP_C, "id -u", "0"), (APP_C, "id -u", ""),
+    (APP_C, "id -g", "node"), (APP_C, "id -g", "0"), (APP_C, "id -g", ""),
+    (DASH_C, "stat -c %u:%g /opt/data", "root:root"), (DASH_C, "stat -c %u:%g /opt/data", "0:0"),
+    (DASH_C, "stat -c %u:%g /opt/data", "10000:0"), (DASH_C, "stat -c %u:%g /opt/data", "0:10000"),
+    (DASH_C, "stat -c %u:%g /opt/data", ""), (DASH_C, "stat -c %u:%g /opt/data", "10000"),
+], ids=lambda value: str(value).replace(" ", "_") or "empty")
+def test_reset_refuses_an_identity_it_cannot_read_as_two_positive_numbers(host: Host, who, command, text):
+    host.update(unreadable(who, command, text))
+    before = snapshot(host)
+    result = run_reset(host)
+    assert result.returncode != 0
+    assert who in result.stderr and "nothing was changed" in result.stderr
     assert_nothing_changed(host, before)
 
 
@@ -1259,8 +1583,6 @@ def test_reset_makes_a_fresh_home_and_token_folder(shared_reset: SharedReset):
     assert (tokens / "executor").read_text().strip() == keys["default"]
     assert (tokens / "planner").read_text().strip() == keys["planner"]
 
-    chown = (host.root / "chown.log").read_text().splitlines()
-    assert f"-R 1000:1000 {home}" in chown and f"1000:1000 {tokens}" in chown
     assert {v: sha_tree(host.vol(v)) for v in untouched} == untouched
     assert not host.state().get("created_volumes")
     assert_secret_free(host, result, generated_secrets(host))
@@ -1293,7 +1615,8 @@ def test_reset_order_of_stops_writes_and_starts(shared_reset: SharedReset):
     assert set(steps[:2]) == {("stop", GATE_C), ("stop", DASH_C)}
     assert set(steps[2:4]) == {("helper", HOME_V), ("helper", TOKENS_V)}
     assert steps[4] == ("start", DASH_C)
-    assert steps[5:-5] == [("write", DASH_C)] * 9  # 5 tokens, 2 API server keys, 2 model tokens
+    assert steps[5:-6] == [("write", DASH_C)] * 9  # 5 tokens, 2 API server keys, 2 model tokens
+    assert steps[-6] == ("helper", TOKENS_V)  # the token files go to the owner app before it restarts
     assert steps[-5:-2] == [("restart", APP_C), ("restart", DASH_C), ("start", GATE_C)]
     assert set(steps[-2:]) == {("start", PROXY_C), ("start", BROWSER_C)}
 
@@ -1302,32 +1625,35 @@ def test_reset_helpers_have_the_agreed_shape(shared_reset: SharedReset):
     host = shared_reset.host
     image = host.state()["containers"][DASH_C]["image"]
     runs = [c for c in host.calls("docker") if c["argv"][0] == "run"]
-    assert sorted(mount_source(c) for c in runs) == sorted([HOME_V, TOKENS_V])
+    assert sorted(mount_source(c) for c in runs) == sorted([HOME_V, TOKENS_V, TOKENS_V])
     for call in runs:
         argv, source = call["argv"], mount_source(call)
         flags = ["--rm", "-i"] if source == HOME_V else ["--rm"]
         assert argv[:-1] == ["run", *flags, "--network", "none", "--user", "0", "--entrypoint", "sh",
                              "--mount", f"type=volume,source={source},target=/volume", image, "-c"]
         script = argv[-1]
-        assert "find /volume -mindepth 1 -delete" in script
         if source == HOME_V:
-            assert "chown -R 1000:1000 /volume" in script and "chmod go-rwx /volume" in script
+            assert "find /volume -mindepth 1 -delete" in script
+            assert "chown -R 10000:10000 /volume" in script and "chmod go-rwx /volume" in script
             with tarfile.open(fileobj=io.BytesIO(call["stdin"])) as archive:
                 members = {m.name.removeprefix("./") for m in archive.getmembers() if m.isfile()}
             assert members == {p.relative_to(STACK_HOME).as_posix() for p in STACK_HOME.rglob("*")
                                if p.is_file()}
+        elif "-delete" in script:
+            assert "chown 10000:10000 /volume" in script and "chmod 700 /volume" in script
+            assert not call["stdin"]
         else:
-            assert "chown 1000:1000 /volume" in script and "chmod 700 /volume" in script
+            assert script.splitlines()[-1] == "chown -R 1000:1000 /volume"
             assert not call["stdin"]
 
 
-def test_reset_writers_run_as_uid_1000_with_values_only_on_stdin(shared_reset: SharedReset):
+def test_reset_writers_run_as_the_platform_identity_with_values_only_on_stdin(shared_reset: SharedReset):
     host = shared_reset.host
     writers = [c for c in host.calls("docker") if docker_target(c)[0] == "exec" and "--user" in c["argv"]]
     assert len(writers) == 9
     for call in writers:
         argv = call["argv"]
-        assert argv[argv.index("--user") + 1] == "1000"
+        assert argv[argv.index("--user") + 1] == "10000:10000"
         assert docker_target(call)[1] == DASH_C
     issues = [c for c in writers if "kanban-workspace-token" in c["argv"]]
     assert sorted(c["argv"][c["argv"].index("--surface") + 1] for c in issues) == sorted(SURFACE_ENV)
@@ -1337,6 +1663,164 @@ def test_reset_writers_run_as_uid_1000_with_values_only_on_stdin(shared_reset: S
         assert argv[argv.index("--out") + 1] == "/tokens/" + argv[argv.index("--surface") + 1]
     carrying = [c for c in writers if c["stdin"] and MODEL_TOKEN.encode() in c["stdin"]]
     assert len(carrying) == 2 and all("-i" in c["argv"] for c in carrying)
+
+
+# --- the platform's runtime identity and the owner app's identity are two different things
+
+IDENTITY_CASES = [
+    pytest.param("shared_reset", (1000, 1000), (10000, 10000), id="platform-10000-app-1000"),
+    pytest.param("reset_remapped", (1000, 1000), (4242, 4242), id="platform-4242-app-1000"),
+    pytest.param("reset_equal", (1000, 1000), (1000, 1000), id="platform-1000-app-1000"),
+]
+
+
+def reset_with_identities(tmp_path_factory, app: tuple[int, int], platform: tuple[int, int]) -> SharedReset:
+    first = Host(tmp_path_factory.mktemp("identities") / "host")
+    first.set_identities(app, platform)
+    return SharedReset(first, run_reset(first), {}, {})
+
+
+@pytest.fixture(scope="module")
+def reset_remapped(tmp_path_factory) -> SharedReset:
+    return reset_with_identities(tmp_path_factory, (1000, 1000), (4242, 4242))
+
+
+@pytest.fixture(scope="module")
+def reset_equal(tmp_path_factory) -> SharedReset:
+    return reset_with_identities(tmp_path_factory, (1000, 1000), (1000, 1000))
+
+
+def finished(request, fixture: str) -> SharedReset:
+    shared = request.getfixturevalue(fixture)
+    assert shared.result.returncode == 0, shared.result.stdout + shared.result.stderr
+    return shared
+
+
+@pytest.mark.parametrize("fixture, app, platform", IDENTITY_CASES)
+def test_reset_succeeds_whether_the_platform_and_app_identities_differ_or_match(request, fixture, app, platform):
+    assert "the stack is reset" in finished(request, fixture).result.stdout
+
+
+@pytest.mark.parametrize("fixture, app, platform", IDENTITY_CASES)
+def test_reset_gives_the_token_files_to_the_app_identity_in_an_owner_only_folder(request, fixture, app, platform):
+    host = finished(request, fixture).host
+    tokens = host.vol(TOKENS_V)
+    assert host.owner_of(tokens) == app and stat.S_IMODE(tokens.stat().st_mode) == 0o700
+    names = set(SURFACE_ENV) | {"executor", "planner"}
+    assert {p.name for p in tokens.iterdir()} == names
+    for name in names:
+        info = (tokens / name).lstat()
+        assert host.owner_of(tokens / name) == app
+        assert stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o600 and 0 < info.st_size <= 16 * 1024
+
+
+@pytest.mark.parametrize("fixture, app, platform", IDENTITY_CASES)
+def test_reset_leaves_the_home_and_its_files_with_the_platform_identity(request, fixture, app, platform):
+    host = finished(request, fixture).host
+    home = host.vol(HOME_V)
+    for path in [home, *home.rglob("*")]:
+        assert host.owner_of(path) == platform, path
+    assert stat.S_IMODE(home.stat().st_mode) & 0o077 == 0
+    for path in home_files(host).values():
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    for path in (home / "config.yaml", home / "profiles/raphael-planner/config.yaml"):
+        assert path.is_file()
+
+
+@pytest.mark.parametrize("fixture, app, platform", IDENTITY_CASES)
+def test_reset_runs_every_platform_command_as_the_platform_identity_and_nothing_as_the_app(
+        request, fixture, app, platform):
+    host = finished(request, fixture).host
+    calls, spec = host.calls("docker"), "%d:%d" % platform
+    writers = writer_calls(host)
+    assert len(writers) == 9
+    for call in writers:
+        assert call["argv"][call["argv"].index("--user") + 1] == spec
+    for call in calls:
+        argv = call["argv"]
+        if argv[0] == "run":
+            assert argv[argv.index("--user") + 1] == "0"
+        elif argv[0] == "exec" and "--user" not in argv:
+            assert argv[2:4] in (["id", "-u"], ["id", "-g"], ["printenv", argv[3]]) or argv[2:4] == ["stat", "-c"]
+    app_spec = "%d:%d" % app
+    named = [c for c in calls if re.search(rf"(?<![0-9]){app_spec}(?![0-9])", "\x00".join(c["argv"]))]
+    if app == platform:
+        return
+    assert len(named) == 1 and named[0]["argv"][0] == "run" and mount_source(named[0]) == TOKENS_V
+    assert named[0]["argv"][-1].splitlines()[-1] == f"chown -R {app_spec} /volume"
+
+
+def test_reset_reads_both_identities_as_numbers_before_it_changes_anything(shared_reset: SharedReset):
+    argvs = [c["argv"] for c in shared_reset.host.calls("docker")]
+    first_change = next(i for i, argv in enumerate(argvs) if argv[0] in ("stop", "start", "restart", "run"))
+    seen = argvs[:first_change]
+    assert ["exec", APP_C, "id", "-u"] in seen and ["exec", APP_C, "id", "-g"] in seen
+    assert ["exec", DASH_C, "stat", "-c", "%u:%g", "/opt/data"] in seen
+
+
+# --- the fake itself: it enforces the exec user, the boot ownership and the owner-only rules
+
+
+def docker_by_hand(host: Host, *args: str) -> subprocess.CompletedProcess:
+    env = {"PATH": f"{host.root / 'bin'}:/usr/bin:/bin", "FAKE_HOST_ROOT": str(host.root),
+           "HOME": str(host.root / "home"), "PYTHONDONTWRITEBYTECODE": "1"}
+    return subprocess.run([str(host.root / "bin/docker"), *args], env=env, capture_output=True, text=True)
+
+
+def own_volume(host: Host, volume: str, who: tuple[int, int], mode: int | None = None) -> None:
+    table = host.owners()
+    table[volume] = list(who)
+    (host.root / "owners.json").write_text(json.dumps(table))
+    if mode is not None:
+        host.vol(volume).chmod(mode)
+
+
+def issue_by_hand(host: Host, user: str) -> subprocess.CompletedProcess:
+    return docker_by_hand(host, "exec", "--user", user, DASH_C, "hermes", "kanban-workspace-token", "issue",
+                          "--surface", "workspace", "--out", "/tokens/workspace-new")
+
+
+def test_the_fake_issues_a_token_for_the_user_that_owns_the_folder(host: Host):
+    own_volume(host, TOKENS_V, (10000, 10000), 0o700)
+    result = issue_by_hand(host, "10000:10000")
+    assert result.returncode == 0, result.stdout + result.stderr
+    made = host.vol(TOKENS_V) / "workspace-new"
+    assert stat.S_IMODE(made.stat().st_mode) == 0o600 and host.owner_of(made) == (10000, 10000)
+
+
+@pytest.mark.parametrize("user, owner, mode, message", [
+    ("1000:1000", (1000, 1000), 0o700, "Permission denied"),
+    ("10000:10000", (1000, 1000), 0o700, "is not owned by the current user"),
+    ("10000:10000", (10000, 10000), 0o750, "is not owner-only"),
+    ("1000", (1000, 0), 0o700, "Permission denied"),
+], ids=["home-of-another-user", "folder-of-another-user", "folder-not-owner-only", "uid-only"])
+def test_the_fake_refuses_a_token_for_the_wrong_user_like_the_real_command(host: Host, user, owner, mode, message):
+    own_volume(host, TOKENS_V, owner, mode)
+    result = issue_by_hand(host, user)
+    assert result.returncode == 2 and result.stdout.startswith("error: ") and message in result.stdout
+    assert not (host.vol(TOKENS_V) / "workspace-new").exists()
+
+
+def test_the_fake_stops_a_writer_that_runs_as_a_user_without_access(host: Host):
+    result = docker_by_hand(host, "exec", "--user", "1000:1000", DASH_C, "sh", "-c", 'printf x >> "$1"', "sh",
+                            "/opt/data/.env")
+    assert result.returncode == 2 and "Permission denied" in result.stderr
+    assert not (host.vol(HOME_V) / ".env").exists()
+
+
+def test_the_fake_boot_hook_gives_the_listed_parts_of_the_home_to_the_runtime_account(host: Host):
+    home = host.vol(HOME_V)
+    (home / "profiles/p").mkdir(parents=True)
+    for name in (".env", "config.yaml", "profiles/p/.env"):
+        (home / name).write_text("x\n")
+    table = host.owners()
+    for path in [home, *home.rglob("*")]:
+        table[str(path.relative_to(host.root / "volumes"))] = [1000, 1000]
+    (host.root / "owners.json").write_text(json.dumps(table))
+    assert docker_by_hand(host, "start", DASH_C).returncode == 0
+    for name in ("", ".env", "config.yaml", "profiles", "profiles/p", "profiles/p/.env"):
+        assert host.owner_of(home / name) == (10000, 10000), name
+    assert host.owner_of(home / "keep.txt") == (1000, 1000)
 
 
 def test_reset_names_only_template_containers_and_volumes(shared_reset: SharedReset):
@@ -1387,6 +1871,104 @@ def test_reset_gives_up_after_120_seconds_naming_the_container(host: Host, who: 
     assert result.returncode != 0
     assert who in all_output(result)
     assert 55 <= len(host.calls("sleep")) <= 60, "120 seconds in total, polled every 2 seconds"
+
+
+def set_healthcheck(who: str, test):
+    def mutate(state: dict) -> None:
+        if test == "absent":
+            state["containers"][who].pop("healthcheck", None)
+        else:
+            state["containers"][who]["healthcheck"] = test
+    return mutate
+
+
+@pytest.mark.parametrize("who", STACK_CONTAINERS)
+def test_reset_refuses_a_container_without_a_health_check_before_it_changes_anything(host: Host, who: str):
+    host.update(set_healthcheck(who, "absent"))
+    before = snapshot(host)
+    result = run_reset(host)
+    assert result.returncode != 0
+    assert who in result.stderr and "health check" in result.stderr
+    assert "must create it with a health check" in result.stderr and "nothing was changed" in result.stderr
+    assert_nothing_changed(host, before)
+    assert host.calls("sleep") == []
+
+
+@pytest.mark.parametrize("test, how", [(["NONE"], "kind-none"), ([], "unreadable")])
+def test_reset_refuses_a_health_check_that_is_none_or_cannot_be_read(host: Host, test: list, how: str):
+    host.update(set_healthcheck(PROXY_C, test))
+    before = snapshot(host)
+    result = run_reset(host)
+    assert result.returncode != 0
+    assert PROXY_C in result.stderr and "must create it with a health check" in result.stderr
+    assert_nothing_changed(host, before)
+
+
+def test_reset_reads_the_health_check_kind_of_all_five_containers_before_it_changes_anything(shared_reset: SharedReset):
+    calls = shared_reset.host.calls("docker")
+    reads = [i for i, c in enumerate(calls) if c["argv"][0] == "inspect" and F_HEALTH_KIND in c["argv"]]
+    assert sorted(calls[i]["argv"][-1] for i in reads) == sorted(STACK_CONTAINERS)
+    changing = [i for i, c in enumerate(calls)
+                if docker_target(c)[0] not in ("inspect", "exec") or "-i" in c["argv"] or "--user" in c["argv"]]
+    assert changing and max(reads) < min(changing)
+
+
+def test_reset_invents_no_probe_of_its_own(shared_reset: SharedReset):
+    docker = shared_reset.host.calls("docker")
+    assert shared_reset.host.calls("curl") == []
+    entered = {docker_target(c)[1] for c in docker if docker_target(c)[0] == "exec"}
+    assert entered <= {APP_C, DASH_C}, "no command is run in the proxy, the gateway or the browser to probe it"
+    words = {word for c in docker for word in c["argv"]}
+    assert not words & {"curl", "wget", "nc", "ncat", "telnet", "ping"}
+    assert not [word for word in words if "://" in word]
+
+
+class PendingReset(NamedTuple):
+    host: Host
+    result: subprocess.CompletedProcess
+
+
+@pytest.fixture(scope="module")
+def pending_reset(tmp_path_factory) -> PendingReset:
+    """One reset in which four containers never answer: two starting, one without a status, one unhealthy."""
+    first = Host(tmp_path_factory.mktemp("pending") / "host")
+
+    def never_answer(state):
+        for who in (APP_C, BROWSER_C):
+            state["containers"][who].update(health_delay=10**6, starting_polls=10**6)
+        state["containers"][GATE_C].pop("health")
+        state["containers"][PROXY_C].update(health="unhealthy")
+
+    first.update(never_answer)
+    return PendingReset(first, run_reset(first))
+
+
+def pending_names(shared: PendingReset) -> str:
+    """The containers that the refusal names after its budget of 120 seconds."""
+    assert shared.result.returncode != 0
+    assert "120 seconds" in shared.result.stderr
+    return shared.result.stderr.split("120 seconds", 1)[-1]
+
+
+@pytest.mark.parametrize("who", [APP_C, BROWSER_C])
+def test_reset_does_not_call_a_container_ready_while_its_health_is_starting(pending_reset: PendingReset, who: str):
+    assert who in pending_names(pending_reset)
+
+
+def test_reset_does_not_call_a_container_ready_when_its_health_status_is_missing(pending_reset: PendingReset):
+    assert GATE_C in pending_names(pending_reset)
+
+
+def test_reset_does_not_call_a_container_ready_while_its_health_is_unhealthy(pending_reset: PendingReset):
+    assert PROXY_C in pending_names(pending_reset)
+
+
+def test_reset_names_no_container_that_answered_when_it_gives_up(pending_reset: PendingReset):
+    assert DASH_C not in pending_names(pending_reset)
+
+
+def test_reset_gives_pending_containers_120_seconds_in_total_polled_every_2_seconds(pending_reset: PendingReset):
+    assert 55 <= len(pending_reset.host.calls("sleep")) <= 60
 
 
 @pytest.mark.parametrize("who", [GATE_C, PROXY_C, BROWSER_C])
@@ -1663,7 +2245,41 @@ def test_check_server2_names_only_template_entries(clean_check: CleanCheck):
 
 def test_check_reads_the_config_with_the_interpreter_of_the_hermes_command(clean_check: CleanCheck):
     uses = (clean_check.host.root / "interp.log").read_text().splitlines()
-    assert uses.count("-") >= 4, "the dispatcher and platform reads, for both profiles, use that interpreter"
+    assert uses.count("-") >= 5, "the served-profile, dispatcher and platform reads use that interpreter"
+
+
+def test_check_reads_the_configured_hermes_home_of_the_dashboard_and_the_gateway(clean_check: CleanCheck):
+    calls = clean_check.host.calls("docker")
+    read = [c["argv"][-1] for c in calls if c["argv"][0] == "inspect" and F_HERMES_HOME in c["argv"]]
+    assert sorted(read) == sorted([DASH_C, GATE_C])
+
+
+@pytest.mark.parametrize("value", ["/somewhere/else", "/opt/data/"])
+@pytest.mark.parametrize("who", [DASH_C, GATE_C])
+def test_check_fails_names_when_hermes_home_is_not_the_home_mount(stack: Host, who: str, value: str):
+    stack.update(set_hermes_home(who, value))
+    result = run_check(stack)
+    assert result.returncode == 1, result.stdout
+    assert list(verdicts(result)) == CHECKS
+    line = next(line for line in result.stdout.splitlines() if line.startswith("FAIL names-on-template"))
+    assert who in line
+    if who == DASH_C:
+        assert failed_checks(result) == {"names-on-template"}
+    assert "names-on-template" in failed_checks(result)
+
+
+def test_check_fails_names_when_the_gateway_uses_another_directory_with_a_stale_state(stack: Host):
+    other = stack.root / "gateway-own-filesystem" / "data"
+    shutil.copytree(stack.vol(HOME_V), other)
+    (other / "stale-state.db").write_text("sentinel rows that must stay\n")
+    stack.update(set_hermes_home(GATE_C, str(other)))
+    before = sha_tree(other)
+    result = run_check(stack)
+    assert result.returncode == 1, result.stdout
+    assert list(verdicts(result)) == CHECKS
+    assert failed_checks(result) == {"names-on-template"}
+    assert GATE_C in next(line for line in result.stdout.splitlines() if line.startswith("FAIL names-on-template"))
+    assert sha_tree(other) == before
 
 
 def test_check_fails_closed_when_the_gateway_is_not_running(stack: Host):
@@ -1687,8 +2303,8 @@ def test_check_does_not_pass_when_the_hermes_command_is_missing(stack: Host):
     (stack.root / "ctr/venv/hermes").unlink()
     result = run_check(stack)
     assert result.returncode == 1
-    assert failed_checks(result) == {"dispatcher-off", "cron-lists-empty", "no-messaging-platform",
-                                     "telegram-send-fails"}
+    assert failed_checks(result) == {"names-on-template", "dispatcher-off", "cron-lists-empty",
+                                     "no-messaging-platform", "telegram-send-fails"}
 
 
 @pytest.mark.parametrize("code", [0, 2, 3, 126, 127])
@@ -1809,6 +2425,174 @@ def test_check_server1_touches_no_stack_container_and_names_only_production(host
     assert named == set(parse_template()["production-container"])
 
 
+# ------------------------------------------------------------------ served profiles and the real cron list
+
+EXTRA = "extra-one"
+EXTRA_KEY = "extra-profile-key-0123456789abcdef"
+JOB_PROGRAM = (
+    "import sys\n"
+    "from cron.jobs import create_job, pause_job, update_job\n"
+    "job = create_job(prompt='p', schedule='every 1h', name='journey-test')\n"
+    "if sys.argv[1] == 'disabled':\n    update_job(job['id'], {'enabled': False})\n"
+    "elif sys.argv[1] == 'paused':\n    pause_job(job['id'])\n"
+)
+
+
+def add_served_profile(host: Host, name: str = EXTRA, dispatcher: bool = True, platform: bool = False) -> Path:
+    folder = host.vol(HOME_V) / "profiles" / name
+    folder.mkdir(parents=True)
+    (folder / ".env").write_text(f"API_SERVER_KEY={EXTRA_KEY}\n")
+    config: dict = {"kanban": {"dispatch_in_gateway": dispatcher}}
+    if platform:
+        config["platforms"] = {"discord": {"enabled": True}}
+    (folder / "config.yaml").write_text(yaml.safe_dump(config))
+    return folder
+
+
+def fail_line(result: subprocess.CompletedProcess, check: str) -> str:
+    return next(line for line in result.stdout.splitlines() if line.startswith(f"FAIL {check}:"))
+
+
+@pytest.fixture(scope="module")
+def real_jobs(tmp_path_factory) -> dict[str, Path]:
+    # one real cron store for each kind of job, made once with the platform's own functions
+    REAL_PYC.mkdir(parents=True, exist_ok=True)
+    stores = {}
+    for kind in ("enabled", "disabled", "paused"):
+        home = tmp_path_factory.mktemp(f"real-cron-{kind}")
+        env = {"PATH": os.environ["PATH"], "HOME": str(home), "HERMES_HOME": str(home), "PYTHONPATH": str(REPO),
+               "PYTHONPYCACHEPREFIX": str(REAL_PYC), "AWS_EC2_METADATA_DISABLED": "true"}
+        done = subprocess.run([sys.executable, "-c", JOB_PROGRAM, kind], env=env, cwd=home,
+                              capture_output=True, text=True)
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert (home / "cron").is_dir()
+        stores[kind] = home / "cron"
+    return stores
+
+
+@pytest.fixture
+def real_stack(stack: Host) -> Host:
+    hermes_gives(real_platform=True)(stack)
+    return stack
+
+
+def test_check_passes_the_cron_check_on_the_real_empty_job_list(real_stack: Host):
+    result = run_check(real_stack)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.splitlines() == [f"PASS {name}" for name in CHECKS]
+
+
+@pytest.mark.parametrize("kind, profile", [("disabled", "default"), ("disabled", "planner"), ("paused", "default")])
+def test_check_fails_on_any_real_cron_job_even_a_disabled_or_paused_one(real_stack: Host, real_jobs, kind, profile):
+    shutil.copytree(real_jobs[kind], profile_folder(real_stack, profile) / "cron")
+    result = run_check(real_stack)
+    name = "default" if profile == "default" else "raphael-planner"
+    assert result.returncode == 1, result.stdout
+    assert list(verdicts(result)) == CHECKS
+    assert failed_checks(result) == {"cron-lists-empty"}
+    assert f"FAIL cron-lists-empty: profile {name} has a cron job" in result.stdout.splitlines()
+
+
+def test_check_lists_cron_jobs_with_the_all_option(clean_check: CleanCheck):
+    listed = [c for c in clean_check.host.calls("docker")
+              if c["argv"][0] == "exec" and any("hermes cron list" in part for part in c["argv"])]
+    assert len(listed) == 2
+    assert all(any(part.endswith("hermes cron list --all") for part in c["argv"]) for c in listed)
+
+
+def test_check_fails_each_check_of_an_extra_served_profile_by_name(stack: Host):
+    add_served_profile(stack)
+    cron_job(EXTRA)(stack)
+    before = snapshot(stack)
+    result = run_check(stack)
+    assert result.returncode == 1, result.stdout
+    assert list(verdicts(result)) == CHECKS
+    assert failed_checks(result) == {"names-on-template", "dispatcher-off", "cron-lists-empty"}
+    for check in ("names-on-template", "dispatcher-off", "cron-lists-empty"):
+        assert EXTRA in fail_line(result, check)
+    assert snapshot(stack) == before
+    assert EXTRA_KEY not in all_output(result)
+
+
+def test_check_fails_the_messaging_platform_of_an_extra_served_profile_by_name(stack: Host):
+    add_served_profile(stack, dispatcher=False, platform=True)
+    result = run_check(stack)
+    assert result.returncode == 1, result.stdout
+    assert failed_checks(result) == {"names-on-template", "no-messaging-platform"}
+    line = fail_line(result, "no-messaging-platform")
+    assert EXTRA in line and "discord" in line
+
+
+def test_check_tries_the_send_from_an_extra_served_profile_too(stack: Host):
+    add_served_profile(stack, dispatcher=False)
+    hermes_gives(send_rc=0)(stack)
+    result = run_check(stack)
+    assert failed_checks(result) == {"names-on-template", "telegram-send-fails"}
+    assert EXTRA in fail_line(result, "telegram-send-fails")
+
+
+def test_check_names_an_extra_served_profile_that_has_nothing_else_wrong(stack: Host):
+    add_served_profile(stack, dispatcher=False)
+    result = run_check(stack)
+    assert result.returncode == 1
+    assert failed_checks(result) == {"names-on-template"}
+    assert EXTRA in fail_line(result, "names-on-template")
+
+
+@pytest.mark.parametrize("entry, kind", [
+    ("Upper-Case", "dir"), ("a" * 70, "dir"), ("notes.txt", "file"), (".hidden", "dir"),
+    ("bad$(touch PWNED)", "dir"),
+])
+def test_check_fails_closed_for_any_entry_of_the_profiles_folder_that_is_not_the_planner(stack: Host, entry, kind):
+    target = stack.vol(HOME_V) / "profiles" / entry
+    target.mkdir() if kind == "dir" else target.write_text("not a profile\n")
+    result = run_check(stack)
+    assert result.returncode == 1, result.stdout
+    assert list(verdicts(result)) == CHECKS
+    assert failed_checks(result) == {"names-on-template"}
+    assert not list(stack.root.rglob("PWNED")), "a profile name reached a shell"
+    line = fail_line(result, "names-on-template")
+    if re.fullmatch(r"[A-Za-z0-9._-]+", entry):
+        assert entry in line
+    else:
+        assert "bad;touch" not in all_output(result) and "bad$(touch" not in all_output(result)
+        assert "bad;touch" not in argv_text(stack) and "bad$(touch" not in argv_text(stack)
+
+
+def test_check_reports_a_served_name_that_is_not_plain_and_never_passes_it_to_a_shell(stack: Host):
+    hermes_gives(serve_extra=["Bad;touch PWNED"])(stack)
+    result = run_check(stack)
+    assert result.returncode == 1, result.stdout
+    assert list(verdicts(result)) == CHECKS
+    assert failed_checks(result) == {"names-on-template"}
+    assert not list(stack.root.rglob("PWNED"))
+    assert "Bad;touch" not in all_output(result) and "Bad;touch" not in argv_text(stack)
+
+
+def test_check_fails_names_when_the_served_profiles_cannot_be_read(stack: Host):
+    hermes_gives(serve_fail=True)(stack)
+    result = run_check(stack)
+    assert result.returncode == 1, result.stdout
+    assert list(verdicts(result)) == CHECKS
+    assert failed_checks(result) == {"names-on-template"}
+    assert "the served profiles cannot be read" in fail_line(result, "names-on-template")
+
+
+def test_check_still_checks_both_permitted_profiles_when_the_served_profiles_cannot_be_read(stack: Host):
+    hermes_gives(serve_fail=True)(stack)
+    dispatcher_on("planner")(stack)
+    cron_job("default")(stack)
+    result = run_check(stack)
+    assert failed_checks(result) == {"names-on-template", "dispatcher-off", "cron-lists-empty"}
+    assert "raphael-planner" in fail_line(result, "dispatcher-off")
+    assert "default" in fail_line(result, "cron-lists-empty")
+
+
+def test_check_passes_the_names_check_when_only_the_permitted_profiles_exist(clean_check: CleanCheck):
+    assert [p.name for p in (clean_check.host.vol(HOME_V) / "profiles").iterdir()] == ["raphael-planner"]
+    assert verdicts(clean_check.result)["names-on-template"] == "PASS"
+
+
 def copy_scripts(dest: Path, rename: dict[str, str] | None = None) -> Path:
     """A copy of the scripts folder (scripts, template, stack-home, proxy), names optionally replaced."""
     target = dest / "scripts" / "journeys"
@@ -1847,6 +2631,7 @@ def test_both_scripts_take_every_name_from_the_template(tmp_path: Path):
     for old, new in renames.items():
         text = text.replace(old, new)
     (alt.root / "state.json").write_text(text)
+    (alt.root / "owners.json").write_text((alt.root / "owners.json").read_text().replace("raphael-journeys-", "alt-rig-"))
     write_view(json.loads(text), alt.root)
     for folder in sorted((alt.root / "volumes").iterdir()):
         if folder.name.startswith("raphael-journeys-"):
