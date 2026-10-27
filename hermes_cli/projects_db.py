@@ -123,6 +123,19 @@ CREATE TABLE IF NOT EXISTS project_removal_operations (
     updated_at       INTEGER NOT NULL,
     PRIMARY KEY (project_id, idempotency_key)
 );
+
+-- Latest revision only of the Raphael-written summary, one row per Project. A
+-- table of its own rather than columns of projects, so the description the
+-- owner wrote is never rewritten and an older registry file gains the summary
+-- through this same additive script.
+CREATE TABLE IF NOT EXISTS project_summaries (
+    project_id      TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+    outcome         TEXT NOT NULL,
+    next_action     TEXT NOT NULL,
+    owner_decision  TEXT,
+    written_at      INTEGER NOT NULL,
+    revision        INTEGER NOT NULL
+);
 """
 
 
@@ -726,6 +739,69 @@ def delete_project(conn: sqlite3.Connection, project_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
     return cur.rowcount > 0
+
+
+def write_project_summary(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    outcome: str,
+    next_action: str,
+    owner_decision: Optional[str] = None,
+) -> int:
+    """Store the next revision of a project's Raphael-written summary.
+
+    Returns the new revision number: 1 for the first write, then one more per
+    write. Only the latest revision is kept. A blank ``owner_decision`` means
+    no decision waits and is stored as NULL. A ``project_id`` that is not in
+    ``projects`` raises the foreign key's :class:`sqlite3.IntegrityError`.
+    """
+    decision = owner_decision if owner_decision and owner_decision.strip() else None
+    with write_txn(conn):
+        revision = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM project_summaries "
+            "WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT OR REPLACE INTO project_summaries "
+            "(project_id, outcome, next_action, owner_decision, written_at, revision) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (project_id, outcome, next_action, decision, _now(), revision),
+        )
+    return revision
+
+
+def get_project_summary(
+    conn: sqlite3.Connection, project_id: str
+) -> Optional[dict]:
+    """The latest Raphael-written summary of a project, or None if none exists.
+
+    Also None, and never an error, when the file predates the summary table:
+    the owner snapshot reads such a file read-only, and a read must not create
+    or migrate anything.
+    """
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'project_summaries'"
+    ).fetchone()
+    if has_table is None:
+        return None
+    row = conn.execute(
+        "SELECT outcome, next_action, owner_decision, written_at, revision "
+        "FROM project_summaries WHERE project_id = ?",
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    outcome, next_action, owner_decision, written_at, revision = row
+    return {
+        "outcome": outcome,
+        "next_action": next_action,
+        "owner_decision": owner_decision,
+        "written_at": written_at,
+        "revision": revision,
+    }
 
 
 # ---------------------------------------------------------------------------
