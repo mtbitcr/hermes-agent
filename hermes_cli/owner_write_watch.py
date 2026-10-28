@@ -355,14 +355,14 @@ def _journeys_verdict(moment: datetime):
             return UNKNOWN, "result file not in NAME=value lines"
         fields[pair.group(1)] = pair.group(2)
     result = fields.get("result")
-    if result in ("passed", "failed"):
-        return PASS, ""
-    if result != "started" or not _JOURNEYS_TIME.fullmatch(fields.get("started", "")):
+    if result not in ("passed", "failed", "started") or not _JOURNEYS_TIME.fullmatch(fields.get("started", "")):
         return UNKNOWN, "result file not understood"
     try:
         started = datetime.strptime(fields["started"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except ValueError:
         return UNKNOWN, "result file not understood"
+    if result != "started":
+        return PASS, ""
     if moment - started > JOURNEYS_STUCK_AFTER:
         return FAIL, f"stuck since {format_time(started)}; the time limit ended it"
     return PASS, ""

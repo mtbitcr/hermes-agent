@@ -1212,6 +1212,43 @@ def test_journeys_no_verdict_keeps_the_previous_state(tmp_path):
     assert host.run().kind == "recovery"
 
 
+@pytest.mark.parametrize("final", ["passed", "failed"])
+@pytest.mark.parametrize("stamp", [
+    "yesterday",
+    "",
+    "2026-10-05 07:00:00",
+    "2026-10-05T07:00:00",
+    "2026-10-05T07:00:00+02:00",
+    "2026-13-05T07:00:00Z",
+    "2026-02-30T07:00:00Z",
+    "2026-10-05T25:00:00Z",
+])
+def test_journeys_a_final_result_with_an_invalid_started_time_keeps_the_stuck_alert(tmp_path, final, stamp):
+    """A final result whose started time is not a real UTC time gives no verdict: no recovery,
+    no message, and the stuck state is kept until a valid result arrives."""
+    host = Host(tmp_path)
+    write_journeys(started_at(START - timedelta(hours=2)))
+    assert host.run().kind == "alert"
+    kept = lambda: {k: v for k, v in json.loads(watch.state_path().read_text(encoding="utf-8")).items()
+                    if k in ("state", "failing", "since")}
+    stored = kept()
+    assert stored["failing"] == ["journeys"]
+    write_journeys(finished(final).replace("started=2026-10-05T07:00:00Z", f"started={stamp}"))
+    outcome = host.run()
+    assert (journeys_check()["outcome"], outcome.kind, outcome.text) == (watch.UNKNOWN, None, "")
+    assert kept() == stored
+    write_journeys(finished(final))
+    assert host.run().kind == "recovery"
+
+
+@pytest.mark.parametrize("final", ["passed", "failed"])
+def test_journeys_a_final_result_without_a_started_time_gives_no_verdict(tmp_path, final):
+    host = Host(tmp_path)
+    write_journeys(f"result={final}\nstep=none\n")
+    outcome = host.run()
+    assert (journeys_check()["outcome"], outcome.kind) == (watch.UNKNOWN, None)
+
+
 def test_journeys_a_run_stuck_across_two_hourly_runs_alerts_once(tmp_path):
     host = Host(tmp_path)
     write_journeys(started_at(START - timedelta(hours=2)))
