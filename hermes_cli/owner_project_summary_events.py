@@ -16,8 +16,15 @@ backoff, whatever the flags say.
 
 ``read`` writes nothing. The tick decides on the row with the flags raised (``Reading.state``). If no request is due
 it stores the reading with ``record``; if one is, the request's claim moves the cursors in the same transaction that
-clears the flags. A request that fails or stops before its claim therefore leaves the row as it was, and the next
+clears the flags. A request that fails before its task is published therefore leaves the row as it was, and the next
 tick finds the same events again.
+
+A task is the receipt of what it covers. The last line of its body, ``covered_line``, names the three cursors the
+request consumed, and ``covered_cursors`` reads them back (None for a task made without the line). A request whose
+task another tick recorded first loses nothing: its publisher moves each cursor to the task's, never back. Nor does
+a request that stops after its task is published and before its claim: storing the task's result does it. A task
+that fails leaves them, and the failure arms a new request. Events after the task's snapshot stay unread until the
+harvest.
 
 The cursors move by compare-and-swap, in the shape of the kanban notifier's: a tick reads past the cursors it found,
 then updates the row only if they are still those. Two ticks that read at the same time therefore count an event
@@ -26,8 +33,13 @@ once; the loser counts nothing and moves nothing.
 Reading changes nothing and creates nothing: every file is opened read-only, a file or table that is not there is a
 source without events, and no event of the summary board itself ever counts.
 
-The delivery cursor is a row id, as the plan says. A delivery row that merges after a row with a higher id has
-merged is therefore not seen as a merge; the card's own ``completed`` and ``archived`` events still are.
+The delivery cursor is a row id, as the plan says. Delivery rows are updated in place, so a row can merge after a row
+with a higher id has merged, and the row source never sees that merge. Its receipt does: ``kanban_delivery`` writes the
+row's state ``merged`` and the event ``delivery_merged`` on the source card in one transaction, task events grow in
+commit order, and ``EVENT_CLASS`` makes that event urgent, so every merge asks for a rewrite at once. The row source
+stays for a merged row that left no receipt, and merged rows are never replayed. All of a board is read in one read
+transaction: a merge's row and its receipt are then seen together, in one tick, and are one rewrite, where read apart
+the row source could count the merge in one tick and the event source in the next.
 """
 
 from __future__ import annotations
@@ -35,6 +47,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,8 +63,9 @@ URGENT = "urgent"
 IGNORED = "ignored"
 
 # A key is a kind of event, or "kind:detail" where the detail (the kind of a block) changes the answer.
-# "merged" and "released" are the kinds the delivery and the ledger source report. Heartbeat, comment, claim,
-# spawn and the like are left out on purpose: a kind that is not here is ignored.
+# "merged" and "released" are the kinds the delivery and the ledger source report; "delivery_merged" is the receipt a
+# merge leaves on its card. Heartbeat, comment, claim, spawn and the like are left out on purpose: a kind that is
+# not here is ignored.
 EVENT_CLASS = {
     "created": MATERIAL,
     "linked": MATERIAL,
@@ -65,6 +79,7 @@ EVENT_CLASS = {
     "unblocked:needs_input": URGENT,
     "review_requested": URGENT,
     "merged": URGENT,
+    "delivery_merged": URGENT,
     "released": URGENT,
 }
 
@@ -77,6 +92,23 @@ class Cursors(NamedTuple):
     event: int = 0
     delivery: int = 0
     release: int = 0
+
+
+# The snapshot above it is JSON: its strings are quoted and keep their newlines escaped, so no line of it starts so.
+_COVERED = re.compile(
+    r"^Covered events: event=([0-9]{1,18}) delivery=([0-9]{1,18}) release=([0-9]{1,18})$", re.MULTILINE
+)
+
+
+def covered_line(cursors: Cursors) -> str:
+    """The line that ends the body of a rewrite task: the cursors of the events the request consumed."""
+    return f"Covered events: event={cursors.event} delivery={cursors.delivery} release={cursors.release}"
+
+
+def covered_cursors(body: Optional[str]) -> Optional[Cursors]:
+    """The cursors that a task's body names, or None for a body without the line (a task made before it existed)."""
+    named = _COVERED.findall(body or "")
+    return Cursors(*map(int, named[-1])) if named else None
 
 
 @dataclass(frozen=True)
@@ -104,9 +136,11 @@ def _board_path(slug: str) -> Path:
 
 @contextlib.contextmanager
 def _read_only(path: Path) -> Iterator[sqlite3.Connection]:
+    """The file opened read-only, in one read transaction: every query made on it sees the same snapshot."""
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN")
         yield conn
     finally:
         conn.close()

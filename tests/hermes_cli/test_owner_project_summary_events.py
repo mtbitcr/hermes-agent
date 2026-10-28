@@ -7,7 +7,8 @@ and ten quick changes are one rewrite (owner decision of 2026-10-27). Card A's o
 rewrite request: the kernel's time box, one open task found by one check first, and a failure limit that only delays
 the next request by a day.
 
-The tests reach the new module only through ``summary_tick``, which each one imports for itself.
+The tests reach the new module only through ``summary_tick``, which each one imports for itself; the two tests of the
+covered line (T2 and T3 at the end) also read it with the module's own parser.
 """
 
 from __future__ import annotations
@@ -576,7 +577,7 @@ def test_a_needs_input_block_and_its_answer_each_give_a_task_inside_the_hour(roo
 
 
 def _append(root: Path, project: dict, card: str, kind: str, payload: dict | None = None) -> None:
-    """An event the kernel writes next to other work, here on its own: ``delivery_merged`` and the like."""
+    """An event the kernel writes next to other work, here on its own: ``delivery_merged_on_base`` and the like."""
     with _board(root, project["board"]) as conn, kanban_db.write_txn(conn):
         kanban_db._append_event(conn, card, kind, payload)
 
@@ -686,10 +687,10 @@ def test_heartbeat_comment_claim_and_unlisted_kinds_give_no_task_while_a_finish_
     before = _top(root, garden)
 
     _quiet(root, garden, busy)
-    for kind in ("promoted", "delivery_merged", "dependency_wait", "block_loop_detected", "owner_retry"):
+    for kind in ("promoted", "delivery_merged_on_base", "dependency_wait", "block_loop_detected", "owner_retry"):
         _append(root, garden, busy, kind, {"note": "written next to other work"})
     made = set(_kinds(root, garden, after=before))
-    assert {"claimed", "spawned", "heartbeat", "commented", "promoted", "delivery_merged"} <= made
+    assert {"claimed", "spawned", "heartbeat", "commented", "promoted", "delivery_merged_on_base"} <= made
     assert not made & {"created", "completed", "blocked", "unblocked", "review_requested"}
 
     for at in (T0 + 100, T0 + 2 * HOUR, T0 + 3 * HOUR):
@@ -922,3 +923,178 @@ def test_a_project_that_is_gone_is_skipped_without_a_read_or_a_failure_while_a_l
     assert _state(root, gone["project_id"]) == before
     assert trace.board(gone) not in trace.opened
     assert [record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING] == []
+
+
+# Rework after the review of the first hand-over (2026-10-28): two major findings, one test (T1 to T3) for each case.
+
+
+class _ProcessDied(BaseException):
+    """A gateway restart as the interrupted code sees it: nothing after this point runs."""
+
+
+def _merge_delivery(root: Path, project: dict, delivery: int, card: str, ledger: _Ledger) -> None:
+    """A merge as kanban_delivery._merged leaves it: the change in the release ledger, then the row's state and the
+    receipt ``delivery_merged`` on its source card, written in one transaction."""
+    label = f"merge-{delivery}"
+    ledger.merge(label, card=card, board=project["board"])
+    with _board(root, project["board"]) as conn, kanban_db.write_txn(conn):
+        conn.execute("UPDATE kanban_deliveries SET pull_request_state = 'merged' WHERE id = ?", (delivery,))
+        kanban_db._append_event(
+            conn, card, "delivery_merged",
+            {
+                "delivery_id": delivery, "head": _sha(label + "-head"), "pull_request_number": delivery,
+                "repository": "mtbitcr/hermes-agent", "merge_commit": _sha(label), "recorded": True,
+                "attempt": _sha(label + "-attempt"),
+            },
+        )
+
+
+# T1: delivery rows are updated in place, so merges need not finish in row-id order; every merge is rewritten at once.
+
+
+def test_merges_in_the_reverse_order_of_their_rows_each_give_a_task_at_once(root, owner):
+    ops = _ops()
+    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
+    garden = _project(owner, "Garden Plan")
+    pid = garden["project_id"]
+    cards = [_card(root, garden, "Plant the beds"), _card(root, garden, "Water the beds")]
+    for card in cards:
+        _complete(root, garden, card)
+    older, newer = (_delivery(root, garden, card, "open") for card in cards)
+    assert older < newer
+    _settle(root)
+    assert _state(root, pid)["delivery_cursor"] == 0
+    ledger = _Ledger()
+
+    _merge_delivery(root, garden, newer, cards[1], ledger)
+    assert ops.summary_tick(now=T0 + 100) == 1
+    first = _assert_rewrite(root, garden, asked_at=T0 + 100)
+    assert _state(root, pid)["delivery_cursor"] == newer
+    _store_rewrite(root, first, T0 + 110)
+    assert _summary_of(root, pid)["revision"] == 2
+    assert _tasks_of(root, garden) == []
+
+    _merge_delivery(root, garden, older, cards[0], ledger)
+    assert ops.summary_tick(now=T0 + 200) == 1
+    second = _assert_rewrite(root, garden, asked_at=T0 + 200)
+    assert second != first
+    _store_rewrite(root, second, T0 + 210)
+    assert _summary_of(root, pid)["revision"] == 3
+    assert _tasks_of(root, garden) == []
+
+    assert ops.summary_tick(now=T0 + 300) == 0
+    assert _tasks_of(root, garden) == []
+    assert _flags(root, garden) == (0, 0)
+
+
+def _cursors(state: dict) -> tuple:
+    return (state["event_cursor"], state["delivery_cursor"], state["release_cursor"])
+
+
+# T2: a task is the receipt of what it covers. A publisher whose task another tick recorded first still moves the
+# cursors, so the events the task covers are not counted again once it is harvested.
+
+
+def test_a_publisher_whose_task_another_tick_recorded_first_still_moves_the_cursors(root, owner, monkeypatch):
+    from hermes_cli import owner_project_summary_events as events
+
+    ops = _ops()
+    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
+    garden = _project(owner, "Garden Plan")
+    pid = garden["project_id"]
+    asking = _card(root, garden, "Choose the room")
+    _settle(root)
+    settled = _state(root, pid)
+    _block(root, garden, asking, "needs_input")
+    top = _top(root, garden)
+    assert top > settled["event_cursor"]
+
+    create_task = kanban_db.create_task
+    met: list = []
+
+    def create_then_let_another_tick_in(*args, **kwargs):
+        """Tick A's task is published and committed; before A's claim a second tick meets it on its own connections."""
+        task_id = create_task(*args, **kwargs)
+        if not met:
+            met.append(task_id)
+            assert ops.summary_tick(now=T0 + 100) == 0
+        return task_id
+
+    monkeypatch.setattr(kanban_db, "create_task", create_then_let_another_tick_in)
+    assert ops.summary_tick(now=T0 + 100) == 0
+    monkeypatch.setattr(kanban_db, "create_task", create_task)
+
+    [task] = _tasks_of(root, garden)
+    assert (task.id, task.status) == (met[0], "ready")
+    assert _open_task_ids(root, garden) == [task.id]
+    adopted = _state(root, pid)
+    assert (adopted["open_task_id"], adopted["last_requested_at"], adopted["failures"]) == (task.id, T0 + 100, 0)
+    assert (adopted["pending"], adopted["pending_urgent"]) == (0, 0)
+    assert _cursors(adopted) == (top, 0, 0)
+    assert events.covered_cursors(task.body) == events.Cursors(top, 0, 0)
+
+    _finish(root, task.id, _valid(outcome=REWRITTEN))
+    assert ops.summary_tick(now=T0 + 110) == 0
+    assert _summary_of(root, pid)["revision"] == 2
+    assert _tasks_of(root, garden) == []
+    assert _flags(root, garden) == (0, 0)
+    assert _cursors(_state(root, pid)) == (top, 0, 0)
+
+    _unblock(root, garden, asking)
+    assert ops.summary_tick(now=T0 + 120) == 1
+    _assert_rewrite(root, garden, asked_at=T0 + 120)
+    assert _cursors(_state(root, pid)) == (_top(root, garden), 0, 0)
+
+
+# T3: the same when the publisher stops after it published. The task names what it covers, so a later tick adopts it
+# through the one check, and the harvest of the task moves the cursors.
+
+
+def test_a_task_published_by_a_tick_that_stopped_covers_its_events_once_a_later_tick_adopts_it(
+    root, owner, monkeypatch,
+):
+    from hermes_cli import owner_project_summary_events as events
+
+    ops = _ops()
+    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
+    garden = _project(owner, "Garden Plan")
+    pid = garden["project_id"]
+    asking = _card(root, garden, "Choose the room")
+    _settle(root)
+    settled = _state(root, pid)
+    _block(root, garden, asking, "needs_input")
+    top = _top(root, garden)
+    assert top > settled["event_cursor"]
+
+    create_task = kanban_db.create_task
+
+    def create_then_die(*args, **kwargs):
+        create_task(*args, **kwargs)
+        raise _ProcessDied
+
+    monkeypatch.setattr(kanban_db, "create_task", create_then_die)
+    with pytest.raises(_ProcessDied):
+        ops.summary_tick(now=T0 + 100)
+    monkeypatch.setattr(kanban_db, "create_task", create_task)
+    assert _state(root, pid) == settled
+    [task] = _tasks_of(root, garden)
+    assert task.status == "ready"
+
+    assert ops.summary_tick(now=T0 + 150) == 0
+    adopted = _state(root, pid)
+    assert (adopted["open_task_id"], adopted["last_requested_at"], adopted["failures"]) == (task.id, T0 + 150, 0)
+    assert (adopted["pending"], adopted["pending_urgent"]) == (0, 0)
+    assert _open_task_ids(root, garden) == [task.id]
+
+    _finish(root, task.id, _valid(outcome=REWRITTEN))
+    assert ops.summary_tick(now=T0 + 160) == 0
+    assert _summary_of(root, pid)["revision"] == 2
+    assert _tasks_of(root, garden) == []
+    assert _flags(root, garden) == (0, 0)
+    assert _cursors(_state(root, pid)) == (top, 0, 0)
+    assert events.covered_cursors(task.body) == events.Cursors(top, 0, 0)
+
+    _unblock(root, garden, asking)
+    assert ops.summary_tick(now=T0 + 170) == 1
+    _assert_rewrite(root, garden, asked_at=T0 + 170)
+    assert _cursors(_state(root, pid)) == (_top(root, garden), 0, 0)

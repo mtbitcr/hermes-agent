@@ -27,6 +27,13 @@ whose removal has started or completed, is skipped before any event is read, and
 stored by ``record`` when no request is due, and by the request's own claim when one is, so a request that fails or
 stops before its claim leaves the row as it was.
 
+The body of every summary task ends with the line that names the events it covers (``events.covered_line``). Once a
+task is published it is that line, not the publisher's claim, that the cursors follow. A tick that finds a task the
+row does not record yet records it and leaves the cursors; a publisher whose claim lost to that recording moves them
+itself, and for a publisher that stopped after publishing the storing of the result moves them (``_store_result``). A
+request whose publisher stopped, or lost the race to another tick, therefore still counts its events once. A tick
+that finds an open task reads no event.
+
 A task is the tick's own only when the tick made it for that Project (``_made_for``): its creator is ``CREATED_BY``
 and its idempotency key names the Project. A key alone vouches for nothing, since any worker can write one with
 ``kanban_create``. A task made by anyone else is never adopted, recorded, archived or stored. When ``create_task``
@@ -214,9 +221,17 @@ def _ensure_summary_board() -> Optional[Path]:
     return path
 
 
-def _task_body(snapshot: dict) -> str:
+def _task_body(snapshot: dict, covered: events.Cursors) -> str:
+    """The instruction, the frozen snapshot, and last the line that names the events the task covers."""
     frozen = json.dumps(snapshot, indent=2, sort_keys=True, ensure_ascii=False)
-    return INSTRUCTION + "\nSteward snapshot, frozen when this task was made:\n" + frozen + "\n"
+    return (
+        INSTRUCTION
+        + "\nSteward snapshot, frozen when this task was made:\n"
+        + frozen
+        + "\n"
+        + events.covered_line(covered)
+        + "\n"
+    )
 
 
 def _key_prefix(project_id: str) -> str:
@@ -237,26 +252,35 @@ def _made_for(task: kanban_db.Task, project_id: str) -> bool:
     return task.created_by == CREATED_BY and (task.idempotency_key or "").startswith(_key_prefix(project_id))
 
 
-def _find_open_task(board: sqlite3.Connection, project_id: str) -> Optional[str]:
+def _find_open_task(board: sqlite3.Connection, project_id: str) -> Optional[sqlite3.Row]:
     """The oldest summary task of the Project that the tick made and that is neither done nor archived, or None.
 
-    A task made by anyone else is not found, whatever its key. The prefix is compared with ``substr``, not
-    LIKE: Project ids hold underscores, which LIKE reads as wildcards, so one Project would find another's
-    task. A failing query is not caught here; a tick that cannot tell whether a task exists must publish nothing.
+    The row holds the task's ``id`` and its ``body``, whose last line names the events it covers. A task made by
+    anyone else is not found, whatever its key. The prefix is compared with ``substr``, not LIKE: Project ids
+    hold underscores, which LIKE reads as wildcards, so one Project would find another's task. A failing query is
+    not caught here; a tick that cannot tell whether a task exists must publish nothing.
     """
     prefix = _key_prefix(project_id)
-    row = board.execute(
-        "SELECT id FROM tasks WHERE created_by = ? AND substr(idempotency_key, 1, ?) = ? "
+    return board.execute(
+        "SELECT id, body FROM tasks WHERE created_by = ? AND substr(idempotency_key, 1, ?) = ? "
         "AND status NOT IN ('done', 'archived') ORDER BY created_at, id LIMIT 1",
         (CREATED_BY, len(prefix), prefix),
     ).fetchone()
-    return None if row is None else row["id"]
 
 
-def _record_open_task(registry: sqlite3.Connection, project_id: str, task_id: str, now: int) -> None:
+def _record_open_task(
+    registry: sqlite3.Connection,
+    project_id: str,
+    task_id: str,
+    now: int,
+    covered: Optional[events.Cursors],
+) -> None:
     """Record a task found on the board as the Project's open one, as the normal claim would.
 
-    A row that already records a task, this one or another, is left alone and nothing is written.
+    A row that already records a task, this one or another, is left alone and nothing is written. The cursors stay
+    where they are: ``_store_result`` moves them to what the task covers. ``covered`` is what the task's body names
+    (None for a task made without the line). The flags are cleared unless a cursor is already past it, since the
+    events beyond it raised them and the task does not cover them. Without the line they are cleared, as before.
     """
     row = registry.execute(
         "SELECT open_task_id FROM project_summary_state WHERE project_id = ?", (project_id,)
@@ -267,11 +291,22 @@ def _record_open_task(registry: sqlite3.Connection, project_id: str, task_id: st
         registry.execute(
             "INSERT OR IGNORE INTO project_summary_state (project_id, updated_at) VALUES (?, ?)", (project_id, now)
         )
-        recorded = registry.execute(
-            "UPDATE project_summary_state SET open_task_id = ?, pending = 0, pending_urgent = 0, "
-            "last_requested_at = ?, updated_at = ? WHERE project_id = ? AND open_task_id IS NULL",
-            (task_id, now, now, project_id),
-        ).rowcount
+        if covered is None:
+            recorded = registry.execute(
+                "UPDATE project_summary_state SET open_task_id = ?, pending = 0, pending_urgent = 0, "
+                "last_requested_at = ?, updated_at = ? WHERE project_id = ? AND open_task_id IS NULL",
+                (task_id, now, now, project_id),
+            ).rowcount
+        else:
+            recorded = registry.execute(
+                "UPDATE project_summary_state SET open_task_id = ?, last_requested_at = ?, updated_at = ?, "
+                "pending = CASE WHEN event_cursor > ? OR delivery_cursor > ? OR release_cursor > ? THEN pending "
+                "ELSE 0 END, "
+                "pending_urgent = CASE WHEN event_cursor > ? OR delivery_cursor > ? OR release_cursor > ? "
+                "THEN pending_urgent ELSE 0 END "
+                "WHERE project_id = ? AND open_task_id IS NULL",
+                (task_id, now, now, *covered, *covered, project_id),
+            ).rowcount
     if recorded == 1:
         logger.info("project summary: Project %s already has summary task %s; recorded it", project_id, task_id)
 
@@ -350,8 +385,16 @@ def _record_failure_before_publishing(registry: sqlite3.Connection, project_id: 
         )
 
 
-def _store_result(registry: sqlite3.Connection, project_id: str, result: SummaryResult, now: int) -> bool:
-    """Store the result and zero the Project's failures unless it stopped being eligible, all in one transaction."""
+def _store_result(
+    registry: sqlite3.Connection, project_id: str, result: SummaryResult, now: int, covered: Optional[events.Cursors]
+) -> bool:
+    """Store the result and zero the Project's failures unless it stopped being eligible, all in one transaction.
+
+    The summary now holds the events the task covers, so in the same statement each cursor moves to the task's
+    ``covered``, never back. The claim of a publisher that lived to make it has moved them already; one that stopped
+    after publishing, or whose task another tick recorded, leaves it to this. A task without the line moves nothing.
+    """
+    floor = events.Cursors() if covered is None else covered
     with write_txn(registry):
         if not _eligible(registry, project_id):
             return False
@@ -363,8 +406,10 @@ def _store_result(registry: sqlite3.Connection, project_id: str, result: Summary
             owner_decision=result.owner_decision,
         )
         registry.execute(
-            "UPDATE project_summary_state SET open_task_id = NULL, failures = 0, updated_at = ? WHERE project_id = ?",
-            (now, project_id),
+            "UPDATE project_summary_state SET open_task_id = NULL, failures = 0, updated_at = ?, "
+            "event_cursor = MAX(event_cursor, ?), delivery_cursor = MAX(delivery_cursor, ?), "
+            "release_cursor = MAX(release_cursor, ?) WHERE project_id = ?",
+            (now, *floor, project_id),
         )
     logger.info("project summary: stored revision %d for Project %s", revision, project_id)
     return True
@@ -397,7 +442,9 @@ def _harvest_one(
         logger.warning("project summary: nothing stored for Project %s: %s", project_id, exc)
         _record_failure(registry, board, project_id, task_id, now)
         return
-    if not _store_result(registry, project_id, result, now):
+    # The task is the tick's own here (a foreign one returned above), so the line in its body is the tick's word.
+    covered = events.covered_cursors(None if task is None else task.body)
+    if not _store_result(registry, project_id, result, now, covered):
         _retire(registry, board, project_id, task_id, now)
         return
     kanban_db.archive_task(board, task_id)
@@ -472,7 +519,7 @@ def _open_summary_task(
     task_id = kanban_db.create_task(
         board,
         title=TITLE_PREFIX + project.name,
-        body=_task_body(snapshot),
+        body=_task_body(snapshot, reading.batch.cursors),
         assignee=PLANNING_ROLE,
         created_by=CREATED_BY,
         workspace_kind="scratch",
@@ -495,17 +542,21 @@ def _open_summary_task(
         return False
     # The claim holds only while the row is the one the key was made from. A loser archives its task only
     # if the winner recorded another one, and decides that inside the transaction that nobody else can write.
-    # The cursors move here, to where the events were read before the snapshot, and not before: a request that
-    # fails first must leave the row as it was. The Project may be pending only through this tick's own reading.
+    # The cursors move here, to where the task's own body says its events were read, and not before: a request
+    # that fails first must leave the row as it was. That is not always this tick's reading: the key can hand
+    # back a task that another tick made from its own. A task without the line moves nothing. The Project may
+    # be pending only through this tick's own reading.
+    covered = events.covered_cursors(made.body) or reading.old
     with write_txn(registry):
         claimed = registry.execute(
             "UPDATE project_summary_state SET open_task_id = ?, last_requested_at = ?, pending = 0, "
-            "pending_urgent = 0, updated_at = ?, event_cursor = ?, delivery_cursor = ?, release_cursor = ? "
+            "pending_urgent = 0, updated_at = ?, event_cursor = MAX(event_cursor, ?), "
+            "delivery_cursor = MAX(delivery_cursor, ?), release_cursor = MAX(release_cursor, ?) "
             "WHERE project_id = ? AND open_task_id IS NULL AND (pending = 1 OR ?) "
             "AND failures = ? AND last_requested_at IS ? "
             "AND event_cursor = ? AND delivery_cursor = ? AND release_cursor = ?",
             (
-                task_id, now, now, *reading.batch.cursors,
+                task_id, now, now, *covered,
                 project.id, int(reading.raises_pending), state["failures"], state["last_requested_at"],
                 *reading.old,
             ),
@@ -516,6 +567,15 @@ def _open_summary_task(
             ).fetchone()
             if recorded is None or recorded["open_task_id"] != task_id:
                 kanban_db.archive_task(board, task_id)
+            else:
+                # Another tick recorded this very task first. It is the Project's open task, so it is not archived,
+                # and the cursors the recording left behind move here. The flags stay as they are.
+                registry.execute(
+                    "UPDATE project_summary_state SET event_cursor = MAX(event_cursor, ?), "
+                    "delivery_cursor = MAX(delivery_cursor, ?), release_cursor = MAX(release_cursor, ?) "
+                    "WHERE project_id = ? AND open_task_id = ?",
+                    (*covered, project.id, task_id),
+                )
             return False
     logger.info("project summary: asked for the first summary of Project %s (task %s)", project.id, task_id)
     return True
@@ -538,7 +598,7 @@ def _request(registry: sqlite3.Connection, now: int) -> int:
                 board = stack.enter_context(kanban_db.connect_closing(path, board=SUMMARY_BOARD))
             open_task = None if board is None else _find_open_task(board, project.id)
             if open_task is not None:
-                _record_open_task(registry, project.id, open_task, now)
+                _record_open_task(registry, project.id, open_task["id"], now, events.covered_cursors(open_task["body"]))
                 continue
             if not _eligible(registry, project.id):
                 continue
