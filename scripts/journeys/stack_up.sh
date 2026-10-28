@@ -25,12 +25,34 @@
 #            and log under ${TMPDIR:-/tmp}, prints one line "stack_up: building platform <commit>; log <path>"
 #            and exits 0 at once. When the image exists it prints "stack_up: image <ref> already exists"; when a
 #            build holds the lock it prints "stack_up: a platform build is already running".
-# converge   Creates what is missing and recreates what is stale, then waits until all five containers are
-#            healthy (one budget of 180 seconds, polled every 2 seconds). The proxy image
+# converge   Creates what is missing and recreates what is stale. The proxy image
 #            raphael-journeys-proxy:<proxy-tag>, the platform image raphael-journeys-platform:<platform-commit>
 #            and raphael-journeys-app-base:<app-revision> must exist already; converge builds the app and
-#            browser layers itself after the proxy has written its CA. The last line is
-#            "stack_up: the stack answers". Tags are plain: letters, digits, dot, dash, underscore, at most 63.
+#            browser layers itself after the proxy has written its CA. Tags are plain: letters, digits, dot,
+#            dash, underscore, at most 63.
+#            Order: network, volumes, proxy, CA copy, CA image layers, dashboard, owner app, gateway, browser.
+#            The owner app is on the stack network with the alias "workspace" (the proxy's upstream, port
+#            3000). The gateway container runs the plain "gateway run" (the image hands it to its supervised
+#            gateway service; HERMES_DASHBOARD stays unset) and shares the owner app's network namespace
+#            (--network container:<owner app id>), so it has no alias or port of its own.
+#            A new proxy tag recreates the proxy; a new owner app tag recreates the owner app and the gateway
+#            (never a volume); a new browser tag the browser (card 3 passes the owner app revision for both, so
+#            they change together); a new platform commit the dashboard and the gateway. The gateway is also
+#            recreated when its network mode does not name the current owner app, or when it runs beside a
+#            stopped owner app (the namespace it joined is gone). A container that is stopped but made by this
+#            script is started when its turn comes.
+#            Converge never issues a token. Before it starts or creates the owner app or the gateway it makes
+#            one read-only check of the token volume: a throw-away helper container with no network mounts the
+#            volume read-only and tests each of the token files that stack-app.settings names with test -s
+#            (missing or zero size fails); it reads no content and prints nothing. A converge in which both
+#            are running and unchanged makes no check.
+#            Last line, exit 0, when every named token file exists: the owner app (the gateway after it) is
+#            started if it is not running, all five containers are waited for (one budget of 180 seconds,
+#            polled every 2 seconds) and the line is "stack_up: the stack answers".
+#            Last line, exit 0, while a named token file is missing: the owner app and the gateway are only
+#            created (never started, never waited for), the proxy, the dashboard and the browser are waited
+#            for, and the line is "stack_up: the first reset starts the owner app and the gateway". Running
+#            converge again changes nothing and ends with the same line until the files exist.
 #
 # Exit codes: 0 done; 1 refused or failed (the message is on standard error as "stack_up: ..."; a refusal made
 # before any change ends with "nothing was changed"); 2 wrong usage. Run converge again after any failure.
@@ -40,8 +62,9 @@
 # exists without the label raphael-journeys.made-by=stack_up; or stack-app.settings names a variable that is not
 # on the template for the owner app, or its issuer is not the proxy's own.
 #
-# Only containers with that label are ever changed, and only by container id. No volume is ever removed: this
-# script has no volume remove, no prune and no docker rm -v. The proxy volume is mounted by the proxy only.
+# Only containers with that label are ever changed, and only by container id. No volume is ever removed or
+# written: this script has no volume remove, no prune and no docker rm -v, and its one helper mounts the token
+# volume read-only. The proxy volume is mounted by the proxy only.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -176,6 +199,7 @@ guard_template_names() {
 
 # The settings file goes to docker as it is, so every name in it must be an owner app name of the template,
 # and its issuer must be the proxy's own (so that it never points at production). Values are never printed.
+token_names=()
 guard_settings() {
   local line name value proxy_issuer seen=" " re='^([A-Za-z_][A-Za-z0-9_]*)=(.*)$'
   [[ -f $settings ]] || refuse "stack-app.settings is missing"
@@ -196,6 +220,7 @@ guard_settings() {
         ;;
       HERMES_*_TOKEN_FILE)
         [[ $value == "$token_dir"/* ]] || refuse "$name in stack-app.settings is not under the token folder"
+        token_names+=("$name")
         ;;
     esac
   done < "$settings"
@@ -340,6 +365,41 @@ start_container() {
   say "created $name"
 }
 
+# create_container NAME DOCKER_RUN_ARGS...: the same container, made but not started (docker create takes the
+# same arguments as docker run and is the one call that makes a container without starting it).
+create_container() {
+  local name=$1
+  shift
+  docker create --label "$label" --restart unless-stopped --name "$name" "$@" > /dev/null ||
+    die "cannot create $name"
+  say "created $name without starting it"
+}
+
+# running ID: the container runs now (its health is not looked at).
+running() {
+  local state
+  state=$(docker inspect --type container --format "$fmt_state" "$1" 2> /dev/null) || return 1
+  [[ $state == true* ]]
+}
+
+# tokens_ready IMAGE: sets tokens to yes when every token file that stack-app.settings names exists and is not
+# empty, otherwise to no. One throw-away helper container with no network sees the token volume read-only and
+# runs test -s on each file: it reads no content, writes nothing and prints nothing. The file names reach it as
+# variables through --env-file, so no value is put on a command line.
+tokens=""
+tokens_ready() {
+  local test_all="" n rc=0
+  for n in "${token_names[@]+"${token_names[@]}"}"; do test_all+="test -s \"\$$n\" && "; done
+  docker run --rm --label "$label" --network none --user 0 --entrypoint sh \
+    --mount "type=volume,source=$tokens_v,target=$token_dir,readonly" --env-file "$settings" \
+    "$1" -c "${test_all}true" > /dev/null 2>&1 || rc=$?
+  case $rc in
+    0) tokens=yes ;;
+    1) tokens=no ;;
+    *) die "cannot check the token files" ;;
+  esac
+}
+
 do_versions() {
   local roles=(proxy app dashboard gateway browser) i ref
   guard_host
@@ -358,7 +418,8 @@ do_versions() {
 do_converge() {
   local proxy_tag=$1 app_rev=$2 platform_tag=$3 browser_rev=$4 tag v
   local proxy_ref=raphael-journeys-proxy:$1 platform_ref=raphael-journeys-platform:$3
-  local app_ref browser_ref proxy_need dash_need gate_need app_need browser_need gate_id proxy_id
+  local app_ref browser_ref proxy_need dash_need gate_need app_need browser_need gate_old app_old
+  local proxy_id app_id gate_id maker
   local ids=()
   for tag in "$proxy_tag" "$app_rev" "$platform_tag" "$browser_rev"; do
     plain "$tag" || refuse "a tag is not plain (letters, digits, dot, dash, underscore; at most 63 characters)"
@@ -373,7 +434,7 @@ do_converge() {
   plan "$dash_c" "$platform_ref"
   dash_need=$need
   plan "$gate_c" "$platform_ref"
-  gate_need=$need
+  gate_need=$need gate_old=$old_id
   if [[ $proxy_need != keep ]]; then
     exists image "$fmt_id" "$proxy_ref" || refuse "the image $proxy_ref is missing; build it first"
   fi
@@ -415,8 +476,7 @@ do_converge() {
   if ! exists image "$fmt_id" "$app_ref"; then build_app "$app_rev"; fi
   if ! exists image "$fmt_id" "$browser_ref"; then build_browser "$browser_rev"; fi
 
-  # 6: dashboard, gateway, owner app (it joins the gateway's network, so the gateway comes first and the owner
-  # app is recreated whenever the gateway is), then the browser.
+  # 6: the dashboard.
   if [[ $dash_need == replace ]]; then remove "$dash_c"; fi
   if [[ $dash_need != keep ]]; then
     start_container "$dash_c" --network "$network" --network-alias dashboard \
@@ -424,28 +484,53 @@ do_converge() {
       --mount "type=volume,source=$tokens_v,target=$token_dir" --env-file "$work/platform.env" \
       --health-cmd "$dash_hc" "${hc_timing[@]}" "$platform_ref" dashboard --host 0.0.0.0 --port 9119 --no-open
   fi
+
+  # 7: the owner app, then the gateway. The gateway joins the owner app's network namespace, so it is made after
+  # the app and made again whenever the app is made again or does not name the current app.
   plan "$app_c" "$app_ref"
-  app_need=$need
-  if [[ $gate_need == keep && $app_need == keep ]]; then
-    ident "$gate_c"
-    if [[ $(docker inspect --type container --format "$fmt_network_mode" "$old_id") != "container:$found_id" ]]; then
-      app_need=replace
+  app_need=$need app_old=$old_id
+  if [[ $gate_need == keep ]]; then
+    if [[ $app_need != keep ]]; then
+      gate_need=replace
+    elif [[ $(docker inspect --type container --format "$fmt_network_mode" "$gate_old" 2> /dev/null) != "container:$app_old" ]]; then
+      gate_need=replace
+    elif running "$gate_old" && ! running "$app_old"; then
+      gate_need=replace
     fi
   fi
-  if [[ $gate_need != keep && $app_need == keep ]]; then app_need=replace; fi
-  if [[ $app_need == replace ]]; then remove "$app_c"; fi
+  # One read-only look at the token files, only when the owner app or the gateway is about to be made or started.
+  tokens=yes
+  if [[ $app_need != keep || $gate_need != keep ]] || ! running "$app_old" || ! running "$gate_old"; then
+    tokens_ready "$platform_ref"
+  fi
+  # While a token file is missing the two are only made: the first reset issues the tokens and starts them.
+  maker=start_container
+  if [[ $tokens != yes ]]; then maker=create_container; fi
   if [[ $gate_need == replace ]]; then remove "$gate_c"; fi
+  if [[ $app_need == replace ]]; then remove "$app_c"; fi
+  if [[ $app_need != keep ]]; then
+    "$maker" "$app_c" --network "$network" --network-alias workspace \
+      --mount "type=volume,source=$tokens_v,target=$token_dir" --env-file "$settings" "$app_ref"
+  fi
+  ident "$app_c"
+  app_id=$found_id
+  if [[ $tokens == yes && $app_need == keep ]] && ! running "$app_id"; then
+    docker start "$app_id" > /dev/null || die "cannot start $app_c"
+    say "started $app_c"
+  fi
   if [[ $gate_need != keep ]]; then
-    start_container "$gate_c" --network "$network" --network-alias workspace --network-alias gateway \
+    "$maker" "$gate_c" --network "container:$app_id" \
       --mount "type=volume,source=$home_v,target=$data_dir" --env-file "$work/platform.env" \
-      --health-cmd "$gate_hc" "${hc_timing[@]}" "$platform_ref" gateway run --no-supervise
+      --health-cmd "$gate_hc" "${hc_timing[@]}" "$platform_ref" gateway run
   fi
   ident "$gate_c"
   gate_id=$found_id
-  if [[ $app_need != keep ]]; then
-    start_container "$app_c" --network "container:$gate_id" \
-      --mount "type=volume,source=$tokens_v,target=$token_dir" --env-file "$settings" "$app_ref"
+  if [[ $tokens == yes && $gate_need == keep ]] && ! running "$gate_id"; then
+    docker start "$gate_id" > /dev/null || die "cannot start $gate_c"
+    say "started $gate_c"
   fi
+
+  # 8: the browser.
   plan "$browser_c" "$browser_ref"
   browser_need=$need
   if [[ $browser_need == replace ]]; then remove "$browser_c"; fi
@@ -453,13 +538,25 @@ do_converge() {
     start_container "$browser_c" --network "$network" --health-cmd "$browser_hc" "${hc_timing[@]}" "$browser_ref"
   fi
 
-  # 7: all five answer inside the one budget.
-  for v in "$proxy_c" "$app_c" "$dash_c" "$gate_c" "$browser_c"; do
-    ident "$v"
-    ids+=("$found_id")
-  done
+  # 9: all five answer inside the one budget; while a token file is missing, the proxy, the dashboard and the
+  # browser only.
+  if [[ $tokens == yes ]]; then
+    for v in "$proxy_c" "$app_c" "$dash_c" "$gate_c" "$browser_c"; do
+      ident "$v"
+      ids+=("$found_id")
+    done
+  else
+    for v in "$proxy_c" "$dash_c" "$browser_c"; do
+      ident "$v"
+      ids+=("$found_id")
+    done
+  fi
   wait_for "${ids[@]}" || die "no answer after 180 seconds from at least one container; run converge again"
-  say "the stack answers"
+  if [[ $tokens == yes ]]; then
+    say "the stack answers"
+  else
+    say "the first reset starts the owner app and the gateway"
+  fi
 }
 
 (($# >= 1)) || usage
