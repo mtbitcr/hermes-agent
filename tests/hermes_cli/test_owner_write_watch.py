@@ -1085,3 +1085,196 @@ def test_round5_3_8642_and_127_0_0_1_are_the_api_servers_defaults():
     assert (watch.DEFAULT_PORT, watch.DEFAULT_HOST) == (8642, "127.0.0.1") == (
         api_server.DEFAULT_PORT, api_server.DEFAULT_HOST)
     assert watch._listener_base() == "http://127.0.0.1:8642"
+
+
+JOURNEYS_LABEL = "Owner journeys run"
+STUCK_DETAIL = "stuck since 2026-10-05 07:00 UTC; the time limit ended it"
+
+
+def write_journeys(content):
+    path = get_hermes_home() / "journeys" / "result"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(content, bytes):
+        path.write_bytes(content)
+    else:
+        path.write_text(content, encoding="utf-8")
+
+
+def started_at(moment):
+    stamp = moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return f"result=started\nstep=none\nreason=the run has started and has not ended\nstarted={stamp}\n"
+
+
+def finished(outcome):
+    return (f"result={outcome}\nstep=none\nreason=done\nstarted=2026-10-05T07:00:00Z\n"
+            "finished=2026-10-05T07:20:00Z\n")
+
+
+def journeys_check():
+    checks = json.loads(watch.report_path().read_text(encoding="utf-8"))["checks"]
+    found = [check for check in checks if check["name"] == "journeys"]
+    assert len(found) == 1
+    return found[0]
+
+
+def test_journeys_no_file_passes(tmp_path):
+    """No result file means no run has started yet: pass."""
+    host = Host(tmp_path)
+    outcome = host.run()
+    check = journeys_check()
+    assert (check["outcome"], check["label"], check["method"]) == (watch.PASS, JOURNEYS_LABEL, "read")
+    assert outcome.kind == "active"
+
+
+def test_journeys_started_more_than_55_minutes_ago_fails_with_the_started_time(tmp_path):
+    """A run still marked started more than 55 minutes before the run's moment fails."""
+    host = Host(tmp_path)
+    write_journeys(started_at(START - timedelta(hours=2)))
+    outcome = host.run()
+    check = journeys_check()
+    assert (check["outcome"], check["detail"]) == (watch.FAIL, STUCK_DETAIL)
+    assert outcome.kind == "alert"
+    assert f"- {JOURNEYS_LABEL}: {STUCK_DETAIL}" in outcome.text
+
+
+def test_journeys_the_stuck_limit_is_55_minutes_exactly(tmp_path):
+    """55 minutes is still inside the limit plus ten minutes; one second more is stuck."""
+    assert watch.JOURNEYS_STUCK_AFTER == timedelta(minutes=55)
+    host = Host(tmp_path)
+    write_journeys(started_at(START - timedelta(minutes=55)))
+    host.run()
+    assert journeys_check()["outcome"] == watch.PASS
+    host = Host(tmp_path)
+    write_journeys(started_at(START - timedelta(minutes=55, seconds=1)))
+    host.run()
+    assert journeys_check()["outcome"] == watch.FAIL
+
+
+@pytest.mark.parametrize("age", [timedelta(0), timedelta(minutes=20), timedelta(minutes=-5)])
+def test_journeys_started_within_55_minutes_passes(tmp_path, age):
+    host = Host(tmp_path)
+    write_journeys(started_at(START - age))
+    outcome = host.run()
+    assert journeys_check()["outcome"] == watch.PASS
+    assert outcome.kind == "active"
+
+
+@pytest.mark.parametrize("final", ["passed", "failed"])
+def test_journeys_a_final_result_passes_however_old(tmp_path, final):
+    """A passed or failed run told the owner itself: pass."""
+    host = Host(tmp_path)
+    write_journeys(finished(final))
+    outcome = host.run()
+    assert journeys_check()["outcome"] == watch.PASS
+    assert outcome.kind == "active"
+
+
+UNREADABLE = object()
+
+
+@pytest.mark.parametrize("content", [
+    UNREADABLE,
+    b"result=started\nstarted=2026-10-05T07:00:00Z\n\xff\xfe\n",
+    "",
+    "result=started\nthis is not a pair\nstarted=2026-10-05T07:00:00Z\n",
+    "result=started\n\nstarted=2026-10-05T07:00:00Z\n",
+    "result=started\nstep=none\n",
+    "result=started\nstarted=\n",
+    "result=started\nstarted=yesterday\n",
+    "result=started\nstarted=2026-10-05 07:00:00\n",
+    "result=started\nstarted=2026-10-05T07:00:00+02:00\n",
+    "result=started\nstarted=2026-10-05T07:00:00\n",
+    "result=started\nstarted=2026-13-05T07:00:00Z\n",
+    "step=none\nstarted=2026-10-05T07:00:00Z\n",
+    "result=unheard\nstarted=2026-10-05T07:00:00Z\n",
+])
+def test_journeys_an_unusable_file_gives_no_verdict(tmp_path, content):
+    host = Host(tmp_path)
+    if content is UNREADABLE:
+        (get_hermes_home() / "journeys" / "result").mkdir(parents=True)
+    else:
+        write_journeys(content)
+    outcome = host.run()
+    assert journeys_check()["outcome"] == watch.UNKNOWN
+    assert outcome.kind is None
+
+
+def test_journeys_no_verdict_keeps_the_previous_state(tmp_path):
+    """After a stuck alert, an unreadable file neither recovers nor re-alerts; once it is
+    readable and final, the recovery follows."""
+    host = Host(tmp_path)
+    write_journeys(started_at(START - timedelta(hours=2)))
+    assert host.run().kind == "alert"
+    write_journeys("not a pair\n")
+    outcome = host.run()
+    assert (journeys_check()["outcome"], outcome.kind, outcome.text) == (watch.UNKNOWN, None, "")
+    write_journeys(finished("passed"))
+    assert host.run().kind == "recovery"
+
+
+@pytest.mark.parametrize("final", ["passed", "failed"])
+@pytest.mark.parametrize("stamp", [
+    "yesterday",
+    "",
+    "2026-10-05 07:00:00",
+    "2026-10-05T07:00:00",
+    "2026-10-05T07:00:00+02:00",
+    "2026-13-05T07:00:00Z",
+    "2026-02-30T07:00:00Z",
+    "2026-10-05T25:00:00Z",
+])
+def test_journeys_a_final_result_with_an_invalid_started_time_keeps_the_stuck_alert(tmp_path, final, stamp):
+    """A final result whose started time is not a real UTC time gives no verdict: no recovery,
+    no message, and the stuck state is kept until a valid result arrives."""
+    host = Host(tmp_path)
+    write_journeys(started_at(START - timedelta(hours=2)))
+    assert host.run().kind == "alert"
+    kept = lambda: {k: v for k, v in json.loads(watch.state_path().read_text(encoding="utf-8")).items()
+                    if k in ("state", "failing", "since")}
+    stored = kept()
+    assert stored["failing"] == ["journeys"]
+    write_journeys(finished(final).replace("started=2026-10-05T07:00:00Z", f"started={stamp}"))
+    outcome = host.run()
+    assert (journeys_check()["outcome"], outcome.kind, outcome.text) == (watch.UNKNOWN, None, "")
+    assert kept() == stored
+    write_journeys(finished(final))
+    assert host.run().kind == "recovery"
+
+
+@pytest.mark.parametrize("final", ["passed", "failed"])
+def test_journeys_a_final_result_without_a_started_time_gives_no_verdict(tmp_path, final):
+    host = Host(tmp_path)
+    write_journeys(f"result={final}\nstep=none\n")
+    outcome = host.run()
+    assert (journeys_check()["outcome"], outcome.kind) == (watch.UNKNOWN, None)
+
+
+def test_journeys_a_run_stuck_across_two_hourly_runs_alerts_once(tmp_path):
+    host = Host(tmp_path)
+    write_journeys(started_at(START - timedelta(hours=2)))
+    outcomes = [host.run(), host.run(), host.run()]
+    assert [outcome.code for outcome in outcomes] == [0, 0, 0]
+    sent = messages(outcomes)
+    assert len(sent) == 1
+    assert outcomes[0].kind == "alert"
+    assert STUCK_DETAIL in sent[0]
+
+
+def test_journeys_a_final_result_after_a_stuck_one_gives_the_recovery_message(tmp_path):
+    host = Host(tmp_path)
+    write_journeys(started_at(START - timedelta(hours=2)))
+    host.run()
+    write_journeys(finished("failed"))
+    after = [host.run(), host.run()]
+    assert after[0].kind == "recovery"
+    assert watch.format_duration(HOUR) in after[0].text
+    assert len(messages(after)) == 1
+
+
+def test_journeys_the_planning_profile_has_no_journeys_result(tmp_path):
+    host = Host(tmp_path, "raphael-planner")
+    write_journeys(started_at(START - timedelta(hours=2)))
+    outcome = host.run()
+    checks = json.loads(watch.report_path().read_text(encoding="utf-8"))["checks"]
+    assert "journeys" not in [check["name"] for check in checks]
+    assert outcome.kind == "active"
