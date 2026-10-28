@@ -71,12 +71,20 @@
 #
 # It refuses, before it changes anything, when: the host name is not JOURNEY_STACK_HOST; a tag is not plain;
 # Docker is not rootless; less than 20 GB is free in Docker's data folder; a container with a template name
-# exists without the label raphael-journeys.made-by=stack_up; or stack-app.settings names a variable that is not
-# on the template for the owner app, or its issuer is not the proxy's own.
+# exists without the label raphael-journeys.made-by=stack_up; a container with a template name cannot be read; or
+# stack-app.settings names a variable that is not on the template for the owner app, or its issuer is not the
+# proxy's own.
 #
-# Only containers with that label are ever changed, and only by container id. No volume is ever removed or
-# written: this script has no volume remove, no prune and no docker rm -v, and its one helper mounts the token
-# volume read-only. The proxy volume is mounted by the proxy only.
+# Only Docker's own answer that there is no such container (for that name) counts as absent. Any other failure of
+# an identity read (a connection or permission error, an empty or odd answer) means the container cannot be read: the
+# line is "stack_up: cannot read the container <name>; nothing was changed". After the first change the same case
+# ends the run with "stack_up: cannot read the container <name>", and a container that this script did not make with
+# "stack_up: container <name> is not one this script made; it was left alone".
+#
+# Only containers with that label are ever changed, and only by container id: Docker is given an id only when a
+# successful identity read of the same run returned it with that label, and an id that was not read that way is
+# never passed to it. No volume is ever removed or written: this script has no volume remove, no prune and no
+# docker rm -v, and its one helper mounts the token volume read-only. The proxy volume is mounted by the proxy only.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -162,14 +170,39 @@ fmt_root='{{.DockerRootDir}}'
 # exists KIND FORMAT REF: read-only look at a network, volume or image.
 exists() { docker inspect --type "$1" --format "$2" "$3" > /dev/null 2>&1; }
 
-# ident NAME: sets found_id (empty when there is no such container) and found_label (read only).
-found_id="" found_label=""
+# cannot_read NAME: an empty $work means nothing was changed yet, because make_work runs right before the first
+# change of every changing mode.
+cannot_read() {
+  if [[ -z $work ]]; then refuse "cannot read the container $1"; fi
+  die "cannot read the container $1"
+}
+
+# ident NAME: one read, always called as a plain statement (it sets found_id). found_id is empty when Docker itself
+# says there is no such container, and otherwise the id this very read returned with the label stack_up; a container
+# with another label, or any other outcome of the read, stops the script. Docker's stderr goes to a temp file and is
+# never printed, so that a warning beside a good read is no failure.
+found_id=""
+good_ident_re='^[0123456789abcdef]{64} '
 ident() {
-  local out
-  found_id="" found_label=""
-  out=$(docker inspect --type container --format "$fmt_ident" "$1" 2> /dev/null) || return 0
+  local out="" err="" errfile rc=0
+  found_id=""
+  errfile=$(mktemp "${TMPDIR:-/tmp}/stack_up.err.XXXXXX" 2> /dev/null) || cannot_read "$1"
+  out=$(docker inspect --type container --format "$fmt_ident" "$1" 2> "$errfile") || rc=$?
+  err=$(< "$errfile")
+  rm -f "$errfile"
+  if ((rc != 0)); then
+    if [[ -z $out ]]; then
+      if [[ $err == "Error: No such container: $1" ]]; then return 0; fi
+      if [[ $err == "Error response from daemon: No such container: $1" ]]; then return 0; fi
+    fi
+    cannot_read "$1"
+  fi
+  [[ $out != *$'\n'* && $out =~ $good_ident_re ]] || cannot_read "$1"
+  if [[ ${out#* } != "$label_value" ]]; then
+    if [[ -z $work ]]; then refuse "container $1 exists but this script did not make it"; fi
+    die "container $1 is not one this script made; it was left alone"
+  fi
   found_id=${out%% *}
-  found_label=${out#* }
 }
 
 plain() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]]; }
@@ -192,13 +225,12 @@ guard_docker() {
   ((avail >= 20 * 1024 * 1024)) || refuse "less than 20 GB is free in Docker's data folder"
 }
 
+# guard_ownership: reads all five in the order of the template, before any change; ident refuses a container that
+# this script did not make and one that cannot be read.
 guard_ownership() {
   local c
   for c in "${containers[@]}"; do
     ident "$c"
-    if [[ -n $found_id && $found_label != "$label_value" ]]; then
-      refuse "container $c exists but this script did not make it"
-    fi
   done
 }
 
@@ -270,7 +302,7 @@ build_proxy() {
 ca_hash=""
 fetch_ca() {
   ident "$proxy_c"
-  [[ -n $found_id && $found_label == "$label_value" ]] || die "the proxy container is missing"
+  [[ -n $found_id ]] || die "the proxy container is missing"
   mkdir -p "$work/ca"
   docker cp "$found_id:$state_dir/ca.pem" "$work/ca/ca.pem" > /dev/null || die "cannot copy the CA out of the proxy"
   ca_hash=$(sha256sum "$work/ca/ca.pem" | cut -c1-12)
@@ -360,11 +392,10 @@ plan() {
   if [[ $have == "$2" ]]; then need=keep; else need=replace; fi
 }
 
-# remove NAME: removes the container of that name by its id, after its label has been read.
+# remove NAME: removes the container of that name by the id that this read returned with the label.
 remove() {
   ident "$1"
   [[ -n $found_id ]] || return 0
-  [[ $found_label == "$label_value" ]] || die "container $1 is not one this script made; it was left alone"
   docker rm --force "$found_id" > /dev/null || die "cannot remove $1"
   say "removed $1"
 }

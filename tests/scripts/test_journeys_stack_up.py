@@ -1,4 +1,4 @@
-"""Tests for scripts/journeys/stack_up.sh (card 2 of the journeys stack plan, rounds 2 and 3).
+"""Tests for scripts/journeys/stack_up.sh (card 2 of the journeys stack plan, rounds 2 to 4).
 
 The script runs against stand-ins for docker, sleep, hostname and df that sit first on PATH. The stand-in
 docker records every call in calls.jsonl, keeps a fake Server 2 in state.json, and refuses (status 98) any
@@ -10,14 +10,20 @@ State.StartedAt from a strictly increasing fake clock at every start and restart
 it: trailing zeros of the fraction cut, no fraction when it is zero, the zero time while never started; a test
 can overwrite it with an exact string), and makes a started owner app exit
 at once when one of the seven token files of stack-app.settings is missing or empty. DOCKER_HOST points at a
-path that does not exist, so a real docker could not answer. No real Docker call is made anywhere. The tests
+path that does not exist, so a real docker could not answer. No real Docker call is made anywhere. The stand-in
+can also answer one identity read by script (scripted.json next to state.json), print the daemon's own wording of a
+missing container (STUB_NOT_FOUND=daemon) and, while STUB_VERIFY is set (every run of stack_up.sh), refuse with
+status 98 a start, stop, restart, rm, cp or --network container:ID of an id that no identity read of that run showed
+with the label (verified.txt), which makes owner rule 2 of round 4 an invariant of every converge test. The tests
 read recorded calls, output lines and the fake host state; they never read the script's text, and the token
 files hold invented placeholder text that is never printed.
 
 Tests test_1_... to test_8_... are the eight tests of the plan (test_1 and test_2 cover the round 2 rules);
 test_9_... onwards and test_extra_... are additions. Round 3 adds test_13 to test_15 (stopped kept containers) and
 test_16 to test_20 (the namespace rule: the gateway is current only when its network mode names the owner app's
-current container id and its State.StartedAt is strictly later than the owner app's).
+current container id and its State.StartedAt is strictly later than the owner app's). Round 4 adds test_21 to
+test_25 (an identity read that fails for any reason but Docker's own "no such container" stops converge before any
+change with one fixed line; Docker is given an id only from a read of the same run that showed the label).
 """
 
 from __future__ import annotations
@@ -110,6 +116,54 @@ def fail(message, rc=1):
     raise Done(rc, message + "\n")
 
 
+VERIFIED = ROOT / "verified.txt"
+SCRIPTED = ROOT / "scripted.json"
+
+
+def verified_ids():
+    return VERIFIED.read_text(encoding="utf-8").split() if VERIFIED.exists() else []
+
+
+def note_verified(cid):
+    with open(VERIFIED, "a", encoding="utf-8") as handle:
+        handle.write(cid + "\n")
+
+
+def require_verified(cid):
+    """While STUB_VERIFY is set, an id reaches a changing call only after a read of this run showed the label."""
+    if os.environ.get("STUB_VERIFY") == "1" and cid not in verified_ids():
+        refuse("id %s was not read with the label stack_up in this run" % cid)
+
+
+def changed_since(start):
+    for line in CALLS.read_text(encoding="utf-8").splitlines()[start:]:
+        call = json.loads(line)
+        if call["tool"] == "docker" and call["argv"][:1] not in (["info"], ["inspect"]):
+            return True
+    return False
+
+
+def scripted_ident(name):
+    """The scripted entry that fires for this identity read of container NAME (see Host.script_read), or None."""
+    if not SCRIPTED.exists():
+        return None
+    entries = json.loads(SCRIPTED.read_text(encoding="utf-8"))
+    for entry in entries:
+        if entry["name"] != name or entry["fired"]:
+            continue
+        if entry["after_change"] and not changed_since(entry["since"]):
+            continue
+        hit = None
+        if entry["seen"] < entry["skip"]:
+            entry["seen"] += 1
+        else:
+            entry["fired"] += 1
+            hit = entry
+        SCRIPTED.write_text(json.dumps(entries), encoding="utf-8")
+        return hit
+    return None
+
+
 def load():
     return json.loads(STATE_FILE.read_text(encoding="utf-8"))
 
@@ -178,7 +232,17 @@ def d_inspect(state, a):
     kind, fmt, ref = a[1], a[3], a[4]
     if kind == "container":
         cid, c = find_container(state, ref)
+        if fmt == F["ident"]:
+            hit = scripted_ident(c["name"] if c else ref)
+            if hit and hit["status"] != 0:
+                raise Done(hit["status"], hit["stderr"])
+            if hit:
+                sys.stderr.write(hit["stderr"])
+                if hit["stdout"] is not None:
+                    return hit["stdout"]
         if c is None:
+            if os.environ.get("STUB_NOT_FOUND") == "daemon":
+                fail("Error response from daemon: No such container: " + ref)
             fail("Error: No such container: " + ref)
         env = merged_env(state, c)
         if fmt == F["image"]:
@@ -195,6 +259,8 @@ def d_inspect(state, a):
             out = c["health"][0] if c["health"] else "NONE"
         elif fmt == F["ident"]:
             out = "%s %s" % (cid, c["labels"].get(LABEL_KEY, ""))
+            if c["labels"].get(LABEL_KEY) == "stack_up":
+                note_verified(cid)
         elif fmt == F["config_image"]:
             out = c["image_ref"]
         elif fmt == F["network_mode"]:
@@ -494,6 +560,7 @@ def d_run(state, a, create=False):
         target = net[len("container:"):]
         if not HEX64.fullmatch(target):
             refuse("--network container: must name the container by its id")
+        require_verified(target)
         _, t = find_container(state, target)
         if t is None:
             fail("docker: Error response from daemon: No such container: " + target, 125)
@@ -533,6 +600,7 @@ def d_cp(state, a):
     cid, _, path = a[0].partition(":")
     if not HEX64.fullmatch(cid):
         refuse("cp must name the container by its id")
+    require_verified(cid)
     _, c = find_container(state, cid)
     if c is None:
         fail("Error: No such container:path: " + a[0])
@@ -549,6 +617,7 @@ def d_cp(state, a):
 def d_rm(state, a):
     if len(a) != 2 or a[0] != "--force" or not HEX64.fullmatch(a[1]):
         refuse("rm shape %r (only: rm --force <container id>; never by name, never -v)" % a)
+    require_verified(a[1])
     if a[1] not in state["containers"]:
         fail("Error response from daemon: No such container: " + a[1])
     del state["containers"][a[1]]
@@ -559,6 +628,7 @@ def d_rm(state, a):
 def d_lifecycle(state, a, sub):
     if len(a) != 1:
         refuse("%s shape %r" % (sub, a))
+    require_verified(a[0])
     cid, c = find_container(state, a[0])
     if c is None:
         fail("Error response from daemon: No such container: " + a[0])
@@ -766,6 +836,11 @@ class Host:
         return env
 
     def run(self, script: str, *args: str, timeout: int = 120, **extra_env: str) -> subprocess.CompletedProcess:
+        if script == "stack_up.sh":
+            # Each run starts with no verified id: the stand-in then refuses an id that no read of this run showed
+            # with the label (owner rule 2 of round 4).
+            extra_env["STUB_VERIFY"] = "1"
+            (self.root / "verified.txt").write_text("", encoding="utf-8")
         return subprocess.run(
             [str(self.scripts / script), *args],
             env=self.env(**extra_env),
@@ -791,11 +866,31 @@ class Host:
     def docker_calls(self, since: int = 0) -> list[list[str]]:
         return [c["argv"] for c in self.calls()[since:] if c["tool"] == "docker"]
 
-    def docker(self, *args: str) -> subprocess.CompletedProcess:
+    def docker(self, *args: str, **extra_env: str) -> subprocess.CompletedProcess:
         """One call of the stand-in docker, as a person at a shell would make it."""
         return subprocess.run(
-            [str(self.bin / "docker"), *args], env=self.env(), cwd=self.root, capture_output=True, text=True, timeout=60
+            [str(self.bin / "docker"), *args],
+            env=self.env(**extra_env),
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
+
+    def script_read(
+        self, name: str, status: int = 1, stdout: str | None = "", stderr: str = "", skip: int = 0, after_change: bool = False
+    ) -> None:
+        """Script one identity read of container NAME: the first skip reads are let through, the next one fires once.
+        Status 0 with a string answers that stdout; status 0 with stdout None passes the real answer and only writes
+        stderr (a warning); a non-zero status fails with stderr. With after_change only reads that follow the first
+        changing docker call logged after this call count."""
+        path = self.root / "scripted.json"
+        entries = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+        entries.append(
+            {"name": name, "skip": skip, "after_change": after_change, "status": status, "stdout": stdout,
+             "stderr": stderr, "seen": 0, "fired": 0, "since": len(self.calls())}
+        )
+        path.write_text(json.dumps(entries), encoding="utf-8")
 
     def mark(self) -> int:
         return len(self.calls())
@@ -1527,6 +1622,170 @@ def test_6_refusals_change_nothing(tmp_path: Path, case: str) -> None:
     assert "nothing was changed" in result.stderr
     assert changing(host.docker_calls()) == []
     assert host.state() == before
+
+
+# --- round 4, rule 1 and 3: an identity read that fails is not "absent"; it refuses before any change
+
+TEMPLATE_CONTAINERS = SECTIONS["containers"]
+TEMPLATE_PROXY, TEMPLATE_APP = TEMPLATE_CONTAINERS[0], TEMPLATE_CONTAINERS[1]
+CONNECTION_ERROR = "Cannot connect to the Docker daemon at unix:///nonexistent/stand-in-only/docker.sock. Is it running?\n"
+
+
+def unlabelled_stopped(host: Host, role: str) -> None:
+    """The container of that role keeps its name and image, loses the label and stops (the review's reproduction)."""
+    state = host.state()
+    container = containers_by_name(state)[role]
+    container["labels"] = {}
+    container["running"] = False
+    host.save(state)
+
+
+@pytest.mark.parametrize("role", TEMPLATE_CONTAINERS)
+def test_21_a_failed_first_identity_read_refuses_before_any_change(stack: Host, role: str) -> None:
+    """One connection error on the first identity read of an unlabelled, stopped container: the fixed line, exit 1,
+    no changing call, the fake host unchanged. Without the rule the script would keep the container and start it."""
+    unlabelled_stopped(stack, role)
+    stack.script_read(role, stderr=CONNECTION_ERROR)
+    before = stack.state()
+    mark = stack.mark()
+    result = stack.converge()
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stdout == ""
+    assert result.stderr == f"stack_up: cannot read the container {role}; nothing was changed\n"
+    assert changing(stack.docker_calls(mark)) == []
+    assert stack.state() == before
+
+
+@pytest.mark.parametrize("role", TEMPLATE_CONTAINERS)
+def test_22_the_same_unlabelled_container_without_a_read_error_refuses_before_any_change(stack: Host, role: str) -> None:
+    """The control of test_21 for all five roles (test_6 keeps its proxy case): the read works, the label is missing."""
+    unlabelled_stopped(stack, role)
+    before = stack.state()
+    mark = stack.mark()
+    result = stack.converge()
+    assert result.returncode != 0
+    assert result.stderr == f"stack_up: container {role} exists but this script did not make it; nothing was changed\n"
+    assert changing(stack.docker_calls(mark)) == []
+    assert stack.state() == before
+
+
+# (status, stdout, stderr) of a first identity read of the proxy that is not absent and not a good read.
+UNREADABLE_PROXY_READS = {
+    "connection_error": (1, "", CONNECTION_ERROR),
+    "permission_denied": (1, "", "permission denied while trying to connect to the Docker daemon socket\n"),
+    "no_such_container_names_another": (1, "", f"Error: No such container: {TEMPLATE_APP}\n"),
+    "no_such_container_and_a_second_line": (1, "", f"Error: No such container: {TEMPLATE_PROXY}\nsecond line\n"),
+    "status_0_empty_stdout": (0, "", ""),
+    "status_0_odd_stdout": (0, "not an id, a space and a label\n", ""),
+    "non_zero_empty_stderr": (1, "", ""),
+}
+
+
+@pytest.mark.parametrize("case", sorted(UNREADABLE_PROXY_READS))
+def test_23_any_other_answer_to_the_first_proxy_read_refuses_before_any_change(host: Host, case: str) -> None:
+    """Only Docker's own 'no such container' for the asked name is absent. On an empty host each other answer to the
+    first identity read of the proxy ends in the fixed line for the proxy: nothing on stdout, no changing call."""
+    status, stdout, stderr = UNREADABLE_PROXY_READS[case]
+    seed_tokens(host)
+    host.script_read(TEMPLATE_PROXY, status=status, stdout=stdout, stderr=stderr)
+    before = host.state()
+    result = host.converge()
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stdout == ""
+    assert result.stderr == f"stack_up: cannot read the container {TEMPLATE_PROXY}; nothing was changed\n"
+    assert changing(host.docker_calls()) == []
+    assert host.state() == before
+
+
+def fired_reads(host: Host) -> int:
+    """How many scripted reads the stand-in has answered (scripted.json is the stand-in's own bookkeeping)."""
+    entries = json.loads((host.root / "scripted.json").read_text(encoding="utf-8"))
+    return sum(entry["fired"] for entry in entries)
+
+
+def test_23b_the_daemons_own_wording_is_absent_and_a_warning_beside_a_good_read_is_no_failure(host: Host) -> None:
+    """Control for test_23: with STUB_NOT_FOUND=daemon (the other wording of Docker's 'no such container') a first
+    creation works as in test_1; then a Docker warning on stderr beside a good read of the proxy changes nothing."""
+    seed_tokens(host)
+    created = host.converge(STUB_NOT_FOUND="daemon")
+    assert created.returncode == 0, created.stdout + created.stderr
+    assert output_lines(created)[-1] == ANSWERS_LINE
+    assert_all_running_and_healthy(host)
+
+    ids = container_ids(host)
+    host.script_read(TEMPLATE_PROXY, status=0, stdout=None, stderr="WARNING: a placeholder warning from the daemon\n")
+    mark = host.mark()
+    result = host.converge()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output_lines(result)[-1] == ANSWERS_LINE
+    assert fired_reads(host) == 1
+    assert {argv[0] for argv in host.docker_calls(mark)} <= {"info", "inspect", "cp"}
+    assert container_ids(host) == ids
+
+
+def test_24_a_read_that_fails_after_the_first_change_stops_with_the_short_line_and_the_next_run_recovers(stack: Host) -> None:
+    """The first identity read of the owner app after the first changing call fails (a new owner app revision, so the
+    CA copy and the new image layers come first). Converge stops with 'cannot read the container ROLE' and without
+    'nothing was changed', makes no lifecycle call, and the same run again, unscripted, finishes."""
+    stack.script_read(TEMPLATE_APP, stderr=CONNECTION_ERROR, after_change=True)
+    mark = stack.mark()
+    failed = stack.converge(app=NEW_REVISION)
+    assert failed.returncode == 1, failed.stdout + failed.stderr
+    assert output_lines(failed)[-1] == f"stack_up: cannot read the container {TEMPLATE_APP}"
+    assert "nothing was changed" not in failed.stderr
+    assert fired_reads(stack) == 1
+    docker = stack.docker_calls(mark)
+    assert changing(docker)
+    assert lifecycle_calls(docker) == []
+
+    result = stack.converge(app=NEW_REVISION)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output_lines(result)[-1] == ANSWERS_LINE
+    assert_all_running_and_healthy(stack)
+    assert_no_volume_removal(stack.docker_calls())
+
+
+def probe_argv(operation: str, cid: str, copy_to: Path) -> list[str]:
+    """One docker call of the kinds the verified-id rule covers, aimed at the container with that id."""
+    if operation == "rm":
+        return ["rm", "--force", cid]
+    if operation == "cp":
+        return ["cp", f"{cid}:/state/ca.pem", str(copy_to)]
+    if operation == "create":
+        return ["create", "--label", LABEL, "--restart", "unless-stopped", "--name", f"probe-{cid[:12]}.invalid",
+                "--network", f"container:{cid}", f"raphael-journeys-platform:{PLATFORM}"]
+    return [operation, cid]
+
+
+@pytest.mark.parametrize("operation", ["start", "stop", "restart", "rm", "cp", "create"])
+def test_25_with_stub_verify_the_stand_in_refuses_an_id_that_no_read_showed_with_the_label(
+    stack: Host, tmp_path: Path, operation: str
+) -> None:
+    """Harness self-test: with STUB_VERIFY=1 an unlabelled container's id and an id that was never read are refused
+    (status 98); after a successful labelled identity read the labelled container is accepted, the unlabelled stays
+    refused even after its own successful read."""
+    state = stack.state()
+    unlabelled = foreign_container(state, "unrelated-container.invalid")
+    stack.save(state)
+    labelled = container_ids(stack)[TEMPLATE_PROXY]
+    (stack.root / "verified.txt").write_text("", encoding="utf-8")
+
+    def attempt(cid: str) -> subprocess.CompletedProcess:
+        return stack.docker(*probe_argv(operation, cid, tmp_path / "ca.pem"), STUB_VERIFY="1")
+
+    def read(name: str) -> None:
+        answer = stack.docker("inspect", "--type", "container", "--format", FORMATS["ident"], name, STUB_VERIFY="1")
+        assert answer.returncode == 0, answer.stderr
+
+    for cid in (unlabelled, labelled):
+        refused = attempt(cid)
+        assert refused.returncode == 98 and "was not read with the label" in refused.stderr, cid
+    read(TEMPLATE_PROXY)
+    accepted = attempt(labelled)
+    assert accepted.returncode == 0, accepted.stderr
+    read("unrelated-container.invalid")
+    refused = attempt(unlabelled)
+    assert refused.returncode == 98 and "was not read with the label" in refused.stderr
 
 
 def test_7_ca_leaves_the_proxy_only_as_ca_pem_and_only_the_proxy_mounts_the_proxy_volume(stack: Host) -> None:
