@@ -1,8 +1,9 @@
 """Seed the journeys test stack for one journey (cards 2 and 3): python seed_states.py JOURNEY < seed.json.
 
-Journey 2 gets a card awaiting review, a review-approved card and a done card held by one waiting release batch;
-journey 3 gets a waiting owner question and a waiting suggestion; journey 5 gets a card stopped after repeated
-failures. All checks run first and the writes after; a refused run prints one fixed line and writes nothing.
+Journey 2 gets a card awaiting review, a review-approved card shown as being delivered (one unfinished delivery row)
+and a done card held by one waiting release batch; journey 3 gets a waiting owner question and a waiting suggestion;
+journey 5 gets a card stopped after repeated failures. All checks run first and the writes after; a refused run prints
+one fixed line and writes nothing.
 """
 
 import contextlib
@@ -187,6 +188,28 @@ def made_up_commit(part):
     return hashlib.sha256(f"journey-test-{part}".encode("ascii")).hexdigest()[:40]
 
 
+def record_unfinished_delivery(card):
+    """The row that shows the done card as being delivered; record_approved_delivery writes nothing while delivery is off."""
+    from hermes_cli import kanban_db
+
+    failed = "the journey board did not take the delivery of the approved card"
+    try:
+        with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
+            with kanban_db.write_txn(conn):
+                approval = conn.execute(
+                    "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'completed' ORDER BY id DESC LIMIT 1", (card,)
+                ).fetchone()
+                if approval is None:
+                    raise Stop(failed)
+                conn.execute(
+                    "INSERT INTO kanban_deliveries (source_task_id, source_head, approval_run_id, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (card, made_up_commit("delivery"), approval["run_id"], int(time.time())),
+                )
+    except (RuntimeError, sqlite3.Error, OSError):
+        raise Stop(failed) from None
+
+
 def say(label, value):
     print(f"seed_states: {label}: {value}")
 
@@ -294,7 +317,9 @@ def seed_home(journey, names):
         approved, _ = make_card(names["approved"])
         hermes("kanban", "--board", BOARD, "request-review", approved, "--force")
         hermes("kanban", "--board", BOARD, "complete", approved, "--summary", APPROVED)
+        record_unfinished_delivery(approved)
         say("approved card", approved)
+        say("approved card delivery", "unfinished")
         merged, _ = make_card(names["merged"])
         hermes("kanban", "--board", BOARD, "complete", merged)
         say("merged card", merged)

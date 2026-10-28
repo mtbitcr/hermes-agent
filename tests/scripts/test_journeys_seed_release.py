@@ -1,4 +1,5 @@
-"""Tests for the journeys seed, card 3: journey 2's review cards and its one waiting release batch.
+"""Tests for the journeys seed, card 3: journey 2's review cards, the approved card shown as being delivered, and its one
+waiting release batch.
 
 seed_states.py runs for real against a temporary platform home, as in test_journeys_seed.py. The reads are the
 real ones: the owner-workspace board read, and the release decision route of the API server.
@@ -13,6 +14,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -43,6 +45,17 @@ APPROVED = "Journey test card approved"
 MERGED = "Journey test card merged"
 LEDGER = "kanban/release_ledger.db"
 VIEW = "/v1/owner-workspace/release"
+# The columns of kanban_deliveries that record_approved_delivery leaves empty: the row has no pull request and no merge.
+UNSET_DELIVERY_COLUMNS = (
+    "integration_task_id",
+    "pull_request_number",
+    "pull_request_head",
+    "pull_request_state",
+    "pull_request_branch",
+    "publish_lease",
+    "publish_lease_until",
+    "publish_refusal",
+)
 
 SEED = {
     "prefix": PREFIX,
@@ -104,6 +117,14 @@ def snapshot(root: Path) -> dict[str, dict]:
 def ledger_rows(home: Path, sql: str) -> list[tuple]:
     with contextlib.closing(sqlite3.connect((home / LEDGER).resolve().as_uri() + "?mode=ro", uri=True)) as conn:
         return conn.execute(sql).fetchall()
+
+
+def board_rows(sql: str, *args) -> list[dict]:
+    """Rows of the journey board file, read through a read-only connection."""
+    path = kanban_db.kanban_db_path(BOARD)
+    with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(row) for row in conn.execute(sql, args)]
 
 
 def edited(change) -> str:
@@ -204,28 +225,27 @@ def test_the_board_read_gives_the_review_card_as_awaiting_review_and_the_approve
     assert cards[APPROVED][1]["review_state"] == "approved"
 
 
-class PlanShowsTheCardClosed(AssertionError):
-    pass
-
-
-@pytest.mark.xfail(
-    strict=True,
-    raises=PlanShowsTheCardClosed,
-    reason="Open for the owner. The Plan page code is in the owner app repository, which is not on this machine: the plan "
-    "document says a done card sits in the closed Completed section unless it is being delivered, and the delivering form "
-    "needs a delivery row that no platform function makes for a seeded card (it needs delivery enabled in the config and a "
-    "real git repository) and that the seed may not write as SQL.",
-)
 def test_the_approved_card_is_in_a_group_the_plan_page_shows_open(seed, reset_home, capsys):
     seed_journey_2(seed, capsys)
 
     column, approved = board_cards()[APPROVED]
-    assert (column, approved["review_state"]) == ("done", "approved")
-    # The plan document's rule for the Plan page, not the page's own code: done is the closed Completed section, and a
-    # done card whose delivery is unfinished is shown as being delivered, under Now.
-    group = "Now" if approved["delivery"] == "delivering" else "Completed"
-    if group == "Completed":
-        raise PlanShowsTheCardClosed("the approved card would land in the closed Completed section")
+    # The Plan page shows a done card under the closed Completed section unless its delivery is unfinished; then it shows
+    # the card as being delivered, under Now.
+    assert (column, approved["review_state"], approved["delivery"]) == ("done", "approved", "delivering")
+
+    # The delivery is the one row record_approved_delivery would insert: no pull request and no merge, and none for the
+    # other two cards.
+    rows = board_rows("SELECT * FROM kanban_deliveries")
+    assert [row["source_task_id"] for row in rows] == [approved["id"]]
+    [row] = rows
+    [completed] = board_rows(
+        "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'completed' ORDER BY id DESC LIMIT 1", approved["id"]
+    )
+    assert re.fullmatch(r"[0-9a-f]{40}", row["source_head"]), row["source_head"]
+    assert completed["run_id"] is not None
+    assert row["approval_run_id"] == completed["run_id"]
+    assert isinstance(row["created_at"], int)
+    assert {name: row[name] for name in UNSET_DELIVERY_COLUMNS} == dict.fromkeys(UNSET_DELIVERY_COLUMNS)
 
 
 # --- 2. The release decision read, and the Put off.
@@ -343,7 +363,10 @@ async def test_the_made_up_commit_ids_and_the_link_pass_the_record_checks_and_ap
         "SELECT merge_commit, pr_url, reviewed_base, reviewed_head, reviewed_tree, tier, card_id, title, board"
         " FROM release_members",
     )
+    [delivery] = board_rows("SELECT source_head FROM kanban_deliveries")
+    source_head = delivery["source_head"]
     assert len({merge, base, head, tree_id}) == 4
+    assert source_head not in {merge, base, head, tree_id}
 
     async with client() as http:
         page = await (await http.get(VIEW)).text()
@@ -355,7 +378,8 @@ async def test_the_made_up_commit_ids_and_the_link_pass_the_record_checks_and_ap
             json.dumps(ow.list_owner_decisions(ow.resolve_owner_context())),
         ]
     )
-    shown = [merge, base, head, tree_id, link, "github.com", "pull/"] + [commit[:7] for commit in (merge, base, head, tree_id)]
+    commits = (merge, base, head, tree_id, source_head)
+    shown = [*commits, link, "github.com", "pull/"] + [commit[:7] for commit in commits]
     assert [item for item in shown if item in everything] == []
 
     # The same values are taken by record_merge on a record of their own, so its own checks accept them.
