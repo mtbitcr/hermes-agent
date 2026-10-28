@@ -1,18 +1,23 @@
-"""Tests for scripts/journeys/stack_up.sh (card 2 of the journeys stack plan, round 2).
+"""Tests for scripts/journeys/stack_up.sh (card 2 of the journeys stack plan, rounds 2 and 3).
 
 The script runs against stand-ins for docker, sleep, hostname and df that sit first on PATH. The stand-in
 docker records every call in calls.jsonl, keeps a fake Server 2 in state.json, and refuses (status 98) any
 subcommand or flag the script is not expected to use. It also models what the real engine and the real owner
 app do that matter here: it refuses to start a container that joins the namespace of a container that is not
 running, refuses a --network container: container that also asks for an alias, hostname, published port, dns,
-add-host, expose or link, keeps the files of each volume with their sizes, and makes a started owner app exit
+add-host, expose or link, keeps the files of each volume with their sizes, gives each container a
+State.StartedAt from a strictly increasing fake clock at every start and restart (printed the way Docker prints
+it: trailing zeros of the fraction cut, no fraction when it is zero, the zero time while never started; a test
+can overwrite it with an exact string), and makes a started owner app exit
 at once when one of the seven token files of stack-app.settings is missing or empty. DOCKER_HOST points at a
 path that does not exist, so a real docker could not answer. No real Docker call is made anywhere. The tests
 read recorded calls, output lines and the fake host state; they never read the script's text, and the token
 files hold invented placeholder text that is never printed.
 
 Tests test_1_... to test_8_... are the eight tests of the plan (test_1 and test_2 cover the round 2 rules);
-test_9_... onwards and test_extra_... are additions.
+test_9_... onwards and test_extra_... are additions. Round 3 adds test_13 to test_15 (stopped kept containers) and
+test_16 to test_20 (the namespace rule: the gateway is current only when its network mode names the owner app's
+current container id and its State.StartedAt is strictly later than the owner app's).
 """
 
 from __future__ import annotations
@@ -69,6 +74,7 @@ FORMATS = {
     "ident": '{{.Id}} {{index .Config.Labels "raphael-journeys.made-by"}}',
     "config_image": "{{.Config.Image}}",
     "network_mode": "{{.HostConfig.NetworkMode}}",
+    "started_at": "{{.State.StartedAt}}",
     "name": "{{.Name}}",
     "id": "{{.Id}}",
     "security": "{{range .SecurityOptions}}{{println .}}{{end}}",
@@ -193,6 +199,8 @@ def d_inspect(state, a):
             out = c["image_ref"]
         elif fmt == F["network_mode"]:
             out = c["network"]
+        elif fmt == F["started_at"]:
+            out = c.get("started_at", ZERO_TIME)
         elif fmt == F["state"]:
             if c["running"] and c["health"] and c["status"] == "starting":
                 c["polls"] -= 1
@@ -347,10 +355,26 @@ def owner_app_can_start(state, c):
     return True
 
 
+ZERO_TIME = "0001-01-01T00:00:00Z"
+
+
+def fake_time(tick):
+    """Docker's State.StartedAt shape: RFC 3339 UTC, the fraction with its trailing zeros cut, none when zero.
+    The clock runs in steps of an eighth of a second from 18:00:00Z, so whole seconds (no fraction) and short and
+    long fractions all occur, and a later value can sort lower as text (18:00:01.125Z against 18:00:01Z)."""
+    seconds, part = divmod(tick, 8)
+    hours, rest = divmod(18 * 3600 + seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    fraction = ("%09d" % (part * 125000000)).rstrip("0")
+    return "2026-10-28T%02d:%02d:%02d%sZ" % (hours, minutes, secs, "." + fraction if fraction else "")
+
+
 def after_start(state, c):
     """What a started container does at once: the owner app without all token files exits and stays down."""
     c["running"], c["status"], c["polls"] = True, "starting", state["polls"]
     c["gen"] = c.get("gen", 0) + 1
+    state["clock"] = state.get("clock", 0) + 1
+    c["started_at"] = fake_time(state["clock"])
     if c["network"].startswith("container:"):
         _, owner = find_container(state, c["network"][len("container:"):])
         c["joined_gen"] = owner["gen"]
@@ -394,6 +418,11 @@ def run_helper(state, opts, command):
         return ""
     if opts.get("--label"):
         refuse("a writing helper is not made by this script")
+    if state.get("fail_next_writing_helper"):
+        # One transient engine failure, injected by a test: the helper changes nothing and the flag is spent.
+        state["fail_next_writing_helper"] = False
+        save(state)
+        fail("docker: Error response from daemon: transient failure (injected by the test)", 125)
     if "find /volume -mindepth 1 -delete" in script:
         files.clear()
     if opts.get("-i"):
@@ -485,6 +514,7 @@ def d_run(state, a, create=False):
         "env": env, "mounts": mounts, "network": net, "aliases": aliases, "ports": [], "restart": "unless-stopped",
         "health": health, "health_opts": {k: v[0] for k, v in opts.items() if k.startswith("--health-")},
         "cmd": command, "running": False, "status": "created", "polls": state["polls"], "gen": 0,
+        "started_at": ZERO_TIME,
     }
     if not create:
         after_start(state, state["containers"][cid])
@@ -679,6 +709,7 @@ def fresh_state() -> dict:
     state = {
         "host": HOST,
         "seq": 0,
+        "clock": 0,
         "polls": 2,
         "free_kb": 100 * 1024 * 1024,
         "docker_root": "/var/lib/stand-in-docker",
@@ -1152,7 +1183,8 @@ def test_5b_gateway_is_recreated_when_its_network_mode_does_not_name_the_current
 
 
 def test_5c_a_running_gateway_beside_a_stopped_owner_app_is_made_again_after_the_app_starts(stack: Host) -> None:
-    """The namespace the gateway joined is gone once the app stopped: start the app, then make the gateway again."""
+    """The namespace the gateway joined is gone once the app stopped: start the app, then the gateway, whose record is
+    older than the app's new start, is restarted (round 3: the namespace rule; the round 2 list was rm, start, run)."""
     state = stack.state()
     containers_by_name(state)[APP_C]["running"] = False
     stack.save(state)
@@ -1163,19 +1195,298 @@ def test_5c_a_running_gateway_beside_a_stopped_owner_app_is_made_again_after_the
     assert output_lines(result)[-1] == ANSWERS_LINE
     docker = stack.docker_calls(mark)
     assert [argv for argv in docker if argv[0] in ("rm", "start", "restart", "stop")] == [
-        ["rm", "--force", before[GATE_C]],
         ["start", before[APP_C]],
+        ["restart", before[GATE_C]],
     ]
-    assert run_names(docker) == [GATE_C]
-    gate_run = next(i for i, argv in enumerate(docker) if argv[0] == "run" and "--name" in argv)
-    assert docker.index(["start", before[APP_C]]) < gate_run
+    assert run_names(docker) == []
     after = container_ids(stack)
-    assert after[APP_C] == before[APP_C] and after[GATE_C] != before[GATE_C]
+    assert after == before
     state = stack.state()
     assert namespaces_stale(state) == []
     for name, container in containers_by_name(state).items():
         assert container["running"] and container["status"] == "healthy", name
     assert containers_by_name(state)[GATE_C]["network"] == f"container:{after[APP_C]}"
+
+
+# --- round 3, rule 2 (finding 2): a stopped kept container is started, never recreated
+
+
+def lifecycle_calls(docker: list[list[str]]) -> list[list[str]]:
+    """Every call that creates, removes, starts or stops one of the five containers (not the --rm token check)."""
+    return [argv for argv in docker if argv[0] in ("run", "create", "start", "stop", "restart", "rm") and "--rm" not in argv]
+
+
+def is_health_inspect(argv: list[str]) -> bool:
+    """An inspect of State.Health: what the health wait polls (the census reads the same format before any change)."""
+    return argv[0] == "inspect" and "State.Health" in argv[4]
+
+
+def assert_health_wait_after_lifecycle(docker: list[list[str]]) -> None:
+    """From the first to the last lifecycle call no health is inspected; the health wait comes after the last one.
+    Inspects of the id, the network mode and State.StartedAt are allowed between the lifecycle calls."""
+    lifecycle = [i for i, argv in enumerate(docker) if lifecycle_calls([argv])]
+    assert lifecycle
+    health = [i for i, argv in enumerate(docker) if is_health_inspect(argv) and i > lifecycle[0]]
+    assert health and min(health) > lifecycle[-1]
+
+
+def assert_all_running_and_healthy(host: Host) -> None:
+    state = host.state()
+    containers = containers_by_name(state)
+    assert sorted(containers) == sorted(STACK_CONTAINERS)
+    for name, container in containers.items():
+        assert container["running"] and container["status"] == "healthy", name
+    assert namespaces_stale(state) == []
+
+
+def assert_no_volume_removal(docker: list[list[str]]) -> None:
+    for argv in docker:
+        assert argv[0] not in ("system", "image", "rmi", "prune")
+        if argv[0] == "volume":
+            assert argv[1] == "create"
+        if argv[0] == "rm":
+            assert not {"-v", "--volumes", PROXY_V, PROXY_C} & set(argv)
+
+
+@pytest.mark.parametrize("role", [PROXY_C, DASH_C, BROWSER_C])
+def test_13_a_stopped_kept_proxy_dashboard_or_browser_is_started_and_nothing_else_is_called(stack: Host, role: str) -> None:
+    """One stopped kept container: exactly one start call, for it; no other lifecycle call; same ids; all healthy."""
+    ids = container_ids(stack)
+    assert stack.docker("stop", ids[role]).returncode == 0
+    assert containers_by_name(stack.state())[role]["running"] is False
+    mark = stack.mark()
+    result = stack.converge()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output_lines(result)[-1] == ANSWERS_LINE
+    docker = stack.docker_calls(mark)
+    assert lifecycle_calls(docker) == [["start", ids[role]]]
+    assert {argv[0] for argv in docker} <= {"info", "inspect", "cp", "start"}, docker
+    assert container_ids(stack) == ids
+    assert_all_running_and_healthy(stack)
+    assert_no_volume_removal(stack.docker_calls())
+
+
+def test_14_all_five_stopped_kept_containers_are_started_in_template_order_before_the_health_wait(stack: Host) -> None:
+    """All five stopped: five start calls, proxy, owner app, dashboard, gateway, browser, all before the health wait."""
+    ids = container_ids(stack)
+    for name in reversed(STACK_CONTAINERS):
+        assert stack.docker("stop", ids[name]).returncode == 0
+    assert not [c for c in containers_by_name(stack.state()).values() if c["running"]]
+    mark = stack.mark()
+    result = stack.converge()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output_lines(result)[-1] == ANSWERS_LINE
+    docker = stack.docker_calls(mark)
+
+    # The gateway was stopped too, so the owner app's start leaves no gateway beside a stopped app to make again:
+    # the same five ids stay and the five lifecycle calls are the five starts, in the order of the template.
+    assert lifecycle_calls(docker) == [["start", ids[name]] for name in STACK_CONTAINERS]
+    # Every start comes before the first health inspect: the census of what runs is read before the first
+    # lifecycle call. Round 3 relaxes this one assertion: the namespace rule reads the id, the network mode and
+    # State.StartedAt between the app's start and the gateway's start, so only health inspects are forbidden there.
+    assert_health_wait_after_lifecycle(docker)
+    assert container_ids(stack) == ids
+    assert_all_running_and_healthy(stack)
+    assert_no_volume_removal(stack.docker_calls())
+
+
+def test_15_a_reset_that_fails_after_its_stop_phase_is_recovered_by_the_next_converge(stack: Host) -> None:
+    """The unchanged reset stops the gateway and the dashboard, then one transient failure hits its first writing
+    helper: the reset exits non-zero. After the stand-in is restored, converge starts the dashboard and the gateway."""
+    ids = container_ids(stack)
+    state = stack.state()
+    state["fail_next_writing_helper"] = True
+    stack.save(state)
+    mark = stack.mark()
+    reset = stack.run("reset_stack.sh")
+    assert reset.returncode != 0, reset.stdout + reset.stderr
+    assert RESET_LINE not in output_lines(reset)
+    failed = [c["argv"] for c in stack.calls()[mark:] if c["tool"] == "docker" and c["rc"] == 125]
+    assert len(failed) == 1 and failed[0][:2] == ["run", "--rm"]
+    assert [argv for argv in stack.docker_calls(mark) if argv[0] in ("stop", "start", "restart")] == [
+        ["stop", GATE_C],
+        ["stop", DASH_C],
+    ]
+    state = stack.state()
+    assert state["fail_next_writing_helper"] is False
+    assert sorted(name for name, c in containers_by_name(state).items() if not c["running"]) == sorted([DASH_C, GATE_C])
+
+    mark = stack.mark()
+    result = stack.converge()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output_lines(result)[-1] == ANSWERS_LINE
+    docker = stack.docker_calls(mark)
+    assert lifecycle_calls(docker) == [["start", ids[DASH_C]], ["start", ids[GATE_C]]]
+    assert container_ids(stack) == ids
+    assert_all_running_and_healthy(stack)
+    assert all(stack.state()["volumes"][TOKENS_V]["files"].get(name) for name in TOKEN_NAMES)
+    assert_no_volume_removal(stack.docker_calls())
+
+
+# --- round 3, rule 1 (finding 1): the namespace rule. The gateway is current only when its network mode names the
+# owner app's current container id and its State.StartedAt is strictly later than the owner app's.
+
+
+def started_key(text: str) -> tuple[str, int]:
+    """State.StartedAt as numbers: the whole seconds (fixed width, so exact as text), then nanoseconds."""
+    whole, _, fraction = text.removesuffix("Z").partition(".")
+    return whole, int((fraction + "000000000")[:9])
+
+
+def gateway_is_current(state: dict) -> bool:
+    """The rule, read from the fake host's records only (never from the script)."""
+    by_name = containers_by_name(state)
+    app, gate = by_name[APP_C], by_name[GATE_C]
+    return gate["network"] == f"container:{app['id']}" and started_key(gate["started_at"]) > started_key(app["started_at"])
+
+
+def set_started_at(host: Host, app: str, gateway: str) -> None:
+    """Overwrite State.StartedAt of the owner app and the gateway with exact strings, as if Docker had printed them."""
+    state = host.state()
+    containers_by_name(state)[APP_C]["started_at"] = app
+    containers_by_name(state)[GATE_C]["started_at"] = gateway
+    host.save(state)
+
+
+def test_16_an_owner_app_restart_with_the_same_id_restarts_the_gateway_once_before_the_health_wait(stack: Host) -> None:
+    """Finding 1: the app restarts (same id) and the gateway stays in the old namespace. Converge restarts the gateway
+    once (same id; no rm, no create) before the health wait; afterwards it is current; a third converge changes nothing."""
+    ids = container_ids(stack)
+    assert gateway_is_current(stack.state())
+    assert stack.docker("restart", ids[APP_C]).returncode == 0
+    assert namespaces_stale(stack.state()) == [GATE_C] and not gateway_is_current(stack.state())
+    mark = stack.mark()
+    result = stack.converge()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output_lines(result)[-1] == ANSWERS_LINE
+    docker = stack.docker_calls(mark)
+    assert lifecycle_calls(docker) == [["restart", ids[GATE_C]]]
+    assert not [argv for argv in docker if argv[0] in ("rm", "create", "start", "stop", "build", "volume", "network")]
+    assert_health_wait_after_lifecycle(docker)
+    assert container_ids(stack) == ids
+    assert gateway_is_current(stack.state())
+    assert_all_running_and_healthy(stack)
+
+    mark = stack.mark()
+    result = stack.converge()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output_lines(result)[-1] == ANSWERS_LINE
+    docker = stack.docker_calls(mark)
+    assert lifecycle_calls(docker) == []
+    assert {argv[0] for argv in docker} <= {"info", "inspect", "cp"}, docker
+    assert_no_volume_removal(stack.docker_calls())
+
+
+# (app StartedAt, gateway StartedAt, is the gateway current): written the way Docker prints them.
+START_TIMES = [
+    pytest.param("2026-10-28T17:34:11Z", "2026-10-28T17:34:11.5Z", True, id="later_but_sorts_lower_as_text"),
+    pytest.param("2026-10-28T17:34:11.5Z", "2026-10-28T17:34:11Z", False, id="earlier_but_sorts_higher_as_text"),
+    pytest.param("2026-10-28T17:34:11Z", "2026-10-28T17:34:11Z", False, id="equal_whole_seconds"),
+    pytest.param("2026-10-28T17:34:11.5Z", "2026-10-28T17:34:11.5Z", False, id="equal_with_fraction"),
+    pytest.param("2026-10-28T17:34:11.12345Z", "2026-10-28T17:34:11.123451Z", True, id="short_fraction_then_long_later"),
+    pytest.param("2026-10-28T17:34:11.123451Z", "2026-10-28T17:34:11.12345Z", False, id="long_fraction_then_short_earlier"),
+    pytest.param("2026-10-28T17:34:11.05Z", "2026-10-28T17:34:11.08Z", True, id="leading_zero_fraction_later"),
+    pytest.param("2026-10-28T17:34:11.08Z", "2026-10-28T17:34:11.05Z", False, id="leading_zero_fraction_earlier"),
+    pytest.param("2026-10-28T17:34:08Z", "2026-10-28T17:34:09Z", True, id="leading_zero_seconds_later"),
+    pytest.param("2026-10-28T17:34:59.9Z", "2026-10-28T17:35:00Z", True, id="minute_boundary_later"),
+    pytest.param("2026-10-28T17:35:00Z", "2026-10-28T17:34:59.999999999Z", False, id="nanosecond_fraction_earlier"),
+]
+
+
+@pytest.mark.parametrize(("app_time", "gate_time", "current"), START_TIMES)
+def test_17_start_times_are_compared_as_numbers_and_never_as_text(stack: Host, app_time: str, gate_time: str, current: bool) -> None:
+    """A gateway that started strictly later is left alone; equal or earlier gets exactly one restart. The cases are
+    chosen so that a raw string comparison answers wrongly in both directions."""
+    ids = container_ids(stack)
+    set_started_at(stack, app_time, gate_time)
+    assert gateway_is_current(stack.state()) is current
+    mark = stack.mark()
+    result = stack.converge()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output_lines(result)[-1] == ANSWERS_LINE
+    docker = stack.docker_calls(mark)
+    if current:
+        assert lifecycle_calls(docker) == []
+    else:
+        assert lifecycle_calls(docker) == [["restart", ids[GATE_C]]]
+        assert_health_wait_after_lifecycle(docker)
+    assert container_ids(stack) == ids
+    assert gateway_is_current(stack.state())
+    assert_all_running_and_healthy(stack)
+
+
+def test_18_a_current_gateway_gets_no_lifecycle_call(stack: Host) -> None:
+    """Both conditions hold: no lifecycle call and no token check; the decision is read from the two records."""
+    ids = container_ids(stack)
+    assert gateway_is_current(stack.state())
+    mark = stack.mark()
+    result = stack.converge()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output_lines(result)[-1] == ANSWERS_LINE
+    docker = stack.docker_calls(mark)
+    assert lifecycle_calls(docker) == []
+    assert {argv[0] for argv in docker} <= {"info", "inspect", "cp"}, docker
+    formats = [argv[4] for argv in docker if argv[0] == "inspect"]
+    assert FORMATS["network_mode"] in formats and formats.count(FORMATS["started_at"]) >= 2
+    assert container_ids(stack) == ids
+
+
+def test_19_a_stopped_gateway_that_names_the_current_app_is_started_once(stack: Host) -> None:
+    """Stopped gateway, network mode names the app: one start call, same id; no restart, no remove, no create."""
+    ids = container_ids(stack)
+    assert stack.docker("stop", ids[GATE_C]).returncode == 0
+    assert containers_by_name(stack.state())[GATE_C]["network"] == f"container:{ids[APP_C]}"
+    mark = stack.mark()
+    result = stack.converge()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output_lines(result)[-1] == ANSWERS_LINE
+    docker = stack.docker_calls(mark)
+    assert lifecycle_calls(docker) == [["start", ids[GATE_C]]]
+    assert not [argv for argv in docker if argv[0] in ("restart", "rm", "create")]
+    assert container_ids(stack) == ids
+    assert gateway_is_current(stack.state())
+    assert_all_running_and_healthy(stack)
+
+
+def test_19b_a_stopped_gateway_that_does_not_name_the_current_app_is_made_again(stack: Host) -> None:
+    """Stopped gateway whose network mode names another id: removed by id and created again, never started or restarted."""
+    ids = container_ids(stack)
+    assert stack.docker("stop", ids[GATE_C]).returncode == 0
+    state = stack.state()
+    containers_by_name(state)[GATE_C]["network"] = "container:" + "0" * 64
+    stack.save(state)
+    mark = stack.mark()
+    result = stack.converge()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output_lines(result)[-1] == ANSWERS_LINE
+    docker = stack.docker_calls(mark)
+    assert [argv for argv in docker if argv[0] == "rm"] == [["rm", "--force", ids[GATE_C]]]
+    assert run_names(docker) == [GATE_C]
+    assert not [argv for argv in docker if argv[0] in ("start", "restart", "stop")]
+    after = container_ids(stack)
+    assert after[APP_C] == ids[APP_C] and after[GATE_C] != ids[GATE_C]
+    assert gateway_is_current(stack.state())
+    assert_all_running_and_healthy(stack)
+
+
+def test_20_first_creation_with_a_new_owner_app_tag_makes_the_gateway_again_without_starting_it(host: Host) -> None:
+    """Token files missing: only condition (a) decides and nothing starts. A new app tag makes the app again, so the
+    old gateway names an app that is gone: it is removed and created (not started) into the new app's namespace."""
+    assert host.converge().returncode == 0
+    before = container_ids(host)
+    mark = host.mark()
+    result = host.converge(app=NEW_REVISION)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output_lines(result)[-1] == FIRST_LINE
+    docker = host.docker_calls(mark)
+    assert not [argv for argv in docker if argv[0] in ("start", "restart", "stop")]
+    assert sorted(argv[2] for argv in docker if argv[0] == "rm") == sorted([before[APP_C], before[GATE_C], before[BROWSER_C]])
+    assert create_names(docker) == [APP_C, GATE_C]
+    assert run_names(docker) == [BROWSER_C]
+    after = container_ids(host)
+    containers = host.containers()
+    assert containers[GATE_C]["network"] == f"container:{after[APP_C]}"
+    assert not containers[APP_C]["running"] and not containers[GATE_C]["running"]
 
 
 def containers_by_name(state: dict) -> dict[str, dict]:
