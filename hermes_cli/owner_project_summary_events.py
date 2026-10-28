@@ -26,6 +26,11 @@ a request that stops after its task is published and before its claim: storing t
 that fails leaves them, and the failure arms a new request. Events after the task's snapshot stay unread until the
 harvest.
 
+A task clears only the events it covers. The key of a request can hand back an older finished task, whose line is
+behind the row's cursors: a tick that was not due stored the events after that task's snapshot. Its claim then leaves
+``pending`` and ``pending_urgent`` raised for the events from the line up to the cursors, which ``uncovered_flags``
+counts again, and for no others. The cursors never go back.
+
 The cursors move by compare-and-swap, in the shape of the kanban notifier's: a tick reads past the cursors it found,
 then updates the row only if they are still those. Two ticks that read at the same time therefore count an event
 once; the loser counts nothing and moves nothing.
@@ -92,6 +97,9 @@ class Cursors(NamedTuple):
     event: int = 0
     delivery: int = 0
     release: int = 0
+
+
+_END = Cursors(*[2**63 - 1] * 3)  # the largest integer SQLite holds: a read with no upper end
 
 
 # The snapshot above it is JSON: its strings are quoted and keep their newlines escaped, so no line of it starts so.
@@ -176,23 +184,23 @@ def _block_kind(board: sqlite3.Connection, event: sqlite3.Row) -> Optional[str]:
     return None if blocked is None else _payload(blocked["payload"]).get("kind")
 
 
-def _count_task_events(board: sqlite3.Connection, after: int, counts: dict) -> int:
+def _count_task_events(board: sqlite3.Connection, after: int, upto: int, counts: dict) -> int:
     last = after
     for event in board.execute(
-        "SELECT id, task_id, kind, payload FROM task_events WHERE id > ? ORDER BY id", (after,)
+        "SELECT id, task_id, kind, payload FROM task_events WHERE id > ? AND id <= ? ORDER BY id", (after, upto)
     ):
         last = event["id"]
         counts[classify(event["kind"], _block_kind(board, event))] += 1
     return last
 
 
-def _count_merges(board: sqlite3.Connection, after: int, counts: dict) -> int:
+def _count_merges(board: sqlite3.Connection, after: int, upto: int, counts: dict) -> int:
     try:
         merged = [
             row["id"]
             for row in board.execute(
-                "SELECT id FROM kanban_deliveries WHERE pull_request_state = ? AND id > ? ORDER BY id",
-                (_MERGED, after),
+                "SELECT id FROM kanban_deliveries WHERE pull_request_state = ? AND id > ? AND id <= ? ORDER BY id",
+                (_MERGED, after, upto),
             )
         ]
     except sqlite3.OperationalError as exc:
@@ -215,7 +223,7 @@ def _holds_card(ledger: sqlite3.Connection, board: sqlite3.Connection, slug: str
     return False
 
 
-def _count_releases(board: sqlite3.Connection, slug: str, after: int, counts: dict) -> int:
+def _count_releases(board: sqlite3.Connection, slug: str, after: int, upto: int, counts: dict) -> int:
     path = release_ledger.ledger_path()
     if not path.exists():
         return after
@@ -223,7 +231,8 @@ def _count_releases(board: sqlite3.Connection, slug: str, after: int, counts: di
     try:
         with _read_only(path) as ledger:
             for event in ledger.execute(
-                "SELECT id, batch_id, kind, payload FROM release_events WHERE id > ? ORDER BY id", (after,)
+                "SELECT id, batch_id, kind, payload FROM release_events WHERE id > ? AND id <= ? ORDER BY id",
+                (after, upto),
             ):
                 last = event["id"]
                 released = (
@@ -238,8 +247,8 @@ def _count_releases(board: sqlite3.Connection, slug: str, after: int, counts: di
     return last
 
 
-def read_events(project: projects_db.Project, cursors: Cursors) -> Batch:
-    """Count what the three sources hold past ``cursors``. This reads and moves nothing.
+def read_events(project: projects_db.Project, cursors: Cursors, until: Cursors = _END) -> Batch:
+    """Count what the three sources hold past ``cursors`` and up to ``until``. This reads and moves nothing.
 
     Every event moves its cursor on, a counted one or an ignored one, so none is read twice. A Project with no
     board, or whose board is the summary board, has no events.
@@ -256,9 +265,9 @@ def read_events(project: projects_db.Project, cursors: Cursors) -> Batch:
     counts = {MATERIAL: 0, URGENT: 0, IGNORED: 0}
     with _read_only(path) as board:
         moved = Cursors(
-            _count_task_events(board, cursors.event, counts),
-            _count_merges(board, cursors.delivery, counts),
-            _count_releases(board, slug, cursors.release, counts),
+            _count_task_events(board, cursors.event, until.event, counts),
+            _count_merges(board, cursors.delivery, until.delivery, counts),
+            _count_releases(board, slug, cursors.release, until.release, counts),
         )
     return Batch(moved, counts[MATERIAL], counts[URGENT])
 
@@ -321,6 +330,27 @@ def read(registry: sqlite3.Connection, project: projects_db.Project) -> Reading:
     except (sqlite3.Error, OSError, ValueError) as exc:
         logger.warning("project summary: cannot read the events of Project %s (%s); none counted", project.id, exc)
         return reading
+
+
+def uncovered_flags(project: projects_db.Project, reading: Reading, covered: Cursors) -> tuple[int, int]:
+    """The ``(pending, pending_urgent)`` that a claim leaves raised when its task covers events up to ``covered``.
+
+    The row stands at the cursors of ``reading.old``. Whatever lies between ``covered`` and those cursors was stored by
+    a tick that was not due, and the task does not cover it, so it is counted again here and the flags follow it. The
+    cursors themselves are not touched. Nothing is read when no cursor is past ``covered``, which is every task the
+    claim's own tick made. A source that cannot be read leaves the flags as the row has them.
+    """
+    old = reading.old
+    if all(stored <= done for stored, done in zip(old, covered)):
+        return 0, 0
+    try:
+        left = read_events(project, covered, until=old)
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        logger.warning(
+            "project summary: cannot read the events past the task's line for Project %s (%s); flags kept", project.id, exc
+        )
+        return reading.row["pending"], reading.row["pending_urgent"]
+    return int(bool(left.material or left.urgent)), int(bool(left.urgent))
 
 
 def record(registry: sqlite3.Connection, project_id: str, reading: Reading) -> bool:

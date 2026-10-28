@@ -32,7 +32,10 @@ task is published it is that line, not the publisher's claim, that the cursors f
 row does not record yet records it and leaves the cursors; a publisher whose claim lost to that recording moves them
 itself, and for a publisher that stopped after publishing the storing of the result moves them (``_store_result``). A
 request whose publisher stopped, or lost the race to another tick, therefore still counts its events once. A tick
-that finds an open task reads no event.
+that finds an open task reads no event. A task also clears only the pending flags of the events within its own line
+(owner rule 2 of 2026-10-28): when the request key hands back an older finished task and the row's cursors are already
+past its line, the claim leaves the flags raised for the events after it (``events.uncovered_flags``), never moves a
+cursor back, and the harvest of that task finds them still pending.
 
 A task is the tick's own only when the tick made it for that Project (``_made_for``): its creator is ``CREATED_BY``
 and its idempotency key names the Project. A key alone vouches for nothing, since any worker can write one with
@@ -545,18 +548,21 @@ def _open_summary_task(
     # The cursors move here, to where the task's own body says its events were read, and not before: a request
     # that fails first must leave the row as it was. That is not always this tick's reading: the key can hand
     # back a task that another tick made from its own. A task without the line moves nothing. The Project may
-    # be pending only through this tick's own reading.
+    # be pending only through this tick's own reading. The flags follow the same line (owner rule 2 of 2026-10-28):
+    # a task clears only the events within it, so an older task that the key hands back leaves the flags raised for
+    # the events after its line that the row's cursors have already passed.
     covered = events.covered_cursors(made.body) or reading.old
+    flags = events.uncovered_flags(project, reading, covered)
     with write_txn(registry):
         claimed = registry.execute(
-            "UPDATE project_summary_state SET open_task_id = ?, last_requested_at = ?, pending = 0, "
-            "pending_urgent = 0, updated_at = ?, event_cursor = MAX(event_cursor, ?), "
+            "UPDATE project_summary_state SET open_task_id = ?, last_requested_at = ?, pending = ?, "
+            "pending_urgent = ?, updated_at = ?, event_cursor = MAX(event_cursor, ?), "
             "delivery_cursor = MAX(delivery_cursor, ?), release_cursor = MAX(release_cursor, ?) "
             "WHERE project_id = ? AND open_task_id IS NULL AND (pending = 1 OR ?) "
             "AND failures = ? AND last_requested_at IS ? "
             "AND event_cursor = ? AND delivery_cursor = ? AND release_cursor = ?",
             (
-                task_id, now, now, *covered,
+                task_id, now, *flags, now, *covered,
                 project.id, int(reading.raises_pending), state["failures"], state["last_requested_at"],
                 *reading.old,
             ),

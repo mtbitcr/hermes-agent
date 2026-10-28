@@ -7,8 +7,9 @@ and ten quick changes are one rewrite (owner decision of 2026-10-27). Card A's o
 rewrite request: the kernel's time box, one open task found by one check first, and a failure limit that only delays
 the next request by a day.
 
-The tests reach the new module only through ``summary_tick``, which each one imports for itself; the two tests of the
-covered line (T2 and T3 at the end) also read it with the module's own parser.
+The tests reach the new module only through ``summary_tick``, which each one imports for itself; the tests of the
+covered line (T2 and T3, and the last ones, on a finished task handed back for its request key) also read it with the
+module's own parser. The last ones also run once under the dispatcher's worker environment.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import sqlite3
 import threading
 import urllib.parse
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1098,3 +1100,254 @@ def test_a_task_published_by_a_tick_that_stopped_covers_its_events_once_a_later_
     assert ops.summary_tick(now=T0 + 170) == 1
     _assert_rewrite(root, garden, asked_at=T0 + 170)
     assert _cursors(_state(root, pid)) == (_top(root, garden), 0, 0)
+
+
+# Rework after the review of the second hand-over (2026-10-28), owner rule 2: a task clears only the pending work of
+# the events within its own watermark. A delayed tick can store the events of a task that was published and never
+# recorded; idempotent creation then hands that finished task back to a request whose cursors are already past what
+# the task covers. The events after the watermark must stay pending, and the cursors must never go back.
+
+
+def _tops(root: Path, project: dict) -> tuple:
+    """Where the three cursors stand once everything is read, counted with plain connections."""
+    merged = _rows(
+        _board_db(root, project["board"]),
+        "SELECT COALESCE(MAX(id), 0) FROM kanban_deliveries WHERE pull_request_state = 'merged'",
+    )[0][0]
+    return (_top(root, project), merged, _ledger_top(root) if (root / LEDGER_FILE).exists() else 0)
+
+
+_URGENT_KINDS = ("decision", "merge", "release")
+
+
+def _scene(root: Path, owner, *, failed: bool, others: tuple = (), worker_on: str | None = None) -> SimpleNamespace:
+    """A settled Project with a card for each kind of change, and the time its next request falls due.
+
+    With ``failed`` its first rewrite has failed, and the request is due once the backoff of an hour has passed;
+    otherwise it is due once the hour since its last request has. ``others`` are settled Projects that stay quiet.
+    ``worker_on`` names one of them, on whose board a worker's own card is made before the settle.
+    """
+    ops = _ops()
+    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
+    garden = _project(owner, "Garden Plan")
+    ledger = _Ledger()
+    cards = {
+        name: _card(root, garden, name)
+        for name in ("opening", "finish", "finish again", "decision", "merge", "release")
+    }
+    delivery = _delivery(root, garden, cards["merge"], "open")
+    beside = {name: _project(owner, name) for name in others}
+    quiet = {name: _card(root, project, "A quiet card") for name, project in beside.items()}
+    worker_task = None
+    if worker_on is not None:
+        with _board(root, beside[worker_on]["board"]) as conn:
+            worker_task = kanban_db.create_task(
+                conn, title="Plan the next milestone", assignee=PLANNER, project_id=beside[worker_on]["project_id"],
+            )
+    _settle(root)
+
+    due = T0 + HOUR
+    if failed:
+        _complete(root, garden, cards["opening"])
+        assert ops.summary_tick(now=T0 + HOUR) == 1
+        _fail(root, _assert_rewrite(root, garden, asked_at=T0 + HOUR))
+        assert ops.summary_tick(now=T0 + HOUR + 10) == 0
+        failure = _state(root, garden["project_id"])
+        assert (failure["failures"], failure["pending"], failure["open_task_id"]) == (1, 1, None)
+        due = failure["updated_at"] + HOUR
+    happen = {
+        "finish": lambda: _complete(root, garden, cards["finish"]),
+        "finish again": lambda: _complete(root, garden, cards["finish again"]),
+        "decision": lambda: _block(root, garden, cards["decision"], "needs_input"),
+        "merge": lambda: _merge_delivery(root, garden, delivery, cards["merge"], ledger),
+        "release": lambda: ledger.release("lamp", card=cards["release"], board=garden["board"]),
+    }
+    return SimpleNamespace(
+        garden=garden, pid=garden["project_id"], due=due, happen=happen, cards=cards,
+        beside=beside, quiet=quiet, worker_task=worker_task,
+    )
+
+
+def _race(root: Path, scene: SimpleNamespace, monkeypatch, later) -> kanban_db.Task:
+    """The delayed tick of the review; returns the finished task that nobody has recorded.
+
+    Tick B passes the one check and waits before it reads events. Meanwhile tick A, at the due time, publishes its task
+    and stops before it records it, the worker finishes that task, and ``later`` happens. B then goes on with its own
+    clock, a second before the due time: it is not due, so it stores the events it reads and moves the cursors.
+    """
+    from hermes_cli import owner_project_summary_events as events
+
+    ops = _ops()
+    read, create_task = events.read, kanban_db.create_task
+    published: list = []
+    watermark: list = []
+
+    def create_then_die(*args, **kwargs):
+        published.append(create_task(*args, **kwargs))
+        raise _ProcessDied
+
+    def read_late(registry, project):
+        if project.id == scene.pid and not watermark:
+            watermark.append(_tops(root, scene.garden))
+            monkeypatch.setattr(kanban_db, "create_task", create_then_die)
+            with pytest.raises(_ProcessDied):
+                ops.summary_tick(now=scene.due)
+            monkeypatch.setattr(kanban_db, "create_task", create_task)
+            _finish(root, published[0], _valid(outcome=REWRITTEN))
+            later()
+        return read(registry, project)
+
+    monkeypatch.setattr(events, "read", read_late)
+    assert ops.summary_tick(now=scene.due - 1) == 0
+    monkeypatch.setattr(events, "read", read)
+
+    [task] = _tasks_of(root, scene.garden)
+    assert (task.id, task.status) == (published[0], "done")
+    recorded = _state(root, scene.pid)
+    assert (recorded["open_task_id"], recorded["pending"]) == (None, 1)
+    assert events.covered_cursors(task.body) == events.Cursors(*watermark[0])
+    assert _cursors(recorded) == _tops(root, scene.garden)
+    assert _cursors(recorded) != watermark[0]
+    return task
+
+
+def _reuse_and_harvest(root: Path, scene: SimpleNamespace, monkeypatch, task, *, urgent: bool) -> None:
+    """The next request gets the finished task back for its key, and the harvest follows.
+
+    The task covers only what lies up to its watermark, so the events after it stay pending: an urgent one is asked for
+    at once after the harvest, an ordinary one once the hour since the claim has passed, and each exactly once.
+    """
+    ops = _ops()
+    garden, pid = scene.garden, scene.pid
+    recorded = _state(root, pid)
+    asked = len(_tasks_of(root, garden, archived=True))
+    claim_at = scene.due + 5
+
+    with _Trace(monkeypatch, root) as trace:
+        assert ops.summary_tick(now=claim_at) == 1
+    _assert_the_check_comes_first(trace)
+    claimed = _state(root, pid)
+    assert claimed["open_task_id"] == task.id
+    assert (claimed["last_requested_at"], claimed["failures"]) == (claim_at, recorded["failures"])
+    assert _cursors(claimed) == _cursors(recorded)
+    assert (claimed["pending"], claimed["pending_urgent"]) == (1, int(urgent))
+    assert len(_tasks_of(root, garden, archived=True)) == asked
+
+    harvest_at = claim_at + 10
+    if urgent:
+        assert ops.summary_tick(now=harvest_at) == 1
+        asked_at = harvest_at
+    else:
+        assert ops.summary_tick(now=harvest_at) == 0
+        harvested = _state(root, pid)
+        assert (harvested["open_task_id"], harvested["failures"]) == (None, 0)
+        assert (harvested["pending"], harvested["pending_urgent"]) == (1, 0)
+        assert ops.summary_tick(now=claim_at + HOUR - 1) == 0
+        assert len(_tasks_of(root, garden, archived=True)) == asked
+        asked_at = claim_at + HOUR
+        assert ops.summary_tick(now=asked_at) == 1
+    assert _summary_of(root, pid)["revision"] == 2
+    second = _assert_rewrite(root, garden, asked_at=asked_at)
+    assert second != task.id
+    assert len(_tasks_of(root, garden, archived=True)) == asked + 1
+    assert _cursors(_state(root, pid)) == _tops(root, garden)
+
+    _store_rewrite(root, second, asked_at + 10)
+    assert _summary_of(root, pid)["revision"] == 3
+    for at in (asked_at + 20, asked_at + 2 * HOUR):
+        assert ops.summary_tick(now=at) == 0
+    assert _tasks_of(root, garden) == []
+    assert len(_tasks_of(root, garden, archived=True)) == asked + 1
+    assert _flags(root, garden) == (0, 0)
+    assert _cursors(_state(root, pid)) == _tops(root, garden)
+
+
+# What the task covers is a decision (material case), or a finish; what comes after it is the case's own event. The
+# failure is counted for the cases that cross the backoff, and not for the hourly boundary.
+_REUSE_CASES = {
+    "material": ("decision", "finish", True),
+    "decision": ("finish", "decision", True),
+    "merge": ("finish", "merge", True),
+    "release": ("finish", "release", True),
+    "hour": ("finish", "finish again", False),
+}
+
+
+@pytest.mark.parametrize("case", list(_REUSE_CASES))
+def test_a_finished_task_handed_back_for_its_key_clears_only_the_events_it_covers(root, owner, monkeypatch, case):
+    covered, later, failed = _REUSE_CASES[case]
+    scene = _scene(root, owner, failed=failed)
+    scene.happen[covered]()
+    task = _race(root, scene, monkeypatch, scene.happen[later])
+    _reuse_and_harvest(root, scene, monkeypatch, task, urgent=later in _URGENT_KINDS)
+
+
+def test_the_flags_are_kept_when_the_events_after_the_tasks_line_cannot_be_read(root, owner, monkeypatch):
+    scene = _scene(root, owner, failed=True)
+    scene.happen["finish"]()
+    task = _race(root, scene, monkeypatch, scene.happen["merge"])
+    before = _state(root, scene.pid)
+    _garble(root / LEDGER_FILE)
+
+    assert _ops().summary_tick(now=scene.due + 5) == 1
+    claimed = _state(root, scene.pid)
+    assert (claimed["open_task_id"], claimed["pending"], claimed["pending_urgent"]) == (task.id, 1, 1)
+    assert _cursors(claimed) == _cursors(before)
+
+
+def _enter_planning_worker(monkeypatch, root: Path, slug: str, task_id: str) -> None:
+    """Take on the store pins kanban_db_dispatch._default_spawn gives a worker.
+
+    The board pins are resolved first, in the dispatcher's own environment.
+    """
+    pins = {
+        "HERMES_KANBAN_DB": str(kanban_db.kanban_db_path(board=slug)),
+        "HERMES_KANBAN_WORKSPACES_ROOT": str(kanban_db.workspaces_root(board=slug)),
+        "HERMES_KANBAN_BOARD": slug,
+    }
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / PLANNER))
+    monkeypatch.setenv("HERMES_PROFILE", PLANNER)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    for name, value in pins.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_a_finished_task_handed_back_for_its_key_holds_under_the_worker_environment(root, owner, monkeypatch):
+    scene = _scene(root, owner, failed=True, others=("Planning Desk", "Spare Room"), worker_on="Planning Desk")
+    desk, spare = scene.beside["Planning Desk"], scene.beside["Spare Room"]
+    scene.happen["finish"]()
+    for name, project in scene.beside.items():
+        _quiet(root, project, scene.quiet[name])
+        assert _cursors(_state(root, project["project_id"])) != _tops(root, project)
+
+    profile_home = root / "profiles" / PLANNER
+    profile_home.mkdir(parents=True)
+    with projects_db.connect_closing(profile_home / REGISTRY_FILE):
+        pass
+    _enter_planning_worker(monkeypatch, root, desk["board"], scene.worker_task)
+    pinned = {name: os.environ[name] for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD")}
+    own_board = _board_db(root, desk["board"])
+    assert Path(pinned["HERMES_KANBAN_DB"]).resolve() == own_board.resolve()
+    own_cards = _rows(own_board, "SELECT id, title, status FROM tasks ORDER BY id")
+
+    task = _race(root, scene, monkeypatch, scene.happen["merge"])
+    _reuse_and_harvest(root, scene, monkeypatch, task, urgent=True)
+
+    registry = root / REGISTRY_FILE
+    projects = (scene.garden, desk, spare)
+    assert _rows(
+        registry,
+        "SELECT project_id, event_cursor, delivery_cursor, release_cursor, pending, pending_urgent, open_task_id, "
+        "failures FROM project_summary_state ORDER BY project_id",
+    ) == sorted((project["project_id"], *_tops(root, project), 0, 0, None, 0) for project in projects)
+    assert _rows(registry, "SELECT project_id, revision FROM project_summaries ORDER BY project_id") == sorted(
+        [(scene.pid, 3), (desk["project_id"], 1), (spare["project_id"], 1)]
+    )
+    assert _rows(
+        _board_db(root, BOARD),
+        "SELECT title, count(*) FROM tasks WHERE task_kind = 'work' GROUP BY title ORDER BY title",
+    ) == [(TITLE + "Garden Plan", 4), (TITLE + "Planning Desk", 1), (TITLE + "Spare Room", 1)]
+    assert _rows(own_board, "SELECT id, title, status FROM tasks ORDER BY id") == own_cards
+    assert _rows(profile_home / REGISTRY_FILE, "SELECT count(*) FROM project_summaries") == [(0,)]
+    assert _rows(profile_home / REGISTRY_FILE, "SELECT count(*) FROM project_summary_state") == [(0,)]
+    assert {name: os.environ[name] for name in pinned} == pinned
