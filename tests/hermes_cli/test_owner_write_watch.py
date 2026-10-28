@@ -1138,14 +1138,14 @@ def test_journeys_started_more_than_55_minutes_ago_fails_with_the_started_time(t
 
 
 def test_journeys_the_stuck_limit_is_55_minutes_exactly(tmp_path):
-    """55 minutes is still inside the limit plus ten minutes; one second more is stuck."""
-    assert watch.JOURNEYS_STUCK_AFTER == timedelta(minutes=55)
+    """130 minutes is still inside the limit plus ten minutes; one second more is stuck."""
+    assert watch.JOURNEYS_STUCK_AFTER == timedelta(minutes=130)
     host = Host(tmp_path)
-    write_journeys(started_at(START - timedelta(minutes=55)))
+    write_journeys(started_at(START - timedelta(minutes=130)))
     host.run()
     assert journeys_check()["outcome"] == watch.PASS
     host = Host(tmp_path)
-    write_journeys(started_at(START - timedelta(minutes=55, seconds=1)))
+    write_journeys(started_at(START - timedelta(minutes=130, seconds=1)))
     host.run()
     assert journeys_check()["outcome"] == watch.FAIL
 

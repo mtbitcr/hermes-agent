@@ -42,7 +42,7 @@ RUNNER = "runner@server2.invalid"
 SENTINELS = [SECRET, "PAGE-BODY-SENTINEL", "PAGE-BANNER-SENTINEL", PAGE_TEXT]
 
 S2_DIR = "/home/raphael-runner/raphael-journeys"
-CONTAINER = "raphael-s2-browser"
+CONTAINER = "raphael-journeys-browser"
 BROWSER_DIR = "/opt/raphael-journeys"
 
 LOCK_REASON = "Refused: a journey run is still at work (the run lock is held)."
@@ -64,15 +64,19 @@ ISO2 = "ssh isolation_check.sh server2"
 ISO1 = "isolation_check.sh server1"
 RESET = "ssh reset_stack.sh"
 JOURNEYS_CALL = "ssh journey-run.sh"
+SEED_CALL = "ssh seed_stack.sh"
+LOOP_ORDER = [3, 5, 2, 1, 4]
+SEEDED = (3, 5, 2)
 ISOLATION = [ISO2, ISO1]
 
 CMD_ISO2 = f"cd '{S2_DIR}' && JOURNEY_PRODUCTION_ORIGIN='{PROD}' ./isolation_check.sh server2"
 CMD_RESET = f"cd '{S2_DIR}' && ./reset_stack.sh"
-CMD_JOURNEYS = (
+CMDS_JOURNEYS = [
     f"JOURNEY_BASE_URL='{BASE_URL}' JOURNEY_PRODUCTION_ORIGIN='{PROD}' "
     f"docker exec -w '{BROWSER_DIR}' -e JOURNEY_BASE_URL -e JOURNEY_PRODUCTION_ORIGIN "
-    f"'{CONTAINER}' sh tools/page-check/journey-run.sh"
-)
+    f"'{CONTAINER}' sh tools/page-check/journey-run.sh {n}"
+    for n in LOOP_ORDER
+]
 
 STAND_IN = r'''
 import json, os, subprocess, sys, time
@@ -102,6 +106,13 @@ def leak(rc):
     sys.stdout.write("leak: %s %s\n" % (answers["secret"], answers["page"]))
     sys.stderr.write("leak: %s %s\n" % (answers["secret"], answers["page"]))
     sys.exit(rc)
+
+
+def curl_spec(label):
+    if label == "curl proxy":
+        return answers["proxy"]
+    asked = calls_so_far("curl app") - 1
+    return answers["app"][min(asked, len(answers["app"]) - 1)]
 
 
 def hang_if_asked(label):
@@ -146,8 +157,13 @@ if name == "ssh":
         label = "ssh isolation_check.sh server2"
     elif "reset_stack.sh" in command:
         label = "ssh reset_stack.sh"
+    elif "seed_stack.sh" in command:
+        label = "ssh seed_stack.sh"
     elif "journey-run.sh" in command:
         label = "ssh journey-run.sh"
+    elif " curl " in command:
+        # the proxy and owner app answers: curl inside the browser container, its output kept
+        label = "curl proxy" if answers["proxy_url"] in command else "curl app"
     else:
         label = "ssh other"
     record(label)
@@ -157,26 +173,25 @@ if name == "ssh":
         env.update(answers.get("remote_env", {}))
         done = subprocess.run(["sh", "-c", command], env=env, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True)
+        if label.startswith("curl"):
+            sys.stdout.write(done.stdout)
+            sys.exit(done.returncode)
         leak(done.returncode)
+    if label.startswith("curl"):
+        spec = curl_spec(label)
+        sys.stdout.write(spec["body"])
+        sys.exit(spec["rc"])
     leak(answers["rc"].get(label, 0))
 if name == "hermes":
     record("hermes")
     sys.exit(answers["hermes_rc"])
 if name == "curl":
-    url = [arg for arg in args if arg.startswith("https://")][-1]
-    if url == answers["proxy_url"]:
-        record("curl proxy")
-        spec = answers["proxy"]
-    else:
-        record("curl app")
-        asked = calls_so_far("curl app") - 1
-        spec = answers["app"][min(asked, len(answers["app"]) - 1)]
-    sys.stdout.write(spec["body"])
-    sys.exit(spec["rc"])
+    record("local curl")  # run_once.sh no longer runs curl on Server 1
+    sys.exit(97)
 sys.exit("stand-in: unknown name " + name)
 '''
 
-TOOLS = ("bash", "flock", "rm", "mkdir", "dirname")
+TOOLS = ("bash", "flock", "rm", "mkdir", "dirname", "date")
 
 
 def _issuer_and_kid() -> tuple[str, str]:
@@ -211,6 +226,9 @@ class Sandbox:
             (self.bin / name).symlink_to(shutil.which(name))
         # The Server 1 part of the isolation check is a stand-in here; the integration test uses the real one.
         self._wrapper(self.scripts / "isolation_check.sh")
+        # The refresh has its own tests (test_journeys_run_loop.py); here it is a refresh that succeeds.
+        (self.scripts / "refresh_stack.sh").write_text("#!/bin/sh\nexit 0\n")
+        (self.scripts / "refresh_stack.sh").chmod(0o755)
         shutil.copy2(PROXY_SOURCE, self.scripts / "synthetic_proxy.py")
         self.write_runner_env()
         self.answer()
@@ -267,6 +285,10 @@ class Sandbox:
     def call(self, label: str) -> dict:
         (found,) = [call for call in self.calls() if call["call"] == label]
         return found
+
+    def commands(self, label: str) -> list[str]:
+        """The remote command of each call with this label, in order."""
+        return [call["argv"][2] for call in self.calls() if call["call"] == label]
 
     def told(self) -> list[str]:
         return [call["stdin"] for call in self.calls() if call["call"] == "hermes"]
@@ -340,7 +362,7 @@ def test_the_script_header_names_every_variable_its_default_and_who_installs_wha
     header = _header()
     for needle in (
         "JOURNEY_S2_SCRIPTS_DIR", "/home/raphael-runner/raphael-journeys",
-        "JOURNEY_BROWSER_CONTAINER", "raphael-s2-browser",
+        "JOURNEY_BROWSER_CONTAINER", "raphael-journeys-browser",
         "JOURNEY_BROWSER_DIR", "/opt/raphael-journeys",
         "JOURNEY_RUNNER_ENV", "~/.hermes/journeys/runner.env",
         "JOURNEY_BASE_URL", "JOURNEY_PRODUCTION_ORIGIN", "JOURNEY_RUNNER_SSH", "JOURNEY_PAGE_TEXT",
@@ -486,7 +508,15 @@ def test_start_prints_no_secret_value(box):
 # -------------------------------------------------------------------------------- run_once.sh
 
 TIME_RE = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"
-PASSING_CALLS = [*ISOLATION, RESET, "curl proxy", "curl app", JOURNEYS_CALL, "hermes"]
+PASSING_CALLS = [
+    *ISOLATION,
+    *[
+        call
+        for n in LOOP_ORDER
+        for call in (RESET, *([SEED_CALL] if n in SEEDED else []), "curl proxy", "curl app", JOURNEYS_CALL)
+    ],
+    "hermes",
+]
 
 
 def test_a_passing_run_goes_through_the_steps_in_order_and_writes_one_result_and_one_owner_line(box):
@@ -494,14 +524,17 @@ def test_a_passing_run_goes_through_the_steps_in_order_and_writes_one_result_and
 
     assert done.returncode == 0, done.stdout + done.stderr
     assert box.names() == PASSING_CALLS
-    assert box.call("curl proxy")["argv"][-1] == PROXY_URL
-    assert box.call("curl app")["argv"][-1] == BASE_URL
+    # The proxy and owner app answers come from curl inside the browser container, through the runner identity.
+    for command in box.commands("curl proxy"):
+        assert command.startswith(f"docker exec '{CONTAINER}' curl ") and command.endswith(f" '{PROXY_URL}'")
+    for command in box.commands("curl app"):
+        assert command.startswith(f"docker exec '{CONTAINER}' curl ") and command.endswith(f" '{BASE_URL}'")
     # Server 2 parts go through the runner identity, in the Server 2 scripts folder; the Server 1
     # part of the isolation check runs locally.
     assert box.call(ISO2)["argv"] == ["ssh", RUNNER, CMD_ISO2]
     assert box.call(ISO1)["argv"] == ["isolation_check.sh", "server1"]
-    assert box.call(RESET)["argv"] == ["ssh", RUNNER, CMD_RESET]
-    assert box.call(JOURNEYS_CALL)["argv"] == ["ssh", RUNNER, CMD_JOURNEYS]
+    assert box.commands(RESET) == [CMD_RESET] * 5
+    assert box.commands(JOURNEYS_CALL) == CMDS_JOURNEYS
     assert box.call("hermes")["argv"] == ["hermes", "send", "--to", "telegram", "--file", "-"]
     # Exactly one result file, and exactly one owner line.
     assert sorted(path.name for path in box.run_dir.iterdir()) == ["result", "run.lock"]
@@ -509,8 +542,8 @@ def test_a_passing_run_goes_through_the_steps_in_order_and_writes_one_result_and
     assert (result["result"], result["step"]) == ("passed", "journeys")
     assert re.fullmatch(TIME_RE, result["started"]) and re.fullmatch(TIME_RE, result["finished"])
     assert box.told() == ["Journeys passed."]
-    # Nothing was retried: every stand-in was called once.
-    assert len(box.names()) == len(set(box.names()))
+    # Nothing was retried: each journey ran its steps once.
+    assert [box.names().count(call) for call in (RESET, SEED_CALL, JOURNEYS_CALL)] == [5, 3, 5]
 
 
 def test_the_settings_named_by_the_owner_change_the_server_2_calls(box):
@@ -521,9 +554,9 @@ def test_the_settings_named_by_the_owner_change_the_server_2_calls(box):
 
     assert done.returncode == 0, done.stdout + done.stderr
     assert box.call(ISO2)["argv"][2] == CMD_ISO2.replace(S2_DIR, "/srv/s2-scripts")
-    assert box.call(RESET)["argv"][2] == CMD_RESET.replace(S2_DIR, "/srv/s2-scripts")
-    expected = CMD_JOURNEYS.replace(BROWSER_DIR, "/srv/browser-dir").replace(CONTAINER, "browser-x")
-    assert box.call(JOURNEYS_CALL)["argv"][2] == expected
+    assert box.commands(RESET) == [CMD_RESET.replace(S2_DIR, "/srv/s2-scripts")] * 5
+    expected = [c.replace(BROWSER_DIR, "/srv/browser-dir").replace(CONTAINER, "browser-x") for c in CMDS_JOURNEYS]
+    assert box.commands(JOURNEYS_CALL) == expected
 
 
 def test_the_runner_settings_file_is_read_from_its_default_place(box):
@@ -534,7 +567,7 @@ def test_the_runner_settings_file_is_read_from_its_default_place(box):
     done = box.run(RUN_ONCE, JOURNEY_RUNNER_ENV=None)
 
     assert done.returncode == 0, done.stdout + done.stderr
-    assert box.call(JOURNEYS_CALL)["argv"][2] == CMD_JOURNEYS
+    assert box.commands(JOURNEYS_CALL) == CMDS_JOURNEYS
 
 
 def test_the_journeys_docker_exec_passes_exactly_the_two_named_variables(box):
@@ -543,14 +576,15 @@ def test_the_journeys_docker_exec_passes_exactly_the_two_named_variables(box):
     )
     assert box.run(RUN_ONCE).returncode == 0
 
-    command = box.call(JOURNEYS_CALL)["argv"][2]
-    prefix, _, rest = command.partition(" docker exec ")
-    # Only these two names are set for docker, and docker passes on only these two names, no value.
-    assert re.findall(r"(\w+)='", prefix) == ["JOURNEY_BASE_URL", "JOURNEY_PRODUCTION_ORIGIN"]
-    assert re.findall(r"-e (\S+)", rest) == ["JOURNEY_BASE_URL", "JOURNEY_PRODUCTION_ORIGIN"]
-    assert "--env" not in rest and "--env-file" not in rest and "=" not in rest
-    assert rest.endswith(f"'{CONTAINER}' sh tools/page-check/journey-run.sh")
-    assert SECRET not in command
+    for n, command in zip(LOOP_ORDER, box.commands(JOURNEYS_CALL), strict=True):
+        prefix, _, rest = command.partition(" docker exec ")
+        # Only these two names are set for docker, and docker passes on only these two names, no value.
+        assert re.findall(r"(\w+)='", prefix) == ["JOURNEY_BASE_URL", "JOURNEY_PRODUCTION_ORIGIN"]
+        assert re.findall(r"-e (\S+)", rest) == ["JOURNEY_BASE_URL", "JOURNEY_PRODUCTION_ORIGIN"]
+        assert "--env" not in rest and "--env-file" not in rest and "=" not in rest
+        # ... and the one digit of its journey.
+        assert rest.endswith(f"'{CONTAINER}' sh tools/page-check/journey-run.sh {n}")
+        assert SECRET not in command
 
 
 def test_the_wait_for_the_owner_app_polls_until_the_page_text_shows(box):
@@ -560,15 +594,17 @@ def test_the_wait_for_the_owner_app_polls_until_the_page_text_shows(box):
 
     assert done.returncode == 0
     names = box.names()
-    # A 200 with a failure banner is not ready, nor is an error status; the third answer is.
-    assert names.count("curl app") == 3 and names.count("sleep") == 2
-    assert names.index(JOURNEYS_CALL) > max(i for i, name in enumerate(names) if name == "curl app")
+    # A 200 with a failure banner is not ready, nor is an error status; the third answer is (journey 3's wait).
+    # The four later journeys find the page at once.
+    assert names.count("curl app") == 3 + 4 and names.count("sleep") == 2
+    third = [i for i, name in enumerate(names) if name == "curl app"][2]
+    assert names.index(JOURNEYS_CALL) > third
     assert box.told() == ["Journeys passed."]
 
 
 # Each step: how it fails, the calls that happen up to and including the failure, and nothing after.
 UP_TO_RESET = [*ISOLATION, RESET]
-UP_TO_APP = [*UP_TO_RESET, "curl proxy"]
+UP_TO_APP = [*UP_TO_RESET, SEED_CALL, "curl proxy"]
 FULL_WAIT = [*UP_TO_APP, *["curl app", "sleep"] * 60, "curl app"]
 BAD_ENV_FILES = {
     "extra-name": f"JOURNEY_BASE_URL={BASE_URL}\nJOURNEY_PRODUCTION_ORIGIN={PROD}\nANTHROPIC_TOKEN={SECRET}\n",
@@ -603,6 +639,10 @@ FAILURES = {
 }
 
 
+# A failure in the loop names its journey; the first journey is 3, and every case here fails in it.
+LOOP_STEPS = ("reset", "seed", "proxy", "owner-app", "journeys")
+
+
 def _arrange(box: Sandbox, change: dict) -> dict:
     box.answer(**{k: v for k, v in change.items() if k not in ("env", "runner_env")})
     if "runner_env" in change:
@@ -627,7 +667,9 @@ def test_a_failed_step_ends_the_run_with_its_name_and_reason_and_runs_no_later_s
     assert (result["result"], result["step"], result["reason"]) == ("failed", step, REASONS[step])
     assert re.fullmatch(TIME_RE, result["started"]) and re.fullmatch(TIME_RE, result["finished"])
     assert sorted(path.name for path in box.run_dir.iterdir()) == ["result", "run.lock"]
-    assert box.told() == [f"Journeys failed at step {step}: {REASONS[step]}."]
+    named = " for journey 3" if step in LOOP_STEPS else ""
+    assert result.get("journey") == ("3" if named else None)
+    assert box.told() == [f"Journeys failed at step {step}{named}: {REASONS[step]}."]
     assert box.names()[-1] == "hermes"
 
 
@@ -723,7 +765,7 @@ def test_a_failed_run_that_cannot_store_its_result_still_names_its_step_in_the_o
 
     assert done.returncode != 0
     assert len(box.told()) == 1
-    assert box.told()[0].startswith(f"Journeys failed at step journeys: {REASONS['journeys']}.")
+    assert box.told()[0].startswith(f"Journeys failed at step journeys for journey 3: {REASONS['journeys']}.")
     assert "could not be stored" in box.told()[0]
 
 
@@ -748,7 +790,7 @@ def test_a_failed_owner_line_is_recorded_in_the_result_of_a_passing_run(box):
     assert (result["result"], result["step"], result["reason"]) == ("failed", "notify", REASONS["notify"])
     assert "earlier_step" not in result
     assert box.names().count("hermes") == 1  # one attempt, no retry
-    assert box.names().count(JOURNEYS_CALL) == 1  # the journeys did pass and are not run again
+    assert box.names().count(JOURNEYS_CALL) == 5  # the journeys did pass and are not run again
 
 
 def test_a_failed_owner_line_is_recorded_in_the_result_of_a_failed_run_too(box):
@@ -770,7 +812,7 @@ def test_a_failed_owner_line_and_a_failed_rewrite_never_leave_a_passed_result(bo
 
     assert done.returncode != 0
     assert box.names().count("hermes") == 1  # told once, not again
-    assert box.names().count(JOURNEYS_CALL) == 1
+    assert box.names().count(JOURNEYS_CALL) == 5
     # The result could not be amended, so the passed one is taken away: a reader never sees "passed".
     assert not (box.run_dir / "result").exists()
     assert sorted(path.name for path in box.run_dir.iterdir()) == ["run.lock"]
@@ -886,7 +928,9 @@ if a[0] == "exec":
             break
     container, command = rest[0], rest[1:]
     stdin = "" if sys.stdin.isatty() else sys.stdin.read()
-    if container == "raphael-s2-browser" or container == answers.get("browser_container"):
+    if container == "raphael-journeys-browser" or container == answers.get("browser_container"):
+        if command[0] == "curl":  # the proxy and owner app checks run in the browser container
+            out(answers["proxy"]["body"] if command[-1] == answers["proxy_url"] else answers["app"][0]["body"])
         out("", answers["rc"].get("docker exec journeys", 0))
     if command[:2] == ["id", "-u"] or command[:2] == ["id", "-g"]:
         out("1001")
@@ -929,6 +973,8 @@ def _integration(box: Sandbox, **answers) -> dict[str, str]:
     s2.mkdir()
     for name in ("isolation_check.sh", "reset_stack.sh", "stack.env.template", "synthetic_proxy.py"):
         shutil.copy2(JOURNEYS / name, s2 / name)
+    (s2 / "seed_stack.sh").write_text("#!/bin/sh\nexit 0\n")  # the seed has its own tests (test_journeys_seed.py)
+    (s2 / "seed_stack.sh").chmod(0o755)
     shutil.copytree(JOURNEYS / "stack-home", s2 / "stack-home")
     shutil.copy2(JOURNEYS / "isolation_check.sh", box.scripts / "isolation_check.sh")  # the local one too
     shutil.copy2(JOURNEYS / "stack.env.template", box.scripts / "stack.env.template")
@@ -973,9 +1019,12 @@ def test_the_real_isolation_check_and_reset_run_on_server_2_through_the_runner_i
     # Server 2 parts: the stack's containers, never production's; the reset stopped and started them.
     assert not any("raphael-workspace" in arg for argv in remote for arg in argv)
     assert ["stop", "raphael-journeys-gateway"] in remote and ["start", "raphael-journeys-browser"] in remote
-    assert remote[-1] == [
-        "exec", "-w", BROWSER_DIR, "-e", "JOURNEY_BASE_URL", "-e", "JOURNEY_PRODUCTION_ORIGIN", CONTAINER,
-        "sh", "tools/page-check/journey-run.sh",
+    assert [argv for argv in remote if argv[-2] == "tools/page-check/journey-run.sh"] == [
+        [
+            "exec", "-w", BROWSER_DIR, "-e", "JOURNEY_BASE_URL", "-e", "JOURNEY_PRODUCTION_ORIGIN", CONTAINER,
+            "sh", "tools/page-check/journey-run.sh", str(n),
+        ]
+        for n in LOOP_ORDER
     ]
     assert box.result()["result"] == "passed"
     assert box.told() == ["Journeys passed."]
@@ -1032,5 +1081,5 @@ def test_a_failing_journey_runner_in_the_browser_container_fails_the_journeys_st
     done = box.run(RUN_ONCE, **env)
 
     assert done.returncode != 0
-    assert box.names() == [ISO2, RESET, "curl proxy", "curl app", JOURNEYS_CALL, "hermes"]
+    assert box.names() == [ISO2, RESET, SEED_CALL, "curl proxy", "curl app", JOURNEYS_CALL, "hermes"]
     assert (box.result()["result"], box.result()["step"]) == ("failed", "journeys")
