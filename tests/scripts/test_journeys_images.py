@@ -31,7 +31,7 @@ PLAYWRIGHT_VERSION = "1.63.0"
 
 SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 PLAIN_FILE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
-DIGEST_REF = re.compile(r".+@sha256:[0-9a-f]{64}")
+DIGEST_REF = re.compile(r".+@sha256:(?!(.)\1{63}$)[0-9a-f]{64}")
 
 
 # --- readers -----------------------------------------------------------------------------------------
@@ -355,3 +355,15 @@ def test_browser_installs_playwright_exactly_and_the_images_agree_on_the_proxy_c
             for args in of_kind(path, kind):
                 for source in copy_parts(args)[0]:
                     assert source not in {".", "./", "/"} and "*" not in source and "key" not in source.lower()
+
+
+def test_a_digest_must_be_exactly_64_lowercase_hex_characters():
+    good = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    assert DIGEST_REF.fullmatch(f"image:1@sha256:{good}")
+    for bad in (good[:-1], good + "0", good.upper(), "g" + good[1:], ""):
+        assert DIGEST_REF.fullmatch(f"image:1@sha256:{bad}") is None, bad
+
+
+def test_a_digest_made_of_one_repeated_character_is_refused():
+    for char in "0af":
+        assert DIGEST_REF.fullmatch(f"image:1@sha256:{char * 64}") is None, char

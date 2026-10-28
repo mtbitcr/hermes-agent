@@ -1,6 +1,6 @@
 # Sign-in proxy of the journeys stack. Build folder: synthetic_proxy.py only.
-# The digest below is a stand-in; set the resolved digest of python:3.12-slim before the first build.
-FROM python:3.12-slim@sha256:0000000000000000000000000000000000000000000000000000000000000000
+# The digest is the registry index digest read by the operator on 2026-10-28 (metadata only, no image pulled); the platform's production Python is 3.11.15.
+FROM python:3.11.15-slim-bookworm@sha256:d29f48a31a8b408ed19272ca1e7b10ebae13b240a27e862d3d4217c528e2e0c3
 
 RUN pip install --no-cache-dir cryptography==50.0.0
 

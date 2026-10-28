@@ -1,8 +1,8 @@
 # Browser of the journeys stack. Build folder: ca.pem only (the proxy's public CA certificate).
 # The page-check is not copied here. Playwright goes in /opt/raphael-journeys, so that node finds it from
-# the page-check folder below it. The digest below is a stand-in; set the resolved digest of the
-# Playwright 1.63.0 image before the first build.
-FROM mcr.microsoft.com/playwright:v1.63.0-noble@sha256:0000000000000000000000000000000000000000000000000000000000000000
+# the page-check folder below it. The digest is the registry index digest read by the operator on 2026-10-28
+# (metadata only, no image pulled); the platform's production Python is 3.11.15.
+FROM mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c30e6f3f4af0a03fa4b706120d5e9b0891c344a27d64559aff5900a4a27
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libnss3-tools \
