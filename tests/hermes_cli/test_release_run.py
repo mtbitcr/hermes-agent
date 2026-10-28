@@ -1030,3 +1030,520 @@ def test_a_send_that_fails_changes_nothing_else_and_names_its_cause(
     assert lines.count(f"Batch {batch_id} {release_cmd._OUTCOMES[outcome]}.") == 1
     assert len([line for line in lines if all(part in line for part in CAUSES[how])]) == 1
     assert len(told) == 1 and SECRET not in shown.out + shown.err
+
+
+# The owner journeys, started once after a release: scripts/journeys/start.sh of this checkout.
+START_SH = Path(__file__).resolve().parents[2] / "scripts" / "journeys" / "start.sh"
+STARTED_LINE = "Started the unit hermes-journeys (time limit 2700 seconds)."
+NOT_VALID = "Journeys not started: the journeys settings file is not valid."
+SCRIPT_FAILED = "Journeys not started: the start script failed"
+# A settings file that follows every rule, and its entries; no output may show their values.
+JOURNEY_SETTINGS = {
+    "JOURNEY_PAGE_TEXT": "Owner app = ready",
+    "JOURNEY_RUNNER_SSH": "runner@stack-two-placeholder",
+    "JOURNEY_S2_SCRIPTS_DIR": "/home/runner/placeholder-journeys",
+}
+VALID_FILE = "".join(f"{name}={value}\n" for name, value in JOURNEY_SETTINGS.items())
+# A value that breaks a rule must not be shown either.
+LEAK = "hunter2-placeholder-value"
+
+
+class Starts(list):
+    """The runs of start.sh a release made, each ``(argv, options)``; no process is started.
+    ``answer`` is what a run gives: a finished process, or an exception to raise. ``look`` is
+    called as each run begins, and what it returns is kept in ``seen``."""
+
+    def __init__(self):
+        super().__init__()
+        self.answer = subprocess.CompletedProcess([], 0, STARTED_LINE + "\n", "")
+        self.look, self.seen = lambda: None, []
+
+    def run(self, argv, **options):
+        self.append((argv, options))
+        self.seen.append(self.look())
+        if isinstance(self.answer, BaseException):
+            raise self.answer
+        return self.answer
+
+
+@pytest.fixture
+def starts(monkeypatch: pytest.MonkeyPatch) -> Starts:
+    """The one seam of the start, ``subprocess.run``, replaced by a record of its calls."""
+    recorded = Starts()
+    monkeypatch.setattr(subprocess, "run", recorded.run)
+    return recorded
+
+
+def _journey_file(root: Path, content: str | bytes = VALID_FILE) -> Path:
+    """``journeys/settings`` under the release root, holding exactly ``content``."""
+    path = root / "journeys" / "settings"
+    path.parent.mkdir(exist_ok=True)
+    path.write_bytes(content.encode() if isinstance(content, str) else content)
+    return path
+
+
+def _sized(size: int) -> str:
+    """Rule-following content of exactly ``size`` bytes, one setting."""
+    head = f"JOURNEY_PAGE_TEXT={LEAK}"
+    return head + "x" * (size - len(head) - 1) + "\n"
+
+
+def _release_unchanged(code: int, host: FakeHost, batch_id: int, sent: Sent) -> None:
+    """Whatever the start did, the release ended as it ends without one: released and exit 0, its
+    pause lifted, the owner told first how it ended."""
+    assert code == 0
+    assert [batch["outcome"] for batch in _batches()] == ["released"]
+    assert (_sentinel(), host.journal[-2:]) == (None, ["outcome released", "resume"])
+    assert sent[0] == f"Release {batch_id} was released."
+
+
+def _shown(out_err: tuple[str, str], sent: Sent, *values: str) -> None:
+    """None of ``values`` was printed or sent."""
+    for value in values:
+        assert value not in "".join(out_err)
+        assert not any(value in line for line in sent)
+
+
+def test_a_released_run_with_a_valid_settings_file_starts_the_journeys_once(
+    root, monkeypatch, capsys, sent, starts
+):
+    batch_id = _accepted(1)["batch_id"]
+    _journey_file(root)
+    monkeypatch.setenv("JOURNEY_PAGE_TEXT", "inherited-placeholder")  # the file's entry wins
+    monkeypatch.setenv("JOURNEY_BROWSER_DIR", "/opt/inherited")  # a name the file lacks stays
+    before, host = dict(os.environ), FakeHost()
+    starts.look = lambda: (_sentinel(), [batch["outcome"] for batch in _batches()], list(sent))
+
+    code = _run(monkeypatch, host)
+
+    [(argv, options)] = starts
+    assert argv == [str(START_SH)]
+    assert options["timeout"] == 60
+    assert options.get("capture_output") and not options.get("shell")
+    folder = str(Path(sys.executable).parent)
+    assert options["env"] == {
+        **before, **JOURNEY_SETTINGS, "HERMES_HOME": str(root),
+        "PATH": os.pathsep.join([folder, before["PATH"]]),
+    }
+    assert options["env"]["PATH"].split(os.pathsep)[0] == folder
+    assert dict(os.environ) == before
+    # It began at the end of the release: the outcome recorded, the pause lifted, the owner told.
+    assert starts.seen == [(None, ["released"], [f"Release {batch_id} was released."])]
+    out_err = capsys.readouterr()
+    assert out_err.out.splitlines()[-2:] == [f"Batch {batch_id} was released.", STARTED_LINE]
+    assert sent == [f"Release {batch_id} was released."]  # a start that worked tells nobody more
+    _release_unchanged(code, host, batch_id, sent)
+    _shown(out_err, sent, *JOURNEY_SETTINGS.values())
+
+
+@pytest.mark.parametrize(
+    ("content", "added"),
+    [
+        ("", {}),
+        ("JOURNEY_A=1", {"JOURNEY_A": "1"}),
+        ("JOURNEY_A=\n", {"JOURNEY_A": ""}),
+        ("JOURNEY_A=b=c  d \n", {"JOURNEY_A": "b=c  d "}),
+        ("JOURNEY_A1_B2=x\nJOURNEY_Z=y\n", {"JOURNEY_A1_B2": "x", "JOURNEY_Z": "y"}),
+        ("JOURNEY_A=héllo\n", {"JOURNEY_A": "héllo"}),
+        (_sized(4000), {"JOURNEY_PAGE_TEXT": _sized(4000)[18:-1]}),
+        ("JOURNEY_=x\n", {"JOURNEY_": "x"}),
+        (VALID_FILE + "JOURNEY_=x\n", {**JOURNEY_SETTINGS, "JOURNEY_": "x"}),
+    ],
+    ids=["empty", "no final newline", "empty value", "value kept as it is", "digits",
+         "UTF-8", "4000 bytes", "the prefix alone", "the usual settings and the prefix alone"],
+)
+def test_a_settings_file_that_follows_every_rule_adds_its_entries_as_they_are(
+    root, monkeypatch, sent, starts, content, added
+):
+    batch_id = _accepted(1)["batch_id"]
+    _journey_file(root, content)
+    before = dict(os.environ)
+
+    assert _run(monkeypatch, FakeHost()) == 0
+
+    [(_argv, options)] = starts
+    assert {k: v for k, v in options["env"].items() if k.startswith("JOURNEY_")} == added
+    assert set(options["env"]) == set(before) | set(added) | {"HERMES_HOME", "PATH"}
+    assert sent == [f"Release {batch_id} was released."]
+
+
+@pytest.mark.parametrize("path", [None, ""], ids=["unset", "empty"])
+def test_a_path_that_is_not_there_is_the_interpreters_folder_alone(
+    root, monkeypatch, sent, starts, path
+):
+    _accepted(1)
+    _journey_file(root)
+    if path is None:
+        monkeypatch.delenv("PATH")
+    else:
+        monkeypatch.setenv("PATH", path)
+
+    assert _run(monkeypatch, FakeHost()) == 0
+
+    [(_argv, options)] = starts
+    assert options["env"]["PATH"] == str(Path(sys.executable).parent)
+
+
+@pytest.mark.parametrize("spelling", [None, "link"], ids=["unset", "a link to the root"])
+def test_the_start_is_given_the_release_root_as_its_home(root, monkeypatch, sent, starts, spelling):
+    """Pinned as the owner's send is: the root as the release names it, whatever the process has."""
+    _accepted(1)
+    _journey_file(root)
+    if spelling is None:
+        monkeypatch.delenv("HERMES_HOME")  # the default home is then the root
+    else:
+        (root.parent / "link").symlink_to(root)
+        monkeypatch.setenv("HERMES_HOME", str(root.parent / "link"))
+
+    assert _run(monkeypatch, FakeHost()) == 0
+
+    [(_argv, options)] = starts
+    assert options["env"]["HERMES_HOME"] == str(root)
+
+
+@pytest.mark.parametrize(
+    ("host", "outcome"),
+    [
+        ({"unhealthy": {NEW}}, "restored"),
+        ({"origin": PREV}, "refused"),
+        ({"unhealthy": {NEW, PREV}}, "failed"),
+    ],
+)
+def test_a_release_that_did_not_end_released_starts_no_journeys(
+    root, monkeypatch, capsys, sent, starts, host, outcome
+):
+    batch_id = _accepted(1)["batch_id"]
+    _journey_file(root)
+    monkeypatch.setattr(release_runner, "_wait", lambda seconds: None)
+
+    code = _run(monkeypatch, FakeHost(**host))
+
+    out_err = capsys.readouterr()
+    printed = _printed_outcome(out_err.out, batch_id)
+    paused = " The platform stays paused." if outcome == "failed" else ""
+    assert (code, starts, _batches()[0]["outcome"]) == (1, [], outcome)
+    assert sent == [f"Release {batch_id} {printed}{paused}"]
+    assert "journey" not in "".join(out_err).lower()
+
+
+@pytest.mark.parametrize(
+    ("hook", "said"),
+    [
+        (("resume", 1), "The platform is still paused"),
+        (("outcome released", 1), "The pause could not be read"),
+    ],
+    ids=["the removal fails", "the pause cannot be read"],
+)
+def test_a_released_run_that_exits_1_starts_no_journeys(
+    root, monkeypatch, capsys, sent, starts, hook, said
+):
+    """The batch is released, but the end of the run cannot say that its own pause is gone: it
+    exits 1, and exit 1 starts nothing. The first test is the control: the same run exits 0."""
+    batch_id = _accepted(1)["batch_id"]
+    _journey_file(root)
+    host, unlink, read_text = FakeHost(), os.unlink, Path.read_text
+
+    def denied(path, *args, **kwargs):  # the removal of the pause fails, as in a read-only folder
+        if Path(path).name == estop.SENTINEL_NAME:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), os.fspath(path))
+        return unlink(path, *args, **kwargs)
+
+    def unreadable(path, *args, **kwargs):  # and the sentinel's folder turned unreadable
+        if path.name == estop.SENTINEL_NAME:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), os.fspath(path))
+        return read_text(path, *args, **kwargs)
+
+    def turn():
+        monkeypatch.setattr(os, "unlink", denied)
+        if hook[0] == "outcome released":  # before the removal: the read at the end fails
+            monkeypatch.setattr(Path, "read_text", unreadable)
+
+    host.at[hook] = turn
+
+    code = _run(monkeypatch, host)
+
+    out_err = capsys.readouterr()
+    assert (code, starts) == (1, [])
+    assert [batch["outcome"] for batch in _batches()] == ["released"]
+    assert said in out_err.out
+    assert sent == [f"Release {batch_id} was released."]
+    assert "journey" not in "".join(out_err).lower()
+
+
+@pytest.mark.parametrize("kind", ["no folder", "no file", "other files only"])
+def test_a_missing_settings_file_starts_nothing_and_tells_nothing(
+    root, monkeypatch, capsys, sent, starts, kind
+):
+    batch_id = _accepted(1)["batch_id"]
+    if kind != "no folder":
+        (root / "journeys").mkdir()
+    if kind == "other files only":
+        (root / "journeys" / "runner.env").write_text(f"JOURNEY_BASE_URL={LEAK}\n")
+
+    code = _run(monkeypatch, FakeHost())
+
+    out_err = capsys.readouterr()
+    assert (code, starts) == (0, [])
+    assert sent == [f"Release {batch_id} was released."]
+    assert out_err.out.splitlines()[-1] == f"Batch {batch_id} was released."
+    assert "journey" not in "".join(out_err).lower() and out_err.err == ""
+
+
+# Each content breaks one rule of the settings file, and holds a value that must not be shown.
+INVALID_CONTENT = {
+    "a name without the prefix": f"PAGE_TEXT={LEAK}\n",
+    "a name in lower case": f"JOURNEY_page_text={LEAK}\n",
+    "a name with a dash": f"JOURNEY_PAGE-TEXT={LEAK}\n",
+    "a name with a space": f"JOURNEY_PAGE TEXT={LEAK}\n",
+    "a space before the equals sign": f"JOURNEY_PAGE_TEXT ={LEAK}\n",
+    "a space before the name": f" JOURNEY_PAGE_TEXT={LEAK}\n",
+    "no name": f"={LEAK}\n",
+    "a line without an equals sign": f"JOURNEY_PAGE_TEXT {LEAK}\n",
+    "a repeated name": f"JOURNEY_PAGE_TEXT={LEAK}\nJOURNEY_PAGE_TEXT={LEAK}\n",
+    "a repeated name, another value": f"JOURNEY_PAGE_TEXT=a\nJOURNEY_PAGE_TEXT={LEAK}\n",
+    "good lines, then a bad one": VALID_FILE + f"OTHER={LEAK}\n",
+    "a blank line": f"JOURNEY_PAGE_TEXT={LEAK}\n\nJOURNEY_RUNNER_SSH={LEAK}\n",
+    "a lone newline": "\n",
+    "a comment": f"# {LEAK}\nJOURNEY_PAGE_TEXT={LEAK}\n",
+    "a NUL byte": f"JOURNEY_PAGE_TEXT={LEAK}\0\n",
+    "bytes that are not UTF-8": b"JOURNEY_PAGE_TEXT=" + LEAK.encode() + b"\xff\n",
+    "4001 bytes": _sized(4001),
+}
+
+
+def _file_refused(code, host, batch_id, sent, starts, out_err) -> None:
+    """The release ended as it does without a start, which was refused for its settings file: one
+    fixed line was printed and sent, and no value of the file was."""
+    assert starts == []
+    assert sent == [f"Release {batch_id} was released.", NOT_VALID]
+    assert out_err.out.splitlines()[-1] == NOT_VALID and out_err.err == ""
+    _release_unchanged(code, host, batch_id, sent)
+    _shown(out_err, sent, LEAK, *JOURNEY_SETTINGS.values())
+
+
+@pytest.mark.parametrize("content", list(INVALID_CONTENT.values()), ids=list(INVALID_CONTENT))
+def test_a_settings_file_that_breaks_a_rule_starts_nothing_and_tells_the_owner(
+    root, monkeypatch, capsys, sent, starts, content
+):
+    batch_id, host = _accepted(1)["batch_id"], FakeHost()
+    _journey_file(root, content)
+
+    code = _run(monkeypatch, host)
+
+    _file_refused(code, host, batch_id, sent, starts, capsys.readouterr())
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["link", "dangling link", "folder", "unreadable file", "journeys is a file"],
+)
+def test_a_settings_file_that_is_not_a_plain_readable_file_starts_nothing_and_tells_the_owner(
+    root, monkeypatch, capsys, sent, starts, kind
+):
+    batch_id, host = _accepted(1)["batch_id"], FakeHost()
+    path, elsewhere = root / "journeys" / "settings", root.parent / "elsewhere"
+    if kind == "journeys is a file":
+        path.parent.write_text(f"JOURNEY_PAGE_TEXT={LEAK}\n")
+    elif kind == "link":
+        path.parent.mkdir()
+        elsewhere.write_text(f"JOURNEY_PAGE_TEXT={LEAK}\n")  # it follows the rules, but is a link
+        path.symlink_to(elsewhere)
+    elif kind == "dangling link":
+        path.parent.mkdir()
+        path.symlink_to(elsewhere)
+    elif kind == "folder":
+        path.mkdir(parents=True)
+    else:
+        _journey_file(root, f"JOURNEY_PAGE_TEXT={LEAK}\n").chmod(0)
+        if os.access(path, os.R_OK):  # root reads it anyway: the open is denied as it is to others
+            real_open = os.open
+
+            def denied(target, *args, **kwargs):
+                if Path(os.fsdecode(target)).name == "settings":
+                    raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), LEAK)
+                return real_open(target, *args, **kwargs)
+
+            monkeypatch.setattr(os, "open", denied)
+
+    code = _run(monkeypatch, host)
+
+    _file_refused(code, host, batch_id, sent, starts, capsys.readouterr())
+
+
+def _not_started(starts: Starts, answer, root: Path, monkeypatch, capsys, sent, told: str) -> None:
+    """A valid file, a start that ends as ``answer`` says: the owner is told one line and nothing
+    more is printed; the release is as it is without a start, and no value of the file is shown."""
+    batch_id, host = _accepted(1)["batch_id"], FakeHost()
+    _journey_file(root)
+    starts.answer = answer
+
+    code = _run(monkeypatch, host)
+
+    out_err = capsys.readouterr()
+    assert len(starts) == 1
+    assert sent == [f"Release {batch_id} was released.", told]
+    assert out_err.out.splitlines()[-1] == f"Batch {batch_id} was released." and out_err.err == ""
+    assert "journey" not in "".join(out_err).lower()
+    _release_unchanged(code, host, batch_id, sent)
+    _shown(out_err, sent, "on stderr", *JOURNEY_SETTINGS.values())
+
+
+@pytest.mark.parametrize("status", [1, 2, 127, -9])
+@pytest.mark.parametrize(
+    ("output", "told"),
+    [
+        ("Refused: a journey run is still at work (the run lock is held).\n",
+         "Journeys not started: a journey run is still at work (the run lock is held)."),
+        ("Refused: " + "r" * 200 + "\n", "Journeys not started: " + "r" * 200),
+        ("Refused: " + "é" * 200 + "\n", "Journeys not started: " + "é" * 200),
+        ("Refused: " + "r" * 201 + "\n", SCRIPT_FAILED),
+        ("Refused: " + "é" * 201 + "\n", SCRIPT_FAILED),
+        ("Refused: \n", SCRIPT_FAILED),
+        ("Refused:\n", SCRIPT_FAILED),
+        ("Refused: first.\nRefused: second.\n", "Journeys not started: first."),
+        ("Refused: first.\r\n", "Journeys not started: first."),
+        ("Refused: first.", "Journeys not started: first."),
+        ("", SCRIPT_FAILED),
+        ("start.sh: line 3: boom\n", SCRIPT_FAILED),
+        ("\nRefused: late.\n", SCRIPT_FAILED),
+        ("refused: lower case.\n", SCRIPT_FAILED),
+        (" Refused: indented.\n", SCRIPT_FAILED),
+        ("Started the unit hermes-journeys (time limit 2700 seconds).\n", SCRIPT_FAILED),
+    ],
+    ids=["reason", "200 characters", "200 wide characters", "201 characters",
+         "201 wide characters", "empty reason", "no space", "first line only", "CRLF",
+         "no newline", "no output", "other words", "first line empty", "lower case",
+         "indented", "a success line"],
+)
+def test_a_start_that_ends_with_a_status_tells_the_owner_its_reason_or_that_it_failed(
+    root, monkeypatch, capsys, sent, starts, status, output, told
+):
+    answer = subprocess.CompletedProcess([str(START_SH)], status, output, "Refused: on stderr\n")
+    _not_started(starts, answer, root, monkeypatch, capsys, sent, told)
+
+
+@pytest.mark.parametrize(
+    ("output", "shown"),
+    [
+        (STARTED_LINE + "\n", STARTED_LINE),
+        (STARTED_LINE, STARTED_LINE),
+        ("one line\nanother line\n", "one line"),
+        ("", None),
+    ],
+    ids=["its line", "no newline", "first line only", "no output"],
+)
+def test_a_start_that_exits_0_prints_its_line_and_tells_nobody(
+    root, monkeypatch, capsys, sent, starts, output, shown
+):
+    batch_id, host = _accepted(1)["batch_id"], FakeHost()
+    _journey_file(root)
+    starts.answer = subprocess.CompletedProcess([str(START_SH)], 0, output, "")
+
+    code = _run(monkeypatch, host)
+
+    out_err = capsys.readouterr()
+    expected = [f"Batch {batch_id} was released."] + ([shown] if shown else [])
+    assert out_err.out.splitlines()[-len(expected):] == expected and out_err.err == ""
+    assert sent == [f"Release {batch_id} was released."]
+    _release_unchanged(code, host, batch_id, sent)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        FileNotFoundError(f"no such file: {LEAK}"), PermissionError(errno.EACCES, LEAK),
+        OSError(LEAK), ValueError(LEAK), RuntimeError(LEAK),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, LEAK),
+    ],
+    ids=lambda error: type(error).__name__,
+)
+def test_a_start_that_raises_is_named_by_its_type_and_changes_nothing(
+    root, monkeypatch, capsys, sent, starts, error
+):
+    batch_id, host = _accepted(1)["batch_id"], FakeHost()
+    _journey_file(root)
+    starts.answer = error
+
+    code = _run(monkeypatch, host)
+
+    out_err = capsys.readouterr()
+    [named] = [line for line in out_err.out.splitlines() if type(error).__name__ in line]
+    assert "journeys" in named and out_err.out.splitlines()[-1] == named and out_err.err == ""
+    assert len(starts) == 1 and sent == [f"Release {batch_id} was released."]
+    _release_unchanged(code, host, batch_id, sent)
+    _shown(out_err, sent, LEAK, *JOURNEY_SETTINGS.values())
+
+
+@pytest.mark.parametrize(
+    ("output", "told"),
+    [
+        (None, SCRIPT_FAILED),
+        (b"", SCRIPT_FAILED),
+        (b"Refused: the run lock is held.\n", "Journeys not started: the run lock is held."),
+        ("Refused: the run lock is held.\n", "Journeys not started: the run lock is held."),
+        (b"Refused: " + b"r" * 201 + b"\n", SCRIPT_FAILED),
+        (b"Started the unit hermes-journeys (time limit 2700 seconds).\n", SCRIPT_FAILED),
+        (b"\xff\xfe", SCRIPT_FAILED),
+    ],
+    ids=["no output", "empty output", "a reason", "a reason as text", "a long reason",
+         "a success line", "bytes that are not UTF-8"],
+)
+def test_a_start_that_reaches_the_limit_tells_the_owner_and_changes_nothing(
+    root, monkeypatch, capsys, sent, starts, output, told
+):
+    """A pipe a background process holds open is a wait that the 60 seconds end: subprocess.run
+    then raises with what was read so far, and the run waits no more."""
+    answer = subprocess.TimeoutExpired([str(START_SH)], 60, output=output)
+    _not_started(starts, answer, root, monkeypatch, capsys, sent, told)
+    assert starts[0][1]["timeout"] == 60
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["SIGINT", "SIGTERM"])
+def test_a_stop_signal_during_the_start_changes_nothing(root, monkeypatch, sent, starts, signum):
+    """The start runs under the stop handlers, which only set a flag: a stop while it waits, up to
+    60 seconds, is no interrupt, and the release ends as it does without a start."""
+    batch_id, host = _accepted(1)["batch_id"], FakeHost()
+    _journey_file(root)
+    names = (signal.SIGINT, signal.SIGTERM)
+    handlers = [signal.getsignal(name) for name in names]
+    starts.look = lambda: _stop_signal(signum)
+
+    code = _run(monkeypatch, host)
+
+    assert len(starts) == 1
+    _release_unchanged(code, host, batch_id, sent)
+    assert [signal.getsignal(name) for name in names] == handlers
+
+
+@pytest.mark.parametrize("case", ["started", "refused", "limit", "raised", "invalid file"])
+def test_the_journeys_start_imports_nothing_after_the_units_stop(root, monkeypatch, starts, case):
+    """K6 for the start: it runs after the cutover, with the checkout moved to NEW, and it reads
+    its settings, starts its process and reports how that ended with the modules loaded before."""
+    _accepted(1)
+    _journey_file(root, "not a setting\n" if case == "invalid file" else VALID_FILE)
+    starts.answer = {
+        "refused": subprocess.CompletedProcess([], 1, "Refused: the run lock is held.\n", ""),
+        "limit": subprocess.TimeoutExpired([str(START_SH)], 60, output=b"Refused: too late.\n"),
+        "raised": PermissionError(errno.EACCES, "Permission denied"),
+    }.get(case, starts.answer)
+    args = _parsed_run()
+    boundary = Boundary(root)
+    boundary.stamp()  # the live gateway runs PREV
+    answer = SimpleNamespace(status=200)  # the health address answers
+    direct = SimpleNamespace(open=lambda url, timeout: contextlib.nullcontext(answer))
+
+    def run(argv, **options):
+        if argv == [str(START_SH)]:
+            return starts.run(argv, **options)
+        return boundary.run(argv, **options)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(build_info, "get_code_identity", lambda **_: {"sha": boundary.head})
+    monkeypatch.setattr(release_host_actions, "_DIRECT", direct)
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=8 * 1024**3))
+    Clock().install(monkeypatch)
+
+    assert args.func(args) == 0
+    assert len(starts) == (case != "invalid file")
+    assert boundary.head == NEW and boundary.modules_at_stop is not None
+    assert set(sys.modules) - boundary.modules_at_stop == set()

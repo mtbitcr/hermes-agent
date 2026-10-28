@@ -1,0 +1,23 @@
+# Fixed, invented test settings of the journeys owner app: NAME=value lines, names from [env raphael-journeys-app]
+# in stack.env.template. Values are taken as written (no quotes). No key, token or sign-in value is kept here:
+# the token values live only in the files the reset writes.
+NODE_ENV=production
+PORT=3000
+RAPHAEL_ACCESS_ISSUER=https://synthetic-team.cloudflareaccess.com
+RAPHAEL_ACCESS_AUDIENCE=raphael-server2-browser
+RAPHAEL_PUBLIC_ORIGIN=https://workspace.synthetic.test
+RAPHAEL_OWNER_MEMBERSHIP_JSON=[{"membershipId":"journey-membership-1","issuer":"https://synthetic-team.cloudflareaccess.com","subject":"raphael-server2-owner","status":"active","role":"owner","projectIds":["journey-test-project"]}]
+RAPHAEL_PROJECT_BINDINGS_JSON=[{"projectId":"journey-test-project","routeSlug":"journey-test","sources":{"hermes":{"projectSlug":"journey-test-project","boardSlug":"journey-test"},"documents":[]}}]
+RAPHAEL_OWNER_TIME_ZONE=UTC
+RAPHAEL_PLANNER_MODEL=claude-sonnet-5
+RAPHAEL_EXECUTOR_MODEL=claude-sonnet-5
+HERMES_API_BASE_URL=http://raphael-journeys-dashboard:9119
+HERMES_CONVERSATION_API_BASE_URL=http://127.0.0.1:8642
+NODE_EXTRA_CA_CERTS=/usr/local/share/raphael-journeys/ca.pem
+HERMES_API_TOKEN_FILE=/var/lib/raphael-tokens/workspace.token
+HERMES_RECOMMENDATIONS_TOKEN_FILE=/var/lib/raphael-tokens/recommendations.token
+HERMES_CONNECTIONS_API_TOKEN_FILE=/var/lib/raphael-tokens/connections.token
+HERMES_AUTOMATIONS_API_TOKEN_FILE=/var/lib/raphael-tokens/automations.token
+HERMES_MODELS_API_TOKEN_FILE=/var/lib/raphael-tokens/models.token
+HERMES_EXECUTOR_API_TOKEN_FILE=/var/lib/raphael-tokens/executor.token
+HERMES_PLANNER_API_TOKEN_FILE=/var/lib/raphael-tokens/planner.token
