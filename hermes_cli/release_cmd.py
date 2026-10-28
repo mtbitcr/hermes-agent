@@ -93,6 +93,18 @@ _LAST_FINISHED_SQL = (
 _BUSY_TIMEOUT_MS = 1000
 # The host lock that run and recover share, a file in the root home (see _locked).
 _LOCK = ".release.lock"
+# The owner journeys, started once after a release (see _start_journeys). Their settings are the
+# file journeys/settings in the root home: one NAME=value line per setting, each name once, made
+# of _JOURNEYS_PREFIX and capital letters, digits and underscores, in at most this many bytes.
+_JOURNEYS_PREFIX = "JOURNEY_"
+_JOURNEYS_NAME_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+_JOURNEYS_MAX_BYTES = 4000
+# The start's time limit, and the longest reason of its refusal that the owner is told.
+_JOURNEYS_SECONDS = 60
+_JOURNEYS_REASON_MAX = 200
+_JOURNEYS_REFUSED = "Refused: "
+_JOURNEYS_FAILED = "the start script failed"
+_JOURNEYS_NOT_VALID = "Journeys not started: the journeys settings file is not valid."
 
 
 class _UnreadableRecord(Exception):
@@ -247,7 +259,9 @@ def run(batch_id: int | None = None) -> int:
     for good unless it is the release's own. A runner result that never comes back fails it midway.
 
     Returns 0 when the batch was released, 1 otherwise, and 1 when the release's own pause is
-    still in place after its removal.
+    still in place after its removal. A run that returns 0 for a released batch then starts the
+    owner journeys once (see _start_journeys); the start changes neither the outcome nor the exit
+    status nor the pause.
     """
     for name in [name for name in os.environ if name.startswith("HERMES_KANBAN")]:
         del os.environ[name]
@@ -277,7 +291,8 @@ def _run(batch_id: int | None) -> int:
 
 
 def _release(inputs: tuple[Any, ...], host: _Host, token: str) -> int:
-    """``run`` from the begin commit to the readback of the pause's removal, under its handlers."""
+    """``run`` from the begin commit to the readback of the pause's removal, under its handlers,
+    and then, for a released batch that returns 0, the start of the owner journeys."""
     batch, merges, pins, reader, actions, settings = inputs
     batch_id, reason = batch["batch_id"], f"release {batch['batch_id']}"
     try:
@@ -356,7 +371,10 @@ def _release(inputs: tuple[Any, ...], host: _Host, token: str) -> int:
             f" at {estop.sentinel_path()}."
         )
         return 1
-    return 0 if outcome == "released" else 1
+    if outcome != "released":
+        return 1
+    _start_journeys()
+    return 0
 
 
 def _tell_owner(line: str) -> None:
@@ -387,6 +405,119 @@ def _tell_owner(line: str) -> None:
     else:
         if sent.returncode:
             print(f"The owner was not told: the send exited with status {sent.returncode}.")
+
+
+def _start_journeys() -> None:
+    """After a release that ended released, with exit 0, start the owner journeys once: run
+    scripts/journeys/start.sh of this checkout (the released commit, once the checkout has moved)
+    with the entries of journeys/settings in the root home added to its environment. Without that
+    file the journeys are not set up: nothing starts and nothing is said. A file that breaks a rule
+    starts nothing and tells the owner so in one fixed line. A start that ends with a status, or
+    at its time limit, tells the owner why in one line; one that raises prints only the type of
+    its error. None of it changes the release, and no value of the file is ever shown."""
+    try:
+        _run_journeys()
+    except Exception as error:  # whatever goes wrong here, the release's outcome stands
+        print(f"The journeys were not started: the start failed ({type(error).__name__}).")
+
+
+def _run_journeys() -> None:
+    root = get_default_hermes_root()
+    try:
+        settings = _journey_settings(root / "journeys" / "settings")
+    except ValueError:  # its message names a rule, never a value
+        print(_JOURNEYS_NOT_VALID)
+        _tell_owner(_JOURNEYS_NOT_VALID)
+        return
+    if settings is None:
+        return
+    folder, path = str(Path(sys.executable).parent), os.environ.get("PATH")
+    env = {
+        **os.environ,
+        **settings,
+        # Pinned as the owner's send is: a bare child would follow the sticky active_profile.
+        "HERMES_HOME": str(root),
+        "PATH": f"{folder}{os.pathsep}{path}" if path else folder,
+    }
+    try:
+        done = subprocess.run(
+            [str(get_project_root() / "scripts" / "journeys" / "start.sh")],
+            capture_output=True,  # only its first line is read; run() ends the wait at the limit
+            text=True,
+            timeout=_JOURNEYS_SECONDS,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as error:
+        status, output = None, error.stdout
+    else:
+        status, output = done.returncode, done.stdout
+    if status == 0:
+        if line := _first_line(output):
+            print(line)
+        return
+    _tell_owner(f"Journeys not started: {_journeys_reason(output)}")
+
+
+def _journey_settings(path: Path) -> dict[str, str] | None:
+    """The settings file at ``path`` as name to value, or None when there is no file. Raise
+    ValueError, with a message that holds no value, for anything else that is not a plain file of
+    at most _JOURNEYS_MAX_BYTES whose lines all follow the rules."""
+    try:
+        # No link is followed and no pipe is waited for: only a plain file is read.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ValueError("the settings file cannot be opened as a plain file") from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("the settings file is not a plain file")
+        data = b""
+        while len(data) <= _JOURNEYS_MAX_BYTES:  # one byte past the limit shows it is passed
+            chunk = os.read(fd, _JOURNEYS_MAX_BYTES + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        raise ValueError("the settings file cannot be read") from None
+    finally:
+        os.close(fd)
+    if len(data) > _JOURNEYS_MAX_BYTES:
+        raise ValueError("the settings file is too large")
+    text = data.decode("utf-8")  # a ValueError too, when it is not UTF-8
+    if "\0" in text:
+        raise ValueError("the settings file holds a NUL byte")
+    lines = text.removesuffix("\n").split("\n") if text else []
+    settings: dict[str, str] = {}
+    for line in lines:
+        name, equals, value = line.partition("=")
+        body = name[len(_JOURNEYS_PREFIX) :]
+        if (
+            not equals
+            or not name.startswith(_JOURNEYS_PREFIX)
+            or not body
+            or not set(body) <= _JOURNEYS_NAME_CHARS
+            or name in settings
+        ):
+            raise ValueError("a line of the settings file breaks a rule")
+        settings[name] = value
+    return settings
+
+
+def _journeys_reason(output: object) -> str:
+    """The text after "Refused: " in the first line of the start's output, when it is there and has
+    at most _JOURNEYS_REASON_MAX characters; otherwise the fixed text."""
+    line = _first_line(output)
+    reason = line[len(_JOURNEYS_REFUSED) :] if line.startswith(_JOURNEYS_REFUSED) else ""
+    return reason if 0 < len(reason) <= _JOURNEYS_REASON_MAX else _JOURNEYS_FAILED
+
+
+def _first_line(output: object) -> str:
+    """The first line of what a process printed, without its line end or the blanks after it: text,
+    the bytes read before a time limit ended it, or nothing."""
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", errors="replace")
+    return output.split("\n", 1)[0].rstrip() if isinstance(output, str) else ""
 
 
 def _guards_failed(guards: list[str]) -> str:
