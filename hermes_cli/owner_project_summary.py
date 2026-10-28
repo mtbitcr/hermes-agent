@@ -18,6 +18,15 @@ records the failure and nothing else.
 
 A failed summary task is archived first; only then does one transaction clear it and count the failure (owner rule 2).
 
+Card B refreshes a summary after changes. Once per Project, after that check and the eligibility test and before the
+decision whether a request is due, ``owner_project_summary_events.read`` looks at the Project's new events. A material
+event waits for the hour that ``_due`` counts from ``last_requested_at``, so ten quick changes are one request; a
+decision asked or answered, a merge and a release do not wait. Every request, first or later, goes through the same
+rules above: the kernel's time box, the one open task, and the backoff after a failure. A Project that is archived, or
+whose removal has started or completed, is skipped before any event is read, and no failure is counted. The reading is
+stored by ``record`` when no request is due, and by the request's own claim when one is, so a request that fails or
+stops before its claim leaves the row as it was.
+
 A task is the tick's own only when the tick made it for that Project (``_made_for``): its creator is ``CREATED_BY``
 and its idempotency key names the Project. A key alone vouches for nothing, since any worker can write one with
 ``kanban_create``. A task made by anyone else is never adopted, recorded, archived or stored. When ``create_task``
@@ -40,9 +49,10 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Any, Iterator, Mapping, Optional
 
 from hermes_cli import kanban_db, projects_db
+from hermes_cli import owner_project_summary_events as events
 from hermes_cli.owner_text import check_owner_text
 from hermes_cli.sqlite_util import write_txn
 
@@ -214,7 +224,7 @@ def _key_prefix(project_id: str) -> str:
     return f"{CREATED_BY}:{project_id}:"
 
 
-def _request_key(state: sqlite3.Row) -> str:
+def _request_key(state: Mapping[str, Any]) -> str:
     """The identity of one request, from the state row alone, so two writers of the same row make one task.
 
     ``_find_open_task`` and ``_made_for`` rely only on the front of it, the creator and the Project id.
@@ -406,7 +416,7 @@ def _harvest(registry: sqlite3.Connection, now: int) -> None:
             _harvest_one(registry, board, row["project_id"], row["open_task_id"], now)
 
 
-def _due(state: sqlite3.Row, now: int) -> bool:
+def _due(state: Mapping[str, Any], now: int) -> bool:
     """The document's rule: nothing open, a request pending, and the hour, the backoff or an urgent flag allows it.
 
     The hour runs from the last request. After a failure the backoff runs from the failure, which the
@@ -438,8 +448,9 @@ def _open_summary_task(
     registry: sqlite3.Connection,
     board: sqlite3.Connection,
     project: projects_db.Project,
-    state: sqlite3.Row,
+    state: Mapping[str, Any],
     now: int,
+    reading: events.Reading,
 ) -> bool:
     # Imported here: the owner kernel is large, and the first import must not run on the event loop.
     from hermes_cli import owner_workspace
@@ -484,12 +495,20 @@ def _open_summary_task(
         return False
     # The claim holds only while the row is the one the key was made from. A loser archives its task only
     # if the winner recorded another one, and decides that inside the transaction that nobody else can write.
+    # The cursors move here, to where the events were read before the snapshot, and not before: a request that
+    # fails first must leave the row as it was. The Project may be pending only through this tick's own reading.
     with write_txn(registry):
         claimed = registry.execute(
             "UPDATE project_summary_state SET open_task_id = ?, last_requested_at = ?, pending = 0, "
-            "pending_urgent = 0, updated_at = ? WHERE project_id = ? AND open_task_id IS NULL AND pending = 1 "
-            "AND failures = ? AND last_requested_at IS ?",
-            (task_id, now, now, project.id, state["failures"], state["last_requested_at"]),
+            "pending_urgent = 0, updated_at = ?, event_cursor = ?, delivery_cursor = ?, release_cursor = ? "
+            "WHERE project_id = ? AND open_task_id IS NULL AND (pending = 1 OR ?) "
+            "AND failures = ? AND last_requested_at IS ? "
+            "AND event_cursor = ? AND delivery_cursor = ? AND release_cursor = ?",
+            (
+                task_id, now, now, *reading.batch.cursors,
+                project.id, int(reading.raises_pending), state["failures"], state["last_requested_at"],
+                *reading.old,
+            ),
         ).rowcount
         if claimed != 1:
             recorded = registry.execute(
@@ -521,15 +540,16 @@ def _request(registry: sqlite3.Connection, now: int) -> int:
             if open_task is not None:
                 _record_open_task(registry, project.id, open_task, now)
                 continue
-            state = states.get(project.id)
-            if state is not None and not _due(state, now):
-                continue
             if not _eligible(registry, project.id):
                 continue
-            if state is None:
-                state = _new_state(registry, project.id, now)
-                if not _due(state, now):
-                    continue
+            if project.id not in states:
+                _new_state(registry, project.id, now)
+            # The one read of events in the turn (card B). Nothing is written until we know whether a request is due.
+            reading = events.read(registry, project)
+            state = reading.state
+            if not _due(state, now):
+                events.record(registry, project.id, reading)
+                continue
             if not ensured:
                 if _ensure_summary_board() is None:
                     break
@@ -537,7 +557,7 @@ def _request(registry: sqlite3.Connection, now: int) -> int:
             if board is None:
                 board = stack.enter_context(kanban_db.connect_closing(path, board=SUMMARY_BOARD))
             asked += 1
-            created += _open_summary_task(registry, board, project, state, now)
+            created += _open_summary_task(registry, board, project, state, now, reading)
     return created
 
 

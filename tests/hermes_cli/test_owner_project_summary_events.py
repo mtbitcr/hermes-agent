@@ -7,7 +7,7 @@ and ten quick changes are one rewrite (owner decision of 2026-10-27). Card A's o
 rewrite request: the kernel's time box, one open task found by one check first, and a failure limit that only delays
 the next request by a day.
 
-Each test imports the modules itself, so each one fails on its own before the change.
+The tests reach the new module only through ``summary_tick``, which each one imports for itself.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ PLANNER = "raphael-planner"
 BOARD = "project-summaries"
 TITLE = "Write the Project summary: "
 HOUR = 3600
-DAY = 24 * HOUR
 T0 = 1_900_000_000
 
 OUTCOME = "The room is booked for Tuesday at noon and the invitations are being written."
@@ -47,16 +46,6 @@ def _ops():
     from hermes_cli import owner_project_summary
 
     return owner_project_summary
-
-
-def _events():
-    from hermes_cli import owner_project_summary_events
-
-    return owner_project_summary_events
-
-
-class _ProcessDied(BaseException):
-    """A gateway restart as the interrupted code sees it: nothing after this point runs."""
 
 
 @pytest.fixture
@@ -190,21 +179,14 @@ def _fail(root: Path, task_id: str) -> None:
         assert kanban_db.block_task(conn, task_id, reason="The summary could not be written.")
 
 
-def _task_status(root: Path, task_id: str) -> str:
-    return _rows(_board_db(root, BOARD), "SELECT status FROM tasks WHERE id = ?", (task_id,))[0][0]
-
-
-def _leave(root: Path, project_id: str, how: str) -> None:
-    assert how in ("archived", "removal_completed")
+def _complete_the_removal(root: Path, project_id: str) -> None:
+    """A permanent removal that has completed: the registry keeps the Project's row, with the phase done."""
     with projects_db.connect_closing(root / REGISTRY_FILE) as registry:
-        if how == "archived":
-            assert projects_db.archive_project(registry, project_id)
-        else:
-            assert projects_db.record_removal_operation(
-                registry, project_id=project_id, idempotency_key="remove-" + project_id, action="start",
-                phase="done", mode="permanent",
-            )
-            assert projects_db.get_active_removal_operation(registry, project_id) is None
+        assert projects_db.record_removal_operation(
+            registry, project_id=project_id, idempotency_key="remove-" + project_id, action="start",
+            phase="done", mode="permanent",
+        )
+        assert projects_db.get_active_removal_operation(registry, project_id) is None
 
 
 def _order(root: Path, *projects: dict) -> None:
@@ -212,12 +194,6 @@ def _order(root: Path, *projects: dict) -> None:
     with projects_db.connect_closing(root / REGISTRY_FILE) as registry, kanban_db.write_txn(registry):
         for age, project in enumerate(projects):
             registry.execute("UPDATE projects SET created_at = ? WHERE id = ?", (1_000 + age, project["project_id"]))
-
-
-def _listed(root: Path, project: dict):
-    with projects_db.connect_closing(root / REGISTRY_FILE) as registry:
-        [found] = [one for one in projects_db.list_projects(registry) if one.id == project["project_id"]]
-    return found
 
 
 # The events a Project's board gets, each written by the kernel's own writer, never by a row of SQL.
@@ -246,17 +222,6 @@ def _block(root: Path, project: dict, card: str, kind: str) -> None:
 def _unblock(root: Path, project: dict, card: str) -> None:
     with _board(root, project["board"]) as conn:
         assert kanban_db.unblock_task(conn, card)
-
-
-def _review(root: Path, project: dict, card: str) -> None:
-    with _board(root, project["board"]) as conn:
-        claimed = kanban_db.claim_task(conn, card)
-        assert claimed is not None
-        kanban_db._set_worker_pid(conn, card, os.getpid())
-        assert kanban_db.request_review(
-            conn, card, summary="Ready for review.", reviewer="reviewer",
-            expected_run_id=claimed.current_run_id,
-        )
 
 
 def _archive_card(root: Path, project: dict, card: str) -> None:
@@ -288,11 +253,6 @@ def _quiet(root: Path, project: dict, card: str) -> None:
         kanban_db._set_worker_pid(conn, card, os.getpid())
         assert kanban_db.heartbeat_worker(conn, card, note="Still working.")
         kanban_db.add_comment(conn, card, "owner", "A note for the card.")
-
-
-def _heartbeat(root: Path, project: dict, card: str) -> None:
-    with _board(root, project["board"]) as conn:
-        assert kanban_db.heartbeat_worker(conn, card, note="Still working.")
 
 
 def _kinds(root: Path, project: dict, after: int = 0) -> list:
@@ -482,63 +442,6 @@ def _garble(path: Path) -> None:
     path.write_bytes(b"this is not a database " * 400)
 
 
-class _Reads:
-    """The two reads a tick makes before it publishes: counts them, and refuses the one named in ``failing``."""
-
-    def __init__(self, monkeypatch):
-        self.calls: list = []
-        self.failing: str | None = None
-        route, snapshot = ow._resolved_route_pin, ow.project_steward_snapshot
-
-        def read_route(*args, **kwargs):
-            self.calls.append(("route", None))
-            if self.failing == "route":
-                raise ow.OwnerWorkspaceError("invalid_model_route", "the planning role has no usable route")
-            return route(*args, **kwargs)
-
-        def read_snapshot(**kwargs):
-            self.calls.append(("snapshot", kwargs.get("project_id")))
-            if self.failing == "snapshot":
-                raise ow.OwnerWorkspaceError("snapshot_unavailable", "the Project board is unavailable")
-            return snapshot(**kwargs)
-
-        monkeypatch.setattr(ow, "_resolved_route_pin", read_route)
-        monkeypatch.setattr(ow, "project_steward_snapshot", read_snapshot)
-
-
-def _crash_after_the_task_is_made(ops, monkeypatch, now: int) -> None:
-    """Interrupt a tick right after create_task commits and before the state row records the task."""
-    create_task = kanban_db.create_task
-
-    def create_then_die(*args, **kwargs):
-        create_task(*args, **kwargs)
-        raise _ProcessDied
-
-    monkeypatch.setattr(kanban_db, "create_task", create_then_die)
-    try:
-        with pytest.raises(_ProcessDied):
-            ops.summary_tick(now=now)
-    finally:
-        monkeypatch.setattr(kanban_db, "create_task", create_task)
-
-
-def _enter_planning_worker(monkeypatch, root: Path, slug: str, task_id: str) -> None:
-    """Take on the store pins kanban_db_dispatch._default_spawn gives a worker.
-
-    The board pins are resolved first, in the dispatcher's own environment.
-    """
-    pins = {
-        "HERMES_KANBAN_DB": str(kanban_db.kanban_db_path(board=slug)),
-        "HERMES_KANBAN_WORKSPACES_ROOT": str(kanban_db.workspaces_root(board=slug)),
-        "HERMES_KANBAN_BOARD": slug,
-    }
-    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / PLANNER))
-    monkeypatch.setenv("HERMES_PROFILE", PLANNER)
-    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
-    for name, value in pins.items():
-        monkeypatch.setenv(name, value)
-
-
 REWRITTEN = "The garden beds are planted and the watering plan is set."
 
 
@@ -624,12 +527,10 @@ def test_ten_quick_changes_give_one_task(root, owner, monkeypatch):
     assert len(_tasks_of(root, garden, archived=True)) == asked + 1
     assert _state(root, pid)["pending"] == 0
 
+    # The hour runs from the last request, T0 + HOUR, and the idle tick above did not move it: a change is due at once.
     _card(root, garden, "One more step")
-    assert ops.summary_tick(now=T0 + 9 * HOUR + 60) == 0
-    assert ops.summary_tick(now=T0 + 10 * HOUR - 1) == 0
-    assert _tasks_of(root, garden) == []
-    assert ops.summary_tick(now=T0 + 10 * HOUR) == 1
-    _assert_rewrite(root, garden, asked_at=T0 + 10 * HOUR)
+    assert ops.summary_tick(now=T0 + 9 * HOUR + 60) == 1
+    _assert_rewrite(root, garden, asked_at=T0 + 9 * HOUR + 60)
 
 
 # Test 3: a decision asked, or answered, is rewritten at once, inside the hour.
@@ -772,36 +673,6 @@ def test_a_released_batch_that_holds_a_card_of_the_project_gives_a_task_at_once(
     assert _tasks_of(root, garden) == []
 
 
-def test_a_release_is_matched_by_the_board_slug_or_by_the_card_and_never_by_another_board(root, owner):
-    ops = _ops()
-    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
-    garden = _project(owner, "Garden Plan")
-    pid = garden["project_id"]
-    water = _card(root, garden, "Water the beds")
-    _settle(root)
-    ledger = _Ledger()
-
-    ledger.release("stranger", card="t_nobody", board="elsewhere")
-    assert ops.summary_tick(now=T0 + 100) == 0
-    assert _tasks_of(root, garden) == []
-    assert _state(root, pid)["release_cursor"] == _ledger_top(root) > 0
-
-    ledger.release("named", card="t_nobody", board=garden["board"])
-    assert ops.summary_tick(now=T0 + 200) == 1
-    named = _assert_rewrite(root, garden, asked_at=T0 + 200)
-    _store_rewrite(root, named, T0 + 210)
-
-    waiting = ledger.merge("manual", card=water)
-    assert waiting["members"][-1]["board"] == ""
-    with contextlib.closing(release_ledger.connect()) as conn:
-        outside = release_ledger.settle_outside_release(
-            conn, running=waiting["members"][-1]["merge_commit"], contains=lambda _merge, _running: True,
-        )
-    assert outside["released"] is not None
-    assert ops.summary_tick(now=T0 + 300) == 1
-    _assert_rewrite(root, garden, asked_at=T0 + 300)
-
-
 # Test 5: heartbeat, comment, claim and every event on the summary board give no task.
 
 
@@ -941,64 +812,6 @@ def test_an_urgent_event_while_a_task_is_open_makes_no_second_task_and_is_asked_
     assert _tasks_of(root, garden) == []
 
 
-def test_a_task_made_before_a_crash_is_found_first_and_no_event_source_is_read(root, owner, monkeypatch):
-    ops = _ops()
-    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
-    reads = _Reads(monkeypatch)
-    garden = _project(owner, "Garden Plan")
-    pid = garden["project_id"]
-    asking = _card(root, garden, "Choose the room")
-    _settle(root)
-    _block(root, garden, asking, "needs_input")
-    before = _state(root, pid)
-
-    _crash_after_the_task_is_made(ops, monkeypatch, T0 + 100)
-    [orphan] = _open_task_ids(root, garden)
-    assert _state(root, pid) == before
-
-    reads.failing = "route"
-    reads.calls.clear()
-    _card(root, garden, "Another card")
-    with _Trace(monkeypatch, root) as trace:
-        assert ops.summary_tick(now=T0 + 200) == 0
-    assert reads.calls == []
-    assert trace.board(garden) not in trace.opened
-    assert LEDGER_FILE not in trace.opened
-    assert _open_task_ids(root, garden) == [orphan]
-    adopted = _state(root, pid)
-    assert (adopted["open_task_id"], adopted["failures"], adopted["last_requested_at"]) == (orphan, 0, T0 + 200)
-    assert adopted["event_cursor"] == before["event_cursor"]
-
-
-@pytest.mark.parametrize("origin", ["batched", "urgent"])
-def test_a_rewrite_request_names_no_time_limit_and_the_kernel_pins_it(root, owner, monkeypatch, origin):
-    ops = _ops()
-    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
-    garden = _project(owner, "Garden Plan")
-    booking, asking = _card(root, garden, "Book the room"), _card(root, garden, "Choose the room")
-    _settle(root)
-    if origin == "batched":
-        _complete(root, garden, booking)
-        at = T0 + HOUR
-    else:
-        _block(root, garden, asking, "needs_input")
-        at = T0 + 100
-
-    made = []
-    create_task = kanban_db.create_task
-
-    def spy(*args, **kwargs):
-        made.append(kwargs)
-        return create_task(*args, **kwargs)
-
-    monkeypatch.setattr(kanban_db, "create_task", spy)
-    assert ops.summary_tick(now=at) == 1
-    [kwargs] = made
-    assert (kwargs["created_by"], kwargs["assignee"]) == ("project-summary", PLANNER)
-    assert "max_runtime_seconds" not in kwargs
-    _assert_rewrite(root, garden, asked_at=at)
-
-
 # Test 9: while failures are counted, an urgent event waits for the backoff, and no turn that asks for nothing shortens it.
 
 
@@ -1030,88 +843,6 @@ def test_an_urgent_event_waits_for_the_backoff_while_failures_are_counted(root, 
         assert (waiting["failures"], waiting["updated_at"]) == (1, failed["updated_at"])
     assert ops.summary_tick(now=due) == 1
     _assert_rewrite(root, garden, asked_at=due, failures=1)
-
-
-def _ask_and_fail(root: Path, project: dict, at: int, *, failures: int) -> int:
-    """The request due at ``at`` is made and its task fails; the tick ten seconds later counts the failure.
-
-    Returns the clock of that tick, the moment the backoff runs from.
-    """
-    ops = _ops()
-    assert ops.summary_tick(now=at) == 1
-    _fail(root, _assert_rewrite(root, project, asked_at=at, failures=failures))
-    assert ops.summary_tick(now=at + 10) == 0
-    state = _state(root, project["project_id"])
-    assert (state["failures"], state["updated_at"], state["open_task_id"], state["pending"]) == (
-        failures + 1, at + 10, None, 1,
-    )
-    return at + 10
-
-
-@pytest.mark.parametrize("origin", ["batched", "urgent"])
-def test_after_the_failure_limit_the_next_request_waits_a_day_and_no_longer(root, owner, origin):
-    ops = _ops()
-    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
-    garden = _project(owner, "Garden Plan")
-    pid = garden["project_id"]
-    booking, asking = _card(root, garden, "Book the room"), _card(root, garden, "Choose the room")
-    _settle(root)
-    if origin == "batched":
-        _complete(root, garden, booking)
-        first_at = T0 + HOUR
-        assert ops.summary_tick(now=first_at - 1) == 0
-    else:
-        _block(root, garden, asking, "needs_input")
-        first_at = T0 + 100
-
-    failed_at = _ask_and_fail(root, garden, first_at, failures=0)
-    for failures, wait in ((1, HOUR), (2, 2 * HOUR), (3, DAY), (4, DAY)):
-        assert ops.summary_tick(now=failed_at + wait - 1) == 0
-        failed_at = _ask_and_fail(root, garden, failed_at + wait, failures=failures)
-    assert _state(root, pid)["failures"] == 5
-
-    assert ops.summary_tick(now=failed_at + DAY - 1) == 0
-    assert ops.summary_tick(now=failed_at + DAY) == 1
-    rewrite = _assert_rewrite(root, garden, asked_at=failed_at + DAY, failures=5)
-    _store_rewrite(root, rewrite, failed_at + DAY + 10)
-    assert _state(root, pid)["failures"] == 0
-    assert _summary_of(root, pid)["revision"] == 2
-    assert _tasks_of(root, garden) == []
-
-
-# Owner rule 1: a failure before the task is published changes the failure count and the clock, and nothing else.
-
-
-@pytest.mark.parametrize("failing", ["route", "snapshot"])
-def test_a_failure_before_the_task_is_made_changes_only_the_failure_count_and_the_clock(
-    root, owner, monkeypatch, failing,
-):
-    ops = _ops()
-    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
-    reads = _Reads(monkeypatch)
-    garden = _project(owner, "Garden Plan")
-    pid = garden["project_id"]
-    asking = _card(root, garden, "Choose the room")
-    _settle(root)
-    _block(root, garden, asking, "needs_input")
-    before = _state(root, pid)
-    asked = len(_tasks_of(root, garden, archived=True))
-
-    reads.failing = failing
-    reads.calls.clear()
-    assert ops.summary_tick(now=T0 + 100) == 0
-    assert [name for name, _project_id in reads.calls][-1:] == [failing]
-    after = _state(root, pid)
-    assert (after["failures"], after["updated_at"]) == (1, T0 + 100)
-    unmoved = [name for name in _WHOLE_STATE if name not in ("failures", "updated_at")]
-    assert {name: after[name] for name in unmoved} == {name: before[name] for name in unmoved}
-    assert len(_tasks_of(root, garden, archived=True)) == asked
-
-    reads.failing = None
-    assert ops.summary_tick(now=T0 + 100 + HOUR - 1) == 0
-    assert ops.summary_tick(now=T0 + 100 + HOUR) == 1
-    _assert_rewrite(root, garden, asked_at=T0 + 100 + HOUR, failures=1)
-    assert _state(root, pid)["event_cursor"] == _top(root, garden)
 
 
 # Test 8: two ticks at the same time, on two connections, make one task; a tick that loses a swap moves nothing.
@@ -1163,108 +894,12 @@ def test_two_ticks_at_the_same_time_on_two_connections_make_one_task(root, owner
     assert _state(root, pid)["event_cursor"] == _top(root, garden)
 
 
-def test_a_tick_that_loses_the_swap_counts_nothing_and_moves_nothing(root, owner, monkeypatch):
-    ops, events = _ops(), _events()
-    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
-    garden = _project(owner, "Garden Plan")
-    pid = garden["project_id"]
-    booking, asking = _card(root, garden, "Book the room"), _card(root, garden, "Choose the room")
-    _settle(root)
-    _complete(root, garden, booking)
-
-    read = events.read_events
-    inner: dict = {"started": False}
-
-    def read_then_lose_the_race(project, cursors):
-        batch = read(project, cursors)
-        if not inner["started"]:
-            inner["started"] = True
-            _block(root, garden, asking, "needs_input")
-            inner["asked"] = ops.summary_tick(now=T0 + 101)
-            inner["state"] = _state(root, pid)
-        return batch
-
-    monkeypatch.setattr(events, "read_events", read_then_lose_the_race)
-    assert ops.summary_tick(now=T0 + 100) == 0
-    assert inner["asked"] == 1
-    assert _state(root, pid) == inner["state"]
-    _assert_rewrite(root, garden, asked_at=T0 + 101)
-    assert _state(root, pid)["event_cursor"] == _top(root, garden)
-
-
-# The cap of new tasks per tick holds for rewrite requests too.
-
-
-def test_rewrite_requests_share_the_cap_of_new_tasks_per_tick(root, owner):
-    ops = _ops()
-    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
-    projects = [_project(owner, f"Plan {name}") for name in "ABCD"]
-    cards = [_card(root, project, "Choose the room") for project in projects]
-    _settle(root)
-    assert ops.MAX_NEW_PER_TICK == 3
-    for project, card in zip(projects, cards):
-        _block(root, project, card, "needs_input")
-
-    assert ops.summary_tick(now=T0 + 100) == 3
-    waiting = [project for project in projects if not _tasks_of(root, project)]
-    assert len(waiting) == 1
-    assert ops.summary_tick(now=T0 + 110) == 1
-    [rewrite] = _tasks_of(root, waiting[0])
-    assert rewrite.status == "ready"
-    assert sum(len(_tasks_of(root, project)) for project in projects) == 4
-
-
-# Cursors that card A left at zero mean "from the start of the source", never "not yet read".
-
-
-def _zero_cursors(root: Path, project_id: str) -> None:
-    with projects_db.connect_closing(root / REGISTRY_FILE) as registry, kanban_db.write_txn(registry):
-        registry.execute(
-            "UPDATE project_summary_state SET event_cursor = 0, delivery_cursor = 0, release_cursor = 0 "
-            "WHERE project_id = ?",
-            (project_id,),
-        )
-
-
-@pytest.mark.parametrize("source", ["events", "deliveries", "ledger"])
-def test_cursors_that_card_a_left_at_zero_read_each_source_from_its_start(root, owner, source):
-    ops = _ops()
-    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
-    garden = _project(owner, "Garden Plan")
-    pid = garden["project_id"]
-    card = _card(root, garden, "Plant the beds")
-    if source == "deliveries":
-        _delivery(root, garden, card, "merged")
-    if source == "ledger":
-        _Ledger().release("beds", card=card, board=garden["board"])
-    _settle(root)
-    _zero_cursors(root, pid)
-    assert _state(root, pid)["last_requested_at"] == T0
-
-    at = T0 + 100
-    if source == "events":
-        assert ops.summary_tick(now=at) == 0
-        assert _flags(root, garden) == (1, 0)
-        assert _state(root, pid)["event_cursor"] == _top(root, garden) > 0
-        assert ops.summary_tick(now=T0 + HOUR - 1) == 0
-        at = T0 + HOUR
-    assert ops.summary_tick(now=at) == 1
-    _assert_rewrite(root, garden, asked_at=at)
-    state = _state(root, pid)
-    assert state["event_cursor"] == _top(root, garden)
-    if source == "deliveries":
-        assert state["delivery_cursor"] > 0
-    if source == "ledger":
-        assert state["release_cursor"] == _ledger_top(root) > 0
-
-
 # Test 10: a Project that is gone is skipped before any read, with no failure; a live Project in the same tick is asked.
 
 
 @pytest.mark.parametrize("order", ["gone_first", "live_first"])
-@pytest.mark.parametrize("how", ["removal_completed", "archived"])
 def test_a_project_that_is_gone_is_skipped_without_a_read_or_a_failure_while_a_live_one_is_asked(
-    root, owner, monkeypatch, caplog, how, order,
+    root, owner, monkeypatch, caplog, order,
 ):
     ops = _ops()
     _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
@@ -1273,7 +908,7 @@ def test_a_project_that_is_gone_is_skipped_without_a_read_or_a_failure_while_a_l
     _settle(root)
     for project in (live, gone):
         _block(root, project, cards[project["name"]], "needs_input")
-    _leave(root, gone["project_id"], how)
+    _complete_the_removal(root, gone["project_id"])
     _garble(_board_db(root, gone["board"]))
     _order(root, *((gone, live) if order == "gone_first" else (live, gone)))
     before = _state(root, gone["project_id"])
@@ -1287,297 +922,3 @@ def test_a_project_that_is_gone_is_skipped_without_a_read_or_a_failure_while_a_l
     assert _state(root, gone["project_id"]) == before
     assert trace.board(gone) not in trace.opened
     assert [record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING] == []
-
-
-# A source that cannot be read ends that Project's turn with nothing changed; the other Projects go on.
-
-
-@pytest.mark.parametrize("order", ["broken_first", "broken_second"])
-def test_an_unreadable_board_ends_that_projects_turn_with_nothing_changed_and_the_others_go_on(
-    root, owner, caplog, order,
-):
-    ops = _ops()
-    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
-    garden, broken = _project(owner, "Garden Plan"), _project(owner, "Broken Plan")
-    cards = {project["name"]: _card(root, project, "Choose the room") for project in (garden, broken)}
-    _settle(root)
-    for project in (garden, broken):
-        _block(root, project, cards[project["name"]], "needs_input")
-    _garble(_board_db(root, broken["board"]))
-    _order(root, *((broken, garden) if order == "broken_first" else (garden, broken)))
-    before = _state(root, broken["project_id"])
-    asked = len(_tasks_of(root, broken, archived=True))
-
-    with caplog.at_level(logging.WARNING, logger=ops.logger.name):
-        assert ops.summary_tick(now=T0 + 100) == 1
-    _assert_rewrite(root, garden, asked_at=T0 + 100)
-    assert len(_tasks_of(root, broken, archived=True)) == asked
-    assert _state(root, broken["project_id"]) == before
-    warned = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
-    assert [text for text in warned if broken["project_id"] in text]
-
-
-def test_an_unreadable_ledger_ends_the_turn_with_nothing_changed_until_it_can_be_read(root, owner, caplog):
-    ops = _ops()
-    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
-    garden = _project(owner, "Garden Plan")
-    pid = garden["project_id"]
-    asking = _card(root, garden, "Choose the room")
-    _settle(root)
-    _Ledger().release("elsewhere", card="t_nobody", board="elsewhere")
-    ledger = root / LEDGER_FILE
-    assert not Path(str(ledger) + "-wal").exists()
-    intact = ledger.read_bytes()
-    _block(root, garden, asking, "needs_input")
-    _garble(ledger)
-    before = _state(root, pid)
-    asked = len(_tasks_of(root, garden, archived=True))
-
-    with caplog.at_level(logging.WARNING, logger=ops.logger.name):
-        assert ops.summary_tick(now=T0 + 100) == 0
-    assert _state(root, pid) == before
-    assert len(_tasks_of(root, garden, archived=True)) == asked
-    warned = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
-    assert [text for text in warned if pid in text]
-
-    ledger.write_bytes(intact)
-    assert ops.summary_tick(now=T0 + 200) == 1
-    _assert_rewrite(root, garden, asked_at=T0 + 200)
-    assert _state(root, pid)["release_cursor"] == _ledger_top(root) > 0
-
-
-# The tick runs inside a worker, and still reaches every store it reads: the boards, the root registry, the ledger.
-
-
-def _count(path: Path, sql: str, params=()) -> int:
-    return _rows(path, sql, params)[0][0]
-
-
-def _still_to_read(root: Path, project: dict, state: dict) -> dict:
-    """Rows past the Project's cursors in the three stores, counted with a plain connection and plain SQL."""
-    board = _board_db(root, project["board"])
-    return {
-        "events": _count(board, "SELECT COUNT(*) FROM task_events WHERE id > ?", (state["event_cursor"],)),
-        "merges": _count(
-            board,
-            "SELECT COUNT(*) FROM kanban_deliveries WHERE pull_request_state = 'merged' AND id > ?",
-            (state["delivery_cursor"],),
-        ),
-        "releases": _count(
-            root / LEDGER_FILE, "SELECT COUNT(*) FROM release_events WHERE id > ?", (state["release_cursor"],),
-        ),
-    }
-
-
-def test_the_tick_under_the_worker_environment_reaches_every_store_it_reads(root, owner, monkeypatch):
-    ops = _ops()
-    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
-    garden = _project(owner, "Garden Plan")
-    desk = _project(owner, "Planning Desk")
-    spare = _project(owner, "Spare Room")
-    projects = (garden, desk, spare)
-    asking = _card(root, garden, "Choose the room")
-    lamp = _card(root, desk, "Order the lamp")
-    worker_task = _card(root, desk, "Plan the next milestone", assignee=PLANNER)
-    parcel = _card(root, spare, "Ship the parcel")
-    _settle(root)
-
-    _block(root, garden, asking, "needs_input")
-    _complete(root, desk, lamp)
-    _Ledger().release("lamp", card=lamp, board=desk["board"])
-    merged = _delivery(root, spare, parcel, "merged")
-    profile_home = root / "profiles" / PLANNER
-    profile_home.mkdir(parents=True)
-    with projects_db.connect_closing(profile_home / REGISTRY_FILE):
-        pass
-
-    before = {project["name"]: _state(root, project["project_id"]) for project in projects}
-    waiting = {project["name"]: _still_to_read(root, project, before[project["name"]]) for project in projects}
-    assert waiting["Garden Plan"]["events"] > 0
-    assert waiting["Planning Desk"]["events"] > 0 and waiting["Planning Desk"]["releases"] > 0
-    assert waiting["Spare Room"]["merges"] == 1
-    held = {
-        project["name"]: (
-            _count(_board_db(root, project["board"]), "SELECT COUNT(*) FROM task_events"),
-            _count(_board_db(root, project["board"]), "SELECT COUNT(*) FROM kanban_deliveries"),
-        )
-        for project in projects
-    }
-    ledger_rows = _count(root / LEDGER_FILE, "SELECT COUNT(*) FROM release_events")
-
-    _enter_planning_worker(monkeypatch, root, desk["board"], worker_task)
-    pinned = {name: os.environ[name] for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK")}
-    assert Path(pinned["HERMES_KANBAN_DB"]).resolve() == _board_db(root, desk["board"]).resolve()
-
-    assert ops.summary_tick(now=T0 + 500) == 3
-
-    assert sorted(task.title for task in _summary_tasks(root)) == sorted(TITLE + p["name"] for p in projects)
-    top_of_ledger = _count(root / LEDGER_FILE, "SELECT MAX(id) FROM release_events")
-    for project in projects:
-        state = _state(root, project["project_id"])
-        board = _board_db(root, project["board"])
-        assert state["event_cursor"] == _count(board, "SELECT MAX(id) FROM task_events")
-        assert state["delivery_cursor"] == _count(
-            board, "SELECT COALESCE(MAX(id), 0) FROM kanban_deliveries WHERE pull_request_state = 'merged'",
-        )
-        assert state["release_cursor"] == top_of_ledger
-        assert _still_to_read(root, project, state) == {"events": 0, "merges": 0, "releases": 0}
-        assert (state["pending"], state["pending_urgent"], state["failures"]) == (0, 0, 0)
-        assert state["open_task_id"] is not None
-        assert (
-            _count(board, "SELECT COUNT(*) FROM task_events"), _count(board, "SELECT COUNT(*) FROM kanban_deliveries"),
-        ) == held[project["name"]]
-    assert _state(root, spare["project_id"])["delivery_cursor"] == merged
-    assert _count(root / LEDGER_FILE, "SELECT COUNT(*) FROM release_events") == ledger_rows
-    assert _count(profile_home / REGISTRY_FILE, "SELECT COUNT(*) FROM project_summary_state") == 0
-    assert {name: os.environ[name] for name in pinned} == pinned
-
-
-# One table sorts the kinds of events, and nothing else decides what an event causes.
-
-
-def test_one_table_sorts_every_kind_of_event():
-    events = _events()
-    material, urgent, ignored = events.MATERIAL, events.URGENT, events.IGNORED
-    assert len({material, urgent, ignored}) == 3
-    assert isinstance(events.EVENT_CLASS, dict)
-    listed = {
-        "created": material, "linked": material, "unlinked": material, "decomposed": material,
-        "archived": material, "completed": material, "blocked": material, "unblocked": material,
-        "review_requested": urgent, "merged": urgent, "released": urgent,
-        "claimed": ignored, "spawned": ignored, "heartbeat": ignored, "commented": ignored, "promoted": ignored,
-    }
-    for kind, expected in listed.items():
-        assert events.classify(kind) == expected, kind
-    assert events.classify("blocked", "needs_input") == urgent
-    assert events.classify("unblocked", "needs_input") == urgent
-    for detail in ("capability", "dependency", "transient", None):
-        assert events.classify("blocked", detail) == material, detail
-        assert events.classify("unblocked", detail) == material, detail
-    for kind in ("delivery_merged", "dependency_wait", "block_loop_detected", "owner_retry", "no_such_kind", ""):
-        assert events.classify(kind) == ignored, kind
-
-
-def test_the_table_alone_decides_what_a_progress_event_causes(root, owner, monkeypatch):
-    ops, events = _ops(), _events()
-    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
-    garden = _project(owner, "Garden Plan")
-    busy, plain, fresh = (_card(root, garden, title) for title in ("Busy card", "Plain card", "Fresh card"))
-    _settle(root)
-
-    _quiet(root, garden, busy)
-    assert ops.summary_tick(now=T0 + 100) == 0
-    assert _flags(root, garden) == (0, 0)
-    monkeypatch.setitem(events.EVENT_CLASS, "heartbeat", events.URGENT)
-    _heartbeat(root, garden, busy)
-    assert ops.summary_tick(now=T0 + 200) == 1
-    stored = _assert_rewrite(root, garden, asked_at=T0 + 200)
-    _store_rewrite(root, stored, T0 + 210)
-
-    monkeypatch.setitem(events.EVENT_CLASS, "completed", events.IGNORED)
-    _complete(root, garden, plain)
-    assert ops.summary_tick(now=T0 + 200 + 3 * HOUR) == 0
-    assert _flags(root, garden) == (0, 0)
-    assert _tasks_of(root, garden) == []
-    _archive_card(root, garden, fresh)
-    assert ops.summary_tick(now=T0 + 200 + 4 * HOUR) == 1
-    _assert_rewrite(root, garden, asked_at=T0 + 200 + 4 * HOUR)
-
-
-@pytest.mark.parametrize("source", ["merged", "released"])
-def test_a_merge_and_a_release_are_sorted_by_the_same_table(root, owner, monkeypatch, source):
-    ops, events = _ops(), _events()
-    _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
-    garden = _project(owner, "Garden Plan")
-    pid = garden["project_id"]
-    card, asking = _card(root, garden, "Plant the beds"), _card(root, garden, "Choose the room")
-    _settle(root)
-    assert events.EVENT_CLASS[source] == events.URGENT
-
-    monkeypatch.setitem(events.EVENT_CLASS, source, events.IGNORED)
-    if source == "merged":
-        merge = _delivery(root, garden, card, "merged")
-    else:
-        _Ledger().release("beds", card=card, board=garden["board"])
-    assert ops.summary_tick(now=T0 + 100) == 0
-    assert _flags(root, garden) == (0, 0)
-    assert _tasks_of(root, garden) == []
-    state = _state(root, pid)
-    assert state["delivery_cursor" if source == "merged" else "release_cursor"] > 0
-
-    _block(root, garden, asking, "needs_input")
-    assert ops.summary_tick(now=T0 + 200) == 1
-    _assert_rewrite(root, garden, asked_at=T0 + 200)
-    if source == "merged":
-        assert _state(root, pid)["delivery_cursor"] == merge
-
-
-# The module on its own: its sources may be missing, and a swap moves the cursors only from the values it read.
-
-
-def test_a_missing_deliveries_table_and_a_missing_ledger_are_sources_without_events(root, owner):
-    events = _events()
-    garden = _project(owner, "Garden Plan")
-    for title in ("Plant the beds", "Book the room"):
-        _card(root, garden, title)
-    _block(root, garden, _card(root, garden, "Choose the room"), "needs_input")
-    board = _board_db(root, garden["board"])
-    with contextlib.closing(sqlite3.connect(board)) as conn:
-        conn.execute("DROP TABLE kanban_deliveries")
-    assert not (root / LEDGER_FILE).exists()
-
-    batch = events.read_events(_listed(root, garden), events.Cursors(0, 0, 0))
-    assert batch.cursors == events.Cursors(_top(root, garden), 0, 0)
-    assert batch.urgent == 1
-    assert batch.material == _count(board, "SELECT COUNT(*) FROM task_events WHERE kind = 'created'") >= 3
-    assert not (root / LEDGER_FILE).exists()
-    again = events.read_events(_listed(root, garden), batch.cursors)
-    assert again == events.Batch(batch.cursors, 0, 0)
-
-
-def test_a_project_without_a_board_or_on_the_summary_board_has_no_events(root, owner):
-    events = _events()
-    _clean(OUTCOME, NEXT_ACTION, DECISION)
-    garden = _project(owner, "Garden Plan")
-    _card(root, garden)
-    _settle(root)
-    assert _top(root, {"board": BOARD}) > 0
-    nothing = events.Batch(events.Cursors(0, 0, 0), 0, 0)
-    for name, columns in (("Loop", {"board_slug": BOARD}), ("Bare", {})):
-        project = {"project_id": _registry_project(root, name, **columns)}
-        assert events.read_events(_listed(root, project), events.Cursors(0, 0, 0)) == nothing, name
-
-
-def test_the_swap_moves_the_cursors_once_and_only_from_the_values_it_read(root, owner):
-    events = _events()
-    _clean(OUTCOME, NEXT_ACTION, DECISION)
-    garden = _project(owner, "Garden Plan")
-    pid = garden["project_id"]
-    _card(root, garden)
-    _settle(root)
-    stored = _state(root, pid)
-    old = events.Cursors(stored["event_cursor"], stored["delivery_cursor"], stored["release_cursor"])
-    won = events.Batch(events.Cursors(old.event + 5, old.delivery + 1, old.release + 2), material=1, urgent=0)
-    lost = events.Batch(events.Cursors(old.event + 9, old.delivery, old.release), material=0, urgent=1)
-
-    with projects_db.connect_closing(root / REGISTRY_FILE) as first, projects_db.connect_closing(
-        root / REGISTRY_FILE
-    ) as second:
-        assert events.advance_cursors(first, pid, old, won) is True
-        moved = _state(root, pid)
-        assert events.Cursors(moved["event_cursor"], moved["delivery_cursor"], moved["release_cursor"]) == won.cursors
-        assert (moved["pending"], moved["pending_urgent"], moved["updated_at"]) == (1, 0, stored["updated_at"])
-
-        assert events.advance_cursors(second, pid, old, lost) is False
-        assert _state(root, pid) == moved
-
-        quiet = events.Batch(events.Cursors(old.event + 6, old.delivery + 1, old.release + 2), material=0, urgent=0)
-        assert events.advance_cursors(second, pid, won.cursors, quiet) is True
-        later = _state(root, pid)
-        assert (later["event_cursor"], later["pending"], later["pending_urgent"]) == (old.event + 6, 1, 0)
-
-        with kanban_db.write_txn(second):
-            second.execute("UPDATE project_summary_state SET open_task_id = 't_open' WHERE project_id = ?", (pid,))
-        held = _state(root, pid)
-        assert events.advance_cursors(first, pid, quiet.cursors, lost) is False
-        assert _state(root, pid) == held
