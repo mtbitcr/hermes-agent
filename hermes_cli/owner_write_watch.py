@@ -23,6 +23,7 @@ logged or written.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -207,6 +208,12 @@ _WIRING = (
 )
 _PAGE_CHECK = "page_check"
 _PAGE_CHECK_LABEL = "Page check of the Automations, Connections and Models pages (routes 13 to 17)"
+_JOURNEYS = "journeys"
+_JOURNEYS_LABEL = "Owner journeys run"
+# RUN_MAX_SECONDS in scripts/journeys/start.sh (2,700 seconds, the user manager's time limit) plus 10 minutes.
+JOURNEYS_STUCK_AFTER = timedelta(minutes=55)
+_JOURNEYS_LINE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)")
+_JOURNEYS_TIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 
 
 def state_path() -> Path:
@@ -289,6 +296,7 @@ def run(
     if indirect:
         results.append(_page_check(page_check, run_page_check or _run_page_check, clock))
         results.extend(_wiring(route_policy or _deployed_route_policy, clock))
+        results.append(_journeys(moment, clock))
     reader = delivery_state or (lambda announced: _previous_delivery(announced, job_id))
     state, kind, text = _decide(previous, results, moment, profile, reader)
     try:
@@ -325,6 +333,39 @@ def _page_check(path: str, run_page_check: Callable[[str], str], clock) -> Resul
     outcome = run_page_check(path)
     return Result(_PAGE_CHECK, _PAGE_CHECK_LABEL, outcome if outcome in (PASS, FAIL, UNKNOWN) else FAIL,
                   detail="did not pass", method="run", path=path, at=clock().isoformat())
+
+
+def _journeys(moment: datetime, clock) -> Result:
+    outcome, detail = _journeys_verdict(moment)
+    return Result(_JOURNEYS, _JOURNEYS_LABEL, outcome, detail=detail, method="read", at=clock().isoformat())
+
+
+def _journeys_verdict(moment: datetime):
+    """``(outcome, detail)`` for journeys/result: a "started" result older than the stuck limit failed."""
+    try:
+        text = (get_hermes_home() / "journeys" / "result").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return PASS, ""
+    except (OSError, UnicodeDecodeError):
+        return UNKNOWN, "result file unreadable"
+    fields = {}
+    for line in text.splitlines():
+        pair = _JOURNEYS_LINE.fullmatch(line)
+        if not pair:
+            return UNKNOWN, "result file not in NAME=value lines"
+        fields[pair.group(1)] = pair.group(2)
+    result = fields.get("result")
+    if result not in ("passed", "failed", "started") or not _JOURNEYS_TIME.fullmatch(fields.get("started", "")):
+        return UNKNOWN, "result file not understood"
+    try:
+        started = datetime.strptime(fields["started"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return UNKNOWN, "result file not understood"
+    if result != "started":
+        return PASS, ""
+    if moment - started > JOURNEYS_STUCK_AFTER:
+        return FAIL, f"stuck since {format_time(started)}; the time limit ended it"
+    return PASS, ""
 
 
 def _wiring(route_policy: Callable[[str, str], Any], clock) -> List[Result]:
