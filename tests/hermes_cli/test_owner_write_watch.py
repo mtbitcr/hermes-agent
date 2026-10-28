@@ -1088,7 +1088,7 @@ def test_round5_3_8642_and_127_0_0_1_are_the_api_servers_defaults():
 
 
 JOURNEYS_LABEL = "Owner journeys run"
-STUCK_DETAIL = "stuck since 2026-10-05 07:00 UTC; the time limit ended it"
+STUCK_DETAIL = "stuck since 2026-10-05 06:00 UTC; the time limit ended it"
 
 
 def write_journeys(content):
@@ -1129,7 +1129,7 @@ def test_journeys_no_file_passes(tmp_path):
 def test_journeys_started_more_than_55_minutes_ago_fails_with_the_started_time(tmp_path):
     """A run still marked started more than 55 minutes before the run's moment fails."""
     host = Host(tmp_path)
-    write_journeys(started_at(START - timedelta(hours=2)))
+    write_journeys(started_at(START - timedelta(hours=3)))
     outcome = host.run()
     check = journeys_check()
     assert (check["outcome"], check["detail"]) == (watch.FAIL, STUCK_DETAIL)
@@ -1203,7 +1203,7 @@ def test_journeys_no_verdict_keeps_the_previous_state(tmp_path):
     """After a stuck alert, an unreadable file neither recovers nor re-alerts; once it is
     readable and final, the recovery follows."""
     host = Host(tmp_path)
-    write_journeys(started_at(START - timedelta(hours=2)))
+    write_journeys(started_at(START - timedelta(hours=3)))
     assert host.run().kind == "alert"
     write_journeys("not a pair\n")
     outcome = host.run()
@@ -1227,7 +1227,7 @@ def test_journeys_a_final_result_with_an_invalid_started_time_keeps_the_stuck_al
     """A final result whose started time is not a real UTC time gives no verdict: no recovery,
     no message, and the stuck state is kept until a valid result arrives."""
     host = Host(tmp_path)
-    write_journeys(started_at(START - timedelta(hours=2)))
+    write_journeys(started_at(START - timedelta(hours=3)))
     assert host.run().kind == "alert"
     kept = lambda: {k: v for k, v in json.loads(watch.state_path().read_text(encoding="utf-8")).items()
                     if k in ("state", "failing", "since")}
@@ -1251,7 +1251,7 @@ def test_journeys_a_final_result_without_a_started_time_gives_no_verdict(tmp_pat
 
 def test_journeys_a_run_stuck_across_two_hourly_runs_alerts_once(tmp_path):
     host = Host(tmp_path)
-    write_journeys(started_at(START - timedelta(hours=2)))
+    write_journeys(started_at(START - timedelta(hours=3)))
     outcomes = [host.run(), host.run(), host.run()]
     assert [outcome.code for outcome in outcomes] == [0, 0, 0]
     sent = messages(outcomes)
@@ -1262,7 +1262,7 @@ def test_journeys_a_run_stuck_across_two_hourly_runs_alerts_once(tmp_path):
 
 def test_journeys_a_final_result_after_a_stuck_one_gives_the_recovery_message(tmp_path):
     host = Host(tmp_path)
-    write_journeys(started_at(START - timedelta(hours=2)))
+    write_journeys(started_at(START - timedelta(hours=3)))
     host.run()
     write_journeys(finished("failed"))
     after = [host.run(), host.run()]
