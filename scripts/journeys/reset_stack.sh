@@ -174,12 +174,17 @@ app_user=""
 if [[ ${app_lines[0]-} =~ $quoted_re ]]; then app_user=${BASH_REMATCH[1]}; fi
 [[ $app_user =~ $user_re ]] ||
   die "the user id of $app_c is not a positive number; nothing was changed"
-probe_out=$(docker run --rm --network none --user "$app_user" --entrypoint sh "$app_image" \
-  -c 'id -u; id -g' 2> /dev/null) || probe_out=""
-mapfile -t probe_ids <<< "$probe_out"
-app_uid=$(read_number "${probe_ids[0]-}") ||
+# Fail closed: the closing x keeps the exact output, because $(...) would drop trailing blank lines.
+probe_raw=$(docker run --rm --network none --user "$app_user" --entrypoint sh "$app_image" \
+  -c 'id -u && id -g' 2> /dev/null && printf x) ||
+  die "the identity probe of $app_c did not exit 0; nothing was changed"
+probe_out=${probe_raw%x}
+mapfile -t probe_ids < <(printf '%s' "$probe_out")
+[[ $probe_out == *$'\n' ]] && ((${#probe_ids[@]} == 2)) ||
+  die "the identity probe of $app_c did not print exactly two lines; nothing was changed"
+app_uid=$(read_number "${probe_ids[0]}") ||
   die "the user id of $app_c is not a positive number; nothing was changed"
-app_gid=$(read_number "${probe_ids[1]-}") ||
+app_gid=$(read_number "${probe_ids[1]}") ||
   die "the group id of $app_c is not a positive number; nothing was changed"
 platform_owner=$(docker exec "$dash_c" stat -c %u:%g "$dash_home" 2> /dev/null) || platform_owner=""
 [[ $platform_owner =~ ^[1-9][0-9]{0,9}:[1-9][0-9]{0,9}$ ]] ||

@@ -380,7 +380,7 @@ TOKEN_VARS = [*SURFACE_ENV.values(), *KEY_ENV.values()]
 F_APP_SETTINGS = ('{{println (printf "%q" .Config.User)}}{{range .Config.Env}}{{$p := split . "="}}'
                   '{{if eq (index $p 0) ' + " ".join(f'"{name}"' for name in TOKEN_VARS) + '}}'
                   '{{println (printf "%q" .)}}{{end}}{{end}}')
-ID_SCRIPT = "id -u; id -g"
+ID_SCRIPT = "id -u && id -g"  # the probe's shell text: a failed first read must stop the second
 
 FAKE_DOCKER = r'''
 
@@ -640,9 +640,13 @@ def d_exec(argv, args):
     return finish(seq, done.returncode, unmap(done.stdout, pairs), unmap(done.stderr, pairs))
 
 
-def d_run_id(seq, state, image, opts, flags):
-    """The read-only helper that prints the user id and group id of the user it runs as (no network, no volume)."""
-    if flags != {"--rm"} or opts.get("--network") != "none" or opts.get("--entrypoint") != "sh" or "--user" not in opts:
+def d_run_id(seq, state, image, opts, flags, command):
+    """The read-only helper (no network, no volume): a real shell runs the script text with a stand-in `id`."""
+    import shlex
+    import subprocess
+    text = command[1] if command[:1] == ["-c"] and len(command) == 2 else ""
+    if (flags != {"--rm"} or opts.get("--network") != "none" or opts.get("--entrypoint") != "sh" or "--user" not in opts
+            or not re.fullmatch(r"id -[ug](?: *(?:&&|\|\||;) *id -[ug])*", text)):
         return finish(seq, 97, err=b"fake docker: run shape not supported\n")
     spec, users = opts["--user"], state["images"][image].get("users", {})
     if spec == "":
@@ -653,12 +657,19 @@ def d_run_id(seq, state, image, opts, flags):
         who = tuple(users[spec])
     else:
         return finish(seq, 126, err=("docker: unable to find user %s: no matching entries in passwd file\n" % spec).encode())
-    said = {}
+    said, codes = {}, {}
     for box in state["containers"].values():  # what a container of this image is made to answer to id
         if box["image"] == image:
             said.update(box.get("answers", {}))
-    lines = [said.get("id -u", str(who[0])), said.get("id -g", str(who[1]))]
-    return finish(seq, 0, ("\n".join(lines) + "\n").encode())
+            codes.update(box.get("exit_codes", {}))
+    reads = ""
+    for flag, number in (("-u", who[0]), ("-g", who[1])):
+        out = said.get("id " + flag, str(number))
+        show = "" if out is None else "printf '%s\\n' " + shlex.quote(out) + "; "
+        reads += "%s) %sreturn %d ;; " % (flag, show, codes.get("id " + flag, 0))
+    shell = "id() { case $1 in %s*) return 127 ;; esac; }\n%s" % (reads, text)
+    done = subprocess.run(["sh", "-c", shell], input=b"", capture_output=True, env={"PATH": "/usr/bin:/bin"})
+    return finish(seq, done.returncode, done.stdout, done.stderr)
 
 
 def d_run(argv, args):
@@ -680,8 +691,8 @@ def d_run(argv, args):
     state = load()
     if image not in state["images"]:
         return finish(seq, 125, err=b"Unable to find image locally; no network\n")
-    if command == ["-c", ID_SCRIPT] and "--mount" not in opts:
-        return d_run_id(seq, state, image, opts, flags)
+    if "--mount" not in opts:
+        return d_run_id(seq, state, image, opts, flags, command)
     mount = dict(part.partition("=")[::2] for part in opts.get("--mount", "").split(","))
     source, target = mount.get("source"), mount.get("target")
     if opts.get("--entrypoint") != "sh" or command[:1] != ["-c"] or len(command) != 2 or not source:
@@ -811,7 +822,7 @@ FAKE_TOOLS_SOURCE = (
     + VIEW_SOURCE
     + "".join("%s = %r\n" % (n, globals()[n])
               for n in ("F_IMAGE", "F_ENV_NAMES", "F_MOUNT_TYPES", "F_MOUNT_DEST", "F_STATE",
-                        "F_HERMES_HOME", "F_HEALTH_KIND", "F_APP_SETTINGS", "TOKEN_VARS", "ID_SCRIPT"))
+                        "F_HERMES_HOME", "F_HEALTH_KIND", "F_APP_SETTINGS", "TOKEN_VARS"))
     + "REPO_ROOT = %r\nREAL_PYC = %r\n" % (str(REPO), str(REAL_PYC))
     + FAKE_DOCKER
     + FAKE_PLATFORM
@@ -1723,8 +1734,15 @@ def test_reset_order_of_stops_writes_and_starts(shared_reset: SharedReset):
 
 def test_reset_helpers_have_the_agreed_shape(shared_reset: SharedReset):
     host = shared_reset.host
-    image = host.state()["containers"][DASH_C]["image"]
-    runs = [c for c in host.calls("docker") if c["argv"][0] == "run"]
+    containers = host.state()["containers"]
+    image, app_image = containers[DASH_C]["image"], containers[APP_C]["image"]
+    app_user = "%d:%d" % tuple(containers[APP_C]["user"])
+    every_run = [c for c in host.calls("docker") if c["argv"][0] == "run"]
+    probes = [c["argv"] for c in every_run if is_id_probe(c["argv"])]  # read-only: nothing mounted, no input
+    assert app_user.partition(":")[0] != "0"
+    assert probes == [["run", "--rm", "--network", "none", "--user", app_user, "--entrypoint", "sh", app_image,
+                       "-c", "id -u && id -g"]]
+    runs = [c for c in every_run if not is_id_probe(c["argv"])]
     assert sorted(mount_source(c) for c in runs) == sorted([HOME_V, TOKENS_V, TOKENS_V])
     for call in runs:
         argv, source = call["argv"], mount_source(call)
@@ -1836,14 +1854,18 @@ def test_reset_runs_every_platform_command_as_the_platform_identity_and_nothing_
     assert len(writers) == 9
     for call in writers:
         assert call["argv"][call["argv"].index("--user") + 1] == spec
+    app_spec = "%d:%d" % app
     for call in calls:
         argv = call["argv"]
-        if argv[0] == "run":
+        if is_id_probe(argv):  # the read-only identity probe runs as the app's configured user, never as root
+            assert argv[argv.index("--user") + 1] == app_spec
+        elif argv[0] == "run":
             assert argv[argv.index("--user") + 1] == "0"
         elif argv[0] == "exec" and "--user" not in argv:
             assert argv[2:4] in (["id", "-u"], ["id", "-g"], ["printenv", argv[3]]) or argv[2:4] == ["stat", "-c"]
-    app_spec = "%d:%d" % app
-    named = [c for c in calls if re.search(rf"(?<![0-9]){app_spec}(?![0-9])", "\x00".join(c["argv"]))]
+    assert len([c for c in calls if is_id_probe(c["argv"])]) == 1
+    named = [c for c in calls if not is_id_probe(c["argv"])
+             and re.search(rf"(?<![0-9]){app_spec}(?![0-9])", "\x00".join(c["argv"]))]
     if app == platform:
         return
     assert len(named) == 1 and named[0]["argv"][0] == "run" and mount_source(named[0]) == TOKENS_V
@@ -1852,9 +1874,11 @@ def test_reset_runs_every_platform_command_as_the_platform_identity_and_nothing_
 
 def test_reset_reads_both_identities_as_numbers_before_it_changes_anything(shared_reset: SharedReset):
     argvs = [c["argv"] for c in shared_reset.host.calls("docker")]
-    first_change = next(i for i, argv in enumerate(argvs) if argv[0] in ("stop", "start", "restart", "run"))
+    first_change = next(i for i, argv in enumerate(argvs)
+                        if argv[0] in ("stop", "start", "restart", "run") and not is_id_probe(argv))
     seen = argvs[:first_change]
-    assert ["exec", APP_C, "id", "-u"] in seen and ["exec", APP_C, "id", "-g"] in seen
+    assert len([argv for argv in seen if is_id_probe(argv)]) == 1  # both of the app's numbers: one read-only run
+    assert not [argv for argv in argvs if argv[:2] == ["exec", APP_C]]
     assert ["exec", DASH_C, "stat", "-c", "%u:%g", "/opt/data"] in seen
 
 
@@ -2328,6 +2352,71 @@ def test_reset_refuses_a_shared_or_not_plain_token_file_name_of_the_stopped_owne
     assert_secret_free(host, result, [MODEL_TOKEN])
     assert_no_setting_values(host, result, settings_to_hide(host) + [NAME_MARK])
     assert_user_only_on_the_probe(host, result)
+
+
+# ------------------------------------------------------------------ reset_stack.sh: the identity probe fails closed
+
+EXTRA_ID = "4999"
+UID_TEXT, GID_TEXT = (str(number) for number in APP_IDS)
+# (printed text, exit status) of `id -u`, then of `id -g`; None prints nothing.
+BAD_PROBES = {
+    "first-read-fails": ((UID_TEXT, 23), (GID_TEXT, 0)),
+    "second-read-fails": ((UID_TEXT, 0), (GID_TEXT, 23)),
+    "extra-line-from-id-u": ((f"{UID_TEXT}\n{EXTRA_ID}", 0), (GID_TEXT, 0)),
+    "extra-line-from-id-g": ((UID_TEXT, 0), (f"{GID_TEXT}\n{EXTRA_ID}", 0)),
+    "blank-line-between": ((UID_TEXT + "\n", 0), (GID_TEXT, 0)),
+    "trailing-blank-line": ((UID_TEXT, 0), (GID_TEXT + "\n", 0)),
+    "one-line": ((UID_TEXT, 0), (None, 0)),
+    "no-output": ((None, 0), (None, 0)),
+}
+
+
+def probe_says(reads):
+    def mutate(state: dict) -> None:
+        box = state["containers"][APP_C]
+        for key, (text, status) in zip(("id -u", "id -g"), reads):
+            box.setdefault("answers", {})[key] = text
+            box.setdefault("exit_codes", {})[key] = status
+    return mutate
+
+
+@pytest.mark.parametrize("case", list(BAD_PROBES))
+def test_reset_refuses_an_identity_probe_unless_both_reads_succeed_and_print_exactly_two_numbers(
+        host: Host, case: str):
+    fresh_stack(host)
+    host.update(probe_says(BAD_PROBES[case]))
+    before = snapshot(host)
+    result = run_reset(host)
+    assert result.returncode != 0, "the reset went on after an identity probe that has to be refused"
+    runs = [c["argv"] for c in host.calls("docker") if c["argv"][0] == "run"]
+    assert [argv[-2:] for argv in runs] == [["-c", "id -u && id -g"]], "the identity probe is not `id -u && id -g`"
+    assert APP_C in result.stderr and "nothing was changed" in result.stderr
+    assert_nothing_changed(host, before)
+    assert host.calls("sleep") == []
+    assert_secret_free(host, result, [MODEL_TOKEN])
+    assert_no_setting_values(host, result, settings_to_hide(host))
+    assert_user_only_on_the_probe(host, result)
+    for number in (UID_TEXT, GID_TEXT, EXTRA_ID):  # not even a helper number is printed or put on a command line
+        assert number not in all_output(result), "a helper number was printed"
+        assert number not in argv_text(host), "a helper number reached a command line"
+
+
+def test_the_fake_runs_the_probe_text_in_a_real_shell_with_a_stand_in_id(host: Host):
+    image = host.state()["containers"][APP_C]["image"]
+
+    def probe(text: str) -> tuple[int, str]:
+        done = docker_by_hand(host, "run", "--rm", "--network", "none", "--user", "1000:1000", "--entrypoint", "sh",
+                              image, "-c", text)
+        return done.returncode, done.stdout
+    assert probe("id -u && id -g") == (0, "1000\n1000\n")
+    host.update(probe_says(((UID_TEXT, 23), (GID_TEXT, 0))))  # `&&` stops after a failed first read, `;` goes on
+    assert probe("id -u && id -g") == (23, f"{UID_TEXT}\n")
+    assert probe("id -u; id -g") == (0, f"{UID_TEXT}\n{GID_TEXT}\n")
+    assert probe("id -u; touch somewhere")[0] == 97
+    host.update(probe_says(((f"{UID_TEXT}\n{EXTRA_ID}", 0), (GID_TEXT + "\n", 0))))
+    assert probe("id -u && id -g") == (0, f"{UID_TEXT}\n{EXTRA_ID}\n{GID_TEXT}\n\n")
+    host.update(probe_says(((None, 0), (None, 0))))
+    assert probe("id -u && id -g") == (0, "")
 
 
 # ------------------------------------------------------------------ isolation_check.sh
