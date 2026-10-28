@@ -1,7 +1,9 @@
-"""Seed the journeys test stack for one journey (card 2): python seed_states.py JOURNEY < seed.json.
+"""Seed the journeys test stack for one journey (cards 2 and 3): python seed_states.py JOURNEY < seed.json.
 
-Journey 3 gets a waiting owner question and a waiting suggestion; journey 5 gets a card stopped after repeated
-failures. All checks run first and the writes after; a refused run prints one fixed line and writes nothing.
+Journey 2 gets a card awaiting review, a review-approved card shown as being delivered (one unfinished delivery row)
+and a done card held by one waiting release batch; journey 3 gets a waiting owner question and a waiting suggestion;
+journey 5 gets a card stopped after repeated failures. All checks run first and the writes after; a refused run prints
+one fixed line and writes nothing.
 """
 
 import contextlib
@@ -16,7 +18,11 @@ import time
 PREFIX = "Journey test"
 BOARD = "journey-test"
 PROJECT_SLUG = "journey-test-project"
-PARTS = {"3": (("question", "questions"), ("suggestion", "suggestions")), "5": (("stopped", "cards"),)}
+PARTS = {"2": (), "3": (("question", "questions"), ("suggestion", "suggestions")), "5": (("stopped", "cards"),)}
+JOURNEY_2_CARDS = ("review", "approved", "merged")  # the three cards of journey 2, by their order in seed.json
+APPROVED = "Approved for the journey test."
+MERGE_LINK = "https://github.com/mtbitcr/hermes-agent/pull/1"
+REVIEW_ROUTE = ("raphael-planner", "anthropic", "routine")  # profile of the stack home, its provider, the task class
 ASK = "Journey test: which option should this journey take?"
 GAVE_UP = "worker crashed repeatedly"
 RECEIPT_KEY = "journey-test-project-seed"
@@ -85,10 +91,8 @@ def item_name(item, label):
 def read_names(seed_text, journey):
     """The one place that knows seed.json's shape: journeys[n].projects[0] with a name and lists of questions, suggestions
     and cards. Returns {"project": NAME, role: NAME}; what the journey does not need is ignored, no value is printed."""
-    if journey == "2":
-        raise Stop("journey 2 is seeded by another card; nothing was written")
     if journey not in PARTS:
-        raise lacks("this seed handles journeys 3 and 5 only")
+        raise lacks("this seed handles journeys 2, 3 and 5 only")
     try:
         seed = json.loads(seed_text)
     except (ValueError, RecursionError):
@@ -105,6 +109,11 @@ def read_names(seed_text, journey):
     if not isinstance(project, dict) or not isinstance(project.get("name"), str):
         raise lacks("the project in seed.json has no name")
     names = {"project": project["name"]}
+    if journey == "2":
+        cards = list_named(project, "cards")
+        if len(cards) != len(JOURNEY_2_CARDS):
+            raise lacks("seed.json does not have exactly three cards for this journey")
+        names.update((role, item_name(card, "card")) for role, card in zip(JOURNEY_2_CARDS, cards))
     for role, key in PARTS[journey]:
         items = list_named(project, key)
         label = key[:-1]
@@ -146,6 +155,59 @@ def make_card(title, *options):
         return card["id"], card["project_id"]
     except (ValueError, KeyError, TypeError):
         raise Stop("hermes kanban create did not answer with a card") from None
+
+
+def make_review_card(title):
+    """Handed over for review, then routed: a locked card cannot be handed over, and an unrouted one is parked in review."""
+    from hermes_cli import kanban_db
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    assignee, provider, tier = REVIEW_ROUTE
+    try:
+        route = model_policy.task_assignment_for(assignee, provider, tier)
+        approved = {
+            "assignee": assignee,
+            "provider": route.provider,
+            "model": route.model,
+            "reasoning_effort": route.reasoning_effort,
+            "execution_tier": tier,
+            "model_policy_lock": kanban_db.mint_policy_lock(assignee, route.provider, route.model, route.reasoning_effort, tier),
+        }
+        with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
+            card = kanban_db.create_task(conn, title=title, created_by="user", project_id=PROJECT_SLUG, board=BOARD, execution_tier=tier)
+        hermes("kanban", "--board", BOARD, "request-review", card, "--force")
+        with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
+            kanban_db.assign_task(conn, card, assignee, approved_route=approved)
+    except (ValueError, RuntimeError, sqlite3.Error, OSError):
+        raise Stop("the card waiting for review did not take an approved route") from None
+    return card
+
+
+def made_up_commit(part):
+    """A commit id that passes the release record's checks and names no real commit."""
+    return hashlib.sha256(f"journey-test-{part}".encode("ascii")).hexdigest()[:40]
+
+
+def record_unfinished_delivery(card):
+    """The row that shows the done card as being delivered; record_approved_delivery writes nothing while delivery is off."""
+    from hermes_cli import kanban_db
+
+    failed = "the journey board did not take the delivery of the approved card"
+    try:
+        with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
+            with kanban_db.write_txn(conn):
+                approval = conn.execute(
+                    "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'completed' ORDER BY id DESC LIMIT 1", (card,)
+                ).fetchone()
+                if approval is None:
+                    raise Stop(failed)
+                conn.execute(
+                    "INSERT INTO kanban_deliveries (source_task_id, source_head, approval_run_id, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (card, made_up_commit("delivery"), approval["run_id"], int(time.time())),
+                )
+    except (RuntimeError, sqlite3.Error, OSError):
+        raise Stop(failed) from None
 
 
 def say(label, value):
@@ -208,6 +270,9 @@ def seed_home(journey, names):
     db = kanban_db.kanban_db_path(BOARD)
     if db.exists() and board_holds_a_card(db):
         raise Stop("the journey board already holds a card; nothing was written")
+    # connect() creates the file, so the record is looked for without opening it.
+    if journey == "2" and release_ledger.ledger_path().exists():
+        raise Stop("a release record already exists; nothing was written")
     owner_receipt_steps()
     # The copied file as it is: load_config() would lay out the home folder, which a refusal must not do.
     if (read_raw_config().get("kanban") or {}).get("dispatch_in_gateway") is not False:
@@ -246,6 +311,36 @@ def seed_home(journey, names):
                 provenance_observed_at=int(time.time()),
             )
         say("suggestion", suggestion)
+    elif journey == "2":
+        review = make_review_card(names["review"])
+        say("card waiting for review", review)
+        approved, _ = make_card(names["approved"])
+        hermes("kanban", "--board", BOARD, "request-review", approved, "--force")
+        hermes("kanban", "--board", BOARD, "complete", approved, "--summary", APPROVED)
+        record_unfinished_delivery(approved)
+        say("approved card", approved)
+        say("approved card delivery", "unfinished")
+        merged, _ = make_card(names["merged"])
+        hermes("kanban", "--board", BOARD, "complete", merged)
+        say("merged card", merged)
+        try:
+            with contextlib.closing(release_ledger.connect()) as conn:
+                batch = release_ledger.record_merge(
+                    conn,
+                    merge_commit=made_up_commit("merge"),
+                    pr_url=MERGE_LINK,
+                    reviewed_base=made_up_commit("base"),
+                    reviewed_head=made_up_commit("head"),
+                    reviewed_tree=made_up_commit("tree"),
+                    tier=1,
+                    card_id=merged,
+                    title=names["merged"],
+                    board=BOARD,
+                    on_main=True,
+                )["batch"]
+        except (ValueError, sqlite3.Error, OSError):
+            raise Stop("the release record did not take the merge of the merged card") from None
+        say("waiting release batch", batch["batch_id"])
     else:
         stopped, _ = make_card(names["stopped"], "--max-retries", "1")
         with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
