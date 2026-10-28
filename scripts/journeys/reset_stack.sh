@@ -13,8 +13,8 @@ say() { printf 'reset_stack: %s\n' "$*"; }
 die() {
   printf 'reset_stack: %s\n' "$*" >&2
   if ((changed)); then
-    # The guards refuse a stopped owner app or dashboard, so a half-done reset needs this hint.
-    printf 'reset_stack: the reset stopped part-way; start the owner app and dashboard containers if they are down, then run it again\n' >&2
+    # The guards refuse a stopped dashboard, so a half-done reset needs this hint.
+    printf 'reset_stack: the reset stopped part-way; start the dashboard container if it is down, then run it again\n' >&2
   fi
   exit 1
 }
@@ -52,7 +52,7 @@ is_listed() {
   return 1
 }
 
-# The Go templates below are the only docker --format shapes this script uses.
+# The Go templates below, and fmt_app after the variable lists, are the only docker --format shapes this script uses.
 fmt_image='{{.Image}}'
 fmt_dest='{{range .Mounts}}{{println .Name .Destination}}{{end}}'
 fmt_state='{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'
@@ -89,6 +89,11 @@ surface_env=(HERMES_API_TOKEN_FILE HERMES_RECOMMENDATIONS_TOKEN_FILE HERMES_CONN
 executor_env=HERMES_EXECUTOR_API_TOKEN_FILE
 planner_env=HERMES_PLANNER_API_TOKEN_FILE
 
+# Owner app settings: its user, then each token file setting as one %q line, so no value spans lines or reads as plain.
+fmt_app='{{println (printf "%q" .Config.User)}}{{range .Config.Env}}{{$p := split . "="}}{{if eq (index $p 0)'
+for name in "${surface_env[@]}" "$executor_env" "$planner_env"; do fmt_app+=" \"$name\""; done
+fmt_app+='}}{{println (printf "%q" .)}}{{end}}{{end}}'
+
 for name in JOURNEY_STACK_HOST JOURNEY_MODEL_TOKEN_FILE; do
   is_listed script-input "$name" || die "$name is not on the template ([script-input])"
 done
@@ -111,7 +116,11 @@ done
 
 missing=()
 for c in "${containers[@]}"; do
-  inspect "$fmt_image" "$c" > /dev/null 2>&1 || missing+=("$c")
+  if found_image=$(inspect "$fmt_image" "$c" 2> /dev/null); then
+    [[ $c != "$app_c" ]] || app_image=$found_image
+  else
+    missing+=("$c")
+  fi
 done
 ((${#missing[@]} == 0)) || die "container not found: ${missing[*]}; nothing was changed"
 
@@ -125,10 +134,9 @@ for c in "${containers[@]}"; do
     die "$c has no configured Docker health check; the operator must create it with a health check; nothing was changed"
 done
 
-for c in "$app_c" "$dash_c"; do
-  state=$(inspect "$fmt_state" "$c") || die "cannot read the state of $c; nothing was changed"
-  [[ $state == "true "* ]] || die "$c is not running; nothing was changed"
-done
+# Only the dashboard must run, as the platform's account is read inside it; the owner app is restarted below.
+state=$(inspect "$fmt_state" "$dash_c") || die "cannot read the state of $dash_c; nothing was changed"
+[[ $state == "true "* ]] || die "$dash_c is not running; nothing was changed"
 
 app_tokens=$(mount_dest "$app_c" "$tokens_v") ||
   die "$app_c must mount the token volume exactly once; nothing was changed"
@@ -147,19 +155,31 @@ for pair in "$dash_c|$dash_home" "$gate_c|$gate_home"; do
     die "HERMES_HOME of ${pair%%|*} is not the home volume mount; nothing was changed"
 done
 
-# read_number CONTAINER COMMAND...: one positive whole number that the command prints inside the container.
+# read_number TEXT: TEXT as one positive whole number.
 read_number() {
-  local out
-  out=$(docker exec "$@" 2> /dev/null) || return 1
-  [[ $out =~ ^[1-9][0-9]{0,9}$ ]] || return 1
-  printf '%s' "$out"
+  [[ $1 =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+  printf '%s' "$1"
 }
+
+# The owner app's settings stay in this shell: nothing prints them or puts one on a command line.
+app_settings=$(inspect "$fmt_app" "$app_c" 2> /dev/null) ||
+  die "cannot read the settings of $app_c; nothing was changed"
+mapfile -t app_lines <<< "$app_settings"
 
 # Two identities that must never be mixed: the owner app's user, and the platform's runtime account,
 # which is whoever owns the top folder of the home inside the running dashboard (the boot hook sets it).
-app_uid=$(read_number "$app_c" id -u) ||
+# The owner app's numbers: one throw-away run of its image as its configured user (the one setting on a command line).
+quoted_re='^"([^"\\]*)"$' user_re='^[A-Za-z0-9_][A-Za-z0-9_.-]*(:[A-Za-z0-9_][A-Za-z0-9_.-]*)?$'
+app_user=""
+if [[ ${app_lines[0]-} =~ $quoted_re ]]; then app_user=${BASH_REMATCH[1]}; fi
+[[ $app_user =~ $user_re ]] ||
   die "the user id of $app_c is not a positive number; nothing was changed"
-app_gid=$(read_number "$app_c" id -g) ||
+probe_out=$(docker run --rm --network none --user "$app_user" --entrypoint sh "$app_image" \
+  -c 'id -u; id -g' 2> /dev/null) || probe_out=""
+mapfile -t probe_ids <<< "$probe_out"
+app_uid=$(read_number "${probe_ids[0]-}") ||
+  die "the user id of $app_c is not a positive number; nothing was changed"
+app_gid=$(read_number "${probe_ids[1]-}") ||
   die "the group id of $app_c is not a positive number; nothing was changed"
 platform_owner=$(docker exec "$dash_c" stat -c %u:%g "$dash_home" 2> /dev/null) || platform_owner=""
 [[ $platform_owner =~ ^[1-9][0-9]{0,9}:[1-9][0-9]{0,9}$ ]] ||
@@ -167,10 +187,17 @@ platform_owner=$(docker exec "$dash_c" stat -c %u:%g "$dash_home" 2> /dev/null) 
 platform_uid=${platform_owner%%:*} platform_gid=${platform_owner##*:}
 app_id=$app_uid:$app_gid platform_id=$platform_uid:$platform_gid
 
-# token_file_name VARIABLE: the file name the owner app expects directly under its token mount.
+# token_file_name VARIABLE: the plain file name that the owner app's settings give once, directly under its token mount.
 token_file_name() {
-  local value
-  value=$(docker exec "$app_c" printenv "$1" 2> /dev/null) || return 1
+  local line value="" found=0 start='"'"$1="
+  for line in "${app_lines[@]:1}"; do
+    if [[ $line == "$start"* ]]; then
+      value=${line#"$start"}
+      value=${value%'"'}
+      found=$((found + 1))
+    fi
+  done
+  ((found == 1)) || return 1
   [[ $value == "$app_tokens"/* ]] || return 1
   value=${value#"$app_tokens"/}
   [[ $value =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || return 1
