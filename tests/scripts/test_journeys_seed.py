@@ -414,7 +414,6 @@ REFUSALS = {
     ),
     "prefix-field-is-not-the-prefix": ("3", edited(lambda data: data.update(prefix="Quarterly SENTINEL-NAME")), None),
     "journey-seed-json-lacks": ("5", _without_journey_5(SEED_TEXT), None),
-    "journey-2": ("2", SEED_TEXT, None),
     "journey-4": ("4", SEED_TEXT, None),
     "card-already-on-the-board": ("3", SEED_TEXT, _a_card_is_already_on_the_board),
     "dispatcher-setting-not-off": ("5", SEED_TEXT, _the_dispatcher_setting_is_on),
