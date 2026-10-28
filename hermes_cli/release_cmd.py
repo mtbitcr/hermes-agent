@@ -495,7 +495,6 @@ def _journey_settings(path: Path) -> dict[str, str] | None:
         if (
             not equals
             or not name.startswith(_JOURNEYS_PREFIX)
-            or not body
             or not set(body) <= _JOURNEYS_NAME_CHARS
             or name in settings
         ):

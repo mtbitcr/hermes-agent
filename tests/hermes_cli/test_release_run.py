@@ -1146,14 +1146,16 @@ def test_a_released_run_with_a_valid_settings_file_starts_the_journeys_once(
         ("JOURNEY_A1_B2=x\nJOURNEY_Z=y\n", {"JOURNEY_A1_B2": "x", "JOURNEY_Z": "y"}),
         ("JOURNEY_A=héllo\n", {"JOURNEY_A": "héllo"}),
         (_sized(4000), {"JOURNEY_PAGE_TEXT": _sized(4000)[18:-1]}),
+        ("JOURNEY_=x\n", {"JOURNEY_": "x"}),
+        (VALID_FILE + "JOURNEY_=x\n", {**JOURNEY_SETTINGS, "JOURNEY_": "x"}),
     ],
     ids=["empty", "no final newline", "empty value", "value kept as it is", "digits",
-         "UTF-8", "4000 bytes"],
+         "UTF-8", "4000 bytes", "the prefix alone", "the usual settings and the prefix alone"],
 )
 def test_a_settings_file_that_follows_every_rule_adds_its_entries_as_they_are(
     root, monkeypatch, sent, starts, content, added
 ):
-    _accepted(1)
+    batch_id = _accepted(1)["batch_id"]
     _journey_file(root, content)
     before = dict(os.environ)
 
@@ -1162,6 +1164,7 @@ def test_a_settings_file_that_follows_every_rule_adds_its_entries_as_they_are(
     [(_argv, options)] = starts
     assert {k: v for k, v in options["env"].items() if k.startswith("JOURNEY_")} == added
     assert set(options["env"]) == set(before) | set(added) | {"HERMES_HOME", "PATH"}
+    assert sent == [f"Release {batch_id} was released."]
 
 
 @pytest.mark.parametrize("path", [None, ""], ids=["unset", "empty"])
@@ -1294,7 +1297,6 @@ INVALID_CONTENT = {
     "a name with a space": f"JOURNEY_PAGE TEXT={LEAK}\n",
     "a space before the equals sign": f"JOURNEY_PAGE_TEXT ={LEAK}\n",
     "a space before the name": f" JOURNEY_PAGE_TEXT={LEAK}\n",
-    "the prefix alone": f"JOURNEY_={LEAK}\n",
     "no name": f"={LEAK}\n",
     "a line without an equals sign": f"JOURNEY_PAGE_TEXT {LEAK}\n",
     "a repeated name": f"JOURNEY_PAGE_TEXT={LEAK}\nJOURNEY_PAGE_TEXT={LEAK}\n",
