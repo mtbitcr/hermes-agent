@@ -1734,15 +1734,8 @@ def test_reset_order_of_stops_writes_and_starts(shared_reset: SharedReset):
 
 def test_reset_helpers_have_the_agreed_shape(shared_reset: SharedReset):
     host = shared_reset.host
-    containers = host.state()["containers"]
-    image, app_image = containers[DASH_C]["image"], containers[APP_C]["image"]
-    app_user = "%d:%d" % tuple(containers[APP_C]["user"])
-    every_run = [c for c in host.calls("docker") if c["argv"][0] == "run"]
-    probes = [c["argv"] for c in every_run if is_id_probe(c["argv"])]  # read-only: nothing mounted, no input
-    assert app_user.partition(":")[0] != "0"
-    assert probes == [["run", "--rm", "--network", "none", "--user", app_user, "--entrypoint", "sh", app_image,
-                       "-c", "id -u && id -g"]]
-    runs = [c for c in every_run if not is_id_probe(c["argv"])]
+    image = host.state()["containers"][DASH_C]["image"]
+    runs = [c for c in host.calls("docker") if c["argv"][0] == "run"]
     assert sorted(mount_source(c) for c in runs) == sorted([HOME_V, TOKENS_V, TOKENS_V])
     for call in runs:
         argv, source = call["argv"], mount_source(call)
@@ -1854,18 +1847,14 @@ def test_reset_runs_every_platform_command_as_the_platform_identity_and_nothing_
     assert len(writers) == 9
     for call in writers:
         assert call["argv"][call["argv"].index("--user") + 1] == spec
-    app_spec = "%d:%d" % app
     for call in calls:
         argv = call["argv"]
-        if is_id_probe(argv):  # the read-only identity probe runs as the app's configured user, never as root
-            assert argv[argv.index("--user") + 1] == app_spec
-        elif argv[0] == "run":
+        if argv[0] == "run":
             assert argv[argv.index("--user") + 1] == "0"
         elif argv[0] == "exec" and "--user" not in argv:
             assert argv[2:4] in (["id", "-u"], ["id", "-g"], ["printenv", argv[3]]) or argv[2:4] == ["stat", "-c"]
-    assert len([c for c in calls if is_id_probe(c["argv"])]) == 1
-    named = [c for c in calls if not is_id_probe(c["argv"])
-             and re.search(rf"(?<![0-9]){app_spec}(?![0-9])", "\x00".join(c["argv"]))]
+    app_spec = "%d:%d" % app
+    named = [c for c in calls if re.search(rf"(?<![0-9]){app_spec}(?![0-9])", "\x00".join(c["argv"]))]
     if app == platform:
         return
     assert len(named) == 1 and named[0]["argv"][0] == "run" and mount_source(named[0]) == TOKENS_V
@@ -1874,12 +1863,21 @@ def test_reset_runs_every_platform_command_as_the_platform_identity_and_nothing_
 
 def test_reset_reads_both_identities_as_numbers_before_it_changes_anything(shared_reset: SharedReset):
     argvs = [c["argv"] for c in shared_reset.host.calls("docker")]
-    first_change = next(i for i, argv in enumerate(argvs)
-                        if argv[0] in ("stop", "start", "restart", "run") and not is_id_probe(argv))
+    first_change = next(i for i, argv in enumerate(argvs) if argv[0] in ("stop", "start", "restart", "run"))
     seen = argvs[:first_change]
-    assert len([argv for argv in seen if is_id_probe(argv)]) == 1  # both of the app's numbers: one read-only run
-    assert not [argv for argv in argvs if argv[:2] == ["exec", APP_C]]
+    assert ["exec", APP_C, "id", "-u"] in seen and ["exec", APP_C, "id", "-g"] in seen
     assert ["exec", DASH_C, "stat", "-c", "%u:%g", "/opt/data"] in seen
+
+
+def test_reset_reads_a_running_owner_app_only_by_docker_exec_before_it_changes_anything(shared_reset: SharedReset):
+    argvs = [c["argv"] for c in shared_reset.host.calls("docker")]
+    first_change = next(i for i, argv in enumerate(argvs) if argv[0] in ("stop", "start", "restart", "run"))
+    into_app = [argv for argv in argvs if argv[:2] == ["exec", APP_C]]
+    assert into_app == [argv for argv in argvs[:first_change] if argv[:2] == ["exec", APP_C]]
+    assert into_app == [["exec", APP_C, "id", "-u"], ["exec", APP_C, "id", "-g"],
+                        *(["exec", APP_C, "printenv", name] for name in TOKEN_VARS)]
+    assert not [argv for argv in argvs if argv[0] == "inspect" and F_APP_SETTINGS in argv]
+    assert not [argv for argv in argvs if is_id_probe(argv)]
 
 
 # --- the fake itself: it enforces the exec user, the boot ownership and the owner-only rules

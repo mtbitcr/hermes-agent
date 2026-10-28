@@ -89,7 +89,8 @@ surface_env=(HERMES_API_TOKEN_FILE HERMES_RECOMMENDATIONS_TOKEN_FILE HERMES_CONN
 executor_env=HERMES_EXECUTOR_API_TOKEN_FILE
 planner_env=HERMES_PLANNER_API_TOKEN_FILE
 
-# Owner app settings: its user, then each token file setting as one %q line, so no value spans lines or reads as plain.
+# Owner app settings, read only while the owner app is stopped or has never run: its user, then each token file
+# setting as one %q line, so no value spans lines or reads as plain.
 fmt_app='{{println (printf "%q" .Config.User)}}{{range .Config.Env}}{{$p := split . "="}}{{if eq (index $p 0)'
 for name in "${surface_env[@]}" "$executor_env" "$planner_env"; do fmt_app+=" \"$name\""; done
 fmt_app+='}}{{println (printf "%q" .)}}{{end}}{{end}}'
@@ -134,9 +135,13 @@ for c in "${containers[@]}"; do
     die "$c has no configured Docker health check; the operator must create it with a health check; nothing was changed"
 done
 
-# Only the dashboard must run, as the platform's account is read inside it; the owner app is restarted below.
+# Only the dashboard must run, as the platform's account is read inside it. The owner app is restarted below, so
+# it may be stopped or have never run: its state only decides how its numbers and token file names are read.
+app_state=$(inspect "$fmt_state" "$app_c") || die "cannot read the state of $app_c; nothing was changed"
 state=$(inspect "$fmt_state" "$dash_c") || die "cannot read the state of $dash_c; nothing was changed"
 [[ $state == "true "* ]] || die "$dash_c is not running; nothing was changed"
+app_running=0
+if [[ $app_state == "true "* ]]; then app_running=1; fi
 
 app_tokens=$(mount_dest "$app_c" "$tokens_v") ||
   die "$app_c must mount the token volume exactly once; nothing was changed"
@@ -161,48 +166,64 @@ read_number() {
   printf '%s' "$1"
 }
 
-# The owner app's settings stay in this shell: nothing prints them or puts one on a command line.
-app_settings=$(inspect "$fmt_app" "$app_c" 2> /dev/null) ||
-  die "cannot read the settings of $app_c; nothing was changed"
-mapfile -t app_lines <<< "$app_settings"
-
 # Two identities that must never be mixed: the owner app's user, and the platform's runtime account,
 # which is whoever owns the top folder of the home inside the running dashboard (the boot hook sets it).
-# The owner app's numbers: one throw-away run of its image as its configured user (the one setting on a command line).
-quoted_re='^"([^"\\]*)"$' user_re='^[A-Za-z0-9_][A-Za-z0-9_.-]*(:[A-Za-z0-9_][A-Za-z0-9_.-]*)?$'
-app_user=""
-if [[ ${app_lines[0]-} =~ $quoted_re ]]; then app_user=${BASH_REMATCH[1]}; fi
-[[ $app_user =~ $user_re ]] ||
-  die "the user id of $app_c is not a positive number; nothing was changed"
-# Fail closed: the closing x keeps the exact output, because $(...) would drop trailing blank lines.
-probe_raw=$(docker run --rm --network none --user "$app_user" --entrypoint sh "$app_image" \
-  -c 'id -u && id -g' 2> /dev/null && printf x) ||
-  die "the identity probe of $app_c did not exit 0; nothing was changed"
-probe_out=${probe_raw%x}
-mapfile -t probe_ids < <(printf '%s' "$probe_out")
-[[ $probe_out == *$'\n' ]] && ((${#probe_ids[@]} == 2)) ||
-  die "the identity probe of $app_c did not print exactly two lines; nothing was changed"
-app_uid=$(read_number "${probe_ids[0]}") ||
-  die "the user id of $app_c is not a positive number; nothing was changed"
-app_gid=$(read_number "${probe_ids[1]}") ||
-  die "the group id of $app_c is not a positive number; nothing was changed"
+# A running owner app tells its own numbers by docker exec. One that is stopped or has never run cannot, so its
+# numbers come from its settings and one throw-away run of its image.
+if ((app_running)); then
+  app_uid=$(docker exec "$app_c" id -u 2> /dev/null) || app_uid=""
+  app_uid=$(read_number "$app_uid") ||
+    die "the user id of $app_c is not a positive number; nothing was changed"
+  app_gid=$(docker exec "$app_c" id -g 2> /dev/null) || app_gid=""
+  app_gid=$(read_number "$app_gid") ||
+    die "the group id of $app_c is not a positive number; nothing was changed"
+else
+  # The owner app's settings stay in this shell: nothing prints them or puts one on a command line.
+  app_settings=$(inspect "$fmt_app" "$app_c" 2> /dev/null) ||
+    die "cannot read the settings of $app_c; nothing was changed"
+  mapfile -t app_lines <<< "$app_settings"
+
+  # Its numbers: one throw-away run of its image as its configured user (the one setting on a command line).
+  quoted_re='^"([^"\\]*)"$' user_re='^[A-Za-z0-9_][A-Za-z0-9_.-]*(:[A-Za-z0-9_][A-Za-z0-9_.-]*)?$'
+  app_user=""
+  if [[ ${app_lines[0]-} =~ $quoted_re ]]; then app_user=${BASH_REMATCH[1]}; fi
+  [[ $app_user =~ $user_re ]] ||
+    die "the user id of $app_c is not a positive number; nothing was changed"
+  # Fail closed: the closing x keeps the exact output, because $(...) would drop trailing blank lines.
+  probe_raw=$(docker run --rm --network none --user "$app_user" --entrypoint sh "$app_image" \
+    -c 'id -u && id -g' 2> /dev/null && printf x) ||
+    die "the identity probe of $app_c did not exit 0; nothing was changed"
+  probe_out=${probe_raw%x}
+  mapfile -t probe_ids < <(printf '%s' "$probe_out")
+  [[ $probe_out == *$'\n' ]] && ((${#probe_ids[@]} == 2)) ||
+    die "the identity probe of $app_c did not print exactly two lines; nothing was changed"
+  app_uid=$(read_number "${probe_ids[0]}") ||
+    die "the user id of $app_c is not a positive number; nothing was changed"
+  app_gid=$(read_number "${probe_ids[1]}") ||
+    die "the group id of $app_c is not a positive number; nothing was changed"
+fi
 platform_owner=$(docker exec "$dash_c" stat -c %u:%g "$dash_home" 2> /dev/null) || platform_owner=""
 [[ $platform_owner =~ ^[1-9][0-9]{0,9}:[1-9][0-9]{0,9}$ ]] ||
   die "the owner of the home folder in $dash_c is not two positive numbers; nothing was changed"
 platform_uid=${platform_owner%%:*} platform_gid=${platform_owner##*:}
 app_id=$app_uid:$app_gid platform_id=$platform_uid:$platform_gid
 
-# token_file_name VARIABLE: the plain file name that the owner app's settings give once, directly under its token mount.
+# token_file_name VARIABLE: the plain file name that the owner app has for VARIABLE, directly under its token mount.
+# A running owner app prints it by docker exec; for one that is stopped or has never run, its settings give it once.
 token_file_name() {
   local line value="" found=0 start='"'"$1="
-  for line in "${app_lines[@]:1}"; do
-    if [[ $line == "$start"* ]]; then
-      value=${line#"$start"}
-      value=${value%'"'}
-      found=$((found + 1))
-    fi
-  done
-  ((found == 1)) || return 1
+  if ((app_running)); then
+    value=$(docker exec "$app_c" printenv "$1" 2> /dev/null) || return 1
+  else
+    for line in "${app_lines[@]:1}"; do
+      if [[ $line == "$start"* ]]; then
+        value=${line#"$start"}
+        value=${value%'"'}
+        found=$((found + 1))
+      fi
+    done
+    ((found == 1)) || return 1
+  fi
   [[ $value == "$app_tokens"/* ]] || return 1
   value=${value#"$app_tokens"/}
   [[ $value =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || return 1
