@@ -2,20 +2,18 @@
 
 seed_states.py runs for real against a temporary platform home: its commands are the real hermes
 commands, its suggestion and give-up come from the real kernel, and the owner-workspace reads
-(decisions list, board read) are the real ones. The reads need the Project to be committed by the
-owner, which the seed never does; the tests play that commit with the platform's own receipt functions.
+(decisions list, board read) are the real ones. Those reads are made straight after the seed with
+nothing played in between: the seed itself leaves the committed owner receipt and the board's owner
+stamp that the reads need.
 seed_stack.sh runs against a stand-in docker that sits first on PATH: it records every call, answers
 inspect, and runs the snippets and the seed program that are sent into the dashboard on this machine.
 No docker and no network is involved.
-
-The shape of seed.json is not described anywhere in this repository. The seed assumes the narrowest
-one the plan supports, and SEED below is that shape: a top-level "prefix", the "project" name, and per
-journey number the names of its cards by the state each one is made in.
 """
 
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import importlib.util
 import json
@@ -45,18 +43,54 @@ STACK_HOME = JOURNEYS / "stack-home"
 
 BOARD = "journey-test"
 PROJECT_SLUG = "journey-test-project"
+PREFIX = "Journey test"
 PROJECT_NAME = "Journey test project"
 QUESTION = "Journey test question"
 SUGGESTION = "Journey test suggestion"
 STOPPED = "Journey test stopped card"
 
+# SEED mirrors the structure that the review reported for the owner app's seed.json: journeys[n].projects
+# arrays, each project with a name and nested questions, suggestions and cards. It is not a copy of that
+# file, which is not on this machine, and any field the review did not report is not in it. Journey 2 carries
+# three cards and a release batch: extra content that the seed for journeys 3 and 5 must leave alone.
 SEED = {
-    "prefix": "Journey test",
-    "project": PROJECT_NAME,
+    "prefix": PREFIX,
     "journeys": {
-        "2": {"review": "Journey test card waiting for review"},
-        "3": {"suggestion": SUGGESTION, "question": QUESTION},
-        "5": {"stopped": STOPPED},
+        "2": {
+            "projects": [
+                {
+                    "name": PROJECT_NAME,
+                    "questions": [],
+                    "suggestions": [],
+                    "cards": [
+                        {"name": "Journey test card waiting for review"},
+                        {"name": "Journey test card approved"},
+                        {"name": "Journey test card merged"},
+                    ],
+                    "release_batch": {"name": "Journey test release batch", "cards": ["Journey test card merged"]},
+                }
+            ]
+        },
+        "3": {
+            "projects": [
+                {
+                    "name": PROJECT_NAME,
+                    "questions": [{"name": QUESTION}],
+                    "suggestions": [{"name": SUGGESTION}],
+                    "cards": [],
+                }
+            ]
+        },
+        "5": {
+            "projects": [
+                {
+                    "name": PROJECT_NAME,
+                    "questions": [],
+                    "suggestions": [],
+                    "cards": [{"name": STOPPED}],
+                }
+            ]
+        },
     },
 }
 SEED_TEXT = json.dumps(SEED, indent=2) + "\n"
@@ -99,9 +133,25 @@ def tree(root: Path) -> dict[str, str]:
     return seen
 
 
-def count(db: Path, sql: str) -> int:
+def first(db: Path, sql: str):
+    """The first column of the first row, read here and not by the seed."""
     with contextlib.closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn:
         return conn.execute(sql).fetchone()[0]
+
+
+def count(db: Path, sql: str) -> int:
+    return first(db, sql)
+
+
+def edited(change) -> str:
+    """SEED as JSON text after change(data) has altered a deep copy of it."""
+    data = copy.deepcopy(SEED)
+    change(data)
+    return json.dumps(data)
+
+
+def project_of(data: dict, journey: str) -> dict:
+    return data["journeys"][journey]["projects"][0]
 
 
 @pytest.fixture
@@ -130,20 +180,16 @@ def run_seed(seed, capsys, journey: str, text: str = SEED_TEXT) -> tuple[int, st
     return code, captured.out, captured.err
 
 
-def commit_project(slug: str) -> None:
-    """Play the owner's commit of the Project: a committed receipt and the board's owner stamp."""
-    ctx = ow.resolve_owner_context()
-    key = f"commit-{slug}"
-    with contextlib.closing(projects_db.connect()) as conn:
-        ow._ensure_schema(conn)
-        project = projects_db.get_project(conn, slug)
-        _, _, token = ow._acquire_or_replay(conn, ctx, key, "owner_task_graph_commit", "d" * 64)
-        ow._update_progress(conn, ctx, key, token, project_id=project.id, board_slug=project.board_slug)
-        ow._finalize_receipt(
-            conn, ctx, key, token, status="committed",
-            result={"ok": True, "project_id": project.id, "root_task_id": "none", "task_ids": []},
-        )
-    kanban_db.write_board_metadata(project.board_slug, project_id=project.id)
+def journey_3_decisions() -> list[tuple]:
+    """What the owner workspace lists for the owner, read with the platform's own function."""
+    decisions = ow.list_owner_decisions(ow.resolve_owner_context())["data"]
+    return sorted((d["kind"], d["authority"], d["title"], d["project_name"]) for d in decisions)
+
+
+JOURNEY_3_DECISIONS = [
+    ("capability", "recommendation", SUGGESTION, PROJECT_NAME),
+    ("owner_input", "task", QUESTION, PROJECT_NAME),
+]
 
 
 # --- 1. Journey 3: one waiting question and one waiting suggestion, no release record.
@@ -153,13 +199,8 @@ def test_journey_3_leaves_one_question_and_one_suggestion_waiting_for_the_owner(
     code, out, err = run_seed(seed, capsys, "3")
     assert code == 0, err
 
-    commit_project(PROJECT_SLUG)
-    decisions = ow.list_owner_decisions(ow.resolve_owner_context())["data"]
-
-    assert sorted((d["kind"], d["authority"], d["title"], d["project_name"]) for d in decisions) == [
-        ("capability", "recommendation", SUGGESTION, PROJECT_NAME),
-        ("owner_input", "task", QUESTION, PROJECT_NAME),
-    ]
+    # Read straight after the seed: exactly one question and one suggestion, both under the journey's Project.
+    assert journey_3_decisions() == JOURNEY_3_DECISIONS
     assert not release_ledger.ledger_path().exists()
 
 
@@ -177,7 +218,7 @@ def test_journey_5_leaves_a_stopped_card_with_the_dispatcher_off_and_starts_no_w
     assert code == 0, err
     assert "seed_states: dispatcher setting: off\n" in out
 
-    commit_project(PROJECT_SLUG)
+    # Read straight after the seed: the Project is the owner's, and its board shows the one stopped card.
     ctx = ow.resolve_owner_context()
     snapshot = ow.read_project_snapshot(ctx, PROJECT_SLUG)
     shown = [(column["name"], task) for column in snapshot["columns"] for task in column["tasks"]]
@@ -208,7 +249,45 @@ def test_journey_5_leaves_a_stopped_card_with_the_dispatcher_off_and_starts_no_w
     assert ow.read_project_snapshot(ctx, PROJECT_SLUG)["steward"]["execution"] == execution
 
 
+def receipt_rows(registry: Path) -> list[tuple]:
+    with contextlib.closing(sqlite3.connect(f"file:{registry}?mode=ro", uri=True)) as conn:
+        return conn.execute("SELECT * FROM owner_workspace_receipts ORDER BY idempotency_key").fetchall()
+
+
+def test_the_seed_commits_one_owner_receipt_and_a_repeat_replays_it(seed, reset_home, capsys):
+    code, out, err = run_seed(seed, capsys, "3")
+    assert code == 0, err
+
+    registry = reset_home / "projects.db"
+    stamp = reset_home / "kanban" / "boards" / BOARD / "board.json"
+    rows = receipt_rows(registry)
+    assert len(rows) == 1
+    project_id = first(registry, f"SELECT id FROM projects WHERE slug = '{PROJECT_SLUG}'")
+    assert json.loads(stamp.read_text(encoding="utf-8"))["project_id"] == project_id
+    stamped = stamp.read_bytes()
+
+    # A repeat finds the same fixed key and digest: it replays, and nothing in the receipt or the stamp moves.
+    seed.commit_owner_receipt()
+    assert receipt_rows(registry) == rows
+    assert stamp.read_bytes() == stamped
+    assert journey_3_decisions() == JOURNEY_3_DECISIONS
+
+
+def test_a_platform_without_a_receipt_step_is_refused_before_anything_is_written(seed, reset_home, capsys, monkeypatch):
+    monkeypatch.delattr(ow, "_finalize_receipt")
+    before = tree(reset_home)
+
+    code, out, err = run_seed(seed, capsys, "3")
+
+    assert (code, out) == (1, "")
+    assert err == "seed_states: the platform lacks a step that commits the owner receipt; nothing was written\n"
+    assert tree(reset_home) == before
+    assert not (reset_home / "projects.db").exists()
+
+
 # --- 3. Refusals: each prints one fixed line, exits 1 and writes nothing.
+
+PREFIX_LINE =f'seed_states: a name in seed.json does not start with "{PREFIX}"; nothing was written\n'
 
 
 def _without_journey_5(text: str) -> str:
@@ -218,9 +297,7 @@ def _without_journey_5(text: str) -> str:
 
 
 def _with_question(name: str) -> str:
-    data = json.loads(SEED_TEXT)
-    data["journeys"]["3"]["question"] = name
-    return json.dumps(data)
+    return edited(lambda data: project_of(data, "3").update(questions=[name]))
 
 
 def _a_card_is_already_on_the_board() -> None:
@@ -238,8 +315,19 @@ def _the_dispatcher_setting_is_on() -> None:
 
 REFUSALS = {
     "name-without-the-prefix": ("3", _with_question("Quarterly SENTINEL-NAME question"), None),
+    "project-name-without-the-prefix": (
+        "3", edited(lambda data: project_of(data, "3").update(name="Quarterly SENTINEL-NAME project")), None,
+    ),
+    "suggestion-name-without-the-prefix": (
+        "3", edited(lambda data: project_of(data, "3").update(suggestions=["Quarterly SENTINEL-NAME suggestion"])), None,
+    ),
+    "stopped-card-name-without-the-prefix": (
+        "5", edited(lambda data: project_of(data, "5").update(cards=[{"title": "Quarterly SENTINEL-NAME card"}])), None,
+    ),
+    "prefix-field-is-not-the-prefix": ("3", edited(lambda data: data.update(prefix="Quarterly SENTINEL-NAME")), None),
     "journey-seed-json-lacks": ("5", _without_journey_5(SEED_TEXT), None),
     "journey-2": ("2", SEED_TEXT, None),
+    "journey-4": ("4", SEED_TEXT, None),
     "card-already-on-the-board": ("3", SEED_TEXT, _a_card_is_already_on_the_board),
     "dispatcher-setting-not-off": ("5", SEED_TEXT, _the_dispatcher_setting_is_on),
 }
@@ -258,6 +346,8 @@ def test_the_seed_refuses_with_one_fixed_line_and_writes_nothing(seed, reset_hom
     assert out == ""
     assert len(err.strip().splitlines()) == 1
     assert "SENTINEL-NAME" not in err
+    if "without-the-prefix" in case or case == "prefix-field-is-not-the-prefix":
+        assert err == PREFIX_LINE
     # Nothing was written: not one file of the home changed, and no project, no new board, no new card.
     assert tree(reset_home) == before
     assert (reset_home / "kanban" / "boards" / BOARD).exists() is (case == "card-already-on-the-board")
@@ -265,6 +355,232 @@ def test_the_seed_refuses_with_one_fixed_line_and_writes_nothing(seed, reset_hom
     if case == "card-already-on-the-board":
         with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
             assert [task.title for task in kanban_db.list_tasks(conn)] == ["A card that was already there"]
+
+
+# --- 3b. Fix: a board that holds a card of ANY kind or status is not a fresh board.
+
+
+def _an_archived_work_card_is_already_on_the_board() -> None:
+    kanban_db.create_board(BOARD)
+    with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
+        kanban_db.archive_task(conn, kanban_db.create_task(conn, title="A card that was already there"))
+    db = kanban_db.kanban_db_path(BOARD)
+    assert count(db, "SELECT COUNT(*) FROM tasks WHERE task_kind = 'work' AND status = 'archived'") == 1
+
+
+def _only_a_suggestion_is_already_on_the_board() -> None:
+    """A board that kanban_db.list_tasks reports as empty: it holds one native recommendation and no work card."""
+    kanban_db.create_board(BOARD)
+    with contextlib.closing(projects_db.connect()) as conn:
+        project_id = projects_db.create_project(conn, name="An older project", slug="an-older-project", board_slug=BOARD)
+    evidence = {
+        "schema_version": 1,
+        "need": "An older need.",
+        "expected_benefit": "An older benefit.",
+        "requested_scope": dict.fromkeys(kanban_db.RECOMMENDATION_SCOPE_FLAGS, False),
+        "risks": "None.",
+        "cost": "None.",
+        "rollback": "Reject it.",
+    }
+    with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
+        kanban_db.create_recommendation(
+            conn,
+            project_id=project_id,
+            target_profile="default",
+            recommendation_kind="skill",
+            recommendation_subject_id="an-older-suggestion",
+            recommendation_label="An older suggestion",
+            recommendation_rationale="Waiting since before the seed.",
+            recommendation_evidence=evidence,
+            provenance_authority="hermes-profile:default",
+        )
+        assert kanban_db.list_tasks(conn, include_archived=True) == []
+    db = kanban_db.kanban_db_path(BOARD)
+    assert count(db, "SELECT COUNT(*) FROM tasks WHERE task_kind = 'work'") == 0
+    assert count(db, "SELECT COUNT(*) FROM tasks WHERE task_kind = 'recommendation'") == 1
+
+
+BOARD_HOLDS_A_CARD = {
+    "work-card": _a_card_is_already_on_the_board,
+    "archived-work-card": _an_archived_work_card_is_already_on_the_board,
+    "suggestion-only": _only_a_suggestion_is_already_on_the_board,
+}
+
+
+@pytest.mark.parametrize("journey", ["3", "5"])
+@pytest.mark.parametrize("case", sorted(BOARD_HOLDS_A_CARD))
+def test_a_board_that_holds_a_card_of_any_kind_is_refused_and_the_home_is_left_as_it_was(
+    seed, reset_home, capsys, case, journey,
+):
+    BOARD_HOLDS_A_CARD[case]()
+    before = tree(reset_home)
+
+    code, out, err = run_seed(seed, capsys, journey)
+
+    assert (code, out) == (1, "")
+    assert err == "seed_states: the journey board already holds a card; nothing was written\n"
+    assert tree(reset_home) == before
+    assert not (reset_home / "kanban" / "boards" / BOARD / "kanban.db-wal").exists()
+    assert not (reset_home / "kanban" / "boards" / BOARD / "kanban.db-shm").exists()
+
+
+def test_a_card_that_only_the_write_ahead_log_holds_is_still_seen_by_the_check(seed, reset_home, capsys):
+    kanban_db.create_board(BOARD)
+    db = kanban_db.kanban_db_path(BOARD)
+    wal = db.with_name(db.name + "-wal")
+    # The platform keeps a board out of WAL mode on a machine whose SQLite has the WAL-reset bug, so this writer
+    # switches the board to WAL itself and holds its card in the log, as a running dashboard does on a newer SQLite.
+    writer = sqlite3.connect(db)
+    writer.row_factory = sqlite3.Row
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        kanban_db.create_task(writer, title="A card that is still in the log")
+        with contextlib.closing(sqlite3.connect(db.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)) as main_file:
+            assert main_file.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+        assert wal.exists() and wal.stat().st_size > 0
+        held = {path: path.read_bytes() for path in (db, wal)}
+
+        code, out, err = run_seed(seed, capsys, "3")
+
+        assert {path: path.read_bytes() for path in (db, wal)} == held
+    finally:
+        writer.close()
+    assert (code, out) == (1, "")
+    assert err == "seed_states: the journey board already holds a card; nothing was written\n"
+    assert not (reset_home / "projects.db").exists()
+
+
+# --- 3c. Fix: the parser reads the structure that the owner app's seed.json has.
+
+
+def test_the_names_come_from_the_projects_arrays_of_the_journeys(seed):
+    assert seed.read_names(SEED_TEXT, "3") == {"project": PROJECT_NAME, "question": QUESTION, "suggestion": SUGGESTION}
+    assert seed.read_names(SEED_TEXT, "5") == {"project": PROJECT_NAME, "stopped": STOPPED}
+
+
+def test_a_list_item_is_a_plain_string_or_an_object_named_by_name_or_title(seed):
+    def as_strings_and_titles(data):
+        project_of(data, "3")["questions"] = [QUESTION]
+        project_of(data, "3")["suggestions"] = [{"title": SUGGESTION}]
+        project_of(data, "5")["cards"] = [STOPPED]
+
+    text = edited(as_strings_and_titles)
+
+    assert seed.read_names(text, "3") == {"project": PROJECT_NAME, "question": QUESTION, "suggestion": SUGGESTION}
+    assert seed.read_names(text, "5") == {"project": PROJECT_NAME, "stopped": STOPPED}
+
+
+def test_journeys_may_be_a_list_of_objects_numbered_by_journey_number_or_id(seed):
+    entries = SEED["journeys"]
+    listed = [{"journey": 2, **entries["2"]}, {"number": "3", **entries["3"]}, {"id": 5, **entries["5"]}]
+    text = json.dumps({"journeys": listed})
+
+    assert seed.read_names(text, "3") == {"project": PROJECT_NAME, "question": QUESTION, "suggestion": SUGGESTION}
+    assert seed.read_names(text, "5") == {"project": PROJECT_NAME, "stopped": STOPPED}
+
+
+def test_a_list_is_found_below_the_project_when_the_project_has_no_such_child(seed):
+    def move_down(data):
+        project = project_of(data, "3")
+        project["waiting"] = {
+            "for_the_owner": [{"questions": project.pop("questions")}],
+            "advice": {"suggestions": project.pop("suggestions")},
+        }
+
+    assert seed.read_names(edited(move_down), "3") == {"project": PROJECT_NAME, "question": QUESTION, "suggestion": SUGGESTION}
+
+
+def test_a_direct_child_wins_over_a_list_of_the_same_key_further_down(seed):
+    def add_a_copy_below(data):
+        project_of(data, "3")["history"] = {"questions": ["Quarterly SENTINEL-NAME question"]}
+
+    assert seed.read_names(edited(add_a_copy_below), "3") == {
+        "project": PROJECT_NAME, "question": QUESTION, "suggestion": SUGGESTION,
+    }
+
+
+def test_other_journeys_and_keys_the_journey_does_not_need_are_ignored(seed):
+    def add_noise(data):
+        data["journeys"]["7"] = {"projects": "SENTINEL-NAME", "note": ["not", "a", "journey"]}
+        data["journeys"]["4"] = {"projects": [{"name": "Quarterly SENTINEL-NAME project", "cards": [1, 2]}]}
+        project_of(data, "3")["cards"] = [{"name": "Quarterly SENTINEL-NAME card"}, {"name": "Another"}]
+        project_of(data, "5")["questions"] = [1, 2, 3]
+        project_of(data, "5")["suggestions"] = "SENTINEL-NAME"
+        data["unrelated"] = {"cards": 7}
+
+    text = edited(add_noise)
+
+    assert seed.read_names(text, "3") == {"project": PROJECT_NAME, "question": QUESTION, "suggestion": SUGGESTION}
+    assert seed.read_names(text, "5") == {"project": PROJECT_NAME, "stopped": STOPPED}
+
+
+def marked(text: str) -> str:
+    """Every name that the parser reads carries a marker, so that a line which echoed a value would show it."""
+    for name in (PROJECT_NAME, QUESTION, SUGGESTION, STOPPED):
+        text = text.replace(name, f"{name} SENTINEL-NAME")
+    return text
+
+
+def _two_lists_below(key: str, value):
+    def change(data):
+        project = project_of(data, "3")
+        project.pop(key)
+        project["left"] = {key: value}
+        project["right"] = [{key: value}]
+
+    return edited(change)
+
+
+# case: (journey, seed.json text, words that the one line must use to name the missing part)
+SHAPE_REFUSALS = {
+    "text-is-not-json": ("3", '{"journeys": SENTINEL-NAME', "JSON object"),
+    "text-is-not-an-object": ("3", '["SENTINEL-NAME"]', "JSON object"),
+    "no-journeys": ("3", edited(lambda data: data.pop("journeys")), "no journeys"),
+    "journey-not-listed": ("5", edited(lambda data: data["journeys"].pop("5")), "no entry for this journey"),
+    "journey-listed-twice": (
+        "3", json.dumps({"journeys": [{"journey": 3, **SEED["journeys"]["3"]}, {"number": "3", **SEED["journeys"]["3"]}]}),
+        "more than one entry",
+    ),
+    "no-projects-list": ("3", edited(lambda data: data["journeys"]["3"].pop("projects")), "no projects list"),
+    "projects-is-not-a-list": ("3", edited(lambda data: data["journeys"]["3"].update(projects={"name": "x"})), "no projects list"),
+    "no-project": ("3", edited(lambda data: data["journeys"]["3"].update(projects=[])), "exactly one project"),
+    "two-projects": ("3", edited(lambda data: data["journeys"]["3"]["projects"].append(project_of(data, "3"))), "exactly one project"),
+    "project-has-no-name": ("3", edited(lambda data: project_of(data, "3").pop("name")), "project in seed.json has no name"),
+    "no-questions-list": ("3", edited(lambda data: project_of(data, "3").pop("questions")), "no questions list"),
+    "no-suggestions-list": ("3", edited(lambda data: project_of(data, "3").pop("suggestions")), "no suggestions list"),
+    "no-cards-list": ("5", edited(lambda data: project_of(data, "5").pop("cards")), "no cards list"),
+    "no-question": ("3", edited(lambda data: project_of(data, "3").update(questions=[])), "exactly one question"),
+    "two-questions": (
+        "3", edited(lambda data: project_of(data, "3")["questions"].append("Journey test second question")), "exactly one question",
+    ),
+    "two-suggestions": (
+        "3", edited(lambda data: project_of(data, "3")["suggestions"].append({"name": "Journey test second suggestion"})),
+        "exactly one suggestion",
+    ),
+    "two-cards": ("5", edited(lambda data: project_of(data, "5")["cards"].append(STOPPED)), "exactly one card"),
+    "two-lists-of-a-key-below-the-project": ("3", _two_lists_below("questions", [QUESTION]), "more than one questions list"),
+    "item-without-a-name": ("3", edited(lambda data: project_of(data, "3").update(questions=[{"text": "x"}])), "question in seed.json has no name"),
+    "item-is-a-number": ("5", edited(lambda data: project_of(data, "5").update(cards=[7])), "card in seed.json has no name"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(SHAPE_REFUSALS))
+def test_a_seed_json_that_lacks_a_part_is_refused_with_one_line_naming_the_part(seed, reset_home, capsys, case):
+    journey, text, part = SHAPE_REFUSALS[case]
+    before = tree(reset_home)
+
+    code, out, err = run_seed(seed, capsys, journey, marked(text))
+
+    assert code == 1
+    assert out == ""
+    assert len(err.strip().splitlines()) == 1
+    assert part in err
+    assert err.startswith("seed_states: ") and err.endswith("; nothing was written\n")
+    assert "SENTINEL-NAME" not in err
+    assert tree(reset_home) == before
+    assert not (reset_home / "projects.db").exists()
+    assert not (reset_home / "kanban" / "boards" / BOARD).exists()
 
 
 # --- 4. seed_stack.sh: the dashboard container, the home owner's ids, nothing secret.
@@ -497,6 +813,19 @@ def test_the_seed_reaches_the_journey_board_and_the_root_stores_from_inside_a_wo
     assert count(journey_db, "SELECT COUNT(*) FROM tasks") == 2
     assert reported["release record"] == "present"
     assert (root / "kanban" / "release_ledger.db").exists()
+
+    # The committed owner receipt is in the root registry, counted here, and the board carries its owner's stamp.
+    project_id = first(registry, f"SELECT id FROM projects WHERE slug = '{PROJECT_SLUG}'")
+    assert count(registry, "SELECT COUNT(*) FROM owner_workspace_receipts") == 1
+    committed = (
+        "SELECT COUNT(*) FROM owner_workspace_receipts WHERE status = 'committed' AND operation = 'owner_task_graph_commit' "
+        f"AND project_id = '{project_id}' AND board_slug = '{BOARD}'"
+    )
+    assert count(registry, committed) == 1
+    assert json.loads((root / "kanban" / "boards" / BOARD / "board.json").read_text(encoding="utf-8"))["project_id"] == project_id
+
+    # The same immediate reads as without a worker: the owner sees the one question and the one suggestion.
+    assert journey_3_decisions() == JOURNEY_3_DECISIONS
 
     # Nothing went to the worker's own board or to its profile.
     assert count(worker_db, "SELECT COUNT(*) FROM tasks") == 1

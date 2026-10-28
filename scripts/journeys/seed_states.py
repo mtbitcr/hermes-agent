@@ -5,8 +5,10 @@ failures. All checks run first and the writes after; a refused run prints one fi
 """
 
 import contextlib
+import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -14,31 +16,102 @@ import time
 PREFIX = "Journey test"
 BOARD = "journey-test"
 PROJECT_SLUG = "journey-test-project"
-ROLES = {"3": ("question", "suggestion"), "5": ("stopped",)}
+PARTS = {"3": (("question", "questions"), ("suggestion", "suggestions")), "5": (("stopped", "cards"),)}
 ASK = "Journey test: which option should this journey take?"
 GAVE_UP = "worker crashed repeatedly"
+RECEIPT_KEY = "journey-test-project-seed"
+RECEIPT_OPERATION = "owner_task_graph_commit"
+RECEIPT_DIGEST = hashlib.sha256(RECEIPT_KEY.encode("ascii")).hexdigest()
+NO_GRAPH_ROOT = "journey-test-no-graph"
 
 
 class Stop(Exception):
     """The run ends here with this one line."""
 
 
+def lacks(what):
+    return Stop(f"{what}; nothing was written")
+
+
+def entry_for(seed, journey):
+    """The one entry of seed.json's journeys for this journey: an object keyed by the number, or a list of
+    objects that carry the number as journey, number or id."""
+    journeys = seed.get("journeys")
+    if isinstance(journeys, dict):
+        entries = [entry for number, entry in journeys.items() if str(number) == journey]
+    elif isinstance(journeys, list):
+        keys = ("journey", "number", "id")
+        entries = [entry for entry in journeys if isinstance(entry, dict) and any(str(entry.get(k)) == journey for k in keys)]
+    else:
+        raise lacks("seed.json has no journeys")
+    if len(entries) > 1:
+        raise lacks("seed.json has more than one entry for this journey")
+    if not entries:
+        raise lacks("seed.json has no entry for this journey")
+    return entries[0]
+
+
+def list_named(project, key):
+    """The list called key: a direct child of the project, else the only one anywhere below it."""
+    if isinstance(project.get(key), list):
+        return project[key]
+    found, pending = [], list(project.values())
+    while pending:
+        node = pending.pop()
+        if isinstance(node, dict):
+            if isinstance(node.get(key), list):
+                found.append(node[key])
+                pending.extend(value for name, value in node.items() if name != key)
+            else:
+                pending.extend(node.values())
+        elif isinstance(node, list):
+            pending.extend(node)
+    if len(found) > 1:
+        raise lacks(f"seed.json has more than one {key} list for this project")
+    if not found:
+        raise lacks(f"seed.json has no {key} list for this project")
+    return found[0]
+
+
+def item_name(item, label):
+    """A list item is a plain string, or an object named by name (or title)."""
+    if isinstance(item, dict):
+        item = next((item[key] for key in ("name", "title") if isinstance(item.get(key), str)), None)
+    if not isinstance(item, str):
+        raise lacks(f"a {label} in seed.json has no name")
+    return item
+
+
 def read_names(seed_text, journey):
-    """The one place that knows the shape of seed.json, which no file in this repository describes. Assumed:
-    {"prefix": "Journey test", "project": NAME, "journeys": {"3": {"question": NAME, "suggestion": NAME},
-    "5": {"stopped": NAME}}} (journey 2 may be listed; another card seeds it). Returns {"project": NAME, role: NAME}."""
+    """The one place that knows seed.json's shape: journeys[n].projects[0] with a name and lists of questions, suggestions
+    and cards. Returns {"project": NAME, role: NAME}; what the journey does not need is ignored, no value is printed."""
     if journey == "2":
         raise Stop("journey 2 is seeded by another card; nothing was written")
+    if journey not in PARTS:
+        raise lacks("this seed handles journeys 3 and 5 only")
     try:
         seed = json.loads(seed_text)
-        names = {"project": seed["project"], **seed["journeys"][journey]}
-        prefix = seed["prefix"]
-        shaped = set(names) == {"project", *ROLES[journey]}
-    except (ValueError, KeyError, TypeError):
-        shaped = False
-    if not shaped:
-        raise Stop("seed.json holds no seed for this journey in the expected shape; nothing was written")
-    if prefix != PREFIX or not all(isinstance(name, str) and name.startswith(PREFIX) for name in names.values()):
+    except (ValueError, RecursionError):
+        seed = None
+    if not isinstance(seed, dict):
+        raise lacks("seed.json is not a JSON object")
+    entry = entry_for(seed, journey)
+    projects = entry.get("projects") if isinstance(entry, dict) else None
+    if not isinstance(projects, list):
+        raise lacks("seed.json has no projects list for this journey")
+    if len(projects) != 1:
+        raise lacks("seed.json does not have exactly one project for this journey")
+    project = projects[0]
+    if not isinstance(project, dict) or not isinstance(project.get("name"), str):
+        raise lacks("the project in seed.json has no name")
+    names = {"project": project["name"]}
+    for role, key in PARTS[journey]:
+        items = list_named(project, key)
+        label = key[:-1]
+        if len(items) != 1:
+            raise lacks(f"seed.json does not have exactly one {label} for this journey")
+        names[role] = item_name(items[0], label)
+    if seed.get("prefix", PREFIX) != PREFIX or not all(name.startswith(PREFIX) for name in names.values()):
         raise Stop(f'a name in seed.json does not start with "{PREFIX}"; nothing was written')
     return names
 
@@ -79,14 +152,59 @@ def say(label, value):
     print(f"seed_states: {label}: {value}")
 
 
+def board_holds_a_card(db_path):
+    """True if the tasks table holds a row of any kind or status; the board is only read, never written."""
+    uri = db_path.resolve().as_uri() + "?mode=ro"
+    # Without -wal/-shm an immutable open adds none and sees every row; with them only a plain one sees the log.
+    if not any(db_path.with_name(db_path.name + suffix).exists() for suffix in ("-wal", "-shm")):
+        uri += "&immutable=1"
+    try:
+        with contextlib.closing(sqlite3.connect(uri, uri=True)) as conn:
+            return conn.execute("SELECT EXISTS (SELECT 1 FROM tasks)").fetchone()[0] == 1
+    except sqlite3.Error:
+        raise Stop("the journey board could not be read; nothing was written") from None
+
+
+def owner_receipt_steps():
+    """The platform steps that commit the owner receipt, found before the first write."""
+    from hermes_cli import kanban_db, owner_workspace, projects_db
+
+    names = ("resolve_owner_context", "_ensure_schema", "_terminal_replay", "_acquire_or_replay", "_update_progress", "_finalize_receipt")
+    if not all(callable(getattr(owner_workspace, name, None)) for name in names) or not callable(getattr(kanban_db, "write_board_metadata", None)):
+        raise Stop("the platform lacks a step that commits the owner receipt; nothing was written")
+    return kanban_db, owner_workspace, projects_db
+
+
+def commit_owner_receipt():
+    """Commit the owner receipt and stamp the journey board, so that the owner workspace lists the Project; a repeat replays."""
+    # No public function does this without creating cards, asking approval and activating, so these are bootstrap's own steps.
+    kanban_db, ow, projects_db = owner_receipt_steps()
+    ctx = ow.resolve_owner_context()
+    try:
+        with contextlib.closing(projects_db.connect()) as conn:
+            project = projects_db.get_project(conn, PROJECT_SLUG)
+            if project is None or not project.board_slug:
+                raise Stop("the journey project is not in the root registry")
+            ow._ensure_schema(conn)
+            if ow._terminal_replay(conn, ctx, RECEIPT_KEY, RECEIPT_OPERATION, RECEIPT_DIGEST) is None:
+                state, _, token = ow._acquire_or_replay(conn, ctx, RECEIPT_KEY, RECEIPT_OPERATION, RECEIPT_DIGEST)
+                if state == "own":
+                    ow._update_progress(conn, ctx, RECEIPT_KEY, token, project_id=project.id, board_slug=project.board_slug)
+                    kanban_db.write_board_metadata(project.board_slug, project_id=project.id)
+                    result = {"ok": True, "project_id": project.id, "root_task_id": NO_GRAPH_ROOT, "task_ids": []}
+                    ow._finalize_receipt(conn, ctx, RECEIPT_KEY, token, status="committed", result=result)
+    except (ow.OwnerWorkspaceError, sqlite3.Error, ValueError, OSError):
+        raise Stop("the owner receipt could not be committed") from None
+
+
 def seed_home(journey, names):
     from hermes_cli import kanban_db, projects_db, release_ledger
     from hermes_cli.config import read_raw_config
 
-    if kanban_db.board_exists(BOARD):
-        with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
-            if kanban_db.list_tasks(conn, include_archived=True):
-                raise Stop("the journey board already holds a card; nothing was written")
+    db = kanban_db.kanban_db_path(BOARD)
+    if db.exists() and board_holds_a_card(db):
+        raise Stop("the journey board already holds a card; nothing was written")
+    owner_receipt_steps()
     # The copied file as it is: load_config() would lay out the home folder, which a refusal must not do.
     if (read_raw_config().get("kanban") or {}).get("dispatch_in_gateway") is not False:
         raise Stop("the work dispatcher setting does not read off; nothing was written")
@@ -134,6 +252,8 @@ def seed_home(journey, names):
             ):
                 raise Stop("the stopped card did not stop")
         say("stopped card", stopped)
+
+    commit_owner_receipt()
 
     with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
         say("work cards on the journey board", len(kanban_db.list_tasks(conn, include_archived=True)))
