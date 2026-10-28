@@ -136,6 +136,22 @@ CREATE TABLE IF NOT EXISTS project_summaries (
     written_at      INTEGER NOT NULL,
     revision        INTEGER NOT NULL
 );
+
+-- What the summary tick (hermes_cli/owner_project_summary.py) remembers per
+-- Project: the one open summary task, the hourly request window and the failure
+-- count, so all three survive a restart. Additive: no existing table changes.
+CREATE TABLE IF NOT EXISTS project_summary_state (
+    project_id       TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+    event_cursor     INTEGER NOT NULL DEFAULT 0,
+    delivery_cursor  INTEGER NOT NULL DEFAULT 0,
+    release_cursor   INTEGER NOT NULL DEFAULT 0,
+    pending          INTEGER NOT NULL DEFAULT 1,
+    pending_urgent   INTEGER NOT NULL DEFAULT 1,
+    open_task_id     TEXT,
+    last_requested_at INTEGER,
+    failures         INTEGER NOT NULL DEFAULT 0,
+    updated_at       INTEGER NOT NULL
+);
 """
 
 
