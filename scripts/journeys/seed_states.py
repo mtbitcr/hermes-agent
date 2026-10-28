@@ -153,7 +153,11 @@ def say(label, value):
 
 
 def board_holds_a_card(db_path):
-    """True if the tasks table holds a row of any kind or status; the board is only read, never written."""
+    """True if the tasks table holds a row of any kind or status.
+
+    The board is only read: no row and no file content is written. A read may create or touch SQLite's own -wal and
+    -shm files, which owner rule 1 accepts.
+    """
     uri = db_path.resolve().as_uri() + "?mode=ro"
     # Without -wal/-shm an immutable open adds none and sees every row; with them only a plain one sees the log.
     if not any(db_path.with_name(db_path.name + suffix).exists() for suffix in ("-wal", "-shm")):

@@ -124,13 +124,46 @@ def template_names(section: str) -> list[str]:
 
 
 def tree(root: Path) -> dict[str, str]:
-    """Relative path -> content hash, for proving a folder was not touched."""
+    """Relative path -> content hash, for proving a folder was not touched.
+
+    Files whose names end in -wal or -shm are left out: they are SQLite's own sidecar files, which a read may create
+    or touch, and owner rule 1 accepts that.
+    """
     seen: dict[str, str] = {}
     for base, dirs, files in os.walk(root):
-        for name in sorted(dirs) + sorted(files):
+        for name in sorted(dirs) + sorted(f for f in files if not f.endswith(("-wal", "-shm"))):
             full = Path(base) / name
             seen[str(full.relative_to(root))] = "dir" if full.is_dir() else hashlib.sha256(full.read_bytes()).hexdigest()
     return seen
+
+
+def rows_of(root: Path) -> dict[str, dict[str, list[tuple]]]:
+    """File -> table -> every row, for each SQLite file under root, read through a read-only connection.
+
+    A file is a SQLite file if it starts with SQLite's 16-byte header. Virtual tables are skipped, because their rows
+    live in their own shadow tables. Rows are sorted by repr, so that the page order does not matter.
+    """
+    found: dict[str, dict[str, list[tuple]]] = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        with path.open("rb") as handle:
+            if handle.read(16) != b"SQLite format 3\x00":
+                continue
+        with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+            tables = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND sql NOT LIKE 'CREATE VIRTUAL TABLE%' ORDER BY name"
+            ).fetchall()
+            found[str(path.relative_to(root))] = {
+                name: sorted(conn.execute('SELECT * FROM "%s"' % name.replace('"', '""')).fetchall(), key=repr)
+                for (name,) in tables
+            }
+    return found
+
+
+def snapshot(root: Path) -> dict[str, dict]:
+    """What owner rule 1 means by writing nothing: the store files' content hashes and every row of every SQLite store."""
+    return {"files": tree(root), "rows": rows_of(root)}
 
 
 def first(db: Path, sql: str):
@@ -190,6 +223,61 @@ JOURNEY_3_DECISIONS = [
     ("capability", "recommendation", SUGGESTION, PROJECT_NAME),
     ("owner_input", "task", QUESTION, PROJECT_NAME),
 ]
+
+
+# --- 0. What "writes nothing" means (owner rule 1): the snapshot that the refusal tests compare.
+
+
+def test_the_snapshot_holds_the_rows_and_the_store_files_and_leaves_the_sqlite_sidecars_out(tmp_path):
+    """Owner rule 1: no row changes and no store file's own content changes; SQLite's own -wal and -shm may be touched."""
+    home = tmp_path / "home"
+    home.mkdir()
+    db, config = home / "store.db", home / "config.yaml"
+    wal, shm = db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        conn.execute("CREATE TABLE cards (id INTEGER PRIMARY KEY, title TEXT)")
+        conn.execute("INSERT INTO cards (title) VALUES ('first')")
+        conn.commit()
+    config.write_text("kanban:\n  dispatch_in_gateway: false\n", encoding="utf-8")
+    assert not wal.exists() and not shm.exists()
+    before = snapshot(home)
+    main_file = db.read_bytes()
+
+    # A second connection keeps the log open, so that SQLite itself creates and rewrites -wal and -shm.
+    keeper = sqlite3.connect(db)
+    try:
+        keeper.execute("PRAGMA wal_autocheckpoint=0")
+        # (a) The sidecars appear and are rewritten by two commits that leave every row as it was: the snapshot stays.
+        keeper.execute("SELECT * FROM cards").fetchall()
+        assert wal.exists() and shm.exists()
+        assert snapshot(home) == before
+        sidecars = (wal.read_bytes(), shm.read_bytes())
+        for title in ("other", "first"):
+            keeper.execute("UPDATE cards SET title = ?", (title,))
+            keeper.commit()
+        assert (wal.read_bytes(), shm.read_bytes()) != sidecars
+        assert snapshot(home) == before
+
+        # (b) A row changes. It is held only in the log, so the main file cannot show it: only the rows can.
+        keeper.execute("UPDATE cards SET title = 'second'")
+        keeper.commit()
+        assert db.read_bytes() == main_file
+        assert snapshot(home) != before
+    finally:
+        keeper.close()
+
+    # (c) The content of an ordinary store file changes.
+    before = snapshot(home)
+    config.write_text("kanban:\n  dispatch_in_gateway: true\n", encoding="utf-8")
+    assert snapshot(home) != before
+
+    # (d) A new store file appears.
+    before = snapshot(home)
+    with contextlib.closing(sqlite3.connect(home / "projects.db")) as conn:
+        conn.execute("CREATE TABLE projects (slug TEXT)")
+        conn.commit()
+    assert snapshot(home) != before
 
 
 # --- 1. Journey 3: one waiting question and one waiting suggestion, no release record.
@@ -275,17 +363,17 @@ def test_the_seed_commits_one_owner_receipt_and_a_repeat_replays_it(seed, reset_
 
 def test_a_platform_without_a_receipt_step_is_refused_before_anything_is_written(seed, reset_home, capsys, monkeypatch):
     monkeypatch.delattr(ow, "_finalize_receipt")
-    before = tree(reset_home)
+    before = snapshot(reset_home)
 
     code, out, err = run_seed(seed, capsys, "3")
 
     assert (code, out) == (1, "")
     assert err == "seed_states: the platform lacks a step that commits the owner receipt; nothing was written\n"
-    assert tree(reset_home) == before
+    assert snapshot(reset_home) == before
     assert not (reset_home / "projects.db").exists()
 
 
-# --- 3. Refusals: each prints one fixed line, exits 1 and writes nothing.
+# --- 3. Refusals: each prints one fixed line, exits 1 and writes nothing (owner rule 1).
 
 PREFIX_LINE =f'seed_states: a name in seed.json does not start with "{PREFIX}"; nothing was written\n'
 
@@ -338,7 +426,7 @@ def test_the_seed_refuses_with_one_fixed_line_and_writes_nothing(seed, reset_hom
     journey, text, set_up = REFUSALS[case]
     if set_up:
         set_up()
-    before = tree(reset_home)
+    before = snapshot(reset_home)
 
     code, out, err = run_seed(seed, capsys, journey, text)
 
@@ -348,8 +436,8 @@ def test_the_seed_refuses_with_one_fixed_line_and_writes_nothing(seed, reset_hom
     assert "SENTINEL-NAME" not in err
     if "without-the-prefix" in case or case == "prefix-field-is-not-the-prefix":
         assert err == PREFIX_LINE
-    # Nothing was written: not one file of the home changed, and no project, no new board, no new card.
-    assert tree(reset_home) == before
+    # Nothing was written (owner rule 1): no row and no store file's content changed; no project, no new board, no new card.
+    assert snapshot(reset_home) == before
     assert (reset_home / "kanban" / "boards" / BOARD).exists() is (case == "card-already-on-the-board")
     assert not (reset_home / "projects.db").exists()
     if case == "card-already-on-the-board":
@@ -413,15 +501,13 @@ def test_a_board_that_holds_a_card_of_any_kind_is_refused_and_the_home_is_left_a
     seed, reset_home, capsys, case, journey,
 ):
     BOARD_HOLDS_A_CARD[case]()
-    before = tree(reset_home)
+    before = snapshot(reset_home)
 
     code, out, err = run_seed(seed, capsys, journey)
 
     assert (code, out) == (1, "")
     assert err == "seed_states: the journey board already holds a card; nothing was written\n"
-    assert tree(reset_home) == before
-    assert not (reset_home / "kanban" / "boards" / BOARD / "kanban.db-wal").exists()
-    assert not (reset_home / "kanban" / "boards" / BOARD / "kanban.db-shm").exists()
+    assert snapshot(reset_home) == before
 
 
 def test_a_card_that_only_the_write_ahead_log_holds_is_still_seen_by_the_check(seed, reset_home, capsys):
@@ -439,11 +525,12 @@ def test_a_card_that_only_the_write_ahead_log_holds_is_still_seen_by_the_check(s
         with contextlib.closing(sqlite3.connect(db.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)) as main_file:
             assert main_file.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
         assert wal.exists() and wal.stat().st_size > 0
-        held = {path: path.read_bytes() for path in (db, wal)}
+        # Owner rule 1: the board file's bytes and the rows stay as they are; the read may touch -wal and -shm.
+        held = (db.read_bytes(), rows_of(db.parent))
 
         code, out, err = run_seed(seed, capsys, "3")
 
-        assert {path: path.read_bytes() for path in (db, wal)} == held
+        assert (db.read_bytes(), rows_of(db.parent)) == held
     finally:
         writer.close()
     assert (code, out) == (1, "")
@@ -568,7 +655,7 @@ SHAPE_REFUSALS = {
 @pytest.mark.parametrize("case", sorted(SHAPE_REFUSALS))
 def test_a_seed_json_that_lacks_a_part_is_refused_with_one_line_naming_the_part(seed, reset_home, capsys, case):
     journey, text, part = SHAPE_REFUSALS[case]
-    before = tree(reset_home)
+    before = snapshot(reset_home)
 
     code, out, err = run_seed(seed, capsys, journey, marked(text))
 
@@ -578,7 +665,7 @@ def test_a_seed_json_that_lacks_a_part_is_refused_with_one_line_naming_the_part(
     assert part in err
     assert err.startswith("seed_states: ") and err.endswith("; nothing was written\n")
     assert "SENTINEL-NAME" not in err
-    assert tree(reset_home) == before
+    assert snapshot(reset_home) == before
     assert not (reset_home / "projects.db").exists()
     assert not (reset_home / "kanban" / "boards" / BOARD).exists()
 
