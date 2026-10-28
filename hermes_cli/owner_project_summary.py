@@ -18,6 +18,11 @@ records the failure and nothing else.
 
 A failed summary task is archived first; only then does one transaction clear it and count the failure (owner rule 2).
 
+A task is the tick's own only when the tick made it for that Project (``_made_for``): its creator is ``CREATED_BY``
+and its idempotency key names the Project. A key alone vouches for nothing, since any worker can write one with
+``kanban_create``. A task made by anyone else is never adopted, recorded, archived or stored. When ``create_task``
+hands one back for the request key, the step fails before a task is published, and the failure rules apply as they are.
+
 The task's time box is the kernel's pin for its class; this module names no limit.
 
 Every store is reached by an explicit path, so the tick still finds the root registry and every board
@@ -110,6 +115,8 @@ def parse_summary_result(conn: sqlite3.Connection, task_id: str) -> SummaryResul
     task = kanban_db.get_task(conn, task_id)
     if task is None:
         raise SummaryRefused("the task is gone")
+    if task.created_by != CREATED_BY:
+        raise SummaryRefused("the task was not made by the summary tick")
     if task.assignee != PLANNING_ROLE:
         raise SummaryRefused("the task is not assigned to the planning role")
     if task.status != "done":
@@ -202,26 +209,36 @@ def _task_body(snapshot: dict) -> str:
     return INSTRUCTION + "\nSteward snapshot, frozen when this task was made:\n" + frozen + "\n"
 
 
+def _key_prefix(project_id: str) -> str:
+    """The front of every request key of the Project: the creator and the Project id."""
+    return f"{CREATED_BY}:{project_id}:"
+
+
 def _request_key(state: sqlite3.Row) -> str:
     """The identity of one request, from the state row alone, so two writers of the same row make one task.
 
-    ``_find_open_task`` relies only on the front of it, the creator and the Project id.
+    ``_find_open_task`` and ``_made_for`` rely only on the front of it, the creator and the Project id.
     """
-    return f"{CREATED_BY}:{state['project_id']}:{state['failures']}:{state['last_requested_at']}"
+    return f"{_key_prefix(state['project_id'])}{state['failures']}:{state['last_requested_at']}"
+
+
+def _made_for(task: kanban_db.Task, project_id: str) -> bool:
+    """Whether the tick made the task for this Project: the creator is the tick, the key names the Project."""
+    return task.created_by == CREATED_BY and (task.idempotency_key or "").startswith(_key_prefix(project_id))
 
 
 def _find_open_task(board: sqlite3.Connection, project_id: str) -> Optional[str]:
-    """The oldest summary task of the Project that is neither done nor archived, or None.
+    """The oldest summary task of the Project that the tick made and that is neither done nor archived, or None.
 
-    The prefix is compared with ``substr``, not LIKE: Project ids hold underscores, which LIKE reads as
-    wildcards, so one Project would find another's task. A failing query is not caught here; a tick that
-    cannot tell whether a task exists must publish nothing.
+    A task made by anyone else is not found, whatever its key. The prefix is compared with ``substr``, not
+    LIKE: Project ids hold underscores, which LIKE reads as wildcards, so one Project would find another's
+    task. A failing query is not caught here; a tick that cannot tell whether a task exists must publish nothing.
     """
-    prefix = f"{CREATED_BY}:{project_id}:"
+    prefix = _key_prefix(project_id)
     row = board.execute(
-        "SELECT id FROM tasks WHERE substr(idempotency_key, 1, ?) = ? AND status NOT IN ('done', 'archived') "
-        "ORDER BY created_at, id LIMIT 1",
-        (len(prefix), prefix),
+        "SELECT id FROM tasks WHERE created_by = ? AND substr(idempotency_key, 1, ?) = ? "
+        "AND status NOT IN ('done', 'archived') ORDER BY created_at, id LIMIT 1",
+        (CREATED_BY, len(prefix), prefix),
     ).fetchone()
     return None if row is None else row["id"]
 
@@ -346,14 +363,22 @@ def _store_result(registry: sqlite3.Connection, project_id: str, result: Summary
 def _harvest_one(
     registry: sqlite3.Connection, board: Optional[sqlite3.Connection], project_id: str, task_id: str, now: int
 ) -> None:
+    task = None if board is None else kanban_db.get_task(board, task_id)
+    # A task the tick did not make for this Project is not its request, and not the tick's to archive or change.
+    foreign = task is not None and not _made_for(task, project_id)
     if not _eligible(registry, project_id):
-        _retire(registry, board, project_id, task_id, now)
+        _retire(registry, None if foreign else board, project_id, task_id, now)
         return
     if board is None:
         logger.warning("project summary: the summary board is gone; nothing stored for Project %s", project_id)
         _record_failure(registry, None, project_id, task_id, now)
         return
-    task = kanban_db.get_task(board, task_id)
+    if foreign:
+        logger.warning(
+            "project summary: task %s was not made by the tick for Project %s; nothing stored", task_id, project_id
+        )
+        _record_failure(registry, None, project_id, task_id, now)
+        return
     if task is not None and task.status not in _SETTLED:
         return
     try:
@@ -447,6 +472,16 @@ def _open_summary_task(
         idempotency_key=_request_key(state),
         **route,
     )
+    # create_task returns the task that already holds the key, whoever made it and whatever its status.
+    made = kanban_db.get_task(board, task_id)
+    if made is None or not _made_for(made, project.id):
+        logger.warning(
+            "project summary: task %s holds the request key of Project %s but the tick did not make it; "
+            "nothing is recorded",
+            task_id, project.id,
+        )
+        _record_failure_before_publishing(registry, project.id, now)
+        return False
     # The claim holds only while the row is the one the key was made from. A loser archives its task only
     # if the winner recorded another one, and decides that inside the transaction that nobody else can write.
     with write_txn(registry):

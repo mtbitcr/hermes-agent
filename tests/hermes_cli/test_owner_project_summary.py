@@ -1990,3 +1990,338 @@ def test_stop_after_the_archive_of_a_closed_request_delays_the_next_request_by_a
     assert _summary_of(root, project_id)["revision"] == 1
     state = _state(root, project_id)
     assert (state["open_task_id"], state["failures"]) == (None, 0)
+
+
+# A task is the kernel's only when the kernel made it for that Project's request. Any worker of the planning role can
+# make a task the native way (kanban_create: its profile is the creator, the idempotency key is its own choice), so a
+# key vouches for nothing: a task made by anyone else is foreign, whatever its key, title, assignee or status.
+
+FOREIGN_OUTCOME = "The room is booked for Wednesday and nothing else is planned."
+KERNEL_OUTCOME = "The garden beds are planted and the watering plan is set."
+
+
+def _foreign_task(key: str) -> str:
+    """A task as the planning role makes it with kanban_create: the role is the creator, the key is its own."""
+    kanban_db.init_db()
+    if not kanban_db.board_exists(BOARD):
+        kanban_db.create_board(slug=BOARD, name="Project summaries")
+    with kanban_db.connect_closing(board=BOARD) as conn:
+        return kanban_db.create_task(
+            conn, title=TITLE + "Garden Plan", assignee=PLANNER, created_by=PLANNER, idempotency_key=key,
+        )
+
+
+def _task_snapshot(root: Path, task_id: str) -> dict:
+    """Everything the summary board holds about one task, read on a separate connection."""
+    path = _board_db(root, BOARD)
+    snapshot = {"task": _rows(path, "SELECT * FROM tasks WHERE id = ?", (task_id,))}
+    for table in ("task_runs", "task_events", "task_comments"):
+        snapshot[table] = _rows(path, f"SELECT * FROM {table} WHERE task_id = ? ORDER BY id", (task_id,))
+    assert snapshot["task"], task_id
+    return snapshot
+
+
+def _kernel_tasks(root: Path, project_id: str) -> list:
+    """The tasks the tick itself made for the Project, archived ones included, oldest first."""
+    return [
+        task for task in _summary_tasks(root, archived=True)
+        if task.created_by == "project-summary"
+        and (task.idempotency_key or "").startswith(f"project-summary:{project_id}:")
+    ]
+
+
+def _record_by_hand(root: Path, project_id: str, task_id: str) -> None:
+    """The state row as an older build or a crash could leave it: ``task_id`` is the Project's open task."""
+    with projects_db.connect_closing(root / "projects.db") as conn, projects_db.write_txn(conn):
+        conn.execute(
+            "INSERT INTO project_summary_state "
+            "(project_id, pending, pending_urgent, open_task_id, last_requested_at, updated_at) "
+            "VALUES (?, 0, 0, ?, ?, ?)",
+            (project_id, task_id, T0, T0),
+        )
+
+
+def _kernel_task_is_stored(root: Path, project_id: str, task_id: str, now: int) -> None:
+    """The Project's own task still works: its result, and not a foreign one, becomes the summary."""
+    _finish(root, task_id, _valid(outcome=KERNEL_OUTCOME))
+    _ops().summary_tick(now=now)
+    stored = _summary_of(root, project_id)
+    assert (stored["revision"], stored["outcome"]) == (1, KERNEL_OUTCOME)
+    assert _task_status(root, task_id) == "archived"
+
+
+def test_ready_task_made_by_anyone_else_with_the_request_key_is_a_failed_step_and_never_recorded(root, owner):
+    ops = _ops()
+    _clean(FOREIGN_OUTCOME, KERNEL_OUTCOME)
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    foreign = _foreign_task(f"project-summary:{project_id}:0:None")
+    assert _task_status(root, foreign) == "ready"
+    before = _task_snapshot(root, foreign)
+
+    assert ops.summary_tick(now=T0) == 0
+
+    state = _whole_state(root, project_id)
+    assert (state["open_task_id"], state["failures"], state["last_requested_at"], state["updated_at"]) == (
+        None, 1, None, T0,
+    )
+    assert _task_snapshot(root, foreign) == before
+    assert [task.id for task in _summary_tasks(root, archived=True)] == [foreign]
+
+    _finish(root, foreign, _valid(outcome=FOREIGN_OUTCOME))
+    finished = _task_snapshot(root, foreign)
+    for at in (T0 + 10, T0 + HOUR - 1):
+        assert ops.summary_tick(now=at) == 0
+        assert _state(root, project_id)["failures"] == 1
+        assert [task.id for task in _summary_tasks(root, archived=True)] == [foreign]
+    assert _summary_of(root, project_id) is None
+    assert _task_snapshot(root, foreign) == finished
+
+    assert ops.summary_tick(now=T0 + HOUR) == 1
+    [own] = _kernel_tasks(root, project_id)
+    assert own.idempotency_key == f"project-summary:{project_id}:1:None"
+    state = _state(root, project_id)
+    assert (state["open_task_id"], state["failures"]) == (own.id, 1)
+    assert _summary_of(root, project_id) is None
+    assert _task_snapshot(root, foreign) == finished
+
+    _kernel_task_is_stored(root, project_id, own.id, T0 + HOUR + 10)
+    assert _task_snapshot(root, foreign) == finished
+
+
+def test_ready_task_made_by_anyone_else_that_only_shares_the_prefix_is_ignored(root, owner):
+    ops = _ops()
+    _clean(FOREIGN_OUTCOME, KERNEL_OUTCOME)
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    foreign = _foreign_task(f"project-summary:{project_id}:9:12345")
+    before = _task_snapshot(root, foreign)
+
+    assert ops.summary_tick(now=T0) == 1
+
+    [own] = _kernel_tasks(root, project_id)
+    assert own.id != foreign
+    assert own.idempotency_key == f"project-summary:{project_id}:0:None"
+    state = _whole_state(root, project_id)
+    assert (state["open_task_id"], state["failures"], state["last_requested_at"]) == (own.id, 0, T0)
+    assert _task_snapshot(root, foreign) == before
+
+    _finish(root, foreign, _valid(outcome=FOREIGN_OUTCOME))
+    finished = _task_snapshot(root, foreign)
+    for at in (T0 + 10, T0 + HOUR):
+        assert ops.summary_tick(now=at) == 0
+    assert _summary_of(root, project_id) is None
+    state = _state(root, project_id)
+    assert (state["open_task_id"], state["failures"]) == (own.id, 0)
+    assert _task_snapshot(root, foreign) == finished
+    assert [task.id for task in _summary_tasks(root, archived=True)] == [foreign, own.id]
+
+    _kernel_task_is_stored(root, project_id, own.id, T0 + HOUR + 10)
+    assert _task_snapshot(root, foreign) == finished
+
+
+def test_finished_task_made_by_anyone_else_with_the_request_key_is_never_recorded_or_stored(root, owner):
+    ops = _ops()
+    _clean(FOREIGN_OUTCOME, KERNEL_OUTCOME)
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    foreign = _foreign_task(f"project-summary:{project_id}:0:None")
+    _finish(root, foreign, _valid(outcome=FOREIGN_OUTCOME))
+    assert _task_status(root, foreign) == "done"
+    finished = _task_snapshot(root, foreign)
+    assert _state(root, project_id) is None
+
+    assert ops.summary_tick(now=T0) == 0
+
+    state = _whole_state(root, project_id)
+    assert (state["open_task_id"], state["failures"], state["last_requested_at"], state["updated_at"]) == (
+        None, 1, None, T0,
+    )
+    assert _summary_of(root, project_id) is None
+    assert _task_snapshot(root, foreign) == finished
+    assert [task.id for task in _summary_tasks(root, archived=True)] == [foreign]
+
+    for at in (T0 + 10, T0 + HOUR - 1):
+        assert ops.summary_tick(now=at) == 0
+        assert _state(root, project_id)["failures"] == 1
+        assert _summary_of(root, project_id) is None
+    assert [task.id for task in _summary_tasks(root, archived=True)] == [foreign]
+
+    assert ops.summary_tick(now=T0 + HOUR) == 1
+    [own] = _kernel_tasks(root, project_id)
+    assert own.idempotency_key == f"project-summary:{project_id}:1:None"
+    state = _state(root, project_id)
+    assert (state["open_task_id"], state["failures"]) == (own.id, 1)
+    assert _summary_of(root, project_id) is None
+    assert _task_snapshot(root, foreign) == finished
+
+    _kernel_task_is_stored(root, project_id, own.id, T0 + HOUR + 10)
+    assert _task_snapshot(root, foreign) == finished
+
+
+def test_existing_summary_is_left_as_it_was_while_ready_and_finished_tasks_made_by_anyone_else_hold_its_keys(
+    root, owner,
+):
+    ops = _ops()
+    _clean(OUTCOME, NEXT_ACTION, DECISION, FOREIGN_OUTCOME)
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    with projects_db.connect_closing(root / "projects.db") as conn:
+        projects_db.write_project_summary(
+            conn, project_id, outcome=OUTCOME, next_action=NEXT_ACTION, owner_decision=DECISION,
+        )
+    official = _summary_of(root, project_id)
+    official_rows = _rows(root / "projects.db", "SELECT * FROM project_summaries")
+    assert (official["revision"], official["outcome"], official["next_action"], official["owner_decision"]) == (
+        1, OUTCOME, NEXT_ACTION, DECISION,
+    )
+    _seed_state(root, project_id, updated_at=T0 - 100)
+    ready = _foreign_task(f"project-summary:{project_id}:9:12345")
+    finished = _foreign_task(f"project-summary:{project_id}:0:None")
+    _finish(root, finished, _valid(outcome=FOREIGN_OUTCOME))
+    finished_before = _task_snapshot(root, finished)
+
+    def official_summary_is_untouched() -> None:
+        assert _summary_of(root, project_id) == official
+        assert _rows(root / "projects.db", "SELECT * FROM project_summaries") == official_rows
+
+    for at in (T0, T0 + 10, T0 + HOUR - 1):
+        ops.summary_tick(now=at)
+        official_summary_is_untouched()
+    _finish(root, ready, _valid(outcome=FOREIGN_OUTCOME))
+    ready_before = _task_snapshot(root, ready)
+    for at in (T0 + HOUR, T0 + HOUR + 10, T0 + 3 * HOUR, T0 + 3 * HOUR + 10):
+        ops.summary_tick(now=at)
+        official_summary_is_untouched()
+
+    assert _task_snapshot(root, ready) == ready_before
+    assert _task_snapshot(root, finished) == finished_before
+    [own] = _kernel_tasks(root, project_id)
+    state = _state(root, project_id)
+    assert (state["open_task_id"], state["failures"]) == (own.id, 1)
+
+
+@pytest.mark.parametrize("kind", ["made_by_anyone_else", "names_another_project"])
+def test_finished_task_recorded_for_a_project_that_is_not_its_own_stores_nothing_and_counts_one_failure(
+    root, owner, kind,
+):
+    ops = _ops()
+    _clean(FOREIGN_OUTCOME)
+    garden = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    desk = _project(owner, "Planning Desk", _DESK_CARDS)["project_id"]
+    if kind == "made_by_anyone_else":
+        task_id = _foreign_task(f"project-summary:{garden}:0:None")
+    else:
+        task_id = _summary_task_by_hand(desk, "Planning Desk", f"0:{T0}")
+    _finish(root, task_id, _valid(outcome=FOREIGN_OUTCOME))
+    _record_by_hand(root, garden, task_id)
+    assert _task_status(root, task_id) == "done"
+    before = _task_snapshot(root, task_id)
+
+    for at in (T0 + 10, T0 + 20, T0 + HOUR - 1):
+        ops.summary_tick(now=at)
+        state = _state(root, garden)
+        assert (state["open_task_id"], state["failures"], state["pending"]) == (None, 1, 1)
+        assert _rows(root / "projects.db", "SELECT count(*) FROM project_summaries") == [(0,)]
+        assert _task_snapshot(root, task_id) == before
+
+    assert _state(root, desk)["open_task_id"] != task_id
+
+
+@pytest.mark.parametrize("project", ["live", "archived"])
+@pytest.mark.parametrize("status", ["ready", "done"])
+def test_recorded_task_made_by_anyone_else_is_dropped_and_never_archived(root, owner, status, project):
+    ops = _ops()
+    _clean(FOREIGN_OUTCOME)
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    task_id = _foreign_task(f"project-summary:{project_id}:0:None")
+    if status == "done":
+        _finish(root, task_id, _valid(outcome=FOREIGN_OUTCOME))
+    _record_by_hand(root, project_id, task_id)
+    if project == "archived":
+        _leave(root, project_id, "archived")
+    before = _task_snapshot(root, task_id)
+
+    ops.summary_tick(now=T0 + 10)
+
+    state = _state(root, project_id)
+    assert (state["open_task_id"], state["failures"], state["pending"]) == (
+        None, 0 if project == "archived" else 1, 1,
+    )
+    assert _summary_of(root, project_id) is None
+    assert _task_snapshot(root, task_id) == before
+
+
+def test_tasks_made_by_anyone_else_store_nothing_under_the_worker_environment(root, owner, monkeypatch):
+    ops = _ops()
+    _clean(FOREIGN_OUTCOME, KERNEL_OUTCOME)
+    garden = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    desk = _project(owner, "Planning Desk", _DESK_CARDS)
+    desk_id = desk["project_id"]
+    ready = _foreign_task(f"project-summary:{garden}:9:12345")
+    finished = _foreign_task(f"project-summary:{garden}:0:None")
+    _finish(root, finished, _valid(outcome=FOREIGN_OUTCOME))
+    with _board(root, desk["board"]) as conn:
+        worker_task = kanban_db.create_task(
+            conn, title="Plan the next milestone", assignee=PLANNER, project_id=desk_id,
+        )
+    profile_home = root / "profiles" / PLANNER
+    profile_home.mkdir(parents=True)
+    with projects_db.connect_closing(profile_home / "projects.db"):
+        pass
+    _enter_planning_worker(monkeypatch, root, desk["board"], worker_task)
+    pinned = {name: os.environ[name] for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD")}
+    own_board = _board_db(root, desk["board"])
+    assert Path(pinned["HERMES_KANBAN_DB"]).resolve() == own_board.resolve()
+    own_cards = _rows(own_board, "SELECT id, title, status FROM tasks ORDER BY id")
+    ready_before, finished_before = _task_snapshot(root, ready), _task_snapshot(root, finished)
+
+    ops.summary_tick(now=T0)
+
+    [desk_task] = _kernel_tasks(root, desk_id)
+    assert _kernel_tasks(root, garden) == []
+    assert _rows(
+        root / "projects.db",
+        "SELECT open_task_id, failures FROM project_summary_state WHERE project_id = ?",
+        (garden,),
+    ) == [(None, 1)]
+    assert _task_snapshot(root, ready) == ready_before
+    assert _task_snapshot(root, finished) == finished_before
+
+    _finish(root, ready, _valid(outcome=FOREIGN_OUTCOME))
+    ready_finished = _task_snapshot(root, ready)
+    _finish(root, desk_task.id, _valid(outcome=KERNEL_OUTCOME))
+    ops.summary_tick(now=T0 + 10)
+    ops.summary_tick(now=T0 + HOUR)
+
+    # The independent count: a plain sqlite3 read of the root registry file.
+    registry = root / "projects.db"
+    assert _rows(registry, "SELECT project_id, revision, outcome FROM project_summaries") == [
+        (desk_id, 1, KERNEL_OUTCOME),
+    ]
+    assert _rows(registry, "SELECT revision FROM project_summaries WHERE project_id = ?", (garden,)) == []
+    [garden_task] = _kernel_tasks(root, garden)
+    assert garden_task.idempotency_key == f"project-summary:{garden}:1:None"
+    assert _rows(
+        registry, "SELECT open_task_id, failures FROM project_summary_state WHERE project_id = ?", (garden,),
+    ) == [(garden_task.id, 1)]
+    assert _task_snapshot(root, ready) == ready_finished
+    assert _task_snapshot(root, finished) == finished_before
+    assert {name: os.environ[name] for name in pinned} == pinned
+    assert _rows(own_board, "SELECT id, title, status FROM tasks ORDER BY id") == own_cards
+    assert _rows(profile_home / "projects.db", "SELECT count(*) FROM project_summaries") == [(0,)]
+    assert _rows(profile_home / "projects.db", "SELECT count(*) FROM project_summary_state") == [(0,)]
+
+
+def test_result_of_a_task_made_by_anyone_else_is_refused_by_the_parser(root, owner):
+    ops = _ops()
+    _clean(FOREIGN_OUTCOME)
+    project_id = _project(owner, "Garden Plan", _CARDS)["project_id"]
+    foreign = _foreign_task(f"project-summary:{project_id}:0:None")
+    own = _summary_task_by_hand(project_id, "Garden Plan", f"0:{T0}")
+    for task_id in (foreign, own):
+        _finish(root, task_id, _valid(outcome=FOREIGN_OUTCOME))
+    before = _task_snapshot(root, foreign)
+
+    with _board(root) as conn:
+        assert ops.parse_summary_result(conn, own).outcome == FOREIGN_OUTCOME
+        with pytest.raises(ops.SummaryRefused, match="not made by the summary tick"):
+            ops.parse_summary_result(conn, foreign)
+
+    assert _task_snapshot(root, foreign) == before
