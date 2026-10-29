@@ -24,24 +24,38 @@
 # each call: a call that comes back at or after the box is late even when it succeeded. A status of 124 or 137, or a
 # failure when the box is over, ends the run with reason box. Nothing on Server 2 is killed, stopped or removed for it.
 #
+# Why a transfer is staged, checked and only then published (steps a, b, c and f): nothing becomes active before every
+# side of its transfer has reported. The stage writes only under a new name (S2dir.new, the archive name with .part, an
+# image id without a tag, the page check folder with .new). Server 1 then reads the status of every side (the producer
+# on Server 1 and the receiver on Server 2, all through settle). Only after that a separate ssh call, bounded by the time
+# that is left, publishes: the marker and the two renames, the final archive name, the tag, the swap of the page check
+# folder. A failure at any side leaves the active folder, its marker, the archive name, the tags and the page check
+# folder as they were and ends with the fixed reason of that transfer; a retry at the same commit then ships again.
+#
 # Steps, in this order (S2dir is the Server 2 folder):
 #   0  read-only first look, three ssh calls, each only when the one before agreed: S2dir/.refresh-commit holds the
 #      commit, stack_up.sh versions shows the released versions, the page check folder exists in the browser container.
 #      When all three agree nothing is shipped, built or converged and only step g runs. Anything else means not current.
-#   a  scripts/journeys of the commit is shipped as a git archive into S2dir.new, with the file .refresh-commit (the
-#      commit) written into it, and swapped in with two renames (the old folder stays as S2dir.previous). Only when
+#   a  scripts/journeys of the commit is shipped as a git archive and extracted into S2dir.new (stage). When both sides
+#      reported 0, a second call writes the file .refresh-commit (the commit) into S2dir.new and swaps it in with two
+#      renames (publish; the old folder stays as S2dir.previous). Only the publish writes the marker. Only when
 #      S2dir/.refresh-commit differs from the commit.
-#   b  the owner app image is shipped (docker save into docker load) only when Server 2 lacks that id, then tagged
-#      raphael-journeys-app-base:<revision>
+#   b  the owner app image is shipped (docker save into docker load, which leaves an id without a tag: the stage) only
+#      when Server 2 lacks that id; once both sides reported 0 (or when nothing was shipped) a separate call tags it
+#      raphael-journeys-app-base:<revision> (the publish)
 #   c  the platform image raphael-journeys-platform:<commit>: when Server 2 lacks it, the git archive of the commit is
-#      shipped as one file, stack_up.sh build platform starts the build (it returns at once) and this script waits for the
-#      image: first look at once, then every 10 seconds (the last sleep cut to the time that is left), until the box
-#      runs out. Nothing on Server 2 is ever killed or stopped; a build still running at the box keeps running.
+#      shipped as one file under the name S2dir.platform-<commit>.tar.part (stage) and, when both sides reported 0,
+#      renamed to S2dir.platform-<commit>.tar by a second call (publish). Only then stack_up.sh build platform starts the
+#      build (it returns at once) and this script waits for the image: first look at once, then every 10 seconds (the
+#      last sleep cut to the time that is left), until the box runs out. Nothing on Server 2 is ever killed or stopped;
+#      a build still running at the box keeps running.
 #   d  stack_up.sh build proxy; its tag is read from the line "stack_up: built proxy <tag>"
 #   e  stack_up.sh converge <proxy tag> <revision> <commit> <revision>
 #   f  /opt/raphael-page-check of the owner app container is copied into the browser container as
-#      /opt/raphael-journeys/tools/page-check (docker cp streams on Server 2 only, through the file S2dir.page-check.tar;
-#      the old copy is replaced by renames, and only after both copies succeeded)
+#      /opt/raphael-journeys/tools/page-check. The stage is one remote chain of && without a pipe (docker cp streams on
+#      Server 2 only, through the file S2dir.page-check.tar, into the folder page-check.new, which is then checked to
+#      hold something), so the status of the remote shell is that of the first side that fails. The publish is a second
+#      call: the old folder is renamed aside, the new one renamed in, the old one removed, then the staging file.
 #   g  last, in every run that gets this far (also when the stack was already current): of each of the five repositories
 #      the two newest tags stay, and so does every tag that one of the five containers uses (stack_up.sh versions, read
 #      again); every other tag is removed, one docker image rm of repo:tag at a time
@@ -338,22 +352,26 @@ stack_is_current() {
 }
 if stack_is_current; then finish; fi
 
-# Step a. scripts/journeys of the commit goes into S2dir.new (the files directly in it) and is swapped in with two
-# renames; the folder it replaces stays as S2dir.previous, one generation. A stale .new or .previous is removed first.
-# The marker .refresh-commit (the commit this folder came from) is written into the new folder after tar and before the
-# renames, so the swap publishes folder and marker together. When the marker on Server 2 already names this commit,
-# no scripts archive is made at all.
+# Step a. scripts/journeys of the commit. The stage extracts the git archive into S2dir.new (the files directly in it; a
+# stale .new is removed first) and touches nothing else, so the active folder and its marker stay as they were until the
+# stream has settled with 0 for the producer, ssh and tar alike. The publish is a second call: the marker .refresh-commit
+# (the commit this folder came from) is written into the new folder, the folder it replaces becomes S2dir.previous (one
+# generation, a stale .previous is removed first) and the new folder is renamed to S2dir, so folder and marker become
+# active together. When the marker on Server 2 already names this commit, no scripts archive is made at all.
 S2_NEW=$S2_DIR.new
 S2_PREVIOUS=$S2_DIR.previous
-ship_scripts_cmd="if [ -e '$S2_NEW' ]; then rm -r '$S2_NEW'; fi && mkdir '$S2_NEW' && tar -xf - -C '$S2_NEW' --strip-components=2"
-ship_scripts_cmd+=" && echo '$COMMIT' > '$S2_NEW/.refresh-commit'"
-ship_scripts_cmd+=" && if [ -e '$S2_DIR' ]; then if [ -e '$S2_PREVIOUS' ]; then rm -r '$S2_PREVIOUS'; fi && mv '$S2_DIR' '$S2_PREVIOUS'; fi"
-ship_scripts_cmd+=" && mv '$S2_NEW' '$S2_DIR'"
+stage_scripts_cmd="if [ -e '$S2_NEW' ]; then rm -r '$S2_NEW'; fi && mkdir '$S2_NEW' && tar -xf - -C '$S2_NEW' --strip-components=2"
+publish_scripts_cmd="echo '$COMMIT' > '$S2_NEW/.refresh-commit'"
+publish_scripts_cmd+=" && if [ -e '$S2_DIR' ]; then if [ -e '$S2_PREVIOUS' ]; then rm -r '$S2_PREVIOUS'; fi && mv '$S2_DIR' '$S2_PREVIOUS'; fi"
+publish_scripts_cmd+=" && mv '$S2_NEW' '$S2_DIR'"
 if ((MARKER_SAME == 0)); then
-  stream "$ship_scripts_cmd" git -C "$ROOT" archive --format=tar "$COMMIT" scripts/journeys || fail ship-scripts
+  stream "$stage_scripts_cmd" git -C "$ROOT" archive --format=tar "$COMMIT" scripts/journeys || fail ship-scripts
+  remote "$publish_scripts_cmd" || fail ship-scripts
 fi
 
-# Step b. The owner app image: shipped only when Server 2 lacks that id, and tagged in every case.
+# Step b. The owner app image: shipped only when Server 2 lacks that id, and tagged in every case. The stage is docker save
+# into docker load (a loaded image id has no tag); the publish is the tag, a separate call that only starts when the
+# stream has settled with 0 on both sides.
 image_known "$IMAGE_ID"
 case $? in
   0) ;;
@@ -362,16 +380,18 @@ case $? in
 esac
 remote "docker tag '$IMAGE_ID' 'raphael-journeys-app-base:$REVISION'" || fail app-image
 
-# Step c. The platform image. Its archive is shipped as one file (a temporary name, then renamed) only when the image is
-# missing; the build is started detached by stack_up.sh and waited for here: the first look at once, then every
-# POLL_SECONDS (the last sleep cut to the time that is left), until the box runs out. A build still running then is left
-# running; every call of the wait ends the run with reason box when it comes back at or after the box.
+# Step c. The platform image. Its archive is shipped as one file only when the image is missing: the stage writes it under
+# the name .part, and only when the stream has settled with 0 on both sides a second call renames it to the archive name,
+# so no file with the archive name exists unless it is whole. Only then the build is started detached by stack_up.sh and
+# waited for here: the first look at once, then every POLL_SECONDS (the last sleep cut to the time that is left), until
+# the box runs out. A build still running then is left running; every call of the wait ends the run with reason box when
+# it comes back at or after the box.
 PLATFORM_REF=raphael-journeys-platform:$COMMIT
 PLATFORM_ARCHIVE=$S2_DIR.platform-$COMMIT.tar
 build_platform() {
   local nap
-  stream "cat > '$PLATFORM_ARCHIVE.part' && mv '$PLATFORM_ARCHIVE.part' '$PLATFORM_ARCHIVE'" \
-    git -C "$ROOT" archive --format=tar "$COMMIT" || fail platform-build
+  stream "cat > '$PLATFORM_ARCHIVE.part'" git -C "$ROOT" archive --format=tar "$COMMIT" || fail platform-build
+  remote "mv '$PLATFORM_ARCHIVE.part' '$PLATFORM_ARCHIVE'" || fail platform-build
   remote "cd '$S2_DIR' && ./stack_up.sh build platform '$COMMIT' '$PLATFORM_ARCHIVE'" || fail platform-build
   while :; do
     image_known "$PLATFORM_REF"
@@ -416,21 +436,25 @@ done <<< "$REMOTE_OUT"
   $LAST_LINE == "stack_up: the first reset starts the owner app and the gateway" ]] || fail converge
 
 # Step f. The page check of the owner app, copied container to container on Server 2 (docker cp reads a stopped owner
-# app too). One remote command with the steps joined by && (the remote shell has no pipefail, so no pipe joins the two
-# docker cp): the copy is made beside the final folder (.new, after a stale .new or .old is removed), out of the owner app
-# into the staging file S2dir.page-check.tar and out of that file into the browser container; only when both succeeded it
-# is checked to hold something (an empty stream is not an error for docker cp) and swapped in with renames; the old folder
-# is removed last, then the staging file. A step that fails stops the chain before the swap, so the final folder is never
-# half a copy.
+# app too), staged and published in two remote calls. The stage is one command with the steps joined by && (the remote
+# shell has no pipefail, so no pipe joins the two docker cp): the copy is made beside the final folder (.new, after a
+# stale .new or .old is removed), out of the owner app into the staging file S2dir.page-check.tar and out of that file
+# into the browser container, and then .new is checked to hold something (an empty stream is not an error for docker cp).
+# Only when the stage has reported 0 does a second call swap .new in with renames (the old folder is kept as .old until
+# the rename has worked, and put back when it did not) and remove the staging file. A step that fails ends the run before
+# the swap, so the final folder is never half a copy and stays as it was.
 PAGE_PREPARE='for d in "$1" "$2"; do if [ -e "$d" ]; then rm -r "$d" || exit 1; fi; done; mkdir -p "$1"'
-PAGE_SWAP='n=$1; f=$2; o=$3; set -- "$n"/*; [ -e "$1" ] || exit 1; if [ -e "$f" ]; then mv "$f" "$o" || exit 1; fi;'
+PAGE_CHECK='set -- "$1"/*; [ -e "$1" ] || exit 1'
+PAGE_SWAP='n=$1; f=$2; o=$3; if [ -e "$f" ]; then mv "$f" "$o" || exit 1; fi;'
 PAGE_SWAP+=' if mv "$n" "$f"; then if [ -e "$o" ]; then rm -r "$o"; fi; exit 0; fi; if [ -e "$o" ]; then mv "$o" "$f"; fi; exit 1'
-page_check_cmd="docker exec '$BROWSER_C' sh -c '$PAGE_PREPARE' sh '$BROWSER_PAGE_CHECK.new' '$BROWSER_PAGE_CHECK.old'"
-page_check_cmd+=" && docker cp '$APP_C:$OPT_PAGE_CHECK/.' - > '$S2_DIR.page-check.tar'"
-page_check_cmd+=" && docker cp - '$BROWSER_C:$BROWSER_PAGE_CHECK.new' < '$S2_DIR.page-check.tar'"
-page_check_cmd+=" && docker exec '$BROWSER_C' sh -c '$PAGE_SWAP' sh '$BROWSER_PAGE_CHECK.new' '$BROWSER_PAGE_CHECK' '$BROWSER_PAGE_CHECK.old'"
-page_check_cmd+=" && if [ -e '$S2_DIR.page-check.tar' ]; then rm '$S2_DIR.page-check.tar'; fi"
-remote "$page_check_cmd" || fail page-check
+page_check_stage="docker exec '$BROWSER_C' sh -c '$PAGE_PREPARE' sh '$BROWSER_PAGE_CHECK.new' '$BROWSER_PAGE_CHECK.old'"
+page_check_stage+=" && docker cp '$APP_C:$OPT_PAGE_CHECK/.' - > '$S2_DIR.page-check.tar'"
+page_check_stage+=" && docker cp - '$BROWSER_C:$BROWSER_PAGE_CHECK.new' < '$S2_DIR.page-check.tar'"
+page_check_stage+=" && docker exec '$BROWSER_C' sh -c '$PAGE_CHECK' sh '$BROWSER_PAGE_CHECK.new'"
+remote "$page_check_stage" || fail page-check
+page_check_publish="docker exec '$BROWSER_C' sh -c '$PAGE_SWAP' sh '$BROWSER_PAGE_CHECK.new' '$BROWSER_PAGE_CHECK' '$BROWSER_PAGE_CHECK.old'"
+page_check_publish+=" && if [ -e '$S2_DIR.page-check.tar' ]; then rm '$S2_DIR.page-check.tar'; fi"
+remote "$page_check_publish" || fail page-check
 
 # Step g, last: finish runs retention (defined above) and ends the run.
 finish

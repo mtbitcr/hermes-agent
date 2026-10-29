@@ -6,11 +6,15 @@ symlinks to bash and dirname). Every stand-in logs its call to one file, in orde
 answers.json. Only the fake ssh (Server 2) keeps state: state.json is read and rewritten inside an
 exclusive flock and is published by rename, so no process ever sees half of it; the git and docker of
 Server 1 never touch it. The fake ssh records [destination, command, stdin size and sha256], answers by
-the kind of command and may advance the clock; it runs three commands for real in a temporary Server 2
-folder (the marker read, the scripts swap, and the page check copy against a fake docker that maps each
-container to a folder). The clock is a number in a file that is published by rename: date +%s prints it,
-sleep N adds N and returns at once, timeout logs its seconds and runs the wrapped command. No test reaches
-a real host, docker or ssh. Runs of the script are shared between tests that look at the same scenario.
+the kind of command and may advance the clock; it runs the commands that touch files for real in a temporary
+Server 2 folder (the marker read, the scripts stage and publish, the platform archive stage, publish and
+removal, and the page check stage and publish against a fake docker that maps each container to a folder).
+A producer may exit non-zero after a complete stream (late_rc) or after a stream cut between entries (cut),
+and the tests compare what is on the fake Server 2 before and after a failed run: nothing may be published
+until every side of a transfer has reported. The clock is a number in a file that is published by rename:
+date +%s prints it, sleep N adds N and returns at once, timeout logs its seconds and runs the wrapped command.
+No test reaches a real host, docker or ssh. Runs of the script are shared between tests that look at the same
+scenario.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -45,6 +50,7 @@ PROXY_TAG = "0123456789ab"
 CA = "cacacacacaca"
 APP_TAG = f"{REVISION}-{CA}"
 PLATFORM_REF = f"raphael-journeys-platform:{COMMIT}"
+APP_BASE_TAG = f"raphael-journeys-app-base:{REVISION}"
 CLOCK_START = 1_700_000_000
 BOX = 1500
 OPT = "/opt/raphael-page-check"
@@ -147,11 +153,14 @@ def end(rc, out=None, data=None):
     sys.exit(rc)
 
 
-def make_tar(files):
+def make_tar(files, cut=None):
+    # cut: the name of an entry; the archive then ends at the header boundary before it, without end-of-archive blocks
     import io, tarfile
-    buf, seen = io.BytesIO(), set()
+    buf, seen, end_at = io.BytesIO(), set(), None
     with tarfile.open(fileobj=buf, mode="w") as tar:
         for path in sorted(files):
+            if cut and end_at is None and path.endswith("/" + cut):
+                end_at = buf.tell()
             parts = path.split("/")
             for i in range(1, len(parts)):
                 folder = "/".join(parts[:i])
@@ -164,7 +173,7 @@ def make_tar(files):
             info = tarfile.TarInfo(path)
             info.size, info.mode = len(blob), (0o755 if path.endswith(".sh") else 0o644)
             tar.addfile(info, io.BytesIO(blob))
-    return buf.getvalue()
+    return buf.getvalue() if end_at is None else buf.getvalue()[:end_at]
 
 
 if name == "git":
@@ -184,9 +193,9 @@ if name == "git":
         if out is not None:
             bump_clock(A["advance"].get(label, 0))
         end(rc, out="" if rc else out)
-    data = make_tar(A["scripts_files"] if label.endswith("scripts") else A["commit_files"])
+    data = make_tar(A["scripts_files"] if label.endswith("scripts") else A["commit_files"], A["cut"].get(label))
     record(label, dir=where, sha=sha(data))
-    end(0, data=data)
+    end(A["late_rc"].get(label, 0), data=data)
 
 if name == "docker":
     if args[:1] == ["inspect"]:
@@ -197,7 +206,7 @@ if name == "docker":
         data = A["save_data"].encode("utf-8")
         rc = A["rc"].get("docker save", 0)
         record("docker save", sha=sha(data))
-        end(rc, data=b"" if rc else data)
+        end(rc or A["late_rc"].get("docker save", 0), data=b"" if rc else data)
     record("docker other")
     end(98, out="")
 '''
@@ -220,7 +229,10 @@ if name == "ssh":
         (f"cd '{D}' && ./stack_up.sh build platform ", "build-platform"),
         (f"cd '{D}' && ./stack_up.sh converge ", "converge"), ("rm ", "rm-archive"),
         ("docker image ls ", "list-tags"), ("docker image rm ", "remove-tag"),
+        ("echo ", "publish-scripts"), ("mv ", "publish-platform"), ("docker exec ", "publish-page-check"),
     ]
+    REAL_KINDS = ("marker", "ship-scripts", "publish-scripts", "ship-platform", "publish-platform", "rm-archive",
+                  "copy-page-check", "publish-page-check")
     kind = exact.get(command)
     if kind is None:
         if " tar -xf - -C " in command:
@@ -268,7 +280,7 @@ if name == "ssh":
             rc = forced or 0
         elif forced is not None:
             rc = forced
-        elif kind in ("marker", "ship-scripts", "copy-page-check"):
+        elif kind in REAL_KINDS:
             real = True
         elif kind == "has-image":
             ref = "raphael-journeys-platform:" + A["head"]
@@ -287,10 +299,14 @@ if name == "ssh":
             repo, tag = arg.split(":", 1)
             if tag in state["tags"].get(repo, []):
                 state["tags"][repo].remove(tag)
-        elif kind not in ("page-check-present", "ship-platform", "build-platform", "rm-archive"):
+        elif kind == "build-platform":
+            rc = 0 if os.path.exists(last) else 1
+        elif kind != "page-check-present":
             rc = 98
         if kind == "build-platform" and rc == 0:
             state["built_at"] = now() + advance
+            with open(last, "rb") as handle:
+                state["archive_sha"] = sha(handle.read())
         if kind == "converge" and rc == 0:
             state["converged"] = True
         pause()
@@ -300,6 +316,9 @@ if name == "ssh":
         env = {"PATH": os.path.join(top, "s2bin"), "HOME": top}
         done = subprocess.run(["/bin/sh", "-c", command], env=env, input=data, capture_output=True, cwd=top)
         rc, out = done.returncode, (done.stdout.decode("utf-8") if kind == "marker" else None)
+    late = pick(A["late_rc"])
+    if late is not None:
+        rc = late
     bump_clock(advance)
     end(rc, out=out)
 
@@ -334,7 +353,7 @@ if name == "s2-docker":
                 if failing and rel.endswith("helper.js"):
                     continue  # a valid archive that stops short of the whole folder
                 tar.add(os.path.join(base, rel), arcname="./" + rel, recursive=False)
-        sys.exit(failing)
+        sys.exit(failing or A["late_rc"].get("s2docker cp-out", 0))
     if op == "cp-in":
         import io, tarfile
         container, dst = args[2].split(":", 1)
@@ -355,15 +374,16 @@ def versions_text(proxy=PROXY_TAG, app=APP_TAG, dashboard=COMMIT, gateway=COMMIT
 
 
 FULL_RUN = [
-    "marker", "ship-scripts", "has-image", "load", "tag", "has-image", "ship-platform", "build-platform",
-    "has-image", "rm-archive", "build-proxy", "converge", "copy-page-check", "versions", *["list-tags"] * 5,
+    "marker", "ship-scripts", "publish-scripts", "has-image", "load", "tag", "has-image", "ship-platform",
+    "publish-platform", "build-platform", "has-image", "rm-archive", "build-proxy", "converge", "copy-page-check",
+    "publish-page-check", "versions", *["list-tags"] * 5,
 ]
 CURRENT_RUN = ["marker", "versions", "page-check-present", "versions", *["list-tags"] * 5]
 CACHED_RUN = [
     "marker", "versions", "has-image", "tag", "has-image", "build-proxy", "converge", "copy-page-check",
-    "versions", *["list-tags"] * 5,
+    "publish-page-check", "versions", *["list-tags"] * 5,
 ]
-SHIPPING = {"ship-scripts", "load", "ship-platform", "build-platform"}
+SHIPPING = {"ship-scripts", "publish-scripts", "load", "ship-platform", "publish-platform", "build-platform"}
 
 
 def tokens(text: str) -> list[str]:
@@ -446,7 +466,7 @@ class Sandbox:
                 "scripts/journeys/images/proxy.Dockerfile": "FROM scratch\n",
             },
             "commit_files": {"Dockerfile": "FROM scratch\n", "app/main.py": "print(1)\n"},
-            "images": [], "tags": {}, "ready_after": 0, "rc": {}, "advance": {},
+            "images": [], "tags": {}, "ready_after": 0, "rc": {}, "advance": {}, "late_rc": {}, "cut": {},
             "out": {
                 "versions": versions_text("none", "none", "none", "none", "none"),
                 "versions_after": versions_text(),
@@ -547,7 +567,7 @@ class Sandbox:
 
     def answer(self, **changes) -> None:
         for key, value in changes.items():
-            merged = key in ("rc", "out", "advance", "inspect")
+            merged = key in ("rc", "out", "advance", "inspect", "late_rc", "cut")
             self.answers[key] = {**self.answers[key], **value} if merged else value
         (self.top / "answers.json").write_text(json.dumps(self.answers), encoding="utf-8")
 
@@ -626,6 +646,25 @@ class Sandbox:
 
     def elapsed(self) -> int:
         return int((self.top / "clock").read_text(encoding="utf-8")) - CLOCK_START
+
+    def server2(self) -> dict:
+        """What is active on the fake Server 2: every file and folder beside the scripts folder (names of a staging
+        kind left out), the image names (a loaded image id with no tag is not one), the retention tags, the build
+        and converge marks, and the page check of the browser."""
+        staging = (".new", ".part", ".page-check.tar")
+        parent = self.s2dir.parent
+        path = self.top / "state.json"
+        state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {
+            "images": self.answers["images"], "tags": self.answers["tags"], "built_at": None, "converged": False,
+        }
+        found = [p for p in sorted(parent.rglob("*")) if not any(part.endswith(staging) for part in p.relative_to(parent).parts)]
+        return {
+            "files": {str(p.relative_to(parent)): p.read_bytes() for p in found if p.is_file()},
+            "folders": [str(p.relative_to(parent)) for p in found if p.is_dir()],
+            "refs": sorted({i for i in state["images"] if not i.startswith("sha256:")}), "tags": state["tags"],
+            "built": state["built_at"], "converged": state["converged"],
+            "page": tree(self.old_copy) if self.old_copy.exists() else None,
+        }
 
     def stdin_calls(self) -> list[str]:
         return [call["call"] for call in self.ssh_calls() if call["stdin_size"]]
@@ -993,8 +1032,8 @@ def expected_scripts(box: Sandbox) -> dict[str, str]:
 def test_scripts_are_shipped_first_among_the_shipping_steps(shared):
     box, _ = shared("full")
     kinds = box.kinds()
-    assert kinds[:2] == ["marker", "ship-scripts"]
-    assert kinds.index("ship-scripts") < min(kinds.index(k) for k in ("load", "ship-platform", "build-platform"))
+    assert kinds[:3] == ["marker", "ship-scripts", "publish-scripts"]
+    assert 2 < min(kinds.index(k) for k in ("load", "ship-platform", "build-platform"))
     (ship,) = box.of("ship-scripts")
     (archive,) = box.of("git archive scripts")
     assert ship["stdin_sha"] == archive["sha"] and ship["stdin_size"] > 0
@@ -1009,12 +1048,17 @@ def test_a_first_run_without_a_folder_creates_it_with_the_files_and_the_marker_d
     assert not (parent / "raphael-journeys.new").exists() and not (parent / "raphael-journeys.previous").exists()
 
 
-def test_the_ship_command_writes_the_marker_into_the_new_folder_after_the_extract_and_before_the_renames(shared):
+def test_the_stage_only_extracts_into_the_new_folder_and_the_publish_call_writes_the_marker_before_the_renames(shared):
     box, _ = shared("full")
-    (command,) = box.remote("ship-scripts")
-    write = f"echo '{COMMIT}' > '{box.s2dir}.new/.refresh-commit'"
-    assert command.count(write) == 1
-    assert command.index("tar -xf -") < command.index(write) < command.index("mv ")
+    new = f"{box.s2dir}.new"
+    assert box.kinds()[1:3] == ["ship-scripts", "publish-scripts"]
+    (stage,) = box.remote("ship-scripts")
+    (publish,) = box.remote("publish-scripts")
+    write = f"echo '{COMMIT}' > '{new}/.refresh-commit'"
+    assert stage == (f"if [ -e '{new}' ]; then rm -r '{new}'; fi && mkdir '{new}' && tar -xf - -C '{new}' --strip-components=2")
+    assert publish.count(write) == 1 and publish.startswith(write) and publish.index(write) < publish.index("mv ")
+    assert "tar -xf" not in publish and publish.endswith(f"mv '{new}' '{box.s2dir}'")
+    assert [c["stdin_size"] > 0 for c in (box.of("ship-scripts")[0], box.of("publish-scripts")[0])] == [True, False]
 
 
 def test_an_existing_folder_is_kept_as_the_previous_copy_and_the_new_one_holds_the_marker(box):
@@ -1048,14 +1092,17 @@ def test_a_second_refresh_replaces_the_previous_copy_and_a_stale_new_folder(box)
     assert tree(box.s2dir) == {"stack_up.sh": "# third generation\n", ".refresh-commit": COMMIT + "\n"}
 
 
-@pytest.mark.parametrize("rc", [{"ship-scripts": 1}, {"git archive scripts": 1}], ids=["ssh", "git"])
-def test_scripts_that_cannot_be_shipped_end_the_run(box, rc):
+@pytest.mark.parametrize("rc, kinds", [
+    ({"ship-scripts": 1}, ["marker", "ship-scripts"]), ({"git archive scripts": 1}, ["marker", "ship-scripts"]),
+    ({"publish-scripts": 1}, ["marker", "ship-scripts", "publish-scripts"]),
+], ids=["receiver", "producer", "publish"])
+def test_scripts_that_cannot_be_shipped_end_the_run(box, rc, kinds):
     box.answer(rc=rc)
     expect_failure(box.run(), "ship-scripts")
-    assert box.kinds() == ["marker", "ship-scripts"] and not box.s2dir.exists()
+    assert box.kinds() == kinds and not box.s2dir.exists()
 
 
-def test_a_real_failure_of_the_scripts_swap_ends_the_run_and_changes_nothing(box):
+def test_a_real_failure_of_the_scripts_stage_ends_the_run_before_any_publish_and_changes_nothing(box):
     broken = box.top / "no-such-parent" / "raphael-journeys"
     box.answer(s2_dir=str(broken))
     expect_failure(box.run(JOURNEY_S2_SCRIPTS_DIR=str(broken)), "ship-scripts")
@@ -1066,9 +1113,13 @@ def test_every_remote_command_parses_as_sh(shared):
     box, done = shared("full")
     expect_success(done)
     assert box.kinds() == FULL_RUN
+    assert {"publish-scripts", "publish-platform", "copy-page-check", "publish-page-check"} <= set(box.kinds())
     for call in box.ssh_calls():
-        parsed = subprocess.run(["sh", "-n", "-c", call["remote"]], capture_output=True, encoding="utf-8", text=True)
-        assert parsed.returncode == 0, (call["remote"], parsed.stderr)
+        words = shlex.split(call["remote"])
+        inner = [words[i + 1] for i, word in enumerate(words[:-1]) if word == "-c"]
+        for text in [call["remote"], *inner]:
+            parsed = subprocess.run(["sh", "-n", "-c", text], capture_output=True, encoding="utf-8", text=True)
+            assert parsed.returncode == 0, (text, parsed.stderr)
 
 
 # ---- b. the owner app image: loaded only when Server 2 lacks the id --------------------------------
@@ -1100,7 +1151,7 @@ def test_a_missing_app_image_is_saved_once_and_loaded_once_and_then_tagged(share
 def test_any_exit_but_0_and_1_of_the_image_question_is_a_failure(box, rc):
     box.answer(rc={f"has-image {IMAGE_ID}": rc})
     expect_failure(box.run(), "image-ask")
-    assert box.kinds() == ["marker", "ship-scripts", "has-image"] and box.of("docker save") == []
+    assert box.kinds() == ["marker", "ship-scripts", "publish-scripts", "has-image"] and box.of("docker save") == []
 
 
 @pytest.mark.parametrize("rc", [{"load": 1}, {"tag": 1}, {"docker save": 1}], ids=["load", "tag", "save"])
@@ -1108,6 +1159,7 @@ def test_a_failed_load_tag_or_save_ends_with_its_reason(box, rc):
     box.answer(rc=rc)
     expect_failure(box.run(), "app-image")
     assert not {"build-platform", "converge"} & set(box.kinds())
+    assert APP_BASE_TAG not in box.server2()["refs"], "the tag is made only after the whole image was loaded"
 
 
 # ---- c. the platform image ------------------------------------------------------------------------
@@ -1124,18 +1176,23 @@ def test_both_images_known_and_the_marker_equal_cross_nothing_and_the_stack_stil
     assert box.sleeps() == [] and not box.staging.parent.joinpath("raphael-journeys.new").exists()
 
 
-def test_a_missing_platform_image_is_shipped_as_one_file_under_a_temporary_name_and_built(shared):
+def test_a_missing_platform_image_is_staged_as_one_file_under_a_temporary_name_published_by_a_rename_and_built(shared):
     box, done = shared("no-platform")
     expect_success(done)
     part, final = f"{box.archive()}.part", box.archive()
-    assert box.remote("ship-platform") == [f"cat > '{part}' && mv '{part}' '{final}'"]
+    assert box.remote("ship-platform") == [f"cat > '{part}'"]
+    assert box.remote("publish-platform") == [f"mv '{part}' '{final}'"]
     assert box.remote("build-platform") == [box.cmd(f"./stack_up.sh build platform '{COMMIT}' '{final}'")]
     (ship,) = box.of("ship-platform")
     (git,) = box.of("git archive commit")
     assert ship["stdin_sha"] == git["sha"] and git["argv"][1:] == ["-C", str(box.checkout), "archive", "--format=tar", COMMIT]
+    assert [c["stdin_size"] for c in box.of("publish-platform")] == [0]
     kinds = box.kinds()
-    assert kinds.index("ship-platform") + 1 == kinds.index("build-platform") and kinds.count("build-platform") == 1
+    assert kinds.index("ship-platform") + 2 == kinds.index("publish-platform") + 1 == kinds.index("build-platform")
+    assert kinds.count("build-platform") == 1
     assert box.server1() == ["git toplevel", "git head", "docker inspect", "git archive commit"]
+    state = json.loads((box.top / "state.json").read_text(encoding="utf-8"))
+    assert state["archive_sha"] == git["sha"], "the build must see the whole archive under its final name"
 
 
 def test_the_wait_checks_at_once_then_every_ten_seconds_and_the_archive_is_removed_when_the_image_is_there(box):
@@ -1159,13 +1216,15 @@ def test_a_platform_question_that_fails_ends_the_run_before_shipping(box):
     assert "ship-platform" not in box.kinds() and box.of("git archive commit") == []
 
 
-@pytest.mark.parametrize("rc", [{"ship-platform": 1}, {"build-platform": 1}, {"git archive commit": 1}],
-                         ids=["ship", "build", "git"])
-def test_a_platform_archive_or_build_that_fails_ends_the_run(box, rc):
+@pytest.mark.parametrize("rc, last", [
+    ({"ship-platform": 1}, "ship-platform"), ({"publish-platform": 1}, "publish-platform"),
+    ({"build-platform": 1}, "build-platform"), ({"git archive commit": 1}, "ship-platform"),
+], ids=["ship", "publish", "build", "git"])
+def test_a_platform_archive_or_build_that_fails_ends_the_run(box, rc, last):
     no_platform(box)
     box.answer(rc=rc)
     expect_failure(box.run(), "platform-build")
-    assert not {"build-proxy", "rm-archive", "converge"} & set(box.kinds())
+    assert box.kinds()[-1] == last and not {"build-proxy", "rm-archive", "converge"} & set(box.kinds())
 
 
 # ---- d. proxy build, e. converge -------------------------------------------------------------------
@@ -1236,20 +1295,27 @@ def test_a_converge_that_does_not_end_well_ends_with_its_reason(box, out, rc):
 # ---- f. the page check copy ------------------------------------------------------------------------
 
 
-def test_the_page_check_is_copied_by_one_command_joined_with_and_after_converge_and_before_the_retention(shared):
+def test_the_page_check_is_staged_by_one_chain_without_a_pipe_and_published_by_a_second_call_before_the_retention(shared):
     box, done = shared("cached")
     expect_success(done)
     kinds = box.kinds()
-    assert kinds.index("converge") + 1 == kinds.index("copy-page-check") == kinds.index("versions", kinds.index("converge")) - 1
-    (command,) = box.remote("copy-page-check")
-    tar, dest = f"{box.s2dir}.page-check.tar", BROWSER_PAGE_CHECK
+    at = kinds.index("converge")
+    assert kinds[at + 1:at + 4] == ["copy-page-check", "publish-page-check", "versions"]
+    (stage,) = box.remote("copy-page-check")
+    (publish,) = box.remote("publish-page-check")
+    tar, final = f"{box.s2dir}.page-check.tar", BROWSER_PAGE_CHECK
+    exec_sh = f"docker exec '{box.browser_c}' sh -c "
     produce = f"docker cp '{box.app_c}:{OPT}/.' - > '{tar}'"
-    consume = f"docker cp - '{box.browser_c}:{dest}.new' < '{tar}'"
+    consume = f"docker cp - '{box.browser_c}:{final}.new' < '{tar}'"
     clean = f"if [ -e '{tar}' ]; then rm '{tar}'; fi"
-    assert command.count("docker cp ") == 2 and command.count(" && ") == 4 and box.of("copy-page-check")[0]["stdin_size"] == 0
-    assert not re.search(r"(?<!\|)\|(?!\|)", command), "the copy must not be a pipeline"
-    assert command.index(produce) < command.index(consume) < command.rindex("mv ") < command.index(clean)
-    assert command.endswith(clean) and command.startswith(f"docker exec '{box.browser_c}' sh -c ")
+    assert stage.count("docker cp ") == 2 and stage.count(" && ") == 3 and stage.count(exec_sh) == 2
+    assert not re.search(r"(?<!\|)\|(?!\|)", stage), "the stage must not be a pipeline"
+    assert stage.startswith(exec_sh) and stage.index(produce) < stage.index(consume) < stage.rindex(exec_sh)
+    assert stage.endswith(f" sh '{final}.new'") and not re.search(re.escape(final) + r"(?!\.(new|old)')", stage)
+    assert "mv " not in stage and "rm " not in stage.split(produce)[1], "the stage must not swap or clean anything"
+    assert publish.startswith(exec_sh) and publish.endswith(clean) and publish.count(" && ") == 1
+    assert f" sh '{final}.new' '{final}' '{final}.old' && " in publish and "docker cp" not in publish
+    assert [c["stdin_size"] for c in box.of("copy-page-check") + box.of("publish-page-check")] == [0, 0]
 
 
 def test_the_copy_replaces_the_old_page_check_with_the_whole_new_one_and_leaves_no_sibling_or_staging_file(shared):
@@ -1274,8 +1340,11 @@ def test_renamed_containers_of_the_template_are_the_ones_used(box):
     box.edit_template("raphael-journeys-browser", "browser-renamed")
     source = tree(box.source_folder)
     expect_success(box.run())
+    assert box.kinds() == CACHED_RUN
     (command,) = box.remote("copy-page-check")
+    (publish,) = box.remote("publish-page-check")
     assert "'owner-app-renamed:" in command and "'browser-renamed:" in command and "raphael-journeys-" not in command
+    assert publish.startswith("docker exec 'browser-renamed' sh -c ") and "raphael-journeys-" not in publish
     assert tree(box.old_copy) == source and "browser-renamed" in str(box.old_copy)
 
 
@@ -1292,24 +1361,194 @@ def _no_browser(box):
     shutil.rmtree(box.fs / box.browser_c)
 
 
+STAGE, PUBLISH = "copy-page-check", "publish-page-check"
 PAGE_FAILS = {
-    "no source": _no_source, "empty source": _empty_source, "no browser": _no_browser,
-    "producer fails with 23 after a valid partial archive": lambda box: box.answer(rc={"s2docker cp-out": 23}),
-    "consumer fails": lambda box: box.answer(rc={"s2docker cp-in": 1}),
-    "swap fails and rolls back": lambda box: (box.top / "mv-fails").write_text("x", encoding="utf-8"),
-    "forced failure": lambda box: box.answer(rc={"copy-page-check": 1}),
+    "no source": (_no_source, STAGE), "empty source": (_empty_source, STAGE), "no browser": (_no_browser, STAGE),
+    "producer fails with 23 after a valid partial archive": (lambda box: box.answer(rc={"s2docker cp-out": 23}), STAGE),
+    "consumer fails": (lambda box: box.answer(rc={"s2docker cp-in": 1}), STAGE),
+    "remote shell fails after the whole stage ran": (lambda box: box.answer(late_rc={STAGE: 255}), STAGE),
+    "swap fails and rolls back": (lambda box: (box.top / "mv-fails").write_text("x", encoding="utf-8"), PUBLISH),
+    "forced failure of the stage": (lambda box: box.answer(rc={STAGE: 1}), STAGE),
+    "forced failure of the publish": (lambda box: box.answer(rc={PUBLISH: 1}), PUBLISH),
 }
 
 
-@pytest.mark.parametrize("setup", list(PAGE_FAILS.values()), ids=list(PAGE_FAILS))
-def test_a_failed_copy_ends_the_run_keeps_the_old_copy_untouched_and_removes_nothing(box, setup):
+@pytest.mark.parametrize("setup, last", list(PAGE_FAILS.values()), ids=list(PAGE_FAILS))
+def test_a_failed_copy_ends_the_run_keeps_the_old_copy_untouched_and_removes_nothing(box, setup, last):
     cached(box)
     box.answer(tags=RETENTION_TAGS)
     setup(box)
+    before = box.server2()
     expect_failure(box.run(), "page-check")
     if (box.fs / box.browser_c).exists():
         assert tree(box.old_copy) == {"old.txt": "OLD\n"}
-    assert box.kinds()[-1] == "copy-page-check" and box.of("remove-tag") == [] and box.of("list-tags") == []
+    assert box.server2() == after_converge(before)
+    assert box.kinds()[-1] == last and box.of("remove-tag") == [] and box.of("list-tags") == []
+
+
+# ---- owner rule 2: stage, check every side, then publish. One regression per transfer ---------------
+
+SCRIPTS_STAGE = ["marker", "ship-scripts"]
+APP_IMAGE_STAGE = [*CACHED_RUN[:3], "load"]
+PLATFORM_STAGE = [*CACHED_RUN[:5], "ship-platform"]
+PLATFORM_RUN = [*PLATFORM_STAGE, "publish-platform", "build-platform", "has-image", "rm-archive", *CACHED_RUN[5:]]
+PAGE_STAGE = CACHED_RUN[:CACHED_RUN.index("copy-page-check") + 1]
+OLD_STACK_UP = "#!/bin/sh\n# old stack_up\n"
+
+
+def old_scripts(box: Sandbox) -> None:
+    """Server 2 holds an older scripts folder; its marker names another commit, so the scripts must ship."""
+    box.set_marker(OTHER_COMMIT + "\n")
+    (box.s2dir / "old.txt").write_text("OLD\n", encoding="utf-8")
+    (box.s2dir / "stack_up.sh").write_text(OLD_STACK_UP, encoding="utf-8")
+
+
+def no_images(box: Sandbox) -> None:
+    """Server 2 holds the scripts of this commit and no image at all."""
+    box.set_marker(COMMIT + "\n")
+
+
+def tagged_app_image(box: Sandbox) -> None:
+    """Server 2 holds the scripts of this commit and the owner app image with its tag, but no platform image."""
+    no_platform(box)
+    box.answer(images=[IMAGE_ID, APP_BASE_TAG])
+
+
+def after_converge(before: dict) -> dict:
+    """The steps before the page check do change the fake Server 2: the app image is tagged and the stack converged."""
+    return {**before, "converged": True, "refs": sorted({*before["refs"], APP_BASE_TAG})}
+
+
+def fails_unpublished(box: Sandbox, key: str, expected: dict, kinds: list[str]) -> None:
+    """Runs the script: it ends with the fixed reason of its transfer after exactly these calls, and Server 2 holds
+    exactly `expected` (what it held before, plus what only earlier steps of the run change)."""
+    expect_failure(box.run(), key)
+    assert box.kinds() == kinds
+    assert box.server2() == expected
+
+
+COMPLETE_THEN_23 = {"late_rc": {"git archive scripts": 23}}
+CUT_THEN_23 = {"late_rc": {"git archive scripts": 23}, "cut": {"git archive scripts": "stack_up.sh"}}
+PRODUCER_IDS = ["whole stream", "tar cut before stack_up.sh"]
+
+
+@pytest.mark.parametrize("answers, missing", [(COMPLETE_THEN_23, set()), (CUT_THEN_23, {"stack_up.sh"})], ids=PRODUCER_IDS)
+def test_a_scripts_producer_that_exits_non_zero_after_its_stream_leaves_the_folder_and_marker_as_they_were(box, answers, missing):
+    old_scripts(box)
+    before = box.server2()
+    box.answer(**answers)
+    fails_unpublished(box, "ship-scripts", before, SCRIPTS_STAGE)
+    assert tree(box.s2dir) == {"old.txt": "OLD\n", "stack_up.sh": OLD_STACK_UP, ".refresh-commit": OTHER_COMMIT + "\n"}
+    assert before["files"]["raphael-journeys/.refresh-commit"] == (OTHER_COMMIT + "\n").encode("utf-8")
+    (git,), (ship,) = box.of("git archive scripts"), box.of("ship-scripts")
+    assert ship["stdin_sha"] == git["sha"], "the receiver was given the stream the producer wrote"
+    staged = tree(Path(f"{box.s2dir}.new"))
+    assert staged == {n: t for n, t in expected_scripts(box).items() if n not in missing}, "real tar took the stream"
+
+
+@pytest.mark.parametrize("answers", [COMPLETE_THEN_23, CUT_THEN_23], ids=PRODUCER_IDS)
+def test_a_healthy_retry_at_the_same_commit_ships_the_scripts_again_and_recovers(box, answers):
+    old_scripts(box)
+    before = box.server2()
+    box.answer(**answers)
+    fails_unpublished(box, "ship-scripts", before, SCRIPTS_STAGE)
+    box.answer(late_rc={"git archive scripts": 0}, cut={"git archive scripts": None})
+    expect_success(box.run())
+    assert box.kinds() == SCRIPTS_STAGE + FULL_RUN
+    archives, ships = box.of("git archive scripts"), box.of("ship-scripts")
+    assert len(archives) == len(ships) == 2 and ships[1]["stdin_sha"] == archives[1]["sha"] and ships[1]["stdin_size"] > 0
+    assert tree(box.s2dir) == {**expected_scripts(box), ".refresh-commit": COMMIT + "\n"}
+    previous = {"old.txt": "OLD\n", "stack_up.sh": OLD_STACK_UP, ".refresh-commit": OTHER_COMMIT + "\n"}
+    assert tree(box.s2dir.parent / "raphael-journeys.previous") == previous
+
+
+def test_a_platform_producer_that_exits_non_zero_after_its_stream_publishes_no_archive_and_never_builds(box):
+    tagged_app_image(box)
+    before = box.server2()
+    box.answer(late_rc={"git archive commit": 23})
+    fails_unpublished(box, "platform-build", before, PLATFORM_STAGE)
+    assert not Path(box.archive()).exists() and before["built"] is None and box.of("build-platform") == []
+    (git,), (ship,) = box.of("git archive commit"), box.of("ship-platform")
+    assert ship["stdin_sha"] == git["sha"], "the receiver was given the stream the producer wrote"
+
+
+def test_a_healthy_retry_at_the_same_commit_ships_the_platform_archive_again_and_goes_on(box):
+    tagged_app_image(box)
+    before = box.server2()
+    box.answer(late_rc={"git archive commit": 23})
+    fails_unpublished(box, "platform-build", before, PLATFORM_STAGE)
+    box.answer(late_rc={"git archive commit": 0})
+    expect_success(box.run())
+    assert box.kinds() == PLATFORM_STAGE + PLATFORM_RUN
+    archives, ships = box.of("git archive commit"), box.of("ship-platform")
+    assert len(archives) == len(ships) == 2 and ships[1]["stdin_sha"] == archives[1]["sha"]
+    state = json.loads((box.top / "state.json").read_text(encoding="utf-8"))
+    assert state["archive_sha"] == archives[1]["sha"] and PLATFORM_REF in state["images"]
+    assert not Path(box.archive()).exists(), "the archive is removed once the image is there"
+
+
+def test_an_app_image_producer_that_exits_non_zero_after_its_stream_makes_no_tag_and_stops_the_run(box):
+    no_images(box)
+    before = box.server2()
+    box.answer(late_rc={"docker save": 23})
+    fails_unpublished(box, "app-image", before, APP_IMAGE_STAGE)
+    assert box.of("tag") == [] and APP_BASE_TAG not in box.server2()["refs"] and before["refs"] == []
+    (save,), (load,) = box.of("docker save"), box.of("load")
+    assert load["stdin_sha"] == save["sha"], "the receiver was given the stream the producer wrote"
+
+
+def test_a_page_check_producer_that_exits_non_zero_after_a_valid_stream_swaps_nothing_and_stops_before_the_retention(box):
+    cached(box)
+    box.answer(tags=RETENTION_TAGS)
+    before = box.server2()
+    box.answer(late_rc={"s2docker cp-out": 23})
+    fails_unpublished(box, "page-check", after_converge(before), PAGE_STAGE)
+    assert before["page"] == {"old.txt": "OLD\n"} and tree(box.old_copy) == before["page"]
+    assert [c["call"] for c in box.calls() if c["call"].startswith("s2docker")] == ["s2docker exec", "s2docker cp-out"]
+    assert box.kinds().count("versions") == 1 and box.of("list-tags") == [] and box.of("remove-tag") == []
+
+
+SIDE_FAILS = {
+    "scripts, the receiver exits 1": (old_scripts, {"rc": {"ship-scripts": 1}}, "ship-scripts", SCRIPTS_STAGE),
+    "scripts, the receiver exits 255 after it extracted everything": (
+        old_scripts, {"late_rc": {"ship-scripts": 255}}, "ship-scripts", SCRIPTS_STAGE),
+    "scripts, the publish call fails": (
+        old_scripts, {"rc": {"publish-scripts": 1}}, "ship-scripts", [*SCRIPTS_STAGE, "publish-scripts"]),
+    "platform, the receiver exits 1": (tagged_app_image, {"rc": {"ship-platform": 1}}, "platform-build", PLATFORM_STAGE),
+    "platform, the receiver exits 255 after it wrote the whole file": (
+        tagged_app_image, {"late_rc": {"ship-platform": 255}}, "platform-build", PLATFORM_STAGE),
+    "platform, the publish call fails": (
+        tagged_app_image, {"rc": {"publish-platform": 1}}, "platform-build", [*PLATFORM_STAGE, "publish-platform"]),
+    "app image, the receiver exits 1": (no_images, {"rc": {"load": 1}}, "app-image", APP_IMAGE_STAGE),
+    "app image, the receiver exits 255 after it loaded the image": (
+        no_images, {"late_rc": {"load": 255}}, "app-image", APP_IMAGE_STAGE),
+    "app image, the publish call fails": (no_images, {"rc": {"tag": 1}}, "app-image", [*APP_IMAGE_STAGE, "tag"]),
+}
+
+
+@pytest.mark.parametrize("seed, answers, key, kinds", list(SIDE_FAILS.values()), ids=list(SIDE_FAILS))
+def test_a_receiver_or_publish_call_that_fails_leaves_the_active_state_as_it_was_and_ends_with_its_reason(
+        box, seed, answers, key, kinds):
+    seed(box)
+    before = box.server2()
+    box.answer(**answers)
+    fails_unpublished(box, key, before, kinds)
+
+
+def test_a_failed_publish_of_the_scripts_leaves_the_staged_folder_without_the_marker(box):
+    old_scripts(box)
+    box.answer(rc={"publish-scripts": 1})
+    expect_failure(box.run(), "ship-scripts")
+    assert tree(Path(f"{box.s2dir}.new")) == expected_scripts(box), "only the publish call writes the marker"
+    assert tree(box.s2dir)[".refresh-commit"] == OTHER_COMMIT + "\n"
+
+
+def test_a_failed_publish_of_the_platform_archive_leaves_the_staged_file_and_no_archive_under_the_final_name(box):
+    tagged_app_image(box)
+    box.answer(rc={"publish-platform": 1})
+    expect_failure(box.run(), "platform-build")
+    assert Path(f"{box.archive()}.part").is_file() and not Path(box.archive()).exists()
+    assert box.of("build-platform") == []
 
 
 # ---- g. the retention: last, with its own versions call, by exact references ------------------------
@@ -1419,7 +1658,9 @@ def test_a_full_run_ends_with_the_retention_and_removes_nothing_from_a_stack_tha
 
 # ---- A. one deadline of 25 minutes for the whole run -----------------------------------------------
 
-AFTER_BOX = {"build-proxy", "converge", "copy-page-check", "rm-archive", "list-tags", "remove-tag"}
+AFTER_BOX = {
+    "build-proxy", "converge", "copy-page-check", "publish-page-check", "rm-archive", "list-tags", "remove-tag",
+}
 
 
 def nothing_stopped(box: Sandbox) -> None:
@@ -1443,7 +1684,7 @@ def test_a_converge_that_returns_late_is_the_box_and_no_page_check_or_removal_fo
     expect_failure(box.run(), "box")
     kinds = box.kinds()
     assert kinds[-1] == "converge" and kinds.count("versions") == 1
-    assert not {"copy-page-check", "list-tags", "remove-tag"} & set(kinds)
+    assert not {"copy-page-check", "publish-page-check", "list-tags", "remove-tag"} & set(kinds)
     assert tree(box.old_copy) == {"old.txt": "OLD\n"}
 
 
@@ -1462,8 +1703,8 @@ def test_a_clock_past_the_box_when_the_shipping_would_begin_starts_no_shipping_c
 
 
 @pytest.mark.parametrize("key, stream, later", [
-    ("has-image#1", "docker save", {"load", "tag", "ship-platform", "build-platform"}),
-    ("has-image#2", "git archive commit", {"ship-platform", "build-platform"}),
+    ("has-image#1", "docker save", {"load", "tag", "ship-platform", "publish-platform", "build-platform"}),
+    ("has-image#2", "git archive commit", {"ship-platform", "publish-platform", "build-platform"}),
 ], ids=["app image", "platform image"])
 def test_a_clock_past_the_box_after_a_question_starts_no_stream(box, key, stream, later):
     box.answer(advance={key: BOX})
@@ -1498,8 +1739,8 @@ def test_every_call_is_bounded_by_the_seconds_left_and_both_sides_of_a_stream_ge
     assert box.timeouts()[0][:2] == ("git", "1500")
     counted = {used: dict(Counter(wrapped for wrapped, _ in found)) for used, found in groups.items()}
     assert counted == {
-        0: {"git": 2, "docker": 1, "ssh": 1}, 300: {"git": 1, "ssh": 1}, 420: {"ssh": 2, "docker": 1},
-        480: {"ssh": 4, "git": 1}, 525: {"ssh": 4}, 725: {"ssh": 7},
+        0: {"git": 2, "docker": 1, "ssh": 1}, 300: {"git": 1, "ssh": 1}, 420: {"ssh": 3, "docker": 1},
+        480: {"ssh": 5, "git": 1}, 525: {"ssh": 4}, 725: {"ssh": 8},
     }
 
 
@@ -1518,13 +1759,15 @@ def test_a_platform_build_that_never_gets_ready_is_polled_every_ten_seconds_unti
 STATUS_CALLS = [
     ("full", "git toplevel", None), ("full", "git head", None), ("full", "docker inspect", None),
     ("full", "ship-scripts", "ship-scripts"), ("full", "git archive scripts", "ship-scripts"),
+    ("full", "publish-scripts", "publish-scripts"),
     ("full", "docker save", "load"), ("full", "load", "load"), ("full", "ship-platform", "ship-platform"),
-    ("full", "git archive commit", "ship-platform"), ("full", "build-platform", "build-platform"),
-    ("full", "has-image#3", "has-image"), ("full", "rm-archive", "rm-archive"),
+    ("full", "git archive commit", "ship-platform"), ("full", "publish-platform", "publish-platform"),
+    ("full", "build-platform", "build-platform"), ("full", "has-image#3", "has-image"),
+    ("full", "rm-archive", "rm-archive"),
     ("cached", "marker", "marker"), ("cached", "versions#1", "versions"), ("cached", "has-image#1", "has-image"),
     ("cached", "tag", "tag"), ("cached", "build-proxy", "build-proxy"), ("cached", "converge", "converge"),
-    ("cached", "copy-page-check", "copy-page-check"), ("cached", "versions#2", "versions"),
-    ("cached", "list-tags", "list-tags"), ("cached", "remove-tag", "remove-tag"),
+    ("cached", "copy-page-check", "copy-page-check"), ("cached", "publish-page-check", "publish-page-check"),
+    ("cached", "versions#2", "versions"), ("cached", "list-tags", "list-tags"), ("cached", "remove-tag", "remove-tag"),
     ("current", "page-check-present", "page-check-present"),
 ]
 STATUS_CASES = [(124, *row) for row in STATUS_CALLS] + [(137, *row) for row in STATUS_CALLS[::4]]
@@ -1541,9 +1784,10 @@ def test_status_124_or_137_of_any_call_is_the_box_even_when_the_clock_did_not_mo
 
 
 LATE_FAILURES = [
-    ("full", "ship-scripts", 1), ("full", "build-platform", 1), ("cached", "versions#1", 1),
+    ("full", "ship-scripts", 1), ("full", "publish-scripts", 1), ("full", "publish-platform", 1),
+    ("full", "build-platform", 1), ("cached", "versions#1", 1),
     ("cached", "has-image#1", 2), ("cached", "converge", 1), ("cached", "copy-page-check", 1),
-    ("cached", "remove-tag", 1),
+    ("cached", "publish-page-check", 1), ("cached", "remove-tag", 1),
 ]
 
 
@@ -1563,10 +1807,11 @@ def test_a_failure_one_second_before_the_box_keeps_its_own_reason(box):
 
 
 LATE = [
-    ("full", "ship-scripts"), ("full", "load"), ("full", "ship-platform"), ("full", "build-platform"),
+    ("full", "ship-scripts"), ("full", "publish-scripts"), ("full", "load"), ("full", "ship-platform"),
+    ("full", "publish-platform"), ("full", "build-platform"),
     ("full", "has-image#3"), ("full", "rm-archive"), ("cached", "marker"), ("cached", "has-image#1"),
     ("cached", "tag"), ("cached", "build-proxy"), ("cached", "converge"), ("cached", "copy-page-check"),
-    ("cached", "versions#2"), ("cached", "list-tags#2"), ("cached", "remove-tag#1"),
+    ("cached", "publish-page-check"), ("cached", "versions#2"), ("cached", "list-tags#2"), ("cached", "remove-tag#1"),
     ("current", "page-check-present"),
 ]
 
