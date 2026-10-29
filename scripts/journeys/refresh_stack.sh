@@ -29,14 +29,23 @@
 # image id without a tag, the page check folder with .new). Server 1 then reads the status of every side (the producer
 # on Server 1 and the receiver on Server 2, all through settle). Only after that a separate ssh call, bounded by the time
 # that is left, publishes: the marker and the two renames, the final archive name, the tag, the swap of the page check
-# folder. A failure at any side leaves the active folder, its marker, the archive name, the tags and the page check
-# folder as they were and ends with the fixed reason of that transfer; a retry at the same commit then ships again.
+# folder. A failure at any side ends with the fixed reason of that transfer and never stops, removes or changes a running
+# container, a volume or the active stack; the active folder, its marker, the archive name, the tags and the page check
+# folder stay as they were except where a publish is half done and undoes itself. What a failed run leaves behind (the
+# staged folder, the .part file, an image without a tag, a .previous folder, the page check .new and .old, the staging
+# file) is tolerated: the next run replaces it by exact name, and the final reconciliation removes it. A retry at the same
+# commit ships again.
 #
-# A read that failed is never an absence or a difference: a transfer is decided only by a read that succeeded. The three
-# reads that decide one are the scripts marker (status 0 with its text, or 3 when there is no marker), the list of all image
-# ids (docker image ls --all: Docker's default list leaves out an image without a tag) and the list of one image reference
-# (status 0, every line an image id). When one of them fails or is garbled the run ends with marker-ask or image-ask and
-# nothing is shipped.
+# A read that failed or was garbled decides nothing: it is never an absence, a difference, or "current". Three reads on
+# Server 2 decide every transfer, and all three are made and validated before the scripts archive, the owner app image or
+# the platform archive cross (the read gate): (1) the scripts marker, (2) docker image inspect of the owner app image id and
+# (3) docker image inspect of raphael-journeys-platform:<commit>. The marker is a different commit only when it was read
+# and holds exactly one line of exactly 40 lowercase hex digits that is not this commit. It is absent only on positive
+# evidence: the folder can be searched and has no such entry, or the folder does not exist and its parent can be searched.
+# Every other marker answer ends the run with marker-ask. An image is there on status 0 and one well-formed id line (for
+# the app image: the id asked), and it is missing only on status 1 and Docker's own not-found line for exactly that name;
+# every other answer ends the run with image-ask (docker image ls decides no existence; it is used by step g only).
+# Whatever fails there, nothing was shipped, published, loaded, tagged or built, and Server 2 is as it was.
 #
 # Steps, in this order (S2dir is the Server 2 folder):
 #   0  read-only first look, three ssh calls, each only when the one before agreed: S2dir/.refresh-commit holds the
