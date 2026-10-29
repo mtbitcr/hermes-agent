@@ -740,9 +740,6 @@ def main():
     sys.stdout.write(out)
     log(argv, rc)
     sys.exit(rc)
-
-
-main()
 '''
 
 PROXY_TAG = "0123456789ab"
@@ -821,7 +818,12 @@ class Host:
         (self.bin / "stub.py").write_text(f"F = {FORMATS!r}\n" + STUB, encoding="utf-8")
         for tool in ("docker", "sleep", "hostname", "df"):
             wrapper = self.bin / tool
-            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$(dirname "$0")/stub.py" {tool} "$@"\n', encoding="utf-8")
+            wrapper.write_text(
+                f'#!/bin/sh\nexec "{sys.executable}" -S -I -c '
+                f"'import sys; sys.path.insert(0, sys.argv.pop(1)); import stub; stub.main()' "
+                f'"$(dirname "$0")" {tool} "$@"\n',
+                encoding="utf-8",
+            )
             wrapper.chmod(0o755)
         (root / "home").mkdir()
         (root / "tmp").mkdir()
@@ -947,14 +949,32 @@ def host(tmp_path: Path) -> Host:
     return Host(tmp_path)
 
 
-@pytest.fixture
-def stack(host: Host) -> Host:
-    """A converged stack that started from a token volume that already holds the files."""
+@pytest.fixture(scope="module")
+def converged_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The converged host, built once: a stack that started from a token volume that already holds the files."""
+    host = Host(tmp_path_factory.mktemp("converged"))
     seed_tokens(host)
     result = host.converge()
     assert result.returncode == 0, result.stdout + result.stderr
     assert output_lines(result)[-1] == ANSWERS_LINE
-    return host
+    return host.root
+
+
+@pytest.fixture
+def stack(converged_root: Path, tmp_path: Path) -> Host:
+    """A private copy of the converged host with an empty calls log."""
+    root = tmp_path / "stack"
+    shutil.copytree(converged_root, root, symlinks=True)
+    converge_log = [json.loads(line) for line in (root / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
+    for name in ("state.json", "scripted.json", "verified.txt"):
+        path = root / name
+        if path.exists():
+            path.write_text(path.read_text(encoding="utf-8").replace(str(converged_root), str(root)), encoding="utf-8")
+    (root / "calls.jsonl").write_text("", encoding="utf-8")
+    copy = Host.__new__(Host)
+    copy.root, copy.scripts, copy.bin = root, root / "tree" / "scripts" / "journeys", root / "bin"
+    copy.converged_docker = [c["argv"] for c in converge_log if c["tool"] == "docker"]
+    return copy
 
 
 def proxy_ca_pem(state: dict) -> str:
@@ -1257,7 +1277,7 @@ def test_5_new_owner_app_tag_recreates_the_owner_app_the_gateway_and_the_browser
     assert namespaces_stale(state) == []
     assert sorted(state["volumes"]) == sorted(STACK_VOLUMES)
 
-    for argv in stack.docker_calls():
+    for argv in stack.converged_docker + stack.docker_calls():
         assert argv[0] not in ("system", "image", "rmi", "prune")
         if argv[0] == "volume":
             assert argv[1] == "create"
@@ -1365,7 +1385,7 @@ def test_13_a_stopped_kept_proxy_dashboard_or_browser_is_started_and_nothing_els
     assert {argv[0] for argv in docker} <= {"info", "inspect", "cp", "start"}, docker
     assert container_ids(stack) == ids
     assert_all_running_and_healthy(stack)
-    assert_no_volume_removal(stack.docker_calls())
+    assert_no_volume_removal(stack.converged_docker + stack.docker_calls())
 
 
 def test_14_all_five_stopped_kept_containers_are_started_in_template_order_before_the_health_wait(stack: Host) -> None:
@@ -1389,7 +1409,7 @@ def test_14_all_five_stopped_kept_containers_are_started_in_template_order_befor
     assert_health_wait_after_lifecycle(docker)
     assert container_ids(stack) == ids
     assert_all_running_and_healthy(stack)
-    assert_no_volume_removal(stack.docker_calls())
+    assert_no_volume_removal(stack.converged_docker + stack.docker_calls())
 
 
 def test_15_a_reset_that_fails_after_its_stop_phase_is_recovered_by_the_next_converge(stack: Host) -> None:
@@ -1422,7 +1442,7 @@ def test_15_a_reset_that_fails_after_its_stop_phase_is_recovered_by_the_next_con
     assert container_ids(stack) == ids
     assert_all_running_and_healthy(stack)
     assert all(stack.state()["volumes"][TOKENS_V]["files"].get(name) for name in TOKEN_NAMES)
-    assert_no_volume_removal(stack.docker_calls())
+    assert_no_volume_removal(stack.converged_docker + stack.docker_calls())
 
 
 # --- round 3, rule 1 (finding 1): the namespace rule. The gateway is current only when its network mode names the
@@ -1476,7 +1496,7 @@ def test_16_an_owner_app_restart_with_the_same_id_restarts_the_gateway_once_befo
     docker = stack.docker_calls(mark)
     assert lifecycle_calls(docker) == []
     assert {argv[0] for argv in docker} <= {"info", "inspect", "cp"}, docker
-    assert_no_volume_removal(stack.docker_calls())
+    assert_no_volume_removal(stack.converged_docker + stack.docker_calls())
 
 
 # (app StartedAt, gateway StartedAt, is the gateway current): written the way Docker prints them.
@@ -1749,7 +1769,7 @@ def test_24_a_read_that_fails_after_the_first_change_stops_with_the_short_line_a
     assert result.returncode == 0, result.stdout + result.stderr
     assert output_lines(result)[-1] == ANSWERS_LINE
     assert_all_running_and_healthy(stack)
-    assert_no_volume_removal(stack.docker_calls())
+    assert_no_volume_removal(stack.converged_docker + stack.docker_calls())
 
 
 def probe_argv(operation: str, cid: str, copy_to: Path) -> list[str]:
@@ -1909,7 +1929,7 @@ def test_7_ca_leaves_the_proxy_only_as_ca_pem_and_only_the_proxy_mounts_the_prox
     """One docker cp of ca.pem; the build folders hold ca.pem only; no other container mounts the proxy volume."""
     state = stack.state()
     proxy_id = container_ids(stack)[PROXY_C]
-    docker = stack.docker_calls()
+    docker = stack.converged_docker + stack.docker_calls()
     copies = [argv for argv in docker if argv[0] == "cp"]
     assert len(copies) == 1
     assert copies[0][1] == f"{proxy_id}:/state/ca.pem" and Path(copies[0][2]).name == "ca.pem"
