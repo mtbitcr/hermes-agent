@@ -41,7 +41,8 @@ BROWSER_DIR = "/opt/raphael-journeys"
 ORDER = [3, 5, 2, 1, 4]
 SEEDED = {3, 5, 2}
 # The fixed reserves of one journey, in minutes: reset + seed (3, 5 and 2 only) + owner app + budget plus 1.
-RESERVES = {3: 4 + 1 + 2 + 2, 5: 4 + 1 + 2 + 6, 2: 4 + 1 + 2 + 4, 1: 4 + 2 + 21, 4: 4 + 2 + 16}
+# The last journey (4) also reserves the final reset that follows it.
+RESERVES = {3: 4 + 1 + 2 + 2, 5: 4 + 1 + 2 + 6, 2: 4 + 1 + 2 + 4, 1: 4 + 2 + 21, 4: 4 + 2 + 16 + 4}
 LIMIT_MINUTES = 118
 
 REASONS = {
@@ -85,7 +86,8 @@ def record(label, extra=None):
 
 
 def current_journey():
-    return ORDER[int((top / "reset.count").read_text()) - 1]
+    # reset 1 is the run's first reset, before any journey; journey k follows reset k + 1
+    return ORDER[int((top / "reset.count").read_text()) - 2]
 
 
 def noise(rc):
@@ -125,8 +127,8 @@ if name == "ssh":
     if "isolation_check.sh server2" in command:
         label = "isolation server2"
     elif "reset_stack.sh" in command:
-        counter("reset")
-        label = "reset %d" % current_journey()
+        count = counter("reset")
+        label = "reset first" if count == 1 else "reset %d" % ORDER[count - 2] if count - 2 < len(ORDER) else "reset last"
     elif "seed_stack.sh" in command:
         label = "seed %d" % current_journey()
     elif "journey-run.sh" in command:
@@ -204,7 +206,7 @@ def loop_calls(journeys=ORDER) -> list[str]:
     return calls
 
 
-PREFIX = ["refresh", "isolation server2", "isolation server1"]
+PREFIX = ["refresh", "reset first", "isolation server2", "isolation server1"]
 
 
 class Sandbox:
@@ -290,8 +292,12 @@ def test_a_passing_run_refreshes_then_runs_each_journey_on_a_fresh_stack_in_orde
     done = box.run()
 
     assert done.returncode == 0, done.stdout + done.stderr
-    assert box.names() == [*PREFIX, *loop_calls(), "hermes"]
-    assert [n for n in box.names() if n.startswith("reset")] == [f"reset {n}" for n in (3, 5, 2, 1, 4)]
+    assert box.names() == [*PREFIX, *loop_calls(), "reset last", "hermes"]
+    assert [n for n in box.names() if n.startswith("reset")] == [
+        "reset first", *[f"reset {n}" for n in (3, 5, 2, 1, 4)], "reset last",
+    ]
+    for label in ("reset first", "reset last"):
+        assert box.call(label)["argv"] == ["ssh", RUNNER, cmd_reset()]
     for n in ORDER:
         assert box.call(f"reset {n}")["argv"] == ["ssh", RUNNER, cmd_reset()]
         assert box.call(f"journey {n}")["argv"] == ["ssh", RUNNER, cmd_journey(n)]
@@ -303,6 +309,32 @@ def test_a_passing_run_refreshes_then_runs_each_journey_on_a_fresh_stack_in_orde
     assert "journey" not in result
     assert box.told() == ["Journeys passed."]
     assert (done.stdout, done.stderr) == ("", "")
+
+
+def test_a_failing_first_reset_stops_the_run_before_the_isolation_check_at_step_reset_with_no_journey(box):
+    box.answer(rc={"reset first": 7})
+
+    done = box.run()
+
+    assert done.returncode != 0
+    assert box.names() == ["refresh", "reset first", "hermes"]
+    result = box.result()
+    assert (result["result"], result["step"], result["reason"]) == ("failed", "reset", REASONS["reset"])
+    assert "journey" not in result
+    assert box.told() == [f"Journeys failed at step reset: {REASONS['reset']}."]
+
+
+def test_a_failing_last_reset_fails_the_run_at_step_reset_and_stores_no_passed_result(box):
+    box.answer(rc={"reset last": 7})
+
+    done = box.run()
+
+    assert done.returncode != 0
+    assert box.names() == [*PREFIX, *loop_calls(), "reset last", "hermes"]
+    result = box.result()
+    assert (result["result"], result["step"], result["reason"]) == ("failed", "reset", REASONS["reset"])
+    assert "journey" not in result
+    assert box.told() == [f"Journeys failed at step reset: {REASONS['reset']}."]
 
 
 def test_a_seed_failure_on_journey_5_records_the_step_and_the_journey_and_starts_nothing_later(box):
@@ -413,6 +445,15 @@ def test_the_time_of_the_refresh_counts_towards_the_limit(box):
     assert (box.result()["step"], box.result()["journey"]) == ("time", "3")
 
 
+def test_the_time_of_the_first_reset_counts_towards_the_limit(box):
+    box.answer(elapsed_after={"reset first": 110 * 60})
+
+    box.run()
+
+    assert box.names() == [*PREFIX, "hermes"]
+    assert (box.result()["step"], box.result()["journey"]) == ("time", "3")
+
+
 # ------------------------------------------------------------------------------- the refresh step
 
 
@@ -420,7 +461,7 @@ def test_the_refresh_runs_after_the_config_and_before_the_isolation_with_the_two
     assert box.run(JOURNEY_S2_SCRIPTS_DIR="/srv/s2").returncode == 0
 
     refresh = box.call("refresh")
-    assert box.names()[0] == "refresh" and box.names()[1:3] == ["isolation server2", "isolation server1"]
+    assert box.names()[0] == "refresh" and box.names()[1:4] == ["reset first", "isolation server2", "isolation server1"]
     assert refresh["argv"] == ["refresh_stack.sh"]  # no argument
     assert refresh["env"] == {"JOURNEY_RUNNER_SSH": RUNNER, "JOURNEY_S2_SCRIPTS_DIR": "/srv/s2"}
 

@@ -181,7 +181,10 @@ if name == "ssh":
         spec = curl_spec(label)
         sys.stdout.write(spec["body"])
         sys.exit(spec["rc"])
-    leak(answers["rc"].get(label, 0))
+    rc = answers["rc"].get(label, 0)
+    if isinstance(rc, list):  # one answer per call of this label, the last one for all later calls
+        rc = rc[min(calls_so_far(label), len(rc)) - 1]
+    leak(rc)
 if name == "hermes":
     record("hermes")
     sys.exit(answers["hermes_rc"])
@@ -508,15 +511,17 @@ def test_start_prints_no_secret_value(box):
 # -------------------------------------------------------------------------------- run_once.sh
 
 TIME_RE = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"
-PASSING_CALLS = [
-    *ISOLATION,
-    *[
-        call
-        for n in LOOP_ORDER
-        for call in (RESET, *([SEED_CALL] if n in SEEDED else []), "curl proxy", "curl app", JOURNEYS_CALL)
-    ],
-    "hermes",
+LOOP_CALLS = [
+    call
+    for n in LOOP_ORDER
+    for call in (RESET, *([SEED_CALL] if n in SEEDED else []), "curl proxy", "curl app", JOURNEYS_CALL)
 ]
+PASSING_CALLS = [RESET, *ISOLATION, *LOOP_CALLS, RESET, "hermes"]
+
+
+def nth_reset_fails(n: int, rc: int = 1) -> dict:
+    """The answers for a run in which only the n-th reset (1 is the run's first) fails."""
+    return {"rc": {RESET: [0] * (n - 1) + [rc]}}
 
 
 def test_a_passing_run_goes_through_the_steps_in_order_and_writes_one_result_and_one_owner_line(box):
@@ -533,7 +538,7 @@ def test_a_passing_run_goes_through_the_steps_in_order_and_writes_one_result_and
     # part of the isolation check runs locally.
     assert box.call(ISO2)["argv"] == ["ssh", RUNNER, CMD_ISO2]
     assert box.call(ISO1)["argv"] == ["isolation_check.sh", "server1"]
-    assert box.commands(RESET) == [CMD_RESET] * 5
+    assert box.commands(RESET) == [CMD_RESET] * 7
     assert box.commands(JOURNEYS_CALL) == CMDS_JOURNEYS
     assert box.call("hermes")["argv"] == ["hermes", "send", "--to", "telegram", "--file", "-"]
     # Exactly one result file, and exactly one owner line.
@@ -543,7 +548,7 @@ def test_a_passing_run_goes_through_the_steps_in_order_and_writes_one_result_and
     assert re.fullmatch(TIME_RE, result["started"]) and re.fullmatch(TIME_RE, result["finished"])
     assert box.told() == ["Journeys passed."]
     # Nothing was retried: each journey ran its steps once.
-    assert [box.names().count(call) for call in (RESET, SEED_CALL, JOURNEYS_CALL)] == [5, 3, 5]
+    assert [box.names().count(call) for call in (RESET, SEED_CALL, JOURNEYS_CALL)] == [7, 3, 5]
 
 
 def test_the_settings_named_by_the_owner_change_the_server_2_calls(box):
@@ -554,7 +559,7 @@ def test_the_settings_named_by_the_owner_change_the_server_2_calls(box):
 
     assert done.returncode == 0, done.stdout + done.stderr
     assert box.call(ISO2)["argv"][2] == CMD_ISO2.replace(S2_DIR, "/srv/s2-scripts")
-    assert box.commands(RESET) == [CMD_RESET.replace(S2_DIR, "/srv/s2-scripts")] * 5
+    assert box.commands(RESET) == [CMD_RESET.replace(S2_DIR, "/srv/s2-scripts")] * 7
     expected = [c.replace(BROWSER_DIR, "/srv/browser-dir").replace(CONTAINER, "browser-x") for c in CMDS_JOURNEYS]
     assert box.commands(JOURNEYS_CALL) == expected
 
@@ -603,7 +608,9 @@ def test_the_wait_for_the_owner_app_polls_until_the_page_text_shows(box):
 
 
 # Each step: how it fails, the calls that happen up to and including the failure, and nothing after.
-UP_TO_RESET = [*ISOLATION, RESET]
+UP_TO_ISOLATION = [RESET, *ISOLATION]
+UP_TO_RESET = [*UP_TO_ISOLATION, RESET]
+ALL_CALLS = [RESET, *ISOLATION, *LOOP_CALLS, RESET]
 UP_TO_APP = [*UP_TO_RESET, SEED_CALL, "curl proxy"]
 FULL_WAIT = [*UP_TO_APP, *["curl app", "sleep"] * 60, "curl app"]
 BAD_ENV_FILES = {
@@ -624,11 +631,13 @@ FAILURES = {
     "config-container": ("config", {"env": {"JOURNEY_BROWSER_CONTAINER": "x; id"}}, []),
     "config-browser-dir": ("config", {"env": {"JOURNEY_BROWSER_DIR": "relative/dir"}}, []),
     **{f"config-file-{key}": ("config", {"runner_env": text}, []) for key, text in BAD_ENV_FILES.items()},
-    "isolation-server2": ("isolation", {"rc": {ISO2: 1}}, [ISO2]),
-    "isolation-server2-ssh-down": ("isolation", {"rc": {ISO2: 255}}, [ISO2]),
-    "isolation-server1": ("isolation", {"rc": {ISO1: 1}}, ISOLATION),
-    "reset": ("reset", {"rc": {RESET: 1}}, UP_TO_RESET),
-    "reset-ssh-down": ("reset", {"rc": {RESET: 255}}, UP_TO_RESET),
+    "reset-first": ("reset", nth_reset_fails(1), [RESET]),
+    "reset-first-ssh-down": ("reset", nth_reset_fails(1, 255), [RESET]),
+    "isolation-server2": ("isolation", {"rc": {ISO2: 1}}, [RESET, ISO2]),
+    "isolation-server2-ssh-down": ("isolation", {"rc": {ISO2: 255}}, [RESET, ISO2]),
+    "isolation-server1": ("isolation", {"rc": {ISO1: 1}}, UP_TO_ISOLATION),
+    "reset": ("reset", nth_reset_fails(2), UP_TO_RESET),
+    "reset-ssh-down": ("reset", nth_reset_fails(2, 255), UP_TO_RESET),
     "proxy-unreachable": ("proxy", {"proxy": {"rc": 7, "body": ""}}, UP_TO_APP),
     "proxy-error-status": ("proxy", {"proxy": {"rc": 22, "body": ""}}, UP_TO_APP),
     "proxy-wrong-answer": ("proxy", {"proxy": {"rc": 0, "body": '{"keys":[]}'}}, UP_TO_APP),
@@ -636,11 +645,15 @@ FAILURES = {
     "owner-app-down": ("owner-app", {"app": [{"rc": 7, "body": ""}]}, FULL_WAIT),
     "journeys-fail": ("journeys", {"rc": {JOURNEYS_CALL: 1}}, [*UP_TO_APP, "curl app", JOURNEYS_CALL]),
     "journeys-ssh-down": ("journeys", {"rc": {JOURNEYS_CALL: 255}}, [*UP_TO_APP, "curl app", JOURNEYS_CALL]),
+    "reset-last": ("reset", nth_reset_fails(7), ALL_CALLS),
+    "reset-last-ssh-down": ("reset", nth_reset_fails(7, 255), ALL_CALLS),
 }
 
 
 # A failure in the loop names its journey; the first journey is 3, and every case here fails in it.
+# The resets before the first journey and after the last one belong to no journey.
 LOOP_STEPS = ("reset", "seed", "proxy", "owner-app", "journeys")
+NO_JOURNEY = ("reset-first", "reset-first-ssh-down", "reset-last", "reset-last-ssh-down")
 
 
 def _arrange(box: Sandbox, change: dict) -> dict:
@@ -667,7 +680,7 @@ def test_a_failed_step_ends_the_run_with_its_name_and_reason_and_runs_no_later_s
     assert (result["result"], result["step"], result["reason"]) == ("failed", step, REASONS[step])
     assert re.fullmatch(TIME_RE, result["started"]) and re.fullmatch(TIME_RE, result["finished"])
     assert sorted(path.name for path in box.run_dir.iterdir()) == ["result", "run.lock"]
-    named = " for journey 3" if step in LOOP_STEPS else ""
+    named = " for journey 3" if step in LOOP_STEPS and case not in NO_JOURNEY else ""
     assert result.get("journey") == ("3" if named else None)
     assert box.told() == [f"Journeys failed at step {step}{named}: {REASONS[step]}."]
     assert box.names()[-1] == "hermes"
@@ -720,7 +733,7 @@ def test_a_hard_kill_with_no_previous_result_leaves_a_started_result_with_its_ti
     assert result["result"] == "started"
     assert re.fullmatch(TIME_RE, result["started"])
     assert "finished" not in result
-    assert box.names() == [ISO2]  # it was in the first step when it died
+    assert box.names() == [RESET, ISO2]  # the first reset ran; it was in the isolation check when it died
     assert sorted(path.name for path in box.run_dir.iterdir()) == ["result", "run.lock"]
 
 
@@ -1036,8 +1049,9 @@ def test_the_real_server_2_isolation_check_refuses_when_the_runner_is_not_on_the
     done = box.run(RUN_ONCE, **env)
 
     assert done.returncode != 0
-    assert box.names() == [ISO2, "hermes"]
-    assert (box.result()["step"], box.result()["reason"]) == ("isolation", REASONS["isolation"])
+    # The real reset refuses on a host that is not the stack host, and it now runs first.
+    assert box.names() == [RESET, "hermes"]
+    assert (box.result()["step"], box.result()["reason"]) == ("reset", REASONS["reset"])
     assert not any(c["argv"][0] in ("stop", "start") for c in _docker_calls(box))  # nothing was reset
 
 
@@ -1047,10 +1061,9 @@ def test_the_real_server_1_isolation_check_refuses_when_production_names_the_pro
     done = box.run(RUN_ONCE, **env)
 
     assert done.returncode != 0
-    assert box.names() == [ISO2, "hermes"]  # Server 2 passed, Server 1 refused, no reset
+    assert box.names() == [RESET, ISO2, "hermes"]  # the first reset ran; Server 2 passed, Server 1 refused
     assert [c["argv"][:2] for c in _docker_calls(box) if c["where"] == "local"] == [["exec", "raphael-workspace"]]
     assert box.result()["step"] == "isolation"
-    assert not any(c["argv"][0] in ("stop", "start") for c in _docker_calls(box))
 
 
 def test_the_real_server_2_isolation_check_refuses_a_name_that_is_not_on_the_template(box):
@@ -1059,7 +1072,7 @@ def test_the_real_server_2_isolation_check_refuses_a_name_that_is_not_on_the_tem
     done = box.run(RUN_ONCE, **env)
 
     assert done.returncode != 0
-    assert box.names() == [ISO2, "hermes"]
+    assert box.names() == [RESET, ISO2, "hermes"]
     assert box.result()["step"] == "isolation"
 
 
@@ -1069,7 +1082,7 @@ def test_a_failing_real_reset_stops_the_run_before_the_proxy_check(box):
     done = box.run(RUN_ONCE, **env)
 
     assert done.returncode != 0
-    assert box.names() == [ISO2, RESET, "hermes"]
+    assert box.names() == [RESET, "hermes"]
     assert (box.result()["result"], box.result()["step"]) == ("failed", "reset")
     printed = _everything_printed(box, done)
     assert all(sentinel not in printed for sentinel in SENTINELS)
@@ -1081,5 +1094,5 @@ def test_a_failing_journey_runner_in_the_browser_container_fails_the_journeys_st
     done = box.run(RUN_ONCE, **env)
 
     assert done.returncode != 0
-    assert box.names() == [ISO2, RESET, SEED_CALL, "curl proxy", "curl app", JOURNEYS_CALL, "hermes"]
+    assert box.names() == [RESET, ISO2, RESET, SEED_CALL, "curl proxy", "curl app", JOURNEYS_CALL, "hermes"]
     assert (box.result()["result"], box.result()["step"]) == ("failed", "journeys")
