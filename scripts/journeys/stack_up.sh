@@ -71,7 +71,8 @@
 #
 # It refuses, before it changes anything, when: the host name is not JOURNEY_STACK_HOST; a tag is not plain;
 # Docker is not rootless; less than 20 GB is free in Docker's data folder; a container with a template name
-# exists without the label raphael-journeys.made-by=stack_up; a container with a template name cannot be read; or
+# exists without the label raphael-journeys.made-by=stack_up (a value that is not exactly stack_up, such as stack_up
+# plus a newline, counts as another label); a container with a template name cannot be read; or
 # stack-app.settings names a variable that is not on the template for the owner app, or its issuer is not the
 # proxy's own.
 #
@@ -81,8 +82,14 @@
 # ends the run with "stack_up: cannot read the container <name>", and a container that this script did not make with
 # "stack_up: container <name> is not one this script made; it was left alone".
 #
+# The label is compared by Docker's own template, on the raw value: the identity read prints the id, one space and
+# one fixed word, owned when the label raphael-journeys.made-by equals stack_up exactly and foreign otherwise. The
+# script sees only that word and never a label value. Text captured with $(...) loses its trailing newlines and its
+# NUL bytes, so a captured value could not tell stack_up from stack_up plus a newline. This holds for every read that
+# decides ownership, versions included.
+#
 # Only containers with that label are ever changed, and only by container id: Docker is given an id only when a
-# successful identity read of the same run returned it with that label, and an id that was not read that way is
+# successful identity read of the same run returned it as owned, and an id that was not read that way is
 # never passed to it. No volume is ever removed or written: this script has no volume remove, no prune and no
 # docker rm -v, and its one helper mounts the token volume read-only. The proxy volume is mounted by the proxy only.
 set -euo pipefail
@@ -159,7 +166,7 @@ home_v=${volumes[0]} tokens_v=${volumes[1]} proxy_v=${volumes[2]}
 # The only docker --format shapes this script uses.
 fmt_name='{{.Name}}'
 fmt_id='{{.Id}}'
-fmt_ident='{{.Id}} {{index .Config.Labels "raphael-journeys.made-by"}}'
+fmt_ident='{{.Id}} {{if eq (index .Config.Labels "raphael-journeys.made-by") "stack_up"}}owned{{else}}foreign{{end}}'
 fmt_config_image='{{.Config.Image}}'
 fmt_network_mode='{{.HostConfig.NetworkMode}}'
 fmt_started='{{.State.StartedAt}}'
@@ -178,13 +185,16 @@ cannot_read() {
 }
 
 # ident NAME: one read, always called as a plain statement (it sets found_id). found_id is empty when Docker itself
-# says there is no such container, and otherwise the id this very read returned with the label stack_up; a container
-# with another label, or any other outcome of the read, stops the script. Docker's stderr goes to a temp file and is
-# never printed, so that a warning beside a good read is no failure.
+# says there is no such container, and otherwise the id this very read returned as owned. Docker's template compares
+# the label with stack_up on the raw value and prints "<id> owned" or "<id> foreign"; the output must be, as a whole,
+# 64 lowercase hex digits, one space and one of those two words (anchored, so a second line or any other text fails).
+# The word foreign, or any other outcome of the read, stops the script. No label value is ever captured or compared
+# here: $(...) would drop its trailing newlines and NUL bytes. Docker's stderr goes to a temp file and is never
+# printed, so that a warning beside a good read is no failure.
 found_id=""
-good_ident_re='^[0123456789abcdef]{64} '
+good_ident_re='^([0123456789abcdef]{64}) (owned|foreign)$'
 ident() {
-  local out="" err="" errfile rc=0
+  local out="" err="" errfile rc=0 id word
   found_id=""
   errfile=$(mktemp "${TMPDIR:-/tmp}/stack_up.err.XXXXXX" 2> /dev/null) || cannot_read "$1"
   out=$(docker inspect --type container --format "$fmt_ident" "$1" 2> "$errfile") || rc=$?
@@ -197,12 +207,13 @@ ident() {
     fi
     cannot_read "$1"
   fi
-  [[ $out != *$'\n'* && $out =~ $good_ident_re ]] || cannot_read "$1"
-  if [[ ${out#* } != "$label_value" ]]; then
+  [[ $out =~ $good_ident_re ]] || cannot_read "$1"
+  id=${BASH_REMATCH[1]} word=${BASH_REMATCH[2]}
+  if [[ $word == foreign ]]; then
     if [[ -z $work ]]; then refuse "container $1 exists but this script did not make it"; fi
     die "container $1 is not one this script made; it was left alone"
   fi
-  found_id=${out%% *}
+  found_id=$id
 }
 
 plain() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]]; }

@@ -1,4 +1,4 @@
-"""Tests for scripts/journeys/stack_up.sh (card 2 of the journeys stack plan, rounds 2 to 4).
+"""Tests for scripts/journeys/stack_up.sh (card 2 of the journeys stack plan, rounds 2 to 5).
 
 The script runs against stand-ins for docker, sleep, hostname and df that sit first on PATH. The stand-in
 docker records every call in calls.jsonl, keeps a fake Server 2 in state.json, and refuses (status 98) any
@@ -14,16 +14,22 @@ path that does not exist, so a real docker could not answer. No real Docker call
 can also answer one identity read by script (scripted.json next to state.json), print the daemon's own wording of a
 missing container (STUB_NOT_FOUND=daemon) and, while STUB_VERIFY is set (every run of stack_up.sh), refuse with
 status 98 a start, stop, restart, rm, cp or --network container:ID of an id that no identity read of that run showed
-with the label (verified.txt), which makes owner rule 2 of round 4 an invariant of every converge test. The tests
-read recorded calls, output lines and the fake host state; they never read the script's text, and the token
-files hold invented placeholder text that is never printed.
+as owned (verified.txt), which makes owner rule 2 of round 4 an invariant of every converge test. It answers the
+identity read the way Docker's own template does: the id, one space and the word owned when the stored value of the
+label raphael-journeys.made-by is exactly stack_up (Python equality on the raw value), otherwise the word foreign,
+and never a label value. The tests read recorded calls, output lines and the fake host state; they never read the
+script's text, and the token files hold invented placeholder text that is never printed.
 
 Tests test_1_... to test_8_... are the eight tests of the plan (test_1 and test_2 cover the round 2 rules);
 test_9_... onwards and test_extra_... are additions. Round 3 adds test_13 to test_15 (stopped kept containers) and
 test_16 to test_20 (the namespace rule: the gateway is current only when its network mode names the owner app's
 current container id and its State.StartedAt is strictly later than the owner app's). Round 4 adds test_21 to
 test_25 (an identity read that fails for any reason but Docker's own "no such container" stops converge before any
-change with one fixed line; Docker is given an id only from a read of the same run that showed the label).
+change with one fixed line; Docker is given an id only from a read of the same run that showed the label). Round 5
+adds test_26 to test_29 (the label is compared by Docker's template on the raw value, so the values stack_up plus one
+newline, stack_up plus two newlines, stack_ plus a NUL byte plus up and stack_upx are foreign: converge and versions
+refuse them for all five roles of the template without a changing call, the exact value is accepted, and test_29
+checks the stand-in's own answer to the identity read).
 """
 
 from __future__ import annotations
@@ -77,7 +83,7 @@ FORMATS = {
         '{{range .Config.Env}}{{$p := split . "="}}{{if eq (index $p 0) "HERMES_HOME"}}{{index $p 1}}{{end}}{{end}}'
     ),
     "health_kind": "{{if .Config.Healthcheck}}{{index .Config.Healthcheck.Test 0}}{{else}}NONE{{end}}",
-    "ident": '{{.Id}} {{index .Config.Labels "raphael-journeys.made-by"}}',
+    "ident": '{{.Id}} {{if eq (index .Config.Labels "raphael-journeys.made-by") "stack_up"}}owned{{else}}foreign{{end}}',
     "config_image": "{{.Config.Image}}",
     "network_mode": "{{.HostConfig.NetworkMode}}",
     "started_at": "{{.State.StartedAt}}",
@@ -258,8 +264,9 @@ def d_inspect(state, a):
         elif fmt == F["health_kind"]:
             out = c["health"][0] if c["health"] else "NONE"
         elif fmt == F["ident"]:
-            out = "%s %s" % (cid, c["labels"].get(LABEL_KEY, ""))
-            if c["labels"].get(LABEL_KEY) == "stack_up":
+            owned = c["labels"].get(LABEL_KEY) == "stack_up"
+            out = "%s %s" % (cid, "owned" if owned else "foreign")
+            if owned:
                 note_verified(cid)
         elif fmt == F["config_image"]:
             out = c["image_ref"]
@@ -1786,6 +1793,116 @@ def test_25_with_stub_verify_the_stand_in_refuses_an_id_that_no_read_showed_with
     read("unrelated-container.invalid")
     refused = attempt(unlabelled)
     assert refused.returncode == 98 and "was not read with the label" in refused.stderr
+
+
+# --- round 5, rules 1 and 2: the label is compared inside Docker's template, on the raw value. The shell drops trailing
+# newlines and NUL bytes from a captured value, so a script that compared the captured text would take the first three
+# of these values for stack_up.
+
+LABEL_KEY = LABEL.partition("=")[0]
+FOREIGN_LABEL_VALUES = {
+    "one_newline": "stack_up\n",
+    "two_newlines": "stack_up\n\n",
+    "nul_byte": "stack_\x00up",
+    "extra_letter": "stack_upx",
+}
+ALL_LABEL_VALUES = {"exact": "stack_up", **FOREIGN_LABEL_VALUES}
+
+
+def stopped_with_label_value(host: Host, role: str, value: str) -> None:
+    """The container of that role keeps its name and image, gets the label with exactly this value and stops."""
+    state = host.state()
+    container = containers_by_name(state)[role]
+    container["labels"] = {LABEL_KEY: value}
+    container["running"] = False
+    host.save(state)
+
+
+@pytest.mark.parametrize("case", sorted(FOREIGN_LABEL_VALUES))
+@pytest.mark.parametrize("role", TEMPLATE_CONTAINERS)
+def test_26_converge_refuses_a_container_whose_label_value_is_not_exactly_stack_up(
+    stack: Host, role: str, case: str
+) -> None:
+    """A stopped container of that role carries one of the four values: the fixed refusal for the role, nothing on
+    stdout, no changing call, the fake host unchanged. Without the rule the script keeps the container and starts it."""
+    stopped_with_label_value(stack, role, FOREIGN_LABEL_VALUES[case])
+    before = stack.state()
+    mark = stack.mark()
+    result = stack.converge()
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert result.stderr == f"stack_up: container {role} exists but this script did not make it; nothing was changed\n"
+    assert changing(stack.docker_calls(mark)) == []
+    assert stack.state() == before
+
+
+@pytest.mark.parametrize("case", sorted(FOREIGN_LABEL_VALUES))
+@pytest.mark.parametrize("role", TEMPLATE_CONTAINERS)
+def test_27_versions_refuses_a_container_whose_label_value_is_not_exactly_stack_up(
+    stack: Host, role: str, case: str
+) -> None:
+    """The read-only versions decides ownership too: on the host of test_26 it ends in the same refusal line, prints no
+    version, makes no changing call and leaves the fake host unchanged."""
+    stopped_with_label_value(stack, role, FOREIGN_LABEL_VALUES[case])
+    before = stack.state()
+    mark = stack.mark()
+    result = stack.run("stack_up.sh", "versions")
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert result.stderr == f"stack_up: container {role} exists but this script did not make it; nothing was changed\n"
+    assert changing(stack.docker_calls(mark)) == []
+    assert stack.state() == before
+
+
+@pytest.mark.parametrize("role", TEMPLATE_CONTAINERS)
+def test_28_a_stopped_container_with_exactly_the_label_value_is_accepted_and_started(stack: Host, role: str) -> None:
+    """The control of test_26 and test_27 on the same host: the exact value is accepted. Versions prints the five
+    'ROLE TAG' lines; converge exits 0, calls start for that container (the call test_26 must not see), keeps the five
+    ids and ends with all five running and healthy."""
+    stopped_with_label_value(stack, role, "stack_up")
+    ids = container_ids(stack)
+    ca = ca_part(stack.state())
+    mark = stack.mark()
+    versions = stack.run("stack_up.sh", "versions")
+    assert versions.returncode == 0, versions.stderr
+    assert versions.stdout.splitlines() == [
+        f"proxy {PROXY_TAG}",
+        f"app {REVISION}-{ca}",
+        f"dashboard {PLATFORM}",
+        f"gateway {PLATFORM}",
+        f"browser {REVISION}-{ca}",
+    ]
+    assert changing(stack.docker_calls(mark)) == []
+
+    mark = stack.mark()
+    result = stack.converge()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output_lines(result)[-1] == ANSWERS_LINE
+    assert ["start", ids[role]] in lifecycle_calls(stack.docker_calls(mark))
+    assert container_ids(stack) == ids
+    assert_all_running_and_healthy(stack)
+
+
+@pytest.mark.parametrize("case", sorted(ALL_LABEL_VALUES))
+def test_29_the_stand_in_answers_the_identity_format_with_one_fixed_word_and_never_a_label_value(
+    host: Host, case: str
+) -> None:
+    """Harness self-test: one direct stand-in 'docker inspect' of a container that carries this label value answers
+    '<id> owned' for exactly stack_up and '<id> foreign' for every other value, shows no label text, and the id reaches
+    verified.txt only when the answer is owned."""
+    value = ALL_LABEL_VALUES[case]
+    state = host.state()
+    cid = foreign_container(state, PROXY_C)
+    state["containers"][cid]["labels"] = {LABEL_KEY: value}
+    host.save(state)
+    (host.root / "verified.txt").write_text("", encoding="utf-8")
+    answer = host.docker("inspect", "--type", "container", "--format", FORMATS["ident"], PROXY_C)
+    word = "owned" if value == "stack_up" else "foreign"
+    assert answer.returncode == 0, answer.stderr
+    assert answer.stdout == f"{cid} {word}\n"
+    assert answer.stderr == ""
+    assert "stack_" not in answer.stdout
+    assert (host.root / "verified.txt").read_text(encoding="utf-8").split() == ([cid] if word == "owned" else [])
 
 
 def test_7_ca_leaves_the_proxy_only_as_ca_pem_and_only_the_proxy_mounts_the_proxy_volume(stack: Host) -> None:
