@@ -733,7 +733,7 @@ def test_a_hard_kill_with_no_previous_result_leaves_a_started_result_with_its_ti
     assert result["result"] == "started"
     assert re.fullmatch(TIME_RE, result["started"])
     assert "finished" not in result
-    assert box.names() == [ISO2]  # it was in the first step when it died
+    assert box.names() == [RESET, ISO2]  # the first reset ran; it was in the isolation check when it died
     assert sorted(path.name for path in box.run_dir.iterdir()) == ["result", "run.lock"]
 
 
