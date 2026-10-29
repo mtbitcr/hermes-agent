@@ -94,19 +94,65 @@ FORMATS = {
 }
 
 STUB = r'''
-import hashlib
-import json
 import os
-import re
 import sys
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-STATE_FILE = ROOT / "state.json"
-CALLS = ROOT / "calls.jsonl"
+# Each stand-in call is a fresh interpreter, and the stdlib json, re, pathlib and hashlib imports cost more than the
+# rest of the call. The common path (reads and writes of the state and the calls log) uses the C coder of json
+# directly and the other modules are imported only by the subcommands that need them.
+try:
+    import _json
+
+    class _Context:
+        strict = True
+        object_hook = object_pairs_hook = None
+        parse_float, parse_int = float, int
+        memo = {}
+
+        @staticmethod
+        def parse_constant(name):
+            return {"-Infinity": float("-inf"), "Infinity": float("inf"), "NaN": float("nan")}[name]
+
+    _scan = _json.make_scanner(_Context)
+    _encode = _json.make_encoder(None, None, _json.encode_basestring_ascii, None, ": ", ", ", False, False, True)
+
+    class json:
+        @staticmethod
+        def loads(text):
+            text = text.strip()
+            value, end = _scan(text, 0)
+            if end != len(text):
+                raise ValueError("Extra data")
+            return value
+
+        @staticmethod
+        def dumps(value):
+            return "".join(_encode(value, 0))
+except Exception:
+    import json
+
+
+def read_text(path):
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def write_text(path, text):
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+STATE_FILE = os.path.join(ROOT, "state.json")
+CALLS = os.path.join(ROOT, "calls.jsonl")
 LABEL_KEY = "raphael-journeys.made-by"
-HEX64 = re.compile(r"[0-9a-f]{64}")
 TOOL = ""
+
+
+class HEX64:
+    @staticmethod
+    def fullmatch(text):
+        return len(text) == 64 and all(ch in "0123456789abcdef" for ch in text)
 
 
 class Done(Exception):
@@ -122,12 +168,12 @@ def fail(message, rc=1):
     raise Done(rc, message + "\n")
 
 
-VERIFIED = ROOT / "verified.txt"
-SCRIPTED = ROOT / "scripted.json"
+VERIFIED = os.path.join(ROOT, "verified.txt")
+SCRIPTED = os.path.join(ROOT, "scripted.json")
 
 
 def verified_ids():
-    return VERIFIED.read_text(encoding="utf-8").split() if VERIFIED.exists() else []
+    return read_text(VERIFIED).split() if os.path.exists(VERIFIED) else []
 
 
 def note_verified(cid):
@@ -142,7 +188,7 @@ def require_verified(cid):
 
 
 def changed_since(start):
-    for line in CALLS.read_text(encoding="utf-8").splitlines()[start:]:
+    for line in read_text(CALLS).splitlines()[start:]:
         call = json.loads(line)
         if call["tool"] == "docker" and call["argv"][:1] not in (["info"], ["inspect"]):
             return True
@@ -151,9 +197,9 @@ def changed_since(start):
 
 def scripted_ident(name):
     """The scripted entry that fires for this identity read of container NAME (see Host.script_read), or None."""
-    if not SCRIPTED.exists():
+    if not os.path.exists(SCRIPTED):
         return None
-    entries = json.loads(SCRIPTED.read_text(encoding="utf-8"))
+    entries = json.loads(read_text(SCRIPTED))
     for entry in entries:
         if entry["name"] != name or entry["fired"]:
             continue
@@ -165,18 +211,18 @@ def scripted_ident(name):
         else:
             entry["fired"] += 1
             hit = entry
-        SCRIPTED.write_text(json.dumps(entries), encoding="utf-8")
+        write_text(SCRIPTED, json.dumps(entries))
         return hit
     return None
 
 
 def load():
-    return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    return json.loads(read_text(STATE_FILE))
 
 
 def save(state):
-    tmp = STATE_FILE.with_name("state.tmp.%d" % os.getpid())
-    tmp.write_text(json.dumps(state), encoding="utf-8")
+    tmp = os.path.join(ROOT, "state.tmp.%d" % os.getpid())
+    write_text(tmp, json.dumps(state))
     os.replace(tmp, STATE_FILE)
 
 
@@ -210,6 +256,8 @@ def merged_env(state, c):
 
 
 def new_id(state, kind):
+    import hashlib
+
     state["seq"] += 1
     return hashlib.sha256(("%s-%d" % (kind, state["seq"])).encode()).hexdigest()
 
@@ -323,6 +371,10 @@ def d_volume(state, a):
 
 
 def d_build(state, a):
+    import hashlib
+    import re
+    from pathlib import Path
+
     tag = fil = ctx = None
     args = {}
     i = 0
@@ -466,6 +518,8 @@ CLASH_BOOL = {"-P", "--publish-all"}
 
 def run_helper(state, opts, command):
     """A throw-away helper container: no network, one volume, no name."""
+    import re
+
     if set(opts) - {"--rm", "-i", "--network", "--user", "--entrypoint", "--mount", "--label", "--env-file"}:
         refuse("helper run flags")
     if opts.get("--network") != ["none"] or opts.get("--user") != ["0"] or opts.get("--entrypoint") != ["sh"]:
@@ -504,6 +558,9 @@ def run_helper(state, opts, command):
 
 
 def read_env_file(path_text):
+    import re
+    from pathlib import Path
+
     env = {}
     if path_text is None:
         return env
@@ -602,6 +659,8 @@ def d_run(state, a, create=False):
 
 
 def d_cp(state, a):
+    from pathlib import Path
+
     if len(a) != 2 or ":" not in a[0]:
         refuse("cp shape %r (copy out of a container only)" % a)
     cid, _, path = a[0].partition(":")
@@ -740,9 +799,6 @@ def main():
     sys.stdout.write(out)
     log(argv, rc)
     sys.exit(rc)
-
-
-main()
 '''
 
 PROXY_TAG = "0123456789ab"
@@ -821,7 +877,12 @@ class Host:
         (self.bin / "stub.py").write_text(f"F = {FORMATS!r}\n" + STUB, encoding="utf-8")
         for tool in ("docker", "sleep", "hostname", "df"):
             wrapper = self.bin / tool
-            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$(dirname "$0")/stub.py" {tool} "$@"\n', encoding="utf-8")
+            wrapper.write_text(
+                f'#!/bin/sh\nexec "{sys.executable}" -S -I -c '
+                f"'import sys; sys.path.insert(0, sys.argv.pop(1)); import stub; stub.main()' "
+                f'"${{0%/*}}" {tool} "$@"\n',
+                encoding="utf-8",
+            )
             wrapper.chmod(0o755)
         (root / "home").mkdir()
         (root / "tmp").mkdir()
@@ -947,14 +1008,32 @@ def host(tmp_path: Path) -> Host:
     return Host(tmp_path)
 
 
-@pytest.fixture
-def stack(host: Host) -> Host:
-    """A converged stack that started from a token volume that already holds the files."""
+@pytest.fixture(scope="module")
+def converged_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The converged host, built once: a stack that started from a token volume that already holds the files."""
+    host = Host(tmp_path_factory.mktemp("converged"))
     seed_tokens(host)
     result = host.converge()
     assert result.returncode == 0, result.stdout + result.stderr
     assert output_lines(result)[-1] == ANSWERS_LINE
-    return host
+    return host.root
+
+
+@pytest.fixture
+def stack(converged_root: Path, tmp_path: Path) -> Host:
+    """A private copy of the converged host with an empty calls log."""
+    root = tmp_path / "stack"
+    shutil.copytree(converged_root, root, symlinks=True)
+    converge_log = [json.loads(line) for line in (root / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
+    for name in ("state.json", "scripted.json", "verified.txt"):
+        path = root / name
+        if path.exists():
+            path.write_text(path.read_text(encoding="utf-8").replace(str(converged_root), str(root)), encoding="utf-8")
+    (root / "calls.jsonl").write_text("", encoding="utf-8")
+    copy = Host.__new__(Host)
+    copy.root, copy.scripts, copy.bin = root, root / "tree" / "scripts" / "journeys", root / "bin"
+    copy.converged_docker = [c["argv"] for c in converge_log if c["tool"] == "docker"]
+    return copy
 
 
 def proxy_ca_pem(state: dict) -> str:
@@ -1257,7 +1336,7 @@ def test_5_new_owner_app_tag_recreates_the_owner_app_the_gateway_and_the_browser
     assert namespaces_stale(state) == []
     assert sorted(state["volumes"]) == sorted(STACK_VOLUMES)
 
-    for argv in stack.docker_calls():
+    for argv in stack.converged_docker + stack.docker_calls():
         assert argv[0] not in ("system", "image", "rmi", "prune")
         if argv[0] == "volume":
             assert argv[1] == "create"
@@ -1365,7 +1444,7 @@ def test_13_a_stopped_kept_proxy_dashboard_or_browser_is_started_and_nothing_els
     assert {argv[0] for argv in docker} <= {"info", "inspect", "cp", "start"}, docker
     assert container_ids(stack) == ids
     assert_all_running_and_healthy(stack)
-    assert_no_volume_removal(stack.docker_calls())
+    assert_no_volume_removal(stack.converged_docker + stack.docker_calls())
 
 
 def test_14_all_five_stopped_kept_containers_are_started_in_template_order_before_the_health_wait(stack: Host) -> None:
@@ -1389,7 +1468,7 @@ def test_14_all_five_stopped_kept_containers_are_started_in_template_order_befor
     assert_health_wait_after_lifecycle(docker)
     assert container_ids(stack) == ids
     assert_all_running_and_healthy(stack)
-    assert_no_volume_removal(stack.docker_calls())
+    assert_no_volume_removal(stack.converged_docker + stack.docker_calls())
 
 
 def test_15_a_reset_that_fails_after_its_stop_phase_is_recovered_by_the_next_converge(stack: Host) -> None:
@@ -1422,7 +1501,7 @@ def test_15_a_reset_that_fails_after_its_stop_phase_is_recovered_by_the_next_con
     assert container_ids(stack) == ids
     assert_all_running_and_healthy(stack)
     assert all(stack.state()["volumes"][TOKENS_V]["files"].get(name) for name in TOKEN_NAMES)
-    assert_no_volume_removal(stack.docker_calls())
+    assert_no_volume_removal(stack.converged_docker + stack.docker_calls())
 
 
 # --- round 3, rule 1 (finding 1): the namespace rule. The gateway is current only when its network mode names the
@@ -1476,7 +1555,7 @@ def test_16_an_owner_app_restart_with_the_same_id_restarts_the_gateway_once_befo
     docker = stack.docker_calls(mark)
     assert lifecycle_calls(docker) == []
     assert {argv[0] for argv in docker} <= {"info", "inspect", "cp"}, docker
-    assert_no_volume_removal(stack.docker_calls())
+    assert_no_volume_removal(stack.converged_docker + stack.docker_calls())
 
 
 # (app StartedAt, gateway StartedAt, is the gateway current): written the way Docker prints them.
@@ -1749,7 +1828,7 @@ def test_24_a_read_that_fails_after_the_first_change_stops_with_the_short_line_a
     assert result.returncode == 0, result.stdout + result.stderr
     assert output_lines(result)[-1] == ANSWERS_LINE
     assert_all_running_and_healthy(stack)
-    assert_no_volume_removal(stack.docker_calls())
+    assert_no_volume_removal(stack.converged_docker + stack.docker_calls())
 
 
 def probe_argv(operation: str, cid: str, copy_to: Path) -> list[str]:
@@ -1909,7 +1988,7 @@ def test_7_ca_leaves_the_proxy_only_as_ca_pem_and_only_the_proxy_mounts_the_prox
     """One docker cp of ca.pem; the build folders hold ca.pem only; no other container mounts the proxy volume."""
     state = stack.state()
     proxy_id = container_ids(stack)[PROXY_C]
-    docker = stack.docker_calls()
+    docker = stack.converged_docker + stack.docker_calls()
     copies = [argv for argv in docker if argv[0] == "cp"]
     assert len(copies) == 1
     assert copies[0][1] == f"{proxy_id}:/state/ca.pem" and Path(copies[0][2]).name == "ca.pem"
