@@ -302,6 +302,51 @@ home_script=${home_script//@PLATFORM@/$platform_id}
 tokens_script=${tokens_script//@PLATFORM@/$platform_id}
 handover_script=${handover_script//@APP@/$app_id}
 
+# The owner app reads its Project, Connections and Automations through a Project of this slug and a board of the same
+# slug whose metadata names that Project's id. The program runs as the platform's runtime account, on the interpreter
+# that the first real hermes launcher on PATH names (the published image puts a shell shim first).
+anchor=raphael-workspace
+anchor_program=$(
+  cat <<'EOF'
+import sys
+from hermes_cli import kanban_db, projects_db
+
+slug = "@ANCHOR@"
+with projects_db.connect_closing() as conn:
+    project = projects_db.get_project(conn, slug)
+if project is None or project.slug != slug:
+    sys.exit("the Project is not in the registry")
+kanban_db.write_board_metadata(slug, project_id=project.id)
+meta = kanban_db.read_board_metadata(slug)
+if not kanban_db.board_exists(slug) or meta.get("slug") != slug or meta.get("project_id") != project.id:
+    sys.exit("the board metadata does not name the Project id")
+EOF
+)
+anchor_program=${anchor_program//@ANCHOR@/$anchor}
+platform_python=$(
+  cat <<'EOF'
+p=$PATH:
+found=
+while [ -n "$p" ]; do
+  d=${p%%:*}
+  p=${p#*:}
+  f=${d:-.}/hermes
+  [ -f "$f" ] && [ -x "$f" ] || continue
+  first=
+  IFS= read -r first < "$f" || true
+  case "$first" in "#!"*) ;; *) continue ;; esac
+  set -f
+  set -- ${first#"#!"}
+  set +f
+  case "${1##*/}" in sh | bash | dash | ash | ksh | zsh) continue ;; esac
+  found=1
+  break
+done
+[ -n "$found" ] || exit 127
+exec "$@" -
+EOF
+)
+
 changed=1
 for c in "$gate_c" "$dash_c"; do
   say "stopping $c"
@@ -313,9 +358,18 @@ say "emptying the home volume $home_v and writing the home from stack-home"
 tar -C "$stack_home" -cf - . | run_helper "$home_v" "$home_script" -i > /dev/null ||
   die "cannot write the home volume $home_v"
 
-# --- Make the stack-only access values inside the dashboard container, as the platform's runtime account.
+# --- Make the Project, its board and the stack-only access values inside the dashboard container, as the platform's
+# runtime account. The Project and its board come first: no token is issued for an app that could not read its Project.
 say "starting $dash_c"
 docker start "$dash_c" > /dev/null || die "cannot start $dash_c"
+
+say "creating the Project $anchor and its board"
+docker exec --user "$platform_id" "$dash_c" hermes project create "Raphael Workspace" \
+  --slug "$anchor" --board "$anchor" > /dev/null 2>&1 ||
+  die "cannot create the Project $anchor and its board"
+say "binding the board $anchor to the id of the Project $anchor"
+docker exec -i --user "$platform_id" "$dash_c" sh -c "$platform_python" sh <<< "$anchor_program" > /dev/null 2>&1 ||
+  die "cannot bind the board $anchor to the id of the Project $anchor, or the id did not read back"
 
 for i in "${!surfaces[@]}"; do
   say "issuing the ${surfaces[i]} token"

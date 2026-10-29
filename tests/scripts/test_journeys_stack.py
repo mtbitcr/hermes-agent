@@ -34,6 +34,8 @@ from typing import NamedTuple
 import pytest
 import yaml
 
+from plugins.dashboard_auth.raphael_workspace import model_policy
+
 pytestmark = pytest.mark.linux_only
 
 REPO = Path(__file__).resolve().parents[2]
@@ -55,6 +57,10 @@ TOKENS_V = "raphael-journeys-tokens"
 PROXY_V = "raphael-journeys-proxy"
 STACK_VOLUMES = [HOME_V, TOKENS_V, PROXY_V]
 PROD_C = "raphael-workspace"
+# The owner app's Project and board. The slug is spelled like the production container's name but is platform
+# data, not a docker resource; the reset writes it twice as the platform's account (project, board metadata).
+ANCHOR = "raphael-workspace"
+ANCHOR_WRITES = 2
 # Old rig names (facts file): present on the fake host so that any call naming them is caught.
 DECOY_CONTAINERS = [
     "raphael-s2-workspace", "raphael-s2-proxy", "raphael-s2-dashboard",
@@ -62,7 +68,7 @@ DECOY_CONTAINERS = [
 ]
 DECOY_VOLUMES = ["raphael-s2-state", "raphael-s2-state-prod", "raphael-s2-pw"]
 # Profile folder names are platform data, not container or volume names.
-NOT_RESOURCE_NAMES = {"raphael-planner"}
+NOT_RESOURCE_NAMES = {"raphael-planner", "raphael-designer"}
 
 # Bytecode of the platform modules that the fake runs for real is cached here (compiling them takes seconds).
 REAL_PYC = Path(tempfile.gettempdir()) / f"journeys-stack-pyc-{os.getuid()}"
@@ -559,8 +565,10 @@ def unmap(data, pairs):
 def container_env(entry, pairs, uid=0, gid=0):
     env = {"FAKE_EXEC_UID": str(uid), "FAKE_EXEC_GID": str(gid), "PATH": "%s:%s:%s:/usr/bin:/bin" % (ROOT / "ctr" / "shim", ROOT / "ctr" / "venv",
                                                ROOT / "ctr" / "bin"),
-           "FAKE_HOST_ROOT": str(ROOT), "PYTHONPATH": str(ROOT / "ctr" / "pkgs"),
-           "PYTHONDONTWRITEBYTECODE": "1", "HOME": str(ROOT / "ctr" / "home")}
+           # The stand-in modules come first; hermes_cli then also reaches the platform's own modules (its
+           # __init__ extends the package path), whose bytecode is read from the shared cache.
+           "FAKE_HOST_ROOT": str(ROOT), "PYTHONPATH": "%s:%s" % (ROOT / "ctr" / "pkgs", REPO_ROOT),
+           "PYTHONPYCACHEPREFIX": REAL_PYC, "PYTHONDONTWRITEBYTECODE": "1", "HOME": str(ROOT / "ctr" / "home")}
     for item in entry["env"]:
         key, _, value = item.partition("=")
         if key != "PATH":
@@ -624,7 +632,8 @@ def d_exec(argv, args):
     for path in targets:
         if not reach(uid, gid, path, 2):
             return finish(seq, 2, err=("sh: 1: cannot create %s: Permission denied\n" % cmd[local.index(path)]).encode())
-    existing = {path for path in targets if Path(path).exists()}
+    volumes = [host for _, host in pairs]
+    known, owned_before = {path for host in volumes for path in tree_of(host)}, load_owners()
     if local[0] in ("python3", "python"):
         local[0] = sys.executable
     try:
@@ -633,9 +642,12 @@ def d_exec(argv, args):
     except FileNotFoundError:
         return finish(seq, 127, err=b"exec: command not found\n")
     table = load_owners()
-    for path in targets:
-        if path not in existing and Path(path).exists() and owner_key(path):
-            table[owner_key(path)] = [uid, gid]
+    # What the command created inside a volume belongs to the identity it ran as, unless it named an owner itself.
+    for host in volumes:
+        for path in tree_of(host):
+            key = owner_key(path)
+            if path not in known and key and table.get(key) == owned_before.get(key):
+                table[key] = [uid, gid]
     save_owners(table)
     return finish(seq, done.returncode, unmap(done.stdout, pairs), unmap(done.stderr, pairs))
 
@@ -770,6 +782,13 @@ def issue_token(args):
 
 
 CRON_LIST_PROGRAM = "import sys\nfrom hermes_cli.cron import cron_list\ncron_list(sys.argv[1] == '1')\n"
+# `hermes project ...`: the platform's own parser and handler for the project commands.
+PROJECT_PROGRAM = (
+    "import argparse, sys\n"
+    "from hermes_cli import projects_cmd\n"
+    "top = argparse.ArgumentParser(prog='hermes')\n"
+    "projects_cmd.build_parser(top.add_subparsers(dest='command'))\n"
+    "sys.exit(projects_cmd.projects_command(top.parse_args(sys.argv[1:])))\n")
 
 
 def real_platform(program, *argv):
@@ -789,10 +808,20 @@ def hermes_main(args):
         return done.returncode
     if args[:2] == ["cron", "list"]:
         profile = "default" if home.parent.name != "profiles" else (
-            "planner" if home.name == "raphael-planner" else home.name)
+            {"raphael-planner": "planner", "raphael-designer": "designer"}.get(home.name, home.name))
         jobs = spec.get("cron_jobs", {}).get(profile, [])
         sys.stdout.write(EMPTY_CRON if not jobs else "".join("%s\n" % job for job in jobs))
         return spec.get("cron_rc", 0)
+    if args[:1] == ["project"]:
+        if spec.get("project_fail") == "refused":
+            sys.stderr.write("fake hermes: project command failed\n")
+            return 2
+        if spec.get("project_fail") == "silent":  # the command answers success and makes nothing
+            return 0
+        done = real_platform(PROJECT_PROGRAM, *args)
+        sys.stdout.write(done.stdout)
+        sys.stderr.write(done.stderr)
+        return done.returncode
     if args[:1] == ["send"]:
         if "--to" not in args or args[-1].startswith("-"):
             sys.stderr.write("usage: hermes send --to PLATFORM TEXT\n")
@@ -830,7 +859,7 @@ FAKE_TOOLS_SOURCE = (
 
 # Stand-ins for the platform modules the scripts import inside the container.
 FAKE_PACKAGES = {
-    "hermes_cli/__init__.py": "",
+    "hermes_cli/__init__.py": "from pkgutil import extend_path\n__path__ = extend_path(__path__, __name__)\n",
     "hermes_cli/config.py": '''
 import os
 from pathlib import Path
@@ -955,6 +984,16 @@ def docker_target(call: dict) -> tuple[str, str | None]:
             i += 2 if argv[i] in ("-u", "--user") else 1
         return sub, argv[i]
     return sub, None
+
+
+def docker_names(call: dict) -> set[str]:
+    """Container and volume style names in a recorded docker call. The anchor slug is spelled like the production
+    container's name; inside the command that an exec runs it is the platform's own data, not a docker resource."""
+    argv = call["argv"]
+    sub, container = docker_target(call)
+    first = argv.index(container) + 1 if sub == "exec" else len(argv)
+    shown = argv[:first] + [part for part in argv[first:] if part != ANCHOR]
+    return set().union(*(resource_names_in(part) for part in shown))
 
 
 FAKE_LIB_SH = r'''
@@ -1366,15 +1405,54 @@ def test_template_says_in_one_comment_line_that_every_container_needs_a_health_c
 def test_stack_home_sets_what_the_facts_say():
     default = yaml.safe_load((STACK_HOME / "config.yaml").read_text())
     profiles = sorted(p for p in (STACK_HOME / "profiles").iterdir() if p.is_dir())
-    assert [p.name for p in profiles] == ["raphael-planner"]
-    planner = yaml.safe_load((profiles[0] / "config.yaml").read_text())
+    assert [p.name for p in profiles] == ["raphael-designer", "raphael-planner"]
+    designer, planner = (yaml.safe_load((p / "config.yaml").read_text()) for p in profiles)
     multiplex = default.get("multiplex_profiles", (default.get("gateway") or {}).get("multiplex_profiles"))
     assert multiplex is True
-    for config in (default, planner):
+    for config in (default, planner, designer):
         assert config["kanban"]["dispatch_in_gateway"] is False
         platforms = config.get("platforms") or {}
         assert set(platforms) <= {"api_server"}, "no messaging platform may be configured"
         assert "cron" not in config
+
+
+def primary_route(profile: str):
+    """The admitted base route the policy recommends for a profile, read from the policy when the test runs."""
+    found = [a for (name, _provider), a in model_policy._ASSIGNMENTS.items() if name == profile and a.recommended]
+    assert len(found) == 1, f"the policy has no single primary route for {profile}"
+    return found[0]
+
+
+def test_stack_home_enables_the_owner_workspace_and_carries_the_admitted_route(tmp_path: Path, monkeypatch):
+    configs = {
+        "default": STACK_HOME / "config.yaml",
+        "raphael-planner": STACK_HOME / "profiles/raphael-planner/config.yaml",
+    }
+    def dig(node, *keys):
+        for key in keys:
+            node = node.get(key) if isinstance(node, dict) else None
+        return node
+
+    for profile, path in configs.items():
+        config = yaml.safe_load(path.read_text())
+        route = primary_route(profile)
+        assert dig(config, "gateway", "api_server", "owner_workspace", "enabled") is True, profile
+        assert dig(config, "model", "provider") == route.provider, profile
+        assert dig(config, "model", "default") == route.model, profile
+        assert dig(config, "agent", "reasoning_effort") == route.reasoning_effort, profile
+        assert config.get("fallback_providers") == [], profile
+
+    # What the plan commit reads: the policy's own reader, on a copy of the home, gives that route and no fallback.
+    home = tmp_path / "home"
+    shutil.copytree(STACK_HOME, home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for profile in configs:
+        route = primary_route(profile)
+        configured = model_policy._configured_route(profile)
+        assert configured == (route.provider, route.model, route.reasoning_effort, True), profile
+        provider, model, effort, fallbacks_disabled = configured
+        admitted = model_policy.validate_assignment(profile, provider, model, effort, disable_fallbacks=fallbacks_disabled)
+        assert admitted == route, profile
 
 
 def test_stack_home_holds_no_dotenv_and_no_values():
@@ -1726,7 +1804,8 @@ def test_reset_order_of_stops_writes_and_starts(shared_reset: SharedReset):
     assert set(steps[:2]) == {("stop", GATE_C), ("stop", DASH_C)}
     assert set(steps[2:4]) == {("helper", HOME_V), ("helper", TOKENS_V)}
     assert steps[4] == ("start", DASH_C)
-    assert steps[5:-6] == [("write", DASH_C)] * 9  # 5 tokens, 2 API server keys, 2 model tokens
+    # the anchor Project and its board, then 5 tokens, 2 API server keys, 2 model tokens
+    assert steps[5:-6] == [("write", DASH_C)] * (ANCHOR_WRITES + 9)
     assert steps[-6] == ("helper", TOKENS_V)  # the token files go to the owner app before it restarts
     assert steps[-5:-2] == [("restart", APP_C), ("restart", DASH_C), ("start", GATE_C)]
     assert set(steps[-2:]) == {("start", PROXY_C), ("start", BROWSER_C)}
@@ -1761,7 +1840,7 @@ def test_reset_helpers_have_the_agreed_shape(shared_reset: SharedReset):
 def test_reset_writers_run_as_the_platform_identity_with_values_only_on_stdin(shared_reset: SharedReset):
     host = shared_reset.host
     writers = [c for c in host.calls("docker") if docker_target(c)[0] == "exec" and "--user" in c["argv"]]
-    assert len(writers) == 9
+    assert len(writers) == ANCHOR_WRITES + 9
     for call in writers:
         argv = call["argv"]
         assert argv[argv.index("--user") + 1] == "10000:10000"
@@ -1774,6 +1853,96 @@ def test_reset_writers_run_as_the_platform_identity_with_values_only_on_stdin(sh
         assert argv[argv.index("--out") + 1] == "/tokens/" + argv[argv.index("--surface") + 1]
     carrying = [c for c in writers if c["stdin"] and MODEL_TOKEN.encode() in c["stdin"]]
     assert len(carrying) == 2 and all("-i" in c["argv"] for c in carrying)
+
+
+# --- the Project and board that the owner app reads
+
+# The platform's own registry and kanban code, run on the home that the reset left: what is there, as the platform reads it.
+ANCHOR_READ = (
+    "import json, sys\n"
+    "from hermes_cli import kanban_db, projects_db\n"
+    "project_slug, board_slug = sys.argv[1:3]\n"
+    "with projects_db.connect_closing() as conn:\n"
+    "    project = projects_db.get_project(conn, project_slug)\n"
+    "meta = kanban_db.read_board_metadata(board_slug)\n"
+    "print(json.dumps({'project': project and {'id': project.id, 'slug': project.slug, 'board': project.board_slug},\n"
+    "                  'board_exists': kanban_db.board_exists(board_slug),\n"
+    "                  'meta': {'slug': meta.get('slug'), 'project_id': meta.get('project_id')}}))\n")
+
+
+def bound_hermes_source() -> tuple[str, str]:
+    """The Project slug and the board slug that the owner app's settings bind: what the app reads, and through which board."""
+    lines = (JOURNEYS / "stack-app.settings").read_text().splitlines()
+    settings = dict(line.partition("=")[::2] for line in lines if line.strip() and not line.startswith("#"))
+    (binding,) = json.loads(settings["RAPHAEL_PROJECT_BINDINGS_JSON"])
+    hermes = binding["sources"]["hermes"]
+    return hermes["projectSlug"], hermes["boardSlug"]
+
+
+def read_anchor(host: Host, scratch: Path) -> dict:
+    """The bound Project and board as the platform reads them from a copy of the home that the reset left."""
+    project_slug, board_slug = bound_hermes_source()
+    home = scratch / "home-copy"
+    shutil.copytree(host.vol(HOME_V), home, symlinks=True)
+    REAL_PYC.mkdir(parents=True, exist_ok=True)
+    env = {"PATH": os.environ["PATH"], "HOME": str(scratch), "HERMES_HOME": str(home), "PYTHONPATH": str(REPO),
+           "PYTHONPYCACHEPREFIX": str(REAL_PYC), "AWS_EC2_METADATA_DISABLED": "true"}
+    done = subprocess.run([sys.executable, "-c", ANCHOR_READ, project_slug, board_slug], env=env, cwd=scratch,
+                          capture_output=True, text=True)
+    assert done.returncode == 0, done.stdout + done.stderr
+    return json.loads(done.stdout.splitlines()[-1])
+
+
+def test_reset_makes_the_project_the_app_binds_and_a_board_that_names_that_projects_id(
+        shared_reset: SharedReset, tmp_path: Path):
+    project_slug, board_slug = bound_hermes_source()
+    seen = read_anchor(shared_reset.host, tmp_path)
+    assert seen["project"] is not None, f"the reset made no Project with the slug {project_slug}"
+    assert seen["project"]["slug"] == project_slug and seen["project"]["board"] == board_slug
+    assert seen["board_exists"], f"the reset made no board {board_slug}"
+    assert seen["meta"]["slug"] == board_slug
+    assert seen["meta"]["project_id"] == seen["project"]["id"]
+
+
+def test_reset_makes_the_project_and_board_before_it_issues_any_token(shared_reset: SharedReset):
+    writers = writer_calls(shared_reset.host)
+    issues = [i for i, call in enumerate(writers) if "kanban-workspace-token" in call["argv"]]
+    assert len(issues) == len(SURFACE_ENV)
+    assert min(issues) >= ANCHOR_WRITES
+
+
+def board_root_is_a_file(host: Host) -> None:
+    """The platform's kanban folder is pinned to a file, so that no board can be written (the Project registry is not affected)."""
+    blocker = host.root / "not-a-folder"
+    blocker.write_text("a file where the platform expects the kanban folder\n")
+    host.update(lambda state: state["containers"][DASH_C]["env"].append(f"HERMES_KANBAN_HOME={blocker}"))
+
+
+def project_command_gives(mode: str):
+    return lambda host: host.update(lambda state: state["hermes"].update(project_fail=mode))
+
+
+# One operation broken per case: how to break it, and whether the Project was made before the reset stopped.
+ANCHOR_BREAKS = {
+    "project-command-refused": (project_command_gives("refused"), False),
+    "project-command-makes-nothing": (project_command_gives("silent"), False),
+    "board-cannot-be-written": (board_root_is_a_file, True),
+}
+
+
+@pytest.mark.parametrize("name", ANCHOR_BREAKS)
+def test_reset_stops_before_any_token_when_the_project_or_its_board_cannot_be_made(host: Host, tmp_path: Path, name):
+    break_it, project_made = ANCHOR_BREAKS[name]
+    break_it(host)
+    result = run_reset(host)
+    assert result.returncode != 0, result.stdout + result.stderr
+    docker = host.calls("docker")
+    assert not [c for c in docker if "kanban-workspace-token" in c["argv"]]
+    done = [docker_target(c) for c in docker]
+    assert not [step for step in done if step[0] == "restart"] and ("start", GATE_C) not in done
+    seen = read_anchor(host, tmp_path)
+    assert (seen["project"] is not None) == project_made
+    assert not seen["board_exists"] and seen["meta"]["project_id"] is None
 
 
 # --- the platform's runtime identity and the owner app's identity are two different things
@@ -1844,7 +2013,7 @@ def test_reset_runs_every_platform_command_as_the_platform_identity_and_nothing_
     host = finished(request, fixture).host
     calls, spec = host.calls("docker"), "%d:%d" % platform
     writers = writer_calls(host)
-    assert len(writers) == 9
+    assert len(writers) == ANCHOR_WRITES + 9
     for call in writers:
         assert call["argv"][call["argv"].index("--user") + 1] == spec
     for call in calls:
@@ -1950,7 +2119,7 @@ def test_reset_names_only_template_containers_and_volumes(shared_reset: SharedRe
     template = parse_template()
     allowed = set(template["containers"]) | set(template["volumes"])
     calls = host.calls("docker")
-    found = set().union(*(resource_names_in(part) for c in calls for part in c["argv"]))
+    found = set().union(*(docker_names(c) for c in calls))
     assert found <= allowed
     assert not found & (set(DECOY_CONTAINERS) | set(DECOY_VOLUMES) | {PROD_C})
     for call in calls:
@@ -1963,9 +2132,11 @@ def test_reset_names_only_template_containers_and_volumes(shared_reset: SharedRe
 
 
 def test_reset_scripts_carry_no_container_or_volume_names():
+    # The one name that is not a docker resource: the reset spells the anchor slug once, as a plain assignment.
+    anchor_assignment = re.compile(r"""\s*[a-z_]+=["']?%s["']?\s*""" % re.escape(ANCHOR))
     for script in (RESET, CHECK):
         for number, line in enumerate(script.read_text().splitlines(), 1):
-            if not line.lstrip().startswith("#"):
+            if not line.lstrip().startswith("#") and not (script == RESET and anchor_assignment.fullmatch(line)):
                 assert not resource_names_in(line), f"{script.name}:{number} hard-codes a name"
 
 
@@ -2116,7 +2287,8 @@ def test_reset_skips_the_model_token_with_one_value_free_line(host: Host, how: s
     assert len(skips) == 1 and "JOURNEY_MODEL_TOKEN_FILE" in skips[0]
     if env:
         assert env["JOURNEY_MODEL_TOKEN_FILE"] not in all_output(result)
-    assert len(writer_calls(host)) == 7  # 5 tokens and 2 API server keys; no model token writes
+    # the anchor Project and its board, 5 tokens and 2 API server keys; no model token writes
+    assert len(writer_calls(host)) == ANCHOR_WRITES + 7
 
 
 def test_reset_stops_when_a_token_cannot_be_issued(host: Host):
@@ -2132,7 +2304,7 @@ def test_reset_stops_when_a_token_cannot_be_issued(host: Host):
 
 def test_reset_prints_no_skip_line_when_the_model_token_is_written(shared_reset: SharedReset):
     assert "skip" not in all_output(shared_reset.result).lower()
-    assert len(writer_calls(shared_reset.host)) == 9
+    assert len(writer_calls(shared_reset.host)) == ANCHOR_WRITES + 9
 
 
 def test_reset_leaves_the_repository_files_alone(shared_reset: SharedReset):
@@ -2253,7 +2425,7 @@ def test_reset_starts_a_stopped_owner_app_on_a_stack_that_was_just_created(host:
     assert set(steps[:2]) == {("stop", GATE_C), ("stop", DASH_C)}
     assert set(steps[2:4]) == {("helper", HOME_V), ("helper", TOKENS_V)}
     assert steps[4] == ("start", DASH_C)
-    assert steps[5:-6] == [("write", DASH_C)] * 9
+    assert steps[5:-6] == [("write", DASH_C)] * (ANCHOR_WRITES + 9)
     assert steps[-6] == ("helper", TOKENS_V)
     assert steps[-5:-2] == [("restart", APP_C), ("restart", DASH_C), ("start", GATE_C)]
     assert set(steps[-2:]) == {("start", PROXY_C), ("start", BROWSER_C)}
@@ -2476,7 +2648,7 @@ def b64d(text: str) -> bytes:
 
 def profile_folder(host: Host, profile: str) -> Path:
     home = host.vol(HOME_V)
-    return home if profile == "default" else home / "profiles" / "raphael-planner"
+    return home if profile == "default" else home / "profiles" / f"raphael-{profile}"
 
 
 def edit_config(host: Host, profile: str, change) -> None:
@@ -2536,15 +2708,22 @@ BREAKS = {
                        extra_mount(GATE_C, {"type": "volume", "name": DECOY_VOLUMES[0], "dest": "/old"}), {}),
     "home-env-name-default": ("names-on-template", lambda h: add_env_line(h, "default", "STRAY_SETTING=1"), {}),
     "home-env-name-planner": ("names-on-template", lambda h: add_env_line(h, "planner", "STRAY_SETTING=1"), {}),
+    "home-env-name-designer": ("names-on-template", lambda h: add_env_line(h, "designer", "STRAY_SETTING=1"), {}),
     "home-env-line-without-name": ("names-on-template", lambda h: add_env_line(h, "planner", "just-text"), {}),
+    "home-env-line-without-name-designer": (
+        "names-on-template", lambda h: add_env_line(h, "designer", "just-text"), {}),
     "dispatcher-on-default": ("dispatcher-off", dispatcher_on("default"), {}),
     "dispatcher-on-planner": ("dispatcher-off", dispatcher_on("planner"), {}),
+    "dispatcher-on-designer": ("dispatcher-off", dispatcher_on("designer"), {}),
     "dispatcher-unset-planner": ("dispatcher-off", dispatcher_unset("planner"), {}),
+    "dispatcher-unset-designer": ("dispatcher-off", dispatcher_unset("designer"), {}),
     "cron-job-default": ("cron-lists-empty", cron_job("default"), {}),
     "cron-job-planner": ("cron-lists-empty", cron_job("planner"), {}),
+    "cron-job-designer": ("cron-lists-empty", cron_job("designer"), {}),
     "cron-command-fails": ("cron-lists-empty", hermes_gives(cron_rc=1), {}),
     "platform-in-default-config": ("no-messaging-platform", platform_enabled("default"), {}),
     "platform-in-planner-config": ("no-messaging-platform", platform_enabled("planner"), {}),
+    "platform-in-designer-config": ("no-messaging-platform", platform_enabled("designer"), {}),
     "message-delivered": ("telegram-send-fails", hermes_gives(send_rc=0), {}),
     "production-answers-200": ("production-get-refused", curl_gives(code=200), {}),
     "production-answers-404": ("production-get-refused", curl_gives(code=404), {}),
@@ -3007,11 +3186,13 @@ def test_check_passes_the_cron_check_on_the_real_empty_job_list(real_stack: Host
     assert result.stdout.splitlines() == [f"PASS {name}" for name in CHECKS]
 
 
-@pytest.mark.parametrize("kind, profile", [("disabled", "default"), ("disabled", "planner"), ("paused", "default")])
+@pytest.mark.parametrize("kind, profile", [("disabled", "default"), ("disabled", "planner"),
+                                           ("disabled", "designer"), ("paused", "default")])
 def test_check_fails_on_any_real_cron_job_even_a_disabled_or_paused_one(real_stack: Host, real_jobs, kind, profile):
-    shutil.copytree(real_jobs[kind], profile_folder(real_stack, profile) / "cron")
+    # the reset's own `hermes project create` already made the default home's cron folder (empty); the job goes into it
+    shutil.copytree(real_jobs[kind], profile_folder(real_stack, profile) / "cron", dirs_exist_ok=True)
     result = run_check(real_stack)
-    name = "default" if profile == "default" else "raphael-planner"
+    name = "default" if profile == "default" else f"raphael-{profile}"
     assert result.returncode == 1, result.stdout
     assert list(verdicts(result)) == CHECKS
     assert failed_checks(result) == {"cron-lists-empty"}
@@ -3021,7 +3202,7 @@ def test_check_fails_on_any_real_cron_job_even_a_disabled_or_paused_one(real_sta
 def test_check_lists_cron_jobs_with_the_all_option(clean_check: CleanCheck):
     listed = [c for c in clean_check.host.calls("docker")
               if c["argv"][0] == "exec" and any("hermes cron list" in part for part in c["argv"])]
-    assert len(listed) == 2
+    assert len(listed) == 1 + len(list((clean_check.host.vol(HOME_V) / "profiles").iterdir()))
     assert all(any(part.endswith("hermes cron list --all") for part in c["argv"]) for c in listed)
 
 
@@ -3068,7 +3249,7 @@ def test_check_names_an_extra_served_profile_that_has_nothing_else_wrong(stack: 
     ("Upper-Case", "dir"), ("a" * 70, "dir"), ("notes.txt", "file"), (".hidden", "dir"),
     ("bad$(touch PWNED)", "dir"),
 ])
-def test_check_fails_closed_for_any_entry_of_the_profiles_folder_that_is_not_the_planner(stack: Host, entry, kind):
+def test_check_fails_closed_for_any_entry_of_the_profiles_folder_that_is_not_a_permitted_profile(stack: Host, entry, kind):
     target = stack.vol(HOME_V) / "profiles" / entry
     target.mkdir() if kind == "dir" else target.write_text("not a profile\n")
     result = run_check(stack)
@@ -3114,8 +3295,50 @@ def test_check_still_checks_both_permitted_profiles_when_the_served_profiles_can
 
 
 def test_check_passes_the_names_check_when_only_the_permitted_profiles_exist(clean_check: CleanCheck):
-    assert [p.name for p in (clean_check.host.vol(HOME_V) / "profiles").iterdir()] == ["raphael-planner"]
+    assert sorted(p.name for p in (clean_check.host.vol(HOME_V) / "profiles").iterdir()) == [
+        "raphael-designer", "raphael-planner"]
     assert verdicts(clean_check.result)["names-on-template"] == "PASS"
+
+
+def cron_lists(host: Host) -> list[dict]:
+    return [c for c in host.calls("docker")
+            if c["argv"][0] == "exec" and any("hermes cron list" in part for part in c["argv"])]
+
+
+def test_check_permits_the_designer_and_checks_it_like_the_planner(clean_check: CleanCheck):
+    assert (clean_check.host.vol(HOME_V) / "profiles/raphael-designer").is_dir()
+    assert clean_check.result.returncode == 0, clean_check.result.stdout
+    assert verdicts(clean_check.result) == {name: "PASS" for name in CHECKS}
+    # One cron list for each of default, planner and designer: the designer is read like the planner.
+    assert len(cron_lists(clean_check.host)) == 3
+
+
+def test_check_still_passes_on_a_stack_without_the_designer(stack: Host):
+    shutil.rmtree(stack.vol(HOME_V) / "profiles/raphael-designer")
+    assert sorted(p.name for p in (stack.vol(HOME_V) / "profiles").iterdir()) == ["raphael-planner"]
+    result = run_check(stack)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert verdicts(result) == {name: "PASS" for name in CHECKS}
+    # Only default and planner were read: the designer is checked when the stack has it, not required.
+    assert len(cron_lists(stack)) == 2
+
+
+@pytest.mark.parametrize("breaking", [dispatcher_on("designer"), dispatcher_unset("designer"),
+                                      cron_job("designer"), platform_enabled("designer")])
+def test_check_fails_the_designer_by_name_when_it_breaks_what_the_planner_may_not(stack: Host, breaking):
+    breaking(stack)
+    result = run_check(stack)
+    assert result.returncode == 1, result.stdout
+    (failed,) = failed_checks(result)
+    assert "raphael-designer" in fail_line(result, failed)
+
+
+def test_check_still_checks_the_designer_when_the_served_profiles_cannot_be_read(stack: Host):
+    hermes_gives(serve_fail=True)(stack)
+    dispatcher_on("designer")(stack)
+    result = run_check(stack)
+    assert failed_checks(result) == {"names-on-template", "dispatcher-off"}
+    assert "raphael-designer" in fail_line(result, "dispatcher-off")
 
 
 def copy_scripts(dest: Path, rename: dict[str, str] | None = None) -> Path:
@@ -3174,6 +3397,6 @@ def test_both_scripts_take_every_name_from_the_template(tmp_path: Path):
     parts = [part for c in alt.calls("docker") for part in c["argv"]]
     named = set(re.findall(r"alt-rig-[a-z]+|alt-production", "\n".join(parts)))
     assert {"alt-rig-home", "alt-rig-tokens", "alt-rig-proxy", "alt-production"} <= named
-    assert not set().union(*(resource_names_in(part) for part in parts)), "an old name was used"
+    assert not set().union(*(docker_names(c) for c in alt.calls("docker"))), "an old name was used"
     assert (alt.vol("alt-rig-home") / "config.yaml").is_file()
     assert (alt.vol("alt-rig-tokens") / "workspace").is_file()

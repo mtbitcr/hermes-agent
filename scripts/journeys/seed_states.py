@@ -157,27 +157,35 @@ def make_card(title, *options):
         raise Stop("hermes kanban create did not answer with a card") from None
 
 
-def make_review_card(title):
-    """Handed over for review, then routed: a locked card cannot be handed over, and an unrouted one is parked in review."""
+def route_card(card):
+    """Give the card the approved route of REVIEW_ROUTE: assignee, provider, model, effort, tier and its lock, in one write."""
     from hermes_cli import kanban_db
     from plugins.dashboard_auth.raphael_workspace import model_policy
 
     assignee, provider, tier = REVIEW_ROUTE
+    route = model_policy.task_assignment_for(assignee, provider, tier)
+    approved = {
+        "assignee": assignee,
+        "provider": route.provider,
+        "model": route.model,
+        "reasoning_effort": route.reasoning_effort,
+        "execution_tier": tier,
+        "model_policy_lock": kanban_db.mint_policy_lock(assignee, route.provider, route.model, route.reasoning_effort, tier),
+    }
+    with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
+        kanban_db.assign_task(conn, card, assignee, approved_route=approved)
+
+
+def make_review_card(title):
+    """Handed over for review, then routed: a locked card cannot be handed over, and an unrouted one is parked in review."""
+    from hermes_cli import kanban_db
+
+    tier = REVIEW_ROUTE[2]
     try:
-        route = model_policy.task_assignment_for(assignee, provider, tier)
-        approved = {
-            "assignee": assignee,
-            "provider": route.provider,
-            "model": route.model,
-            "reasoning_effort": route.reasoning_effort,
-            "execution_tier": tier,
-            "model_policy_lock": kanban_db.mint_policy_lock(assignee, route.provider, route.model, route.reasoning_effort, tier),
-        }
         with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
             card = kanban_db.create_task(conn, title=title, created_by="user", project_id=PROJECT_SLUG, board=BOARD, execution_tier=tier)
         hermes("kanban", "--board", BOARD, "request-review", card, "--force")
-        with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
-            kanban_db.assign_task(conn, card, assignee, approved_route=approved)
+        route_card(card)
     except (ValueError, RuntimeError, sqlite3.Error, OSError):
         raise Stop("the card waiting for review did not take an approved route") from None
     return card
@@ -342,7 +350,16 @@ def seed_home(journey, names):
             raise Stop("the release record did not take the merge of the merged card") from None
         say("waiting release batch", batch["batch_id"])
     else:
-        stopped, _ = make_card(names["stopped"], "--max-retries", "1")
+        # Made with the task class (the command line has no flag for it): only a card that carries one takes the route.
+        try:
+            with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
+                stopped = kanban_db.create_task(
+                    conn, title=names["stopped"], created_by="user", project_id=PROJECT_SLUG, board=BOARD,
+                    max_retries=1, execution_tier=REVIEW_ROUTE[2],
+                )
+            route_card(stopped)
+        except (ValueError, RuntimeError, sqlite3.Error, OSError):
+            raise Stop("the stopped card did not take an approved route") from None
         with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
             if kanban_db.claim_task(conn, stopped) is None:
                 raise Stop("the stopped card could not be claimed")

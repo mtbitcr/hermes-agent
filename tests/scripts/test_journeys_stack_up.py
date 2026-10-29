@@ -757,6 +757,16 @@ def d_exec(state, a):
             return ""
         if 'cat >> "$1"' in script:
             return ""
+    # The reset's Project and board calls as the platform's account: each is matched whole, word by word, in its place.
+    anchor, dashboard = "raphael-workspace", "raphael-journeys-dashboard"
+    if (a[:i], a[i]) == (["--user", "10000:10000"], dashboard) and cmd == [
+        "hermes", "project", "create", "Raphael Workspace", "--slug", anchor, "--board", anchor,
+    ]:
+        return ""
+    if (a[:i], a[i]) == (["-i", "--user", "10000:10000"], dashboard) and (
+        len(cmd) == 4 and cmd[0] == "sh" and cmd[1] == "-c" and cmd[3] == "sh"
+    ):
+        return ""
     refuse("exec program %r" % (cmd[:3],))
 
 
@@ -1235,6 +1245,92 @@ def test_2_reset_after_converge_exits_0_and_all_five_containers_are_running_and_
 
     order = [(argv[0], argv[1]) for argv in stack.docker_calls(mark) if argv[0] in ("stop", "start", "restart")]
     assert order.index(("stop", GATE_C)) < order.index(("restart", APP_C)) < order.index(("start", GATE_C))
+
+
+# The reset's Project and board calls; the stand-in takes each only as the whole argument list the reset passes.
+ANCHOR = "raphael-workspace"
+AS_PLATFORM = ["--user", "10000:10000"]
+SHIM = "an invented shell text"
+BOARD_WRITE = ["sh", "-c", SHIM, "sh"]
+PROGRAM = "an invented program on standard input\n"
+
+
+def create_project(name: str = "Raphael Workspace", slug: str = ANCHOR, board: str = ANCHOR) -> list[str]:
+    return ["hermes", "project", "create", name, "--slug", slug, "--board", board]
+
+
+def exec_in(stack: Host, *words: str) -> subprocess.CompletedProcess:
+    """One call of the stand-in `docker exec` with these words after exec; standard input is the invented program."""
+    return subprocess.run(
+        [str(stack.bin / "docker"), "exec", *words],
+        env=stack.env(), cwd=stack.root, input=PROGRAM, capture_output=True, text=True, timeout=60,
+    )
+
+
+NEAR_MISSES = {
+    "create_in_another_target": [*AS_PLATFORM, GATE_C, *create_project()],
+    "create_without_the_user_option": [DASH_C, *create_project()],
+    "create_as_another_user": ["--user", "0:0", DASH_C, *create_project()],
+    "create_with_an_extra_exec_option": [*AS_PLATFORM, "-i", DASH_C, *create_project()],
+    "create_with_another_slug": [*AS_PLATFORM, DASH_C, *create_project(slug="other-slug")],
+    "create_with_a_slug_that_only_starts_like_the_anchor": [*AS_PLATFORM, DASH_C, *create_project(slug=ANCHOR + "-2")],
+    "create_with_another_board": [*AS_PLATFORM, DASH_C, *create_project(board="other-board")],
+    "create_with_another_name": [*AS_PLATFORM, DASH_C, *create_project(name="Another Workspace")],
+    "create_with_its_options_swapped": [
+        *AS_PLATFORM, DASH_C, "hermes", "project", "create", "Raphael Workspace", "--board", ANCHOR, "--slug", ANCHOR,
+    ],
+    "create_without_the_board_option": [*AS_PLATFORM, DASH_C, *create_project()[:-2]],
+    "create_with_an_extra_option": [*AS_PLATFORM, DASH_C, *create_project(), "--force"],
+    "another_project_subcommand": [*AS_PLATFORM, DASH_C, "hermes", "project", "delete", "Raphael Workspace",
+                                   "--slug", ANCHOR, "--board", ANCHOR],
+    "create_words_in_another_place": [
+        *AS_PLATFORM, DASH_C, "hermes", "project", "create", "--slug", ANCHOR, "--board", ANCHOR, "Raphael Workspace",
+    ],
+    "create_as_one_joined_word": [*AS_PLATFORM, DASH_C, " ".join(create_project())],
+    "create_inside_a_shell_script": [*AS_PLATFORM, DASH_C, "sh", "-c", " ".join(create_project()), "sh"],
+    "board_write_in_another_target": ["-i", *AS_PLATFORM, GATE_C, *BOARD_WRITE],
+    "board_write_without_the_input_option": [*AS_PLATFORM, DASH_C, *BOARD_WRITE],
+    "board_write_with_its_options_swapped": [*AS_PLATFORM, "-i", DASH_C, *BOARD_WRITE],
+    "board_write_as_another_user": ["-i", "--user", "0", DASH_C, *BOARD_WRITE],
+    "board_write_with_another_shell": ["-i", *AS_PLATFORM, DASH_C, "bash", "-c", SHIM, "sh"],
+    "board_write_with_another_shell_option": ["-i", *AS_PLATFORM, DASH_C, "sh", "-s", SHIM, "sh"],
+    "board_write_with_another_argument_zero": ["-i", *AS_PLATFORM, DASH_C, "sh", "-c", SHIM, "bash"],
+    "board_write_without_its_argument_zero": ["-i", *AS_PLATFORM, DASH_C, "sh", "-c", SHIM],
+    "board_write_without_a_script": ["-i", *AS_PLATFORM, DASH_C, "sh", "-c"],
+    "board_write_with_an_extra_word": ["-i", *AS_PLATFORM, DASH_C, *BOARD_WRITE, "extra"],
+    "board_write_words_in_another_place": ["-i", *AS_PLATFORM, DASH_C, "sh", "sh", "-c", SHIM],
+}
+
+STILL_REFUSED = {
+    "a_terminal_option": ["-t", *AS_PLATFORM, DASH_C, *create_project()],
+    "an_environment_option": ["-e", "A_NAME=a-value", *AS_PLATFORM, DASH_C, *create_project()],
+    "a_working_folder_option": ["-w", "/tmp", *AS_PLATFORM, DASH_C, *create_project()],
+    "a_project_listing": [*AS_PLATFORM, DASH_C, "hermes", "project", "list"],
+    "a_token_issue_without_out": [*AS_PLATFORM, DASH_C, "hermes", "kanban-workspace-token", "issue", "--surface", "x"],
+    "a_shell_script_without_a_known_purpose": [*AS_PLATFORM, DASH_C, "sh", "-c", "an invented script", "sh"],
+    "a_plain_program": [DASH_C, "rm", "-rf", "/tmp/anything"],
+}
+
+
+def test_2b_the_stand_in_takes_the_resets_project_create_and_board_write_calls(stack: Host) -> None:
+    created = exec_in(stack, *AS_PLATFORM, DASH_C, *create_project())
+    assert created.returncode == 0, created.stderr
+    written = exec_in(stack, "-i", *AS_PLATFORM, DASH_C, *BOARD_WRITE)
+    assert written.returncode == 0, written.stderr
+
+
+@pytest.mark.parametrize("case", sorted(NEAR_MISSES))
+def test_2c_the_stand_in_refuses_a_call_that_differs_from_either_one_in_a_word_or_the_place_of_a_word(
+    stack: Host, case: str
+) -> None:
+    refused = exec_in(stack, *NEAR_MISSES[case])
+    assert refused.returncode == 98 and "stand-in docker: refused" in refused.stderr, refused.stderr
+
+
+@pytest.mark.parametrize("case", sorted(STILL_REFUSED))
+def test_2d_the_stand_in_still_refuses_what_it_refused_before(stack: Host, case: str) -> None:
+    refused = exec_in(stack, *STILL_REFUSED[case])
+    assert refused.returncode == 98 and "stand-in docker: refused" in refused.stderr, refused.stderr
 
 
 def test_3_isolation_check_names_on_template_passes_on_the_created_stack(stack: Host) -> None:

@@ -4,4 +4,6 @@
 ARG APP_IMAGE_DIGEST
 FROM ${APP_IMAGE_DIGEST}
 
-COPY --chmod=0644 ca.pem /usr/local/share/raphael-journeys/ca.pem
+# BuildKit gives a folder that COPY --chmod creates the same mode as the file (0644, which cannot be searched),
+# so the file goes straight into /usr/local/share, which the image already has.
+COPY --chmod=0644 ca.pem /usr/local/share/raphael-journeys-ca.pem

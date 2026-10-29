@@ -31,6 +31,7 @@ import pytest
 from agent import estop
 from hermes_cli import kanban_db, owner_workspace as ow, projects_db, release_ledger
 from hermes_cli.config import load_config
+from plugins.dashboard_auth.raphael_workspace import model_policy
 
 pytestmark = pytest.mark.linux_only
 
@@ -335,6 +336,47 @@ def test_journey_5_leaves_a_stopped_card_with_the_dispatcher_off_and_starts_no_w
     config.write_text(config.read_text(encoding="utf-8").replace("dispatch_in_gateway: false", "dispatch_in_gateway: true"), encoding="utf-8")
     assert load_config()["kanban"]["dispatch_in_gateway"] is True
     assert ow.read_project_snapshot(ctx, PROJECT_SLUG)["steward"]["execution"] == execution
+
+
+ROUTE_COLUMNS = ("assignee", "provider_override", "model_override", "reasoning_effort", "execution_tier", "model_policy_lock")
+
+
+def route_of(card_id: str) -> dict:
+    with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
+        card = kanban_db.get_task(conn, card_id)
+    return {column: getattr(card, column) for column in ROUTE_COLUMNS}
+
+
+def test_journey_5_stopped_card_holds_the_route_that_make_review_card_gives(seed, reset_home, capsys):
+    code, out, err = run_seed(seed, capsys, "5")
+    assert code == 0, err
+    with contextlib.closing(kanban_db.connect(board=BOARD)) as conn:
+        (stopped,) = [task.id for task in kanban_db.list_tasks(conn)]
+
+    # The reference is a card made by the seed's own make_review_card, on the same board.
+    with seed.at_root(kanban_db.kanban_home()):
+        reference = seed.make_review_card("Journey test route reference")
+
+    route = route_of(stopped)
+    assert route == route_of(reference)
+
+    # Equal is not enough if both are empty: it is the route that REVIEW_ROUTE and the model policy admit,
+    # and its lock validates for exactly those columns.
+    assignee, provider, tier = seed.REVIEW_ROUTE
+    admitted = model_policy.task_assignment_for(assignee, provider, tier)
+    assert route == {
+        "assignee": assignee,
+        "provider_override": admitted.provider,
+        "model_override": admitted.model,
+        "reasoning_effort": admitted.reasoning_effort,
+        "execution_tier": tier,
+        "model_policy_lock": route["model_policy_lock"],
+    }
+    assert route["model_policy_lock"]
+    assert kanban_db.policy_lock_error(
+        route["model_policy_lock"], assignee, admitted.provider, admitted.model, admitted.reasoning_effort, tier
+    ) is None
+    assert stopped != reference
 
 
 def receipt_rows(registry: Path) -> list[tuple]:

@@ -25,8 +25,11 @@ PROXY_SOURCE = JOURNEYS / "synthetic_proxy.py"
 S6_DASHBOARD_RUN = REPO / "docker" / "s6-rc.d" / "dashboard" / "run"
 OWNER_WRITE_WATCH = REPO / "hermes_cli" / "owner_write_watch.py"
 
-BOUND_PROJECT = "journey-test-project"
-BOUND_BOARD = "journey-test"
+# The anchor: the Project and board the owner app's tokens are granted for. It is the only thing the app has bound.
+BOUND_PROJECT = "raphael-workspace"
+BOUND_BOARD = "raphael-workspace"
+# Where the owner app image keeps the proxy's CA: one file in a folder the image already has.
+APP_CA_FILE = "/usr/local/share/raphael-journeys-ca.pem"
 PLAYWRIGHT_VERSION = "1.63.0"
 
 SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -255,6 +258,28 @@ def test_issuer_audience_membership_and_addresses_match_the_stack_files():
     assert settings["HERMES_CONVERSATION_API_BASE_URL"] == f"http://{api_host}:{api_port}"
 
 
+def test_only_the_anchor_is_bound_without_documents_and_the_membership_names_its_project_id():
+    settings = read_settings()
+    bound = check_bindings(settings["RAPHAEL_PROJECT_BINDINGS_JSON"])
+    bindings = json.loads(settings["RAPHAEL_PROJECT_BINDINGS_JSON"])
+    assert len(bindings) == 1, "something besides the anchor is bound"
+    binding = bindings[0]
+    hermes = binding["sources"]["hermes"]
+    assert bound == {BOUND_PROJECT}
+    assert binding["routeSlug"] == BOUND_PROJECT
+    assert (hermes["projectSlug"], hermes["boardSlug"]) == (BOUND_PROJECT, BOUND_BOARD)
+    assert binding["sources"]["documents"] == []
+
+    # The anchor is the Project and board that the dashboard grants the owner app's tokens, not a copy of a name.
+    from plugins.dashboard_auth.raphael_workspace import token_store
+
+    assert (hermes["projectSlug"], hermes["boardSlug"]) == (token_store.PROJECT, token_store.BOARD)
+
+    # The one active membership is for that binding's project id, and for nothing else.
+    active = check_membership(settings["RAPHAEL_OWNER_MEMBERSHIP_JSON"], settings["RAPHAEL_ACCESS_ISSUER"], bound)
+    assert active[0]["projectIds"] == [binding["projectId"]]
+
+
 def test_the_seven_token_file_values_are_distinct_plain_names_under_one_folder():
     settings = read_settings()
     token_names = [name for name in parse_template()[f"env {template_container(1)}"] if name.endswith("_TOKEN_FILE")]
@@ -355,6 +380,24 @@ def test_browser_installs_playwright_exactly_and_the_images_agree_on_the_proxy_c
             for args in of_kind(path, kind):
                 for source in copy_parts(args)[0]:
                     assert source not in {".", "./", "/"} and "*" not in source and "key" not in source.lower()
+
+
+def test_the_app_layer_copies_the_ca_to_one_file_and_creates_no_folder_for_it():
+    # BuildKit gives a folder that COPY --chmod creates the same mode as the file (0644, which cannot be searched),
+    # so the app layer must not make one: nothing else runs, and the destination is a file in a folder the image has.
+    instructions = parse_dockerfile(APP_CA_DOCKERFILE)
+    assert {name for name, _args in instructions} == {"ARG", "FROM", "COPY"}
+    copies = of_kind(APP_CA_DOCKERFILE, "COPY")
+    assert len(copies) == 1
+    _sources, destination = copy_parts(copies[0])
+    assert not destination.endswith("/"), "a folder destination is created by COPY"
+    folder, file_name = posixpath.split(destination)
+    assert PLAIN_FILE_NAME.fullmatch(file_name), destination
+    assert folder == posixpath.dirname(APP_CA_FILE), f"{folder} is not a folder the image already has"
+    assert destination == APP_CA_FILE
+
+    # The app reads exactly that file.
+    assert read_settings()["NODE_EXTRA_CA_CERTS"] == destination
 
 
 def test_the_proxy_user_and_group_are_not_debian_base_system_accounts():

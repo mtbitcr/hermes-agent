@@ -1,0 +1,5 @@
+# Fixed, non-secret settings of the journeys test stack: the designer profile.
+# Same rules as the default profile; nothing here comes from production.
+
+kanban:
+  dispatch_in_gateway: false

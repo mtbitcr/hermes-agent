@@ -3,3 +3,16 @@
 
 kanban:
   dispatch_in_gateway: false
+
+gateway:
+  api_server:
+    owner_workspace:
+      enabled: true
+
+# The admitted base route of this profile, as the model policy lists it, and no fallback.
+model:
+  provider: anthropic
+  default: claude-opus-5-5
+agent:
+  reasoning_effort: max
+fallback_providers: []
