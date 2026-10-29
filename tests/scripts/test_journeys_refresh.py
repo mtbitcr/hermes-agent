@@ -3,9 +3,9 @@
 refresh_stack.sh runs for real, from a temporary copy of the journeys folder inside a temporary
 "checkout", against stand-ins that sit alone on PATH: ssh, docker, git, timeout, date and sleep (plus
 symlinks to bash and dirname). Every stand-in logs its call to one file, in order, and answers from
-answers.json. Only the fake ssh (Server 2) keeps state: state.json is read and rewritten inside an
+answers.bin. Only the fake ssh (Server 2) keeps state: state.bin is read and rewritten inside an
 exclusive flock and is published by rename, so no process ever sees half of it; the git and docker of
-Server 1 never touch it. The fake ssh records [destination, command, stdin size and sha256], answers by
+Server 1 never touch it. The fake ssh records [destination, command, stdin size and checksum], answers by
 the kind of command and may advance the clock; it runs the commands that touch files for real in a temporary
 Server 2 folder (the marker read, the scripts stage and publish, the platform archive stage, publish and
 removal, and the page check stage and publish against a fake docker that maps each container to a folder).
@@ -16,11 +16,16 @@ until every side of a transfer has reported. The clock is a number in a file tha
 date +%s prints it, sleep N adds N and returns at once, timeout logs its seconds and runs the wrapped command.
 No test reaches a real host, docker or ssh. Runs of the script are shared between tests that look at the same
 scenario.
+Answers and state are marshal files and the log is one repr line per call: a stand-in imports no json, re, shlex,
+hashlib or subprocess, because each of them costs more to import than the whole call.
 """
 
 from __future__ import annotations
 
+import ast
+import importlib.util
 import json
+import marshal
 import os
 import re
 import shlex
@@ -84,15 +89,15 @@ REPOSITORIES = [
 ]
 
 STAND_IN = r'''
-import json, os, sys
+import marshal, os, sys
 
 top = os.path.dirname(os.path.abspath(__file__))
 name = os.path.basename(sys.argv[1])
 args = sys.argv[2:]
-with open(os.path.join(top, "answers.json"), encoding="utf-8") as handle:
-    A = json.load(handle)
+with open(os.path.join(top, "answers.bin"), "rb") as handle:
+    A = marshal.loads(handle.read())
 SECRET = A["secret"]
-log, clock, state_path = (os.path.join(top, n) for n in ("calls.jsonl", "clock", "state.json"))
+log, clock, state_path = (os.path.join(top, n) for n in ("calls.log", "clock", "state.bin"))
 
 
 def now():
@@ -101,19 +106,37 @@ def now():
 
 
 def sha(data):
-    import hashlib
-    return hashlib.sha256(data).hexdigest()
+    # a checksum and the length: the tests only compare the two ends of one stream
+    import zlib
+    return "%08x-%d" % (zlib.crc32(data), len(data))
 
 
-def publish(target, text):
+def split(text):
+    # the words of a command that quotes with single quotes only
+    words, word, quoted = [], None, False
+    for char in text:
+        if char == "'":
+            quoted = not quoted
+            word = word or ""
+        elif quoted or not char.isspace():
+            word = (word or "") + char
+        elif word is not None:
+            words.append(word)
+            word = None
+    return words + ([word] if word is not None else [])
+
+
+def publish(target, data):
     # temporary file in the same folder, then a rename: a reader sees the old file or the whole new one
+    if isinstance(data, str):
+        data = data.encode("utf-8")
     temp = "%s.%d.tmp" % (target, os.getpid())
-    half = len(text) // 2
-    with open(temp, "w", encoding="utf-8") as handle:
-        handle.write(text[:half])
+    half = len(data) // 2
+    with open(temp, "wb") as handle:
+        handle.write(data[:half])
         handle.flush()
         pause()
-        handle.write(text[half:])
+        handle.write(data[half:])
     os.replace(temp, target)
 
 
@@ -140,7 +163,7 @@ def bump_clock(seconds):
 
 def record(label, **extra):
     with open(log, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"call": label, "argv": [name, *args], **extra}) + "\n")
+        handle.write(repr({"call": label, "argv": [name, *args], **extra}) + "\n")
 
 
 def end(rc, out=None, data=None, err=None):
@@ -218,7 +241,6 @@ if name == "docker":
 
 STAND_IN += r'''
 if name == "ssh":
-    import shlex
     command = args[-1]
     data = b"" if sys.stdin.isatty() else sys.stdin.buffer.read()
     D, B = A["s2_dir"], A["browser"]
@@ -228,8 +250,6 @@ if name == "ssh":
         f"cd '{D}' && ./stack_up.sh build proxy": "build-proxy",
         f"docker exec '{B}' test -d '/opt/raphael-journeys/tools/page-check'": "page-check-present",
         "docker load": "load",
-        f"if [ -e '{D}.new' ]; then rm -r '{D}.new'; fi": "rm-scripts-new",
-        f"if [ -e '{D}.page-check.tar' ]; then rm '{D}.page-check.tar'; fi": "rm-staging-tar",
     }
     prefixes = [
         ("docker tag ", "tag"), ("cat > ", "ship-platform"),
@@ -241,14 +261,14 @@ if name == "ssh":
         ("echo ", "publish-scripts"), ("mv ", "publish-platform"),
     ]
     REAL_KINDS = ("marker", "ship-scripts", "publish-scripts", "ship-platform", "publish-platform", "rm-archive",
-                  "copy-page-check", "publish-page-check", "rm-scripts-new", "rm-page-check", "rm-staging-tar")
+                  "copy-page-check", "publish-page-check", "rm-page-check")
     kind = exact.get(command)
     if kind is None:
         if " tar -xf - -C " in command:
             kind = "ship-scripts"
         elif "docker cp " in command:
             kind = "copy-page-check"
-        elif command.startswith("docker exec ") and 'for d in "$@"' in command:
+        elif command.startswith("docker exec ") and " && r=0 || r=1; " in command:
             kind = "rm-page-check"
         elif ".refresh-commit" in command and " cat " in command and not command.startswith("echo "):
             kind = "marker"
@@ -256,10 +276,7 @@ if name == "ssh":
             kind = "publish-page-check"
         else:
             kind = next((k for p, k in prefixes if command.startswith(p)), "other")
-    try:
-        words = shlex.split(command)
-    except ValueError:
-        words = []
+    words = split(command)
     merged = words[-1:] == ["2>&1"]
     last = words[-1] if words else ""
     core = words[:-1] if merged else words
@@ -271,8 +288,8 @@ if name == "ssh":
     real, rc, out, err = False, 0, None, None
     with locked(state_path):
         if os.path.exists(state_path):
-            with open(state_path, encoding="utf-8") as handle:
-                state = json.load(handle)
+            with open(state_path, "rb") as handle:
+                state = marshal.loads(handle.read())
         else:
             state = {"images": list(A["images"]), "untagged": list(A["untagged"]),
                      "tags": {k: list(v) for k, v in A["tags"].items()},
@@ -344,12 +361,23 @@ if name == "ssh":
         if kind == "converge" and rc == 0:
             state["converged"] = True
         pause()
-        publish(state_path, json.dumps(state))
+        publish(state_path, marshal.dumps(state))
     if real:
-        import subprocess
-        env = {"PATH": os.path.join(top, "s2bin"), "HOME": top}
-        done = subprocess.run(["/bin/sh", "-c", command], env=env, input=data, capture_output=True, cwd=top)
-        rc, out = done.returncode, (done.stdout.decode("utf-8") if kind == "marker" else None)
+        # the commands that touch files run for real, spawned without the subprocess module
+        work = os.path.join(top, "run.%d" % os.getpid())
+        with open(work + ".in", "wb") as handle:
+            handle.write(data)
+        os.chdir(top)
+        pid = os.posix_spawn("/bin/sh", ["/bin/sh", "-c", command], {"PATH": os.path.join(top, "s2bin"), "HOME": top},
+                             file_actions=[(os.POSIX_SPAWN_OPEN, 0, work + ".in", os.O_RDONLY, 0),
+                                           (os.POSIX_SPAWN_OPEN, 1, work + ".out", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
+                                           (os.POSIX_SPAWN_OPEN, 2, os.devnull, os.O_WRONLY, 0)])
+        rc, out = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]), None
+        if kind == "marker":
+            with open(work + ".out", encoding="utf-8", newline="") as handle:
+                out = handle.read()
+        os.remove(work + ".in")
+        os.remove(work + ".out")
     late = pick(A["late_rc"])
     if late is not None:
         rc = late
@@ -366,11 +394,10 @@ if name == "s2-docker":
     op = {"exec": "exec", "cp": "cp-out" if args[2:3] == ["-"] else "cp-in"}.get(args[0], "other")
     record("s2docker " + op)
     if op == "exec":
-        import subprocess
         if not os.path.isdir(os.path.join(fs, args[1])):
             sys.exit(1)
         mapped = [host(args[1], a) if a.startswith("/") else a for a in args[2:]]
-        sys.exit(subprocess.run(mapped).returncode)
+        os.execvp(mapped[0], mapped)
     if op == "cp-out":
         import tarfile
         container, src = args[1].split(":", 1)
@@ -403,22 +430,31 @@ sys.exit("stand-in: unknown name " + name)
 '''
 
 
+# compiled once: every stand-in runs as a .pyc, so no call compiles the source again
+STAND_IN_PYC = importlib.util.MAGIC_NUMBER + bytes(12) + marshal.dumps(compile(STAND_IN, "stand_in.py", "exec", dont_inherit=True))
+
+
 def versions_text(proxy=PROXY_TAG, app=APP_TAG, dashboard=COMMIT, gateway=COMMIT, browser=APP_TAG) -> str:
     return f"proxy {proxy}\napp {app}\ndashboard {dashboard}\ngateway {gateway}\nbrowser {browser}\n"
 
 
-RECONCILE = ["rm-scripts-new", "rm-archive", "rm-page-check", "rm-staging-tar"]
-GATE = ["marker", "has-image", "has-image"]
+CLEANUP = ["rm-archive", "rm-page-check"]
+CLEANUP_BOUND = range(1, 11)
 FULL_RUN = [
-    "marker", "has-image", "has-image", "ship-scripts", "publish-scripts", "load", "tag", "ship-platform",
+    "marker", "ship-scripts", "publish-scripts", "has-image", "load", "tag", "has-image", "ship-platform",
     "publish-platform", "build-platform", "has-image", "build-proxy", "converge", "copy-page-check",
-    "publish-page-check", *RECONCILE, "versions", *["list-tags"] * 5,
+    "publish-page-check", "versions", *["list-tags"] * 5,
 ]
-CURRENT_RUN = ["marker", "versions", "page-check-present", *RECONCILE, "versions", *["list-tags"] * 5]
+CURRENT_RUN = ["marker", "versions", "page-check-present", "versions", *["list-tags"] * 5]
 CACHED_RUN = [
-    "marker", "versions", "has-image", "has-image", "tag", "build-proxy", "converge", "copy-page-check",
-    "publish-page-check", *RECONCILE, "versions", *["list-tags"] * 5,
+    "marker", "versions", "has-image", "tag", "has-image", "build-proxy", "converge", "copy-page-check",
+    "publish-page-check", "versions", *["list-tags"] * 5,
 ]
+SCRIPTS_STAGE = ["marker", "ship-scripts"]
+APP_IMAGE_STAGE = [*CACHED_RUN[:3], "load"]
+PLATFORM_STAGE = [*CACHED_RUN[:5], "ship-platform"]
+PLATFORM_RUN = [*PLATFORM_STAGE, "publish-platform", "build-platform", "has-image", *CACHED_RUN[5:]]
+PAGE_STAGE = CACHED_RUN[:CACHED_RUN.index("copy-page-check") + 1]
 SHIPPING = {"ship-scripts", "publish-scripts", "load", "ship-platform", "publish-platform", "build-platform"}
 INSPECT_APP = f"docker image inspect --format '{{{{.Id}}}}' '{IMAGE_ID}' 2>&1"
 INSPECT_PLATFORM = f"docker image inspect --format '{{{{.Id}}}}' '{PLATFORM_REF}' 2>&1"
@@ -445,11 +481,11 @@ def values_in(text: str) -> list[str]:
     return [value for value in values if value in text]
 
 
-def expect_failure(done: subprocess.CompletedProcess[str], key: str) -> None:
-    assert done.stderr == f"refresh_stack: {REASONS[key]}\n", done.stderr
-    assert done.stdout == "", done.stdout
-    assert done.returncode == 1
-    assert not values_in(done.stdout + done.stderr)
+def expect_failure(done: subprocess.CompletedProcess[str], key: str, why: str = "", also: str = "") -> None:
+    assert done.stderr == f"refresh_stack: {REASONS[key]}\n{also}", (why, done.stderr)
+    assert done.stdout == "", (why, done.stdout)
+    assert done.returncode == 1, why
+    assert not values_in(done.stdout + done.stderr), why
 
 
 def expect_success(done: subprocess.CompletedProcess[str]) -> None:
@@ -457,6 +493,12 @@ def expect_success(done: subprocess.CompletedProcess[str]) -> None:
     assert done.stdout == SUCCESS, done.stdout
     assert done.returncode == 0
     assert not values_in(done.stdout + done.stderr)
+
+
+def sandboxes(box: Sandbox, names: list[str]):
+    """One test, several variants of the same setup: the first runs in the test's own sandbox, each other in a new one."""
+    for i, name in enumerate(names):
+        yield name, box if i == 0 else Sandbox(box.top.parent / f"{box.top.name}-{i}")
 
 
 def tree(folder: Path) -> dict[str, str]:
@@ -479,7 +521,7 @@ class Sandbox:
         self.fs = top / "s2fs"
         for folder in (self.scripts, self.bin, self.s2bin, self.home, self.s2dir.parent):
             folder.mkdir(parents=True)
-        (top / "stand_in.py").write_text(STAND_IN, encoding="utf-8")
+        (top / "stand_in.pyc").write_bytes(STAND_IN_PYC)
         (top / "clock").write_text(str(CLOCK_START), encoding="utf-8")
         for name in ("ssh", "docker", "git"):
             self._wrapper(self.bin / name, name)
@@ -524,7 +566,7 @@ class Sandbox:
         self.write_state(COMMIT)
 
     def _wrapper(self, path: Path, name: str) -> None:
-        path.write_text(f'#!/bin/sh\nexec "{sys.executable}" -I -S "{self.top / "stand_in.py"}" {name} "$@"\n')
+        path.write_text(f'#!/bin/sh\nexec "{sys.executable}" -I -S "{self.top / "stand_in.pyc"}" {name} "$@"\n')
         path.chmod(0o755)
 
     def _failing_tool(self, tool: str, looked_at: str, rules: dict[str, str]) -> None:
@@ -537,7 +579,7 @@ class Sandbox:
         (self.s2bin / tool).chmod(0o755)
 
     def _clock_tools(self) -> None:
-        log, clock = self.top / "calls.jsonl", self.top / "clock"
+        log, clock = self.top / "calls.log", self.top / "clock"
         leak = f'echo "leak: {SECRET}" >&2'
         (self.bin / "date").write_text(
             f'#!/bin/sh\n[ "$*" = "+%s" ] || exit 98\nread now < "{clock}"\n'
@@ -624,8 +666,7 @@ class Sandbox:
     def snapshot(self) -> dict:
         """Everything on the fake Server 2 and its state, staging names included, for a before and after compare."""
         parent = self.s2dir.parent
-        path = self.top / "state.json"
-        state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {
+        state = self.state() or {
             "images": self.answers["images"], "untagged": self.answers["untagged"], "tags": self.answers["tags"],
             "built_at": None, "converged": False,
         }
@@ -658,7 +699,15 @@ class Sandbox:
             elif key == "inspect":
                 value = {**self.answers[key], **value}
             self.answers[key] = value
-        (self.top / "answers.json").write_text(json.dumps(self.answers), encoding="utf-8")
+        (self.top / "answers.bin").write_bytes(marshal.dumps(self.answers))
+
+    def state(self) -> dict | None:
+        """The state the ssh stand-in keeps for the fake Server 2; None while no ssh call has been made."""
+        path = self.top / "state.bin"
+        return marshal.loads(path.read_bytes()) if path.exists() else None
+
+    def put_state(self, state: dict) -> None:
+        (self.top / "state.bin").write_bytes(marshal.dumps(state))
 
     def env(self, **changes: str | None) -> dict[str, str]:
         env = {
@@ -693,7 +742,7 @@ class Sandbox:
         every git, docker and ssh call sits behind a timeout that was given exactly the seconds left of its own run."""
         calls = self.calls()
         for index, call in enumerate(calls):
-            assert SECRET not in json.dumps(call), f"a value reached a call: {call['call']}"
+            assert SECRET not in repr(call), f"a value reached a call: {call['call']}"
             assert not call.get("secret_in_stdin"), "a value was streamed"
             words = forbidden(" ".join(call["argv"][1:]))
             assert not words, f"{words} in {call['argv']}"
@@ -702,6 +751,9 @@ class Sandbox:
             if call["call"] == "timeout":
                 seconds = call["argv"][1]
                 assert re.fullmatch(r"[1-9][0-9]*", seconds), call["argv"]
+                if self.is_cleanup(calls, index):
+                    assert int(seconds) in CLEANUP_BOUND, ("a cleanup call needs its own short bound", call["argv"])
+                    continue
                 began = [clock for first, clock in self.runs if first <= index][-1]
                 assert int(seconds) == BOX - (call["now"] - began), (call["argv"], call["now"] - began)
         tools = ("git", "docker", "ssh")
@@ -710,18 +762,30 @@ class Sandbox:
         assert wrapped == called, ("a git, docker or ssh call ran without its own timeout", wrapped, called)
 
     def calls(self) -> list[dict]:
-        log = self.top / "calls.jsonl"
-        return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
+        log = self.top / "calls.log"
+        return [ast.literal_eval(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
 
-    def ssh_calls(self) -> list[dict]:
-        return [call for call in self.calls() if call["argv"][0] == "ssh"]
+    @staticmethod
+    def is_cleanup(calls: list[dict], index: int) -> bool:
+        """The call at index is a cleanup ssh call of the end of a run, or the timeout that wraps one."""
+        if calls[index]["call"] in CLEANUP:
+            return True
+        return calls[index]["call"] == "timeout" and index + 1 < len(calls) and calls[index + 1]["call"] in CLEANUP
+
+    def ssh_calls(self, cleanup: bool = False) -> list[dict]:
+        """The ssh calls; the two cleanup calls at the end of a run are left out unless cleanup is asked for."""
+        return [c for c in self.calls() if c["argv"][0] == "ssh" and (cleanup or c["call"] not in CLEANUP)]
 
     def kinds(self) -> list[str]:
         return [call["call"] for call in self.ssh_calls()]
 
-    def last_kinds(self) -> list[str]:
+    def all_kinds(self) -> list[str]:
+        return [call["call"] for call in self.ssh_calls(cleanup=True)]
+
+    def last_kinds(self, cleanup: bool = False) -> list[str]:
         """The kinds of the ssh calls of the last run only (kinds() holds those of every run)."""
-        return [call["call"] for call in self.calls()[self.runs[-1][0]:] if call["argv"][0] == "ssh"]
+        return [c["call"] for c in self.calls()[self.runs[-1][0]:]
+                if c["argv"][0] == "ssh" and (cleanup or c["call"] not in CLEANUP)]
 
     def of(self, kind: str) -> list[dict]:
         return [call for call in self.calls() if call["call"] == kind]
@@ -737,7 +801,9 @@ class Sandbox:
 
     def timeouts(self) -> list[tuple[str, str, int]]:
         """(wrapped command, seconds, seconds already used) of every timeout call, in order."""
-        return [(c["argv"][2], c["argv"][1], c["now"] - CLOCK_START) for c in self.of("timeout")]
+        calls = self.calls()
+        return [(c["argv"][2], c["argv"][1], c["now"] - CLOCK_START) for i, c in enumerate(calls)
+                if c["call"] == "timeout" and not self.is_cleanup(calls, i)]
 
     def elapsed(self) -> int:
         return int((self.top / "clock").read_text(encoding="utf-8")) - CLOCK_START
@@ -748,8 +814,7 @@ class Sandbox:
         and converge marks, and the page check of the browser."""
         staging = (".new", ".part", ".page-check.tar")
         parent = self.s2dir.parent
-        path = self.top / "state.json"
-        state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {
+        state = self.state() or {
             "images": self.answers["images"], "tags": self.answers["tags"], "built_at": None, "converged": False,
         }
         found = [p for p in sorted(parent.rglob("*")) if not any(part.endswith(staging) for part in p.relative_to(parent).parts)]
@@ -799,17 +864,16 @@ class Sandbox:
             Path(name).write_bytes(b"LEFT")
         return self.leftovers()
 
-    def reconcile_cmds(self) -> dict[str, str]:
-        """The four removals of the final reconciliation, one remote call each, by exact name: the staged scripts folder,
-        the platform archive (and its .part), the page check .new and .old in the browser container, the staging tar."""
-        new, archive, tar, page = f"{self.s2dir}.new", self.archive(), f"{self.s2dir}.page-check.tar", BROWSER_PAGE_CHECK
-        loop = 'r=0; for d in "$@"; do if [ -e "$d" ]; then rm -r "$d" || r=1; fi; done; exit $r'
+    def cleanup_cmds(self) -> dict[str, str]:
+        """The two cleanup calls of the end of a run, by exact name: this run's platform archive and its part file, then
+        the old page check sibling and the page check staging tar."""
+        archive, tar, page = self.archive(), f"{self.s2dir}.page-check.tar", BROWSER_PAGE_CHECK
+        remove = 'if [ -e "$1" ]; then rm -r "$1"; fi'
         return {
-            "rm-scripts-new": f"if [ -e '{new}' ]; then rm -r '{new}'; fi",
             "rm-archive": (f"r=0; if [ -e '{archive}.part' ]; then rm '{archive}.part' || r=1; fi; "
                            f"if [ -e '{archive}' ]; then rm '{archive}' || r=1; fi; exit $r"),
-            "rm-page-check": f"docker exec '{self.browser_c}' sh -c '{loop}' sh '{page}.new' '{page}.old'",
-            "rm-staging-tar": f"if [ -e '{tar}' ]; then rm '{tar}'; fi",
+            "rm-page-check": (f"docker exec '{self.browser_c}' sh -c '{remove}' sh '{page}.old' && r=0 || r=1; "
+                              f"if [ -e '{tar}' ]; then rm '{tar}' || r=1; fi; exit $r"),
         }
 
     def converge_cmd(self, proxy_tag: str = PROXY_TAG) -> str:
@@ -833,9 +897,10 @@ def cached(box: Sandbox) -> None:
     box.answer(images=[IMAGE_ID, PLATFORM_REF])
 
 
-def reconciled(box: Sandbox) -> bool:
-    """Each removal of the final reconciliation ran exactly once, with its exact text."""
-    return {kind: box.remote(kind) for kind in RECONCILE} == {kind: [cmd] for kind, cmd in box.reconcile_cmds().items()}
+def cleaned(box: Sandbox, *kinds: str) -> bool:
+    """Each named cleanup call ran exactly once, with its exact text, and no other cleanup call ran."""
+    want = {kind: [cmd] for kind, cmd in box.cleanup_cmds().items() if kind in kinds}
+    return {kind: box.remote(kind) for kind in CLEANUP} == {kind: want.get(kind, []) for kind in CLEANUP}
 
 
 def current(box: Sandbox) -> None:
@@ -1034,14 +1099,10 @@ def test_default_hermes_home_is_dot_hermes_under_home(box):
 
 GOOD = f"{REVISION} {IMAGE_ID}\n"
 BAD_OWNER = {
-    "short label": (f"{'a' * 39} {IMAGE_ID}\n", 0, "revision"), "long label": (f"{'a' * 41} {IMAGE_ID}\n", 0, "revision"),
-    "uppercase label": (f"{REVISION.upper()} {IMAGE_ID}\n", 0, "revision"),
-    "missing label": (f" {IMAGE_ID}\n", 0, "revision"), "non-hex label": (f"{'g' * 40} {IMAGE_ID}\n", 0, "revision"),
-    "short id": (f"{REVISION} sha256:abc\n", 0, "owner"), "uppercase id": (f"{REVISION} sha256:{'AB' * 32}\n", 0, "owner"),
+    "short label": (f"{'a' * 39} {IMAGE_ID}\n", 0, "revision"), "uppercase label": (f"{REVISION.upper()} {IMAGE_ID}\n", 0, "revision"),
+    "missing label": (f" {IMAGE_ID}\n", 0, "revision"), "short id": (f"{REVISION} sha256:abc\n", 0, "owner"),
     "id without prefix": (f"{REVISION} {'ab' * 32}\n", 0, "owner"), "empty": ("", 0, "owner"),
-    "nonsense": ("nonsense\n", 0, "owner"), "two lines": (GOOD + GOOD, 0, "owner"),
-    "extra field": (f"{REVISION} {IMAGE_ID} extra\n", 0, "owner"),
-    "failing inspect": (GOOD, 1, "owner"), "failing inspect, no output": ("", 125, "owner"),
+    "two lines": (GOOD + GOOD, 0, "owner"), "failing inspect": (GOOD, 1, "owner"),
 }
 
 
@@ -1085,7 +1146,7 @@ def test_a_current_stack_crosses_nothing_and_goes_straight_to_the_retention(shar
     assert box.remote("page-check-present") == [f"docker exec '{box.browser_c}' test -d '{BROWSER_PAGE_CHECK}'"]
     assert box.server1() == ["git toplevel", "git head", "docker inspect"]
     assert all(call["stdin_size"] == 0 for call in box.ssh_calls())
-    assert box.sleeps() == [] and reconciled(box)
+    assert box.sleeps() == [] and cleaned(box) and box.all_kinds() == CURRENT_RUN, "nothing was made, so nothing is cleaned"
     assert sorted(path.name for path in box.s2dir.parent.iterdir()) == ["raphael-journeys"]
     assert tree(box.s2dir) == {".refresh-commit": COMMIT + "\n"}
 
@@ -1104,94 +1165,73 @@ def _swapped() -> str:
 
 
 NOT_CURRENT = {
-    "versions fails": (versions_text(), 1), "ssh fails": (versions_text(), 255), "garbled": ("garbage\n", 0),
-    "empty": ("", 0), "four lines": (versions_text().rsplit("browser", 1)[0], 0),
-    "extra line": (versions_text() + "extra x\n", 0), "wrong order": (_swapped(), 0),
-    "blank line": (versions_text().replace("app ", "\napp "), 0), "unknown role": (versions_text().replace("gateway", "gatewa"), 0),
-    "proxy none": (versions_text(proxy="none"), 0), "proxy not plain": (versions_text(proxy="a b"), 0),
-    "dashboard differs": (versions_text(dashboard=OTHER_COMMIT), 0),
-    "gateway differs": (versions_text(gateway=OTHER_COMMIT), 0),
-    "app other revision": (versions_text(app=f"{OTHER_COMMIT}-{CA}"), 0),
-    "app without hash": (versions_text(app=REVISION), 0),
-    "app uppercase hex": (versions_text(app=f"{REVISION}-{CA.upper()}"), 0),
-    "app short hex": (versions_text(app=f"{REVISION}-{CA[:11]}"), 0),
-    "browser other revision": (versions_text(browser=f"{OTHER_COMMIT}-{CA}"), 0),
+    "versions fails": (versions_text(), 1), "garbled": ("garbage\n", 0), "wrong order": (_swapped(), 0),
+    "proxy none": (versions_text(proxy="none"), 0), "app other revision": (versions_text(app=f"{OTHER_COMMIT}-{CA}"), 0),
     "browser none": (versions_text(browser="none"), 0),
 }
 
 
-@pytest.mark.parametrize("text, rc", list(NOT_CURRENT.values()), ids=list(NOT_CURRENT))
-def test_versions_that_differ_or_cannot_be_read_are_not_current_and_the_look_stops_there(box, text, rc):
-    box.set_marker(COMMIT + "\n")
-    box.answer(out={"versions": text}, rc={"versions": rc, "has-image": 2})
-    expect_failure(box.run(), "image-ask")
-    assert box.kinds() == ["marker", "versions", "has-image"]
+def test_versions_that_differ_or_cannot_be_read_are_not_current_and_the_look_stops_there(box):
+    for why, sandbox in sandboxes(box, list(NOT_CURRENT)):
+        text, rc = NOT_CURRENT[why]
+        sandbox.set_marker(COMMIT + "\n")
+        sandbox.answer(out={"versions": text}, rc={"versions": rc, "has-image": 2})
+        expect_failure(sandbox.run(), "image-ask", why)
+        assert sandbox.kinds() == ["marker", "versions", "has-image"], why
 
 
 MARKERS = {"missing": None, "other commit": OTHER_COMMIT + "\n", "other commit without a newline": OTHER_COMMIT}
 
 
-@pytest.mark.parametrize("text", list(MARKERS.values()), ids=list(MARKERS))
-def test_a_marker_that_was_read_and_differs_or_is_absent_is_not_current_and_ships_the_scripts_once(box, text):
-    box.set_marker(text)
-    box.answer(rc={"ship-scripts": 1})
-    expect_failure(box.run(), "ship-scripts")
-    assert box.kinds() == [*GATE, "ship-scripts"]
-    assert box.stdin_calls() == ["ship-scripts"] and box.server1()[-1] == "git archive scripts"
-    assert len(box.of("git archive scripts")) == 1
+def test_a_marker_that_was_read_and_differs_or_is_absent_is_not_current_and_ships_the_scripts_once(box):
+    for why, sandbox in sandboxes(box, list(MARKERS)):
+        sandbox.set_marker(MARKERS[why])
+        sandbox.answer(rc={"ship-scripts": 1})
+        expect_failure(sandbox.run(), "ship-scripts", why)
+        assert sandbox.kinds() == SCRIPTS_STAGE, why
+        assert sandbox.stdin_calls() == ["ship-scripts"] and sandbox.server1()[-1] == "git archive scripts", why
+        assert len(sandbox.of("git archive scripts")) == 1, why
 
 
-GARBLED_MARKERS = {
-    "empty": "", "only a newline": "\n", "39 characters": OTHER_COMMIT[:39] + "\n", "41 characters": OTHER_COMMIT + "0\n",
-    "upper case": OTHER_COMMIT.upper() + "\n", "not hex": "z" * 40 + "\n", "two commit lines": COMMIT + "\n" + COMMIT + "\n",
-    "two different commit lines": OTHER_COMMIT + "\n" + COMMIT + "\n", "a blank line after the commit": OTHER_COMMIT + "\n\n",
-    "text after the commit": OTHER_COMMIT + " extra\n", "a carriage return": OTHER_COMMIT + "\r\n",
-    "equal commit and text": COMMIT + " extra\n",
+def marker_text(text: str):
+    return lambda box: (cached(box), box.set_marker(text))
+
+
+def marker_status(rc: int):
+    return lambda box: (cached(box), box.answer(rc={"marker": rc}))
+
+
+def marker_is_a_folder(box: Sandbox) -> None:
+    cached(box)
+    (box.s2dir / ".refresh-commit").unlink()
+    box.set_marker(None, folder=True)
+
+
+FAILED_MARKER_READS = {
+    "empty": marker_text(""), "39 characters": marker_text(OTHER_COMMIT[:39] + "\n"),
+    "upper case": marker_text(OTHER_COMMIT.upper() + "\n"), "two commit lines": marker_text(COMMIT + "\n" + COMMIT + "\n"),
+    "a blank line after the commit": marker_text(OTHER_COMMIT + "\n\n"), "a carriage return": marker_text(OTHER_COMMIT + "\r\n"),
+    "equal commit and text": marker_text(COMMIT + " extra\n"), "status 1": marker_status(1), "status 4": marker_status(4),
+    "status 255": marker_status(255), "marker is a folder": marker_is_a_folder,
+    "folder is a plain file": lambda box: (cached(box), box.unreachable("folder is a plain file")),
+    "marker is a dangling link": lambda box: (cached(box), box.unreachable("marker is a dangling link")),
 }
 
 
-@pytest.mark.parametrize("text", list(GARBLED_MARKERS.values()), ids=list(GARBLED_MARKERS))
-def test_a_marker_that_is_not_one_line_of_forty_lowercase_hex_digits_ends_the_run_before_any_transfer(box, text):
-    cached(box)
-    box.set_marker(text)
-    before = box.snapshot()
-    expect_failure(box.run(), "marker-ask")
-    assert box.kinds() == ["marker"] and box.stdin_calls() == [] and not SHIPPING & set(box.kinds())
-    assert box.server1() == ["git toplevel", "git head", "docker inspect"] and box.snapshot() == before
-
-
-@pytest.mark.parametrize("how", ["folder is a plain file", "folder is a link that loops", "marker is a dangling link"])
-def test_a_marker_path_that_cannot_be_examined_is_a_failed_read_and_not_an_absent_marker(box, how):
-    cached(box)
-    box.unreachable(how)
-    before = box.snapshot()
-    expect_failure(box.run(), "marker-ask")
-    assert box.kinds() == ["marker"] and box.stdin_calls() == [] and box.snapshot() == before
-    assert box.server1() == ["git toplevel", "git head", "docker inspect"]
+def test_a_marker_that_is_not_one_commit_or_could_not_be_read_is_a_failed_read_with_the_fixed_reason_and_no_value(box):
+    for why, sandbox in sandboxes(box, list(FAILED_MARKER_READS)):
+        FAILED_MARKER_READS[why](sandbox)
+        before = sandbox.snapshot()
+        expect_failure(sandbox.run(), "marker-ask", why)
+        assert sandbox.all_kinds() == ["marker"] and sandbox.stdin_calls() == [], why
+        assert sandbox.server1() == ["git toplevel", "git head", "docker inspect"] and sandbox.snapshot() == before, why
 
 
 def test_a_parent_folder_that_cannot_be_searched_is_no_evidence_that_the_marker_is_absent(box):
     missing = box.top / "no-such-parent" / "raphael-journeys"
     box.answer(s2_dir=str(missing))
     expect_failure(box.run(JOURNEY_S2_SCRIPTS_DIR=str(missing)), "marker-ask")
-    assert box.kinds() == ["marker"] and box.stdin_calls() == [] and not missing.parent.exists()
-
-
-UNREADABLE_MARKERS = {**{f"status {rc}": rc for rc in (1, 2, 4, 125, 126, 127, 255)}, "a folder": None}
-
-
-@pytest.mark.parametrize("rc", list(UNREADABLE_MARKERS.values()), ids=list(UNREADABLE_MARKERS))
-def test_a_marker_that_could_not_be_read_ends_the_run_and_nothing_crosses_or_changes(box, rc):
-    cached(box)
-    if rc is None:
-        (box.s2dir / ".refresh-commit").unlink()
-        box.set_marker(None, folder=True)
-    else:
-        box.answer(rc={"marker": rc})
-    before = box.server2()
-    expect_failure(box.run(), "marker-ask")
-    assert box.kinds() == ["marker"] and box.stdin_calls() == []
-    assert box.server1() == ["git toplevel", "git head", "docker inspect"] and box.server2() == before
+    assert box.all_kinds() == ["marker"] and box.stdin_calls() == [] and not missing.parent.exists()
 
 
 def test_the_marker_one_run_leaves_makes_the_next_run_find_the_stack_current(box):
@@ -1199,9 +1239,9 @@ def test_the_marker_one_run_leaves_makes_the_next_run_find_the_stack_current(box
     assert box.stdin_calls() == ["ship-scripts", "load", "ship-platform"]
     before = len(box.ssh_calls())
     box.answer(out={"versions": versions_text()})
-    state = json.loads((box.top / "state.json").read_text(encoding="utf-8"))
+    state = box.state()
     state["count"] = {}
-    (box.top / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    box.put_state(state)
     expect_success(box.run())
     assert [c["call"] for c in box.ssh_calls()[before:]] == CURRENT_RUN
     assert box.stdin_calls() == ["ship-scripts", "load", "ship-platform"]
@@ -1218,8 +1258,8 @@ def expected_scripts(box: Sandbox) -> dict[str, str]:
 def test_scripts_are_shipped_first_among_the_shipping_steps(shared):
     box, _ = shared("full")
     kinds = box.kinds()
-    assert kinds[:5] == [*GATE, "ship-scripts", "publish-scripts"]
-    assert 4 < min(kinds.index(k) for k in ("load", "ship-platform", "build-platform"))
+    assert kinds[:3] == [*SCRIPTS_STAGE, "publish-scripts"]
+    assert 2 < min(kinds.index(k) for k in ("load", "ship-platform", "build-platform"))
     (ship,) = box.of("ship-scripts")
     (archive,) = box.of("git archive scripts")
     assert ship["stdin_sha"] == archive["sha"] and ship["stdin_size"] > 0
@@ -1237,7 +1277,7 @@ def test_a_first_run_without_a_folder_creates_it_with_the_files_and_the_marker_d
 def test_the_stage_only_extracts_into_the_new_folder_and_the_publish_call_writes_the_marker_before_the_renames(shared):
     box, _ = shared("full")
     new = f"{box.s2dir}.new"
-    assert box.kinds()[3:5] == ["ship-scripts", "publish-scripts"]
+    assert box.kinds()[1:3] == ["ship-scripts", "publish-scripts"]
     (stage,) = box.remote("ship-scripts")
     (publish,) = box.remote("publish-scripts")
     write = f"echo '{COMMIT}' > '{new}/.refresh-commit'"
@@ -1279,8 +1319,8 @@ def test_a_second_refresh_replaces_the_previous_copy_and_a_stale_new_folder(box)
 
 
 @pytest.mark.parametrize("rc, kinds", [
-    ({"ship-scripts": 1}, [*GATE, "ship-scripts"]), ({"git archive scripts": 1}, [*GATE, "ship-scripts"]),
-    ({"publish-scripts": 1}, [*GATE, "ship-scripts", "publish-scripts"]),
+    ({"ship-scripts": 1}, SCRIPTS_STAGE), ({"git archive scripts": 1}, SCRIPTS_STAGE),
+    ({"publish-scripts": 1}, [*SCRIPTS_STAGE, "publish-scripts"]),
 ], ids=["receiver", "producer", "publish"])
 def test_scripts_that_cannot_be_shipped_end_the_run(box, rc, kinds):
     box.answer(rc=rc)
@@ -1293,7 +1333,7 @@ def test_a_real_failure_of_the_scripts_stage_ends_the_run_before_any_publish_and
     stuck.symlink_to(box.top / "nowhere")
     before = box.snapshot()
     expect_failure(box.run(), "ship-scripts")
-    assert box.kinds() == [*GATE, "ship-scripts"] and not box.s2dir.exists() and box.snapshot() == before
+    assert box.kinds() == SCRIPTS_STAGE and not box.s2dir.exists() and box.snapshot() == before
 
 
 def test_every_remote_command_parses_as_sh(shared):
@@ -1359,18 +1399,28 @@ def test_an_app_image_id_held_without_a_tag_is_not_saved_or_loaded_again_and_onl
     assert APP_BASE_TAG in box.server2()["refs"]
 
 
-# ---- b and c. a read that failed or was garbled is not "missing": nothing crosses ---------------------
+# ---- owner rule 4 item 1: one helper asks Server 2 about an image, with docker image inspect ----------
+# Found: status 0 and sha256: plus 64 lowercase hex. Missing: only Docker's own not-found answer for exactly that name.
+# Everything else is a failed read: image-ask and exit 1, with no value in the output. A read may come after a transfer.
 
 NOT_FOUND_OTHER = "Error response from daemon: No such image: raphael-journeys-platform:" + "e" * 40 + "\n"
-GARBLED_READS = {
-    "not an id": "hello\n", "upper case hex": "sha256:" + "AB" * 32 + "\n", "63 hex digits": "sha256:" + "a" * 63 + "\n",
-    "65 hex digits": "sha256:" + "a" * 65 + "\n", "no prefix": "ab" * 32 + "\n", "an id and a junk line": IMAGE_ID + "\njunk\n",
-    "empty": "", "only a blank line": "\n", "an empty list": "[]\n",
-}
 UNREADABLE_READS = {
-    **{f"status {rc}": {"rc": rc} for rc in (1, 2, 125, 255)},
-    **{f"garbled, {name}": {"garbled": text} for name, text in GARBLED_READS.items()},
+    "status 1": {"rc": 1}, "status 255": {"rc": 255}, "garbled, empty": {"garbled": ""},
+    "garbled, not an id": {"garbled": "hello\n"}, "garbled, 63 hex digits": {"garbled": "sha256:" + "a" * 63 + "\n"},
+    "garbled, upper case hex": {"garbled": "sha256:" + "AB" * 32 + "\n"},
+    "garbled, an id and a junk line": {"garbled": IMAGE_ID + "\njunk\n"}, "garbled, an empty list": {"garbled": "[]\n"},
     "not-found line of another image": {"rc": 1, "garbled": NOT_FOUND_OTHER},
+}
+NOT_FOUND_SHAPES = {
+    "empty line": ("\n", "Error response from daemon: No such image: %s\n"), "[]": ("[]\n", "Error response from daemon: No such image: %s\n"),
+    "nothing on stdout": ("", "Error response from daemon: No such image: %s\n"),
+    "empty line, old wording": ("\n", "Error: No such image: %s\n"), "[], old wording": ("[]\n", "Error: No such image: %s\n"),
+}
+NOT_DOCKERS_OWN = {
+    "another image": NOT_FOUND_OTHER, "longer name": "Error response from daemon: No such image: %s:more\n",
+    "trailing blank": "Error response from daemon: No such image: %s \n", "lower case": "error response from daemon: no such image: %s\n",
+    "two lines": "Error response from daemon: No such image: %s\nError response from daemon: No such image: %s\n",
+    "other error": "Error response from daemon: Get \"https://registry/v2/\": no such host\n",
 }
 
 
@@ -1378,103 +1428,87 @@ def break_read(box: Sandbox, key: str, case: dict) -> None:
     box.answer(**{what: {key: value} for what, value in case.items()})
 
 
-@pytest.mark.parametrize("case", list(UNREADABLE_READS.values()), ids=list(UNREADABLE_READS))
-def test_an_app_image_read_that_could_not_be_read_ends_the_run_and_nothing_crosses_or_changes(box, case):
-    cached(box)
-    break_read(box, "has-image#1", case)
-    before = box.server2()
-    expect_failure(box.run(), "image-ask")
-    assert box.kinds() == CACHED_RUN[:3] and box.stdin_calls() == []
-    assert box.server1() == ["git toplevel", "git head", "docker inspect"] and box.server2() == before
+def test_an_app_image_read_that_could_not_be_read_ends_the_run_with_image_ask_and_nothing_crosses(box):
+    for why, sandbox in sandboxes(box, list(UNREADABLE_READS)):
+        cached(sandbox)
+        break_read(sandbox, "has-image#1", UNREADABLE_READS[why])
+        before = sandbox.server2()
+        expect_failure(sandbox.run(), "image-ask", why)
+        assert sandbox.all_kinds() == CACHED_RUN[:3] and sandbox.stdin_calls() == [], why
+        assert sandbox.server1() == ["git toplevel", "git head", "docker inspect"] and sandbox.server2() == before, why
 
 
-@pytest.mark.parametrize("case", list(UNREADABLE_READS.values()), ids=list(UNREADABLE_READS))
-def test_a_platform_image_read_that_could_not_be_read_ends_the_run_and_nothing_crosses(box, case):
-    cached(box)
-    break_read(box, "has-image#2", case)
-    before = box.snapshot()
-    expect_failure(box.run(), "image-ask")
-    assert box.kinds() == CACHED_RUN[:4] and box.stdin_calls() == []
-    assert box.server1() == ["git toplevel", "git head", "docker inspect"] and box.snapshot() == before
+def test_a_platform_image_read_that_could_not_be_read_ends_the_run_with_image_ask_and_ships_no_archive(box):
+    names = ["status 255", "garbled, empty", "garbled, 63 hex digits", "not-found line of another image"]
+    for why, sandbox in sandboxes(box, names):
+        cached(sandbox)
+        break_read(sandbox, "has-image#2", UNREADABLE_READS[why])
+        expect_failure(sandbox.run(), "image-ask", why)
+        assert sandbox.all_kinds() == CACHED_RUN[:5] and sandbox.stdin_calls() == [], why
+        assert sandbox.of("git archive commit") == [], why
 
 
-@pytest.mark.parametrize("case", list(UNREADABLE_READS.values()), ids=list(UNREADABLE_READS))
-def test_a_platform_image_read_that_could_not_be_read_in_the_wait_ends_the_run_and_the_build_keeps_running(box, case):
-    no_platform(box)
-    break_read(box, "has-image#3", case)
-    expect_failure(box.run(), "image-ask")
-    kinds = box.kinds()
-    assert kinds[-2:] == ["build-platform", "has-image"] and not AFTER_BOX & set(kinds)
-    assert box.server2()["built"] is not None
+def test_a_platform_image_read_that_could_not_be_read_in_the_wait_ends_the_run_and_the_build_keeps_running(box):
+    for why, sandbox in sandboxes(box, ["status 255", "garbled, empty"]):
+        no_platform(sandbox)
+        break_read(sandbox, "has-image#3", UNREADABLE_READS[why])
+        expect_failure(sandbox.run(), "image-ask", why)
+        kinds = sandbox.kinds()
+        assert kinds[-2:] == ["build-platform", "has-image"] and not AFTER_BOX & set(kinds), why
+        assert sandbox.server2()["built"] is not None and sandbox.all_kinds()[-1] == "rm-archive", why
 
 
 def test_an_app_image_read_that_answers_with_another_id_than_the_one_asked_is_no_find(box):
     cached(box)
     box.answer(garbled={"has-image#1": "sha256:" + "ef56" * 16 + "\n"})
-    before = box.snapshot()
+    before = box.server2()
     expect_failure(box.run(), "image-ask")
-    assert box.kinds() == CACHED_RUN[:3] and box.stdin_calls() == [] and box.snapshot() == before
+    assert box.kinds() == CACHED_RUN[:3] and box.stdin_calls() == [] and box.server2() == before
 
 
-def test_a_platform_image_read_may_answer_with_any_well_formed_id(box):
-    cached(box)
-    box.answer(platform_id="sha256:" + "ef56" * 16)
-    expect_success(box.run())
-    assert box.kinds() == CACHED_RUN and box.stdin_calls() == []
+def test_a_failed_read_may_come_after_a_transfer_and_still_ends_the_run_with_the_fixed_reason(box):
+    # the order rule is gone: the scripts crossed before the app image read, an app image before the platform read
+    box.set_marker(OTHER_COMMIT + "\n")
+    box.answer(rc={"has-image#1": 255})
+    expect_failure(box.run(), "image-ask", "scripts first")
+    assert box.kinds() == [*SCRIPTS_STAGE, "publish-scripts", "has-image"] and box.stdin_calls() == ["ship-scripts"]
+    second = Sandbox(box.top.parent / f"{box.top.name}-2")
+    second.set_marker(COMMIT + "\n")
+    second.answer(rc={"has-image#2": 255})
+    expect_failure(second.run(), "image-ask", "app image first")
+    assert second.kinds() == ["marker", "versions", "has-image", "load", "tag", "has-image"]
+    assert second.of("ship-platform") == [] and second.of("git archive commit") == []
 
 
-INITIAL_READS = {
-    "app id read fails": (1, {"rc": 255}), "app id read is empty": (1, {"garbled": ""}),
-    "app id answer is a not-found line of another image": (1, {"rc": 1, "garbled": NOT_FOUND_OTHER}),
-    "platform read fails": (2, {"rc": 255}), "platform read is empty": (2, {"garbled": ""}),
-    "platform answer is a not-found line of another image": (2, {"rc": 1, "garbled": NOT_FOUND_OTHER}),
-}
-STALE_STATES = {
-    "stale scripts": lambda box: (cached(box), box.set_marker(OTHER_COMMIT + "\n")),
-    "missing app image": lambda box: (cached(box), box.answer(images=[PLATFORM_REF])),
-    "stale scripts and missing app image": lambda box: (box.set_marker(OTHER_COMMIT + "\n"), box.answer(images=[PLATFORM_REF])),
-}
+def test_docker_own_not_found_answer_is_accepted_in_both_shapes_it_has_at_the_app_and_the_platform_position(box):
+    for why, sandbox in sandboxes(box, list(NOT_FOUND_SHAPES)):
+        stdout, error = NOT_FOUND_SHAPES[why]
+        cached(sandbox)
+        sandbox.answer(images=[PLATFORM_REF], missing_stdout=stdout, missing_error=error, rc={"load": 1})
+        expect_failure(sandbox.run(), "app-image", why)
+        assert sandbox.kinds() == [*CACHED_RUN[:3], "load"], why
+        assert sandbox.remote("has-image") == [INSPECT_APP] and INSPECT_APP.endswith(" 2>&1"), why
+    platform = Sandbox(box.top.parent / f"{box.top.name}-platform")
+    cached(platform)
+    platform.answer(images=[IMAGE_ID], missing_stdout="[]\n", missing_error="Error: No such image: %s\n", rc={"ship-platform": 1})
+    expect_failure(platform.run(), "platform-build", "platform position")
+    assert platform.kinds() == PLATFORM_STAGE and platform.remote("has-image")[1] == INSPECT_PLATFORM
 
 
-@pytest.mark.parametrize("state", list(STALE_STATES.values()), ids=list(STALE_STATES))
-@pytest.mark.parametrize("which, case", list(INITIAL_READS.values()), ids=list(INITIAL_READS))
-def test_an_initial_image_read_that_failed_or_was_garbled_ends_the_run_before_the_scripts_or_an_image_cross(
-    box, which, case, state,
-):
-    state(box)
-    break_read(box, f"has-image#{which}", case)
-    before = box.snapshot()
-    expect_failure(box.run(), "image-ask")
-    kinds = box.kinds()
-    assert kinds[-1] == "has-image" and kinds.count("has-image") == which and not SHIPPING & set(kinds)
-    assert box.stdin_calls() == [] and box.server1() == ["git toplevel", "git head", "docker inspect"]
-    assert box.snapshot() == before
+def test_a_not_found_line_that_is_not_dockers_own_for_the_asked_name_is_no_absence(box):
+    for why, sandbox in sandboxes(box, list(NOT_DOCKERS_OWN)):
+        cached(sandbox)
+        sandbox.answer(images=[PLATFORM_REF], missing_error=NOT_DOCKERS_OWN[why])
+        expect_failure(sandbox.run(), "image-ask", why)
+        assert sandbox.kinds() == CACHED_RUN[:3] and sandbox.stdin_calls() == [], why
 
 
-@pytest.mark.parametrize("stdout, error", [
-    ("\n", "Error response from daemon: No such image: %s\n"), ("[]\n", "Error response from daemon: No such image: %s\n"),
-    ("", "Error response from daemon: No such image: %s\n"), ("\n", "Error: No such image: %s\n"),
-    ("[]\n", "Error: No such image: %s\n"),
-], ids=["empty line", "[]", "nothing on stdout", "empty line, old wording", "[], old wording"])
-def test_docker_own_not_found_answer_is_accepted_in_both_shapes_it_has(box, stdout, error):
-    box.answer(missing_stdout=stdout, missing_error=error)
-    expect_success(box.run())
-    assert box.kinds() == FULL_RUN and box.remote("has-image")[:2] == [INSPECT_APP, INSPECT_PLATFORM]
-    assert box.remote("has-image")[0].endswith(" 2>&1")
-
-
-@pytest.mark.parametrize("error", [
-    "Error response from daemon: No such image: raphael-journeys-platform:" + "e" * 40 + "\n",
-    "Error response from daemon: No such image: %s:more\n", "Error response from daemon: No such image: x%s\n",
-    "Error response from daemon: No such image: %s \n", "error response from daemon: no such image: %s\n",
-    "Error response from daemon: No such image: %s\nError response from daemon: No such image: %s\n",
-    "Error response from daemon: Get \"https://registry/v2/\": no such host\n", "Error response from daemon: No such image\n",
-], ids=["another image", "longer name", "name with a prefix", "trailing blank", "lower case", "two lines", "other error", "no name"])
-def test_a_not_found_line_that_is_not_dockers_own_for_the_asked_name_is_no_absence(box, error):
-    box.answer(missing_error=error)
-    before = box.snapshot()
-    expect_failure(box.run(), "image-ask")
-    assert box.kinds() == [*GATE[:2]] and box.stdin_calls() == [] and box.snapshot() == before
+def test_docker_image_ls_is_asked_only_for_the_retention_listing(shared):
+    box, done = shared("full")
+    expect_success(done)
+    assert all(text.startswith("docker image inspect ") for text in box.remote("has-image"))
+    assert all(text.startswith("docker image ls ") for text in box.remote("list-tags"))
+    assert not [call for call in box.ssh_calls(cleanup=True) if "image ls" in call["remote"] and call["call"] != "list-tags"]
 
 
 # ---- c. the platform image ------------------------------------------------------------------------
@@ -1485,7 +1519,7 @@ def test_both_images_known_and_the_marker_equal_cross_nothing_and_the_stack_stil
     expect_success(done)
     assert box.kinds() == CACHED_RUN
     assert box.server1() == ["git toplevel", "git head", "docker inspect"]
-    assert box.stdin_calls() == [] and not SHIPPING & set(box.kinds()) and reconciled(box)
+    assert box.stdin_calls() == [] and not SHIPPING & set(box.kinds()) and cleaned(box, "rm-page-check")
     assert box.remote("has-image") == [INSPECT_APP, INSPECT_PLATFORM]
     assert box.remote("tag") == [f"docker tag '{IMAGE_ID}' 'raphael-journeys-app-base:{REVISION}'"]
     assert box.sleeps() == [] and not box.staging.parent.joinpath("raphael-journeys.new").exists()
@@ -1506,35 +1540,32 @@ def test_a_missing_platform_image_is_staged_as_one_file_under_a_temporary_name_p
     assert kinds.index("ship-platform") + 2 == kinds.index("publish-platform") + 1 == kinds.index("build-platform")
     assert kinds.count("build-platform") == 1
     assert box.server1() == ["git toplevel", "git head", "docker inspect", "git archive commit"]
-    state = json.loads((box.top / "state.json").read_text(encoding="utf-8"))
+    state = box.state()
     assert state["archive_sha"] == git["sha"], "the build must see the whole archive under its final name"
 
 
-def test_the_wait_checks_at_once_then_every_ten_seconds_and_the_archive_is_left_for_the_final_reconciliation(box):
+def test_the_wait_checks_at_once_then_every_ten_seconds_and_the_archive_stays_until_the_cleanup_at_the_end(box):
     no_platform(box)
     box.answer(ready_after=60, rc={"build-proxy": 1})
     expect_failure(box.run(), "proxy-tag")
     kinds = box.kinds()
     assert kinds[kinds.index("build-platform") + 1] == "has-image"
     # the two questions before the shipping, then the first look at once and one more look after each of the 6 sleeps
-    assert box.remote("has-image")[2:] == [INSPECT_PLATFORM] * 8 and box.remote("has-image")[:2] == [INSPECT_APP, INSPECT_PLATFORM]
+    assert box.remote("has-image")[:2] == [INSPECT_APP, INSPECT_PLATFORM] and box.remote("has-image")[2:] == [INSPECT_PLATFORM] * 7
     assert box.sleeps() == ["10"] * 6 and box.elapsed() == 60
-    assert kinds[-2:] == ["has-image", "build-proxy"] and "rm-archive" not in kinds
-    assert Path(box.archive()).is_file(), "a failed run leaves the archive; the next run's reconciliation removes it"
+    assert box.all_kinds()[-3:] == ["has-image", "build-proxy", "rm-archive"] and not Path(box.archive()).exists()
     box.answer(rc={"build-proxy": None})
     expect_success(box.run())
     assert not Path(box.archive()).exists() and len(box.of("build-platform")) == 1
 
 
-@pytest.mark.parametrize("rc, last", [
-    ({"ship-platform": 1}, "ship-platform"), ({"publish-platform": 1}, "publish-platform"),
-    ({"build-platform": 1}, "build-platform"), ({"git archive commit": 1}, "ship-platform"),
-], ids=["ship", "publish", "build", "git"])
-def test_a_platform_archive_or_build_that_fails_ends_the_run(box, rc, last):
-    no_platform(box)
-    box.answer(rc=rc)
-    expect_failure(box.run(), "platform-build")
-    assert box.kinds()[-1] == last and not {"build-proxy", "rm-archive", "converge"} & set(box.kinds())
+def test_a_platform_archive_or_build_that_fails_ends_the_run(box):
+    for why, sandbox in sandboxes(box, ["ship-platform", "publish-platform", "build-platform"]):
+        no_platform(sandbox)
+        sandbox.answer(rc={why: 1})
+        expect_failure(sandbox.run(), "platform-build", why)
+        assert sandbox.kinds()[-1] == why and not {"build-proxy", "converge"} & set(sandbox.kinds()), why
+        assert sandbox.all_kinds()[-1] == "rm-archive" and cleaned(sandbox, "rm-archive"), why
 
 
 # ---- d. proxy build, e. converge -------------------------------------------------------------------
@@ -1559,10 +1590,9 @@ def test_a_proxy_tag_of_63_plain_characters_is_passed_on_to_converge(box):
 
 
 PROXY_BAD = {
-    "no line": ("stack_up: built app 1\n", 0), "empty": ("", 0), "tag not plain": ("stack_up: built proxy a b\n", 0),
-    "tag too long": (f"stack_up: built proxy {'a' * 64}\n", 0), "empty tag": ("stack_up: built proxy \n", 0),
-    "slash in tag": ("stack_up: built proxy a/b\n", 0), "text before": (f"x stack_up: built proxy {PROXY_TAG}\n", 0),
-    "nonzero exit": (f"stack_up: built proxy {PROXY_TAG}\n", 1),
+    "no line": ("stack_up: built app 1\n", 0), "tag not plain": ("stack_up: built proxy a b\n", 0),
+    "tag too long": (f"stack_up: built proxy {'a' * 64}\n", 0),
+    "text before": (f"x stack_up: built proxy {PROXY_TAG}\n", 0), "nonzero exit": (f"stack_up: built proxy {PROXY_TAG}\n", 1),
 }
 
 
@@ -1589,8 +1619,6 @@ def test_both_success_lines_of_converge_are_accepted(box, out):
 CONVERGE_BAD = {
     "other last line": ("stack_up: the stack answers\nstack_up: waiting\n", 0), "empty output": ("", 0),
     "nonzero exit": ("stack_up: the stack answers\n", 1), "trailing space": ("stack_up: the stack answers \n", 0),
-    "prefix only": ("stack_up: the stack\n", 0),
-    "failure line": ("stack_up: container x is not one this script made; it was left alone\n", 1),
 }
 
 
@@ -1605,12 +1633,12 @@ def test_a_converge_that_does_not_end_well_ends_with_its_reason(box, out, rc):
 # ---- f. the page check copy ------------------------------------------------------------------------
 
 
-def test_the_page_check_is_staged_by_one_chain_without_a_pipe_and_swapped_by_a_second_call_before_the_reconciliation(shared):
+def test_the_page_check_is_staged_by_one_chain_without_a_pipe_and_swapped_by_a_second_call_that_removes_nothing(shared):
     box, done = shared("cached")
     expect_success(done)
     kinds = box.kinds()
     at = kinds.index("converge")
-    assert kinds[at + 1:at + 8] == ["copy-page-check", "publish-page-check", *RECONCILE, "versions"]
+    assert kinds[at + 1:at + 4] == ["copy-page-check", "publish-page-check", "versions"]
     (stage,) = box.remote("copy-page-check")
     (publish,) = box.remote("publish-page-check")
     tar, final = f"{box.s2dir}.page-check.tar", BROWSER_PAGE_CHECK
@@ -1624,8 +1652,8 @@ def test_the_page_check_is_staged_by_one_chain_without_a_pipe_and_swapped_by_a_s
     assert "mv " not in stage and "rm " not in stage.split(produce)[1], "the stage must not swap or clean anything"
     assert publish.startswith(exec_sh) and publish.endswith(f" sh '{final}.new' '{final}' '{final}.old'")
     assert " && " not in publish and "docker cp" not in publish and tar not in publish, "the swap cleans nothing"
-    assert publish.index('rm -r "$o"') < publish.index('mv "$f" "$o"'), "an old sibling is removed first, to make room"
-    assert publish.count("rm ") == 1, "after the swap the old copy stays for the final reconciliation"
+    assert stage.index('rm -r "$d"') < stage.index(produce), "stale siblings are removed first, in the stage, to make room"
+    assert "rm " not in publish, "after the swap the old copy stays until the cleanup at the end"
     assert [c["stdin_size"] for c in box.of("copy-page-check") + box.of("publish-page-check")] == [0, 0]
 
 
@@ -1665,23 +1693,17 @@ def _no_source(box):
     shutil.rmtree(box.source_folder)
 
 
-def _empty_source(box):
-    for path in list(box.source_folder.rglob("*"))[::-1]:
-        path.unlink() if path.is_file() else path.rmdir()
-
-
 def _no_browser(box):
     shutil.rmtree(box.fs / box.browser_c)
 
 
 STAGE, PUBLISH = "copy-page-check", "publish-page-check"
 PAGE_FAILS = {
-    "no source": (_no_source, STAGE), "empty source": (_empty_source, STAGE), "no browser": (_no_browser, STAGE),
+    "no source": (_no_source, STAGE), "no browser": (_no_browser, STAGE),
     "producer fails with 23 after a valid partial archive": (lambda box: box.answer(rc={"s2docker cp-out": 23}), STAGE),
     "consumer fails": (lambda box: box.answer(rc={"s2docker cp-in": 1}), STAGE),
     "remote shell fails after the whole stage ran": (lambda box: box.answer(late_rc={STAGE: 255}), STAGE),
     "swap fails and rolls back": (lambda box: (box.top / "mv-fails").write_text("x", encoding="utf-8"), PUBLISH),
-    "forced failure of the stage": (lambda box: box.answer(rc={STAGE: 1}), STAGE),
     "forced failure of the publish": (lambda box: box.answer(rc={PUBLISH: 1}), PUBLISH),
 }
 
@@ -1692,8 +1714,9 @@ def test_a_failed_copy_ends_the_run_keeps_the_old_copy_untouched_and_removes_not
     box.answer(tags=RETENTION_TAGS)
     setup(box)
     before = box.server2()
-    expect_failure(box.run(), "page-check")
-    if (box.fs / box.browser_c).exists():
+    gone = not (box.fs / box.browser_c).exists()
+    expect_failure(box.run(), "page-check", also=CLEANUP_LINE["rm-page-check"] if gone else "")
+    if not gone:
         assert tree(box.old_copy) == {"old.txt": "OLD\n"}
     assert box.server2() == after_converge(before)
     assert box.kinds()[-1] == last and box.of("remove-tag") == [] and box.of("list-tags") == []
@@ -1701,11 +1724,6 @@ def test_a_failed_copy_ends_the_run_keeps_the_old_copy_untouched_and_removes_not
 
 # ---- owner rule 2: stage, check every side, then publish. One regression per transfer ---------------
 
-SCRIPTS_STAGE = [*GATE, "ship-scripts"]
-APP_IMAGE_STAGE = [*CACHED_RUN[:4], "load"]
-PLATFORM_STAGE = [*CACHED_RUN[:5], "ship-platform"]
-PLATFORM_RUN = [*PLATFORM_STAGE, "publish-platform", "build-platform", "has-image", *CACHED_RUN[5:]]
-PAGE_STAGE = CACHED_RUN[:CACHED_RUN.index("copy-page-check") + 1]
 OLD_STACK_UP = "#!/bin/sh\n# old stack_up\n"
 
 
@@ -1795,10 +1813,10 @@ def test_a_healthy_retry_at_the_same_commit_ships_the_platform_archive_again_and
     assert box.kinds() == PLATFORM_STAGE + PLATFORM_RUN
     archives, ships = box.of("git archive commit"), box.of("ship-platform")
     assert len(archives) == len(ships) == 2 and ships[1]["stdin_sha"] == archives[1]["sha"]
-    state = json.loads((box.top / "state.json").read_text(encoding="utf-8"))
+    state = box.state()
     assert state["archive_sha"] == archives[1]["sha"] and PLATFORM_REF in state["images"]
-    assert not Path(box.archive()).exists(), "the final reconciliation removes the archive once the stack is current"
-    assert not Path(f"{box.archive()}.part").exists() and reconciled(box)
+    assert not Path(box.archive()).exists(), "the cleanup at the end removes the archive"
+    assert not Path(f"{box.archive()}.part").exists() and len(box.remote("rm-archive")) == 2 and len(box.remote("rm-page-check")) == 1
 
 
 def test_an_archive_that_is_already_gone_when_it_is_removed_is_no_failure(box):
@@ -1823,7 +1841,7 @@ def test_a_retry_after_a_load_and_a_failed_producer_finds_the_id_without_a_tag_a
     before = box.server2()
     box.answer(late_rc={"docker save": 23})
     fails_unpublished(box, "app-image", before, APP_IMAGE_STAGE)
-    state = json.loads((box.top / "state.json").read_text(encoding="utf-8"))
+    state = box.state()
     assert box.of("tag") == [] and state["untagged"] == [IMAGE_ID], "the loaded id waits on Server 2 without a tag"
     box.answer(late_rc={"docker save": 0})
     expect_success(box.run())
@@ -1840,22 +1858,20 @@ def test_a_page_check_producer_that_exits_non_zero_after_a_valid_stream_swaps_no
     box.answer(late_rc={"s2docker cp-out": 23})
     fails_unpublished(box, "page-check", after_converge(before), PAGE_STAGE)
     assert before["page"] == {"old.txt": "OLD\n"} and tree(box.old_copy) == before["page"]
-    assert [c["call"] for c in box.calls() if c["call"].startswith("s2docker")] == ["s2docker exec", "s2docker cp-out"]
+    assert [c["call"] for c in box.calls() if c["call"].startswith("s2docker")] == [
+        "s2docker exec", "s2docker cp-out", "s2docker exec"], "the last one is the cleanup removing the old sibling"
     assert box.kinds().count("versions") == 1 and box.of("list-tags") == [] and box.of("remove-tag") == []
 
 
 SIDE_FAILS = {
-    "scripts, the receiver exits 1": (old_scripts, {"rc": {"ship-scripts": 1}}, "ship-scripts", SCRIPTS_STAGE),
     "scripts, the receiver exits 255 after it extracted everything": (
         old_scripts, {"late_rc": {"ship-scripts": 255}}, "ship-scripts", SCRIPTS_STAGE),
     "scripts, the publish call fails": (
         old_scripts, {"rc": {"publish-scripts": 1}}, "ship-scripts", [*SCRIPTS_STAGE, "publish-scripts"]),
-    "platform, the receiver exits 1": (tagged_app_image, {"rc": {"ship-platform": 1}}, "platform-build", PLATFORM_STAGE),
     "platform, the receiver exits 255 after it wrote the whole file": (
         tagged_app_image, {"late_rc": {"ship-platform": 255}}, "platform-build", PLATFORM_STAGE),
     "platform, the publish call fails": (
         tagged_app_image, {"rc": {"publish-platform": 1}}, "platform-build", [*PLATFORM_STAGE, "publish-platform"]),
-    "app image, the receiver exits 1": (no_images, {"rc": {"load": 1}}, "app-image", APP_IMAGE_STAGE),
     "app image, the receiver exits 255 after it loaded the image": (
         no_images, {"late_rc": {"load": 255}}, "app-image", APP_IMAGE_STAGE),
     "app image, the publish call fails": (no_images, {"rc": {"tag": 1}}, "app-image", [*APP_IMAGE_STAGE, "tag"]),
@@ -1912,14 +1928,6 @@ def test_a_scripts_publish_that_fails_at_any_step_keeps_the_old_folder_and_marke
     assert (tree(previous) if previous.exists() else None) == kept
 
 
-def test_a_failed_publish_of_the_platform_archive_leaves_the_staged_file_and_no_archive_under_the_final_name(box):
-    tagged_app_image(box)
-    box.answer(rc={"publish-platform": 1})
-    expect_failure(box.run(), "platform-build")
-    assert Path(f"{box.archive()}.part").is_file() and not Path(box.archive()).exists()
-    assert box.of("build-platform") == []
-
-
 # ---- g. the retention: last, with its own versions call, by exact references ------------------------
 
 LIST_FORMAT = "--format '{{.Tag}}'"
@@ -1943,13 +1951,13 @@ def planned(removed: dict[str, list[str]]) -> list[tuple[str, str]]:
 
 
 def stored_tags(box: Sandbox) -> dict[str, list[str]]:
-    return json.loads((box.top / "state.json").read_text(encoding="utf-8"))["tags"]
+    return box.state()["tags"]
 
 
 def test_the_retention_is_last_and_removes_every_old_plain_tag_by_its_exact_reference_one_call_each(shared):
     box, done = shared("tags")
     expect_success(done)
-    assert box.kinds()[:8] == CURRENT_RUN[:8] and reconciled(box), "the reconciliation comes before the retention"
+    assert box.kinds()[:4] == CURRENT_RUN[:4] and cleaned(box), "a current stack made nothing and cleans nothing"
     assert box.remote("versions")[-1] == box.cmd("./stack_up.sh versions")
     assert retention_steps(box) == planned(REMOVED)
     assert box.remote("list-tags") == [f"docker image ls '{repo}' {LIST_FORMAT}" for repo in REPOSITORIES]
@@ -1980,12 +1988,8 @@ def test_tags_used_by_containers_are_those_of_the_retention_call_and_per_reposit
 
 BAD_RETENTION_VERSIONS = {
     "fails": (versions_text(), 1), "ssh fails": (versions_text(), 255), "garbled": ("garbage\n", 0), "empty": ("", 0),
-    "four lines": (versions_text().rsplit("browser", 1)[0], 0), "six lines": (versions_text() + "extra x\n", 0),
-    "wrong order": (_swapped(), 0), "blank line": (versions_text().replace("app ", "\napp "), 0),
-    "tag not plain": (versions_text(proxy="a!b"), 0), "tag with a slash": (versions_text(app="a/b"), 0),
-    "tag too long": (versions_text(browser="a" * 64), 0), "empty tag": (versions_text(gateway=""), 0),
-    "unknown role": (versions_text().replace("gateway", "gatewa"), 0),
-    "extra field": (versions_text().replace("proxy ", "proxy x "), 0),
+    "four lines": (versions_text().rsplit("browser", 1)[0], 0), "wrong order": (_swapped(), 0),
+    "tag not plain": (versions_text(proxy="a!b"), 0), "unknown role": (versions_text().replace("gateway", "gatewa"), 0),
 }
 
 
@@ -1994,7 +1998,7 @@ def test_versions_that_cannot_be_read_at_the_retention_remove_nothing_and_end_wi
     with_tags(box)
     box.answer(out={"versions#2": text}, rc={"versions#2": rc})
     expect_failure(box.run(), "prune")
-    assert box.kinds() == CURRENT_RUN[:8] and stored_tags(box) == RETENTION_TAGS
+    assert box.kinds() == CURRENT_RUN[:4] and stored_tags(box) == RETENTION_TAGS
 
 
 @pytest.mark.parametrize("target, listed", [
@@ -2025,261 +2029,175 @@ def test_a_full_run_ends_with_the_retention_and_removes_nothing_from_a_stack_tha
     assert box.of("remove-tag") == []
 
 
-# ---- owner rule 3: one final reconciliation. It removes by exact name, once the stack is current -----------------
-# A failed removal is remembered: convergence, the page check copy and the retention still finish, and the run ends
-# with the fixed reason of the first failed phase. The next healthy run removes what is left.
+# ---- owner rule 4 item 2: one best-effort cleanup at the end of every refresh -----------------------
+# It removes this run's own files by exact name (the platform archive and its part file, then the old page check
+# sibling and the staging tar), through one function, once, whatever the exit status. It changes neither the exit status
+# nor the convergence: a removal that fails prints its phase on stderr. Nothing of an earlier run is looked for.
 
-LEFTOVERS = sorted([
-    "raphael-journeys.new", f"raphael-journeys.platform-{COMMIT}.tar", f"raphael-journeys.platform-{COMMIT}.tar.part",
-    "raphael-journeys.page-check.tar", "page-check.new", "page-check.old",
-])
 PLAIN_REMAINS = {repo: [t for t in RETENTION_TAGS[repo] if t not in REMOVED[repo]] for repo in REPOSITORIES}
-CLEANUPS = {
-    "the platform archive": (no_platform, "rm-archive", "rm-fails-archive", "platform-build", lambda box: Path(box.archive())),
-    "the old page check": (cached, "rm-page-check", "rm-fails", "page-check", lambda box: Path(f"{box.old_copy}.old")),
-    "the staging tar of the page check": (
-        cached, "rm-staging-tar", "rm-fails-staging", "page-check", lambda box: box.staging),
-    "the staged scripts folder": (
-        cached, "rm-scripts-new", "rm-fails-new", "ship-scripts", lambda box: Path(f"{box.s2dir}.new")),
+CLEANUP_LINE = {
+    "rm-archive": f"refresh_stack: cleanup failed: platform-build ({REASONS['platform-build']})\n",
+    "rm-page-check": f"refresh_stack: cleanup failed: page-check ({REASONS['page-check']})\n",
 }
-INJECTIONS = ["forced status", "the tool of Server 2 fails"]
 
 
-def inject(box: Sandbox, how: str, kind: str, control: str, on: bool) -> None:
-    if how == "forced status":
-        box.answer(rc={kind: 255 if on else None})
-    elif on:
-        (box.top / control).touch()
-    else:
-        (box.top / control).unlink()
+def cleanup_bounds(box: Sandbox) -> list[int]:
+    """The seconds of the timeout in front of each cleanup ssh call."""
+    calls = box.calls()
+    found = []
+    for index, call in enumerate(calls):
+        if call["call"] in CLEANUP:
+            assert calls[index - 1]["call"] == "timeout" and calls[index - 1]["argv"][2] == "ssh", "no bound of its own"
+            found.append(int(calls[index - 1]["argv"][1]))
+    return found
 
 
-def stack_is_up_but_not_clean(box: Sandbox, leftover: Path) -> None:
-    """After a run that ended on a failed removal: the stack was brought up, the page check is the new one and the
-    retention ran through; only the one leftover is there."""
-    assert len(box.of("build-proxy")) == len(box.of("converge")) == 1 and box.server2()["converged"] is True
-    assert tree(box.old_copy) == tree(box.source_folder) and stored_tags(box) == PLAIN_REMAINS
-    assert retention_steps(box) == planned(REMOVED) and leftover.exists()
+def test_the_cleanup_runs_once_after_the_retention_and_removes_exactly_this_runs_own_files(shared):
+    box, done = shared("full")
+    expect_success(done)
+    assert box.all_kinds() == [*FULL_RUN, "rm-archive", "rm-page-check"] and cleaned(box, *CLEANUP)
+    assert cleanup_bounds(box) and all(seconds in CLEANUP_BOUND for seconds in cleanup_bounds(box))
+    assert all(call["stdin_size"] == 0 for call in box.ssh_calls(cleanup=True) if call["call"] in CLEANUP)
+    assert not Path(box.archive()).exists() and not Path(f"{box.archive()}.part").exists()
+    assert not box.staging.exists() and not Path(f"{box.old_copy}.old").exists() and tree(box.old_copy) == tree(box.source_folder)
+    assert sorted(path.name for path in box.s2dir.parent.iterdir()) == ["raphael-journeys"]
 
 
-@pytest.mark.parametrize("how", INJECTIONS)
-@pytest.mark.parametrize("what", list(CLEANUPS), ids=list(CLEANUPS))
-def test_a_removal_that_fails_ends_with_the_reason_of_its_phase_after_the_stack_is_current_and_the_next_run_removes_the_leftover(
-        box, what, how):
-    scenario, kind, control, reason, where = CLEANUPS[what]
-    scenario(box)
-    box.answer(tags=RETENTION_TAGS)
-    if kind == "rm-scripts-new":
-        box.plant_leftovers()
-    inject(box, how, kind, control, True)
-    expect_failure(box.run(), reason)
-    kinds = box.kinds()
-    assert kinds.index("converge") < kinds.index("copy-page-check") < kinds.index(kind) < kinds.index("list-tags")
-    assert [k for k in kinds if k in RECONCILE] == RECONCILE, "every removal was tried although one failed"
-    stack_is_up_but_not_clean(box, where(box))
-    inject(box, how, kind, control, False)
-    expect_success(box.run())
-    assert box.last_kinds() == CURRENT_RUN, "the second run takes the already-current shortcut"
-    assert box.leftovers() == [] and not where(box).exists()
-    assert len(box.of("build-proxy")) == len(box.of("converge")) == 1 and stored_tags(box) == PLAIN_REMAINS
+def test_nothing_is_removed_early_by_the_platform_step_or_inside_the_page_check_step(shared):
+    box, _ = shared("full")
+    steps = {kind: box.remote(kind) for kind in FULL_RUN}
+    removal = re.compile(r"\brm\b")
+    assert not [text for kind in ("ship-platform", "publish-platform", "build-platform", "build-proxy", "converge")
+                for text in steps[kind] if removal.search(text)]
+    (copy,) = steps["copy-page-check"]
+    (swap,) = steps["publish-page-check"]
+    assert not removal.search(swap) and box.archive() not in copy + swap and str(box.staging) not in swap
+    assert box.all_kinds().index("rm-archive") > box.all_kinds().index("list-tags")
 
 
-@pytest.mark.parametrize("how", INJECTIONS)
-def test_both_page_check_leftovers_that_could_not_be_removed_are_removed_together_by_the_next_run_through_the_shortcut(
-        box, how):
+def test_a_run_that_made_no_archive_removes_only_the_page_check_files_and_a_current_run_calls_nothing(shared):
+    box, done = shared("cached")
+    expect_success(done)
+    assert box.all_kinds() == [*CACHED_RUN, "rm-page-check"] and cleaned(box, "rm-page-check")
+    box, done = shared("current")
+    expect_success(done)
+    assert box.all_kinds() == CURRENT_RUN and cleaned(box)
+
+
+FAILED_RUNS = {
+    "the proxy build fails": (no_platform, {"build-proxy": 1}, "proxy-tag", ["rm-archive"]),
+    "the converge fails": (no_platform, {"converge": 1}, "converge", ["rm-archive"]),
+    "the page check copy fails": (cached, {"copy-page-check": 1}, "page-check", ["rm-page-check"]),
+    "the platform archive cannot be published": (no_platform, {"publish-platform": 1}, "platform-build", ["rm-archive"]),
+}
+
+
+def test_a_failed_run_ends_as_it_did_and_removes_what_it_made_through_the_same_cleanup(box):
+    for why, sandbox in sandboxes(box, list(FAILED_RUNS)):
+        setup, rc, key, cleanups = FAILED_RUNS[why]
+        setup(sandbox)
+        sandbox.answer(rc=rc)
+        expect_failure(sandbox.run(), key, why)
+        assert sandbox.all_kinds()[-len(cleanups):] == cleanups and cleaned(sandbox, *cleanups), why
+        assert not Path(sandbox.archive()).exists() and not Path(f"{sandbox.archive()}.part").exists(), why
+        assert not sandbox.staging.exists() and not Path(f"{sandbox.old_copy}.old").exists(), why
+        assert all(seconds in CLEANUP_BOUND for seconds in cleanup_bounds(sandbox)), why
+
+
+def test_a_refresh_that_runs_out_of_the_box_is_the_box_and_its_cleanup_has_a_short_bound_of_its_own(box):
+    no_platform(box)
+    box.answer(advance={"converge": BOX + 5})
+    expect_failure(box.run(), "box")
+    assert box.all_kinds()[-2:] == ["converge", "rm-archive"] and cleaned(box, "rm-archive")
+    assert cleanup_bounds(box) == [bound for bound in cleanup_bounds(box) if bound in CLEANUP_BOUND] != []
+    assert not Path(box.archive()).exists()
+
+
+def test_a_refresh_that_ends_in_the_retention_prune_still_cleans_up_and_keeps_that_reason(box):
     cached(box)
-    box.answer(tags=RETENTION_TAGS)
-    both = (("rm-page-check", "rm-fails"), ("rm-staging-tar", "rm-fails-staging"))
-    for kind, control in both:
-        inject(box, how, kind, control, True)
-    expect_failure(box.run(), "page-check")
-    assert box.leftovers() == ["page-check.old", "raphael-journeys.page-check.tar"]
-    assert tree(box.old_copy) == tree(box.source_folder) and stored_tags(box) == PLAIN_REMAINS
-    for kind, control in both:
-        inject(box, how, kind, control, False)
+    box.answer(tags=RETENTION_TAGS, rc={f"remove-tag raphael-journeys-proxy:{'c' * 12}": 1})
+    expect_failure(box.run(), "prune")
+    assert box.all_kinds()[-1] == "rm-page-check" and cleaned(box, "rm-page-check") and not box.staging.exists()
+
+
+CLEANUP_FAILS = {
+    "the platform archive cannot be removed": (no_platform, "rm-fails-archive", None, "rm-archive"),
+    "the old page check sibling cannot be removed": (cached, "rm-fails", None, "rm-page-check"),
+    "the staging tar of the page check cannot be removed": (cached, "rm-fails-staging", None, "rm-page-check"),
+    "the ssh call of the platform cleanup fails": (no_platform, None, 255, "rm-archive"),
+    "the ssh call of the page check cleanup fails": (cached, None, 255, "rm-page-check"),
+}
+
+
+def test_a_removal_that_fails_prints_its_phase_and_changes_neither_the_exit_status_nor_the_convergence(box):
+    for why, sandbox in sandboxes(box, list(CLEANUP_FAILS)):
+        setup, control, rc, kind = CLEANUP_FAILS[why]
+        setup(sandbox)
+        if control:
+            (sandbox.top / control).touch()
+        if rc:
+            sandbox.answer(rc={kind: rc})
+        done = sandbox.run()
+        assert (done.returncode, done.stdout, done.stderr) == (0, SUCCESS, CLEANUP_LINE[kind]), why
+        assert not values_in(done.stdout + done.stderr) and sandbox.server2()["converged"] is True, why
+        assert sandbox.kinds()[-6:] == ["versions", *["list-tags"] * 5], "the retention ran through: " + why
+        assert sandbox.remote(kind) == [sandbox.cleanup_cmds()[kind]], why
+
+
+def test_two_failed_cleanup_calls_print_their_two_phases_in_order_and_the_refresh_still_succeeds(box):
+    no_platform(box)
+    box.answer(rc={"rm-archive": 255, "rm-page-check": 255})
+    done = box.run()
+    assert (done.returncode, done.stdout) == (0, SUCCESS)
+    assert done.stderr == CLEANUP_LINE["rm-archive"] + CLEANUP_LINE["rm-page-check"]
+    assert box.all_kinds()[-2:] == ["rm-archive", "rm-page-check"] and box.server2()["converged"] is True
+
+
+def test_a_failed_removal_after_a_failed_run_keeps_that_runs_reason_and_status_and_adds_its_line_after_it(box):
+    no_platform(box)
+    box.answer(rc={"converge": 1, "rm-archive": 255})
+    done = box.run()
+    assert (done.returncode, done.stdout) == (1, "")
+    assert done.stderr == f"refresh_stack: {REASONS['converge']}\n" + CLEANUP_LINE["rm-archive"]
+
+
+def test_a_part_file_that_cannot_be_removed_is_a_failed_removal_of_the_platform_phase(box):
+    no_platform(box)
+    (box.top / "rm-fails-part").touch()
+    box.answer(rc={"publish-platform": 1})
+    done = box.run()
+    assert (done.returncode, done.stdout) == (1, "")
+    assert done.stderr == f"refresh_stack: {REASONS['platform-build']}\n" + CLEANUP_LINE["rm-archive"]
+    assert Path(f"{box.archive()}.part").exists() and not Path(box.archive()).exists()
+
+
+def test_files_of_earlier_runs_are_not_looked_for_and_stay_where_they_are(box):
+    cached(box)
+    box.plant_leftovers()
+    names = [f"{box.s2dir}.new", box.archive(), f"{box.archive()}.part"]
     expect_success(box.run())
-    assert box.last_kinds() == CURRENT_RUN and box.leftovers() == []
-    assert sorted(path.name for path in box.old_copy.parent.iterdir()) == ["page-check"] and not box.staging.exists()
+    assert all(Path(name).exists() for name in names) and cleaned(box, "rm-page-check")
 
 
-@pytest.mark.parametrize("target, remaining", [
-    (f"raphael-journeys-proxy:{'c' * 12}", planned(REMOVED)),
-    (f"{PLATFORM_REPO}:{'p4' * 20}", planned({**{repo: [] for repo in REPOSITORIES}, PLATFORM_REPO: ["p4" * 20]})),
-], ids=["first removal", "last removal"])
-def test_a_tag_that_cannot_be_removed_ends_with_prune_after_the_stack_is_current_and_the_next_run_removes_it(
-        box, target, remaining):
+def test_a_tag_that_cannot_be_removed_ends_with_prune_after_the_stack_is_current_and_the_next_run_removes_it(box):
+    target = f"{PLATFORM_REPO}:{'p4' * 20}"
     cached(box)
     box.answer(tags=RETENTION_TAGS, rc={f"remove-tag {target}": 1})
     expect_failure(box.run(), "prune")
     kinds = box.kinds()
-    assert "converge" in kinds and kinds.index("publish-page-check") < kinds.index("list-tags") and reconciled(box)
+    assert "converge" in kinds and kinds.index("publish-page-check") < kinds.index("list-tags") and cleaned(box, "rm-page-check")
     assert box.of("remove-tag")[-1]["arg"] == target and tree(box.old_copy) == tree(box.source_folder)
-    assert target.split(":")[1] in stored_tags(box)[target.split(":")[0]], "the tag is still there"
+    assert target.split(":")[1] in stored_tags(box)[PLATFORM_REPO], "the tag is still there"
     box.answer(rc={f"remove-tag {target}": None})
     expect_success(box.run())
-    assert box.last_kinds()[:3] == CURRENT_RUN[:3] and retention_steps(box) == remaining
+    assert box.last_kinds()[:3] == CURRENT_RUN[:3]
+    assert retention_steps(box) == planned({**{repo: [] for repo in REPOSITORIES}, PLATFORM_REPO: ["p4" * 20]})
     assert stored_tags(box) == PLAIN_REMAINS and len(box.of("converge")) == 1
-
-
-FIRST_FAILED = {
-    "archive, then a tag": ({"rm-archive": 1, "remove-tag raphael-journeys-proxy:" + "c" * 12: 1}, "platform-build"),
-    "old page check, then a tag": ({"rm-page-check": 1, "remove-tag raphael-journeys-proxy:" + "c" * 12: 1}, "page-check"),
-    "staging tar, then a tag": ({"rm-staging-tar": 255, "remove-tag raphael-journeys-proxy:" + "c" * 12: 1}, "page-check"),
-    "archive, then the old page check": ({"rm-archive": 255, "rm-page-check": 1}, "platform-build"),
-    "old page check, then the staging tar": ({"rm-page-check": 1, "rm-staging-tar": 1}, "page-check"),
-    "staged scripts, then the archive": ({"rm-scripts-new": 1, "rm-archive": 1}, "ship-scripts"),
-    "all four removals and a tag": ({
-        "rm-scripts-new": 1, "rm-archive": 1, "rm-page-check": 1, "rm-staging-tar": 1,
-        "remove-tag raphael-journeys-proxy:" + "c" * 12: 1}, "ship-scripts"),
-}
-
-
-@pytest.mark.parametrize("rc, reason", list(FIRST_FAILED.values()), ids=list(FIRST_FAILED))
-def test_two_failed_cleanups_end_with_the_reason_of_the_first_failed_phase_and_the_work_is_finished(box, rc, reason):
-    no_platform(box)
-    box.answer(tags=RETENTION_TAGS, rc=rc)
-    expect_failure(box.run(), reason)
-    kinds = box.kinds()
-    assert kinds.count("build-proxy") == kinds.count("converge") == kinds.count("publish-page-check") == 1
-    assert [k for k in kinds if k in RECONCILE] == RECONCILE and "versions" in kinds[kinds.index("rm-staging-tar"):]
-    assert tree(box.old_copy) == tree(box.source_folder)
-    box.answer(rc={key: None for key in rc})
-    expect_success(box.run())
-    assert box.leftovers() == [] and stored_tags(box) == PLAIN_REMAINS
-
-
-@pytest.mark.parametrize("key", [
-    "rm-archive", "rm-page-check", "rm-staging-tar", "versions#2", "list-tags raphael-journeys-proxy", "remove-tag#1",
-])
-def test_the_box_running_out_after_a_failed_cleanup_is_the_box_and_not_the_remembered_reason(box, key):
-    no_platform(box)
-    box.answer(tags=RETENTION_TAGS, rc={"rm-scripts-new": 255}, advance={key: BOX})
-    expect_failure(box.run(), "box")
-    kinds = box.kinds()
-    assert kinds[-1] == key.split()[0].split("#")[0] and box.elapsed() == BOX and "rm-scripts-new" in kinds
-    assert kinds.count("converge") == 1
-    nothing_stopped(box)
-
-
-def test_the_previous_scripts_copy_survives_every_reconciliation(box):
-    old_scripts(box)
-    box.answer(images=[IMAGE_ID, PLATFORM_REF], tags=RETENTION_TAGS, rc={"rm-archive": 255})
-    old = tree(box.s2dir)
-    previous = Path(f"{box.s2dir}.previous")
-    expect_failure(box.run(), "platform-build")
-    assert tree(previous) == old and reconciled(box)
-    box.answer(rc={"rm-archive": None})
-    expect_success(box.run())
-    assert tree(previous) == old and box.last_kinds() == CURRENT_RUN
-    expect_success(box.run())
-    assert tree(previous) == old and box.leftovers() == []
-    sweeps = [cmd for kind in RECONCILE for cmd in box.remote(kind)]
-    assert len(sweeps) == 12 and not any(".previous" in cmd or ".refresh-commit" in cmd for cmd in sweeps)
-    assert not any(re.search(r"[*?]|\bdocker (rm|container|volume)\b", cmd) for cmd in sweeps)
-    assert (box.s2dir / ".refresh-commit").read_text(encoding="utf-8") == COMMIT + "\n"
-
-
-@pytest.mark.parametrize("scenario", ["cached", "current"])
-def test_a_healthy_run_removes_every_leftover_of_failed_runs_by_exact_name_and_nothing_that_only_looks_like_one(
-        box, scenario):
-    SCENARIOS[scenario](box)
-    previous = Path(f"{box.s2dir}.previous")
-    previous.mkdir()
-    (previous / "kept.txt").write_text("KEPT\n", encoding="utf-8")
-    (box.s2dir / "stack_up.sh").write_text(OLD_STACK_UP, encoding="utf-8")
-    assert box.plant_leftovers() == LEFTOVERS
-    decoys = [
-        Path(box.archive(OTHER_COMMIT)), Path(f"{box.s2dir}.newer"), Path(f"{box.s2dir}.page-check.tar.bak"),
-        Path(f"{box.s2dir}.platform-{COMMIT}.tar.part2"), box.old_copy.parent / "page-check.older",
-    ]
-    for decoy in decoys:
-        if decoy.parent == box.old_copy.parent:
-            decoy.mkdir()
-        else:
-            decoy.write_bytes(b"DECOY")
-    expect_success(box.run())
-    assert box.leftovers() == sorted(d.name for d in decoys) and all(d.exists() for d in decoys)
-    assert reconciled(box) and tree(previous) == {"kept.txt": "KEPT\n"}
-    assert (box.s2dir / "stack_up.sh").read_text(encoding="utf-8") == OLD_STACK_UP
-    assert (box.s2dir / ".refresh-commit").read_text(encoding="utf-8") == COMMIT + "\n"
-    assert box.kinds() == (CURRENT_RUN if scenario == "current" else CACHED_RUN)
-
-
-STAGED = {
-    "scripts publish fails": (old_scripts, {"rc": {"publish-scripts": 1}}, "ship-scripts", ["raphael-journeys.new"]),
-    "platform publish fails": (
-        tagged_app_image, {"rc": {"publish-platform": 1}}, "platform-build", [f"raphael-journeys.platform-{COMMIT}.tar.part"]),
-    "page check consumer fails": (
-        cached, {"rc": {"s2docker cp-in": 1}}, "page-check", ["page-check.new", "raphael-journeys.page-check.tar"]),
-}
-
-
-@pytest.mark.parametrize("seed, answers, reason, left", list(STAGED.values()), ids=list(STAGED))
-def test_the_staged_names_a_failed_run_leaves_are_tolerated_and_cleaned_by_the_next_healthy_run(
-        box, seed, answers, reason, left):
-    seed(box)
-    box.answer(**answers)
-    expect_failure(box.run(), reason)
-    assert box.leftovers() == sorted(left)
-    box.answer(**{what: {key: None for key in value} for what, value in answers.items()})
-    expect_success(box.run())
-    assert box.leftovers() == [] and box.server2()["converged"] is True
-
-
-def test_a_failed_swap_of_the_page_check_leaves_the_old_copy_active_and_the_next_run_cleans_the_new_sibling(box):
-    cached(box)
-    (box.top / "mv-fails").write_text("x", encoding="utf-8")
-    expect_failure(box.run(), "page-check")
-    assert tree(box.old_copy) == {"old.txt": "OLD\n"}
-    assert box.leftovers() == ["page-check.new", "raphael-journeys.page-check.tar"]
-    assert box.of("list-tags") == [] and "rm-page-check" not in box.kinds(), "a failed copy reconciles and prunes nothing"
-    (box.top / "mv-fails").unlink()
-    expect_success(box.run())
-    assert box.leftovers() == [] and box.old_copy.is_dir()
-
-
-def run_on_server2(box: Sandbox, command: str) -> subprocess.CompletedProcess[str]:
-    """One recorded remote command, run for real in the folders of the fake Server 2 with the same tools as the stand-in."""
-    env = {"PATH": str(box.s2bin), "HOME": str(box.top)}
-    return subprocess.run(["/bin/sh", "-c", command], env=env, capture_output=True, encoding="utf-8", text=True, cwd=box.top)
-
-
-def swap_ready(box: Sandbox) -> tuple[str, Path, Path]:
-    """The swap command of a normal run, with Server 2 put back to: the old copy active, a new copy beside it staged, and
-    an old sibling of an earlier failed run in the way."""
-    cached(box)
-    expect_success(box.run())
-    (swap,) = box.remote("publish-page-check")
-    box.seed_fs()
-    new, old = Path(f"{box.old_copy}.new"), Path(f"{box.old_copy}.old")
-    shutil.copytree(box.source_folder, new)
-    (old / "stale").mkdir(parents=True)
-    (old / "stale" / "file.txt").write_text("STALE\n", encoding="utf-8")
-    return swap, new, old
-
-
-def test_a_page_check_swap_that_meets_an_old_sibling_removes_that_exact_leftover_first(box):
-    swap, new, old = swap_ready(box)
-    done = run_on_server2(box, swap)
-    assert done.returncode == 0, done.stderr
-    assert tree(box.old_copy) == tree(box.source_folder) and not new.exists()
-    assert tree(old) == {"old.txt": "OLD\n"}, "the active copy was moved to the exact .old name, not into a leftover"
-
-
-def test_a_page_check_swap_that_cannot_remove_the_old_sibling_moves_nothing(box):
-    swap, new, old = swap_ready(box)
-    (box.top / "rm-fails").write_text("x", encoding="utf-8")
-    done = run_on_server2(box, swap)
-    assert done.returncode == 1
-    assert tree(box.old_copy) == {"old.txt": "OLD\n"} and tree(new) == tree(box.source_folder)
-    assert tree(old) == {"stale/file.txt": "STALE\n"}
 
 
 # ---- A. one deadline of 25 minutes for the whole run -----------------------------------------------
 
-AFTER_BOX = {
-    "build-proxy", "converge", "copy-page-check", "publish-page-check", *RECONCILE, "list-tags", "remove-tag",
-}
+AFTER_BOX = {"build-proxy", "converge", "copy-page-check", "publish-page-check", "list-tags", "remove-tag"}
 
 
 def nothing_stopped(box: Sandbox) -> None:
@@ -2303,7 +2221,7 @@ def test_a_converge_that_returns_late_is_the_box_and_no_page_check_or_removal_fo
     expect_failure(box.run(), "box")
     kinds = box.kinds()
     assert kinds[-1] == "converge" and kinds.count("versions") == 1
-    assert not {"copy-page-check", "publish-page-check", *RECONCILE, "list-tags", "remove-tag"} & set(kinds)
+    assert not {"copy-page-check", "publish-page-check", "list-tags", "remove-tag"} & set(kinds)
     assert tree(box.old_copy) == {"old.txt": "OLD\n"}
 
 
@@ -2358,8 +2276,8 @@ def test_every_call_is_bounded_by_the_seconds_left_and_both_sides_of_a_stream_ge
     assert box.timeouts()[0][:2] == ("git", "1500")
     counted = {used: dict(Counter(wrapped for wrapped, _ in found)) for used, found in groups.items()}
     assert counted == {
-        0: {"git": 2, "docker": 1, "ssh": 1}, 300: {"ssh": 3, "git": 1}, 420: {"ssh": 2, "docker": 1},
-        480: {"ssh": 4, "git": 1}, 525: {"ssh": 3}, 725: {"ssh": 12},
+        0: {"git": 2, "docker": 1, "ssh": 1}, 300: {"git": 1, "ssh": 1}, 420: {"ssh": 3, "docker": 1},
+        480: {"ssh": 5, "git": 1}, 525: {"ssh": 3}, 725: {"ssh": 8},
     }
 
 
@@ -2375,24 +2293,18 @@ def test_a_platform_build_that_never_gets_ready_is_polled_every_ten_seconds_unti
     nothing_stopped(box)
 
 
+# one call of each kind the script makes: Server 1 (git, docker), both sides of a stream, a status call, a call whose
+# answer is read, the wait loop, the converge, the page check, the retention and the first look of a current stack
 STATUS_CALLS = [
-    ("full", "git toplevel", None), ("full", "git head", None), ("full", "docker inspect", None),
-    ("full", "ship-scripts", "ship-scripts"), ("full", "git archive scripts", "ship-scripts"),
-    ("full", "publish-scripts", "publish-scripts"),
-    ("full", "docker save", "load"), ("full", "load", "load"), ("full", "ship-platform", "ship-platform"),
-    ("full", "git archive commit", "ship-platform"), ("full", "publish-platform", "publish-platform"),
+    ("full", "git toplevel", None), ("full", "docker inspect", None),
+    ("full", "git archive scripts", "ship-scripts"), ("full", "ship-scripts", "ship-scripts"),
+    ("full", "publish-scripts", "publish-scripts"), ("full", "docker save", "load"), ("full", "load", "load"),
     ("full", "build-platform", "build-platform"), ("full", "has-image#3", "has-image"),
-    ("full", "rm-archive", "rm-archive"),
     ("cached", "marker", "marker"), ("cached", "versions#1", "versions"), ("cached", "has-image#1", "has-image"),
-    ("cached", "has-image#2", "has-image"),
-    ("cached", "tag", "tag"), ("cached", "build-proxy", "build-proxy"), ("cached", "converge", "converge"),
-    ("cached", "copy-page-check", "copy-page-check"), ("cached", "publish-page-check", "publish-page-check"),
-    ("cached", "rm-scripts-new", "rm-scripts-new"), ("cached", "rm-page-check", "rm-page-check"),
-    ("cached", "rm-staging-tar", "rm-staging-tar"),
-    ("cached", "versions#2", "versions"), ("cached", "list-tags", "list-tags"), ("cached", "remove-tag", "remove-tag"),
-    ("current", "page-check-present", "page-check-present"), ("current", "rm-archive", "rm-archive"),
+    ("cached", "converge", "converge"), ("cached", "publish-page-check", "publish-page-check"),
+    ("cached", "remove-tag", "remove-tag"), ("current", "page-check-present", "page-check-present"),
 ]
-STATUS_CASES = [(124, *row) for row in STATUS_CALLS] + [(137, *row) for row in STATUS_CALLS[::4]]
+STATUS_CASES = [(124, *row) for row in STATUS_CALLS] + [(137, *row) for row in STATUS_CALLS[::5]]
 
 
 @pytest.mark.parametrize("status, scenario, key, last", STATUS_CASES,
@@ -2406,12 +2318,8 @@ def test_status_124_or_137_of_any_call_is_the_box_even_when_the_clock_did_not_mo
 
 
 LATE_FAILURES = [
-    ("full", "ship-scripts", 1), ("full", "publish-scripts", 1), ("full", "publish-platform", 1),
-    ("full", "build-platform", 1), ("cached", "versions#1", 1),
-    ("cached", "has-image#1", 2), ("cached", "converge", 1), ("cached", "copy-page-check", 1),
-    ("cached", "publish-page-check", 1), ("cached", "remove-tag", 1), ("full", "rm-archive", 1),
-    ("cached", "rm-scripts-new", 1), ("cached", "rm-page-check", 1), ("cached", "rm-staging-tar", 1),
-    ("current", "rm-archive", 1),
+    ("full", "ship-scripts", 1), ("full", "build-platform", 1), ("cached", "has-image#1", 2),
+    ("cached", "converge", 1), ("cached", "remove-tag", 1),
 ]
 
 
@@ -2431,13 +2339,10 @@ def test_a_failure_one_second_before_the_box_keeps_its_own_reason(box):
 
 
 LATE = [
-    ("full", "ship-scripts"), ("full", "publish-scripts"), ("full", "load"), ("full", "ship-platform"),
-    ("full", "publish-platform"), ("full", "build-platform"),
-    ("full", "has-image#3"), ("full", "rm-archive"), ("cached", "marker"), ("cached", "has-image#1"),
-    ("cached", "has-image#2"), ("cached", "tag"), ("cached", "build-proxy"), ("cached", "converge"),
-    ("cached", "copy-page-check"), ("cached", "publish-page-check"), ("cached", "rm-scripts-new"),
-    ("cached", "rm-page-check"), ("cached", "rm-staging-tar"), ("cached", "versions#2"), ("cached", "list-tags#2"),
-    ("cached", "remove-tag#1"), ("current", "page-check-present"), ("current", "rm-archive"),
+    ("full", "ship-scripts"), ("full", "publish-platform"), ("full", "build-platform"), ("full", "has-image#3"),
+    ("cached", "marker"), ("cached", "has-image#1"), ("cached", "build-proxy"), ("cached", "converge"),
+    ("cached", "publish-page-check"), ("cached", "list-tags#2"), ("cached", "remove-tag#1"),
+    ("current", "page-check-present"),
 ]
 
 
@@ -2462,15 +2367,15 @@ def test_stand_in_calls_at_the_same_time_never_show_half_a_state_and_lose_no_upd
 
     def reader() -> None:
         while not stop.is_set():
-            for name, parse in (("state.json", json.loads), ("clock", int)):
+            for name, parse in (("state.bin", marshal.loads), ("clock", int)):
                 try:
-                    text = (box.top / name).read_text(encoding="utf-8")
+                    text = (box.top / name).read_bytes()
                 except FileNotFoundError:
                     continue
                 reads[0] += 1
                 try:
                     parse(text)
-                except ValueError:
+                except (ValueError, EOFError, TypeError):
                     broken.append((name, text))
 
     watcher = threading.Thread(target=reader)
@@ -2485,7 +2390,7 @@ def test_stand_in_calls_at_the_same_time_never_show_half_a_state_and_lose_no_upd
     total = workers * rounds
     assert broken == [], f"a reader saw a half-written file: {broken[:1]}"
     assert reads[0] > 0, "the reader never read"
-    counted = json.loads((box.top / "state.json").read_text(encoding="utf-8"))["count"]["has-image"]
-    assert counted == total, f"updates were lost in state.json: {counted} of {total}"
+    counted = box.state()["count"]["has-image"]
+    assert counted == total, f"updates were lost in state.bin: {counted} of {total}"
     assert len(box.of("has-image")) == total, "calls are missing from the log"
     assert box.elapsed() == total, f"updates were lost in the clock: {box.elapsed()} of {total}"

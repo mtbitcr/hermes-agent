@@ -1,89 +1,75 @@
 #!/usr/bin/env bash
-# Bring the journeys test stack on Server 2 to the released versions (card 3). Runs on Server 1, takes no argument,
-# and exits 0 only when the stack is at the released versions.
+# Bring the journeys test stack on Server 2 to the released versions (card 3). Runs on Server 1, takes no argument, and
+# exits 0 only when the stack is at the released versions.
 #
 # The released versions:
 #   platform  the commit of the checkout that holds this script (git, found from this script's own folder). It must
-#             equal code_sha in HERMES_HOME/gateway_state.json (read here without jq or python): the gateway on
-#             Server 1 runs the same commit. Different, unreadable or absent: refused before any Server 2 step.
+#             equal code_sha in HERMES_HOME/gateway_state.json (read without jq or python); otherwise the run is refused
+#             before any Server 2 step.
 #   owner app the org.opencontainers.image.revision label and the image id of the production container named in
-#             [production-container] of stack.env.template. One docker inspect with a two-field format reads them.
-#             On Server 1 this script runs only that docker inspect and docker save of that image id; it changes nothing.
+#             [production-container] of stack.env.template, from one docker inspect. On Server 1 this script runs only
+#             that docker inspect and docker save of that image id; it changes nothing.
 #
-# Settings (the operator's environment):
-#   JOURNEY_RUNNER_SSH         ssh destination of the runner identity on Server 2 (required; same rule as run_once.sh)
-#   JOURNEY_S2_SCRIPTS_DIR     Server 2 folder that holds scripts/journeys of the released commit (same rule and default
-#                              as run_once.sh; a trailing slash is stripped; the root is refused)
-#   HERMES_HOME                Server 1 platform home. Default ~/.hermes
-# Container names come from stack.env.template next to this script, read at run time. Only the five image repository
-# names are typed in this script. Every Server 2 step is one ssh "$JOURNEY_RUNNER_SSH" "<command>" with exactly two
-# arguments; a command that runs a script of the folder starts with cd '<folder>' && . No command line carries a value.
+# Settings: JOURNEY_RUNNER_SSH (ssh destination of the runner identity on Server 2; required), JOURNEY_S2_SCRIPTS_DIR
+# (Server 2 folder of scripts/journeys, called S2dir here; same rule and default as run_once.sh; a trailing slash is
+# stripped; the root is refused), HERMES_HOME (default ~/.hermes). Container names come from stack.env.template next to
+# this script. Every Server 2 step is one ssh "$JOURNEY_RUNNER_SSH" "<command>" with exactly two arguments; no command
+# line carries a value.
 #
-# The box is 25 minutes from the start of this script. Every git, docker and ssh call, both sides of a pipeline included,
-# runs as timeout <seconds left> <command>; with no time left the call is not started. The clock is read before and after
-# each call: a call that comes back at or after the box is late even when it succeeded. A status of 124 or 137, or a
-# failure when the box is over, ends the run with reason box. Nothing on Server 2 is killed, stopped or removed for it.
+# The box is 25 minutes from the start. Every git, docker and ssh call (both sides of a pipeline) runs as
+# timeout <seconds left> <command> and is not started when no time is left. The clock is read before and after each call;
+# a call that comes back at or after the box is late even when it succeeded. A status of 124 or 137, or a failure once the
+# box is over, ends the run with reason box. Nothing on Server 2 is killed, stopped or removed for it.
 #
-# Why a transfer is staged, checked and only then published (steps a, b, c and f): nothing becomes active before every
-# side of its transfer has reported. The stage writes only under a new name (S2dir.new, the archive name with .part, an
-# image id without a tag, the page check folder with .new). Server 1 then reads the status of every side (the producer
-# on Server 1 and the receiver on Server 2, all through settle). Only after that a separate ssh call, bounded by the time
-# that is left, publishes: the marker and the two renames, the final archive name, the tag, the swap of the page check
-# folder. A failure at any side ends with the fixed reason of that transfer and never stops, removes or changes a running
-# container, a volume or the active stack; the active folder, its marker, the archive name, the tags and the page check
-# folder stay as they were except where a publish is half done and undoes itself. What a failed run leaves behind (the
-# staged folder, the .part file, an image without a tag, a .previous folder, the page check .new and .old, the staging
-# file) is tolerated: the next run replaces it by exact name, and the final reconciliation removes it. A retry at the same
-# commit ships again.
+# Reads on Server 2 (a failed or garbled read is never an absence, a difference or "current"):
+#   marker  S2dir/.refresh-commit. Status 0 and exactly one line of 40 lowercase hex digits (the final newline may be
+#           missing): this commit or another commit. Status 3, from a folder that can be searched and has no such entry
+#           or from a missing folder whose parent can be searched: no marker. Everything else ends the run: marker-ask.
+#   image   one docker image inspect of the exact id or reference, parsed here and never printed. Found: status 0 and one
+#           line sha256: plus 64 lowercase hex (for an id, the id asked). Missing: status 1 and Docker's own not-found
+#           line for exactly that name (after at most one empty line or "[]" line). Everything else ends the run:
+#           image-ask. docker image ls decides no existence; step g uses it to list tags.
+# A read may come after a transfer. A run that ends with exit 1 after a transfer is accepted: the next run repeats it.
 #
-# A read that failed or was garbled decides nothing: it is never an absence, a difference, or "current". Three reads on
-# Server 2 decide every transfer, and all three are made and validated before the scripts archive, the owner app image or
-# the platform archive cross (the read gate): (1) the scripts marker, (2) docker image inspect of the owner app image id and
-# (3) docker image inspect of raphael-journeys-platform:<commit>. The marker is a different commit only when it was read
-# and holds exactly one line of exactly 40 lowercase hex digits that is not this commit. It is absent only on positive
-# evidence: the folder can be searched and has no such entry, or the folder does not exist and its parent can be searched.
-# Every other marker answer ends the run with marker-ask. An image is there on status 0 and one well-formed id line (for
-# the app image: the id asked), and it is missing only on status 1 and Docker's own not-found line for exactly that name;
-# every other answer ends the run with image-ask (docker image ls decides no existence; it is used by step g only).
-# Whatever fails there, nothing was shipped, published, loaded, tagged or built, and Server 2 is as it was.
-#
-# Steps, in this order (S2dir is the Server 2 folder):
-#   0  read-only first look, three ssh calls, each only when the one before agreed: S2dir/.refresh-commit holds the
-#      commit, stack_up.sh versions shows the released versions, the page check folder exists in the browser container.
-#      When all three agree nothing is shipped, built or converged and only step g runs. Anything else means not current.
-#      The marker call has two ways to say "no match" that ship: another text, or no marker at all (status 3); any other
-#      status is a read that failed and ends the run with marker-ask. The other two calls gate no transfer.
-#   a  scripts/journeys of the commit is shipped as a git archive and extracted into S2dir.new (stage). When both sides
-#      reported 0, a second call writes the file .refresh-commit (the commit) into S2dir.new and swaps it in with two
-#      renames (publish; the old folder stays as S2dir.previous, and when the second rename fails the first is undone).
-#      A publish that fails at any point leaves S2dir with its old files and old marker. Only the publish writes the
-#      marker. Only when S2dir/.refresh-commit differs from the commit or is absent.
-#   b  the owner app image is shipped (docker save into docker load, which leaves an id without a tag: the stage) only
-#      when the list of image ids on Server 2 was read and lacks that id; once both sides reported 0 (or when nothing was
-#      shipped) a separate call tags it raphael-journeys-app-base:<revision> (the publish)
-#   c  the platform image raphael-journeys-platform:<commit>: when the list of that reference on Server 2 was read and is
-#      empty, the git archive of the commit is shipped as one file under the name S2dir.platform-<commit>.tar.part (stage)
-#      and, when both sides reported 0, renamed to S2dir.platform-<commit>.tar by a second call (publish). Only then
-#      stack_up.sh build platform starts the build (it returns at once) and this script waits for the image: first look
-#      at once, then every 10 seconds (the last sleep cut to the time that is left), until the box runs out. Nothing on
-#      Server 2 is ever killed or stopped; a build still running at the box keeps running. Once the image is there the
-#      archive is removed; a removal that fails ends the run with platform-build.
-#   d  stack_up.sh build proxy; its tag is read from the line "stack_up: built proxy <tag>"
-#   e  stack_up.sh converge <proxy tag> <revision> <commit> <revision>
+# Steps, in this order:
+#   0  first look, three read-only ssh calls, each only when the one before agreed: the marker holds this commit,
+#      stack_up.sh versions shows the released versions, the page check folder is in the browser container. When all
+#      three agree nothing is shipped, built or converged and only step g runs. Otherwise the stack is not current.
+#   a  unless the marker holds this commit: scripts/journeys of the commit, as a git archive, is extracted into S2dir.new.
+#      A second call then writes .refresh-commit into it and swaps it in with two renames (an old folder stays as
+#      S2dir.previous; when the second rename fails the first is undone). Only that call writes the marker.
+#   b  the owner app image: shipped (docker save into docker load, which leaves an id without a tag) when image inspect of
+#      its id says missing; then, in every case, tagged raphael-journeys-app-base:<revision> by a separate call.
+#   c  the platform image raphael-journeys-platform:<commit>: when image inspect of that reference says missing, the git
+#      archive of the commit is shipped to S2dir.platform-<commit>.tar.part and renamed to S2dir.platform-<commit>.tar,
+#      stack_up.sh build platform starts the build (it returns at once), and this script waits with the same inspect: at
+#      once, then every 10 seconds (the last sleep cut to the time left), until the image is there or the box runs out.
+#      A build still running at the box keeps running.
+#   d  stack_up.sh build proxy; its tag is the last line "stack_up: built proxy <tag>".
+#   e  stack_up.sh converge <proxy tag> <revision> <commit> <revision>.
 #   f  /opt/raphael-page-check of the owner app container is copied into the browser container as
-#      /opt/raphael-journeys/tools/page-check. The stage is one remote chain of && without a pipe (docker cp streams on
-#      Server 2 only, through the file S2dir.page-check.tar, into the folder page-check.new, which is then checked to
-#      hold something), so the status of the remote shell is that of the first side that fails. The publish is a second
-#      call: the old folder is renamed aside, the new one renamed in, the old one removed, then the staging file. When
-#      the old folder cannot be removed the run ends with page-check and step g does not run.
-#   g  last, in every run that gets this far (also when the stack was already current): of each of the five repositories
-#      the two newest tags stay, and so does every tag that one of the five containers uses (stack_up.sh versions, read
-#      again); every other tag is removed, one docker image rm of repo:tag at a time
-# Never used on Server 2: -f, --force, prune, docker rm, container rm, volume rm.
+#      /opt/raphael-journeys/tools/page-check: one stage call (docker cp through S2dir.page-check.tar into page-check.new,
+#      checked to hold something), then one swap call (the final folder to .old, .new to the final name; put back on error).
+#   g  retention, in every run that gets this far (also when the stack was current): of each of the five repositories
+#      the two newest tags stay, and so does every tag a container of the stack uses (stack_up.sh versions, read again);
+#      every other tag is removed, one docker image rm of repo:tag at a time.
+# A transfer writes only under a new name, every side of it (the producer on Server 1, the receiver on Server 2) is read
+# through settle, and only then a separate call publishes (marker and renames, tag, final archive name, swap). A failed
+# run never stops, removes or changes a running container, a volume or the active stack. It may leave staged files, an
+# image without a tag, S2dir.previous and page-check .new or .old behind; a later run replaces them by exact name.
+#
+# Cleanup is the one place where this run removes files: the EXIT trap, once, at every end of the run (success, already
+# current, any failure, the box). After step g it makes one ssh call for each flag that is set and removes this run's own
+# files by exact name: the platform archive and its .part file (step c started a shipment; phase platform-build), the page
+# check .old and S2dir.page-check.tar (step f was reached; phase page-check). Each call has its own bound of
+# CLEANUP_SECONDS. A call that fails prints one line on stderr, "refresh_stack: cleanup failed: <phase> (<its reason>)", and
+# changes neither the exit status, nor the convergence, nor the success line. Nothing was made by a run that is current, so
+# it makes no cleanup call. Leftovers of earlier runs are not looked for: they are accepted.
 #
 # Output: on success one line on stdout, "refresh_stack: the stack is at the released versions". A failure ends with
-# exactly one line on stderr, "refresh_stack: <reason>" (the reasons are in reason_for), and exit 1. No output line carries
-# a value, and the output of ssh, docker and git is parsed here and never echoed.
+# one line on stderr, "refresh_stack: <reason>" (the reasons are in reason_for), and exit 1. No line carries a value;
+# the output of ssh, docker and git is parsed here and never echoed. Never used on Server 2: -f, --force, prune,
+# docker rm, container rm, volume rm.
 set -uo pipefail
 umask 077
 export LC_ALL=C TZ=UTC
@@ -96,11 +82,13 @@ NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]*$'
 TAG_RE='^[A-Za-z0-9._-]{1,63}$'
 SHA_RE='^[0-9a-f]{40}$'
 BOX_SECONDS=1500
+CLEANUP_SECONDS=5
 POLL_SECONDS=10
 KEEP_TAGS=2
 OPT_PAGE_CHECK=/opt/raphael-page-check
 BROWSER_PAGE_CHECK=/opt/raphael-journeys/tools/page-check
 SUCCESS_LINE='refresh_stack: the stack is at the released versions'
+MADE_ARCHIVE=0 MADE_PAGE=0
 
 reason_for() {
   case $1 in
@@ -128,6 +116,29 @@ fail() {
   printf 'refresh_stack: %s\n' "$(reason_for "$1")" >&2
   exit 1
 }
+
+# cleanup: the one place where this run removes files, as the EXIT trap, so every end of the run passes through it once: the
+# success line, the already-current run, any fail, the box. Each flag that is set gives one best-effort ssh call that removes
+# this run's own files by exact name. Every call has its own bound of CLEANUP_SECONDS (not the time left of the box, which
+# may be over), so the box is overrun by a few seconds at most. It never calls fail, budget or settle and never exits, so it
+# changes neither the exit status nor the convergence. A call that fails prints one line on stderr that names its phase.
+# A flag is set only after the names its call uses (PLATFORM_ARCHIVE, PAGE_TAR) are defined. Leftovers of earlier runs are
+# not looked for. Never force, never a container or a volume.
+PAGE_REMOVE='if [ -e "$1" ]; then rm -r "$1"; fi'
+tidy() {
+  timeout "$CLEANUP_SECONDS" ssh "$RUNNER" "$2" > /dev/null 2>&1 < /dev/null || printf 'refresh_stack: cleanup failed: %s (%s)\n' "$1" "$(reason_for "$1")" >&2
+}
+cleanup() {
+  trap - EXIT
+  if ((MADE_ARCHIVE == 1)); then
+    tidy platform-build "r=0; if [ -e '$PLATFORM_ARCHIVE.part' ]; then rm '$PLATFORM_ARCHIVE.part' || r=1; fi; if [ -e '$PLATFORM_ARCHIVE' ]; then rm '$PLATFORM_ARCHIVE' || r=1; fi; exit \$r"
+  fi
+  if ((MADE_PAGE == 1)); then
+    tidy page-check "docker exec '$BROWSER_C' sh -c '$PAGE_REMOVE' sh '$BROWSER_PAGE_CHECK.old' && r=0 || r=1; if [ -e '$PAGE_TAR' ]; then rm '$PAGE_TAR' || r=1; fi; exit \$r"
+  fi
+  return 0
+}
+trap cleanup EXIT
 
 ((${#} == 0)) || fail usage
 
@@ -278,23 +289,35 @@ stream() {
   settle "${rcs[@]}"
 }
 
-# image_known IMAGE_ID_OR_REFERENCE: 0 when Server 2 holds the image, 1 when the list was read and the image is not in it, 2
-# when the list could not be read. The question is a list, not docker image inspect (whose status 1 also covers a docker
-# error): of all image ids for an id, of the id line of that one reference for a reference. The id list is taken with --all,
-# because Docker's default list leaves out an image without a tag, and a loaded image has none until it is tagged. A status
-# other than 0, or a line that is not sha256: and 64 lowercase hex, means unread. An id is held when a line equals it, a
-# reference when any line is there.
-image_known() {
-  local line found=1 id_re='^sha256:[0-9a-f]{64}$' listing="docker image ls '$1' --no-trunc --format '{{.ID}}'"
-  if [[ $1 == sha256:* ]]; then listing="docker image ls --all --no-trunc --format '{{.ID}}'"; fi
-  remote_out "$listing"
-  [[ $REMOTE_RC == 0 ]] || return 2
-  while IFS= read -r line; do
-    if [[ -z $line ]]; then continue; fi
-    [[ $line =~ $id_re ]] || return 2
-    if [[ $1 != sha256:* || $line == "$1" ]]; then found=0; fi
-  done <<< "$REMOTE_OUT"
-  return "$found"
+# image_state NAME: the one question about an image on Server 2 (NAME is an image id or the platform reference, both
+# validated before), asked with one docker image inspect. 0 found, 1 missing, 2 could not be read. Found: status 0 and
+# one line, sha256: and 64 lowercase hex (for an id, the id asked). Missing: status 1 and, after one optional leading empty
+# line or one "[]" line, one line that is Docker's own not-found answer for exactly NAME. Everything else is 2. The answer
+# is parsed here and never printed. A tag on the image does not matter.
+image_state() {
+  local name=$1 text line id_re='^sha256:[0-9a-f]{64}$'
+  remote_out "docker image inspect --format '{{.Id}}' '$name' 2>&1"
+  text=$REMOTE_OUT
+  case $REMOTE_RC in
+    0)
+      line=${text%$'\n'}
+      [[ $line =~ $id_re ]] || return 2
+      if [[ $name == sha256:* && $line != "$name" ]]; then return 2; fi
+      return 0
+      ;;
+    1)
+      if [[ $text == $'\n'* ]]; then
+        text=${text#$'\n'}
+      elif [[ $text == '[]'$'\n'* ]]; then
+        text=${text#'[]'$'\n'}
+      fi
+      line=${text%$'\n'}
+      if [[ $line == "Error response from daemon: No such image: $name" || $line == "Error: No such image: $name" ]]; then
+        return 1
+      fi
+      ;;
+  esac
+  return 2
 }
 
 # parse_versions: the answer of stack_up.sh versions (REMOTE_RC and REMOTE_OUT) read into VERSION_TAGS: the tags of proxy,
@@ -365,19 +388,27 @@ finish() {
 
 # Step 0. The first look: three read-only calls in this order, each only when the one before agreed with the released
 # versions. The stack is current only when all three agree. MARKER_SAME is 1 when the first agreed (the scripts folder on
-# Server 2 came from this commit): step a then ships no scripts. The first call answers 0 with the marker (a marker that
-# differs, is empty or is odd text is a marker that differs), or 3 when there is no marker at all; anything else means the
-# marker could not be read, which ends the run with marker-ask before anything is shipped. The other two calls gate no transfer.
+# Server 2 came from this commit): step a then ships no scripts. The first call answers 3 when there is positive evidence
+# that there is no marker (the folder can be searched and has no such entry, or there is no folder and its parent can be
+# searched), and 4 when the path cannot be examined. On status 0 the output must be exactly one line of 40 lowercase hex
+# digits (the final newline may be missing): this commit, or another commit, which is not current. Anything else is a read
+# that failed and ends the run with marker-ask. The other two calls decide no transfer.
 MARKER_SAME=0
+S2_PARENT=${S2_DIR%/*}
+if [[ -z $S2_PARENT ]]; then S2_PARENT=/; fi
+S2_MARKER=$S2_DIR/.refresh-commit
+marker_cmd="if [ -d '$S2_DIR' ] && [ -x '$S2_DIR' ]; then if [ -e '$S2_MARKER' ] || [ -L '$S2_MARKER' ]; then cat '$S2_MARKER'; else exit 3; fi;"
+marker_cmd+=" elif [ -d '$S2_PARENT' ] && [ -x '$S2_PARENT' ] && [ ! -e '$S2_DIR' ] && [ ! -L '$S2_DIR' ]; then exit 3; else exit 4; fi"
 stack_is_current() {
   local marker app_re="^$REVISION-[0-9a-f]{12}\$"
-  remote_out "if [ -e '$S2_DIR/.refresh-commit' ]; then cat '$S2_DIR/.refresh-commit'; else exit 3; fi"
+  remote_out "$marker_cmd"
   case $REMOTE_RC in
     0) ;;
     3) return 1 ;;
     *) fail marker-ask ;;
   esac
   marker=${REMOTE_OUT%$'\n'}
+  [[ $marker =~ $SHA_RE ]] || fail marker-ask
   [[ $marker == "$COMMIT" ]] || return 1
   MARKER_SAME=1
   remote_out "cd '$S2_DIR' && ./stack_up.sh versions"
@@ -414,7 +445,7 @@ fi
 # Step b. The owner app image: shipped only when Server 2 lacks that id, and tagged in every case. The stage is docker save
 # into docker load (a loaded image id has no tag); the publish is the tag, a separate call that only starts when the
 # stream has settled with 0 on both sides.
-image_known "$IMAGE_ID"
+image_state "$IMAGE_ID"
 case $? in
   0) ;;
   1) stream "docker load" docker save "$IMAGE_ID" || fail app-image ;;
@@ -427,17 +458,17 @@ remote "docker tag '$IMAGE_ID' 'raphael-journeys-app-base:$REVISION'" || fail ap
 # so no file with the archive name exists unless it is whole. Only then the build is started detached by stack_up.sh and
 # waited for here: the first look at once, then every POLL_SECONDS (the last sleep cut to the time that is left), until
 # the box runs out. A build still running then is left running; every call of the wait ends the run with reason box when
-# it comes back at or after the box. Once the image is there the archive is removed (an archive that is already gone is no
-# failure; a removal that fails ends the run with platform-build, the box reason keeping precedence).
+# it comes back at or after the box. The archive and its .part file are removed by cleanup at the end of the run.
 PLATFORM_REF=raphael-journeys-platform:$COMMIT
 PLATFORM_ARCHIVE=$S2_DIR.platform-$COMMIT.tar
 build_platform() {
   local nap
+  MADE_ARCHIVE=1
   stream "cat > '$PLATFORM_ARCHIVE.part'" git -C "$ROOT" archive --format=tar "$COMMIT" || fail platform-build
   remote "mv '$PLATFORM_ARCHIVE.part' '$PLATFORM_ARCHIVE'" || fail platform-build
   remote "cd '$S2_DIR' && ./stack_up.sh build platform '$COMMIT' '$PLATFORM_ARCHIVE'" || fail platform-build
   while :; do
-    image_known "$PLATFORM_REF"
+    image_state "$PLATFORM_REF"
     case $? in
       0) break ;;
       1) ;;
@@ -448,9 +479,8 @@ build_platform() {
     if ((LEFT < nap)); then nap=$LEFT; fi
     sleep "$nap" > /dev/null 2>&1 < /dev/null
   done
-  remote "if [ -e '$PLATFORM_ARCHIVE' ]; then rm '$PLATFORM_ARCHIVE'; fi" || fail platform-build
 }
-image_known "$PLATFORM_REF"
+image_state "$PLATFORM_REF"
 case $? in
   0) ;;
   1) build_platform ;;
@@ -482,24 +512,21 @@ done <<< "$REMOTE_OUT"
 # shell has no pipefail, so no pipe joins the two docker cp): the copy is made beside the final folder (.new, after a
 # stale .new or .old is removed), out of the owner app into the staging file S2dir.page-check.tar and out of that file
 # into the browser container, and then .new is checked to hold something (an empty stream is not an error for docker cp).
-# Only when the stage has reported 0 does a second call swap .new in with renames (the old folder is kept as .old until
-# the rename has worked, and put back when it did not) and remove the staging file. A step that fails ends the run before
-# the swap, so the final folder is never half a copy and stays as it was. Removing the old folder is part of the swap: when
-# that rm fails the swap exits 1, the run ends with page-check and step g does not run (the new folder is already the
-# active one, whole; the old one stays beside it as .old and the staging file stays; the next stage removes the .old and
-# writes the staging file again).
+# Only when the stage has reported 0 does a second call swap .new in with renames (the old folder is kept as .old and put
+# back when the rename of .new did not work). A step that fails ends the run before the swap, so the final folder is never
+# half a copy and stays as it was. The staging file and .old are removed by cleanup at the end of the run.
+PAGE_TAR=$S2_DIR.page-check.tar
 PAGE_PREPARE='for d in "$1" "$2"; do if [ -e "$d" ]; then rm -r "$d" || exit 1; fi; done; mkdir -p "$1"'
 PAGE_CHECK='set -- "$1"/*; [ -e "$1" ] || exit 1'
 PAGE_SWAP='n=$1; f=$2; o=$3; if [ -e "$f" ]; then mv "$f" "$o" || exit 1; fi;'
-PAGE_SWAP+=' if mv "$n" "$f"; then if [ -e "$o" ]; then rm -r "$o" || exit 1; fi; exit 0; fi; if [ -e "$o" ]; then mv "$o" "$f"; fi; exit 1'
+PAGE_SWAP+=' if mv "$n" "$f"; then exit 0; fi; if [ -e "$o" ]; then mv "$o" "$f"; fi; exit 1'
 page_check_stage="docker exec '$BROWSER_C' sh -c '$PAGE_PREPARE' sh '$BROWSER_PAGE_CHECK.new' '$BROWSER_PAGE_CHECK.old'"
-page_check_stage+=" && docker cp '$APP_C:$OPT_PAGE_CHECK/.' - > '$S2_DIR.page-check.tar'"
-page_check_stage+=" && docker cp - '$BROWSER_C:$BROWSER_PAGE_CHECK.new' < '$S2_DIR.page-check.tar'"
+page_check_stage+=" && docker cp '$APP_C:$OPT_PAGE_CHECK/.' - > '$PAGE_TAR'"
+page_check_stage+=" && docker cp - '$BROWSER_C:$BROWSER_PAGE_CHECK.new' < '$PAGE_TAR'"
 page_check_stage+=" && docker exec '$BROWSER_C' sh -c '$PAGE_CHECK' sh '$BROWSER_PAGE_CHECK.new'"
+MADE_PAGE=1
 remote "$page_check_stage" || fail page-check
-page_check_publish="docker exec '$BROWSER_C' sh -c '$PAGE_SWAP' sh '$BROWSER_PAGE_CHECK.new' '$BROWSER_PAGE_CHECK' '$BROWSER_PAGE_CHECK.old'"
-page_check_publish+=" && if [ -e '$S2_DIR.page-check.tar' ]; then rm '$S2_DIR.page-check.tar'; fi"
-remote "$page_check_publish" || fail page-check
+remote "docker exec '$BROWSER_C' sh -c '$PAGE_SWAP' sh '$BROWSER_PAGE_CHECK.new' '$BROWSER_PAGE_CHECK' '$BROWSER_PAGE_CHECK.old'" || fail page-check
 
-# Step g, last: finish runs retention (defined above) and ends the run.
+# Step g, last: finish runs retention (defined above) and ends the run; cleanup follows it.
 finish
