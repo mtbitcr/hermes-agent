@@ -228,6 +228,7 @@ if name == "ssh":
         f"docker exec '{B}' test -d '/opt/raphael-journeys/tools/page-check'": "page-check-present",
         "docker load": "load",
         "docker image ls --no-trunc --format '{{.ID}}'": "has-image",
+        "docker image ls --all --no-trunc --format '{{.ID}}'": "has-image",
         "docker image ls '%s' --no-trunc --format '{{.ID}}'" % ref: "has-image",
         f"if [ -e '{archive}' ]; then rm '{archive}'; fi": "rm-archive",
     }
@@ -264,7 +265,8 @@ if name == "ssh":
             with open(state_path, encoding="utf-8") as handle:
                 state = json.load(handle)
         else:
-            state = {"images": list(A["images"]), "tags": {k: list(v) for k, v in A["tags"].items()},
+            state = {"images": list(A["images"]), "untagged": list(A["untagged"]),
+                     "tags": {k: list(v) for k, v in A["tags"].items()},
                      "built_at": None, "converged": False, "count": {}}
         n = state["count"][kind] = state["count"].get(kind, 0) + 1
 
@@ -296,15 +298,20 @@ if name == "ssh":
             if arg:
                 ids = [A["platform_id"]] if arg in state["images"] else []
             else:
-                ids = [i for i in state["images"] if i.startswith("sha256:")]
+                # like Docker: the plain listing leaves out an id that has no tag, --all lists every id held
+                ids = [i for i in state["images"] if i.startswith("sha256:")
+                       and ("--all" in words or i not in state["untagged"])]
             garbled = pick(A["garbled"])
             out = "".join(i + "\n" for i in ids) if garbled is None else garbled
         elif kind == "load":
+            if A["app_image_id"] not in state["images"]:
+                state["untagged"].append(A["app_image_id"])
             state["images"].append(A["app_image_id"])
         elif kind == "tag":
             known = words[2] in state["images"]
             if known:
                 state["images"].append(words[3])
+                state["untagged"] = [i for i in state["untagged"] if i != words[2]]
             rc = 0 if known else 1
         elif kind == "remove-tag":
             repo, tag = arg.split(":", 1)
@@ -397,7 +404,7 @@ CACHED_RUN = [
     "publish-page-check", "versions", *["list-tags"] * 5,
 ]
 SHIPPING = {"ship-scripts", "publish-scripts", "load", "ship-platform", "publish-platform", "build-platform"}
-LIST_IDS = "docker image ls --no-trunc --format '{{.ID}}'"
+LIST_IDS = "docker image ls --all --no-trunc --format '{{.ID}}'"
 LIST_PLATFORM = f"docker image ls '{PLATFORM_REF}' --no-trunc --format '{{{{.ID}}}}'"
 
 
@@ -481,7 +488,7 @@ class Sandbox:
                 "scripts/journeys/images/proxy.Dockerfile": "FROM scratch\n",
             },
             "commit_files": {"Dockerfile": "FROM scratch\n", "app/main.py": "print(1)\n"},
-            "images": [], "tags": {}, "ready_after": 0, "rc": {}, "advance": {}, "late_rc": {}, "cut": {},
+            "images": [], "untagged": [], "tags": {}, "ready_after": 0, "rc": {}, "advance": {}, "late_rc": {}, "cut": {},
             "garbled": {}, "platform_id": PLATFORM_ID, "eats_archive": False,
             "out": {
                 "versions": versions_text("none", "none", "none", "none", "none"),
@@ -1201,6 +1208,17 @@ def test_a_list_that_holds_only_other_images_means_the_id_is_missing_and_it_is_s
     assert box.kinds() == FULL_RUN and box.remote("has-image")[0] == LIST_IDS and len(box.of("load")) == 1
 
 
+def test_an_app_image_id_held_without_a_tag_is_not_saved_or_loaded_again_and_only_gets_its_tag(box):
+    cached(box)
+    box.answer(untagged=[IMAGE_ID])
+    expect_success(box.run())
+    assert box.of("docker save") == [] and box.of("load") == [], "an id Server 2 holds without a tag was shipped again"
+    assert box.kinds() == CACHED_RUN and box.remote("has-image") == [LIST_IDS, LIST_PLATFORM]
+    assert box.server1() == ["git toplevel", "git head", "docker inspect"] and box.stdin_calls() == []
+    assert box.remote("tag") == [f"docker tag '{IMAGE_ID}' 'raphael-journeys-app-base:{REVISION}'"]
+    assert APP_BASE_TAG in box.server2()["refs"]
+
+
 # ---- b and c. a list that could not be read is not an empty list: nothing crosses -------------------
 
 GARBLED_LISTS = {
@@ -1589,6 +1607,21 @@ def test_an_app_image_producer_that_exits_non_zero_after_its_stream_makes_no_tag
     assert box.of("tag") == [] and APP_BASE_TAG not in box.server2()["refs"] and before["refs"] == []
     (save,), (load,) = box.of("docker save"), box.of("load")
     assert load["stdin_sha"] == save["sha"], "the receiver was given the stream the producer wrote"
+
+
+def test_a_retry_after_a_load_and_a_failed_producer_finds_the_id_without_a_tag_and_ships_nothing_again(box):
+    no_images(box)
+    before = box.server2()
+    box.answer(late_rc={"docker save": 23})
+    fails_unpublished(box, "app-image", before, APP_IMAGE_STAGE)
+    state = json.loads((box.top / "state.json").read_text(encoding="utf-8"))
+    assert box.of("tag") == [] and state["untagged"] == [IMAGE_ID], "the loaded id waits on Server 2 without a tag"
+    box.answer(late_rc={"docker save": 0})
+    expect_success(box.run())
+    assert len(box.of("docker save")) == len(box.of("load")) == 1, "the retry shipped the image again"
+    assert box.kinds() == APP_IMAGE_STAGE + PLATFORM_RUN
+    assert box.remote("tag") == [f"docker tag '{IMAGE_ID}' 'raphael-journeys-app-base:{REVISION}'"]
+    assert APP_BASE_TAG in box.server2()["refs"]
 
 
 def test_a_page_check_producer_that_exits_non_zero_after_a_valid_stream_swaps_nothing_and_stops_before_the_retention(box):

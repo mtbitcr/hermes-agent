@@ -33,9 +33,10 @@
 # folder as they were and ends with the fixed reason of that transfer; a retry at the same commit then ships again.
 #
 # A read that failed is never an absence or a difference: a transfer is decided only by a read that succeeded. The three
-# reads that decide one are the scripts marker (status 0 with its text, or 3 when there is no marker), the list of image
-# ids and the list of one image reference (status 0, every line an image id). When one of them fails or is garbled the run
-# ends with marker-ask or image-ask and nothing is shipped.
+# reads that decide one are the scripts marker (status 0 with its text, or 3 when there is no marker), the list of all image
+# ids (docker image ls --all: Docker's default list leaves out an image without a tag) and the list of one image reference
+# (status 0, every line an image id). When one of them fails or is garbled the run ends with marker-ask or image-ask and
+# nothing is shipped.
 #
 # Steps, in this order (S2dir is the Server 2 folder):
 #   0  read-only first look, three ssh calls, each only when the one before agreed: S2dir/.refresh-commit holds the
@@ -270,11 +271,13 @@ stream() {
 
 # image_known IMAGE_ID_OR_REFERENCE: 0 when Server 2 holds the image, 1 when the list was read and the image is not in it, 2
 # when the list could not be read. The question is a list, not docker image inspect (whose status 1 also covers a docker
-# error): of all image ids for an id, of the id line of that one reference for a reference. A status other than 0, or a line
-# that is not sha256: and 64 lowercase hex, means unread. An id is held when a line equals it, a reference when any line is there.
+# error): of all image ids for an id, of the id line of that one reference for a reference. The id list is taken with --all,
+# because Docker's default list leaves out an image without a tag, and a loaded image has none until it is tagged. A status
+# other than 0, or a line that is not sha256: and 64 lowercase hex, means unread. An id is held when a line equals it, a
+# reference when any line is there.
 image_known() {
   local line found=1 id_re='^sha256:[0-9a-f]{64}$' listing="docker image ls '$1' --no-trunc --format '{{.ID}}'"
-  if [[ $1 == sha256:* ]]; then listing="docker image ls --no-trunc --format '{{.ID}}'"; fi
+  if [[ $1 == sha256:* ]]; then listing="docker image ls --all --no-trunc --format '{{.ID}}'"; fi
   remote_out "$listing"
   [[ $REMOTE_RC == 0 ]] || return 2
   while IFS= read -r line; do
