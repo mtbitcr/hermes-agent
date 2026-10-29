@@ -94,19 +94,65 @@ FORMATS = {
 }
 
 STUB = r'''
-import hashlib
-import json
 import os
-import re
 import sys
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-STATE_FILE = ROOT / "state.json"
-CALLS = ROOT / "calls.jsonl"
+# Each stand-in call is a fresh interpreter, and the stdlib json, re, pathlib and hashlib imports cost more than the
+# rest of the call. The common path (reads and writes of the state and the calls log) uses the C coder of json
+# directly and the other modules are imported only by the subcommands that need them.
+try:
+    import _json
+
+    class _Context:
+        strict = True
+        object_hook = object_pairs_hook = None
+        parse_float, parse_int = float, int
+        memo = {}
+
+        @staticmethod
+        def parse_constant(name):
+            return {"-Infinity": float("-inf"), "Infinity": float("inf"), "NaN": float("nan")}[name]
+
+    _scan = _json.make_scanner(_Context)
+    _encode = _json.make_encoder(None, None, _json.encode_basestring_ascii, None, ": ", ", ", False, False, True)
+
+    class json:
+        @staticmethod
+        def loads(text):
+            text = text.strip()
+            value, end = _scan(text, 0)
+            if end != len(text):
+                raise ValueError("Extra data")
+            return value
+
+        @staticmethod
+        def dumps(value):
+            return "".join(_encode(value, 0))
+except Exception:
+    import json
+
+
+def read_text(path):
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def write_text(path, text):
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+STATE_FILE = os.path.join(ROOT, "state.json")
+CALLS = os.path.join(ROOT, "calls.jsonl")
 LABEL_KEY = "raphael-journeys.made-by"
-HEX64 = re.compile(r"[0-9a-f]{64}")
 TOOL = ""
+
+
+class HEX64:
+    @staticmethod
+    def fullmatch(text):
+        return len(text) == 64 and all(ch in "0123456789abcdef" for ch in text)
 
 
 class Done(Exception):
@@ -122,12 +168,12 @@ def fail(message, rc=1):
     raise Done(rc, message + "\n")
 
 
-VERIFIED = ROOT / "verified.txt"
-SCRIPTED = ROOT / "scripted.json"
+VERIFIED = os.path.join(ROOT, "verified.txt")
+SCRIPTED = os.path.join(ROOT, "scripted.json")
 
 
 def verified_ids():
-    return VERIFIED.read_text(encoding="utf-8").split() if VERIFIED.exists() else []
+    return read_text(VERIFIED).split() if os.path.exists(VERIFIED) else []
 
 
 def note_verified(cid):
@@ -142,7 +188,7 @@ def require_verified(cid):
 
 
 def changed_since(start):
-    for line in CALLS.read_text(encoding="utf-8").splitlines()[start:]:
+    for line in read_text(CALLS).splitlines()[start:]:
         call = json.loads(line)
         if call["tool"] == "docker" and call["argv"][:1] not in (["info"], ["inspect"]):
             return True
@@ -151,9 +197,9 @@ def changed_since(start):
 
 def scripted_ident(name):
     """The scripted entry that fires for this identity read of container NAME (see Host.script_read), or None."""
-    if not SCRIPTED.exists():
+    if not os.path.exists(SCRIPTED):
         return None
-    entries = json.loads(SCRIPTED.read_text(encoding="utf-8"))
+    entries = json.loads(read_text(SCRIPTED))
     for entry in entries:
         if entry["name"] != name or entry["fired"]:
             continue
@@ -165,18 +211,18 @@ def scripted_ident(name):
         else:
             entry["fired"] += 1
             hit = entry
-        SCRIPTED.write_text(json.dumps(entries), encoding="utf-8")
+        write_text(SCRIPTED, json.dumps(entries))
         return hit
     return None
 
 
 def load():
-    return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    return json.loads(read_text(STATE_FILE))
 
 
 def save(state):
-    tmp = STATE_FILE.with_name("state.tmp.%d" % os.getpid())
-    tmp.write_text(json.dumps(state), encoding="utf-8")
+    tmp = os.path.join(ROOT, "state.tmp.%d" % os.getpid())
+    write_text(tmp, json.dumps(state))
     os.replace(tmp, STATE_FILE)
 
 
@@ -210,6 +256,8 @@ def merged_env(state, c):
 
 
 def new_id(state, kind):
+    import hashlib
+
     state["seq"] += 1
     return hashlib.sha256(("%s-%d" % (kind, state["seq"])).encode()).hexdigest()
 
@@ -323,6 +371,10 @@ def d_volume(state, a):
 
 
 def d_build(state, a):
+    import hashlib
+    import re
+    from pathlib import Path
+
     tag = fil = ctx = None
     args = {}
     i = 0
@@ -466,6 +518,8 @@ CLASH_BOOL = {"-P", "--publish-all"}
 
 def run_helper(state, opts, command):
     """A throw-away helper container: no network, one volume, no name."""
+    import re
+
     if set(opts) - {"--rm", "-i", "--network", "--user", "--entrypoint", "--mount", "--label", "--env-file"}:
         refuse("helper run flags")
     if opts.get("--network") != ["none"] or opts.get("--user") != ["0"] or opts.get("--entrypoint") != ["sh"]:
@@ -504,6 +558,9 @@ def run_helper(state, opts, command):
 
 
 def read_env_file(path_text):
+    import re
+    from pathlib import Path
+
     env = {}
     if path_text is None:
         return env
@@ -602,6 +659,8 @@ def d_run(state, a, create=False):
 
 
 def d_cp(state, a):
+    from pathlib import Path
+
     if len(a) != 2 or ":" not in a[0]:
         refuse("cp shape %r (copy out of a container only)" % a)
     cid, _, path = a[0].partition(":")
@@ -821,7 +880,7 @@ class Host:
             wrapper.write_text(
                 f'#!/bin/sh\nexec "{sys.executable}" -S -I -c '
                 f"'import sys; sys.path.insert(0, sys.argv.pop(1)); import stub; stub.main()' "
-                f'"$(dirname "$0")" {tool} "$@"\n',
+                f'"${{0%/*}}" {tool} "$@"\n',
                 encoding="utf-8",
             )
             wrapper.chmod(0o755)
