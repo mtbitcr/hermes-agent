@@ -9,7 +9,7 @@ set -euo pipefail
 umask 077
 
 UNIT=hermes-journeys.service
-RUN_MAX_SECONDS=2700
+RUN_MAX_SECONDS=7200
 # Names run_once.sh reads from its environment (its header says what each is and who installs it).
 PASS_ON=(PATH HOME HERMES_HOME JOURNEY_PAGE_TEXT JOURNEY_RUNNER_SSH JOURNEY_RUNNER_ENV
   JOURNEY_S2_SCRIPTS_DIR JOURNEY_BROWSER_CONTAINER JOURNEY_BROWSER_DIR)
