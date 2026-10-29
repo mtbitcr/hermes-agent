@@ -357,6 +357,20 @@ def test_browser_installs_playwright_exactly_and_the_images_agree_on_the_proxy_c
                     assert source not in {".", "./", "/"} and "*" not in source and "key" not in source.lower()
 
 
+def test_the_proxy_user_and_group_are_not_debian_base_system_accounts():
+    base_accounts = {
+        "root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail", "news",
+        "uucp", "proxy", "www-data", "backup", "list", "irc", "_apt", "nobody",
+    }
+    commands = [part.strip() for run in of_kind(PROXY_DOCKERFILE, "RUN") for part in run.split("&&")]
+    groups = [part.split()[-1] for part in commands if re.match(r"groupadd\b", part)]
+    users = [part.split()[-1] for part in commands if re.match(r"useradd\b", part)]
+    runs_as = [args.split(":")[0] for args in of_kind(PROXY_DOCKERFILE, "USER")]
+    assert len(groups) == 1 and len(users) == 1 and runs_as
+    for name in (groups[0], users[0], runs_as[-1]):
+        assert name not in base_accounts, f"{name} already exists in the Debian base image"
+
+
 def test_a_digest_must_be_exactly_64_lowercase_hex_characters():
     good = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
     assert DIGEST_REF.fullmatch(f"image:1@sha256:{good}")

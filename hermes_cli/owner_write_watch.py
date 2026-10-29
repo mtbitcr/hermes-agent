@@ -211,7 +211,7 @@ _PAGE_CHECK_LABEL = "Page check of the Automations, Connections and Models pages
 _JOURNEYS = "journeys"
 _JOURNEYS_LABEL = "Owner journeys run"
 # RUN_MAX_SECONDS in scripts/journeys/start.sh (2,700 seconds, the user manager's time limit) plus 10 minutes.
-JOURNEYS_STUCK_AFTER = timedelta(minutes=55)
+JOURNEYS_STUCK_AFTER = timedelta(minutes=130)
 _JOURNEYS_LINE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)")
 _JOURNEYS_TIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 

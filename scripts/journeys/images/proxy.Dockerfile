@@ -5,13 +5,13 @@ FROM python:3.11.15-slim-bookworm@sha256:d29f48a31a8b408ed19272ca1e7b10ebae13b24
 RUN pip install --no-cache-dir cryptography==50.0.0
 
 # Docker copies this empty, user-owned folder into the proxy volume on first use, so the proxy can write its keys.
-RUN groupadd --system --gid 10001 proxy \
-    && useradd --system --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin proxy \
+RUN groupadd --system --gid 10001 journeys-proxy \
+    && useradd --system --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin journeys-proxy \
     && mkdir /state \
-    && chown proxy:proxy /state
+    && chown journeys-proxy:journeys-proxy /state
 
 WORKDIR /app
 COPY synthetic_proxy.py /app/synthetic_proxy.py
 
-USER proxy
+USER journeys-proxy
 CMD ["python3", "synthetic_proxy.py"]
