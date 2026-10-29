@@ -3,17 +3,21 @@
 # Steps, in this order, each at most once; the first that fails ends the run (no retry, no later step):
 #   refresh    refresh_stack.sh of this folder: the stack is at the released versions (it reads
 #              JOURNEY_RUNNER_SSH and JOURNEY_S2_SCRIPTS_DIR)
+#   reset      reset_stack.sh on Server 2 through the runner identity, so that no earlier run's state is left
+#              (a failure here ends the run at step reset, with no journey)
 #   isolation  isolation_check.sh server2 on Server 2 through the runner identity, then server1 here
 # then, for journeys 3, 5, 2, 1 and 4 in that order, each on a fresh stack:
 #   time       refuse to start the journey when the minutes since the run started plus its fixed reserve
 #              (reset 4, seed 1 for 3, 5 and 2 only, owner app 2, the journey's budget plus 1: 3 is 2, 5 is 6,
-#              2 is 4, 1 is 21, 4 is 16) are more than 118
+#              2 is 4, 1 is 21, 4 is 16; journey 4 also reserves the last reset, 4) are more than 118
 #   reset      reset_stack.sh on Server 2 through the runner identity
 #   seed       seed_stack.sh <n> on Server 2 (journeys 3, 5 and 2 only)
 #   proxy      the sign-in proxy answers its key list (the one answer that needs no owner app)
 #   owner-app  the owner app shows JOURNEY_PAGE_TEXT, polled for 120 seconds at most
 #   journeys   docker exec in the browser container on Server 2, through the runner identity:
 #              sh tools/page-check/journey-run.sh <n> with only JOURNEY_BASE_URL and JOURNEY_PRODUCTION_ORIGIN passed in
+# After the last journey has passed, one more reset (step reset, no journey) leaves the stack clean, and only
+# then is "passed" stored.
 # The proxy and owner-app answers are fetched with curl inside the browser container through the runner identity
 # (the stack publishes no port) and checked here on Server 1. The owner app's root answers a redirect to
 # /projects, so its check follows at most 3 redirects and looks for the page text on the page it lands on;
@@ -192,6 +196,8 @@ remote_answer() { ssh "$JOURNEY_RUNNER_SSH" "$1" 2> /dev/null < /dev/null; }
 JOURNEY_RUNNER_SSH=$JOURNEY_RUNNER_SSH JOURNEY_S2_SCRIPTS_DIR=$S2_DIR \
   "$HERE/refresh_stack.sh" > /dev/null 2>&1 < /dev/null || finish failed refresh
 
+remote "cd '$S2_DIR' && ./reset_stack.sh" || finish failed reset
+
 remote "cd '$S2_DIR' && JOURNEY_PRODUCTION_ORIGIN='$ORIGIN' ./isolation_check.sh server2" || finish failed isolation
 "$HERE/isolation_check.sh" server1 > /dev/null 2>&1 < /dev/null || finish failed isolation
 
@@ -223,7 +229,7 @@ reserve_minutes() {
     5) echo $((total + 6)) ;;
     2) echo $((total + 4)) ;;
     1) echo $((total + 21)) ;;
-    4) echo $((total + 16)) ;;
+    4) echo $((total + 16 + RESET_MINUTES)) ;;
   esac
 }
 
@@ -259,4 +265,5 @@ for n in "${LOOP_ORDER[@]}"; do
 done
 
 JOURNEY=""
+remote "cd '$S2_DIR' && ./reset_stack.sh" || finish failed reset
 finish passed journeys
