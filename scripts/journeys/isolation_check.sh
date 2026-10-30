@@ -262,10 +262,14 @@ check_names_on_template() {
   verdict names-on-template
 }
 
-# The profiles that the stack permits. The profiles to check are these two plus any other profile that the
-# platform serves (check_served_profiles).
-PERMITTED=(default raphael-planner)
-PROFILES=("${PERMITTED[@]}")
+# The profiles that the stack permits. The default profile and the planner are always checked. The designer is
+# permitted too and checked like the planner, but only when the stack has it (served, or a folder of the
+# profiles folder), so that a stack without it is still valid. The profiles to check are these plus any other
+# profile that the platform serves (check_served_profiles).
+ALWAYS_CHECKED=(default raphael-planner)
+WHEN_PRESENT=(raphael-designer)
+PERMITTED=("${ALWAYS_CHECKED[@]}" "${WHEN_PRESENT[@]}")
+PROFILES=("${ALWAYS_CHECKED[@]}")
 
 # Runs in the gateway container: $1 names the profile, whose folder becomes the platform home.
 PROFILE_SH='
@@ -347,13 +351,14 @@ for e in "$HERMES_HOME"/profiles/* "$HERMES_HOME"/profiles/.[!.]* "$HERMES_HOME"
 done
 '
 
-# Sets PROFILES for the checks below and adds to PROBLEMS: any served profile beyond the two permitted ones,
-# and any entry of the profiles folder other than the planner (even one the enumeration skips), is a problem
-# that names it. When the enumeration cannot be read the two permitted profiles are checked.
+# Sets PROFILES for the checks below and adds to PROBLEMS: any served profile beyond the permitted ones, and
+# any entry of the profiles folder other than the planner and the designer (even one the enumeration skips), is
+# a problem that names it. A permitted profile that the stack has, served or as a folder, is checked. When the
+# enumeration cannot be read the profiles that are always checked are checked, and the designer when it has a folder.
 check_served_profiles() {
   local line name seen_default=0 odd=0
   local -a extra=()
-  PROFILES=("${PERMITTED[@]}")
+  PROFILES=("${ALWAYS_CHECKED[@]}")
   profile_read default "$SERVED_PY"
   if [ "$DK_RC" -ne 0 ]; then
     add_problem "the served profiles cannot be read"
@@ -364,8 +369,12 @@ check_served_profiles() {
         "served "*)
           name=${line#served }
           if [ "$name" = default ]; then seen_default=1; fi
-          if [[ $name =~ ^[a-z0-9][a-z0-9_-]*$ ]] && ! in_list "$name" "${PERMITTED[@]}"; then
-            extra+=("$name")
+          if [[ $name =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+            if ! in_list "$name" "${PERMITTED[@]}"; then
+              extra+=("$name")
+            elif ! in_list "$name" "${PROFILES[@]}"; then
+              PROFILES+=("$name")
+            fi
           fi
           ;;
       esac
@@ -392,7 +401,9 @@ check_served_profiles() {
       "entry ?") add_problem "the profiles folder holds an entry whose name is not plain, which is not a stack profile" ;;
       "entry "*)
         name=${line#entry }
-        if [ "$name" != raphael-planner ] && ! in_list "$name" "${extra[@]+"${extra[@]}"}"; then
+        if [ "$name" != default ] && in_list "$name" "${PERMITTED[@]}"; then
+          in_list "$name" "${PROFILES[@]}" || PROFILES+=("$name")
+        elif ! in_list "$name" "${extra[@]+"${extra[@]}"}"; then
           add_problem "the profiles folder holds the entry $name, which is not a stack profile"
         fi
         ;;

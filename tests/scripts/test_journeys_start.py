@@ -1015,6 +1015,22 @@ def _docker_calls(box: Sandbox) -> list[dict]:
     return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
 
 
+PRODUCTION_C = "raphael-workspace"
+DASHBOARD_C = "raphael-journeys-dashboard"
+PLATFORM_ID = "999:999"  # what the fake docker answers when the reset asks who owns the platform home
+
+# The reset's one call that carries production's name, as data: the slug of the Project and of its board.
+RESET_PROJECT_CALL = [
+    "exec", "--user", PLATFORM_ID, DASHBOARD_C, "hermes", "project", "create", "Raphael Workspace",
+    "--slug", PRODUCTION_C, "--board", PRODUCTION_C,
+]
+
+
+def touches_production(argv: list[str]) -> bool:
+    """Whether a docker call has production's name in any argument; only the reset's Project call, whole, is let by."""
+    return any(PRODUCTION_C in arg for arg in argv) and argv != RESET_PROJECT_CALL
+
+
 def test_the_real_isolation_check_and_reset_run_on_server_2_through_the_runner_identity(box):
     env = _integration(box)
 
@@ -1030,7 +1046,7 @@ def test_the_real_isolation_check_and_reset_run_on_server_2_through_the_runner_i
     # Server 1 part: only production's container is asked, on Server 1's own docker.
     assert local == [["exec", "raphael-workspace", "printenv", "RAPHAEL_ACCESS_ISSUER"]]
     # Server 2 parts: the stack's containers, never production's; the reset stopped and started them.
-    assert not any("raphael-workspace" in arg for argv in remote for arg in argv)
+    assert [argv for argv in remote if touches_production(argv)] == []
     assert ["stop", "raphael-journeys-gateway"] in remote and ["start", "raphael-journeys-browser"] in remote
     assert [argv for argv in remote if argv[-2] == "tools/page-check/journey-run.sh"] == [
         [
@@ -1041,6 +1057,118 @@ def test_the_real_isolation_check_and_reset_run_on_server_2_through_the_runner_i
     ]
     assert box.result()["result"] == "passed"
     assert box.told() == ["Journeys passed."]
+
+
+def on_dashboard(
+    *command: str, verb: str = "exec", options: tuple[str, ...] = ("--user", PLATFORM_ID), target: str = DASHBOARD_C
+) -> list[str]:
+    """A docker call as the reset passes it to the stack's dashboard: the verb, its options, the target, the command."""
+    return [verb, *options, target, *command]
+
+
+PROJECT_COMMAND = ["hermes", "project", "create", "Raphael Workspace", "--slug", PRODUCTION_C, "--board", PRODUCTION_C]
+# The board write sends its program, which names the slug, on standard input: the name is not in its arguments.
+BOARD_WRITE_COMMAND = ["sh", "-c", "an invented shell text", "sh"]
+
+RESETS_OWN_CALLS = {
+    "the_project_call": on_dashboard(*PROJECT_COMMAND),
+    "the_board_write_call": on_dashboard(*BOARD_WRITE_COMMAND, options=("-i", "--user", PLATFORM_ID)),
+}
+
+REFUSED = {
+    # the name as the container, image, volume or network that a docker command acts on
+    "exec_target": ["exec", PRODUCTION_C, "printenv", "RAPHAEL_ACCESS_ISSUER"],
+    "exec_target_with_the_resets_project_words": ["exec", PRODUCTION_C, *PROJECT_COMMAND],
+    "exec_target_with_the_resets_project_options_and_words": on_dashboard(*PROJECT_COMMAND, target=PRODUCTION_C),
+    "exec_target_with_the_resets_board_write_options": on_dashboard(
+        *BOARD_WRITE_COMMAND, options=("-i", "--user", PLATFORM_ID), target=PRODUCTION_C
+    ),
+    "stop_target": ["stop", PRODUCTION_C],
+    "start_target": ["start", PRODUCTION_C],
+    "restart_target": ["restart", PRODUCTION_C],
+    "kill_target": ["kill", PRODUCTION_C],
+    "rm_target": ["rm", "-f", PRODUCTION_C],
+    "inspect_target": ["inspect", "--type", "container", "--format", "{{.State.Running}}", PRODUCTION_C],
+    "logs_target": ["logs", "--tail", "5", PRODUCTION_C],
+    "run_image": ["run", "--rm", PRODUCTION_C],
+    "pull_image": ["pull", PRODUCTION_C],
+    "remove_image": ["image", "rm", PRODUCTION_C],
+    "remove_volume": ["volume", "rm", PRODUCTION_C],
+    "inspect_network": ["network", "inspect", PRODUCTION_C],
+    "connect_network": ["network", "connect", PRODUCTION_C, "raphael-journeys-gateway"],
+    # longer names that contain it
+    "longer_container_name": ["exec", f"{PRODUCTION_C}-db-1", "true"],
+    "longer_container_name_removal": ["rm", "-f", f"{PRODUCTION_C}-db-1"],
+    "image_reference_with_a_registry_and_a_tag": ["run", "--rm", f"registry.example/{PRODUCTION_C}:tag"],
+    # the name in an option that takes a name
+    "name_option": ["run", "--name", PRODUCTION_C, "an-image"],
+    "name_option_joined": ["create", f"--name={PRODUCTION_C}", "an-image"],
+    "short_volume_source": ["run", "-v", f"{PRODUCTION_C}:/data", "an-image"],
+    "long_volume_source": ["run", "--volume", f"{PRODUCTION_C}:/data:ro", "an-image"],
+    "mount_source": ["run", "--mount", f"type=volume,source={PRODUCTION_C},target=/data", "an-image"],
+    "network_option": ["run", "--network", PRODUCTION_C, "an-image"],
+    "network_of_a_container": ["run", f"--network=container:{PRODUCTION_C}", "an-image"],
+    "volumes_from_option": ["run", "--volumes-from", PRODUCTION_C, "an-image"],
+    "link_option": ["run", "--link", f"{PRODUCTION_C}:db", "an-image"],
+    "compose_project_short_option": ["compose", "-p", PRODUCTION_C, "down"],
+    "compose_project_long_option": ["compose", "--project-name", PRODUCTION_C, "up", "-d"],
+    "copy_source": ["cp", f"{PRODUCTION_C}:/etc/hostname", "/tmp/hostname"],
+    "copy_destination": ["cp", "/tmp/hostname", f"{PRODUCTION_C}:/tmp/hostname"],
+    # the name in the own options of an exec on the stack's dashboard
+    "exec_environment_value": on_dashboard("hermes", "project", "list", options=("-e", f"X={PRODUCTION_C}")),
+    "exec_user_value": on_dashboard("hermes", "project", "list", options=("--user", PRODUCTION_C)),
+    # the name in another inner command on the stack's dashboard
+    "name_in_a_shell_command": on_dashboard("sh", "-c", f"docker rm {PRODUCTION_C}"),
+    "name_in_the_board_write_shell_text": on_dashboard(
+        "sh", "-c", f"docker rm {PRODUCTION_C}", "sh", options=("-i", "--user", PLATFORM_ID)
+    ),
+    "name_in_another_hermes_command": on_dashboard("hermes", "project", "delete", PRODUCTION_C),
+    # the reset's Project call with one word changed, added, dropped or moved
+    "project_call_in_another_stack_container": on_dashboard(*PROJECT_COMMAND, target="raphael-journeys-gateway"),
+    "project_call_of_another_docker_command": on_dashboard(*PROJECT_COMMAND, verb="run"),
+    "project_call_with_the_name_as_the_account": on_dashboard(*PROJECT_COMMAND, options=("--user", PRODUCTION_C)),
+    "project_call_with_an_extra_exec_option": on_dashboard(*PROJECT_COMMAND, options=("-i", "--user", PLATFORM_ID)),
+    "project_call_with_an_environment_option": on_dashboard(*PROJECT_COMMAND, options=("-e", f"X={PRODUCTION_C}")),
+    "project_call_without_the_user_option": on_dashboard(*PROJECT_COMMAND, options=()),
+    "project_call_with_the_name_as_the_projects_name": on_dashboard(
+        "hermes", "project", "create", PRODUCTION_C, "--slug", PRODUCTION_C, "--board", PRODUCTION_C
+    ),
+    "project_call_with_a_slug_that_starts_with_the_name": on_dashboard(
+        "hermes", "project", "create", "Raphael Workspace", "--slug", f"{PRODUCTION_C}-2", "--board", PRODUCTION_C
+    ),
+    "project_call_with_a_slug_that_ends_with_the_name": on_dashboard(
+        "hermes", "project", "create", "Raphael Workspace", "--slug", f"old-{PRODUCTION_C}", "--board", PRODUCTION_C
+    ),
+    "project_call_with_a_board_that_contains_the_name": on_dashboard(
+        "hermes", "project", "create", "Raphael Workspace", "--slug", PRODUCTION_C, "--board", f"a-{PRODUCTION_C}-b"
+    ),
+    "project_call_with_the_slug_joined_to_its_option": on_dashboard(
+        "hermes", "project", "create", "Raphael Workspace", f"--slug={PRODUCTION_C}", "--board", PRODUCTION_C
+    ),
+    "project_call_with_its_options_swapped": on_dashboard(
+        "hermes", "project", "create", "Raphael Workspace", "--board", PRODUCTION_C, "--slug", PRODUCTION_C
+    ),
+    "project_call_without_the_board_option": on_dashboard(*PROJECT_COMMAND[:-2]),
+    "project_call_with_an_extra_word": on_dashboard(*PROJECT_COMMAND, "--force"),
+    "project_call_with_another_subcommand": on_dashboard(
+        "hermes", "project", "delete", "Raphael Workspace", "--slug", PRODUCTION_C, "--board", PRODUCTION_C
+    ),
+    "project_call_with_its_words_in_another_place": on_dashboard(
+        "hermes", "project", "create", "--slug", PRODUCTION_C, "--board", PRODUCTION_C, "Raphael Workspace"
+    ),
+    "project_call_as_one_joined_word": on_dashboard(" ".join(PROJECT_COMMAND)),
+    "project_call_inside_a_shell_script": on_dashboard("sh", "-c", " ".join(PROJECT_COMMAND), "sh"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(RESETS_OWN_CALLS))
+def test_the_production_guard_accepts_the_resets_project_and_board_calls(case):
+    assert not touches_production(RESETS_OWN_CALLS[case])
+
+
+@pytest.mark.parametrize("case", sorted(REFUSED))
+def test_the_production_guard_refuses_the_name_anywhere_but_as_the_slugs_of_the_resets_project_call(case):
+    assert touches_production(REFUSED[case])
 
 
 def test_the_real_server_2_isolation_check_refuses_when_the_runner_is_not_on_the_stack_host(box):

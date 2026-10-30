@@ -757,6 +757,17 @@ def d_exec(state, a):
             return ""
         if 'cat >> "$1"' in script:
             return ""
+    # The reset's Project and board calls as the platform's account: each is matched whole, word by word, in its place.
+    anchor, dashboard = "raphael-workspace", "raphael-journeys-dashboard"
+    if (a[:i], a[i]) == (["--user", "10000:10000"], dashboard) and cmd == [
+        "hermes", "project", "create", "Raphael Workspace", "--slug", anchor, "--board", anchor,
+    ]:
+        return ""
+    # BOARD_SHELL and BOARD_PROGRAM are the reset's texts, put in front of this source by the test as F is.
+    if (a[:i], a[i]) == (["-i", "--user", "10000:10000"], dashboard) and (
+        cmd == ["sh", "-c", BOARD_SHELL, "sh"] and stdin == BOARD_PROGRAM
+    ):
+        return ""
     refuse("exec program %r" % (cmd[:3],))
 
 
@@ -1019,10 +1030,8 @@ def converged_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return host.root
 
 
-@pytest.fixture
-def stack(converged_root: Path, tmp_path: Path) -> Host:
-    """A private copy of the converged host with an empty calls log."""
-    root = tmp_path / "stack"
+def private_copy(converged_root: Path, root: Path) -> Host:
+    """A copy of the converged host at ROOT with an empty calls log."""
     shutil.copytree(converged_root, root, symlinks=True)
     converge_log = [json.loads(line) for line in (root / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
     for name in ("state.json", "scripted.json", "verified.txt"):
@@ -1034,6 +1043,19 @@ def stack(converged_root: Path, tmp_path: Path) -> Host:
     copy.root, copy.scripts, copy.bin = root, root / "tree" / "scripts" / "journeys", root / "bin"
     copy.converged_docker = [c["argv"] for c in converge_log if c["tool"] == "docker"]
     return copy
+
+
+@pytest.fixture
+def stack(converged_root: Path, tmp_path: Path) -> Host:
+    """A private copy of the converged host with an empty calls log."""
+    return private_copy(converged_root, tmp_path / "stack")
+
+
+@pytest.fixture(scope="module")
+def shared_stack(converged_root: Path, tmp_path_factory: pytest.TempPathFactory) -> Host:
+    """One copy of the converged host for all the cases of test_2b to test_2e: each makes one docker exec call that is
+    taken or refused with no change of the host (only the calls log grows), and none of them reads the calls log."""
+    return private_copy(converged_root, tmp_path_factory.mktemp("shared") / "stack")
 
 
 def proxy_ca_pem(state: dict) -> str:
@@ -1235,6 +1257,202 @@ def test_2_reset_after_converge_exits_0_and_all_five_containers_are_running_and_
 
     order = [(argv[0], argv[1]) for argv in stack.docker_calls(mark) if argv[0] in ("stop", "start", "restart")]
     assert order.index(("stop", GATE_C)) < order.index(("restart", APP_C)) < order.index(("start", GATE_C))
+
+
+# The reset's Project and board calls; the stand-in takes each only as the whole argument list the reset passes, and the
+# board write only with the reset's whole shell text and its whole program on standard input.
+ANCHOR = "raphael-workspace"
+AS_PLATFORM = ["--user", "10000:10000"]
+# BOARD_SHELL and BOARD_PROGRAM are a deliberate copy of the text that reset_stack.sh sends for the board metadata
+# write: platform_python as the shell text, and anchor_program for ANCHOR plus the one newline of the here-string as
+# the input. The test does not read the reset, so a change of the reset turns the test red.
+BOARD_SHELL = """\
+p=$PATH:
+found=
+while [ -n "$p" ]; do
+  d=${p%%:*}
+  p=${p#*:}
+  f=${d:-.}/hermes
+  [ -f "$f" ] && [ -x "$f" ] || continue
+  first=
+  IFS= read -r first < "$f" || true
+  case "$first" in "#!"*) ;; *) continue ;; esac
+  set -f
+  set -- ${first#"#!"}
+  set +f
+  case "${1##*/}" in sh | bash | dash | ash | ksh | zsh) continue ;; esac
+  found=1
+  break
+done
+[ -n "$found" ] || exit 127
+exec "$@" -"""
+BOARD_PROGRAM = """\
+import sys
+from hermes_cli import kanban_db, projects_db
+
+slug = "raphael-workspace"
+with projects_db.connect_closing() as conn:
+    project = projects_db.get_project(conn, slug)
+if project is None or project.slug != slug:
+    sys.exit("the Project is not in the registry")
+kanban_db.write_board_metadata(slug, project_id=project.id)
+meta = kanban_db.read_board_metadata(slug)
+if not kanban_db.board_exists(slug) or meta.get("slug") != slug or meta.get("project_id") != project.id:
+    sys.exit("the board metadata does not name the Project id")
+"""
+BOARD_WRITE = ["sh", "-c", BOARD_SHELL, "sh"]
+# The stand-in compares with these very texts: they go in front of its source as F does.
+STUB = f"BOARD_SHELL = {BOARD_SHELL!r}\nBOARD_PROGRAM = {BOARD_PROGRAM!r}\n" + STUB
+
+
+def create_project(name: str = "Raphael Workspace", slug: str = ANCHOR, board: str = ANCHOR) -> list[str]:
+    return ["hermes", "project", "create", name, "--slug", slug, "--board", board]
+
+
+def exec_in(stack: Host, *words: str, stdin: str = BOARD_PROGRAM) -> subprocess.CompletedProcess:
+    """One call of the stand-in `docker exec` with these words after exec; standard input is the reset's program
+    unless stdin says otherwise (the empty string sends none)."""
+    return subprocess.run(
+        [str(stack.bin / "docker"), "exec", *words],
+        env=stack.env(), cwd=stack.root, input=stdin, capture_output=True, text=True, timeout=60,
+    )
+
+
+NEAR_MISSES = {
+    "create_in_another_target": [*AS_PLATFORM, GATE_C, *create_project()],
+    "create_without_the_user_option": [DASH_C, *create_project()],
+    "create_as_another_user": ["--user", "0:0", DASH_C, *create_project()],
+    "create_with_an_extra_exec_option": [*AS_PLATFORM, "-i", DASH_C, *create_project()],
+    "create_with_another_slug": [*AS_PLATFORM, DASH_C, *create_project(slug="other-slug")],
+    "create_with_a_slug_that_only_starts_like_the_anchor": [*AS_PLATFORM, DASH_C, *create_project(slug=ANCHOR + "-2")],
+    "create_with_another_board": [*AS_PLATFORM, DASH_C, *create_project(board="other-board")],
+    "create_with_another_name": [*AS_PLATFORM, DASH_C, *create_project(name="Another Workspace")],
+    "create_with_its_options_swapped": [
+        *AS_PLATFORM, DASH_C, "hermes", "project", "create", "Raphael Workspace", "--board", ANCHOR, "--slug", ANCHOR,
+    ],
+    "create_without_the_board_option": [*AS_PLATFORM, DASH_C, *create_project()[:-2]],
+    "create_with_an_extra_option": [*AS_PLATFORM, DASH_C, *create_project(), "--force"],
+    "another_project_subcommand": [*AS_PLATFORM, DASH_C, "hermes", "project", "delete", "Raphael Workspace",
+                                   "--slug", ANCHOR, "--board", ANCHOR],
+    "create_words_in_another_place": [
+        *AS_PLATFORM, DASH_C, "hermes", "project", "create", "--slug", ANCHOR, "--board", ANCHOR, "Raphael Workspace",
+    ],
+    "create_as_one_joined_word": [*AS_PLATFORM, DASH_C, " ".join(create_project())],
+    "create_inside_a_shell_script": [*AS_PLATFORM, DASH_C, "sh", "-c", " ".join(create_project()), "sh"],
+    "board_write_in_another_target": ["-i", *AS_PLATFORM, GATE_C, *BOARD_WRITE],
+    "board_write_without_the_input_option": [*AS_PLATFORM, DASH_C, *BOARD_WRITE],
+    "board_write_with_its_options_swapped": [*AS_PLATFORM, "-i", DASH_C, *BOARD_WRITE],
+    "board_write_as_another_user": ["-i", "--user", "0", DASH_C, *BOARD_WRITE],
+    "board_write_with_another_shell": ["-i", *AS_PLATFORM, DASH_C, "bash", "-c", BOARD_SHELL, "sh"],
+    "board_write_with_another_shell_option": ["-i", *AS_PLATFORM, DASH_C, "sh", "-s", BOARD_SHELL, "sh"],
+    "board_write_with_another_argument_zero": ["-i", *AS_PLATFORM, DASH_C, "sh", "-c", BOARD_SHELL, "bash"],
+    "board_write_without_its_argument_zero": ["-i", *AS_PLATFORM, DASH_C, "sh", "-c", BOARD_SHELL],
+    "board_write_without_a_script": ["-i", *AS_PLATFORM, DASH_C, "sh", "-c"],
+    "board_write_with_an_extra_word": ["-i", *AS_PLATFORM, DASH_C, *BOARD_WRITE, "extra"],
+    "board_write_words_in_another_place": ["-i", *AS_PLATFORM, DASH_C, "sh", "sh", "-c", BOARD_SHELL],
+}
+
+STILL_REFUSED = {
+    "a_terminal_option": ["-t", *AS_PLATFORM, DASH_C, *create_project()],
+    "an_environment_option": ["-e", "A_NAME=a-value", *AS_PLATFORM, DASH_C, *create_project()],
+    "a_working_folder_option": ["-w", "/tmp", *AS_PLATFORM, DASH_C, *create_project()],
+    "a_project_listing": [*AS_PLATFORM, DASH_C, "hermes", "project", "list"],
+    "a_token_issue_without_out": [*AS_PLATFORM, DASH_C, "hermes", "kanban-workspace-token", "issue", "--surface", "x"],
+    "a_shell_script_without_a_known_purpose": [*AS_PLATFORM, DASH_C, "sh", "-c", "an invented script", "sh"],
+    "a_plain_program": [DASH_C, "rm", "-rf", "/tmp/anything"],
+}
+
+
+def altered(text: str, old: str, new: str) -> str:
+    """TEXT with its one OLD put as NEW; a text that holds OLD more or less than once is a mistake of the case."""
+    assert text.count(old) == 1, old
+    return text.replace(old, new)
+
+
+# The reset's board write with its options, target and words right and its shell text or its input wrong: the pair is
+# (shell text, input). The first case is the reproduction of the review.
+BOARD_WRITE_REFUSED = {
+    "exit_42_as_the_shell_text_and_no_input": ("exit 42", ""),
+    "exit_42_as_the_shell_text": ("exit 42", BOARD_PROGRAM),
+    "an_empty_shell_text": ("", BOARD_PROGRAM),
+    "an_empty_shell_text_and_no_input": ("", ""),
+    "a_nested_docker_command_as_the_shell_text": ("docker run --rm alpine true", BOARD_PROGRAM),
+    "a_shell_text_with_one_word_altered": (altered(BOARD_SHELL, "exit 127", "exit 0"), BOARD_PROGRAM),
+    "a_shell_text_without_its_last_word": (altered(BOARD_SHELL, 'exec "$@" -', 'exec "$@"'), BOARD_PROGRAM),
+    "a_shell_text_with_text_added_at_its_end": (BOARD_SHELL + "\nexit 42", BOARD_PROGRAM),
+    "a_shell_text_with_a_newline_added_at_its_end": (BOARD_SHELL + "\n", BOARD_PROGRAM),
+    "a_shell_text_with_text_added_at_its_start": ("exit 42\n" + BOARD_SHELL, BOARD_PROGRAM),
+    "a_shell_text_without_its_first_line": (BOARD_SHELL.partition("\n")[2], BOARD_PROGRAM),
+    "a_shell_text_without_a_middle_line": (altered(BOARD_SHELL, "  set +f\n", ""), BOARD_PROGRAM),
+    "a_shell_text_without_its_last_line": (BOARD_SHELL.rpartition("\n")[0], BOARD_PROGRAM),
+    "a_shell_text_with_one_space_added": (altered(BOARD_SHELL, "  found=1\n", "   found=1\n"), BOARD_PROGRAM),
+    "a_shell_text_with_crlf_line_ends": (BOARD_SHELL.replace("\n", "\r\n"), BOARD_PROGRAM),
+    "no_input": (BOARD_SHELL, ""),
+    "a_newline_as_the_input": (BOARD_SHELL, "\n"),
+    "the_program_for_another_board_slug": (BOARD_SHELL, altered(BOARD_PROGRAM, ANCHOR, "other-workspace")),
+    "the_program_for_a_slug_that_only_starts_like_the_anchor": (
+        BOARD_SHELL, altered(BOARD_PROGRAM, ANCHOR, ANCHOR + "-2"),
+    ),
+    "an_unrelated_program": (BOARD_SHELL, "import sys\nsys.exit(42)\n"),
+    "the_program_with_its_board_write_altered": (
+        BOARD_SHELL, altered(BOARD_PROGRAM, "write_board_metadata(slug, project_id=project.id)",
+                             "write_board_metadata(slug, project_id=None)"),
+    ),
+    "the_program_with_its_board_write_made_a_read": (
+        BOARD_SHELL, altered(BOARD_PROGRAM, "write_board_metadata(slug, project_id=project.id)",
+                             "read_board_metadata(slug)"),
+    ),
+    "the_program_without_its_board_write": (
+        BOARD_SHELL, altered(BOARD_PROGRAM, "kanban_db.write_board_metadata(slug, project_id=project.id)\n", ""),
+    ),
+    "the_program_with_text_added_after_it": (BOARD_SHELL, BOARD_PROGRAM + "sys.exit(42)\n"),
+    "the_program_with_a_newline_added_after_it": (BOARD_SHELL, BOARD_PROGRAM + "\n"),
+    "the_program_with_text_added_before_it": (BOARD_SHELL, "sys.exit(42)\n" + BOARD_PROGRAM),
+    "the_program_without_its_final_newline": (BOARD_SHELL, BOARD_PROGRAM.removesuffix("\n")),
+    "the_program_with_crlf_line_ends": (BOARD_SHELL, BOARD_PROGRAM.replace("\n", "\r\n")),
+}
+
+
+def test_2b_the_stand_in_takes_the_resets_project_create_and_board_write_calls(shared_stack: Host) -> None:
+    created = exec_in(shared_stack, *AS_PLATFORM, DASH_C, *create_project())
+    assert created.returncode == 0, created.stderr
+    written = exec_in(shared_stack, "-i", *AS_PLATFORM, DASH_C, *BOARD_WRITE)
+    assert written.returncode == 0, written.stderr
+
+
+@pytest.mark.parametrize("case", sorted(NEAR_MISSES))
+def test_2c_the_stand_in_refuses_a_call_that_differs_from_either_one_in_a_word_or_the_place_of_a_word(
+    shared_stack: Host, case: str
+) -> None:
+    refused = exec_in(shared_stack, *NEAR_MISSES[case])
+    assert refused.returncode == 98 and "stand-in docker: refused" in refused.stderr, refused.stderr
+
+
+@pytest.mark.parametrize("case", sorted(STILL_REFUSED))
+def test_2d_the_stand_in_still_refuses_what_it_refused_before(shared_stack: Host, case: str) -> None:
+    refused = exec_in(shared_stack, *STILL_REFUSED[case])
+    assert refused.returncode == 98 and "stand-in docker: refused" in refused.stderr, refused.stderr
+
+
+@pytest.mark.parametrize("case", sorted(BOARD_WRITE_REFUSED))
+def test_2e_the_stand_in_refuses_a_board_write_whose_shell_text_or_input_is_not_exactly_the_resets(
+    shared_stack: Host, case: str
+) -> None:
+    shell, stdin = BOARD_WRITE_REFUSED[case]
+    refused = exec_in(shared_stack, "-i", *AS_PLATFORM, DASH_C, "sh", "-c", shell, "sh", stdin=stdin)
+    assert refused.returncode == 98 and "stand-in docker: refused" in refused.stderr, refused.stderr
+
+
+def test_2f_the_cases_of_2b_to_2e_leave_the_host_they_share_as_the_converge_left_it(
+    shared_stack: Host, converged_root: Path
+) -> None:
+    """Whichever of those cases ran before this one, only the calls log of the shared copy grew."""
+    for name in ("state.json", "scripted.json", "verified.txt"):
+        original, copy = converged_root / name, shared_stack.root / name
+        assert copy.exists() == original.exists(), name
+        if original.exists():
+            expected = original.read_text(encoding="utf-8").replace(str(converged_root), str(shared_stack.root))
+            assert copy.read_text(encoding="utf-8") == expected, name
 
 
 def test_3_isolation_check_names_on_template_passes_on_the_created_stack(stack: Host) -> None:

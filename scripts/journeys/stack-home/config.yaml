@@ -1,12 +1,26 @@
 # Fixed, non-secret settings of the journeys test stack: the default profile.
 # reset_stack.sh copies this folder into the stack's platform home. Nothing here comes from production.
 
-# One gateway serves this profile and the profile folders under profiles/ (the planner).
+# One gateway serves this profile and the profile folders under profiles/ (the planner and the designer).
 multiplex_profiles: true
 
 kanban:
   # The kanban dispatcher stays off in the gateway, so no card starts work by itself.
   dispatch_in_gateway: false
+
+gateway:
+  api_server:
+    owner_workspace:
+      # The owner app reads its Project, Connections and Automations through this API.
+      enabled: true
+
+# The admitted base route of this profile, as the model policy lists it, and no fallback.
+model:
+  provider: anthropic
+  default: claude-opus-5-5
+agent:
+  reasoning_effort: max
+fallback_providers: []
 
 # No messaging platform is set. The API server is switched on by API_SERVER_KEY in .env alone.
 # No cron job is set either; the isolation check proves that every job list is empty.
