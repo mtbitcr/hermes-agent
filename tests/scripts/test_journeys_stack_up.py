@@ -757,8 +757,13 @@ def d_exec(state, a):
             return ""
         if 'cat >> "$1"' in script:
             return ""
-    # The reset's Project and board calls as the platform's account: each is matched whole, word by word, in its place.
+    # The reset's board store, Project and board calls as the platform's account: each is matched whole, word by word,
+    # in its place.
     anchor, dashboard = "raphael-workspace", "raphael-journeys-dashboard"
+    if (a[:i], a[i]) == (["--user", "10000:10000"], dashboard) and cmd == [
+        "hermes", "kanban", "boards", "create", anchor,
+    ]:
+        return ""
     if (a[:i], a[i]) == (["--user", "10000:10000"], dashboard) and cmd == [
         "hermes", "project", "create", "Raphael Workspace", "--slug", anchor, "--board", anchor,
     ]:
@@ -1257,10 +1262,13 @@ def test_2_reset_after_converge_exits_0_and_all_five_containers_are_running_and_
 
     order = [(argv[0], argv[1]) for argv in stack.docker_calls(mark) if argv[0] in ("stop", "start", "restart")]
     assert order.index(("stop", GATE_C)) < order.index(("restart", APP_C)) < order.index(("start", GATE_C))
+    # the platform's first three writes: the board's store, then the Project, then the board metadata
+    writes = [argv[argv.index(DASH_C) + 1:] for argv in stack.docker_calls(mark) if argv[0] == "exec" and "--user" in argv]
+    assert writes[:3] == [create_board(), create_project(), BOARD_WRITE]
 
 
-# The reset's Project and board calls; the stand-in takes each only as the whole argument list the reset passes, and the
-# board write only with the reset's whole shell text and its whole program on standard input.
+# The reset's board store, Project and board calls; the stand-in takes each only as the whole argument list the reset
+# passes, and the board write only with the reset's whole shell text and its whole program on standard input.
 ANCHOR = "raphael-workspace"
 AS_PLATFORM = ["--user", "10000:10000"]
 # BOARD_SHELL and BOARD_PROGRAM are a deliberate copy of the text that reset_stack.sh sends for the board metadata
@@ -1305,6 +1313,10 @@ BOARD_WRITE = ["sh", "-c", BOARD_SHELL, "sh"]
 STUB = f"BOARD_SHELL = {BOARD_SHELL!r}\nBOARD_PROGRAM = {BOARD_PROGRAM!r}\n" + STUB
 
 
+def create_board(board: str = ANCHOR) -> list[str]:
+    return ["hermes", "kanban", "boards", "create", board]
+
+
 def create_project(name: str = "Raphael Workspace", slug: str = ANCHOR, board: str = ANCHOR) -> list[str]:
     return ["hermes", "project", "create", name, "--slug", slug, "--board", board]
 
@@ -1319,6 +1331,15 @@ def exec_in(stack: Host, *words: str, stdin: str = BOARD_PROGRAM) -> subprocess.
 
 
 NEAR_MISSES = {
+    "store_in_another_target": [*AS_PLATFORM, GATE_C, *create_board()],
+    "store_without_the_user_option": [DASH_C, *create_board()],
+    "store_as_another_user": ["--user", "0:0", DASH_C, *create_board()],
+    "store_with_an_extra_exec_option": [*AS_PLATFORM, "-i", DASH_C, *create_board()],
+    "store_of_another_board": [*AS_PLATFORM, DASH_C, *create_board("other-workspace")],
+    "store_of_a_board_that_only_starts_like_the_anchor": [*AS_PLATFORM, DASH_C, *create_board(ANCHOR + "-2")],
+    "store_with_its_words_in_another_order": [*AS_PLATFORM, DASH_C, "hermes", "kanban", "create", "boards", ANCHOR],
+    "store_with_an_extra_option": [*AS_PLATFORM, DASH_C, *create_board(), "--switch"],
+    "store_as_one_joined_word": [*AS_PLATFORM, DASH_C, " ".join(create_board())],
     "create_in_another_target": [*AS_PLATFORM, GATE_C, *create_project()],
     "create_without_the_user_option": [DASH_C, *create_project()],
     "create_as_another_user": ["--user", "0:0", DASH_C, *create_project()],
@@ -1413,7 +1434,9 @@ BOARD_WRITE_REFUSED = {
 }
 
 
-def test_2b_the_stand_in_takes_the_resets_project_create_and_board_write_calls(shared_stack: Host) -> None:
+def test_2b_the_stand_in_takes_the_resets_board_store_project_create_and_board_write_calls(shared_stack: Host) -> None:
+    stored = exec_in(shared_stack, *AS_PLATFORM, DASH_C, *create_board(), stdin="")
+    assert stored.returncode == 0, stored.stderr
     created = exec_in(shared_stack, *AS_PLATFORM, DASH_C, *create_project())
     assert created.returncode == 0, created.stderr
     written = exec_in(shared_stack, "-i", *AS_PLATFORM, DASH_C, *BOARD_WRITE)
@@ -2298,6 +2321,22 @@ def test_extra_build_proxy_makes_one_image_tagged_by_the_hash_of_its_inputs(host
     assert len(builds) == 1 and builds[0][builds[0].index("--tag") + 1] == f"raphael-journeys-proxy:{tag}"
     assert changing(host.docker_calls()) == builds
     assert host.state()["images"][f"raphael-journeys-proxy:{tag}"]["built"]["context_files"] == ["synthetic_proxy.py"]
+
+
+def test_extra_build_proxy_with_its_tag_already_there_builds_nothing_and_prints_the_same_last_line(host: Host) -> None:
+    """A rebuild would move the tag to a new image and orphan the running proxy's image: the tag is kept as it is."""
+    first = host.run("stack_up.sh", "build", "proxy")
+    assert first.returncode == 0, first.stdout + first.stderr
+    (build,) = [argv for argv in host.docker_calls() if argv[0] == "build"]  # the tag was missing: one build
+    ref = build[build.index("--tag") + 1]
+    tag, image_id = ref.partition(":")[2], host.state()["images"][ref]["id"]
+    mark = host.mark()
+    again = host.run("stack_up.sh", "build", "proxy")
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert again.stdout.splitlines()[-1] == first.stdout.splitlines()[-1] == f"stack_up: built proxy {tag}"
+    assert not [argv for argv in host.docker_calls(mark) if argv[0] == "build"]
+    assert changing(host.docker_calls(mark)) == []
+    assert host.state()["images"][ref]["id"] == image_id
 
 
 def wait_for_image(host: Host, ref: str) -> dict:
