@@ -61,6 +61,43 @@ PROD_C = "raphael-workspace"
 # data, not a docker resource; the reset writes it twice as the platform's account (project, board metadata).
 ANCHOR = "raphael-workspace"
 ANCHOR_WRITES = 2
+# The two writes that need the platform's code, as reset_stack.sh sends them (a copy of its texts, so a change turns the focused tests red).
+PROJECT_CREATE = ["hermes", "project", "create", "Raphael Workspace", "--slug", ANCHOR, "--board", ANCHOR]
+BOARD_SHELL = """\
+p=$PATH:
+found=
+while [ -n "$p" ]; do
+  d=${p%%:*}
+  p=${p#*:}
+  f=${d:-.}/hermes
+  [ -f "$f" ] && [ -x "$f" ] || continue
+  first=
+  IFS= read -r first < "$f" || true
+  case "$first" in "#!"*) ;; *) continue ;; esac
+  set -f
+  set -- ${first#"#!"}
+  set +f
+  case "${1##*/}" in sh | bash | dash | ash | ksh | zsh) continue ;; esac
+  found=1
+  break
+done
+[ -n "$found" ] || exit 127
+exec "$@" -"""
+BOARD_PROGRAM = """\
+import sys
+from hermes_cli import kanban_db, projects_db
+
+slug = "raphael-workspace"
+with projects_db.connect_closing() as conn:
+    project = projects_db.get_project(conn, slug)
+if project is None or project.slug != slug:
+    sys.exit("the Project is not in the registry")
+kanban_db.write_board_metadata(slug, project_id=project.id)
+meta = kanban_db.read_board_metadata(slug)
+if not kanban_db.board_exists(slug) or meta.get("slug") != slug or meta.get("project_id") != project.id:
+    sys.exit("the board metadata does not name the Project id")
+"""
+BOARD_WRITE = ["sh", "-c", BOARD_SHELL, "sh"]
 # Old rig names (facts file): present on the fake host so that any call naming them is caught.
 DECOY_CONTAINERS = [
     "raphael-s2-workspace", "raphael-s2-proxy", "raphael-s2-dashboard",
@@ -590,6 +627,15 @@ def redirect_targets(local):
     return [local[3 + int(n)] for n in re.findall(r'>>?\s*"\$(\d)"', local[2]) if 3 + int(n) < len(local)]
 
 
+def is_anchor_call(container, interactive, user, cmd, stdin_bytes):
+    """The reset's Project call or its board write, whole: container, account, words and (for the board) input."""
+    if container != DASH_C or user is None:
+        return False
+    if interactive:
+        return cmd == BOARD_WRITE and stdin_bytes == BOARD_PROGRAM.encode()
+    return cmd == PROJECT_CREATE
+
+
 def d_exec(argv, args):
     import subprocess
     interactive, user, i = False, None, 0
@@ -628,6 +674,8 @@ def d_exec(argv, args):
         if not Path(local[3]).exists():
             return finish(seq, 1, err=("stat: cannot statx '%s': No such file or directory\n" % cmd[3]).encode())
         return finish(seq, 0, ("%d:%d\n" % tuple(owner_in(load_owners(), local[3]))).encode())
+    if is_anchor_call(container, interactive, user, cmd, stdin_bytes) and not load().get("hermes", {}).get("real_platform"):
+        return finish(seq, 0)  # recorded whole above; the platform's code runs only where a test reads what it wrote
     targets = redirect_targets(local)
     for path in targets:
         if not reach(uid, gid, path, 2):
@@ -851,7 +899,8 @@ FAKE_TOOLS_SOURCE = (
     + VIEW_SOURCE
     + "".join("%s = %r\n" % (n, globals()[n])
               for n in ("F_IMAGE", "F_ENV_NAMES", "F_MOUNT_TYPES", "F_MOUNT_DEST", "F_STATE",
-                        "F_HERMES_HOME", "F_HEALTH_KIND", "F_APP_SETTINGS", "TOKEN_VARS"))
+                        "F_HERMES_HOME", "F_HEALTH_KIND", "F_APP_SETTINGS", "TOKEN_VARS",
+                        "DASH_C", "PROJECT_CREATE", "BOARD_WRITE", "BOARD_PROGRAM"))
     + "REPO_ROOT = %r\nREAL_PYC = %r\n" % (str(REPO), str(REAL_PYC))
     + FAKE_DOCKER
     + FAKE_PLATFORM
@@ -1735,7 +1784,10 @@ def shared_reset(tmp_path_factory) -> SharedReset:
     first = Host(tmp_path_factory.mktemp("after-reset") / "host")
     untouched = {v: sha_tree(first.vol(v)) for v in [PROXY_V] + DECOY_VOLUMES}
     repo_before = sha_tree(STACK_HOME)
-    return SharedReset(first, reset_ok(first), untouched, repo_before)
+    hermes_gives(real_platform=True)(first)  # the anchor tests read what the platform's code wrote in this reset
+    result = reset_ok(first)
+    first.update(lambda state: state["hermes"].pop("real_platform"))  # the copies of this host reset without it
+    return SharedReset(first, result, untouched, repo_before)
 
 
 def test_reset_makes_a_fresh_home_and_token_folder(shared_reset: SharedReset):
@@ -1934,6 +1986,7 @@ ANCHOR_BREAKS = {
 def test_reset_stops_before_any_token_when_the_project_or_its_board_cannot_be_made(host: Host, tmp_path: Path, name):
     break_it, project_made = ANCHOR_BREAKS[name]
     break_it(host)
+    hermes_gives(real_platform=True)(host)  # this test reads what the platform's code wrote, or could not write
     result = run_reset(host)
     assert result.returncode != 0, result.stdout + result.stderr
     docker = host.calls("docker")
@@ -1943,6 +1996,67 @@ def test_reset_stops_before_any_token_when_the_project_or_its_board_cannot_be_ma
     seen = read_anchor(host, tmp_path)
     assert (seen["project"] is not None) == project_made
     assert not seen["board_exists"] and seen["meta"]["project_id"] is None
+
+
+# --- the stand-ins start the platform's code for the Project and board calls only where a test reads what it wrote
+
+AS_PLATFORM = ["--user", "10000:10000"]
+OTHER_PROGRAM = "import sys\nsys.exit(42)\n"
+
+
+def venv_starts(host: Host) -> list[str]:
+    """Each start of the venv interpreter wrapper, in order: a hermes launcher by its path, a program on standard input as -."""
+    log = host.root / "interp.log"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def create_project(name: str = "Raphael Workspace", slug: str = ANCHOR) -> list[str]:
+    return ["hermes", "project", "create", name, "--slug", slug, "--board", ANCHOR]
+
+
+def test_an_ordinary_reset_records_the_project_and_board_calls_whole_and_starts_no_platform_process_for_them(host: Host):
+    reset_ok(host)
+    project, board = writer_calls(host)[:ANCHOR_WRITES]
+    assert project["argv"] == ["exec", *AS_PLATFORM, DASH_C, *PROJECT_CREATE] and project["stdin"] is None
+    assert board["argv"] == ["exec", "-i", *AS_PLATFORM, DASH_C, *BOARD_WRITE]
+    assert board["stdin"] == BOARD_PROGRAM.encode()
+    assert project["rc"] == 0 and board["rc"] == 0
+    # the five token issues start the hermes launcher; the Project call starts none, and no program is run from standard input
+    assert venv_starts(host) == [str(host.root / "ctr/venv/hermes")] * len(SURFACE_ENV)
+
+
+def test_the_shared_reset_that_the_anchor_tests_read_started_the_platforms_code_for_both_calls(shared_reset: SharedReset):
+    launcher = str(shared_reset.host.root / "ctr/venv/hermes")
+    assert venv_starts(shared_reset.host) == [launcher, "-", *[launcher] * len(SURFACE_ENV)]
+
+
+PROJECT_NEAR_MISSES = {
+    "another-name": [*AS_PLATFORM, DASH_C, *create_project(name="Other Workspace")],
+    "another-slug": [*AS_PLATFORM, DASH_C, *create_project(slug="other-workspace")],
+    "an-extra-word": [*AS_PLATFORM, DASH_C, *PROJECT_CREATE, "extra"],
+    "another-container": [*AS_PLATFORM, GATE_C, *PROJECT_CREATE],
+    "with-the-input-option": ["-i", *AS_PLATFORM, DASH_C, *PROJECT_CREATE],
+}
+BOARD_NEAR_MISSES = {
+    "another-shell-text": ("-i", DASH_C, ["sh", "-c", "exit 42", "sh"], BOARD_PROGRAM),
+    "another-program": ("-i", DASH_C, BOARD_WRITE, OTHER_PROGRAM),
+    "another-container": ("-i", GATE_C, BOARD_WRITE, OTHER_PROGRAM),
+}
+
+
+@pytest.mark.parametrize("case", PROJECT_NEAR_MISSES)
+def test_a_project_call_that_is_not_the_resets_is_still_run_by_the_stand_in(host: Host, case: str):
+    project_command_gives("refused")(host)  # the platform's own command is never reached: hermes answers 2 at once
+    words = PROJECT_NEAR_MISSES[case]
+    done = docker_by_hand(host, "exec", *words, stdin="" if "-i" in words else None)
+    assert done.returncode == 2 and "project command failed" in done.stderr, done.stdout + done.stderr
+
+
+@pytest.mark.parametrize("case", BOARD_NEAR_MISSES)
+def test_a_board_write_that_is_not_the_resets_is_still_run_by_the_stand_in(host: Host, case: str):
+    option, container, command, program = BOARD_NEAR_MISSES[case]
+    done = docker_by_hand(host, "exec", option, *AS_PLATFORM, container, *command, stdin=program)
+    assert done.returncode == 42, done.stdout + done.stderr
 
 
 # --- the platform's runtime identity and the owner app's identity are two different things
@@ -2052,10 +2166,10 @@ def test_reset_reads_a_running_owner_app_only_by_docker_exec_before_it_changes_a
 # --- the fake itself: it enforces the exec user, the boot ownership and the owner-only rules
 
 
-def docker_by_hand(host: Host, *args: str) -> subprocess.CompletedProcess:
+def docker_by_hand(host: Host, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
     env = {"PATH": f"{host.root / 'bin'}:/usr/bin:/bin", "FAKE_HOST_ROOT": str(host.root),
            "HOME": str(host.root / "home"), "PYTHONDONTWRITEBYTECODE": "1"}
-    return subprocess.run([str(host.root / "bin/docker"), *args], env=env, capture_output=True, text=True)
+    return subprocess.run([str(host.root / "bin/docker"), *args], env=env, input=stdin, capture_output=True, text=True)
 
 
 def own_volume(host: Host, volume: str, who: tuple[int, int], mode: int | None = None) -> None:

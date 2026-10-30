@@ -1030,10 +1030,8 @@ def converged_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return host.root
 
 
-@pytest.fixture
-def stack(converged_root: Path, tmp_path: Path) -> Host:
-    """A private copy of the converged host with an empty calls log."""
-    root = tmp_path / "stack"
+def private_copy(converged_root: Path, root: Path) -> Host:
+    """A copy of the converged host at ROOT with an empty calls log."""
     shutil.copytree(converged_root, root, symlinks=True)
     converge_log = [json.loads(line) for line in (root / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
     for name in ("state.json", "scripted.json", "verified.txt"):
@@ -1045,6 +1043,19 @@ def stack(converged_root: Path, tmp_path: Path) -> Host:
     copy.root, copy.scripts, copy.bin = root, root / "tree" / "scripts" / "journeys", root / "bin"
     copy.converged_docker = [c["argv"] for c in converge_log if c["tool"] == "docker"]
     return copy
+
+
+@pytest.fixture
+def stack(converged_root: Path, tmp_path: Path) -> Host:
+    """A private copy of the converged host with an empty calls log."""
+    return private_copy(converged_root, tmp_path / "stack")
+
+
+@pytest.fixture(scope="module")
+def shared_stack(converged_root: Path, tmp_path_factory: pytest.TempPathFactory) -> Host:
+    """One copy of the converged host for all the cases of test_2b to test_2e: each makes one docker exec call that is
+    taken or refused with no change of the host (only the calls log grows), and none of them reads the calls log."""
+    return private_copy(converged_root, tmp_path_factory.mktemp("shared") / "stack")
 
 
 def proxy_ca_pem(state: dict) -> str:
@@ -1402,34 +1413,46 @@ BOARD_WRITE_REFUSED = {
 }
 
 
-def test_2b_the_stand_in_takes_the_resets_project_create_and_board_write_calls(stack: Host) -> None:
-    created = exec_in(stack, *AS_PLATFORM, DASH_C, *create_project())
+def test_2b_the_stand_in_takes_the_resets_project_create_and_board_write_calls(shared_stack: Host) -> None:
+    created = exec_in(shared_stack, *AS_PLATFORM, DASH_C, *create_project())
     assert created.returncode == 0, created.stderr
-    written = exec_in(stack, "-i", *AS_PLATFORM, DASH_C, *BOARD_WRITE)
+    written = exec_in(shared_stack, "-i", *AS_PLATFORM, DASH_C, *BOARD_WRITE)
     assert written.returncode == 0, written.stderr
 
 
 @pytest.mark.parametrize("case", sorted(NEAR_MISSES))
 def test_2c_the_stand_in_refuses_a_call_that_differs_from_either_one_in_a_word_or_the_place_of_a_word(
-    stack: Host, case: str
+    shared_stack: Host, case: str
 ) -> None:
-    refused = exec_in(stack, *NEAR_MISSES[case])
+    refused = exec_in(shared_stack, *NEAR_MISSES[case])
     assert refused.returncode == 98 and "stand-in docker: refused" in refused.stderr, refused.stderr
 
 
 @pytest.mark.parametrize("case", sorted(STILL_REFUSED))
-def test_2d_the_stand_in_still_refuses_what_it_refused_before(stack: Host, case: str) -> None:
-    refused = exec_in(stack, *STILL_REFUSED[case])
+def test_2d_the_stand_in_still_refuses_what_it_refused_before(shared_stack: Host, case: str) -> None:
+    refused = exec_in(shared_stack, *STILL_REFUSED[case])
     assert refused.returncode == 98 and "stand-in docker: refused" in refused.stderr, refused.stderr
 
 
 @pytest.mark.parametrize("case", sorted(BOARD_WRITE_REFUSED))
 def test_2e_the_stand_in_refuses_a_board_write_whose_shell_text_or_input_is_not_exactly_the_resets(
-    stack: Host, case: str
+    shared_stack: Host, case: str
 ) -> None:
     shell, stdin = BOARD_WRITE_REFUSED[case]
-    refused = exec_in(stack, "-i", *AS_PLATFORM, DASH_C, "sh", "-c", shell, "sh", stdin=stdin)
+    refused = exec_in(shared_stack, "-i", *AS_PLATFORM, DASH_C, "sh", "-c", shell, "sh", stdin=stdin)
     assert refused.returncode == 98 and "stand-in docker: refused" in refused.stderr, refused.stderr
+
+
+def test_2f_the_cases_of_2b_to_2e_leave_the_host_they_share_as_the_converge_left_it(
+    shared_stack: Host, converged_root: Path
+) -> None:
+    """Whichever of those cases ran before this one, only the calls log of the shared copy grew."""
+    for name in ("state.json", "scripted.json", "verified.txt"):
+        original, copy = converged_root / name, shared_stack.root / name
+        assert copy.exists() == original.exists(), name
+        if original.exists():
+            expected = original.read_text(encoding="utf-8").replace(str(converged_root), str(shared_stack.root))
+            assert copy.read_text(encoding="utf-8") == expected, name
 
 
 def test_3_isolation_check_names_on_template_passes_on_the_created_stack(stack: Host) -> None:
