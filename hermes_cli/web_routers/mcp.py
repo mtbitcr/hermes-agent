@@ -67,6 +67,7 @@ _CONNECTIONS_TEMPLATE_ROUTES = (
     ("PUT", "/api/mcp/servers/{name}/enabled"),
     ("DELETE", "/api/mcp/servers/{name}"),
     ("GET", "/api/mcp/oauth/callback/{name}"),
+    ("POST", "/api/mcp/servers/{name}/test"),
 )
 
 
@@ -310,13 +311,17 @@ async def remove_mcp_server(
 
 
 @router.post("/api/mcp/servers/{name}/test")
-async def test_mcp_server(name: str, profile: Optional[str] = None):
+async def test_mcp_server(
+    name: str, request: Request, profile: Optional[str] = None
+):
     """Connect to the server, list its tools, disconnect.  Returns tool list."""
     from hermes_cli.mcp_config import (
         _get_mcp_servers,
         _oauth_tokens_present,
         _probe_single_server,
     )
+
+    _enforce_connections_machine_profile(request, name=name, profile=profile)
 
     def _read():
         with _profile_scope(profile):
@@ -347,6 +352,24 @@ async def test_mcp_server(name: str, profile: Optional[str] = None):
             tools = _probe_single_server(name, servers[name], details=details)
             token_present = _oauth_tokens_present(name) if needs_oauth_token else True
             return tools, token_present
+
+    principal = getattr(request.state, "token_principal", None)
+    if (
+        getattr(request.state, "token_authenticated", False)
+        and getattr(principal, "principal", None) == CONNECTIONS_PRINCIPAL
+    ):
+        # Raphael Workspace's connections credential gets the safe answer only:
+        # tool names, never a schema or an error text (it can hold an address).
+        # A failed check is audited too: the strict seam refuses an unaudited 200.
+        try:
+            tools, token_present = await asyncio.to_thread(_probe_scoped)
+        except Exception:
+            tools, token_present = [], False
+        _audit_connections_machine_success(request, connection=name)
+        return {
+            "ok": token_present,
+            "tools": [{"name": t} for t, _ in tools] if token_present else [],
+        }
 
     try:
         # Probe blocks on a dedicated MCP event loop — run in a thread so the
