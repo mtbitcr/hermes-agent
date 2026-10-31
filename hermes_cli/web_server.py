@@ -13772,6 +13772,8 @@ from hermes_cli.web_routers.mcp import (  # noqa: E402,F401 — legacy re-export
     list_mcp_catalog,
     install_mcp_catalog_entry,
 )
+from hermes_cli.web_routers import connection_rows as _connection_rows_routes  # noqa: E402
+app.include_router(_connection_rows_routes.router)
 
 
 
