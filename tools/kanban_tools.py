@@ -2030,8 +2030,22 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"or (2) create continuation tasks with parents=[{tid}] "
                     f"and keep this task alive."
                 )
+            saved_patches = []
+            if patch_attachment_id is None:
+                # No patch named: the run's newest saved patch goes to review
+                # exactly as kanban_request_review hands it over.
+                run_id = _worker_run_id(tid)
+                saved_patches = kb.saved_patch_ids_for_review(conn, tid, run_id)
 
             try:
+                if saved_patches:
+                    # Inside this try, so a phantom created_cards id gets the
+                    # HallucinatedCardsError answer below.
+                    return _hand_saved_patch_to_review(
+                        kb, conn, tid, saved_patches[-1], summary or result,
+                        metadata, run_id, created_cards=created_cards,
+                        merge_parent_heads=merge_parent_heads,
+                    )
                 ok = kb.complete_task(
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
@@ -2172,20 +2186,22 @@ def _handle_block(args: dict, **kw) -> str:
 
 def _hand_saved_patch_to_review(
     kb, conn, tid, patch_attachment_id, summary, metadata, run_id,
+    *, created_cards=None, merge_parent_heads=False,
 ) -> str:
     """Hand the run's newest saved patch to review through ``complete_task``.
 
     ``complete_task`` takes no ``reviewer``: it parks the card for the
     reviewer the policy resolves, so the tool's ``reviewer`` argument does
-    not apply here.
+    not apply here. ``kanban_complete`` passes its own ``created_cards`` and
+    ``merge_parent_heads``; it answers the ``HallucinatedCardsError`` itself.
     """
     try:
         ok = kb.complete_task(
             conn, tid,
             result=None, summary=summary, metadata=metadata,
-            created_cards=None,
+            created_cards=created_cards,
             patch_attachment_id=patch_attachment_id,
-            merge_parent_heads=False,
+            merge_parent_heads=merge_parent_heads,
             expected_run_id=run_id,
         )
     except kb.ArtifactPreservationError as artifact_err:
