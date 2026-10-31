@@ -76,6 +76,17 @@ class TestEdgeCases:
     def test_empty_string(self, repair):
         assert repair("") is None
 
+    def test_unloaded_read_tool_not_repaired_into_write_tool(self, repair):
+        # kanban_read is not loaded: it must fail as an unknown tool, never
+        # run as the similar-looking write tool kanban_create.
+        repair.__self__.valid_tool_names = {"kanban_create", "kanban_comment", "kanban_show"}
+        assert repair("kanban_read") is None
+
+    def test_misspelled_name_not_repaired(self, repair):
+        # A misspelling is not decoration of the same name: fail as unknown.
+        repair.__self__.valid_tool_names = {"kanban_complete"}
+        assert repair("kanban_comlete") is None
+
 
 
 
@@ -119,9 +130,8 @@ class TestVolcEngineXmlPollution:
         assert repair("write file") == "write_file"
 
 
-    def test_leading_quote_falls_through_to_fuzzy_match(self, repair):
-        # Sanitizer only trims when the XML char is at idx > 0 — a
-        # name that *starts* with a quote is left untouched so the
-        # rest of the pipeline (fuzzy match at 0.7 cutoff) can still
-        # recover the obvious target.
+    def test_leading_quote_is_trimmed(self, repair):
+        # A name that *starts* with a quote has it trimmed as well,
+        # then the trailing quote is cut, so the obvious target is
+        # still recovered.
         assert repair('"terminal"') == "terminal"
