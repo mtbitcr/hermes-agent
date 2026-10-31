@@ -81,6 +81,41 @@ def test_the_pull_request_of_a_card_the_owner_replaced_is_closed_once_at_the_nex
     assert (gh["calls"], _events(kb, tid), _state(kb, head)) == (calls, events, "replaced")
 
 
+def test_the_pull_request_of_a_card_whose_carrier_the_owner_replaced_is_closed_once_at_the_next_arm_step(armed):
+    """The source card's review_followup_recorded event names the rework card that carries its change on from H,
+    with no pull request of its own; while that card carries it, the arm step closes nothing. Once the owner
+    replaced that card, the next arm step closes the pull request once, naming the replacement, which neither
+    continues H nor links to the source, and a second arm step sends nothing."""
+    from hermes_cli.kanban_delivery import arm_step
+
+    kb, root, repo, gh = armed
+    db = kb.kanban_db_path()
+    tid, head = _ready(armed)
+    conn = kb.connect()
+    try:
+        rework = kb.create_task(conn, title="rework", parents=[tid])
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET base_commit = ? WHERE id = ?", (head, rework))
+            kb._append_event(conn, tid, "review_followup_recorded", {"followup_task_id": rework})
+    finally:
+        conn.close()
+    arm_step(db)
+    assert _closes(gh) == []
+    replacement = _replace(kb, rework)
+
+    arm_step(db)
+
+    assert _closes(gh) == [CLOSE]
+    assert _state(kb, head) == "replaced"
+    assert _outcomes(kb, tid) == [("delivery_close_pending", 41, replacement, None),
+                                  ("delivery_replaced", 41, replacement, 200)]
+    calls, events = list(gh["calls"]), _events(kb, tid)
+
+    arm_step(db)
+
+    assert (gh["calls"], _events(kb, tid), _state(kb, head)) == (calls, events, "replaced")
+
+
 def test_a_refused_close_of_the_pull_request_of_a_replaced_card_reads_close_refused(armed):
     """GitHub refuses the close: the row reads close_refused, with GitHub's status, as a continuation's refused
     close does, and the close is not sent again."""
