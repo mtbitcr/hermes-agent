@@ -341,7 +341,7 @@ def _shown_in_titles_and_names(text):
 
 _REGISTERED_NAMES = [
     "ZAI", "Zhipu", "GLM", "Z.AI", "z-ai", "GMI", "Copilot", "Kimi", "Codex",
-    "Nemotron", "Moonshot AI", "Gemini", "Google", "Vertex AI",
+    "Nemotron", "Moonshot AI", "Gemini", "Vertex AI",
     "Amazon Bedrock", "AWS", "Azure", "OpenRouter", "Anthropic", "Claude",
     "OpenAI", "ChatGPT", "GPT", "DeepSeek", "Qwen", "Grok", "xAI", "x.ai",
     "MiniMax", "Mini-Max", "StepFun", "Xiaomi", "MiMo", "Nous Research",
@@ -378,7 +378,7 @@ def test_registered_model_and_provider_names_are_hidden_in_any_form(name):
 @pytest.mark.parametrize(
     "name",
     ["zai", "zhipu", "glm", "gmi", "copilot", "kimi", "codex", "nemotron", "gemini",
-     "google", "claude", "openai", "gpt", "qwen", "deepseek", "grok", "minimax",
+     "claude", "openai", "gpt", "qwen", "deepseek", "grok", "minimax",
      "bedrock"],
 )
 def test_names_are_hidden_in_lowercase_too(name):
@@ -427,6 +427,47 @@ def test_github_models_provider_aliases_stay_hidden(alias):
     shown = text.replace(alias, "GitHub")
     for kind in ("title", "project_name", "planner_prose"):
         assert check_owner_text(shown, kind) == shown, kind
+
+
+# The owner connects Google services such as Gmail, Calendar and Drive
+# themselves, so Google reads in any letter case.
+@pytest.mark.parametrize(
+    "name",
+    ["Google", "google", "GOOGLE", "Google Drive", "Google Calendar", "Gmail on Google"],
+)
+def test_google_is_readable_in_planner_prose_and_titles(name):
+    text = f"Check {name} for the invite."
+    for kind in ("planner_prose", "title"):
+        assert check_owner_text(text, kind) == text, kind
+    assert ow.owner_title(text) == text
+
+
+# Google's own model families and its AI platform stay hidden.
+@pytest.mark.parametrize(
+    "name",
+    ["Gemini", "gemini", "GEMINI", "Gemini 2.5 Pro", "Gemma", "gemma", "gemma-3",
+     "GCP", "gcp", "Vertex AI"],
+)
+def test_google_model_families_and_ai_platform_stay_hidden(name):
+    _refused_everywhere(f"Draft the invite with {name}.")
+
+
+# A model named through Google stays hidden: google in any letter case, then
+# a colon or a slash, with or without a space, then the model.
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Draft it with google/gemini-2.5-pro.",
+        "Draft it with Google / Gemma 3.",
+        "Draft it with GOOGLE/GEMINI.",
+        "Draft it with google:gemini-2.5-flash.",
+        "Draft it with Google: Gemma 3.",
+        "Draft it with GOOGLE : GEMINI.",
+    ],
+    ids=["slash", "slash-spaced", "slash-upper", "colon", "colon-spaced", "colon-upper"],
+)
+def test_a_model_named_through_google_stays_hidden(text):
+    _refused_everywhere(text)
 
 
 # Every line break the checker knows: the policy's "line_break".
@@ -579,6 +620,16 @@ def test_bare_web_addresses_are_refused_without_a_list_of_endings(text):
 )
 def test_a_github_com_web_address_stays_hidden(text):
     # GitHub reads as a name; its web addresses stay hidden by the address rules.
+    _refused_everywhere(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Read googleapis.com today", "Open https://www.googleapis.com/calendar/v3 today"],
+    ids=["bare-host", "full-address"],
+)
+def test_a_googleapis_com_web_address_stays_hidden(text):
+    # Google reads as a name; its web addresses stay hidden by the address rules.
     _refused_everywhere(text)
 
 
