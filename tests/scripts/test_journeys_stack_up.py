@@ -1586,6 +1586,39 @@ def test_5_new_owner_app_tag_recreates_the_owner_app_the_gateway_and_the_browser
             assert re.fullmatch(r"[0-9a-f]{64}", argv[-1])
 
 
+PLATFORM_REF = f"raphael-journeys-platform:{PLATFORM}"
+
+
+def test_5a_same_image_name_with_another_image_id_replaces_the_container(stack: Host) -> None:
+    """The dashboard keeps its image name, but its image id is no longer the reference's: it is made again."""
+    state = stack.state()
+    by_name = containers_by_name(state)
+    by_name[DASH_C]["image_id"] = state["images"][f"raphael-journeys-proxy:{PROXY_TAG}"]["id"]
+    stack.save(state)
+    before = container_ids(stack)
+    mark = stack.mark()
+    result = stack.converge()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert run_names(stack.docker_calls(mark)) == [DASH_C]
+    after = container_ids(stack)
+    assert after[DASH_C] != before[DASH_C]
+    assert {n: i for n, i in after.items() if n != DASH_C} == {n: i for n, i in before.items() if n != DASH_C}
+
+
+def test_5a2_same_image_name_whose_reference_image_is_missing_is_refused(stack: Host) -> None:
+    """The reference image has no record any more: the existing missing-image refusal, nothing changed."""
+    state = stack.state()
+    state["images"]["old"] = state["images"].pop(PLATFORM_REF)
+    stack.save(state)
+    before = stack.state()
+    mark = stack.mark()
+    result = stack.converge()
+    assert result.returncode != 0
+    assert f"the image {PLATFORM_REF} is missing; build it first; nothing was changed" in result.stderr
+    assert changing(stack.docker_calls(mark)) == []
+    assert stack.state() == before
+
+
 def test_5b_gateway_is_recreated_when_its_network_mode_does_not_name_the_current_owner_app(stack: Host) -> None:
     """Recovery after a failed converge: a gateway that joined an owner app that is gone is made again."""
     state = stack.state()
