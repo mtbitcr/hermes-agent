@@ -433,7 +433,8 @@ def test_github_models_provider_aliases_stay_hidden(alias):
 # themselves, so Google reads in any letter case.
 @pytest.mark.parametrize(
     "name",
-    ["Google", "google", "GOOGLE", "Google Drive", "Google Calendar", "Gmail on Google"],
+    ["Google", "google", "GOOGLE", "gOoGlE", "Google Drive", "Google Calendar",
+     "Gmail on Google"],
 )
 def test_google_is_readable_in_planner_prose_and_titles(name):
     text = f"Check {name} for the invite."
@@ -468,6 +469,41 @@ def test_google_model_families_and_ai_platform_stay_hidden(name):
 )
 def test_a_model_named_through_google_stays_hidden(text):
     _refused_everywhere(text)
+
+
+# A model named through Google stays hidden whatever it is called, also when
+# its name is listed nowhere.
+_GOOGLE_JOINTS = {
+    "colon": ":", "colon-space-after": ": ", "colon-space-before": " :",
+    "colon-spaced": " : ", "slash": "/", "slash-space-after": "/ ",
+    "slash-space-before": " /", "slash-spaced": " / ",
+}
+
+
+@pytest.mark.parametrize(
+    "joint", list(_GOOGLE_JOINTS.values()), ids=list(_GOOGLE_JOINTS)
+)
+@pytest.mark.parametrize(
+    "model",
+    ["palm-2", "codegemma-7b", "text-bison", "imagen-4", "veo-3",
+     "learnlm-1.5-pro-experimental"],
+)
+def test_any_model_named_through_google_stays_hidden(model, joint):
+    for google in ("google", "Google", "GOOGLE", "gOoGlE"):
+        _refused_everywhere(f"Draft it with {google}{joint}{model}.")
+
+
+# Google's AI provider and platform names stay hidden though Google reads:
+# Google AI Studio and Google Vertex, also as the provider aliases
+# google-ai-studio and google-vertex, and Google Cloud.
+@pytest.mark.parametrize(
+    "name",
+    ["Google AI Studio", "google-ai-studio", "Google Cloud", "Google Cloud Platform",
+     "google-vertex"],
+)
+def test_google_ai_provider_and_platform_names_stay_hidden(name):
+    for written in (name, name.upper(), name.lower()):
+        _refused_everywhere(f"I used {written} for your draft.")
 
 
 # Every line break the checker knows: the policy's "line_break".
