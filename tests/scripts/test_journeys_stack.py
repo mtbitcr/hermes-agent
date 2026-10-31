@@ -149,20 +149,17 @@ def primary_route(profile: str):
     return found[0]
 
 
-def test_stack_home_enables_the_owner_workspace_and_carries_the_admitted_route(tmp_path: Path, monkeypatch):
-    configs = {
-        "default": STACK_HOME / "config.yaml",
-        "raphael-planner": STACK_HOME / "profiles/raphael-planner/config.yaml",
-    }
-    def dig(node, *keys):
-        for key in keys:
-            node = node.get(key) if isinstance(node, dict) else None
-        return node
+def dig(node, *keys):
+    for key in keys:
+        node = node.get(key) if isinstance(node, dict) else None
+    return node
 
+
+def assert_admitted_routes(configs: dict, tmp_path: Path, monkeypatch) -> None:
+    """Each profile's config carries the policy's primary route and no fallback, and the plan commit admits it."""
     for profile, path in configs.items():
         config = yaml.safe_load(path.read_text())
         route = primary_route(profile)
-        assert dig(config, "gateway", "api_server", "owner_workspace", "enabled") is True, profile
         assert dig(config, "model", "provider") == route.provider, profile
         assert dig(config, "model", "default") == route.model, profile
         assert dig(config, "agent", "reasoning_effort") == route.reasoning_effort, profile
@@ -179,6 +176,24 @@ def test_stack_home_enables_the_owner_workspace_and_carries_the_admitted_route(t
         provider, model, effort, fallbacks_disabled = configured
         admitted = model_policy.validate_assignment(profile, provider, model, effort, disable_fallbacks=fallbacks_disabled)
         assert admitted == route, profile
+
+
+def test_stack_home_enables_the_owner_workspace_and_carries_the_admitted_route(tmp_path: Path, monkeypatch):
+    configs = {
+        "default": STACK_HOME / "config.yaml",
+        "raphael-planner": STACK_HOME / "profiles/raphael-planner/config.yaml",
+    }
+    for profile, path in configs.items():
+        config = yaml.safe_load(path.read_text())
+        assert dig(config, "gateway", "api_server", "owner_workspace", "enabled") is True, profile
+    assert_admitted_routes(configs, tmp_path, monkeypatch)
+
+
+def test_stack_home_gives_the_designer_the_admitted_route_as_the_planner_has_it(tmp_path: Path, monkeypatch):
+    """Without its route a plan for the designer is refused with invalid_model_route."""
+    assert_admitted_routes(
+        {"raphael-designer": STACK_HOME / "profiles/raphael-designer/config.yaml"}, tmp_path, monkeypatch
+    )
 
 
 def test_stack_home_holds_no_dotenv_and_no_values():

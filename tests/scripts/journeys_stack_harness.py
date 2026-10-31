@@ -41,10 +41,12 @@ PROXY_V = "raphael-journeys-proxy"
 STACK_VOLUMES = [HOME_V, TOKENS_V, PROXY_V]
 PROD_C = "raphael-workspace"
 # The owner app's Project and board. The slug is spelled like the production container's name but is platform
-# data, not a docker resource; the reset writes it twice as the platform's account (project, board metadata).
+# data, not a docker resource; the reset writes it three times as the platform's account (board store, project, board
+# metadata).
 ANCHOR = "raphael-workspace"
-ANCHOR_WRITES = 2
-# The two writes that need the platform's code, as reset_stack.sh sends them (a copy of its texts, so a change turns the focused tests red).
+ANCHOR_WRITES = 3
+# The three writes that need the platform's code, as reset_stack.sh sends them (a copy of its texts, so a change turns the focused tests red).
+BOARD_CREATE = ["hermes", "kanban", "boards", "create", ANCHOR]
 PROJECT_CREATE = ["hermes", "project", "create", "Raphael Workspace", "--slug", ANCHOR, "--board", ANCHOR]
 BOARD_SHELL = """\
 p=$PATH:
@@ -611,12 +613,13 @@ def redirect_targets(local):
 
 
 def is_anchor_call(container, interactive, user, cmd, stdin_bytes):
-    """The reset's Project call or its board write, whole: container, account, words and (for the board) input."""
+    """The reset's board store call, its Project call or its board write, whole: container, account, words and (for the
+    board write) input."""
     if container != DASH_C or user is None:
         return False
     if interactive:
         return cmd == BOARD_WRITE and stdin_bytes == BOARD_PROGRAM.encode()
-    return cmd == PROJECT_CREATE
+    return cmd in (BOARD_CREATE, PROJECT_CREATE)
 
 
 def d_exec(argv, args):
@@ -820,6 +823,13 @@ PROJECT_PROGRAM = (
     "top = argparse.ArgumentParser(prog='hermes')\n"
     "projects_cmd.build_parser(top.add_subparsers(dest='command'))\n"
     "sys.exit(projects_cmd.projects_command(top.parse_args(sys.argv[1:])))\n")
+# `hermes kanban boards create ...`: the platform's own parser and handler for the kanban commands.
+BOARD_CREATE_PROGRAM = (
+    "import argparse, sys\n"
+    "from hermes_cli import kanban\n"
+    "top = argparse.ArgumentParser(prog='hermes')\n"
+    "kanban.build_parser(top.add_subparsers(dest='command'))\n"
+    "sys.exit(kanban.kanban_command(top.parse_args(sys.argv[1:])))\n")
 
 
 def real_platform(program, *argv):
@@ -853,6 +863,14 @@ def hermes_main(args):
         sys.stdout.write(done.stdout)
         sys.stderr.write(done.stderr)
         return done.returncode
+    if args[:3] == ["kanban", "boards", "create"]:
+        if spec.get("board_fail") == "refused":
+            sys.stderr.write("fake hermes: board command failed\n")
+            return 2
+        done = real_platform(BOARD_CREATE_PROGRAM, *args)
+        sys.stdout.write(done.stdout)
+        sys.stderr.write(done.stderr)
+        return done.returncode
     if args[:1] == ["send"]:
         if "--to" not in args or args[-1].startswith("-"):
             sys.stderr.write("usage: hermes send --to PLATFORM TEXT\n")
@@ -883,7 +901,7 @@ FAKE_TOOLS_SOURCE = (
     + "".join("%s = %r\n" % (n, globals()[n])
               for n in ("F_IMAGE", "F_ENV_NAMES", "F_MOUNT_TYPES", "F_MOUNT_DEST", "F_STATE",
                         "F_HERMES_HOME", "F_HEALTH_KIND", "F_APP_SETTINGS", "TOKEN_VARS",
-                        "DASH_C", "PROJECT_CREATE", "BOARD_WRITE", "BOARD_PROGRAM"))
+                        "DASH_C", "BOARD_CREATE", "PROJECT_CREATE", "BOARD_WRITE", "BOARD_PROGRAM"))
     + "REPO_ROOT = %r\nREAL_PYC = %r\n" % (str(REPO), str(REAL_PYC))
     + FAKE_DOCKER
     + FAKE_PLATFORM

@@ -303,8 +303,9 @@ tokens_script=${tokens_script//@PLATFORM@/$platform_id}
 handover_script=${handover_script//@APP@/$app_id}
 
 # The owner app reads its Project, Connections and Automations through a Project of this slug and a board of the same
-# slug whose metadata names that Project's id. The program runs as the platform's runtime account, on the interpreter
-# that the first real hermes launcher on PATH names (the published image puts a shell shim first).
+# slug whose metadata names that Project's id. The board needs its store first: the dashboard refuses the owner app's
+# tokens while the board has none. The program runs as the platform's runtime account, on the interpreter that the
+# first real hermes launcher on PATH names (the published image puts a shell shim first).
 anchor=raphael-workspace
 anchor_program=$(
   cat <<'EOF'
@@ -363,6 +364,9 @@ tar -C "$stack_home" -cf - . | run_helper "$home_v" "$home_script" -i > /dev/nul
 say "starting $dash_c"
 docker start "$dash_c" > /dev/null || die "cannot start $dash_c"
 
+say "creating the store of the board $anchor"
+docker exec --user "$platform_id" "$dash_c" hermes kanban boards create "$anchor" > /dev/null 2>&1 ||
+  die "cannot create the store of the board $anchor"
 say "creating the Project $anchor and its board"
 docker exec --user "$platform_id" "$dash_c" hermes project create "Raphael Workspace" \
   --slug "$anchor" --board "$anchor" > /dev/null 2>&1 ||

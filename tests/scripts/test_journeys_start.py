@@ -1019,7 +1019,9 @@ PRODUCTION_C = "raphael-workspace"
 DASHBOARD_C = "raphael-journeys-dashboard"
 PLATFORM_ID = "999:999"  # what the fake docker answers when the reset asks who owns the platform home
 
-# The reset's one call that carries production's name, as data: the slug of the Project and of its board.
+# The reset's two calls that carry production's name, as data: the slug of the board whose store it creates, and the
+# slugs of the Project and of its board.
+RESET_BOARD_CREATE_CALL = ["exec", "--user", PLATFORM_ID, DASHBOARD_C, "hermes", "kanban", "boards", "create", PRODUCTION_C]
 RESET_PROJECT_CALL = [
     "exec", "--user", PLATFORM_ID, DASHBOARD_C, "hermes", "project", "create", "Raphael Workspace",
     "--slug", PRODUCTION_C, "--board", PRODUCTION_C,
@@ -1027,8 +1029,9 @@ RESET_PROJECT_CALL = [
 
 
 def touches_production(argv: list[str]) -> bool:
-    """Whether a docker call has production's name in any argument; only the reset's Project call, whole, is let by."""
-    return any(PRODUCTION_C in arg for arg in argv) and argv != RESET_PROJECT_CALL
+    """Whether a docker call has production's name in any argument; only the reset's board-create call and its Project
+    call, each whole, are let by."""
+    return any(PRODUCTION_C in arg for arg in argv) and argv not in (RESET_BOARD_CREATE_CALL, RESET_PROJECT_CALL)
 
 
 def test_the_real_isolation_check_and_reset_run_on_server_2_through_the_runner_identity(box):
@@ -1047,6 +1050,8 @@ def test_the_real_isolation_check_and_reset_run_on_server_2_through_the_runner_i
     assert local == [["exec", "raphael-workspace", "printenv", "RAPHAEL_ACCESS_ISSUER"]]
     # Server 2 parts: the stack's containers, never production's; the reset stopped and started them.
     assert [argv for argv in remote if touches_production(argv)] == []
+    # the two calls the guard lets by are the reset's own, and the board's store comes before the Project
+    assert remote.index(RESET_BOARD_CREATE_CALL) < remote.index(RESET_PROJECT_CALL)
     assert ["stop", "raphael-journeys-gateway"] in remote and ["start", "raphael-journeys-browser"] in remote
     assert [argv for argv in remote if argv[-2] == "tools/page-check/journey-run.sh"] == [
         [
@@ -1066,11 +1071,13 @@ def on_dashboard(
     return [verb, *options, target, *command]
 
 
+BOARD_CREATE_COMMAND = ["hermes", "kanban", "boards", "create", PRODUCTION_C]
 PROJECT_COMMAND = ["hermes", "project", "create", "Raphael Workspace", "--slug", PRODUCTION_C, "--board", PRODUCTION_C]
 # The board write sends its program, which names the slug, on standard input: the name is not in its arguments.
 BOARD_WRITE_COMMAND = ["sh", "-c", "an invented shell text", "sh"]
 
 RESETS_OWN_CALLS = {
+    "the_board_create_call": on_dashboard(*BOARD_CREATE_COMMAND),
     "the_project_call": on_dashboard(*PROJECT_COMMAND),
     "the_board_write_call": on_dashboard(*BOARD_WRITE_COMMAND, options=("-i", "--user", PLATFORM_ID)),
 }
@@ -1158,6 +1165,27 @@ REFUSED = {
     ),
     "project_call_as_one_joined_word": on_dashboard(" ".join(PROJECT_COMMAND)),
     "project_call_inside_a_shell_script": on_dashboard("sh", "-c", " ".join(PROJECT_COMMAND), "sh"),
+    # the reset's board-create call with its target, account, board or word order changed
+    "exec_target_with_the_resets_board_create_options_and_words": on_dashboard(*BOARD_CREATE_COMMAND, target=PRODUCTION_C),
+    "board_create_call_in_another_stack_container": on_dashboard(*BOARD_CREATE_COMMAND, target="raphael-journeys-gateway"),
+    "board_create_call_of_another_docker_command": on_dashboard(*BOARD_CREATE_COMMAND, verb="run"),
+    "board_create_call_as_another_account": on_dashboard(*BOARD_CREATE_COMMAND, options=("--user", "0:0")),
+    "board_create_call_without_the_user_option": on_dashboard(*BOARD_CREATE_COMMAND, options=()),
+    "board_create_call_with_an_extra_exec_option": on_dashboard(
+        *BOARD_CREATE_COMMAND, options=("-i", "--user", PLATFORM_ID)
+    ),
+    "board_create_call_with_a_board_that_starts_with_the_name": on_dashboard(
+        "hermes", "kanban", "boards", "create", f"{PRODUCTION_C}-2"
+    ),
+    "board_create_call_with_a_board_that_contains_the_name": on_dashboard(
+        "hermes", "kanban", "boards", "create", f"a-{PRODUCTION_C}-b"
+    ),
+    "board_create_call_with_its_words_in_another_order": on_dashboard(
+        "hermes", "kanban", "create", "boards", PRODUCTION_C
+    ),
+    "board_create_call_with_another_boards_subcommand": on_dashboard("hermes", "kanban", "boards", "rm", PRODUCTION_C),
+    "board_create_call_with_an_extra_word": on_dashboard(*BOARD_CREATE_COMMAND, "--switch"),
+    "board_create_call_as_one_joined_word": on_dashboard(" ".join(BOARD_CREATE_COMMAND)),
 }
 
 

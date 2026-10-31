@@ -23,6 +23,7 @@ from journeys_stack_harness import (
     ANCHOR,
     ANCHOR_WRITES,
     APP_C,
+    BOARD_CREATE,
     BOARD_PROGRAM,
     BOARD_WRITE,
     BROWSER_C,
@@ -286,7 +287,7 @@ def test_reset_order_of_stops_writes_and_starts(shared_reset: SharedReset):
     assert set(steps[:2]) == {("stop", GATE_C), ("stop", DASH_C)}
     assert set(steps[2:4]) == {("helper", HOME_V), ("helper", TOKENS_V)}
     assert steps[4] == ("start", DASH_C)
-    # the anchor Project and its board, then 5 tokens, 2 API server keys, 2 model tokens
+    # the anchor board's store, its Project and its board metadata, then 5 tokens, 2 API server keys, 2 model tokens
     assert steps[5:-6] == [("write", DASH_C)] * (ANCHOR_WRITES + 9)
     assert steps[-6] == ("helper", TOKENS_V)  # the token files go to the owner app before it restarts
     assert steps[-5:-2] == [("restart", APP_C), ("restart", DASH_C), ("start", GATE_C)]
@@ -349,6 +350,7 @@ ANCHOR_READ = (
     "meta = kanban_db.read_board_metadata(board_slug)\n"
     "print(json.dumps({'project': project and {'id': project.id, 'slug': project.slug, 'board': project.board_slug},\n"
     "                  'board_exists': kanban_db.board_exists(board_slug),\n"
+    "                  'store_exists': kanban_db.kanban_db_path(board_slug).is_file(),\n"
     "                  'meta': {'slug': meta.get('slug'), 'project_id': meta.get('project_id')}}))\n")
 
 
@@ -386,6 +388,12 @@ def test_reset_makes_the_project_the_app_binds_and_a_board_that_names_that_proje
     assert seen["meta"]["project_id"] == seen["project"]["id"]
 
 
+def test_reset_makes_the_store_of_the_board_the_app_binds(shared_reset: SharedReset, tmp_path: Path):
+    """Board metadata alone is no store: the dashboard refuses the owner app's tokens until the board's database exists."""
+    _project_slug, board_slug = bound_hermes_source()
+    assert read_anchor(shared_reset.host, tmp_path)["store_exists"], f"the reset made no store for the board {board_slug}"
+
+
 def test_reset_makes_the_project_and_board_before_it_issues_any_token(shared_reset: SharedReset):
     writers = writer_calls(shared_reset.host)
     issues = [i for i, call in enumerate(writers) if "kanban-workspace-token" in call["argv"]]
@@ -404,17 +412,25 @@ def project_command_gives(mode: str):
     return lambda host: host.update(lambda state: state["hermes"].update(project_fail=mode))
 
 
-# One operation broken per case: how to break it, and whether the Project was made before the reset stopped.
+def board_store_command_gives(mode: str):
+    return lambda host: host.update(lambda state: state["hermes"].update(board_fail=mode))
+
+
+# One operation broken per case: how to break it, and whether the board's store and the Project were made before the
+# reset stopped. The store comes first, so a refused store stops the reset before the Project. The stand-in's hermes
+# runs the platform's code on the home without the container's kanban folder pin, so that pin breaks only the board
+# metadata write, after the store and the Project.
 ANCHOR_BREAKS = {
-    "project-command-refused": (project_command_gives("refused"), False),
-    "project-command-makes-nothing": (project_command_gives("silent"), False),
-    "board-cannot-be-written": (board_root_is_a_file, True),
+    "board-store-refused": (board_store_command_gives("refused"), False, False),
+    "project-command-refused": (project_command_gives("refused"), True, False),
+    "project-command-makes-nothing": (project_command_gives("silent"), True, False),
+    "board-cannot-be-written": (board_root_is_a_file, True, True),
 }
 
 
 @pytest.mark.parametrize("name", ANCHOR_BREAKS)
 def test_reset_stops_before_any_token_when_the_project_or_its_board_cannot_be_made(host: Host, tmp_path: Path, name):
-    break_it, project_made = ANCHOR_BREAKS[name]
+    break_it, store_made, project_made = ANCHOR_BREAKS[name]
     break_it(host)
     hermes_gives(real_platform=True)(host)  # this test reads what the platform's code wrote, or could not write
     result = run_reset(host)
@@ -424,8 +440,8 @@ def test_reset_stops_before_any_token_when_the_project_or_its_board_cannot_be_ma
     done = [docker_target(c) for c in docker]
     assert not [step for step in done if step[0] == "restart"] and ("start", GATE_C) not in done
     seen = read_anchor(host, tmp_path)
-    assert (seen["project"] is not None) == project_made
-    assert not seen["board_exists"] and seen["meta"]["project_id"] is None
+    assert seen["store_exists"] == store_made and (seen["project"] is not None) == project_made
+    assert seen["meta"]["project_id"] is None
 
 
 # --- the stand-ins start the platform's code for the Project and board calls only where a test reads what it wrote
@@ -446,18 +462,22 @@ def create_project(name: str = "Raphael Workspace", slug: str = ANCHOR) -> list[
 
 def test_an_ordinary_reset_records_the_project_and_board_calls_whole_and_starts_no_platform_process_for_them(host: Host):
     reset_ok(host)
-    project, board = writer_calls(host)[:ANCHOR_WRITES]
+    # in this order: the board's store, the Project that names the board, the board metadata that names the Project
+    store, project, board = writer_calls(host)[:ANCHOR_WRITES]
+    assert store["argv"] == ["exec", *AS_PLATFORM, DASH_C, *BOARD_CREATE] and store["stdin"] is None
     assert project["argv"] == ["exec", *AS_PLATFORM, DASH_C, *PROJECT_CREATE] and project["stdin"] is None
     assert board["argv"] == ["exec", "-i", *AS_PLATFORM, DASH_C, *BOARD_WRITE]
     assert board["stdin"] == BOARD_PROGRAM.encode()
-    assert project["rc"] == 0 and board["rc"] == 0
-    # the five token issues start the hermes launcher; the Project call starts none, and no program is run from standard input
+    assert store["rc"] == 0 and project["rc"] == 0 and board["rc"] == 0
+    # the five token issues start the hermes launcher; the store and Project calls start none, and no program is run
+    # from standard input
     assert venv_starts(host) == [str(host.root / "ctr/venv/hermes")] * len(SURFACE_ENV)
 
 
-def test_the_shared_reset_that_the_anchor_tests_read_started_the_platforms_code_for_both_calls(shared_reset: SharedReset):
+def test_the_shared_reset_that_the_anchor_tests_read_started_the_platforms_code_for_all_three_calls(
+        shared_reset: SharedReset):
     launcher = str(shared_reset.host.root / "ctr/venv/hermes")
-    assert venv_starts(shared_reset.host) == [launcher, "-", *[launcher] * len(SURFACE_ENV)]
+    assert venv_starts(shared_reset.host) == [launcher, launcher, "-", *[launcher] * len(SURFACE_ENV)]
 
 
 PROJECT_NEAR_MISSES = {
@@ -471,6 +491,13 @@ BOARD_NEAR_MISSES = {
     "another-shell-text": ("-i", DASH_C, ["sh", "-c", "exit 42", "sh"], BOARD_PROGRAM),
     "another-program": ("-i", DASH_C, BOARD_WRITE, OTHER_PROGRAM),
     "another-container": ("-i", GATE_C, BOARD_WRITE, OTHER_PROGRAM),
+}
+STORE_NEAR_MISSES = {
+    "another-board": [*AS_PLATFORM, DASH_C, *BOARD_CREATE[:-1], "other-workspace"],
+    "without-the-account": [DASH_C, *BOARD_CREATE],
+    "another-container": [*AS_PLATFORM, GATE_C, *BOARD_CREATE],
+    "words-in-another-order": [*AS_PLATFORM, DASH_C, "hermes", "boards", "kanban", "create", ANCHOR],
+    "an-extra-word": [*AS_PLATFORM, DASH_C, *BOARD_CREATE, "--switch"],
 }
 
 
@@ -487,6 +514,13 @@ def test_a_board_write_that_is_not_the_resets_is_still_run_by_the_stand_in(host:
     option, container, command, program = BOARD_NEAR_MISSES[case]
     done = docker_by_hand(host, "exec", option, *AS_PLATFORM, container, *command, stdin=program)
     assert done.returncode == 42, done.stdout + done.stderr
+
+
+@pytest.mark.parametrize("case", STORE_NEAR_MISSES)
+def test_a_board_store_call_that_is_not_the_resets_is_still_run_by_the_stand_in(host: Host, case: str):
+    board_store_command_gives("refused")(host)  # the platform's own command is never reached: hermes answers 2 at once
+    done = docker_by_hand(host, "exec", *STORE_NEAR_MISSES[case])
+    assert done.returncode == 2 and "fake hermes: " in done.stderr, done.stdout + done.stderr
 
 
 # --- the platform's runtime identity and the owner app's identity are two different things
@@ -810,7 +844,7 @@ def test_reset_skips_the_model_token_with_one_value_free_line(host: Host, how: s
     assert len(skips) == 1 and "JOURNEY_MODEL_TOKEN_FILE" in skips[0]
     if env:
         assert env["JOURNEY_MODEL_TOKEN_FILE"] not in all_output(result)
-    # the anchor Project and its board, 5 tokens and 2 API server keys; no model token writes
+    # the anchor board's store, its Project and its board metadata, 5 tokens and 2 API server keys; no model token writes
     assert len(writer_calls(host)) == ANCHOR_WRITES + 7
 
 

@@ -17,7 +17,8 @@
 #            from, or "none" when the container does not exist. The app and browser tags are
 #            "<revision>-<12 hex of the CA hash>"; the dashboard and gateway tags are the platform commit.
 # build      Builds one image from scripts/journeys/images and prints one line "stack_up: built <role> <tag>".
-#            proxy: tag = first 12 hex of sha256 over synthetic_proxy.py followed by images/proxy.Dockerfile.
+#            proxy: tag = first 12 hex of sha256 over synthetic_proxy.py followed by images/proxy.Dockerfile. When
+#            that tag exists already it is kept, not built again, and the same line is printed.
 #            app and browser: need the running proxy container; the CA is copied out as ca.pem and the tag is
 #            "<revision>-<first 12 hex of sha256 of ca.pem>". The app image is raphael-journeys-app-base:<revision>
 #            (loaded by the caller) plus the CA layer.
@@ -300,12 +301,15 @@ docker_build() {
 
 proxy_hash() { cat "$proxy_source" "$images/proxy.Dockerfile" | sha256sum | cut -c1-12; }
 
+# build_proxy: an existing tag is kept, because a rebuild moves the tag to a new image and orphans the running proxy's.
 build_proxy() {
   local tag
   tag=$(proxy_hash)
-  mkdir "$work/proxy"
-  cp "$proxy_source" "$work/proxy/"
-  docker_build --tag "raphael-journeys-proxy:$tag" --file "$images/proxy.Dockerfile" "$work/proxy"
+  if ! exists image "$fmt_id" "raphael-journeys-proxy:$tag"; then
+    mkdir "$work/proxy"
+    cp "$proxy_source" "$work/proxy/"
+    docker_build --tag "raphael-journeys-proxy:$tag" --file "$images/proxy.Dockerfile" "$work/proxy"
+  fi
   say "built proxy $tag"
 }
 
