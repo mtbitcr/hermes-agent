@@ -31157,6 +31157,7 @@ def apply_owner_project_plan(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        captured = capture_worker(conn, task_id)
         # A removal: same in-predicate Gate B as a claim. The row leaves the
         # board only if the fence is open at an authoritative epoch.
         gate_sql, gate_params = fence_cas_conjunct(conn)
@@ -31179,6 +31180,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
         archive_recorded_review_followups(conn, task_id)
+    stop_after_commit(captured)
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
