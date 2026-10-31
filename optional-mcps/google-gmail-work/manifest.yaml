@@ -1,0 +1,28 @@
+# Maintained-fork admission of Google's official hosted Gmail MCP.
+# No third-party package or local process is involved.
+manifest_version: 1
+
+name: google-gmail-work
+description: >-
+  Mail, labels and drafts from your Gmail through Google's official hosted
+  connection.
+source: https://developers.google.com/workspace/gmail/api/reference/mcp
+
+transport:
+  type: http
+  url: https://gmailmcp.googleapis.com/mcp/v1
+
+auth:
+  type: oauth
+
+tools:
+  default_enabled:
+    - get_message
+    - get_thread
+    - list_drafts
+    - list_labels
+    - search_threads
+
+post_install: |
+  Sign in on Google's consent page. Raphael never asks you to paste a key or
+  token.
