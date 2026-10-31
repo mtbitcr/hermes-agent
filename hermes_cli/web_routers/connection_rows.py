@@ -96,6 +96,20 @@ def _status(sign_in_kind: str, enabled: bool, signed_in: bool) -> str:
     return "unknown" if sign_in_kind == "unknown" else "configured"
 
 
+def _saved_config() -> Dict[str, Any]:
+    """The scoped profile's config file exactly as saved; ``{}`` when missing, unreadable or malformed.
+
+    Never through ``load_config()``: that first initializes the home it reads
+    (directories, ``SOUL.md`` and their permissions), and this read changes nothing.
+    """
+    from hermes_cli.config import read_user_config_raw
+
+    try:
+        return read_user_config_raw()
+    except Exception:  # unreadable or malformed: no rows, and the file stays as it is
+        return {}
+
+
 def _read_profile(profile: str) -> List[Tuple[str, str, str, bool, bool]]:
     """``(name, transport, sign_in_kind, enabled, signed_in)`` per saved connection.
 
@@ -107,7 +121,7 @@ def _read_profile(profile: str) -> List[Tuple[str, str, str, bool, bool]]:
     try:
         with _profile_scope(profile):
             saved = []
-            for name, cfg in sorted(_get_mcp_servers().items()):
+            for name, cfg in sorted(_get_mcp_servers(_saved_config()).items()):
                 if profile == "default" and name in _REMOVED_ROOT_CONNECTIONS:
                     continue
                 summary = _mcp_server_summary(name, cfg)

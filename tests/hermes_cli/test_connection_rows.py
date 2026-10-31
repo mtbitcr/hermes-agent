@@ -14,6 +14,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -46,6 +47,8 @@ STATUSES = {"connected", "paused", "needs_authorization", "configured", "unknown
 OUTSIDER = "raphael-business"
 #: Owner decision of 2026-10-31: removed from the root profile, never a root row.
 REMOVED_FROM_ROOT = ("microsoft-personal", "github-bitcredit", "google-calendar-personal")
+#: The only path under the root home a read may create or change: the audit log it appends to.
+AUDIT_LOG = "logs/dashboard-auth.log"
 
 
 def _fake(label):
@@ -165,15 +168,37 @@ def _save_sign_in(home, name):
 
 
 def _saved_state(root):
-    """Every saved connection setting and sign-in under the root home: path -> bytes."""
+    """Every path under the root home, each profile home included, the root itself too.
+
+    path -> (type, permission mode, digest of a file's contents), so nothing it
+    holds is ever printed.
+    """
     state = {}
-    for path in sorted(root.rglob("*")):
-        rel = path.relative_to(root)
-        if path.is_dir() and path.name == "mcp-tokens":
-            state[f"{rel}/"] = b""
-        elif path.is_file() and (path.name in {"config.yaml", ".env"} or "mcp-tokens" in rel.parts):
-            state[str(rel)] = path.read_bytes()
+    for path in (root, *sorted(root.rglob("*"))):
+        info = path.lstat()
+        content = path.read_bytes() if stat.S_ISREG(info.st_mode) else None
+        if stat.S_ISLNK(info.st_mode):
+            content = str(path.readlink()).encode("utf-8")
+        digest = None if content is None else hashlib.sha256(content).hexdigest()
+        state[str(path.relative_to(root))] = (stat.S_IFMT(info.st_mode), stat.S_IMODE(info.st_mode), digest)
     return state
+
+
+def _changed_paths(before, after):
+    """Each path created, removed or changed, the audit log aside, as its path and modes only."""
+
+    def mode(entry):
+        if entry is None:
+            return "absent"
+        kind = "dir" if stat.S_ISDIR(entry[0]) else "link" if stat.S_ISLNK(entry[0]) else "file"
+        return f"{kind} {entry[1]:04o}"
+
+    changed = []
+    for rel in sorted(set(before) | set(after)):
+        was, now = before.get(rel), after.get(rel)
+        if rel != AUDIT_LOG and was != now:
+            changed.append(f"{rel}: {mode(was)} -> {mode(now)}" + (" (contents)" if mode(was) == mode(now) else ""))
+    return changed
 
 
 @pytest.fixture()
@@ -187,13 +212,20 @@ def home(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def saved(home):
-    """The saved connections and sign-ins of every profile, the outsider's included."""
+    """The saved connections and sign-ins of every profile, the outsider's included.
+
+    Only those: no profile home has its standard skeleton yet, and every
+    directory is 0755.
+    """
     servers = _servers()
     homes = {name: home if name == "default" else home / "profiles" / name for name in servers}
     for name, by_name in servers.items():
         _write_home(homes[name], by_name)
         for connection in SIGNED_IN.get(name, ()):
             _save_sign_in(homes[name], connection)
+    for path in (home, *home.rglob("*")):
+        if path.is_dir():
+            path.chmod(0o755)
     return _Quiet(root=home, homes=homes, servers=servers, secrets=_secrets(servers))
 
 
@@ -290,6 +322,15 @@ def _rows(dash):
     response = dash.call("connections")
     assert response.status_code == 200, response.text
     return response.json()["rows"]
+
+
+def _rows_changing_nothing(dash, root):
+    """The rows, read between two snapshots of the root home that differ in the audit log alone."""
+    before = _saved_state(root)
+    rows = _rows(dash)
+    changed = _changed_paths(before, _saved_state(root))
+    assert changed == [], "the read created, removed or changed a path in the root or a profile home"
+    return rows
 
 
 def _audit_text():
@@ -389,9 +430,10 @@ def test_agent_rows_are_read_only_and_owner_rows_are_not(dash, saved):
 
 def test_an_oauth_row_without_a_saved_sign_in_reads_needs_authorization(dash, saved):
     _router()
-    before = _saved_state(saved.root)
-    rows = _rows(dash)
-    assert _saved_state(saved.root) == before, "the read changed a saved connection or sign-in"
+    from hermes_cli.dashboard_auth import audit as audit_mod
+
+    assert audit_mod._resolve_log_path() == saved.root / AUDIT_LOG
+    rows = _rows_changing_nothing(dash, saved.root)
 
     status = {(row["profile"], row["name"]): row["status"] for row in rows}
     assert status[("default", "google-gmail-work")] == "needs_authorization"
@@ -407,14 +449,14 @@ def test_an_oauth_row_without_a_saved_sign_in_reads_needs_authorization(dash, sa
     servers = saved.servers["raphael-designer"]
     servers["claude-design"].pop("enabled")
     _write_home(designer, servers)
-    claude_design = {row["name"]: row for row in _rows(dash) if row["profile"] == "raphael-designer"}["claude-design"]
+    rows = _rows_changing_nothing(dash, saved.root)
+    claude_design = {row["name"]: row for row in rows if row["profile"] == "raphael-designer"}["claude-design"]
     assert (claude_design["enabled"], claude_design["status"]) == (True, "configured")
 
     (designer / "mcp-tokens" / "claude-design.json").unlink()
-    before = _saved_state(saved.root)
-    claude_design = {row["name"]: row for row in _rows(dash) if row["profile"] == "raphael-designer"}["claude-design"]
+    rows = _rows_changing_nothing(dash, saved.root)
+    claude_design = {row["name"]: row for row in rows if row["profile"] == "raphael-designer"}["claude-design"]
     assert claude_design["status"] == "needs_authorization"
-    assert _saved_state(saved.root) == before, "the read changed a saved connection or sign-in"
 
 
 # ---------------------------------------------------------------------------
