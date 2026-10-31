@@ -13,8 +13,12 @@ the newest over exactly as ``kanban_request_review`` does:
   in the review lane;
 * several saved patches: the newest by receipt order is handed over, and a
   patch id inside ``metadata`` is not read;
-* no saved patch: the worktree head is parked, as before; and
-* a run claimed from review: its own saved patch is never handed over.
+* no saved patch: the worktree head is parked, as before;
+* a run claimed from review: its own saved patch is never handed over;
+* a phantom ``created_cards`` entry is refused with the completion's own
+  answer before anything lands, and the corrected retry hands it over; and
+* ``merge_parent_heads`` merges an integration's exact parent heads before
+  the patch is applied, as it does when the call names the patch id.
 
 The worker side of every scenario runs in the exact environment the
 dispatcher gives the worker it launches: it is taken from
@@ -331,6 +335,106 @@ def worker_build(fenced_root, tmp_path, monkeypatch):
         conn.close()
 
 
+@pytest.fixture
+def integration_build(fenced_root, tmp_path, monkeypatch):
+    """A claimed Project-linked integration build, with this process as its worker.
+
+    Set up as ``worker_build`` is, except that the card belongs to a real
+    Project and integrates its parents' heads (``integrates_parent_heads``).
+    Its one mutating parent changed the owned module on its own branch and is
+    done, with a git head receipt the integration branch does not contain yet.
+    """
+    from hermes_cli import projects_db as pdb
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    monkeypatch.setattr(
+        model_policy, "reviewer_profile_ids", lambda: (REVIEWER,), raising=True,
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "--initial-branch=main")
+    (repo / OWNED).mkdir(parents=True)
+    (repo / MODULE).write_text(f"{BASE_LINE}\n", encoding="utf-8")
+    _git(repo, "add", MODULE)
+    _git(repo, "commit", "-m", "owned module", author=SEED_AUTHOR)
+    with pdb.connect_closing() as projects:
+        project_id = pdb.create_project(
+            projects, name="Integration project", primary_path=str(repo),
+        )
+    for slug in (SLUG, OTHER):
+        kb.create_board(slug)
+    with closing(kb.connect(board=OTHER)) as other:
+        kb.create_task(other, title="someone else's card", assignee="default")
+    for profile in (IMPLEMENTER, REVIEWER):
+        (fenced_root / "profiles" / profile).mkdir(parents=True)
+    board_db = fenced_root / "kanban" / "boards" / SLUG / "kanban.db"
+    conn = kb.connect(board=SLUG)
+    try:
+        # The parent commits its change on its own branch and completes; the
+        # kernel derives its head receipt from git.
+        parent = kb.create_task(
+            conn, title="parent build", assignee=IMPLEMENTER,
+            workspace_kind="worktree", workspace_path=str(repo),
+            branch_name="feature/parent", owned_paths=[OWNED],
+            project_id=project_id,
+        )
+        claimed = kb.claim_task(conn, parent)
+        assert claimed is not None
+        parent_workspace, parent_branch = kb._resolve_worktree_workspace(
+            claimed, board=SLUG,
+        )
+        parent_workspace = Path(parent_workspace)
+        kb.set_workspace_path(conn, parent, str(parent_workspace))
+        kb.set_branch_name(conn, parent, parent_branch)
+        kb.record_worktree_base(conn, parent, parent_workspace)
+        (parent_workspace / MODULE).write_text("value = 2\n", encoding="utf-8")
+        _git(parent_workspace, "add", MODULE)
+        _git(
+            parent_workspace, "commit", "-m", "parent change", author=WORKER_AUTHOR,
+        )
+        assert kb.complete_task(conn, parent, summary="changed the owned module")
+        parent_head = _git(
+            repo, "rev-parse", "--verify", f"refs/heads/{parent_branch}",
+        ).strip()
+
+        task_id = kb.create_task(
+            conn, title="integration that completes", assignee=IMPLEMENTER,
+            workspace_kind="worktree", workspace_path=str(repo),
+            branch_name=BRANCH, owned_paths=[OWNED], parents=[parent],
+            project_id=project_id, integrates_parent_heads=True,
+            requires_review=True,
+        )
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert claimed.project_id == project_id
+        assert claimed.integrates_parent_heads is True
+        workspace, branch, base = _launch_worker(
+            conn, claimed, fenced_root, tmp_path, monkeypatch,
+        )
+        # Read with plain SQL and git: the parent is done, its receipt is its
+        # branch head, and the integration branch does not contain it yet.
+        with closing(sqlite3.connect(board_db)) as raw:
+            row = raw.execute(
+                "SELECT status, head_commit FROM tasks WHERE id = ?", (parent,),
+            ).fetchone()
+        assert row == ("done", parent_head)
+        assert _git(repo, "merge-base", parent_head, base).strip() != parent_head
+        yield {
+            "conn": conn,
+            "task": task_id,
+            "run": claimed.current_run_id,
+            "repo": repo,
+            "workspace": workspace,
+            "branch": branch,
+            "base": base,
+            "root": fenced_root,
+            "parent": parent,
+            "parent_head": parent_head,
+        }
+    finally:
+        conn.close()
+
+
 def test_a_saved_patch_is_handed_over_when_complete_names_none(worker_build):
     """(a) The run's saved patch lands on the task branch and the card parks.
 
@@ -495,3 +599,150 @@ def test_a_run_claimed_from_review_hands_no_patch_over(
     changed = _git(build["repo"], "show", f"{build['branch']}:{MODULE}")
     assert changed == "value = 2\n"
     assert _patch_trailers(build) == []
+
+
+def test_a_phantom_created_card_blocks_the_handover_until_it_is_dropped(
+    worker_build,
+):
+    """(e) A phantom ``created_cards`` entry is refused before the patch lands.
+
+    The completion's own ``HallucinatedCardsError`` answer applies: the card
+    keeps running on its base and nothing is parked. The retry that drops the
+    phantom id hands the saved patch over.
+    """
+    from tools import kanban_tools as kt
+
+    build = worker_build
+    conn, task_id, run_id = build["conn"], build["task"], build["run"]
+    board_db = build["root"] / "kanban" / "boards" / SLUG / "kanban.db"
+    patch = _patch("value = 2")
+    patch_id = _upload(build, "planned-rework.patch", patch)
+    assert kb.saved_patch_ids_for_review(conn, task_id, run_id) == [patch_id]
+
+    out = json.loads(kt._handle_complete({
+        "summary": SUMMARY, "created_cards": ["t_deadbeef"],
+    }))
+
+    message = out.get("error") or ""
+    assert message.startswith(
+        "kanban_complete blocked: the following created_cards"
+    ), out
+    assert "t_deadbeef" in message
+    assert "ok" not in out and "handed_over_patch_attachment_id" not in out
+    task = kb.get_task(conn, task_id)
+    assert (task.status, task.current_run_id) == ("running", run_id)
+    # Read back with git and plain SQL: nothing was materialized, the card
+    # neither parked nor completed, and only the refusal's audit event landed.
+    assert _branch_head(build) == build["base"]
+    assert _git(build["workspace"], "status", "--porcelain") == ""
+    assert _count(board_db, "tasks", "id = ? AND status = 'running'", (task_id,)) == 1
+    assert _count(
+        board_db, "task_events",
+        "task_id = ? AND kind IN ('review_requested', 'completed')", (task_id,),
+    ) == 0
+    assert _count(
+        board_db, "task_events",
+        "task_id = ? AND kind = 'completion_blocked_hallucination'", (task_id,),
+    ) == 1
+    with closing(sqlite3.connect(board_db)) as raw:
+        (stored,) = raw.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()
+    assert "worktree_materialization" not in json.loads(stored or "{}")
+
+    out = json.loads(kt._handle_complete({"summary": SUMMARY, "created_cards": []}))
+
+    assert out.get("ok") is True, out
+    assert out["run_id"] == run_id
+    assert out["status"] == "review"
+    assert out["handed_over_patch_attachment_id"] == patch_id
+    assert kb.get_task(conn, task_id).status == "review"
+    changed = _git(build["repo"], "show", f"{build['branch']}:{MODULE}")
+    assert changed == _content_after(patch) == "value = 2\n"
+    assert _patch_trailers(build) == [f"Hermes-Patch-Attachment: {patch_id}"]
+    assert _count(board_db, "tasks", "id = ? AND status = 'review'", (task_id,)) == 1
+    assert _count(
+        board_db, "task_events", "task_id = ? AND kind = 'review_requested'", (task_id,),
+    ) == 1
+
+
+def _assert_parked_on_parent_and_patch(build: dict, patch: bytes, patch_id: int) -> None:
+    """The card is in review on a head that holds the parent head and the patch.
+
+    Read with git and plain SQL: the parent head is an ancestor of the task
+    branch, the branch holds what the patch says on top of the parent's line,
+    and the run's receipt names that head, the patch and the merged parent.
+    """
+    board_db = build["root"] / "kanban" / "boards" / SLUG / "kanban.db"
+    task_id, run_id, parent_head = build["task"], build["run"], build["parent_head"]
+    head = _branch_head(build)
+    assert _git(build["repo"], "merge-base", parent_head, head).strip() == parent_head
+    changed = _git(build["repo"], "show", f"{head}:{MODULE}")
+    assert changed == _content_after(patch) == "value = 3\n"
+    assert _patch_trailers(build) == [f"Hermes-Patch-Attachment: {patch_id}"]
+    assert _count(board_db, "tasks", "id = ? AND status = 'review'", (task_id,)) == 1
+    assert _count(
+        board_db, "task_events", "task_id = ? AND kind = 'review_requested'", (task_id,),
+    ) == 1
+    with closing(sqlite3.connect(board_db)) as raw:
+        (stored,) = raw.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()
+    materialized = json.loads(stored)["worktree_materialization"]
+    assert materialized["materialized_head"] == head
+    assert materialized["patch_attachment_id"] == patch_id
+    assert materialized["merged_parent_heads"] == [
+        {"task_id": build["parent"], "head_commit": parent_head},
+    ]
+
+
+def test_complete_merges_the_parent_heads_before_the_saved_patch(
+    integration_build,
+):
+    """(f) ``merge_parent_heads`` with no patch named: parent heads, then the patch.
+
+    The saved patch changes the line the parent wrote, so it applies only on
+    top of the parent's head.
+    """
+    from tools import kanban_tools as kt
+
+    build = integration_build
+    conn, task_id, run_id = build["conn"], build["task"], build["run"]
+    patch = _patch("value = 3", before="value = 2")
+    patch_id = _upload(build, "integration.patch", patch)
+    assert kb.saved_patch_ids_for_review(conn, task_id, run_id) == [patch_id]
+
+    out = json.loads(kt._handle_complete({
+        "summary": SUMMARY, "merge_parent_heads": True,
+    }))
+
+    assert out.get("ok") is True, out
+    assert out["run_id"] == run_id
+    assert out["status"] == "review"
+    assert out["handed_over_patch_attachment_id"] == patch_id
+    assert kb.get_task(conn, task_id).status == "review"
+    _assert_parked_on_parent_and_patch(build, patch, patch_id)
+
+
+def test_complete_with_an_explicit_patch_id_merges_the_parent_heads_too(
+    integration_build,
+):
+    """(g) The control for (f): the patch named explicitly lands the same way."""
+    from tools import kanban_tools as kt
+
+    build = integration_build
+    conn, task_id, run_id = build["conn"], build["task"], build["run"]
+    patch = _patch("value = 3", before="value = 2")
+    patch_id = _upload(build, "integration.patch", patch)
+
+    out = json.loads(kt._handle_complete({
+        "summary": SUMMARY, "merge_parent_heads": True,
+        "patch_attachment_id": patch_id,
+    }))
+
+    assert out.get("ok") is True, out
+    assert out["run_id"] == run_id
+    # The explicit id keeps its own path: no saved-patch handover answer.
+    assert "handed_over_patch_attachment_id" not in out
+    assert kb.get_task(conn, task_id).status == "review"
+    _assert_parked_on_parent_and_patch(build, patch, patch_id)
