@@ -76,6 +76,7 @@ from hermes_cli.kanban_delivery_fences import (
     _PASSING, TEST_JOB_STEPS, Decision, Policy, _required_check, decide_publish, load_policy,
 )
 from hermes_cli.kanban_delivery_owner_policy import combined_policy
+from hermes_cli.kanban_merge_gate import _carried_on_by
 
 logger = logging.getLogger(__name__)
 
@@ -1672,8 +1673,10 @@ def _replaced(conn: sqlite3.Connection, old_id: Optional[int] = None) -> list:
     published pull request is another one of the same repository. Finding 183: and each published
     row whose source card the owner replaced (:data:`_OWNER_REPLACEMENT`), which the card the owner
     named replaces, no link or pull request of it needed; a row a rework card continues keeps that
-    card. The row is still the latest on its pull request, and no close of it was sent; a merged row
-    is final (card 10's owner rule 2), and so is a row closed outside."""
+    card. Likewise each other published row whose source card names a card the owner replaced as one
+    that carries its change on (:func:`_carried_on_by`): that card's replacement, which carries the
+    change on now, replaces it. The row is still the latest on its pull request, and no close of it
+    was sent; a merged row is final (card 10's owner rule 2), and so is a row closed outside."""
     old, new, later, earlier = (_RECEIPT.format(name) for name in ("old", "new", "later", "earlier"))
     closable = ("old.pull_request_number IS NOT NULL AND (? IS NULL OR old.id = ?) "
                 "AND IFNULL(old.pull_request_state, '') NOT IN (?, ?) "
@@ -1697,9 +1700,21 @@ def _replaced(conn: sqlite3.Connection, old_id: Optional[int] = None) -> list:
         f"AND new.pull_request_number != old.pull_request_number AND {new} = {old} "
         f"WHERE {closable} GROUP BY old.id ORDER BY old.id", params)]
     continued, owner = {row["id"] for row in rows}, _OWNER_REPLACEMENT.format("old")
-    return rows + [dict(row) for row in conn.execute(
+    rows += [dict(row) for row in conn.execute(
         f"SELECT old.*, {old} AS repository, {owner} AS replaced_by FROM kanban_deliveries AS old "
         f"WHERE {owner} IS NOT NULL AND {closable} ORDER BY old.id", params) if row["id"] not in continued]
+    taken, carrier = {row["id"] for row in rows}, _OWNER_REPLACEMENT.format("carrier")
+    for row in conn.execute(f"SELECT old.*, {old} AS repository FROM kanban_deliveries AS old "
+                            f"WHERE {closable} ORDER BY old.id", params).fetchall():
+        if row["id"] in taken:
+            continue
+        for card in _carried_on_by(conn, row["source_task_id"]):
+            (replaced_by,) = conn.execute(f"SELECT {carrier} FROM (SELECT ? AS source_task_id) AS carrier",
+                                          (card,)).fetchone()
+            if replaced_by is not None:
+                rows.append({**dict(row), "replaced_by": replaced_by})
+                break
+    return rows
 
 
 def _approving_cards(conn: sqlite3.Connection, row: dict, read: tuple, returned: bool = False) -> list:
