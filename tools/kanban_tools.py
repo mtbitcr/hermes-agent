@@ -2030,6 +2030,16 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"or (2) create continuation tasks with parents=[{tid}] "
                     f"and keep this task alive."
                 )
+            if patch_attachment_id is None:
+                # No patch named: the run's newest saved patch goes to review
+                # exactly as kanban_request_review hands it over.
+                run_id = _worker_run_id(tid)
+                saved_patches = kb.saved_patch_ids_for_review(conn, tid, run_id)
+                if saved_patches:
+                    return _hand_saved_patch_to_review(
+                        kb, conn, tid, saved_patches[-1], summary or result,
+                        metadata, run_id,
+                    )
 
             try:
                 ok = kb.complete_task(
