@@ -2305,10 +2305,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
 
 def repair_tool_call(agent, tool_name: str) -> str | None:
-    """Repair a mismatched tool name (case, separators, CamelCase, ``_tool`` suffixes twice so
-    ``TodoTool_tool`` reduces fully) before aborting. Only the decoration of the same name is fixed,
-    so a call never turns into a different tool. Returns the repaired name if in valid_tool_names,
-    else None."""
+    """Repair a mismatched tool name (case, separators, CamelCase, a leading ``mcp__`` namespace,
+    ``_tool`` suffixes twice so ``TodoTool_tool`` reduces fully) before aborting. Only the decoration
+    of the same name is fixed, so a call never turns into a different tool. Returns the repaired name
+    if in valid_tool_names, else None."""
     if not tool_name:
         return None
     # VolcEngine api/plan leaks XML attribute fragments into tool_use.name (`terminal"
@@ -2341,7 +2341,16 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     normalized = _norm(tool_name)
     if normalized in agent.valid_tool_names:
         return normalized
-    cands: set[str] = {tool_name, lowered, normalized, _camel_snake(tool_name)}
+    # Claude-style models write built-in tools with the connection namespace (``mcp__tool_search``).
+    # The similarity step that used to absorb it is gone (it could pick a different tool), so strip
+    # the prefix once here; a loaded connection tool such as ``mcp__github__create_issue`` already
+    # returned above, and every candidate below must still equal a loaded name exactly.
+    names = [tool_name]
+    if lowered.startswith("mcp__") and len(tool_name) > len("mcp__"):
+        names.append(tool_name[len("mcp__"):])
+    cands: set[str] = set()
+    for name in names:
+        cands |= {name, name.lower(), _norm(name), _camel_snake(name)}
     for _ in range(2):  # strip trailing tool-suffix up to twice (TodoTool_tool needs it)
         extra: set[str] = set()
         for c in cands:
