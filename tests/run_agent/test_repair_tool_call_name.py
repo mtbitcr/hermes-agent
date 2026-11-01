@@ -135,3 +135,22 @@ class TestVolcEngineXmlPollution:
         # then the trailing quote is cut, so the obvious target is
         # still recovered.
         assert repair('"terminal"') == "terminal"
+
+
+class TestConnectionNamespacePrefix:
+    """Claude-style models write built-in tools with the connection namespace
+    (``mcp__tool_search``). The prefix is decoration of the same name, so it is
+    stripped once; only an exact loaded name is accepted."""
+
+    def test_prefixed_built_in_tool_is_repaired(self, repair):
+        repair.__self__.valid_tool_names = {"tool_describe", "tool_search"}
+        assert repair("mcp__tool_describe") == "tool_describe"
+        assert repair("MCP__Tool_Search") == "tool_search"
+
+    def test_prefixed_unloaded_tool_is_not_repaired(self, repair):
+        repair.__self__.valid_tool_names = {"kanban_create"}
+        assert repair("mcp__kanban_read") is None
+
+    def test_loaded_connection_tool_keeps_its_name(self, repair):
+        repair.__self__.valid_tool_names = {"mcp__github__create_issue"}
+        assert repair("mcp__github__create_issue") == "mcp__github__create_issue"
