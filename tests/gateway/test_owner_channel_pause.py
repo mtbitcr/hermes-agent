@@ -1,19 +1,21 @@
 """Pause of the owner's Telegram messages (gateway/owner_channel_pause.py).
 
-While paused, the chat the serving gateway's configuration (the root Hermes home's) names as the
-Telegram home channel gets no card notice from the kanban notifier and no scheduled report from
-``cron.scheduler._deliver_result``, whichever profile's job or worker sends it. A paused notice is
-not kept: its cursor advances without a failure, so nothing old is sent after the resume, even when
-the notifier first polls after it. A paused report is recorded failed ``route_refused`` and stays
-eligible for Send again, which is itself refused while paused and allowed after the resume; a pause
-that begins after the live try still stops the standalone fallback. A missing, unreadable or
-malformed pause file counts as not paused. Every other chat is served as before. The module is
-imported inside each test, so on a tree without it each test fails on its own. Chat ids, tokens and
-the report text are invented placeholders.
+While paused, the root profile's Telegram home channel (named by the root Hermes home's .env, else
+by its config.yaml; never by the process environment) gets no card notice from the kanban notifier
+and no scheduled report from ``cron.scheduler._deliver_result``, whichever profile's job or worker
+sends it. A paused notice is not kept: its cursor advances without a failure, so nothing old is
+sent after the resume, even when the notifier first polls after one or more pause windows. A paused
+report is recorded failed ``route_refused`` and stays eligible for Send again, which is itself
+refused while paused and allowed after the resume; a pause that begins after the live try still
+stops the standalone fallback. The pause file keeps the pause windows of the last 7 days; a missing,
+unreadable or malformed one counts as not paused. Every other chat is served as before. The module
+is imported inside each test, so on a tree without it each test fails on its own. Chat ids, tokens
+and the report text are invented placeholders.
 """
 
 import asyncio
 import json
+import time
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
 from unittest.mock import MagicMock, patch
@@ -76,7 +78,7 @@ class _Telegram:
 
 
 def _runner(adapter):
-    _name_home(get_default_hermes_root(), HOME_CHAT)  # the serving gateway's configuration on disk
+    _name_home(get_default_hermes_root(), HOME_CHAT)  # the root profile's Telegram home on disk
     runner = GatewayRunner.__new__(GatewayRunner)
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner.config = _gateway_config()
@@ -141,10 +143,11 @@ def _running_loop():
 
 @contextmanager
 def _transports(*, fake_router=True, fake_config=True):
-    """The gateway configuration above, a live router and a standalone sender that both deliver
-    every chat they are handed; yields the ``platform:chat`` each path was handed, in order. With
-    ``fake_router=False`` the real DeliveryRouter hands the live send to the adapter passed in; with
-    ``fake_config=False`` every configuration is read from disk."""
+    """The gateway configuration above, its Telegram home also named in the root config.yaml, a
+    live router and a standalone sender that both deliver every chat they are handed; yields the
+    ``platform:chat`` each path was handed, in order. With ``fake_router=False`` the real
+    DeliveryRouter hands the live send to the adapter passed in; with ``fake_config=False`` every
+    configuration is read from disk as the test wrote it."""
     handed = {"live": [], "standalone": []}
     router = MagicMock()
 
@@ -167,6 +170,7 @@ def _transports(*, fake_router=True, fake_config=True):
     router._deliver_to_platform = deliver_to_platform
     with ExitStack() as stack:
         if fake_config:
+            _name_home(get_default_hermes_root(), HOME_CHAT)
             stack.enter_context(patch("gateway.config.load_gateway_config", return_value=_gateway_config()))
         if fake_router:
             stack.enter_context(patch("gateway.delivery.DeliveryRouter", return_value=router))
@@ -340,7 +344,7 @@ def test_send_again_is_refused_while_paused_and_allowed_after_the_resume(monkeyp
     assert _resend_view(execution_id)["reason"] == "already_delivered"
 
 
-# --- the serving gateway's home, a pause begun mid-delivery, a notice first seen after the resume ---
+# --- the root profile's home, a pause begun mid-delivery, a notice first seen after the resume -----
 
 @pytest.mark.parametrize("paused", [True, False], ids=["paused", "unpaused"])
 @pytest.mark.parametrize("satellite_home", [None, OTHER_CHAT], ids=["satellite-names-no-home", "satellite-names-other"])
@@ -348,10 +352,10 @@ def test_satellite_report_to_the_serving_gateways_home_is_refused_while_paused(
     tmp_path, monkeypatch, satellite_home, paused,
 ):
     """Through the real multiplex ticker (``InProcessCronScheduler`` → ``cron.scheduler.tick`` →
-    ``_deliver_result``), the planning satellite's report to the chat the serving gateway's
-    configuration names as the Telegram home is refused ``route_refused`` while paused, whether
-    planning's own configuration names no home or another chat; that other chat is not the owner's
-    and is delivered. The route rule refuses an unrouted chat as before; unpaused, both go."""
+    ``_deliver_result``), the planning satellite's report to the chat the root profile's .env
+    names as the Telegram home is refused ``route_refused`` while paused, whether planning's own
+    configuration names no home or another chat; that other chat is not the owner's and is
+    delivered. The route rule refuses an unrouted chat as before; unpaused, both go."""
     from gateway import owner_channel_pause
     from tests.cron.test_cron_multiplex_shared_route_delivery import (
         OWNER_CHAT, STRAY_CHAT, _primary_adapter, _tick_planning_briefs,
@@ -360,7 +364,7 @@ def test_satellite_report_to_the_serving_gateways_home_is_refused_while_paused(
     root = tmp_path / "root"
     planning = root / "profiles" / "planning"
     root.mkdir()
-    # The serving gateway's own settings name OWNER_CHAT as its Telegram home, as /sethome writes it.
+    # The root profile's .env names OWNER_CHAT as its Telegram home, as /sethome writes it.
     (root / ".env").write_text(
         f"TELEGRAM_BOT_TOKEN=5550000000:placeholder-gateway-token\nTELEGRAM_HOME_CHANNEL={OWNER_CHAT}\n",
         encoding="utf-8",
@@ -403,6 +407,44 @@ def test_satellite_report_to_the_serving_gateways_home_is_refused_while_paused(
         assert sorted(primary.sent) == sorted([OWNER_CHAT, OTHER_CHAT])
         assert delivery_errors["owner-brief"] is None
         assert _profile_outcomes(planning, "owner-brief") == [("delivered", None)]
+
+
+@pytest.mark.parametrize("paused", [True, False], ids=["paused", "unpaused"])
+@pytest.mark.parametrize("path", ["standalone", "live"])
+@pytest.mark.parametrize("root_file", [".env", "config.yaml"], ids=["root-env", "root-config-yaml"])
+def test_root_profiles_home_decides_whatever_the_process_environment_names(monkeypatch, root_file, path, paused):
+    """The root profile names HOME_CHAT as its Telegram home in its .env, or in its config.yaml
+    while its .env has no home line; the process environment names OTHER_CHAT, as a worker's may.
+    Through the real ``_deliver_result`` on either path, HOME_CHAT is refused ``route_refused``
+    while paused and OTHER_CHAT is delivered; unpaused, both are delivered."""
+    from gateway import owner_channel_pause
+
+    root = get_default_hermes_root()
+    env = "TELEGRAM_BOT_TOKEN=5550000000:placeholder-gateway-token\n"
+    if root_file == ".env":
+        env += f"TELEGRAM_HOME_CHANNEL={HOME_CHAT}\n"
+    else:
+        _name_home(root, HOME_CHAT)
+    (root / ".env").write_text(env, encoding="utf-8")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "5550000001:placeholder-worker-token")
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", OTHER_CHAT)
+    if paused:
+        owner_channel_pause.pause()
+
+    job = {"id": "job-report", "name": "Daily report", "deliver": f"telegram:{HOME_CHAT},telegram:{OTHER_CHAT}"}
+    live = {"adapters": {Platform.TELEGRAM: MagicMock()}, "loop": _running_loop()} if path == "live" else {}
+    with _transports(fake_config=False) as handed, delivery_record.recording("exec-root-home", job["id"]):
+        error = scheduler._deliver_result(job, REPORT, **live)
+
+    expected = {"live": [], "standalone": []}
+    expected[path] = [f"telegram:{OTHER_CHAT}"] if paused else [f"telegram:{HOME_CHAT}", f"telegram:{OTHER_CHAT}"]
+    assert handed == expected
+    if paused:
+        assert "paused by the owner" in error
+        assert _outcomes("exec-root-home") == [("failed", "route_refused"), ("delivered", None)]
+    else:
+        assert error is None
+        assert _outcomes("exec-root-home") == [("delivered", None), ("delivered", None)]
 
 
 @pytest.mark.parametrize("paused", [True, False], ids=["paused", "unpaused"])
@@ -508,10 +550,45 @@ def test_notice_created_while_paused_is_dropped_by_the_first_poll_after_the_resu
     assert runner._kanban_sub_fail_counts == {}
 
 
+def test_notices_created_in_two_pause_windows_are_dropped_by_the_first_poll_after_both(tmp_path, monkeypatch):
+    """Two pause windows with no notifier poll between them: the first poll after the second
+    resume drops the home chat's notices from both windows, advancing both cursors without a
+    failure, while the other chat gets both; a notice created after the resume reaches the home
+    chat as before."""
+    from gateway import owner_channel_pause
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "pause.db"))
+    kb.init_db()
+    adapter = _Telegram()
+    runner = _runner(adapter)
+
+    owner_channel_pause.pause()
+    first = _completed_task(HOME_CHAT, OTHER_CHAT)
+    owner_channel_pause.resume()
+    owner_channel_pause.pause()
+    second = _completed_task(HOME_CHAT, OTHER_CHAT)
+    owner_channel_pause.resume()
+    _tick(monkeypatch, runner)
+
+    assert adapter.to(HOME_CHAT) == [], "nothing from either pause window after the resume"
+    assert _unseen(first, HOME_CHAT) == _unseen(second, HOME_CHAT) == [], "both cursors advance"
+    other = adapter.to(OTHER_CHAT)
+    assert len(other) == 2, "every other chat as before"
+    assert {task for task in (first, second) for text in other if task in text} == {first, second}
+    assert runner._kanban_sub_fail_counts == {}, "a dropped notice is no failure"
+
+    fresh = _completed_task(HOME_CHAT)
+    _tick(monkeypatch, runner)
+    [notice] = adapter.to(HOME_CHAT)
+    assert fresh in notice and first not in notice and second not in notice
+    assert runner._kanban_sub_fail_counts == {}
+
+
 def test_worker_environment_reads_the_root_pause_file_and_the_serving_gateways_home(tmp_path, monkeypatch):
     """A kanban worker's environment: its profile home, its board pinned, its task set, and its
-    own Telegram settings loaded into the process env. The module still reads the pause file in the
-    root Hermes home and the home chat the serving gateway's settings name, not the worker's."""
+    own Telegram settings, in its profile's files and loaded into the process env, naming
+    OTHER_CHAT as the home. The module still reads the pause file in the root Hermes home and the
+    home chat the root profile's files name, not the worker's."""
     from gateway import owner_channel_pause
 
     root = tmp_path / "root"
@@ -521,8 +598,15 @@ def test_worker_environment_reads_the_root_pause_file_and_the_serving_gateways_h
         f"TELEGRAM_BOT_TOKEN=5550000000:placeholder-gateway-token\nTELEGRAM_HOME_CHANNEL={HOME_CHAT}\n",
         encoding="utf-8",
     )
-    (root / "owner_channel_pause.json").write_text('{"paused": true}', encoding="utf-8")
-    (worker_home / "owner_channel_pause.json").write_text('{"paused": false}', encoding="utf-8")
+    _name_home(root, HOME_CHAT)
+    (worker_home / ".env").write_text(
+        f"TELEGRAM_BOT_TOKEN=5550000001:placeholder-worker-token\nTELEGRAM_HOME_CHANNEL={OTHER_CHAT}\n",
+        encoding="utf-8",
+    )
+    _name_home(worker_home, OTHER_CHAT)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    owner_channel_pause.pause()  # the owner's pause, in the root pause file
+    (worker_home / "owner_channel_pause.json").write_text('{"windows": []}', encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(worker_home))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "boards" / "ops" / "kanban.db"))
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "ops")
@@ -541,5 +625,76 @@ def test_worker_environment_reads_the_root_pause_file_and_the_serving_gateways_h
     assert owner_channel_pause.is_owner_home_chat("telegram", HOME_CHAT) is True
     assert owner_channel_pause.is_owner_home_chat("telegram", OTHER_CHAT) is False
     owner_channel_pause.resume()
-    assert json.loads((root / "owner_channel_pause.json").read_text(encoding="utf-8"))["paused"] is False
-    assert json.loads((worker_home / "owner_channel_pause.json").read_text(encoding="utf-8")) == {"paused": False}
+    assert owner_channel_pause.is_paused() is False
+    assert (root / "owner_channel_pause.json").is_file()
+    assert (worker_home / "owner_channel_pause.json").read_text(encoding="utf-8") == '{"windows": []}'
+
+
+# --- the pause windows -----------------------------------------------------------------------------
+
+def test_pause_and_resume_keep_the_pause_windows_of_the_last_seven_days():
+    """The pause file keeps every pause window of the last 7 days as ``[start, end]`` in time
+    order: a pause opens one, a resume closes it, a later pause or resume never changes a closed
+    one, and one that ended more than 7 days ago is dropped at the next write. A home-chat notice
+    created inside any kept window is dropped, and while paused every one is."""
+    from gateway import owner_channel_pause
+
+    _name_home(get_default_hermes_root(), HOME_CHAT)
+    day = 24 * 3600
+    now = int(time.time())
+    stale, recent = [now - 9 * day, now - 8 * day], [now - 2 * day, now - day]
+    _pause_file().write_text(json.dumps({"windows": [stale, recent]}), encoding="utf-8")
+
+    def windows():
+        return json.loads(_pause_file().read_text(encoding="utf-8"))["windows"]
+
+    def drops(created_at, chat_id=HOME_CHAT):
+        return owner_channel_pause.drops_notice("telegram", chat_id, created_at)
+
+    owner_channel_pause.resume()  # not paused: nothing to close
+    assert windows() == [stale, recent]
+
+    owner_channel_pause.pause()
+    kept, opened = windows()
+    assert kept == recent, "the window that ended more than 7 days ago is dropped; the recent one stays"
+    assert opened[0] >= now and opened[1] is None
+    owner_channel_pause.pause()  # already paused: nothing to open
+    assert windows() == [recent, opened]
+    assert owner_channel_pause.is_paused() is True
+    assert drops(now - 3 * day) is True, "while paused, an older notice is dropped too"
+
+    owner_channel_pause.resume()
+    kept, first = windows()
+    assert kept == recent and first[0] == opened[0] < first[1]
+    assert owner_channel_pause.is_paused() is False
+    owner_channel_pause.pause()
+    owner_channel_pause.resume()
+    kept, closed, second = windows()
+    assert [kept, closed] == [recent, first], "a later pause and resume never change a closed window"
+    assert first[1] <= second[0] < second[1], "in time order"
+
+    # A window holds its start but not its end; the last two may meet, so only their outer bounds.
+    for start, end in (recent, [first[0], second[1]]):
+        assert (drops(start - 1), drops(start), drops(end - 1), drops(end)) == (False, True, True, False)
+    assert drops(now - 3 * day) is False and drops(stale[0]) is False
+    assert drops(first[0], OTHER_CHAT) is False, "every other chat as before"
+
+
+@pytest.mark.parametrize("pause_file", ["missing", "unreadable", "malformed", "wrong-shape"])
+def test_missing_unreadable_or_malformed_pause_file_has_no_windows(pause_file):
+    """A missing, unreadable (a directory fails to read as root too), truncated or wrongly shaped
+    pause file reads as no windows without raising: not paused, and nothing is held."""
+    from gateway import owner_channel_pause
+
+    _name_home(get_default_hermes_root(), HOME_CHAT)
+    now = int(time.time())
+    if pause_file == "unreadable":
+        _pause_file().mkdir()
+    elif pause_file == "malformed":
+        _pause_file().write_text('{"windows": [[%d, nu' % now, encoding="utf-8")
+    elif pause_file == "wrong-shape":
+        _pause_file().write_text(json.dumps({"windows": [[str(now), None]]}), encoding="utf-8")
+
+    assert owner_channel_pause.is_paused() is False
+    assert owner_channel_pause.drops_notice("telegram", HOME_CHAT, now) is False
+    assert owner_channel_pause.refuses_report("telegram", HOME_CHAT) is False
