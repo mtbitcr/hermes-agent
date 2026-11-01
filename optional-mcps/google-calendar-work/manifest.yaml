@@ -1,0 +1,26 @@
+# Maintained-fork admission of Google's official hosted Calendar MCP.
+# No third-party package or local process is involved.
+manifest_version: 1
+
+name: google-calendar-work
+description: >-
+  Events and calendars from your Google Calendar through Google's official
+  hosted connection.
+source: https://developers.google.com/workspace/calendar/api/guides/configure-mcp-server
+
+transport:
+  type: http
+  url: https://calendarmcp.googleapis.com/mcp/v1
+
+auth:
+  type: oauth
+
+tools:
+  default_enabled:
+    - get_event
+    - list_calendars
+    - list_events
+
+post_install: |
+  Sign in on Google's consent page. Raphael never asks you to paste a key or
+  token.
