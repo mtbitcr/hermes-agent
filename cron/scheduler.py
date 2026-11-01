@@ -2662,7 +2662,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
                 )
                 continue
 
-        if owner_channel_pause.is_owner_home_chat(config, platform, chat_id) and owner_channel_pause.is_paused():
+        if owner_channel_pause.refuses_report(platform, chat_id):
             msg = f"platform '{platform_name}' home chat is paused by the owner"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
@@ -3169,6 +3169,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
                 target_errors.append(msg)
                 delivery_errors.extend(target_errors)
                 continue
+            if owner_channel_pause.refuses_report(platform, chat_id):  # read again: it may have begun since
+                recorder.note_failed("route_refused")  # an earlier try that may have sent keeps its outcome
+                delivery_errors.extend(target_errors + [f"platform '{platform_name}' home chat is paused by the owner"])
+                continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
             recorder.handing_over(cleaned_delivery_content)
             coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
@@ -3198,6 +3202,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
                     # again, and it keeps the unknown outcome recorded above.
                     target_errors.append(f"standalone delivery to {platform_name} failed after it started")
                     delivery_errors.extend(target_errors)
+                    continue
+                if owner_channel_pause.refuses_report(platform, chat_id):  # read again before the retry
+                    recorder.note_failed("route_refused")  # a first send that started keeps its unknown outcome
+                    delivery_errors.extend(target_errors + [f"platform '{platform_name}' home chat is paused by the owner"])
                     continue
                 # The thread-pool fallback can itself raise (SMTP ConnectionError,
                 # future.result timeout, etc.). An exception raised inside this

@@ -669,13 +669,12 @@ class GatewayKanbanWatchersMixin:
                             continue
                         from gateway import owner_channel_pause
 
-                        if owner_channel_pause.is_owner_home_chat(
-                            getattr(self, "config", None), plat, sub["chat_id"],
-                        ) and owner_channel_pause.is_paused():
+                        if owner_channel_pause.drops_notice(plat, sub["chat_id"], ev.created_at):
                             # The owner paused their Telegram messages: the home
-                            # chat's visible notice is skipped the same way and
-                            # not kept, so the cursor advances, no failure is
-                            # counted and nothing old is sent after the resume.
+                            # chat's visible notice, seen or created while paused,
+                            # is skipped the same way and not kept, so the cursor
+                            # advances, no failure is counted and nothing old is
+                            # sent after the resume.
                             continue
                         try:
                             _send_res = await adapter.send(
