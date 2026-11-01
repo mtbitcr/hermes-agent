@@ -4,7 +4,8 @@ A parent satisfies a child once it is done or archived. With delivery on, a chil
 whose owned paths overlap the parent's also waits until the parent's change has
 merged: the parent card, or a card that carries its change on, has a delivery row
 in state merged. A card's delivery_updated or review_followup_recorded event names
-the card that carries its change on; that chain is followed for at most eight links,
+the card that carries its change on, and the owner_project_plan_change event of an
+owner replace names the replacement; that chain is followed for at most eight links,
 and a card on it is never held by its own parent. With delivery off the delivery
 ledger is not read; a parent with no delivery row, also on a board opened without
 that ledger, satisfies the child at approval, as before, and a change that can never
@@ -22,23 +23,26 @@ import json
 import sqlite3
 
 _LINKS = 8  # as far as kanban_delivery_update._approved_base follows its chain
-_CARRIER_KEYS = {"delivery_updated": "update_task_id", "review_followup_recorded": "followup_task_id"}
+_CARRIER_KEYS = {"delivery_updated": "update_task_id", "review_followup_recorded": "followup_task_id",
+                 "owner_project_plan_change": "replacement_task_id"}
 
 
 def named_carrier(kind: str, record) -> str | None:
     """The card that a parent card's own ``kind`` record names as carrying its change on: the update_task_id of a
-    delivery_updated event or the followup_task_id of a review_followup_recorded event. No other card is one."""
+    delivery_updated event, the followup_task_id of a review_followup_recorded event or the replacement_task_id of
+    the owner_project_plan_change event of an owner replace. No other card is one."""
     key = _CARRIER_KEYS.get(kind)
     carrier = record.get(key) if key is not None and isinstance(record, dict) else None
     return carrier if isinstance(carrier, str) else None
 
 
 def _carried_on_by(conn: sqlite3.Connection, card: str) -> list[str]:
-    """The cards that ``card``'s own delivery_updated and review_followup_recorded events name."""
+    """The cards that ``card``'s own delivery_updated, review_followup_recorded and owner_project_plan_change
+    events name."""
     named = []
     for kind, payload in conn.execute(
         "SELECT kind, payload FROM task_events WHERE task_id = ? "
-        "AND kind IN ('delivery_updated', 'review_followup_recorded') ORDER BY id",
+        "AND kind IN ('delivery_updated', 'review_followup_recorded', 'owner_project_plan_change') ORDER BY id",
         (card,),
     ):
         try:

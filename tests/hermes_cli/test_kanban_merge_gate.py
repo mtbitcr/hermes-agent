@@ -141,6 +141,30 @@ def test_a_change_merged_through_its_update_card_releases_the_child(board):
         assert _status(conn, sibling) == "ready"
 
 
+def test_a_child_whose_parents_carrier_the_owner_replaced_waits_for_the_replacements_merge(board):
+    """The owner replaced the parent's update card as apply_owner_project_plan leaves it: a replacement with the
+    card's parents, and the card archived with an owner_project_plan_change event naming it as replacement_task_id.
+    The replacement carries the change on now, so the child waits until its change merged, and is then released."""
+    with kb.connect() as conn:
+        parent = _card(conn, "parent", ["src/a.py"])
+        update = _card(conn, "update", ["src/a.py"], parents=[parent])
+        sibling = _card(conn, "sibling", ["src/a.py"], parents=[parent])
+        _approved(conn, parent, "updated")
+        _carried_on_by(conn, parent, update)
+        replacement = _card(conn, "replacement", ["src/a.py"], parents=[parent])
+        assert kb.cas_transition_task(
+            conn, update, expected_status=_status(conn, update), expected_revision=kb.task_event_revision(conn, update),
+            to_status="archived", event_kind="owner_project_plan_change",
+            event_payload={"actor": "owner", "action": "replace", "replacement_task_id": replacement},
+        )["moved"] is True
+        kb.recompute_ready(conn)
+        assert _status(conn, sibling) == "todo"
+
+        _approved(conn, replacement, "merged")
+        kb.recompute_ready(conn)
+        assert _status(conn, sibling) == "ready"
+
+
 def test_with_delivery_off_children_start_at_approval(board):
     _delivery(board, enabled=False)
     with kb.connect() as conn:

@@ -116,12 +116,15 @@ _LEGACY_NAMES = _any_of(
 # an everyday word, because owner titles have always refused it in any case.
 # "github" is left out because the owner connects GitHub themselves (owner
 # decision of 2026-10-26); the provider aliases github-model and github-models
-# stay compound names.
+# stay compound names. "google" is left out because the owner connects Google
+# services such as Gmail, Calendar and Drive themselves; gemini, gemma and gcp
+# stay names, and a model named through Google, as in google:palm-2, stays
+# hidden by the "google_as_prefix" rule below.
 _NAMES = [
     "aci", "actualcomputer", "alibaba", "amazon", "anthropic", "arcee", "aws",
     "azure", "bedrock", "chatgpt", "claude", "codex", "commandcode", "copilot", "dashscope",
     "deepinfra", "deepseek", "devstral", "doubao", "gcp", "gemini", "gemma",
-    "glm", "gmi", "google", "gpt", "grok", "haiku", "hermes", "hf",
+    "glm", "gmi", "gpt", "grok", "haiku", "hermes", "hf",
     "huggingface", "kilocode", "kimi", "llama", "llamacpp", "mimo", "minimax",
     "mistral", "mixtral", "msl", "nebius", "nemotron", "novita", "nvidia",
     "o1", "o3", "o4", "ollama", "openai", "opencode", "openrouter", "opus",
@@ -131,7 +134,8 @@ _NAMES = [
 _COMPOUND_NAMES = [
     ["actual", "computer"], ["ai", "gateway"], ["arcee", "ai"], ["command", "code"],
     ["deep", "infra"], ["deep", "seek"], ["fireworks", "ai"], ["github", "model"],
-    ["github", "models"], ["gmi", "cloud"],
+    ["github", "models"], ["gmi", "cloud"], ["google", "ai", "studio"],
+    ["google", "cloud"], ["google", "vertex"],
     ["hugging", "face"], ["kilo", "code"], ["kilo", "gateway"], ["llama", "cpp"],
     ["meta", "ai"], ["mini", "max"], ["minimax", "ai"], ["model", "api"],
     ["moonshot", "ai"], ["muse", "spark"], ["nous", "portal"], ["nous", "research"],
@@ -304,6 +308,10 @@ _GROUPS = {
         "compound_name": _rule(
             f"(?<!{_ALNUM})(?:{'|'.join(_joined(words) for words in _COMPOUND_NAMES)})"
             f"{_NAME_END}"
+        ),
+        "google_as_prefix": _rule(
+            f"(?<!{_ALNUM}){_cased('google')}{_SPACE}*[/:]{_SPACE}*"
+            f"(?=[0-9A-Za-z{_STAND_IN_LETTER}\\u0660])"
         ),
         "everyday_word_capitalized_after_a_word": _rule(
             f"(?:[0-9A-Za-z{_STAND_IN_LETTER}\\u0660]{_GAP}+|{_STAND_IN})"
@@ -607,7 +615,7 @@ _CASES = [
     ("title", "Plan with Together AI", False),
     ("title", "Draft it with gemma-2", False),
     ("title", "Plan the trip together", True),
-    ("title", "Update the Google Calendar", False),
+    ("title", "Update the Google Calendar", True),
     ("title", "Book the fireworks for Friday", True),
     ("title", "Clean the feedback list", True),
     ("title", "Meet at 12:30 in room A", True),

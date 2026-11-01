@@ -169,6 +169,7 @@ fmt_name='{{.Name}}'
 fmt_id='{{.Id}}'
 fmt_ident='{{.Id}} {{if eq (index .Config.Labels "raphael-journeys.made-by") "stack_up"}}owned{{else}}foreign{{end}}'
 fmt_config_image='{{.Config.Image}}'
+fmt_image_id='{{.Image}}'
 fmt_network_mode='{{.HostConfig.NetworkMode}}'
 fmt_started='{{.State.StartedAt}}'
 fmt_state='{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}'
@@ -396,7 +397,7 @@ wait_for() {
 # plan NAME REF: need = create (no container), replace (another image) or keep; old_id is the container's id.
 need="" old_id=""
 plan() {
-  local have
+  local have have_id ref_id
   ident "$1"
   old_id=$found_id
   if [[ -z $old_id ]]; then
@@ -404,7 +405,12 @@ plan() {
     return 0
   fi
   have=$(docker inspect --type container --format "$fmt_config_image" "$old_id" 2> /dev/null) || have=""
-  if [[ $have == "$2" ]]; then need=keep; else need=replace; fi
+  need=replace
+  [[ $have == "$2" ]] || return 0
+  # Same name is not enough: a rebuilt tag or a removed image record leaves the container on an older image.
+  have_id=$(docker inspect --type container --format "$fmt_image_id" "$old_id" 2> /dev/null) || have_id=""
+  ref_id=$(docker inspect --type image --format "$fmt_id" "$2" 2> /dev/null) || ref_id=""
+  if [[ -n $ref_id && $have_id == "$ref_id" ]]; then need=keep; fi
 }
 
 # remove NAME: removes the container of that name by the id that this read returned with the label.
