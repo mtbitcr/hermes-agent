@@ -13,7 +13,7 @@ early (#97905; single-profile sibling report #88220).
 The invariant pinned here: ``next_run_at`` written during a foreign-process
 tick carries the JOB-OWNING profile's configured UTC offset.
 """
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -30,11 +30,8 @@ def _fresh_tz_cache(monkeypatch):
     hermes_time.reset_cache()
 
 
-def test_foreign_process_tick_persists_owning_profile_offset(
-    tmp_path, monkeypatch
-):
-    """next_run_at persisted during a multiplex tick uses the ticked
-    profile's timezone, not the backend process's."""
+def _create_job_in_foreign_process_tick(tmp_path, monkeypatch):
+    """Create ``0 14 * * *`` for an Eastern profile from a UTC backend process."""
     backend_home = tmp_path / "backend"  # desktop backend's own profile: UTC
     profile_a = tmp_path / "north-caribbean"  # job-owning profile: Eastern
     backend_home.mkdir()
@@ -49,7 +46,7 @@ def test_foreign_process_tick_persists_owning_profile_offset(
     monkeypatch.setenv("HERMES_HOME", str(backend_home))
 
     # Backend process resolves its own timezone first (process startup).
-    assert hermes_time.now().utcoffset() == datetime.now(
+    assert hermes_time.now().utcoffset() == hermes_time.datetime.now(
         ZoneInfo("UTC")
     ).utcoffset()
 
@@ -68,13 +65,54 @@ def test_foreign_process_tick_persists_owning_profile_offset(
             job = load_jobs()[0]
     finally:
         reset_hermes_home_override(token)
+    return job
 
+
+def _assert_owning_profile_offset(job):
     next_run = datetime.fromisoformat(job["next_run_at"])
-    expected_offset = datetime.now(ZoneInfo("America/New_York")).utcoffset()
+    # The owning profile's offset at the run's own moment: the clock may
+    # change between now and then, so "now" is the wrong reference.
+    expected_offset = next_run.astimezone(ZoneInfo("America/New_York")).utcoffset()
     assert next_run.utcoffset() == expected_offset, (
         f"next_run_at {job['next_run_at']} persisted with foreign offset "
         f"{next_run.utcoffset()} instead of the owning profile's "
         f"{expected_offset} — fires (offset delta) early (#97905)"
     )
+    # The foreign process zone (UTC) must stay distinct from the profile's.
+    assert expected_offset != timedelta(0)
     # And the wall clock honors the cron expression in the profile's zone.
     assert (next_run.hour, next_run.minute) == (14, 0)
+    return next_run
+
+
+def test_foreign_process_tick_persists_owning_profile_offset(
+    tmp_path, monkeypatch
+):
+    """next_run_at persisted during a multiplex tick uses the ticked
+    profile's timezone, not the backend process's."""
+    job = _create_job_in_foreign_process_tick(tmp_path, monkeypatch)
+    _assert_owning_profile_offset(job)
+
+
+def test_foreign_process_tick_offset_across_clock_change(tmp_path, monkeypatch):
+    """Fixed clock 2026-11-01 02:00Z: New York is still on EDT (-04:00) but the
+    next 14:00 run falls after the clock change, on EST (-05:00)."""
+    frozen = datetime(2026, 11, 1, 2, 0, tzinfo=timezone.utc)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen.astimezone(tz)
+
+    # hermes_time.now() is the clock create_job uses.
+    monkeypatch.setattr(hermes_time, "datetime", FrozenDatetime)
+
+    job = _create_job_in_foreign_process_tick(tmp_path, monkeypatch)
+    next_run = _assert_owning_profile_offset(job)
+
+    ny = ZoneInfo("America/New_York")
+    offset_now = FrozenDatetime.now(ny).utcoffset()
+    assert offset_now == timedelta(hours=-4)
+    assert next_run.utcoffset() == timedelta(hours=-5)
+    # Guard: "offset now" would be the wrong expectation in this window.
+    assert next_run.utcoffset() != offset_now
