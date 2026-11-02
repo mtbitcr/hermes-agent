@@ -73,6 +73,12 @@ def is_paused() -> bool:
     return _is_open(_windows())
 
 
+def paused_since() -> int | None:
+    """The start of the open pause window in whole seconds; None when not paused. Never raises."""
+    windows = _windows()
+    return windows[-1][0] if _is_open(windows) else None
+
+
 def pause() -> None:
     """Pause the owner's Telegram messages: open a window. A repeat while paused changes nothing."""
     windows = _windows()
@@ -113,6 +119,15 @@ def _owner_home_chat_id() -> str:
         except Exception:
             home = None
     return str(home) if home else ""
+
+
+def has_owner_home_chat() -> bool:
+    """True when the root profile names a Telegram home channel, found as ``_owner_home_chat_id``
+    finds it. Never raises."""
+    try:
+        return bool(_owner_home_chat_id())
+    except Exception:
+        return False
 
 
 def is_owner_home_chat(platform: Any, chat_id: Any) -> bool:
