@@ -15,7 +15,9 @@ from fastapi import APIRouter, HTTPException, Request
 from hermes_cli.dashboard_auth.token_auth import register_machine_token_family, register_token_route
 from hermes_cli.web_deps import late
 from hermes_cli.web_routers.mcp import (
+    _BUSINESS_PROFILE,
     _CLAUDE_DESIGN_CONNECTION,
+    _LINKEDIN_SHARE_CONNECTION,
     _audit_connections_machine_success,
     _enforce_connections_machine_profile,
 )
@@ -40,11 +42,16 @@ _ROUTE = "/api/mcp/connection-rows"
 _ROW_PROFILES = {
     "default": "owner",
     "raphael-designer": "designer",
+    "raphael-business": "business",
     "raphael-builder": "agent",
     "raphael-planner": "agent",
     "raphael-verifier": "agent",
     "raphael-claude-worker": "agent",
 }
+
+#: Profiles read for the named connections alone: any other connection saved
+#: there is never looked at and never becomes a row.
+_ROW_CONNECTIONS = {_BUSINESS_PROFILE: frozenset({_LINKEDIN_SHARE_CONNECTION})}
 
 #: Owner decision of 2026-10-31: the root profile holds only Gmail, Calendar and
 #: Google Drive Work. These were removed from it and never appear as root rows.
@@ -113,16 +120,20 @@ def _saved_config() -> Dict[str, Any]:
 def _read_profile(profile: str) -> List[Tuple[str, str, str, bool, bool]]:
     """``(name, transport, sign_in_kind, enabled, signed_in)`` per saved connection.
 
-    Nothing for a profile that does not exist on this host.
+    Only the named connections of a profile in ``_ROW_CONNECTIONS``. Nothing
+    for a profile that does not exist on this host.
     """
     from hermes_cli.mcp_catalog import server_enabled
     from hermes_cli.mcp_config import _get_mcp_servers, _oauth_tokens_present
 
+    only = _ROW_CONNECTIONS.get(profile)
     try:
         with _profile_scope(profile):
             saved = []
             for name, cfg in sorted(_get_mcp_servers(_saved_config()).items()):
                 if profile == "default" and name in _REMOVED_ROOT_CONNECTIONS:
+                    continue
+                if only is not None and name not in only:
                     continue
                 summary = _mcp_server_summary(name, cfg)
                 kind = _sign_in_kind(name, summary["transport"], summary["auth"])

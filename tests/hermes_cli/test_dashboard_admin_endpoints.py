@@ -293,6 +293,206 @@ class TestMcpEndpoints:
             if previous is None:
                 restore_registration(provider.name, provider, None)
 
+    def test_connections_machine_token_holds_linkedin_share_in_the_business_profile_only(
+        self, monkeypatch
+    ):
+        import asyncio
+
+        import yaml
+        from starlette.testclient import TestClient
+
+        from hermes_constants import get_hermes_home
+        from hermes_cli import mcp_catalog, web_server
+        from hermes_cli.mcp_config import _get_mcp_servers
+        from hermes_cli.dashboard_auth import register_provider
+        from hermes_cli.dashboard_auth.registry import (
+            restore_registration,
+            snapshot_registration,
+        )
+        from hermes_cli.web_routers.mcp import _register_connections_machine_routes
+        from plugins.dashboard_auth.raphael_workspace import (
+            ConnectionsManageTokenProvider,
+        )
+        from plugins.dashboard_auth.raphael_workspace import token_store
+        from tools.claude_design_oauth import CLAUDE_DESIGN_REDIRECT_URI
+
+        _register_connections_machine_routes()
+        hermes_home = get_hermes_home()
+        for name in ("raphael-business", "raphael-designer", "raphael-verifier"):
+            profile_home = hermes_home / "profiles" / name
+            profile_home.mkdir(parents=True)
+            (profile_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+        business_crm = {"url": "https://business-crm.mcp.example/mcp", "auth": "oauth"}
+        business_config = hermes_home / "profiles" / "raphael-business" / "config.yaml"
+        business_config.write_text(
+            yaml.safe_dump({"mcp_servers": {"business-crm": business_crm}}),
+            encoding="utf-8",
+        )
+
+        output_dir = hermes_home / "connections-business-boundary-test"
+        output_dir.mkdir(mode=0o700)
+        output_path = output_dir / "connections.token"
+        token_store.issue(
+            out_path=output_path,
+            surface=token_store.CONNECTIONS_SURFACE,
+        )
+        bearer = output_path.read_text(encoding="utf-8").strip()
+
+        provider = ConnectionsManageTokenProvider()
+        previous = snapshot_registration(provider.name)
+        if previous is None:
+            register_provider(provider)
+
+        # Nothing reaches the Worker or LinkedIn: the install's tool probe and
+        # the sign-in worker are local stand-ins.
+        monkeypatch.setattr(mcp_catalog, "_probe_tools", lambda _name: None)
+        started = []
+
+        def fake_worker(flow, _cfg):
+            started.append(flow)
+            asyncio.run(
+                flow.publish_authorization_url(
+                    "https://idp.example/authorize?state=synthetic-business"
+                )
+            )
+
+        monkeypatch.setattr(web_server, "_run_dashboard_mcp_oauth", fake_worker)
+
+        def business_servers():
+            return yaml.safe_load(business_config.read_text(encoding="utf-8"))[
+                "mcp_servers"
+            ]
+
+        business = {"profile": "raphael-business"}
+        callback = "https://workspace.example/api/mcp/oauth/callback/linkedin-share"
+        headers = {"Authorization": f"Bearer {bearer}"}
+        try:
+            with TestClient(web_server.app) as machine:
+                installed = machine.post(
+                    "/api/mcp/catalog/install",
+                    headers=headers,
+                    json={"name": "linkedin-share", **business},
+                )
+                assert installed.status_code == 200, installed.text
+                assert business_servers()["linkedin-share"]["url"] == (
+                    "https://linkedin-share.agentsbridge.net/mcp"
+                )
+
+                listed = machine.get(
+                    "/api/mcp/servers", headers=headers, params=business
+                )
+                assert listed.status_code == 200, listed.text
+                assert [server["name"] for server in listed.json()["servers"]] == [
+                    "business-crm",
+                    "linkedin-share",
+                ]
+                assert machine.get(
+                    "/api/mcp/servers",
+                    headers=headers,
+                    params={"profile": "raphael-verifier"},
+                ).status_code == 403
+
+                # The sign-in is the ordinary callback flow, never Claude
+                # Design's manual one.
+                signing_in = machine.post(
+                    "/api/mcp/servers/linkedin-share/auth",
+                    headers=headers,
+                    params=business,
+                    json={"redirect_uri": callback},
+                )
+                assert signing_in.status_code == 200, signing_in.text
+                assert signing_in.json()["status"] == "authorization_required"
+                assert "flow" not in signing_in.json()
+                [flow] = started
+                assert (flow.profile, flow.redirect_uri) == ("raphael-business", callback)
+                assert flow.redirect_uri != CLAUDE_DESIGN_REDIRECT_URI
+                assert machine.get(
+                    f"/api/mcp/oauth/flows/{flow.flow_id}", headers=headers
+                ).status_code == 200
+                assert machine.post(
+                    f"/api/mcp/oauth/flows/{flow.flow_id}/submit",
+                    headers=headers,
+                    json={"code": "synthetic-code#synthetic-business"},
+                ).status_code == 404
+                delivered = machine.get(
+                    "/api/mcp/oauth/callback/linkedin-share",
+                    headers=headers,
+                    params={"code": "synthetic-code", "state": "synthetic-business"},
+                )
+                assert delivered.status_code == 200, delivered.text
+                assert flow._callback == ("synthetic-code", "synthetic-business")
+
+                for enabled in (False, True):
+                    toggled = machine.put(
+                        "/api/mcp/servers/linkedin-share/enabled",
+                        headers=headers,
+                        json={"enabled": enabled, **business},
+                    )
+                    assert toggled.status_code == 200, toggled.text
+                    assert business_servers()["linkedin-share"]["enabled"] is enabled
+
+                for profile in (None, "default", "raphael-designer"):
+                    chosen = {"profile": profile} if profile else {}
+                    assert machine.post(
+                        "/api/mcp/catalog/install",
+                        headers=headers,
+                        json={"name": "linkedin-share", **chosen},
+                    ).status_code == 403, profile
+                    assert machine.post(
+                        "/api/mcp/servers/linkedin-share/auth",
+                        headers=headers,
+                        params=chosen,
+                        json={"redirect_uri": callback},
+                    ).status_code == 403, profile
+                    assert machine.put(
+                        "/api/mcp/servers/linkedin-share/enabled",
+                        headers=headers,
+                        json={"enabled": False, **chosen},
+                    ).status_code == 403, profile
+                    assert machine.delete(
+                        "/api/mcp/servers/linkedin-share",
+                        headers=headers,
+                        params=chosen,
+                    ).status_code == 403, profile
+
+                for other in ("claude-design", "google-drive-work"):
+                    assert machine.post(
+                        "/api/mcp/catalog/install",
+                        headers=headers,
+                        json={"name": other, **business},
+                    ).status_code == 403, other
+                assert machine.post(
+                    "/api/mcp/servers/business-crm/auth",
+                    headers=headers,
+                    params=business,
+                    json={
+                        "redirect_uri": (
+                            "https://workspace.example/api/mcp/oauth/callback/business-crm"
+                        )
+                    },
+                ).status_code == 403
+                assert machine.put(
+                    "/api/mcp/servers/business-crm/enabled",
+                    headers=headers,
+                    json={"enabled": False, **business},
+                ).status_code == 403
+                assert machine.delete(
+                    "/api/mcp/servers/business-crm", headers=headers, params=business
+                ).status_code == 403
+                assert len(started) == 1
+
+                removed = machine.delete(
+                    "/api/mcp/servers/linkedin-share", headers=headers, params=business
+                )
+                assert removed.status_code == 200, removed.text
+                assert business_servers() == {"business-crm": business_crm}
+                assert "linkedin-share" not in _get_mcp_servers()
+        finally:
+            for flow in started:
+                web_server._mcp_oauth_flows.pop(flow.flow_id, None)
+            if previous is None:
+                restore_registration(provider.name, provider, None)
+
     def test_delete_revokes_config_and_all_oauth_state(self):
         from hermes_cli.mcp_config import _get_mcp_servers
         from tools.mcp_oauth import HermesTokenStorage
