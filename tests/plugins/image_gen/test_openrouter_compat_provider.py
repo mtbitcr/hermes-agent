@@ -759,8 +759,9 @@ class TestImageApiSurface:
         from plugins.image_gen.openrouter import _IMAGE_API_MODELS, _build_providers
 
         by_name = {p.name: p for p in _build_providers()}
-        openrouter_ids = {m["id"] for m in by_name["openrouter"].list_models()}
-        nous_ids = {m["id"] for m in by_name["nous"].list_models()}
+        with patch("requests.get", side_effect=OSError("network down")):
+            openrouter_ids = {m["id"] for m in by_name["openrouter"].list_models()}
+            nous_ids = {m["id"] for m in by_name["nous"].list_models()}
         assert "openai/gpt-image-2" in openrouter_ids
         assert set(_IMAGE_API_MODELS) <= openrouter_ids
         assert not (set(_IMAGE_API_MODELS) & nous_ids)
