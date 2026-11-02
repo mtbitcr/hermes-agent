@@ -887,6 +887,17 @@ async def install_mcp_catalog_entry(
     _enforce_connections_machine_profile(
         request, name=name, profile=effective_profile
     )
+    principal = getattr(request.state, "token_principal", None)
+    if (
+        body.env
+        and getattr(request.state, "token_authenticated", False)
+        and getattr(principal, "principal", None) == CONNECTIONS_PRINCIPAL
+    ):
+        # Raphael Workspace always sends an empty env, and its connections
+        # credential is granted connections, never a profile's .env. Refusing
+        # any env before anything is written keeps it from rewriting another
+        # connection's key or a control in any profile.
+        raise HTTPException(status_code=403, detail="Forbidden")
     if body.env:
         def _write_env():
             with _profile_scope(effective_profile):

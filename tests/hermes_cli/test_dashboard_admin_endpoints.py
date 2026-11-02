@@ -493,6 +493,233 @@ class TestMcpEndpoints:
             if previous is None:
                 restore_registration(provider.name, provider, None)
 
+    @pytest.fixture
+    def connections_headers(self, monkeypatch):
+        """The native connections credential, over profiles that each hold a key.
+
+        The default, Designer and Business profiles each keep one existing
+        ``.env`` key, and the Business profile also a separately configured
+        ``business-crm`` connection. The install's tool probe is a local
+        stand-in, so nothing reaches the Worker or a provider.
+        """
+        import yaml
+
+        from hermes_constants import get_hermes_home
+        from hermes_cli import mcp_catalog
+        from hermes_cli.dashboard_auth import register_provider
+        from hermes_cli.dashboard_auth.registry import (
+            restore_registration,
+            snapshot_registration,
+        )
+        from hermes_cli.web_routers.mcp import _register_connections_machine_routes
+        from plugins.dashboard_auth.raphael_workspace import (
+            ConnectionsManageTokenProvider,
+        )
+        from plugins.dashboard_auth.raphael_workspace import token_store
+
+        _register_connections_machine_routes()
+        hermes_home = get_hermes_home()
+        designer = hermes_home / "profiles" / "raphael-designer"
+        business = hermes_home / "profiles" / "raphael-business"
+        for home in (designer, business):
+            home.mkdir(parents=True)
+        for home in (hermes_home, designer):
+            (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+        business_crm = {"url": "https://business-crm.mcp.example/mcp", "auth": "oauth"}
+        (business / "config.yaml").write_text(
+            yaml.safe_dump({"mcp_servers": {"business-crm": business_crm}}),
+            encoding="utf-8",
+        )
+        for home, key in (
+            (hermes_home, "REPORTS_API_KEY"),
+            (designer, "DESIGN_LIBRARY_API_KEY"),
+            (business, "BUSINESS_CRM_API_KEY"),
+        ):
+            (home / ".env").write_text(
+                f"{key}=placeholder-original\n", encoding="utf-8"
+            )
+
+        output_dir = hermes_home / "connections-env-boundary-test"
+        output_dir.mkdir(mode=0o700)
+        output_path = output_dir / "connections.token"
+        token_store.issue(
+            out_path=output_path,
+            surface=token_store.CONNECTIONS_SURFACE,
+        )
+        bearer = output_path.read_text(encoding="utf-8").strip()
+
+        provider = ConnectionsManageTokenProvider()
+        previous = snapshot_registration(provider.name)
+        if previous is None:
+            register_provider(provider)
+        monkeypatch.setattr(mcp_catalog, "_probe_tools", lambda _name: None)
+        try:
+            yield {"Authorization": f"Bearer {bearer}"}
+        finally:
+            if previous is None:
+                restore_registration(provider.name, provider, None)
+
+    @pytest.mark.parametrize(
+        ("payload", "params", "env"),
+        [
+            pytest.param(
+                {"name": "linkedin-share", "profile": "raphael-business"},
+                {},
+                {"BUSINESS_CRM_API_KEY": "placeholder-new"},
+                id="business-profile-in-body",
+            ),
+            pytest.param(
+                {"name": "linkedin-share"},
+                {"profile": "raphael-business"},
+                {"BUSINESS_CRM_API_KEY": "placeholder-new"},
+                id="business-profile-in-query",
+            ),
+            pytest.param(
+                {"name": "linkedin-share", "profile": "raphael-business"},
+                {},
+                {
+                    "BUSINESS_CRM_API_KEY": "placeholder-new",
+                    "HERMES_YOLO_MODE": "placeholder-new",
+                },
+                id="business-mixed-payload",
+            ),
+            pytest.param(
+                {"name": "linkedin-share", "profile": "raphael-business"},
+                {},
+                {"BUSINESS_CRM_API_KEY": ""},
+                id="business-empty-value",
+            ),
+            pytest.param(
+                {"name": "claude-design", "profile": "raphael-designer"},
+                {},
+                {"DESIGN_LIBRARY_API_KEY": "placeholder-new"},
+                id="designer-profile",
+            ),
+            pytest.param(
+                {"name": "google-drive-work"},
+                {},
+                {"REPORTS_API_KEY": "placeholder-new"},
+                id="default-profile",
+            ),
+        ],
+    )
+    def test_connections_machine_token_cannot_write_env_through_catalog_install(
+        self, connections_headers, payload, params, env
+    ):
+        import yaml
+        from starlette.testclient import TestClient
+
+        from hermes_constants import get_hermes_home
+        from hermes_cli import web_server
+
+        hermes_home = get_hermes_home()
+        profile = payload.get("profile") or params.get("profile")
+        home = hermes_home / "profiles" / profile if profile else hermes_home
+
+        def env_files():
+            return {
+                path: path.read_text(encoding="utf-8")
+                for path in hermes_home.rglob(".env")
+            }
+
+        def servers():
+            config = (home / "config.yaml").read_text(encoding="utf-8")
+            return yaml.safe_load(config).get("mcp_servers", {})
+
+        with TestClient(web_server.app) as machine:
+            before = env_files()
+            refused = machine.post(
+                "/api/mcp/catalog/install",
+                headers=connections_headers,
+                params=params,
+                json={**payload, "env": env},
+            )
+            assert refused.status_code == 403, refused.text
+            assert refused.json() == {"detail": "Forbidden"}
+            assert env_files() == before
+            assert payload["name"] not in servers()
+
+            # The profile rule allows this very request, so only its env was
+            # refused.
+            installed = machine.post(
+                "/api/mcp/catalog/install",
+                headers=connections_headers,
+                params=params,
+                json={**payload, "env": {}},
+            )
+            assert installed.status_code == 200, installed.text
+            assert payload["name"] in servers()
+            assert env_files() == before
+
+    def test_connections_machine_token_still_installs_with_an_empty_env(
+        self, connections_headers
+    ):
+        import yaml
+        from starlette.testclient import TestClient
+
+        from hermes_constants import get_hermes_home
+        from hermes_cli import web_server
+
+        business = get_hermes_home() / "profiles" / "raphael-business"
+        with TestClient(web_server.app) as machine:
+            installed = machine.post(
+                "/api/mcp/catalog/install",
+                headers=connections_headers,
+                json={"name": "linkedin-share", "profile": "raphael-business", "env": {}},
+            )
+
+        assert installed.status_code == 200, installed.text
+        config = yaml.safe_load((business / "config.yaml").read_text(encoding="utf-8"))
+        assert sorted(config["mcp_servers"]) == ["business-crm", "linkedin-share"]
+        assert (business / ".env").read_text(encoding="utf-8") == (
+            "BUSINESS_CRM_API_KEY=placeholder-original\n"
+        )
+
+    def test_dashboard_session_still_writes_env_through_catalog_install(
+        self, tmp_path, monkeypatch
+    ):
+        import yaml
+
+        from hermes_constants import get_hermes_home
+        from hermes_cli import mcp_catalog
+
+        catalog = tmp_path / "optional-mcps"
+        (catalog / "demo").mkdir(parents=True)
+        (catalog / "demo" / "manifest.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "manifest_version": 1,
+                    "name": "demo",
+                    "description": "Synthetic dashboard env fixture",
+                    "source": "https://example.test/demo",
+                    "transport": {"type": "stdio", "command": "demo-mcp"},
+                    "auth": {
+                        "type": "api_key",
+                        "env": [{"name": "DEMO_API_KEY", "prompt": "Demo API key"}],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_OPTIONAL_MCPS", str(catalog))
+        installs = []
+        monkeypatch.setattr(
+            mcp_catalog,
+            "install_entry",
+            lambda entry, enable=True: installs.append(entry.name),
+        )
+        env_path = get_hermes_home() / ".env"
+        env_path.write_text("DEMO_API_KEY=placeholder-original\n", encoding="utf-8")
+
+        response = self.client.post(
+            "/api/mcp/catalog/install",
+            json={"name": "demo", "env": {"DEMO_API_KEY": "placeholder-new"}},
+        )
+
+        assert response.status_code == 200, response.text
+        assert installs == ["demo"]
+        assert env_path.read_text(encoding="utf-8") == "DEMO_API_KEY=placeholder-new\n"
+
     def test_delete_revokes_config_and_all_oauth_state(self):
         from hermes_cli.mcp_config import _get_mcp_servers
         from tools.mcp_oauth import HermesTokenStorage
