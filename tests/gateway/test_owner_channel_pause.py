@@ -447,6 +447,35 @@ def test_root_profiles_home_decides_whatever_the_process_environment_names(monke
         assert _outcomes("exec-root-home") == [("delivered", None), ("delivered", None)]
 
 
+@pytest.mark.parametrize("config_yaml", ["missing", "unreadable", "malformed", "non-mapping"])
+def test_missing_unreadable_or_malformed_root_config_yaml_names_no_home_chat(monkeypatch, config_yaml):
+    """The root .env has no home line and the root config.yaml is missing, unreadable (a directory
+    fails to read as root too), truncated or not a mapping, while the worker's profile and the
+    process environment name HOME_CHAT: no chat is the owner home chat and nothing raises, so while
+    paused a report to HOME_CHAT is not refused and its notice is not dropped."""
+    from gateway import owner_channel_pause
+
+    root = get_default_hermes_root()
+    (root / ".env").write_text("TELEGRAM_BOT_TOKEN=5550000000:placeholder-gateway-token\n", encoding="utf-8")
+    config = root / "config.yaml"
+    if config_yaml == "unreadable":
+        config.mkdir()
+    elif config_yaml == "malformed":
+        config.write_text("platforms: {telegram: {home_channel: {chat_id: '%s'" % HOME_CHAT, encoding="utf-8")
+    elif config_yaml == "non-mapping":
+        section = {"platforms": {"telegram": {"home_channel": {"chat_id": HOME_CHAT}}}}
+        config.write_text(yaml.safe_dump([section]), encoding="utf-8")
+    worker_home = root / "profiles" / "coder"
+    _name_home(worker_home, HOME_CHAT)
+    monkeypatch.setenv("HERMES_HOME", str(worker_home))
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", HOME_CHAT)
+    owner_channel_pause.pause()
+
+    assert owner_channel_pause._owner_home_chat_id() == ""
+    assert owner_channel_pause.refuses_report("telegram", HOME_CHAT) is False
+    assert owner_channel_pause.drops_notice("telegram", HOME_CHAT, int(time.time())) is False
+
+
 @pytest.mark.parametrize("paused", [True, False], ids=["paused", "unpaused"])
 @pytest.mark.parametrize("live", ["scheduling_failed", "refused", "raised", "raised_in_flight"])
 def test_pause_begun_after_the_live_try_stops_the_standalone_fallback(live, paused):

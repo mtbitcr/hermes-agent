@@ -31,7 +31,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import yaml
 from dotenv import dotenv_values
 
 from utils import atomic_json_write
@@ -107,7 +106,9 @@ def _owner_home_chat_id() -> str:
         home = None
     if not home:
         try:
-            config = yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8"))
+            from hermes_cli.config import read_user_config_raw
+
+            config = read_user_config_raw(root / "config.yaml")
             home = config["platforms"]["telegram"]["home_channel"]["chat_id"]
         except Exception:
             home = None
