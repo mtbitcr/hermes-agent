@@ -13,7 +13,7 @@ import logging
 import os
 import re
 import stat
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -38,6 +38,11 @@ FLOOR_NOTE = (
 # the token never reaches an HTTP library's error text.
 _BEARER_TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
 
+# The one form start and end may take: YYYY-MM-DDTHH:MM:SSZ, whole seconds in
+# UTC and nothing else. Every other form is refused rather than read, so the
+# window checked and sent is exactly the window asked for.
+_UTC_DATE_TIME = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})Z")
+
 # One request, two aliased nodes over the same filter: the total, and the
 # visits per referrer host.
 _QUERY = """query {
@@ -56,14 +61,15 @@ _QUERY = """query {
 
 
 def _utc(value) -> datetime | None:
-    """Parse an ISO 8601 date-time in UTC ("Z" or "+00:00"); None otherwise."""
-    if not isinstance(value, str):
+    """Parse a date-time in exactly the form YYYY-MM-DDTHH:MM:SSZ; None for any
+    other form and for a date or time that does not exist."""
+    match = _UTC_DATE_TIME.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
         return None
     try:
-        moment = datetime.fromisoformat(value)
+        return datetime(*map(int, match.groups()), tzinfo=timezone.utc)
     except ValueError:
         return None
-    return moment if moment.utcoffset() == timedelta(0) else None
 
 
 def _rfc3339(moment: datetime) -> str:
@@ -105,27 +111,63 @@ def _read_token(token_file: str) -> str | None:
     return token if _BEARER_TOKEN.fullmatch(token) else None
 
 
+def _visits(row) -> int | None:
+    """A row's sum.visits when it is a JSON integer of 0 or more; None otherwise."""
+    group_sum = row.get("sum") if isinstance(row, dict) else None
+    visits = group_sum.get("visits") if isinstance(group_sum, dict) else None
+    # bool is a subclass of int: a JSON true must not count as one visit.
+    if isinstance(visits, bool) or not isinstance(visits, int) or visits < 0:
+        return None
+    return visits
+
+
+def _referer_host(row) -> str | None:
+    """A topReferers row's dimensions.refererHost, with null as ""; None when
+    the row holds no such string or null."""
+    dimensions = row.get("dimensions") if isinstance(row, dict) else None
+    if not isinstance(dimensions, dict) or "refererHost" not in dimensions:
+        return None
+    host = dimensions["refererHost"]
+    if host is None:
+        return ""
+    return host if isinstance(host, str) else None
+
+
 def _counts(response: httpx.Response) -> tuple[int, list[dict]] | None:
-    """(total visits, visits per referrer host) from a 200 answer without
-    GraphQL errors; None for any other answer."""
+    """(total visits, visits per referrer host) from a 200 answer in the one
+    accepted shape; None for any other answer.
+
+    The shape: errors absent or null; data.viewer.accounts a list of exactly
+    one object, which holds the lists total (zero or one row) and topReferers.
+    Every row has sum.visits, a JSON integer of 0 or more, and every
+    topReferers row has dimensions.refererHost, a string or null.
+    """
     if response.status_code != 200:
         return None
     try:
         payload = response.json()
-        if payload.get("errors"):
-            return None
-        account = payload["data"]["viewer"]["accounts"][0]
-        total = sum(int(group["sum"]["visits"]) for group in account["total"])
-        hosts = [
-            {
-                "host": str(group["dimensions"]["refererHost"] or ""),
-                "visits": int(group["sum"]["visits"]),
-            }
-            for group in account["topReferers"]
-        ]
-    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+    except (ValueError, RecursionError):  # not JSON, or nested too deep to decode
         return None
-    return total, hosts
+    if not isinstance(payload, dict) or payload.get("errors") is not None:
+        return None
+    data = payload.get("data")
+    viewer = data.get("viewer") if isinstance(data, dict) else None
+    accounts = viewer.get("accounts") if isinstance(viewer, dict) else None
+    if not isinstance(accounts, list) or len(accounts) != 1 or not isinstance(accounts[0], dict):
+        return None
+    total, referers = accounts[0].get("total"), accounts[0].get("topReferers")
+    if not isinstance(total, list) or len(total) > 1 or not isinstance(referers, list):
+        return None
+    visits = _visits(total[0]) if total else 0  # no total row: no visits
+    if visits is None:
+        return None
+    hosts = []
+    for row in referers:
+        host, host_visits = _referer_host(row), _visits(row)
+        if host is None or host_visits is None:
+            return None
+        hosts.append({"host": host, "visits": host_visits})
+    return visits, hosts
 
 
 def _is_linkedin(host: str) -> bool:
@@ -138,7 +180,8 @@ def website_visits(start, end) -> str:
     begin, finish = _utc(start), _utc(end)
     if begin is None or finish is None:
         return tool_error(
-            "start and end must be ISO 8601 UTC date-times, such as 2026-10-25T00:00:00Z."
+            "start and end must be UTC date-times in exactly the form YYYY-MM-DDTHH:MM:SSZ, "
+            "such as 2026-10-25T00:00:00Z."
         )
     if finish <= begin:
         return tool_error("end must be after start.")
@@ -202,13 +245,16 @@ WEBSITE_VISITS_SCHEMA = {
         "properties": {
             "start": {
                 "type": "string",
-                "description": "Window start, an ISO 8601 UTC date-time such as 2026-10-25T00:00:00Z.",
+                "description": (
+                    "Window start, a UTC date-time in exactly the form YYYY-MM-DDTHH:MM:SSZ, "
+                    "such as 2026-10-25T00:00:00Z."
+                ),
             },
             "end": {
                 "type": "string",
                 "description": (
-                    "Window end, an ISO 8601 UTC date-time after start and at most 31 days "
-                    "later, such as 2026-11-01T00:00:00Z."
+                    "Window end, a UTC date-time in exactly the form YYYY-MM-DDTHH:MM:SSZ, "
+                    "after start and at most 31 days later, such as 2026-11-01T00:00:00Z."
                 ),
             },
         },

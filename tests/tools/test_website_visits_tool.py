@@ -17,6 +17,11 @@ import yaml
 from hermes_constants import get_hermes_home
 
 NOT_SET_UP = "Website visits are not set up yet."
+BAD_FORM = (
+    "start and end must be UTC date-times in exactly the form YYYY-MM-DDTHH:MM:SSZ, "
+    "such as 2026-10-25T00:00:00Z."
+)
+NO_COUNTS_200 = "Cloudflare did not return visit counts (HTTP status 200)."
 TOKEN = "recorded-fake-token-5f3c9a1e7b2d"
 ACCOUNT_TAG = "4f9a2c7e1b3d5f6a8c0e2b4d6f8a0c1e"
 SITE_TAG = "9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a"
@@ -201,6 +206,21 @@ def test_window_without_visits_counts_zero(cloudflare, configured):
     assert (out["visits"], out["linkedin_visits"], out["hosts"]) == (0, 0, [])
 
 
+def test_null_host_and_absent_errors_are_counted(cloudflare, configured):
+    # Owner rule 1, section 2: refererHost may be null, errors may be absent.
+    answer = _recorded_answer(referrers=[(None, 640), ("www.linkedin.com", 120)])
+    del answer["errors"]
+    cloudflare.answer = _respond(200, json=answer)
+
+    out = _dispatch()
+
+    assert (out["visits"], out["linkedin_visits"]) == (RECORDED_TOTAL, 120)
+    assert out["hosts"] == [
+        {"host": "", "visits": 640},
+        {"host": "www.linkedin.com", "visits": 120},
+    ]
+
+
 # (b) ---------------------------------------------------------------------
 
 
@@ -310,6 +330,82 @@ def test_graphql_errors_answer_the_same_sentence_with_status_200(cloudflare, con
     assert "not authorized" not in out["error"]
 
 
+# Owner rule 1, section 2: the answer counts only in one shape. Each answer
+# below leaves that shape at one point, in total rows and topReferers rows
+# alike where the rule covers both.
+_ACCOUNT = _recorded_answer()["data"]["viewer"]["accounts"][0]
+_LEFT_OUT = object()
+
+
+def _answer_with_accounts(accounts):
+    return {"data": {"viewer": {"accounts": accounts}}, "errors": None}
+
+
+def _answer_with_node(name, value):
+    """The recorded answer with the account's ``name`` node set to ``value``,
+    or left out when ``value`` is _LEFT_OUT."""
+    account = {**_ACCOUNT, name: value}
+    if value is _LEFT_OUT:
+        del account[name]
+    return _answer_with_accounts([account])
+
+
+OTHER_ANSWER_SHAPES = {
+    # data.viewer.accounts is a list with exactly one object.
+    "accounts-missing": {"data": {"viewer": {}}, "errors": None},
+    "accounts-not-a-list": _answer_with_accounts(_ACCOUNT),
+    "no-account": _answer_with_accounts([]),
+    "two-accounts": _answer_with_accounts([_ACCOUNT, _ACCOUNT]),
+    "account-not-an-object": _answer_with_accounts([[_ACCOUNT]]),
+    # That object holds total and topReferers, and each is a list.
+    "total-missing": _answer_with_node("total", _LEFT_OUT),
+    "total-object": _answer_with_node("total", {}),
+    "total-string": _answer_with_node("total", ""),
+    "topReferers-missing": _answer_with_node("topReferers", _LEFT_OUT),
+    "topReferers-object": _answer_with_node("topReferers", {}),
+    "topReferers-string": _answer_with_node("topReferers", ""),
+    # total has zero or one row.
+    "two-total-rows": _recorded_answer(total=[{"sum": {"visits": 740}}] * 2),
+    # Each row is an object whose sum is an object whose visits is a JSON
+    # integer of 0 or more: never a boolean, a fraction or a string.
+    "total-row-not-an-object": _recorded_answer(total=[RECORDED_TOTAL]),
+    "total-sum-not-an-object": _recorded_answer(total=[{"sum": RECORDED_TOTAL}]),
+    "total-visits-boolean": _recorded_answer(total=[{"sum": {"visits": True}}]),
+    "total-visits-fraction": _recorded_answer(total=[{"sum": {"visits": 12.9}}]),
+    "total-visits-float": _recorded_answer(total=[{"sum": {"visits": 1480.0}}]),
+    "total-visits-negative": _recorded_answer(total=[{"sum": {"visits": -1}}]),
+    "total-visits-string": _recorded_answer(total=[{"sum": {"visits": "1480"}}]),
+    "referrer-row-not-an-object": _answer_with_node("topReferers", ["www.linkedin.com"]),
+    "referrer-sum-not-an-object": _answer_with_node(
+        "topReferers", [{"sum": 120, "dimensions": {"refererHost": "www.linkedin.com"}}]
+    ),
+    "referrer-visits-boolean": _recorded_answer(referrers=[("www.linkedin.com", True)]),
+    "referrer-visits-fraction": _recorded_answer(referrers=[("www.linkedin.com", 12.9)]),
+    "referrer-visits-float": _recorded_answer(referrers=[("www.linkedin.com", 120.0)]),
+    "referrer-visits-negative": _recorded_answer(referrers=[("www.linkedin.com", -1)]),
+    "referrer-visits-string": _recorded_answer(referrers=[("www.linkedin.com", "120")]),
+    # Each topReferers row has dimensions, an object whose refererHost is a
+    # string or null.
+    "dimensions-missing": _answer_with_node("topReferers", [{"sum": {"visits": 120}}]),
+    "host-object": _recorded_answer(referrers=[({"name": "www.linkedin.com"}, 120)]),
+    # errors is absent or null.
+    "errors-empty-list": {**_recorded_answer(), "errors": []},
+}
+
+
+@pytest.mark.parametrize("shape", list(OTHER_ANSWER_SHAPES))
+def test_answer_in_another_shape_gets_the_status_200_sentence(cloudflare, configured, shape):
+    cloudflare.answer = _respond(200, json=OTHER_ANSWER_SHAPES[shape])
+
+    assert _dispatch() == {"error": NO_COUNTS_200}
+
+
+def test_answer_too_deep_to_decode_gets_the_status_200_sentence(cloudflare, configured):
+    cloudflare.answer = _respond(200, text="[" * 100_000 + "]" * 100_000)
+
+    assert _dispatch() == {"error": NO_COUNTS_200}
+
+
 # (e) ---------------------------------------------------------------------
 
 # Every answer below carries the token in its body or exception text, so a
@@ -360,23 +456,8 @@ def test_refusal_logs_never_hold_the_token(cloudflare, configured, caplog):
         ("2026-01-01T00:00:00Z", "2026-03-01T00:00:00Z"),
         ("2026-11-01T00:00:00Z", "2026-10-25T00:00:00Z"),
         ("2026-10-25T00:00:00Z", "2026-10-25T00:00:00Z"),
-        ("2026-10-25", "2026-11-01"),
-        ("2026-10-25T00:00:00", "2026-11-01T00:00:00"),
-        ("2026-10-25T00:00:00+02:00", "2026-11-01T00:00:00+02:00"),
-        ("last week", "today"),
-        (None, END),
     ],
-    ids=[
-        "31-days-and-1-second",
-        "two-months",
-        "end-before-start",
-        "end-equals-start",
-        "dates-without-time",
-        "no-utc-designator",
-        "not-utc",
-        "not-iso-8601",
-        "missing-start",
-    ],
+    ids=["31-days-and-1-second", "two-months", "end-before-start", "end-equals-start"],
 )
 def test_bad_window_is_refused_before_any_call(cloudflare, configured, start, end):
     out = _dispatch(start, end)
@@ -385,18 +466,51 @@ def test_bad_window_is_refused_before_any_call(cloudflare, configured, start, en
     assert cloudflare.requests == []
 
 
+# Owner rule 1, section 1: start and end come only as YYYY-MM-DDTHH:MM:SSZ.
 @pytest.mark.parametrize(
     "start, end",
     [
-        ("2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z"),
+        ("2026-10-01X00:00:00Z", "2026-11-01T00:00:00Z"),
+        ("2026-10-25 00:00:00Z", "2026-11-01 00:00:00Z"),
         ("2026-10-25T00:00:00+00:00", "2026-11-01T00:00:00+00:00"),
+        ("2026-10-25T00:00:00+02:00", "2026-11-01T00:00:00+02:00"),
+        ("2026-10-25T00:00:00.000Z", "2026-11-01T00:00:00.000Z"),
+        ("2026-10-01T00:00:00Z", "2026-11-01T00:00:00.0000001Z"),
+        ("2026-10-25T00:00Z", "2026-11-01T00:00Z"),
+        ("2026-10-25", "2026-11-01"),
+        ("2026-10-25T00:00:00", "2026-11-01T00:00:00"),
+        ("2026-10-25T00:00:00Z\n", "2026-11-01T00:00:00Z\n"),
+        ("last week", "today"),
+        (None, END),
     ],
-    ids=["exactly-31-days", "utc-as-offset"],
+    ids=[
+        "other-separator",
+        "space-separator",
+        "utc-as-offset",
+        "not-utc",
+        "fractional-seconds",
+        "fraction-past-31-days",
+        "no-seconds",
+        "dates-without-time",
+        "no-utc-designator",
+        "trailing-newline",
+        "not-iso-8601",
+        "missing-start",
+    ],
 )
-def test_window_up_to_31_days_is_queried(cloudflare, configured, start, end):
+def test_other_form_is_refused_with_one_sentence_before_any_call(
+    cloudflare, configured, start, end
+):
+    assert _dispatch(start, end) == {"error": BAD_FORM}
+    assert cloudflare.requests == []
+
+
+def test_window_up_to_31_days_is_queried(cloudflare, configured):
+    start, end = "2026-10-01T00:00:00Z", "2026-11-01T00:00:00Z"
+
     out = _dispatch(start, end)
 
-    assert out["visits"] == RECORDED_TOTAL
+    assert (out["start"], out["end"], out["visits"]) == (start, end, RECORDED_TOTAL)
     assert len(cloudflare.requests) == 1
 
 
