@@ -5,13 +5,20 @@ set and whether owner messages are paused, ``PUT /api/owner-channel/paused``
 pauses or resumes them and ``POST /api/owner-channel/test`` sends one fixed
 test message. Only the owner app's connections credential is admitted, and
 every call writes one audit row. Every token and chat id is synthetic, and
-every send goes to a fake send function, never to Telegram.
+every send goes to a fake send function, or through the real one to a fake
+Telegram transport, never to Telegram.
 """
 
+import errno
 import importlib
 import importlib.util
 import json
+import os
+import subprocess
+import sys
+import time
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +35,9 @@ BOT_TOKEN = "8899988999:SyntheticOwnerChannelToken"
 HOME_NAME = "SyntheticOwnerName"
 #: A pause start with digits 1 to 4 only, none of them a digit of the home chat.
 PAUSE_START = 1234123412
+#: What a hosting profile and the process environment name; never the owner's home or token.
+OTHER_CHAT = "-12341234123412"
+OTHER_TOKEN = "1122334455:SyntheticHostingProfileToken"
 
 
 class _Quiet(SimpleNamespace):
@@ -37,14 +47,31 @@ class _Quiet(SimpleNamespace):
         return "<quiet>"
 
 
+class _Clock:
+    """The routes' clock in a test: it stands still until the test moves it."""
+
+    def __init__(self):
+        self.now = 1_000_000.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def _clock(monkeypatch, routes):
+    clock = _Clock()
+    monkeypatch.setattr(routes, "_now", clock)
+    return clock
+
+
 def _router(monkeypatch):
-    """The routes' module, asserted inside a test so its absence fails that test; no test
-    message has been answered or sent yet in this process."""
+    """The routes' module, asserted inside a test so its absence fails that test; its test state
+    lives in the per-test root home."""
     assert importlib.util.find_spec(ROUTER) is not None, f"{ROUTER} does not exist"
     module = importlib.import_module(ROUTER)
     module._register_owner_channel_routes()
-    monkeypatch.setattr(module, "_test_answers", {})
-    monkeypatch.setattr(module, "_last_test_sent", None)
     return module
 
 
@@ -73,18 +100,24 @@ def _sent_answer():
 
 
 @pytest.fixture()
-def home(tmp_path, monkeypatch):
-    """The root Hermes home the dashboard runs with; it names no Telegram home yet."""
+def home(tmp_path, monkeypatch, request):
+    """The root Hermes home; it names no Telegram home yet. The dashboard runs with it as its
+    HERMES_HOME or, parametrized ``"profile"``, with a profile home under it."""
     root = tmp_path / "hermes"
     root.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(root))
+    hermes_home = root
+    if getattr(request, "param", "root") == "profile":
+        hermes_home = root / "profiles" / "worker"
+        hermes_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
     return root
 
 
 @pytest.fixture()
 def sends(monkeypatch):
-    """Every call of the fake send function; ``answer`` sets what it returns or raises."""
+    """Every call of the fake send function; ``answer`` sets what it returns or raises, and
+    ``real`` is the real send function."""
     calls = []
     answer = {"do": _sent_answer}
 
@@ -92,8 +125,26 @@ def sends(monkeypatch):
         calls.append(dict(args))
         return answer["do"]()
 
+    real = importlib.import_module("tools.send_message_tool").send_message_tool
     monkeypatch.setattr("tools.send_message_tool.send_message_tool", fake)
-    return _Quiet(calls=calls, answer=answer)
+    return _Quiet(calls=calls, answer=answer, real=real)
+
+
+@pytest.fixture()
+def telegram(sends, monkeypatch):
+    """The real send function with only its final Telegram transport faked: ``deliveries``
+    holds the token, chat id and text of each delivery, and ``after`` runs once it is made."""
+    deliveries = []
+    after = {"do": lambda: None}
+
+    async def deliver(token, chat_id, message, **kw):
+        deliveries.append((token, chat_id, message))
+        after["do"]()
+        return {"success": True, "platform": "telegram", "chat_id": chat_id, "message_id": "4242"}
+
+    monkeypatch.setattr("tools.send_message_tool.send_message_tool", sends.real)
+    monkeypatch.setattr("tools.send_message_tool._send_telegram", deliver)
+    return _Quiet(deliveries=deliveries, after=after)
 
 
 @pytest.fixture()
@@ -174,6 +225,93 @@ def _audit_rows():
     return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
 
 
+def _call_and_audit(dash, method, path, **kwargs):
+    """One call with the connections credential, and the audit rows it wrote."""
+    before = len(_audit_rows())
+    response = dash.call("connections", method, path, **kwargs)
+    return response, [json.loads(row) for row in _audit_rows()[before:]]
+
+
+#: One POST of the test route served in a fresh Python process, as a second or restarted
+#: dashboard serves it: the same root home and credential, the repository on sys.path, and a
+#: fake send function that appends a line to a file, then answers sent or dies as a crash does.
+_ONE_POST_IN_A_FRESH_PROCESS = r'''
+import json
+import os
+import sys
+
+given = json.loads(sys.stdin.read())
+sys.path.insert(0, given["repo"])
+
+import tools.send_message_tool as send_tool
+
+
+def fake_send(args, **kw):
+    with open(given["sends"], "a", encoding="utf-8") as sends:
+        sends.write("sent\n")
+    if given["crash"]:
+        os._exit(70)
+    return json.dumps({"success": True, "message_id": "4242"})
+
+
+send_tool.send_message_tool = fake_send
+
+from fastapi.testclient import TestClient
+
+from hermes_cli import web_server
+from hermes_cli.dashboard_auth import register_provider
+from hermes_cli.dashboard_auth.registry import snapshot_registration
+from hermes_cli.web_routers import owner_channel
+from plugins.dashboard_auth.raphael_workspace import ConnectionsManageTokenProvider
+
+provider = ConnectionsManageTokenProvider()
+if snapshot_registration(provider.name) is None:
+    register_provider(provider)
+if given["now"] is not None:
+    owner_channel._now = lambda: given["now"]
+web_server.app.state.auth_required = False
+web_server.app.state.bound_host = None
+response = TestClient(web_server.app).post(
+    "/api/owner-channel/test",
+    json={"request_id": given["request_id"]},
+    headers={"Authorization": "Bearer " + given["bearer"]},
+)
+print("ANSWER " + json.dumps({"status": response.status_code, "body": response.json()}))
+'''
+
+
+def _post_test_in_a_fresh_process(dash, tmp_path, request_id, *, now=None, crash=False):
+    """Exit code, answer (``{"status", "body"}``, None when it died) and stderr of one POST in a
+    fresh process; ``now`` fixes its clock. The bearer goes in on stdin, never on a command line."""
+    given = {
+        "repo": str(Path(__file__).resolve().parents[2]),
+        "bearer": dash.connections,
+        "request_id": request_id,
+        "sends": str(tmp_path / "fresh-process-sends.txt"),
+        "now": now,
+        "crash": crash,
+    }
+    done = subprocess.run(
+        [sys.executable, "-c", _ONE_POST_IN_A_FRESH_PROCESS],
+        input=json.dumps(given),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=tmp_path,
+        env=dict(os.environ),
+        timeout=180,
+    )
+    answers = [line[len("ANSWER "):] for line in done.stdout.splitlines() if line.startswith("ANSWER ")]
+    return SimpleNamespace(
+        code=done.returncode, answer=json.loads(answers[-1]) if answers else None, stderr=done.stderr[-3000:]
+    )
+
+
+def _sends_by_fresh_processes(tmp_path):
+    sends = tmp_path / "fresh-process-sends.txt"
+    return len(sends.read_text(encoding="utf-8").splitlines()) if sends.exists() else 0
+
+
 # ---------------------------------------------------------------------------
 # 1. GET: three keys, never a token, chat id or user name
 # ---------------------------------------------------------------------------
@@ -220,7 +358,11 @@ def test_the_test_route_sends_the_fixed_text_once_through_the_send_function(dash
     assert response.json() == {"outcome": "sent", "reason": None}
     assert len(sends.calls) == 1
     (call,) = sends.calls
-    assert (call.get("action", "send"), call["target"], call["message"]) == ("send", "telegram", TEST_TEXT)
+    assert (call.get("action", "send"), call["target"], call["message"]) == (
+        "send",
+        f"telegram:{HOME_CHAT}",
+        TEST_TEXT,
+    )
     assert HOME_CHAT.lstrip("-") not in response.text
     assert "chat_id" not in response.text
 
@@ -240,14 +382,89 @@ def test_the_same_request_id_twice_sends_once_and_answers_the_same(dash, monkeyp
 def test_a_second_request_id_within_30_seconds_gets_429_and_no_send(dash, monkeypatch, sends):
     routes = _router(monkeypatch)
     _name_home(dash.root, ".env")
+    clock = _clock(monkeypatch, routes)
 
     assert _post_test(dash).json() == {"outcome": "sent", "reason": None}
     response = _post_test(dash)
     assert response.status_code == 429, response.text
     assert len(sends.calls) == 1
 
-    routes._last_test_sent -= 30
+    clock.advance(30)
     assert _post_test(dash).json() == {"outcome": "sent", "reason": None}
+    assert len(sends.calls) == 2
+
+
+def test_a_request_id_answered_409_while_paused_is_answered_409_again_after_resume(dash, monkeypatch, sends):
+    _router(monkeypatch)
+    _name_home(dash.root, ".env")
+    request_id = str(uuid.uuid4())
+    _put_paused(dash, True)
+    assert _post_test(dash, request_id).status_code == 409
+    _put_paused(dash, False)
+
+    response = _post_test(dash, request_id)
+    assert (response.status_code, response.json()) == (409, {"error": "paused"})
+    assert sends.calls == []
+    assert _post_test(dash).json() == {"outcome": "sent", "reason": None}
+
+
+def test_a_request_id_answered_429_is_answered_429_again_after_the_interval(dash, monkeypatch, sends):
+    routes = _router(monkeypatch)
+    _name_home(dash.root, ".env")
+    clock = _clock(monkeypatch, routes)
+    request_id = str(uuid.uuid4())
+    assert _post_test(dash).json() == {"outcome": "sent", "reason": None}
+    assert _post_test(dash, request_id).status_code == 429
+    clock.advance(31)
+
+    response = _post_test(dash, request_id)
+    assert (response.status_code, response.json()) == (429, {"error": "too_soon"})
+    assert len(sends.calls) == 1
+    assert _post_test(dash).json() == {"outcome": "sent", "reason": None}
+    assert len(sends.calls) == 2
+
+
+def test_the_interval_counts_from_when_a_slow_send_returns(dash, monkeypatch, sends):
+    routes = _router(monkeypatch)
+    _name_home(dash.root, ".env")
+    clock = _clock(monkeypatch, routes)
+
+    def slow_send():
+        clock.advance(31)
+        return _sent_answer()
+
+    sends.answer["do"] = slow_send
+    assert _post_test(dash).json() == {"outcome": "sent", "reason": None}
+    response = _post_test(dash)
+    assert response.status_code == 429, response.text
+    assert len(sends.calls) == 1
+
+
+def _skipped():
+    """What the real tool answers when it sends nothing because a cron job delivers there itself."""
+    return json.dumps({
+        "success": True,
+        "skipped": True,
+        "reason": "cron_auto_delivery_duplicate_target",
+        "target": f"telegram:{HOME_CHAT}",
+        "note": "SyntheticProviderText",
+    })
+
+
+def test_a_proven_non_send_does_not_use_up_the_interval(dash, monkeypatch, sends):
+    _router(monkeypatch)
+    assert _post_test(dash).json()["outcome"] == "not_sent"
+
+    _name_home(dash.root, ".env")
+    sends.answer["do"] = _skipped
+    response = _post_test(dash)
+    assert (response.status_code, response.json()["outcome"]) == (200, "not_sent")
+    assert "SyntheticProviderText" not in response.text
+    assert HOME_CHAT.lstrip("-") not in response.text
+
+    sends.answer["do"] = _sent_answer
+    response = _post_test(dash)
+    assert (response.status_code, response.json()) == (200, {"outcome": "sent", "reason": None})
     assert len(sends.calls) == 2
 
 
@@ -282,7 +499,7 @@ def _raises():
 
 @pytest.mark.parametrize(
     "answer, outcome",
-    [(_refused, "not_sent"), (_raises, "unknown"), (lambda: "not json", "unknown")],
+    [(_refused, "unknown"), (_raises, "unknown"), (lambda: "not json", "unknown")],
     ids=["refused", "raised", "unreadable"],
 )
 def test_a_failed_send_answers_a_fixed_reason_never_the_provider_text(dash, monkeypatch, sends, answer, outcome):
@@ -298,6 +515,99 @@ def test_a_failed_send_answers_a_fixed_reason_never_the_provider_text(dash, monk
     assert "SyntheticProviderText" not in response.text
     assert HOME_CHAT.lstrip("-") not in response.text
     assert len(sends.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# 2b. POST test across processes: restarts, a second process, a crash
+# ---------------------------------------------------------------------------
+
+
+def test_two_fresh_processes_with_the_same_request_id_send_once_and_answer_the_same(dash, tmp_path):
+    _name_home(dash.root, ".env")
+    request_id = str(uuid.uuid4())
+
+    first = _post_test_in_a_fresh_process(dash, tmp_path, request_id)
+    again = _post_test_in_a_fresh_process(dash, tmp_path, request_id)
+    sent = {"status": 200, "body": {"outcome": "sent", "reason": None}}
+    assert (first.code, first.answer) == (0, sent), first.stderr
+    assert (again.code, again.answer) == (0, sent), again.stderr
+    assert _sends_by_fresh_processes(tmp_path) == 1
+
+
+def test_a_fresh_process_within_30_seconds_of_a_send_gets_429_and_sends_nothing(dash, monkeypatch, sends, tmp_path):
+    _router(monkeypatch)
+    _name_home(dash.root, ".env")
+    before_the_send = time.time()
+    assert _post_test(dash).json() == {"outcome": "sent", "reason": None}
+
+    later = _post_test_in_a_fresh_process(dash, tmp_path, str(uuid.uuid4()), now=before_the_send + 29)
+    assert (later.code, later.answer) == (0, {"status": 429, "body": {"error": "too_soon"}}), later.stderr
+    assert _sends_by_fresh_processes(tmp_path) == 0
+    assert len(sends.calls) == 1
+
+
+def test_a_reservation_cut_off_by_a_crash_answers_unknown_and_never_sends(dash, monkeypatch, sends, tmp_path):
+    routes = _router(monkeypatch)
+    _name_home(dash.root, ".env")
+    request_id = str(uuid.uuid4())
+
+    crashed = _post_test_in_a_fresh_process(dash, tmp_path, request_id, crash=True)
+    assert (crashed.code, crashed.answer, _sends_by_fresh_processes(tmp_path)) == (70, None, 1), crashed.stderr
+
+    response = _post_test(dash, request_id)
+    assert (response.status_code, response.json()) == (200, {"outcome": "unknown", "reason": routes._UNKNOWN})
+    response = _post_test(dash)
+    assert response.status_code == 429, response.text
+    assert sends.calls == []
+    assert _sends_by_fresh_processes(tmp_path) == 1
+
+
+# ---------------------------------------------------------------------------
+# 2c. POST test through the real send function, only the Telegram transport faked
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("home", ["profile"], indirect=True)
+def test_the_test_message_goes_to_the_root_home_with_the_root_token(dash, monkeypatch, telegram):
+    _router(monkeypatch)
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+
+    hosting_profile = get_hermes_home()
+    assert (get_default_hermes_root(), hosting_profile.parent.name) == (dash.root, "profiles")
+    (hosting_profile / ".env").write_text(
+        f"TELEGRAM_BOT_TOKEN={OTHER_TOKEN}\nTELEGRAM_HOME_CHANNEL={OTHER_CHAT}\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", OTHER_TOKEN)
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", OTHER_CHAT)
+    _name_home(dash.root, ".env")
+
+    assert dash.call("connections", "GET", CHANNEL).json()["state"] == "ready"
+    response = _post_test(dash)
+    assert (response.status_code, response.json()) == (200, {"outcome": "sent", "reason": None})
+    assert len(telegram.deliveries) == 1
+    token, chat_id, text = telegram.deliveries[0]
+    assert (token == BOT_TOKEN, chat_id == HOME_CHAT, text == TEST_TEXT) == (True, True, True)
+
+
+def test_a_reply_lost_after_delivery_answers_unknown_and_uses_up_the_interval(dash, monkeypatch, telegram):
+    routes = _router(monkeypatch)
+    _name_home(dash.root, ".env")
+
+    def lose_the_reply():
+        raise TimeoutError(f"SyntheticProviderText: no reply for chat {HOME_CHAT}")
+
+    telegram.after["do"] = lose_the_reply
+    response = _post_test(dash)
+    assert (response.status_code, response.json()) == (200, {"outcome": "unknown", "reason": routes._UNKNOWN})
+    assert len(telegram.deliveries) == 1
+    state = (dash.root / "owner_channel_test.json").read_text(encoding="utf-8")
+    for text in (response.text, state):
+        assert "SyntheticProviderText" not in text
+        assert HOME_CHAT.lstrip("-") not in text and BOT_TOKEN not in text
+
+    response = _post_test(dash)
+    assert response.status_code == 429, response.text
+    assert len(telegram.deliveries) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -406,14 +716,16 @@ def test_every_call_writes_exactly_one_audit_row(dash, monkeypatch, sends):
 
     _name_home(dash.root, ".env")
     request_id = str(uuid.uuid4())
+    sent_id = str(uuid.uuid4())
     calls = [
         ("connections", "GET", CHANNEL, {}, 200),
         ("connections", "PUT", PAUSED, {"json": {"paused": True}}, 200),
         ("connections", "POST", TEST, {"json": {"request_id": request_id}}, 409),
         ("connections", "PUT", PAUSED, {"json": {"paused": "no"}}, 400),
         ("connections", "PUT", PAUSED, {"json": {"paused": False}}, 200),
-        ("connections", "POST", TEST, {"json": {"request_id": request_id}}, 200),
-        ("connections", "POST", TEST, {"json": {"request_id": request_id}}, 200),
+        ("connections", "POST", TEST, {"json": {"request_id": request_id}}, 409),
+        ("connections", "POST", TEST, {"json": {"request_id": sent_id}}, 200),
+        ("connections", "POST", TEST, {"json": {"request_id": sent_id}}, 200),
         ("connections", "POST", TEST, {"json": {"request_id": str(uuid.uuid4())}}, 429),
         ("connections", "POST", TEST, {"json": {"request_id": "not-a-uuid"}}, 400),
         ("workspace", "GET", CHANNEL, {}, 403),
@@ -442,3 +754,63 @@ def test_every_call_writes_exactly_one_audit_row(dash, monkeypatch, sends):
     text = "\n".join(_audit_rows())
     assert dash.connections not in text and dash.connections.split(".", 1)[1] not in text
     assert HOME_CHAT.lstrip("-") not in text
+
+
+def _no_space(*args, **kwargs):
+    raise OSError(errno.ENOSPC, "No space left on device (SyntheticFailureText)")
+
+
+def _fails(*args, **kwargs):
+    raise RuntimeError(f"SyntheticFailureText {HOME_CHAT}")
+
+
+def _row_kinds(rows):
+    return [(row["event"], row["decision"], row["status"]) for row in rows]
+
+
+@pytest.mark.parametrize("paused", [True, False], ids=["pause", "resume"])
+def test_a_storage_failure_on_pause_or_resume_answers_500_and_writes_one_audit_row(dash, monkeypatch, paused):
+    _router(monkeypatch)
+    from gateway import owner_channel_pause
+
+    pause_file = dash.root / "owner_channel_pause.json"
+    if not paused:
+        _put_paused(dash, True)
+    before = pause_file.read_bytes() if pause_file.exists() else None
+    monkeypatch.setattr(owner_channel_pause, "atomic_json_write", _no_space)
+
+    response, rows = _call_and_audit(dash, "PUT", PAUSED, json={"paused": paused})
+    assert (response.status_code, response.json()) == (500, {"error": "failed"})
+    assert _row_kinds(rows) == [("token_auth_failure", "deny", 500)]
+    assert owner_channel_pause.is_paused() == (not paused)
+    assert (pause_file.read_bytes() if pause_file.exists() else None) == before
+
+
+def test_a_failure_inside_get_answers_500_and_writes_one_audit_row(dash, monkeypatch):
+    _router(monkeypatch)
+    from gateway import owner_channel_pause
+
+    monkeypatch.setattr(owner_channel_pause, "paused_since", _fails)
+    response, rows = _call_and_audit(dash, "GET", CHANNEL)
+    assert (response.status_code, response.json()) == (500, {"error": "failed"})
+    assert _row_kinds(rows) == [("token_auth_failure", "deny", 500)]
+
+
+@pytest.mark.parametrize("state", ["unwritable", "not-json", "wrong-shape"])
+def test_a_test_state_that_cannot_be_kept_answers_500_sends_nothing_and_writes_one_audit_row(
+    dash, monkeypatch, sends, state
+):
+    routes = _router(monkeypatch)
+    _name_home(dash.root, ".env")
+    state_file = dash.root / "owner_channel_test.json"
+    if state == "unwritable":
+        monkeypatch.setattr(routes, "atomic_json_write", _no_space)
+    elif state == "not-json":
+        state_file.write_text("{not json", encoding="utf-8")
+    else:
+        state_file.write_text(json.dumps({"answers": [], "last_test_at": None}), encoding="utf-8")
+
+    response, rows = _call_and_audit(dash, "POST", TEST, json={"request_id": str(uuid.uuid4())})
+    assert (response.status_code, response.json()) == (500, {"error": "failed"})
+    assert _row_kinds(rows) == [("token_auth_failure", "deny", 500)]
+    assert sends.calls == []
