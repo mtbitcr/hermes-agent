@@ -2626,6 +2626,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
             _primary_profile_routes_for_current_home,
             _serving_multiplex_satellite,
         )
+        from gateway import owner_channel_pause
         from gateway.delivery import DeliveryTransport, resolve_delivery_transport
 
         # The one check that decides which targets a profile may reach on a platform it has no
@@ -2660,6 +2661,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
                     "route_refused" if lender._primary.get(platform) is not None else "no_connection"
                 )
                 continue
+
+        if owner_channel_pause.refuses_report(platform, chat_id):
+            msg = f"platform '{platform_name}' home chat is paused by the owner"
+            logger.warning("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+            recorder.note_failed("route_refused")
+            continue
 
         target_adapters, router_config, transport = adapters, config, None
         if isinstance(adapters, SharedRouteAdapters):
@@ -3161,6 +3169,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
                 target_errors.append(msg)
                 delivery_errors.extend(target_errors)
                 continue
+            if owner_channel_pause.refuses_report(platform, chat_id):  # read again: it may have begun since
+                recorder.note_failed("route_refused")  # an earlier try that may have sent keeps its outcome
+                delivery_errors.extend(target_errors + [f"platform '{platform_name}' home chat is paused by the owner"])
+                continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
             recorder.handing_over(cleaned_delivery_content)
             coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
@@ -3190,6 +3202,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, *, resend
                     # again, and it keeps the unknown outcome recorded above.
                     target_errors.append(f"standalone delivery to {platform_name} failed after it started")
                     delivery_errors.extend(target_errors)
+                    continue
+                if owner_channel_pause.refuses_report(platform, chat_id):  # read again before the retry
+                    recorder.note_failed("route_refused")  # a first send that started keeps its unknown outcome
+                    delivery_errors.extend(target_errors + [f"platform '{platform_name}' home chat is paused by the owner"])
                     continue
                 # The thread-pool fallback can itself raise (SMTP ConnectionError,
                 # future.result timeout, etc.). An exception raised inside this

@@ -667,6 +667,15 @@ class GatewayKanbanWatchersMixin:
                             # is resolved (reset or bumped) by the wake
                             # outcome there, not by skipping the send here.
                             continue
+                        from gateway import owner_channel_pause
+
+                        if owner_channel_pause.drops_notice(plat, sub["chat_id"], ev.created_at):
+                            # The owner paused their Telegram messages: the home
+                            # chat's visible notice, seen or created while paused,
+                            # is skipped the same way and not kept, so the cursor
+                            # advances, no failure is counted and nothing old is
+                            # sent after the resume.
+                            continue
                         try:
                             _send_res = await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
