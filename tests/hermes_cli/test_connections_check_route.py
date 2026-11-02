@@ -148,6 +148,11 @@ def test_check_is_ok_again_after_a_new_sign_in_replaces_the_refused_one(owner_ch
     )
     storage, token = _store_tokens("work-calendar", "refused-access")
     assert storage.mark_sign_in_rejected(token) is True
+
+    refused = owner_check.client.post("/api/mcp/servers/work-calendar/test")
+    assert refused.status_code == 200, refused.text
+    assert refused.json() == {"ok": False, "tools": []}
+
     _store_tokens("work-calendar", "fresh-access")
     assert storage.is_sign_in_rejected() is False
 
