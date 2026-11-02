@@ -76,6 +76,7 @@ def owner_check(tmp_path, monkeypatch, _isolate_hermes_home):
             ("read_message", "Reads one message"),
         ]
 
+    state.real_oauth_tokens_present = mcp_config._oauth_tokens_present
     monkeypatch.setattr(mcp_config, "_probe_single_server", fake_probe)
     monkeypatch.setattr(mcp_config, "_oauth_tokens_present", lambda name: False)
     monkeypatch.setattr(audit, "_resolve_log_path", lambda: state.log_path)
@@ -103,7 +104,64 @@ def owner_check(tmp_path, monkeypatch, _isolate_hermes_home):
         return await token_auth.token_auth_middleware(request, call_next)
 
     state.client = TestClient(app)
+    state.monkeypatch = monkeypatch
     return state
+
+
+def _store_tokens(name, access_token):
+    import asyncio
+
+    from mcp.shared.auth import OAuthToken
+
+    from tools.mcp_oauth import HermesTokenStorage
+
+    storage = HermesTokenStorage(name)
+    token = OAuthToken(access_token=access_token, token_type="Bearer")
+    asyncio.run(storage.set_tokens(token))
+    return storage, token
+
+
+def test_check_is_not_ok_while_the_stored_sign_in_is_refused(owner_check):
+    """With the real helper, a token file named by a sign-in-rejected marker is
+    not proof of sign-in: the check answers not ok and lists no tools."""
+    import hermes_cli.mcp_config as mcp_config
+
+    owner_check.monkeypatch.setattr(
+        mcp_config, "_oauth_tokens_present", owner_check.real_oauth_tokens_present
+    )
+    storage, token = _store_tokens("work-calendar", "refused-access")
+    assert storage.mark_sign_in_rejected(token) is True
+    assert storage.is_sign_in_rejected() is True
+
+    resp = owner_check.client.post("/api/mcp/servers/work-calendar/test")
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"ok": False, "tools": []}
+
+
+def test_check_is_ok_again_after_a_new_sign_in_replaces_the_refused_one(owner_check):
+    """A token file written after the marker is not named by it, so the same
+    check answers ok."""
+    import hermes_cli.mcp_config as mcp_config
+
+    owner_check.monkeypatch.setattr(
+        mcp_config, "_oauth_tokens_present", owner_check.real_oauth_tokens_present
+    )
+    storage, token = _store_tokens("work-calendar", "refused-access")
+    assert storage.mark_sign_in_rejected(token) is True
+
+    refused = owner_check.client.post("/api/mcp/servers/work-calendar/test")
+    assert refused.status_code == 200, refused.text
+    assert refused.json() == {"ok": False, "tools": []}
+
+    _store_tokens("work-calendar", "fresh-access")
+    assert storage.is_sign_in_rejected() is False
+
+    resp = owner_check.client.post("/api/mcp/servers/work-calendar/test")
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "ok": True,
+        "tools": [{"name": "list_messages"}, {"name": "read_message"}],
+    }
 
 
 def test_owner_credential_checks_root_entries_and_claude_design_only_as_designer(
