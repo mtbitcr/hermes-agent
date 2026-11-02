@@ -3,10 +3,11 @@
 ``GET /api/owner-channel`` reads whether the owner's Telegram home channel is
 set and whether owner messages are paused, ``PUT /api/owner-channel/paused``
 pauses or resumes them and ``POST /api/owner-channel/test`` sends one fixed
-test message. Only the owner app's connections credential is admitted, and
-every call writes one audit row. Every token and chat id is synthetic, and
-every send goes to a fake send function, or through the real one to a fake
-Telegram transport, never to Telegram.
+test message. Only the owner app's connections credential is admitted, every
+call writes one audit row, and the routes serve only in the default profile's
+process. Every token and chat id is synthetic, and every send goes to a fake
+send function, or through the real one to a fake Telegram transport, never to
+Telegram.
 """
 
 import errno
@@ -133,7 +134,9 @@ def sends(monkeypatch):
 @pytest.fixture()
 def telegram(sends, monkeypatch):
     """The real send function with only its final Telegram transport faked: ``deliveries``
-    holds the token, chat id and text of each delivery, and ``after`` runs once it is made."""
+    holds the token, chat id and text of each delivery, and ``after`` runs once it is made.
+    The process environment holds the root bot token, as the default profile's process loads
+    it from the root .env at its start."""
     deliveries = []
     after = {"do": lambda: None}
 
@@ -142,6 +145,7 @@ def telegram(sends, monkeypatch):
         after["do"]()
         return {"success": True, "platform": "telegram", "chat_id": chat_id, "message_id": "4242"}
 
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", BOT_TOKEN)
     monkeypatch.setattr("tools.send_message_tool.send_message_tool", sends.real)
     monkeypatch.setattr("tools.send_message_tool._send_telegram", deliver)
     return _Quiet(deliveries=deliveries, after=after)
@@ -367,16 +371,13 @@ def test_the_test_route_sends_the_fixed_text_once_through_the_send_function(dash
     assert "chat_id" not in response.text
 
 
-def test_the_same_request_id_twice_sends_once_and_answers_the_same(dash, monkeypatch, sends):
+def test_an_empty_body_sends_once(dash, monkeypatch, sends):
     _router(monkeypatch)
     _name_home(dash.root, ".env")
-    request_id = str(uuid.uuid4())
 
-    first = _post_test(dash, request_id)
-    again = _post_test(dash, request_id)
-    assert (first.status_code, again.status_code) == (200, 200)
-    assert again.json() == first.json() == {"outcome": "sent", "reason": None}
-    assert len(sends.calls) == 1
+    response = dash.call("connections", "POST", TEST)
+    assert (response.status_code, response.json()) == (200, {"outcome": "sent", "reason": None})
+    assert [(call["target"], call["message"]) for call in sends.calls] == [(f"telegram:{HOME_CHAT}", TEST_TEXT)]
 
 
 def test_a_second_request_id_within_30_seconds_gets_429_and_no_send(dash, monkeypatch, sends):
@@ -394,34 +395,33 @@ def test_a_second_request_id_within_30_seconds_gets_429_and_no_send(dash, monkey
     assert len(sends.calls) == 2
 
 
-def test_a_request_id_answered_409_while_paused_is_answered_409_again_after_resume(dash, monkeypatch, sends):
-    _router(monkeypatch)
-    _name_home(dash.root, ".env")
-    request_id = str(uuid.uuid4())
-    _put_paused(dash, True)
-    assert _post_test(dash, request_id).status_code == 409
-    _put_paused(dash, False)
-
-    response = _post_test(dash, request_id)
-    assert (response.status_code, response.json()) == (409, {"error": "paused"})
-    assert sends.calls == []
-    assert _post_test(dash).json() == {"outcome": "sent", "reason": None}
-
-
-def test_a_request_id_answered_429_is_answered_429_again_after_the_interval(dash, monkeypatch, sends):
+def test_two_calls_inside_30_seconds_send_once_and_the_second_answers_429(dash, monkeypatch, sends):
     routes = _router(monkeypatch)
     _name_home(dash.root, ".env")
     clock = _clock(monkeypatch, routes)
     request_id = str(uuid.uuid4())
-    assert _post_test(dash).json() == {"outcome": "sent", "reason": None}
-    assert _post_test(dash, request_id).status_code == 429
-    clock.advance(31)
 
-    response = _post_test(dash, request_id)
+    assert _post_test(dash, request_id).json() == {"outcome": "sent", "reason": None}
+    clock.advance(29)
+    again = _post_test(dash, request_id)  # a retry after a lost answer; the request_id is ignored
+    assert (again.status_code, again.json()) == (429, {"error": "too_soon"})
+    assert len(sends.calls) == 1
+
+    clock.advance(1)
+    assert _post_test(dash, request_id).json() == {"outcome": "sent", "reason": None}
+    assert len(sends.calls) == 2
+
+
+def test_a_clock_moved_back_by_31_seconds_still_answers_429(dash, monkeypatch, sends):
+    routes = _router(monkeypatch)
+    _name_home(dash.root, ".env")
+    clock = _clock(monkeypatch, routes)
+
+    assert _post_test(dash).json() == {"outcome": "sent", "reason": None}
+    clock.advance(-31)
+    response = _post_test(dash)
     assert (response.status_code, response.json()) == (429, {"error": "too_soon"})
     assert len(sends.calls) == 1
-    assert _post_test(dash).json() == {"outcome": "sent", "reason": None}
-    assert len(sends.calls) == 2
 
 
 def test_the_interval_counts_from_when_a_slow_send_returns(dash, monkeypatch, sends):
@@ -449,23 +449,6 @@ def _skipped():
         "target": f"telegram:{HOME_CHAT}",
         "note": "SyntheticProviderText",
     })
-
-
-def test_a_proven_non_send_does_not_use_up_the_interval(dash, monkeypatch, sends):
-    _router(monkeypatch)
-    assert _post_test(dash).json()["outcome"] == "not_sent"
-
-    _name_home(dash.root, ".env")
-    sends.answer["do"] = _skipped
-    response = _post_test(dash)
-    assert (response.status_code, response.json()["outcome"]) == (200, "not_sent")
-    assert "SyntheticProviderText" not in response.text
-    assert HOME_CHAT.lstrip("-") not in response.text
-
-    sends.answer["do"] = _sent_answer
-    response = _post_test(dash)
-    assert (response.status_code, response.json()) == (200, {"outcome": "sent", "reason": None})
-    assert len(sends.calls) == 2
 
 
 def test_a_paused_channel_gets_409_paused_and_no_send(dash, monkeypatch, sends):
@@ -517,20 +500,47 @@ def test_a_failed_send_answers_a_fixed_reason_never_the_provider_text(dash, monk
     assert len(sends.calls) == 1
 
 
+@pytest.mark.parametrize(
+    "home_set, answer, outcome",
+    [(False, _sent_answer, "not_sent"), (True, _skipped, "not_sent"), (True, _raises, "unknown")],
+    ids=["no-home", "skipped", "raised"],
+)
+def test_every_outcome_keeps_the_cooldown_not_sent_and_unknown_included(
+    dash, monkeypatch, sends, home_set, answer, outcome
+):
+    routes = _router(monkeypatch)
+    clock = _clock(monkeypatch, routes)
+    if home_set:
+        _name_home(dash.root, ".env")
+    sends.answer["do"] = answer
+    response = _post_test(dash)
+    assert (response.status_code, response.json()["outcome"]) == (200, outcome)
+    assert "SyntheticProviderText" not in response.text
+
+    _name_home(dash.root, ".env")
+    sends.answer["do"] = _sent_answer
+    clock.advance(29)
+    response = _post_test(dash)
+    assert (response.status_code, response.json()) == (429, {"error": "too_soon"})
+    clock.advance(1)
+    assert _post_test(dash).json() == {"outcome": "sent", "reason": None}
+    assert len(sends.calls) == (2 if home_set else 1)
+
+
 # ---------------------------------------------------------------------------
 # 2b. POST test across processes: restarts, a second process, a crash
 # ---------------------------------------------------------------------------
 
 
-def test_two_fresh_processes_with_the_same_request_id_send_once_and_answer_the_same(dash, tmp_path):
+def test_two_calls_from_two_processes_inside_30_seconds_send_once_and_the_second_answers_429(dash, tmp_path):
     _name_home(dash.root, ".env")
-    request_id = str(uuid.uuid4())
+    request_id = str(uuid.uuid4())  # the second call is a retry after a lost answer
+    now = time.time()
 
-    first = _post_test_in_a_fresh_process(dash, tmp_path, request_id)
-    again = _post_test_in_a_fresh_process(dash, tmp_path, request_id)
-    sent = {"status": 200, "body": {"outcome": "sent", "reason": None}}
-    assert (first.code, first.answer) == (0, sent), first.stderr
-    assert (again.code, again.answer) == (0, sent), again.stderr
+    first = _post_test_in_a_fresh_process(dash, tmp_path, request_id, now=now)
+    second = _post_test_in_a_fresh_process(dash, tmp_path, request_id, now=now + 29)
+    assert (first.code, first.answer) == (0, {"status": 200, "body": {"outcome": "sent", "reason": None}}), first.stderr
+    assert (second.code, second.answer) == (0, {"status": 429, "body": {"error": "too_soon"}}), second.stderr
     assert _sends_by_fresh_processes(tmp_path) == 1
 
 
@@ -546,8 +556,8 @@ def test_a_fresh_process_within_30_seconds_of_a_send_gets_429_and_sends_nothing(
     assert len(sends.calls) == 1
 
 
-def test_a_reservation_cut_off_by_a_crash_answers_unknown_and_never_sends(dash, monkeypatch, sends, tmp_path):
-    routes = _router(monkeypatch)
+def test_a_send_cut_off_by_a_crash_keeps_the_cooldown(dash, monkeypatch, sends, tmp_path):
+    _router(monkeypatch)
     _name_home(dash.root, ".env")
     request_id = str(uuid.uuid4())
 
@@ -555,9 +565,7 @@ def test_a_reservation_cut_off_by_a_crash_answers_unknown_and_never_sends(dash, 
     assert (crashed.code, crashed.answer, _sends_by_fresh_processes(tmp_path)) == (70, None, 1), crashed.stderr
 
     response = _post_test(dash, request_id)
-    assert (response.status_code, response.json()) == (200, {"outcome": "unknown", "reason": routes._UNKNOWN})
-    response = _post_test(dash)
-    assert response.status_code == 429, response.text
+    assert (response.status_code, response.json()) == (429, {"error": "too_soon"})
     assert sends.calls == []
     assert _sends_by_fresh_processes(tmp_path) == 1
 
@@ -567,18 +575,16 @@ def test_a_reservation_cut_off_by_a_crash_answers_unknown_and_never_sends(dash, 
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("home", ["profile"], indirect=True)
-def test_the_test_message_goes_to_the_root_home_with_the_root_token(dash, monkeypatch, telegram):
+def test_the_test_message_goes_to_the_root_home_with_the_default_process_token(dash, monkeypatch, telegram):
     _router(monkeypatch)
     from hermes_constants import get_default_hermes_root, get_hermes_home
 
-    hosting_profile = get_hermes_home()
-    assert (get_default_hermes_root(), hosting_profile.parent.name) == (dash.root, "profiles")
-    (hosting_profile / ".env").write_text(
+    assert get_hermes_home() == get_default_hermes_root() == dash.root
+    other_profile = dash.root / "profiles" / "worker"
+    other_profile.mkdir(parents=True)
+    (other_profile / ".env").write_text(
         f"TELEGRAM_BOT_TOKEN={OTHER_TOKEN}\nTELEGRAM_HOME_CHANNEL={OTHER_CHAT}\n", encoding="utf-8"
     )
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", OTHER_TOKEN)
-    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", OTHER_CHAT)
     _name_home(dash.root, ".env")
 
     assert dash.call("connections", "GET", CHANNEL).json()["state"] == "ready"
@@ -660,22 +666,8 @@ def test_put_a_body_that_is_not_json_is_a_client_error(dash, monkeypatch):
     assert not (dash.root / "owner_channel_pause.json").exists()
 
 
-@pytest.mark.parametrize(
-    "body",
-    [{}, {"request_id": "not-a-uuid"}, {"request_id": 7}, {"request_id": str(uuid.uuid4()), "extra": 1}, []],
-    ids=["empty", "not-a-uuid", "number", "extra-key", "list"],
-)
-def test_post_test_any_other_body_is_a_client_error_and_sends_nothing(dash, monkeypatch, sends, body):
-    _router(monkeypatch)
-    _name_home(dash.root, ".env")
-
-    response = dash.call("connections", "POST", TEST, json=body)
-    assert 400 <= response.status_code < 500, response.text
-    assert sends.calls == []
-
-
 # ---------------------------------------------------------------------------
-# 4. Only the connections credential
+# 4. Only the connections credential, only in the default profile's process
 # ---------------------------------------------------------------------------
 
 
@@ -705,6 +697,36 @@ def test_a_request_without_the_connections_credential_is_refused_on_all_three_ro
     assert dash.call("connections", "GET", CHANNEL).status_code == 200
 
 
+@pytest.mark.parametrize("home", ["profile"], indirect=True)
+def test_a_process_with_a_non_default_profile_gets_503_on_all_three_routes(dash, monkeypatch, sends):
+    _router(monkeypatch)
+    from gateway import owner_channel_pause
+    from hermes_cli.profiles import get_active_profile_name
+
+    assert get_active_profile_name() == "worker"
+    _name_home(dash.root, ".env")
+    calls = [
+        ("GET", CHANNEL, {}),
+        ("PUT", PAUSED, {"json": {"paused": True}}),
+        ("POST", TEST, {}),
+        ("POST", TEST, {"json": {"request_id": str(uuid.uuid4())}}),
+    ]
+    for method, path, kwargs in calls:
+        response, rows = _call_and_audit(dash, method, path, **kwargs)
+        assert (response.status_code, response.json()) == (503, {"error": "unavailable"}), (method, path)
+        assert _row_kinds(rows) == [("token_auth_failure", "deny", 503)], (method, path)
+    assert sends.calls == []
+    for name in ("owner_channel_pause.json", "owner_channel_test.json", "owner_channel_test.lock"):
+        assert not (dash.root / name).exists(), name
+
+    owner_channel_pause.pause()  # paused by the default profile's process
+    before = (dash.root / "owner_channel_pause.json").read_bytes()
+    response = dash.call("connections", "PUT", PAUSED, json={"paused": False})
+    assert (response.status_code, response.json()) == (503, {"error": "unavailable"})
+    assert owner_channel_pause.is_paused()
+    assert (dash.root / "owner_channel_pause.json").read_bytes() == before
+
+
 # ---------------------------------------------------------------------------
 # 5. Audit
 # ---------------------------------------------------------------------------
@@ -715,19 +737,14 @@ def test_every_call_writes_exactly_one_audit_row(dash, monkeypatch, sends):
     from plugins.dashboard_auth.raphael_workspace import CONNECTIONS_GRANT, CONNECTIONS_PRINCIPAL
 
     _name_home(dash.root, ".env")
-    request_id = str(uuid.uuid4())
-    sent_id = str(uuid.uuid4())
     calls = [
         ("connections", "GET", CHANNEL, {}, 200),
         ("connections", "PUT", PAUSED, {"json": {"paused": True}}, 200),
-        ("connections", "POST", TEST, {"json": {"request_id": request_id}}, 409),
+        ("connections", "POST", TEST, {}, 409),
         ("connections", "PUT", PAUSED, {"json": {"paused": "no"}}, 400),
         ("connections", "PUT", PAUSED, {"json": {"paused": False}}, 200),
-        ("connections", "POST", TEST, {"json": {"request_id": request_id}}, 409),
-        ("connections", "POST", TEST, {"json": {"request_id": sent_id}}, 200),
-        ("connections", "POST", TEST, {"json": {"request_id": sent_id}}, 200),
+        ("connections", "POST", TEST, {}, 200),
         ("connections", "POST", TEST, {"json": {"request_id": str(uuid.uuid4())}}, 429),
-        ("connections", "POST", TEST, {"json": {"request_id": "not-a-uuid"}}, 400),
         ("workspace", "GET", CHANNEL, {}, 403),
         ("none", "PUT", PAUSED, {"json": {"paused": True}}, 401),
         ("owner", "POST", TEST, {"json": {"request_id": str(uuid.uuid4())}}, 401),
@@ -808,9 +825,9 @@ def test_a_test_state_that_cannot_be_kept_answers_500_sends_nothing_and_writes_o
     elif state == "not-json":
         state_file.write_text("{not json", encoding="utf-8")
     else:
-        state_file.write_text(json.dumps({"answers": [], "last_test_at": None}), encoding="utf-8")
+        state_file.write_text(json.dumps({"last_test_at": "soon"}), encoding="utf-8")
 
-    response, rows = _call_and_audit(dash, "POST", TEST, json={"request_id": str(uuid.uuid4())})
+    response, rows = _call_and_audit(dash, "POST", TEST)
     assert (response.status_code, response.json()) == (500, {"error": "failed"})
     assert _row_kinds(rows) == [("token_auth_failure", "deny", 500)]
     assert sends.calls == []
