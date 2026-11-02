@@ -52,7 +52,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 from hermes_constants import secure_parent_dir
 
 logger = logging.getLogger(__name__)
@@ -88,6 +88,34 @@ _SDK_CLASSES: dict[str, Any] = {}
 _SDK_LOAD_FAILED = False
 
 
+def _validate_metadata_issuer(oauth_metadata: "OAuthMetadata", expected_issuer: str) -> None:
+    """Google's two metadata documents differ by a final ``/`` (the same URL, RFC 3986 6.2.3)."""
+    from mcp.client.auth import OAuthFlowError
+
+    issuer = str(oauth_metadata.issuer)
+    if issuer == expected_issuer:
+        return
+    bare, slashed = sorted((issuer, expected_issuer))
+    try:
+        parts = urlsplit(bare)
+    except ValueError:
+        parts = None  # malformed URL: reported as the plain mismatch below
+    if (
+        parts is not None
+        and parts.hostname
+        and "@" not in parts.netloc
+        and bare == f"https://{parts.netloc}"
+        and slashed == f"{bare}/"
+    ):
+        logger.debug(
+            "MCP OAuth: issuer %r matches %r apart from a final slash", issuer, expected_issuer
+        )
+        return
+    raise OAuthFlowError(
+        f"Authorization server metadata issuer mismatch: {oauth_metadata.issuer} != {expected_issuer}"
+    )
+
+
 def _ensure_sdk_loaded() -> bool:
     """Import the MCP SDK OAuth classes on first use and bind module globals.
 
@@ -101,6 +129,7 @@ def _ensure_sdk_loaded() -> bool:
     if not _SDK_CLASSES:
         try:
             from mcp.client.auth import OAuthClientProvider as _Provider
+            from mcp.client.auth import oauth2 as _sdk_oauth2, utils as _sdk_utils
             from mcp.shared.auth import (
                 OAuthClientInformationFull as _InfoFull,
                 OAuthClientMetadata as _ClientMeta,
@@ -119,6 +148,11 @@ def _ensure_sdk_loaded() -> bool:
             OAuthMetadata=_Meta,
             OAuthToken=_Token,
         )
+        # oauth2 binds the SDK's checker by name: swap it there once, never over another binding.
+        _sdk_bound = getattr(_sdk_oauth2, "validate_metadata_issuer", None)
+        _sdk_original = getattr(_sdk_utils, "validate_metadata_issuer", None)
+        if _sdk_bound is not None and _sdk_bound is _sdk_original:
+            _sdk_oauth2.validate_metadata_issuer = _validate_metadata_issuer
     g = globals()
     for _name, _cls in _SDK_CLASSES.items():
         if g.get(_name) is None:
