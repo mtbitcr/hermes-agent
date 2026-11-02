@@ -459,6 +459,26 @@ def test_an_oauth_row_without_a_saved_sign_in_reads_needs_authorization(dash, sa
     assert claude_design["status"] == "needs_authorization"
 
 
+def test_an_oauth_row_whose_saved_sign_in_was_refused_reads_needs_authorization(dash, saved):
+    _router()
+    import asyncio
+
+    from mcp.shared.auth import OAuthToken
+
+    from tools.mcp_oauth import HermesTokenStorage
+
+    before = {(row["profile"], row["name"]): row["status"] for row in _rows(dash)}
+    assert before[("default", "google-drive-work")] == "configured"
+
+    storage = HermesTokenStorage("google-drive-work")
+    token = OAuthToken(access_token="refused-access", token_type="Bearer")
+    asyncio.run(storage.set_tokens(token))
+    assert storage.mark_sign_in_rejected(token) is True
+
+    status = {(row["profile"], row["name"]): row["status"] for row in _rows(dash)}
+    assert status[("default", "google-drive-work")] == "needs_authorization"
+
+
 # ---------------------------------------------------------------------------
 # 4. Only the connections credential
 # ---------------------------------------------------------------------------
