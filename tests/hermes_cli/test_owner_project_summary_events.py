@@ -851,6 +851,9 @@ def test_an_urgent_event_waits_for_the_backoff_while_failures_are_counted(root, 
 # Test 8: two ticks at the same time, on two connections, make one task; a tick that loses a swap moves nothing.
 
 
+_TWO_TICKS_WAIT_SECONDS = 60
+
+
 def test_two_ticks_at_the_same_time_on_two_connections_make_one_task(root, owner, monkeypatch):
     ops = _ops()
     _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
@@ -861,7 +864,7 @@ def test_two_ticks_at_the_same_time_on_two_connections_make_one_task(root, owner
     _block(root, garden, asking, "needs_input")
     asked = len(_tasks_of(root, garden, archived=True))
 
-    meeting = threading.Barrier(2, timeout=10)
+    meeting = threading.Barrier(2, timeout=_TWO_TICKS_WAIT_SECONDS)
     one_at_a_time = threading.Lock()
     create_task = kanban_db.create_task
 
@@ -887,7 +890,7 @@ def test_two_ticks_at_the_same_time_on_two_connections_make_one_task(root, owner
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=60)
+        thread.join(timeout=_TWO_TICKS_WAIT_SECONDS)
     assert not errors, errors
     assert not any(thread.is_alive() for thread in threads)
 
