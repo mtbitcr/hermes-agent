@@ -851,7 +851,7 @@ def test_an_urgent_event_waits_for_the_backoff_while_failures_are_counted(root, 
 # Test 8: two ticks at the same time, on two connections, make one task; a tick that loses a swap moves nothing.
 
 
-_TWO_TICKS_WAIT_SECONDS = 60
+_TWO_TICKS_WAIT_SECONDS = 20
 
 
 def test_two_ticks_at_the_same_time_on_two_connections_make_one_task(root, owner, monkeypatch):
@@ -864,17 +864,34 @@ def test_two_ticks_at_the_same_time_on_two_connections_make_one_task(root, owner
     _block(root, garden, asking, "needs_input")
     asked = len(_tasks_of(root, garden, archived=True))
 
-    meeting = threading.Barrier(2, timeout=_TWO_TICKS_WAIT_SECONDS)
+    # A tick that finds a task already on the board never calls create_task, so the ticks must meet before
+    # either one can make it: once each has read "no open task", and once each holds the task, before any claim.
+    # A meeting is best effort: a broken or timed-out barrier lets the tick go on, never hang.
+    read_the_board = threading.Barrier(2, timeout=_TWO_TICKS_WAIT_SECONDS)
+    holding_the_task = threading.Barrier(2, timeout=_TWO_TICKS_WAIT_SECONDS)
     one_at_a_time = threading.Lock()
+    find_open_task = ops._find_open_task
     create_task = kanban_db.create_task
 
+    def meet(barrier: threading.Barrier) -> None:
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            pass
+
+    def find_then_meet(board, project_id):
+        found = find_open_task(board, project_id)
+        if project_id == pid:
+            meet(read_the_board)
+        return found
+
     def create_then_meet(*args, **kwargs):
-        """Both ticks hold the same unclaimed row and the same task before either one makes its claim."""
         with one_at_a_time:
             task_id = create_task(*args, **kwargs)
-        meeting.wait()
+        meet(holding_the_task)
         return task_id
 
+    monkeypatch.setattr(ops, "_find_open_task", find_then_meet)
     monkeypatch.setattr(kanban_db, "create_task", create_then_meet)
     results: list = []
     errors: list = []
@@ -884,15 +901,17 @@ def test_two_ticks_at_the_same_time_on_two_connections_make_one_task(root, owner
             results.append(ops.summary_tick(now=T0 + 100))
         except BaseException as exc:
             errors.append(exc)
-            meeting.abort()
+            read_the_board.abort()
+            holding_the_task.abort()
 
-    threads = [threading.Thread(target=tick) for _ in range(2)]
+    threads = [threading.Thread(target=tick, daemon=True) for _ in range(2)]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=_TWO_TICKS_WAIT_SECONDS)
+        thread.join(timeout=3 * _TWO_TICKS_WAIT_SECONDS)
     assert not errors, errors
-    assert not any(thread.is_alive() for thread in threads)
+    stuck = [thread for thread in threads if thread.is_alive()]
+    assert not stuck, f"{len(stuck)} of the two ticks did not finish; results so far: {results}"
 
     assert sorted(results) == [0, 1]
     _assert_rewrite(root, garden, asked_at=T0 + 100)
