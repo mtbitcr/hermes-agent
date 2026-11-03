@@ -1,9 +1,10 @@
 """Connection rows: GET /api/mcp/connection-rows, one read-only row per connection.
 
 The owner app's connections credential reads one row per saved connection of a
-fixed list of profiles: default (owner), raphael-designer (designer) and
-raphael-builder, raphael-planner, raphael-verifier and raphael-claude-worker
-(agent). A row holds names and states only, never an address, command,
+fixed list of profiles: default (owner), raphael-designer (designer),
+raphael-business (business, for LinkedIn Share alone) and raphael-builder,
+raphael-planner, raphael-verifier and raphael-claude-worker (agent). A row
+holds names and states only, never an address, command,
 arguments, environment values or headers, and the read changes nothing. Every
 other caller is refused. Every token is minted here under tmp_path, every
 saved sign-in is an empty recorded fake and every address, command and value
@@ -37,14 +38,15 @@ ROW_FIELDS = [
 ROLES = {
     "default": "owner",
     "raphael-designer": "designer",
+    "raphael-business": "business",
     "raphael-builder": "agent",
     "raphael-planner": "agent",
     "raphael-verifier": "agent",
     "raphael-claude-worker": "agent",
 }
 STATUSES = {"connected", "paused", "needs_authorization", "configured", "unknown"}
-#: A real profile that is not on the list.
-OUTSIDER = "raphael-business"
+#: On the list for LinkedIn Share alone: every other connection it saves stays out of the rows.
+BUSINESS = "raphael-business"
 #: Owner decision of 2026-10-31: removed from the root profile, never a root row.
 REMOVED_FROM_ROOT = ("microsoft-personal", "github-bitcredit", "google-calendar-personal")
 #: The only path under the root home a read may create or change: the audit log it appends to.
@@ -76,7 +78,7 @@ def _stdio(label):
 
 
 def _servers():
-    """What each profile saves, the outsider included."""
+    """What each profile saves, the business profile's hidden business-crm included."""
     agent_github = {
         "github-agent-factory": _stdio("factory"),
         "github-agent-factory-org": _stdio("factory-org"),
@@ -106,7 +108,7 @@ def _servers():
         "raphael-claude-worker": {
             "context7": _http("context7", auth=None, headers={"Authorization": "Bearer " + _fake("context7")}),
         },
-        OUTSIDER: {"business-crm": _http("business-crm")},
+        BUSINESS: {"business-crm": _http("business-crm")},
     }
 
 
@@ -114,7 +116,7 @@ def _servers():
 SIGNED_IN = {
     "default": ("google-drive-work", "microsoft-personal"),
     "raphael-designer": ("claude-design",),
-    OUTSIDER: ("business-crm",),
+    BUSINESS: ("business-crm",),
 }
 
 
@@ -212,7 +214,7 @@ def home(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def saved(home):
-    """The saved connections and sign-ins of every profile, the outsider's included.
+    """The saved connections and sign-ins of every profile.
 
     Only those: no profile home has its standard skeleton yet, and every
     directory is 0755.
@@ -512,17 +514,18 @@ def test_only_the_connections_credential_is_admitted(dash, saved):
 
 
 # ---------------------------------------------------------------------------
-# 5. A profile off the list is never read
+# 5. The business profile is read for LinkedIn Share alone
 # ---------------------------------------------------------------------------
 
 
-def test_a_profile_off_the_list_is_never_read(dash, saved, monkeypatch):
+def test_the_business_profile_is_read_for_linkedin_share_alone(dash, saved, monkeypatch):
     _router()
     from hermes_cli import mcp_config
     from hermes_constants import get_hermes_home
 
-    scoped, read_homes = [], []
+    scoped, read_homes, inspected = [], [], []
     real_scope = dash.web_server._profile_scope
+    real_summary = dash.web_server._mcp_server_summary
     real_servers = mcp_config._get_mcp_servers
     real_signed_in = mcp_config._oauth_tokens_present
 
@@ -530,27 +533,60 @@ def test_a_profile_off_the_list_is_never_read(dash, saved, monkeypatch):
         scoped.append(profile)
         return real_scope(profile)
 
+    def summary(name, cfg):
+        inspected.append(name)
+        return real_summary(name, cfg)
+
     def servers(*args, **kwargs):
         read_homes.append(Path(get_hermes_home()).resolve())
         return real_servers(*args, **kwargs)
 
     def signed_in(name):
         read_homes.append(Path(get_hermes_home()).resolve())
+        inspected.append(name)
         return real_signed_in(name)
 
     monkeypatch.setattr(dash.web_server, "_profile_scope", scope)
+    monkeypatch.setattr(dash.web_server, "_mcp_server_summary", summary)
     monkeypatch.setattr(mcp_config, "_get_mcp_servers", servers)
     monkeypatch.setattr(mcp_config, "_oauth_tokens_present", signed_in)
 
     plain = dash.call("connections")
-    asked = dash.call("connections", params={"profile": OUTSIDER})
+    asked = dash.call("connections", params={"profile": BUSINESS})
     assert (plain.status_code, asked.status_code) == (200, 200)
     assert asked.json() == plain.json()
-    assert OUTSIDER not in {row["profile"] for row in plain.json()["rows"]}
+    assert BUSINESS not in {row["profile"] for row in plain.json()["rows"]}
     assert "business-crm" not in plain.text
+    # Its saved sign-in is never even looked at.
+    assert "business-crm" not in inspected
 
     assert set(scoped) == set(ROLES)
     assert set(read_homes) == {saved.homes[name].resolve() for name in ROLES}
+
+
+def test_linkedin_share_is_the_one_business_row_and_it_is_not_read_only(dash, saved):
+    _router()
+    business = saved.homes[BUSINESS]
+    _write_home(business, {**saved.servers[BUSINESS], "linkedin-share": _http("linkedin-share")})
+    _save_sign_in(business, "linkedin-share")
+
+    rows = _rows_changing_nothing(dash, saved.root)
+
+    assert [row for row in rows if row["name"] == "linkedin-share"] == [
+        {
+            "name": "linkedin-share",
+            "profile": BUSINESS,
+            "profile_role": "business",
+            "transport": "http",
+            "sign_in_kind": "oauth",
+            "status": "configured",
+            "enabled": True,
+            "read_only": False,
+            "catalogue": True,
+        }
+    ]
+    assert [row["name"] for row in rows if row["profile"] == BUSINESS] == ["linkedin-share"]
+    assert "business-crm" not in {row["name"] for row in rows}
 
 
 # ---------------------------------------------------------------------------

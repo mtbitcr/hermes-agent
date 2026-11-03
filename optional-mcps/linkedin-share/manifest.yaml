@@ -1,0 +1,27 @@
+# The owner app's own LinkedIn Share Worker (services/linkedin-share in the
+# owner app repository), held only by the business profile, raphael-business.
+# No third-party package or local process is involved.
+manifest_version: 1
+
+name: linkedin-share
+description: >-
+  Share approved posts on LinkedIn through the owner app's own LinkedIn Share
+  connection.
+source: https://learn.microsoft.com/en-us/linkedin/consumer/integrations/self-serve/share-on-linkedin
+
+transport:
+  type: http
+  url: https://linkedin-share.agentsbridge.net/mcp
+
+auth:
+  type: oauth
+
+tools:
+  default_enabled:
+    - read_profile_name
+    - create_post
+    - delete_post
+
+post_install: |
+  The connector posts only the exact text the owner approved. It makes at
+  most three posts a day. It keeps the LinkedIn sign-in inside the Worker.

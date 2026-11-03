@@ -5,6 +5,7 @@ The owner app's connections credential reaches the existing connection check,
 credential is a recorded fake principal: no token value appears anywhere.
 """
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -194,6 +195,64 @@ def test_owner_credential_checks_root_entries_and_claude_design_only_as_designer
         resp = client.post(f"/api/mcp/servers/{name}/test", params=params)
         assert resp.status_code == 403, (name, profile)
     assert len(owner_check.probes) == 2
+
+
+def test_owner_credential_checks_linkedin_share_only_as_business(owner_check):
+    """LinkedIn Share is checked in the business profile alone; it is refused in
+    every other profile, and every other entry there, before any probe."""
+    import hermes_cli.mcp_config as mcp_config
+    from hermes_constants import get_hermes_home
+
+    default_home = get_hermes_home()
+    business = default_home / "profiles" / "raphael-business"
+    business.mkdir(parents=True)
+    (business / "config.yaml").write_text(
+        "mcp_servers:\n"
+        f"  business-crm:\n    url: {_address('raphael-business', 'business-crm')}\n",
+        encoding="utf-8",
+    )
+    # Every home lists LinkedIn Share too, so a probe of the wrong one would show.
+    for role in (*_ROLES, "raphael-business"):
+        home = default_home if role == "default" else default_home / "profiles" / role
+        with (home / "config.yaml").open("a", encoding="utf-8") as config:
+            config.write(
+                f"  linkedin-share:\n    url: {_address(role, 'linkedin-share')}\n"
+                "    auth: oauth\n"
+            )
+    signed_in = []
+
+    def tokens_present(name):
+        signed_in.append((name, Path(get_hermes_home()).resolve()))
+        return True
+
+    owner_check.monkeypatch.setattr(mcp_config, "_oauth_tokens_present", tokens_present)
+    client = owner_check.client
+
+    check = client.post(
+        "/api/mcp/servers/linkedin-share/test", params={"profile": "raphael-business"}
+    )
+    assert check.status_code == 200, check.text
+    assert check.json() == {
+        "ok": True,
+        "tools": [{"name": "list_messages"}, {"name": "read_message"}],
+    }
+    assert owner_check.probes == [
+        ("linkedin-share", _address("raphael-business", "linkedin-share")),
+    ]
+    assert signed_in == [("linkedin-share", business.resolve())]
+
+    for name, profile in (
+        ("linkedin-share", None),
+        ("linkedin-share", "default"),
+        ("linkedin-share", "raphael-designer"),
+        ("linkedin-share", "raphael-verifier"),
+        ("business-crm", "raphael-business"),
+        ("claude-design", "raphael-business"),
+    ):
+        params = {"profile": profile} if profile else {}
+        resp = client.post(f"/api/mcp/servers/{name}/test", params=params)
+        assert resp.status_code == 403, (name, profile)
+    assert len(owner_check.probes) == 1
 
 
 def test_owner_credential_answer_holds_tool_names_only(owner_check):

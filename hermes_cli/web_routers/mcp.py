@@ -54,6 +54,8 @@ from plugins.dashboard_auth.raphael_workspace import (  # noqa: E402
 
 _CLAUDE_DESIGN_CONNECTION = "claude-design"
 _DESIGNER_PROFILE = "raphael-designer"
+_LINKEDIN_SHARE_CONNECTION = "linkedin-share"
+_BUSINESS_PROFILE = "raphael-business"
 
 _CONNECTIONS_LITERAL_ROUTES = (
     ("GET", "/api/mcp/catalog"),
@@ -100,24 +102,29 @@ def _enforce_connections_machine_profile(
     name: Optional[str] = None,
     profile: Optional[str] = None,
 ) -> None:
-    """Keep the service credential's design access in one non-execution profile.
+    """Keep the service credential's design and business access in their own profiles.
 
     Interactive dashboard sessions retain the normal multi-profile admin API.
-    Raphael Workspace's machine credential may read the default or Designer
-    connection views, but only Claude Design may be mutated in the Designer
-    profile and it may never be installed in the default execution profile.
+    Raphael Workspace's machine credential may read the default, Designer or
+    Business connection views, but only Claude Design may be mutated in the
+    Designer profile and only LinkedIn Share in the Business profile, and
+    neither may ever be installed in the default execution profile.
     """
     if not getattr(request.state, "token_authenticated", False):
         return
     principal = getattr(request.state, "token_principal", None)
     if getattr(principal, "principal", None) != CONNECTIONS_PRINCIPAL:
         return
-    if profile not in {None, _DESIGNER_PROFILE}:
+    if profile not in {None, _DESIGNER_PROFILE, _BUSINESS_PROFILE}:
         raise HTTPException(status_code=403, detail="Forbidden")
     if name is None:
         return
     if name == _CLAUDE_DESIGN_CONNECTION:
         if profile != _DESIGNER_PROFILE:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        return
+    if name == _LINKEDIN_SHARE_CONNECTION:
+        if profile != _BUSINESS_PROFILE:
             raise HTTPException(status_code=403, detail="Forbidden")
         return
     if profile is not None:
@@ -873,6 +880,10 @@ async def install_mcp_catalog_entry(
     entry = mcp_catalog.get_entry(name)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"No catalog entry '{name}'")
+    # The lookup also accepts an ``official/<name>`` alias. Authorize, install,
+    # audit and answer under the entry's own name, so an alias can never reach
+    # a profile that its canonical name is kept out of.
+    name = entry.name
 
     # Persist any supplied env vars first (catalog entries declare which names
     # they need; we only write the ones the user provided).
@@ -880,6 +891,17 @@ async def install_mcp_catalog_entry(
     _enforce_connections_machine_profile(
         request, name=name, profile=effective_profile
     )
+    principal = getattr(request.state, "token_principal", None)
+    if (
+        body.env
+        and getattr(request.state, "token_authenticated", False)
+        and getattr(principal, "principal", None) == CONNECTIONS_PRINCIPAL
+    ):
+        # Raphael Workspace always sends an empty env, and its connections
+        # credential is granted connections, never a profile's .env. Refusing
+        # any env before anything is written keeps it from rewriting another
+        # connection's key or a control in any profile.
+        raise HTTPException(status_code=403, detail="Forbidden")
     if body.env:
         def _write_env():
             with _profile_scope(effective_profile):
