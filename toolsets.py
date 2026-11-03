@@ -481,6 +481,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "website_visits": {
+        "description": "Read-only website visit counts from Cloudflare Web Analytics, with the LinkedIn share",
+        "tools": ["website_visits"],
+        "includes": []
+    },
+
 
     # Scenario-specific toolsets
     
