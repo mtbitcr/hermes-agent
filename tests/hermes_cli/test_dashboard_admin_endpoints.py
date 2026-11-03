@@ -720,6 +720,137 @@ class TestMcpEndpoints:
         assert installs == ["demo"]
         assert env_path.read_text(encoding="utf-8") == "DEMO_API_KEY=placeholder-new\n"
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param({"name": "official/linkedin-share"}, id="linkedin-no-profile"),
+            pytest.param(
+                {"name": "official/linkedin-share", "profile": ""},
+                id="linkedin-empty-profile",
+            ),
+            pytest.param(
+                {"name": "official/linkedin-share", "profile": "default"},
+                id="linkedin-default-profile",
+            ),
+            pytest.param(
+                {"name": "official/linkedin-share", "profile": "raphael-designer"},
+                id="linkedin-designer-profile",
+            ),
+            pytest.param({"name": "official/claude-design"}, id="design-no-profile"),
+            pytest.param(
+                {"name": "official/claude-design", "profile": "raphael-business"},
+                id="design-business-profile",
+            ),
+        ],
+    )
+    def test_connections_machine_token_cannot_install_a_catalog_alias_outside_its_profile(
+        self, connections_headers, payload
+    ):
+        import yaml
+        from starlette.testclient import TestClient
+
+        from hermes_constants import get_hermes_home
+        from hermes_cli import web_server
+
+        hermes_home = get_hermes_home()
+
+        def saved_files():
+            return {
+                path: path.read_bytes()
+                for pattern in ("config.yaml", ".env")
+                for path in hermes_home.rglob(pattern)
+            }
+
+        def saved_servers():
+            return {
+                name
+                for path in hermes_home.rglob("config.yaml")
+                for name in yaml.safe_load(path.read_text(encoding="utf-8")).get(
+                    "mcp_servers", {}
+                )
+            }
+
+        with TestClient(web_server.app) as machine:
+            before = saved_files()
+            refused = machine.post(
+                "/api/mcp/catalog/install",
+                headers=connections_headers,
+                json={**payload, "env": {}},
+            )
+            assert refused.status_code == 403, refused.text
+            assert refused.json() == {"detail": "Forbidden"}
+            assert saved_files() == before
+            # Only the Business profile's own connection is saved anywhere.
+            assert saved_servers() == {"business-crm"}
+
+    @pytest.mark.parametrize(
+        ("payload", "params", "profile", "name"),
+        [
+            pytest.param(
+                {"name": "official/linkedin-share", "profile": "raphael-business"},
+                {},
+                "raphael-business",
+                "linkedin-share",
+                id="linkedin-business-profile-in-body",
+            ),
+            pytest.param(
+                {"name": "official/linkedin-share"},
+                {"profile": "raphael-business"},
+                "raphael-business",
+                "linkedin-share",
+                id="linkedin-business-profile-in-query",
+            ),
+            pytest.param(
+                {"name": "official/claude-design", "profile": "raphael-designer"},
+                {},
+                "raphael-designer",
+                "claude-design",
+                id="design-designer-profile-in-body",
+            ),
+        ],
+    )
+    def test_connections_machine_token_installs_a_catalog_alias_under_its_own_name(
+        self, connections_headers, payload, params, profile, name
+    ):
+        import yaml
+        from starlette.testclient import TestClient
+
+        from hermes_constants import get_hermes_home
+        from hermes_cli import web_server
+
+        hermes_home = get_hermes_home()
+        config = hermes_home / "profiles" / profile / "config.yaml"
+
+        def other_files():
+            return {
+                path: path.read_bytes()
+                for pattern in ("config.yaml", ".env")
+                for path in hermes_home.rglob(pattern)
+                if path != config
+            }
+
+        def servers():
+            return yaml.safe_load(config.read_text(encoding="utf-8")).get(
+                "mcp_servers", {}
+            )
+
+        with TestClient(web_server.app) as machine:
+            before_files, before_servers = other_files(), servers()
+            installed = machine.post(
+                "/api/mcp/catalog/install",
+                headers=connections_headers,
+                params=params,
+                json={**payload, "env": {}},
+            )
+            assert installed.status_code == 200, installed.text
+            assert installed.json()["name"] == name
+            after = servers()
+            assert sorted(after) == sorted([*before_servers, name])
+            assert payload["name"] not in after
+            assert {key: after[key] for key in before_servers} == before_servers
+            # Every .env, and every other profile's config, is as it was.
+            assert other_files() == before_files
+
     def test_delete_revokes_config_and_all_oauth_state(self):
         from hermes_cli.mcp_config import _get_mcp_servers
         from tools.mcp_oauth import HermesTokenStorage

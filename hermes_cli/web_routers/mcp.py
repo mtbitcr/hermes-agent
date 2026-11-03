@@ -880,6 +880,10 @@ async def install_mcp_catalog_entry(
     entry = mcp_catalog.get_entry(name)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"No catalog entry '{name}'")
+    # The lookup also accepts an ``official/<name>`` alias. Authorize, install,
+    # audit and answer under the entry's own name, so an alias can never reach
+    # a profile that its canonical name is kept out of.
+    name = entry.name
 
     # Persist any supplied env vars first (catalog entries declare which names
     # they need; we only write the ones the user provided).
