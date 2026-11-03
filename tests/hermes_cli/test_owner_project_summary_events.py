@@ -20,6 +20,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
@@ -851,6 +852,10 @@ def test_an_urgent_event_waits_for_the_backoff_while_failures_are_counted(root, 
 # Test 8: two ticks at the same time, on two connections, make one task; a tick that loses a swap moves nothing.
 
 
+_TWO_TICKS_WAIT_SECONDS = 30
+_TWO_TICKS_JOIN_SECONDS = 3 * _TWO_TICKS_WAIT_SECONDS
+
+
 def test_two_ticks_at_the_same_time_on_two_connections_make_one_task(root, owner, monkeypatch):
     ops = _ops()
     _clean(OUTCOME, NEXT_ACTION, DECISION, REWRITTEN)
@@ -861,35 +866,66 @@ def test_two_ticks_at_the_same_time_on_two_connections_make_one_task(root, owner
     _block(root, garden, asking, "needs_input")
     asked = len(_tasks_of(root, garden, archived=True))
 
-    meeting = threading.Barrier(2, timeout=10)
+    # A tick that finds a task already on the board never calls create_task, so the ticks must meet before either
+    # one can make it: once each has read "no open task" (no database lock held), and once each holds the task,
+    # before any claim. Both meetings are mandatory: a broken or timed-out barrier fails the test, so a late tick
+    # can never turn this into a serialized create-then-find run that passes without any competition.
+    read_the_board = threading.Barrier(2, timeout=_TWO_TICKS_WAIT_SECONDS)
+    holding_the_task = threading.Barrier(2, timeout=_TWO_TICKS_WAIT_SECONDS)
     one_at_a_time = threading.Lock()
+    find_open_task = ops._find_open_task
     create_task = kanban_db.create_task
+    saw_no_open_task: dict = {}
+    held_the_task: dict = {}
+
+    def find_then_meet(board, project_id):
+        found = find_open_task(board, project_id)
+        if project_id == pid:
+            saw_no_open_task[threading.get_ident()] = found is None
+            read_the_board.wait()
+        return found
 
     def create_then_meet(*args, **kwargs):
-        """Both ticks hold the same unclaimed row and the same task before either one makes its claim."""
         with one_at_a_time:
             task_id = create_task(*args, **kwargs)
-        meeting.wait()
+        holding_the_task.wait()
+        held_the_task[threading.get_ident()] = task_id
         return task_id
 
+    monkeypatch.setattr(ops, "_find_open_task", find_then_meet)
     monkeypatch.setattr(kanban_db, "create_task", create_then_meet)
     results: list = []
     errors: list = []
+
+    def abort_the_meetings() -> None:
+        read_the_board.abort()
+        holding_the_task.abort()
 
     def tick() -> None:
         try:
             results.append(ops.summary_tick(now=T0 + 100))
         except BaseException as exc:
             errors.append(exc)
-            meeting.abort()
+            abort_the_meetings()
 
-    threads = [threading.Thread(target=tick) for _ in range(2)]
+    threads = [threading.Thread(target=tick, daemon=True) for _ in range(2)]
     for thread in threads:
         thread.start()
+    deadline = time.monotonic() + _TWO_TICKS_JOIN_SECONDS
     for thread in threads:
-        thread.join(timeout=60)
-    assert not errors, errors
-    assert not any(thread.is_alive() for thread in threads)
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    if any(thread.is_alive() for thread in threads):
+        abort_the_meetings()
+        for thread in threads:
+            thread.join(timeout=5)
+    stuck = [thread for thread in threads if thread.is_alive()]
+    assert not stuck, f"{len(stuck)} of the two ticks did not finish; results so far: {results}; errors: {errors}"
+    assert not errors, f"a tick failed or the two ticks did not meet, so the race did not happen: {errors!r}"
+    assert not read_the_board.broken and not holding_the_task.broken, "a meeting of the two ticks was broken"
+    assert sorted(saw_no_open_task.values()) == [True, True], (
+        f"both ticks must have read 'no open task' before either made one: {saw_no_open_task}"
+    )
+    assert len(held_the_task) == 2, f"both ticks must have reached create_task and held a task: {held_the_task}"
 
     assert sorted(results) == [0, 1]
     _assert_rewrite(root, garden, asked_at=T0 + 100)
