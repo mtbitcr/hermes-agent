@@ -2532,23 +2532,29 @@ def _handle_review_findings(args: dict, **kw) -> str:
                     f"('{pinned_board}')"
                 )
             kernel_head = kb._latest_review_head_provenance(conn, tid)
+            bound_digest, bound_what = kernel_head, "kernel-parked review head"
             if kernel_head is None:
-                return tool_error(
-                    f"kanban_review_findings: no repository head was parked "
-                    f"by the kernel for {tid} at review handover; the only "
-                    "supported candidate is a repository head the kernel "
-                    "parks at review handover, so no candidate can be bound "
-                    "for this run"
-                )
+                from hermes_cli.kanban_review_record import record_candidate
+
+                record = record_candidate(conn, tid)
+                if record is None:
+                    return tool_error(
+                        f"kanban_review_findings: no repository head was parked "
+                        f"by the kernel for {tid} at review handover; the only "
+                        "supported candidate is a repository head the kernel "
+                        "parks at review handover, so no candidate can be bound "
+                        "for this run"
+                    )
+                bound_digest, bound_what = record.digest, "review handover record"
             caller_digest = args.get("candidate_digest")
             if (
                 caller_digest is not None
                 and str(caller_digest).strip()
-                and str(caller_digest) != kernel_head
+                and str(caller_digest) != bound_digest
             ):
                 return tool_error(
                     f"kanban_review_findings: candidate_digest does not "
-                    f"match the kernel-parked review head for {tid}; the "
+                    f"match the {bound_what} for {tid}; the "
                     "reviewed candidate is fixed at handover, not "
                     "re-declared by the caller"
                 )
@@ -2556,7 +2562,7 @@ def _handle_review_findings(args: dict, **kw) -> str:
                 result = kb.submit_review_findings(
                     conn, tid,
                     findings=findings,
-                    candidate_digest=kernel_head,
+                    candidate_digest=bound_digest,
                     expected_run_id=run_id,
                     risk_tier=args.get("risk_tier"),
                 )
@@ -3935,11 +3941,14 @@ KANBAN_REVIEW_FINDINGS_SCHEMA = {
         "implementer with concrete required changes. Each finding needs "
         "severity (one of blocking, major, minor), file, lines, problem, "
         "impact, smallest_fix, and candidate_digest. The candidate is "
-        "always the repository head the kernel itself parked at review "
-        "handover — omit candidate_digest to use it, or pass it back "
-        "verbatim; a digest that disagrees with the kernel-parked head is "
-        "refused, and a task with no kernel-parked head cannot be reviewed "
-        "through this tool at all. Reporting the SAME findings against an "
+        "always fixed by the kernel at review handover: the repository "
+        "head it parked or, for a task that owns no paths and parked no "
+        "head, the handover record itself — omit candidate_digest to use "
+        "it, or pass it back verbatim; a digest that disagrees with it is "
+        "refused (a finding's wrong digest is refused naming the right "
+        "one), and a task that owns paths but has no kernel-parked head "
+        "cannot be reviewed through this tool at all. Reporting the SAME "
+        "findings against an "
         "unchanged candidate twice in a row blocks the task for an owner "
         "decision instead of re-running the implementer. Only valid from a "
         "task claimed from the review column, and only for your own task. "
@@ -3986,11 +3995,12 @@ KANBAN_REVIEW_FINDINGS_SCHEMA = {
             "candidate_digest": {
                 "type": "string",
                 "description": (
-                    "Optional. Must equal the repository head the kernel "
-                    "parked at review handover — omit it to use that head "
-                    "automatically. A value that disagrees with the "
-                    "kernel-parked head is refused; this tool never binds "
-                    "a candidate the kernel did not itself park."
+                    "Optional. Must equal the candidate the kernel fixed at "
+                    "review handover — the repository head it parked, or "
+                    "the handover record for a task that owns no paths — "
+                    "omit it to use that candidate automatically. A value "
+                    "that disagrees with it is refused; this tool never "
+                    "binds a candidate the kernel did not itself fix."
                 ),
             },
             "risk_tier": {
