@@ -447,6 +447,14 @@ DEFAULT_CONFIG = {
         # browser_cdp / browser_evaluate capabilities.
         "extension_control": {"enabled": False, "developer_mode": False},
     },
+    # Look-only design browser: its own CDP endpoint (never browser.cdp_url), the hosts it may open
+    # ("*.<host>" = exactly one label below <host>) and the kanban board slugs it may run on.
+    # Empty denies everything.
+    "design_browser": {
+        "cdp_url": "",
+        "allowed_hosts": [],
+        "boards": [],
+    },
     # Filesystem checkpoints: snapshot the working directory once per turn (on the first
     # write_file/patch call); restore with /rollback. Opt-in via `hermes chat --checkpoints` or
     # enabled=True (most users never use /rollback). Single shared shadow store with real pruning.
