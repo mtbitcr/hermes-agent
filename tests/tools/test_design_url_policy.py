@@ -9,6 +9,7 @@ import socket
 
 import pytest
 
+import tools.design_url_policy as design_url_policy
 import tools.url_safety as url_safety
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 from hermes_constants import get_hermes_home
@@ -33,6 +34,13 @@ SECRET = "s3cr3t-value"
 
 def _punycode(host):
     return host.encode("idna").decode("ascii")
+
+
+def _nested_url(path, layers):
+    """``path`` on the public host, percent-encoded ``layers`` times over: each layer escapes the
+    ``%`` signs of the one below, so it takes ``layers`` decoding passes to read ``path`` again."""
+    escape = "%" + "25" * (layers - 1)
+    return "https://raphael.agentsbridge.net/" + "".join(f"{escape}{ord(c):02X}" for c in path)
 
 
 @pytest.fixture(autouse=True)
@@ -227,6 +235,47 @@ def test_counter_hosts_are_denied_even_when_listed(url):
 def test_counter_path_is_denied_on_every_host(host, path):
     assert design_url_refusal(f"https://{host}/", PLAN_HOSTS) is None
     assert design_url_refusal(f"https://{host}{path}", PLAN_HOSTS) is not None
+
+
+def test_deep_escape_nesting_is_denied_with_bounded_decoding(monkeypatch):
+    # The review's case: every layer of nesting cost one more decoding pass over the whole path.
+    calls = 0
+    unquote = design_url_policy.unquote
+
+    def counting_unquote(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return unquote(*args, **kwargs)
+
+    monkeypatch.setattr(design_url_policy, "unquote", counting_unquote)
+    refusals, counts = [], []
+    for nesting in (1_000, 50_000):
+        calls = 0
+        url = "https://raphael.agentsbridge.net/" + "%" + "25" * nesting + "41"
+        refusals.append(design_url_refusal(url, ["raphael.agentsbridge.net"]))
+        counts.append(calls)
+    assert counts[0] == counts[1]
+    assert counts[1] <= design_url_policy._MAX_DECODE_PASSES + 1
+    assert None not in refusals
+
+
+def test_escape_nesting_within_the_budget_is_undone_completely():
+    counter = design_url_refusal("https://raphael.agentsbridge.net/cdn-cgi/rum", PLAN_HOSTS)
+    assert counter is not None
+    for layers in range(1, design_url_policy._MAX_DECODE_PASSES + 1):
+        assert design_url_refusal(_nested_url("cdn-cgi/rum", layers), PLAN_HOSTS) == counter
+        assert design_url_refusal(_nested_url("boards/design", layers), PLAN_HOSTS) is None
+
+
+def test_escape_nesting_one_level_beyond_the_budget_is_denied():
+    # Fail closed: escapes left once the budget is spent are never undone, so the check cannot tell
+    # where the path leads, and even an ordinary page is denied.
+    budget = design_url_policy._MAX_DECODE_PASSES
+    query = f"?page={SECRET}"
+    assert design_url_refusal(_nested_url("boards/design", budget) + query, PLAN_HOSTS) is None
+    refusal = design_url_refusal(_nested_url("boards/design", budget + 1) + query, PLAN_HOSTS)
+    assert refusal is not None
+    assert SECRET not in refusal
 
 
 @pytest.mark.parametrize("ips", [

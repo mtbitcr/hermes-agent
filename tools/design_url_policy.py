@@ -33,6 +33,10 @@ from tools.url_safety import (
 _COUNTER_HOSTS = ("static.cloudflareinsights.com", "cloudflareinsights.com")
 _COUNTER_PATH_PREFIX = "/cdn-cgi/rum"
 _HOST_LABEL = re.compile(r"[a-z0-9-]+")
+# A server undoes a path's percent escapes once, a proxy in front of it perhaps once more. Each pass
+# rescans the whole path and every two characters can nest one more layer, so decoding is capped at
+# this many passes rather than run until nothing changes.
+_MAX_DECODE_PASSES = 4
 
 
 def _ascii_host(host: str) -> str | None:
@@ -56,14 +60,21 @@ def _ascii_host(host: str) -> str | None:
     return ascii_host if labels[-1][0].isalpha() else None
 
 
-def _is_counter_path(path: str) -> bool:
-    """True when ``path`` reaches the counter prefix as a server might read it: percent escapes
-    undone until none are left, backslashes and repeated slashes as one ``/``, dot segments
-    resolved, in any case."""
-    while (decoded := unquote(path)) != path:
+def _path_refusal(path: str) -> str | None:
+    """Why ``path`` must not be loaded, or None. It must not when it reaches the counter prefix as
+    a server might read it: percent escapes undone, backslashes and repeated slashes as one ``/``,
+    dot segments resolved, in any case. Nor when escapes remain after ``_MAX_DECODE_PASSES``
+    passes, because decoding stops there and where such a path leads goes unchecked."""
+    for _ in range(_MAX_DECODE_PASSES + 1):
+        if (decoded := unquote(path)) == path:
+            break
         path = decoded
+    else:
+        return "path has too many layers of percent escapes"
     path = posixpath.normpath(re.sub(r"[/\\]+", "/", "/" + path)).lower()
-    return path.startswith(_COUNTER_PATH_PREFIX)
+    if path.startswith(_COUNTER_PATH_PREFIX):
+        return "the visitor counter is always blocked"
+    return None
 
 
 def _allowed_hosts(policy: Any) -> list[tuple[str, bool]]:
@@ -145,8 +156,8 @@ def design_url_refusal(
         return "only the default https port is allowed"
     if any(host == counter or host.endswith("." + counter) for counter in _COUNTER_HOSTS):
         return "the visitor counter is always blocked"
-    if _is_counter_path(parts.path):
-        return "the visitor counter is always blocked"
+    if (refusal := _path_refusal(parts.path)) is not None:
+        return refusal
     allowed = _allowed_hosts(policy)
     if builder_host is not None:
         own = _ascii_host(builder_host) if isinstance(builder_host, str) else None
