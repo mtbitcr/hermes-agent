@@ -262,12 +262,12 @@ check_names_on_template() {
   verdict names-on-template
 }
 
-# The profiles that the stack permits. The default profile and the planner are always checked. The designer is
-# permitted too and checked like the planner, but only when the stack has it (served, or a folder of the
-# profiles folder), so that a stack without it is still valid. The profiles to check are these plus any other
+# The profiles that the stack permits. The default profile and the planner are always checked. The designer and
+# the business profile are permitted too and checked like the planner, but only when the stack has them (served, or
+# a folder of the profiles folder), so that a stack without them is still valid. The profiles to check are these plus any other
 # profile that the platform serves (check_served_profiles).
 ALWAYS_CHECKED=(default raphael-planner)
-WHEN_PRESENT=(raphael-designer)
+WHEN_PRESENT=(raphael-designer raphael-business)
 PERMITTED=("${ALWAYS_CHECKED[@]}" "${WHEN_PRESENT[@]}")
 PROFILES=("${ALWAYS_CHECKED[@]}")
 
@@ -352,9 +352,9 @@ done
 '
 
 # Sets PROFILES for the checks below and adds to PROBLEMS: any served profile beyond the permitted ones, and
-# any entry of the profiles folder other than the planner and the designer (even one the enumeration skips), is
-# a problem that names it. A permitted profile that the stack has, served or as a folder, is checked. When the
-# enumeration cannot be read the profiles that are always checked are checked, and the designer when it has a folder.
+# any entry of the profiles folder other than the permitted ones (even one the enumeration skips), is a problem
+# that names it. A permitted profile that the stack has, served or as a folder, is checked. When the enumeration
+# cannot be read the profiles that are always checked are checked, and the others when they have a folder.
 check_served_profiles() {
   local line name seen_default=0 odd=0
   local -a extra=()
