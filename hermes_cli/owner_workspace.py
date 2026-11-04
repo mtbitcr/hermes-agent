@@ -2649,7 +2649,8 @@ OWNER_PROJECT_RUN_CONTEXT_CAPABILITY = "run_task_context"
 OWNER_PROJECT_PLANNING_CONTEXT_CAPABILITY = "planning_context_v1"
 # The same planning DTO at schema version 2, each task also carrying the owned
 # paths its row stores. Version 1 stays exactly what the released Workspace
-# reads; a reader naming both receives version 2.
+# reads; a reader naming both receives version 2. A card parked for review
+# carries the scope its handover recorded, not its read-only row's.
 OWNER_PROJECT_PLANNING_CONTEXT_V2_CAPABILITY = "planning_context_v2"
 # A separately negotiated contour for what waits on the owner and why work
 # stopped. Without it the snapshot and Decisions keep today's shape and
@@ -3284,6 +3285,8 @@ def owner_project_planning_context(
 
     ``owned_paths`` serves schema version 2: the same DTO, each task also
     carrying the owned paths its row stores (``[]`` when it stores none).
+    A card parked for review stores ``[]`` so its review run is read-only;
+    it carries the scope its handover recorded instead (``[]`` if none).
     """
     selected_rows, actionable_truncated, relations_truncated = (
         _select_owner_project_task_rows(conn, project_id, include_archived=True)
@@ -3362,6 +3365,12 @@ def owner_project_planning_context(
         })
         if owned_paths:
             tasks[-1]["owned_paths"] = task.owned_paths or []
+            if task.status == "review" and task.owned_paths == []:
+                # The park stores [] so the review run is read-only; the
+                # planner sees the implementation scope its handover recorded.
+                scope = kanban_db._latest_review_scope_provenance(conn, task.id)
+                if scope is not None and scope["owned_paths"]:
+                    tasks[-1]["owned_paths"] = scope["owned_paths"]
 
     retained_terminal = sum(
         1 for row in selected_rows
@@ -3435,7 +3444,8 @@ def read_project_snapshot(
     each task also carrying the owned paths its row stores; it takes the
     place of version 1 when both are asked for and defaults off, so a
     version-1 reader keeps exactly today's context; see
-    ``OWNER_PROJECT_PLANNING_CONTEXT_V2_CAPABILITY``.
+    ``OWNER_PROJECT_PLANNING_CONTEXT_V2_CAPABILITY``. A card parked for
+    review carries the scope its handover recorded, not its read-only row's.
 
     ``owner_waiting`` adds what waits on the owner and why work stopped; it
     defaults off so the shape and selection stay exactly today's; see
