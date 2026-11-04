@@ -218,7 +218,10 @@ def test_a_row_without_a_pull_request_is_unfinished_only_while_it_may_still_publ
 
 def test_an_older_returned_row_without_a_pull_request_is_finished_once_a_newer_row_merged(owner):
     """Owner rule of 2026-10-21, item 2: a row is unfinished by its state alone. A row returned for changes before
-    the publish step took it has no pull request, and is finished: the card's newer row carries its delivery."""
+    the publish step took it has no pull request, and is finished: the card's newer row carries its delivery.
+    The state-alone rule has one exception, the owner decision of 2026-11-04: a row with no pull request parked
+    with head_moved is finished once a newer row of its card is merged, updated, replaced, returned for changes or
+    closed outside (condition (a)), or once any row of its card is replaced (condition (c))."""
     from hermes_cli.kanban_delivery import unfinished_delivery_task_ids
 
     project = _project(owner, "Delivery Pilot")
@@ -233,6 +236,68 @@ def test_an_older_returned_row_without_a_pull_request_is_finished_once_a_newer_r
     with _board(project) as conn:
         assert unfinished_delivery_task_ids(conn, [task_id]) == set()
         assert conn.execute(_INDEPENDENT_COUNT, (project["project_id"], *UNFINISHED)).fetchone()[0] == 0
+    snapshot = ow.read_project_snapshot(owner, project["slug"], delivery_state=True)
+    for steward in (ow.project_steward_snapshot(project_id=project["project_id"]), snapshot["steward"]):
+        assert (steward["execution"]["state"], steward["active_work"]) == ("complete", [])
+    assert _cards(snapshot)["Publish the launch page"]["delivery"] is None
+
+
+@pytest.mark.parametrize("newer", ["merged", "updated"])
+def test_a_row_parked_with_head_moved_is_finished_once_a_newer_row_of_its_card_finished(owner, newer):
+    """Owner decision of 2026-11-04, condition (a): a row with no pull request parked with head_moved is finished
+    once a newer row of its card is merged, updated, replaced, returned for changes or closed outside; no later
+    pass adopts it then."""
+    from hermes_cli.kanban_delivery import unfinished_delivery_task_ids
+
+    project = _project(owner, "Delivery Pilot")
+    task_id = _card(project, "Publish the launch page", status="done")
+    _parked(project, task_id, "head_moved")  # the card's only row yet, so the only one parked
+    _delivery(project, task_id, newer, head="b" * 40)
+
+    with _board(project) as conn:
+        assert unfinished_delivery_task_ids(conn, [task_id]) == set()
+    snapshot = ow.read_project_snapshot(owner, project["slug"], delivery_state=True)
+    for steward in (ow.project_steward_snapshot(project_id=project["project_id"]), snapshot["steward"]):
+        assert (steward["execution"]["state"], steward["active_work"]) == ("complete", [])
+    assert _cards(snapshot)["Publish the launch page"]["delivery"] is None
+
+
+@pytest.mark.parametrize("older", ["merged", "updated"])
+def test_a_row_parked_with_head_moved_stays_unfinished_without_a_newer_finished_row(owner, older):
+    """Only a newer row of its card counts for condition (a), and no condition but (a) and (c) applies: a row
+    parked with head_moved after the card's merged or updated row, with no row after it, stays unfinished."""
+    from hermes_cli.kanban_delivery import unfinished_delivery_task_ids
+
+    project = _project(owner, "Delivery Pilot")
+    task_id = _card(project, "Publish the launch page", status="done")
+    _delivery(project, task_id, older)
+    with _board(project) as conn, kanban_db.write_txn(conn):  # parks this row only, unlike _parked
+        conn.execute(
+            "INSERT INTO kanban_deliveries (source_task_id, source_head, created_at, publish_refusal) "
+            "VALUES (?, ?, 0, 'head_moved')", (task_id, "b" * 40),
+        )
+
+    with _board(project) as conn:
+        assert unfinished_delivery_task_ids(conn, [task_id]) == {task_id}
+
+
+def test_a_row_parked_with_head_moved_is_finished_once_its_card_delivery_moved_to_a_replacement(owner):
+    """Owner decision of 2026-11-04, condition (c), the shape of delivery 103: the card's older row was replaced,
+    its delivery moved to a replacement card, so its newer row parked with head_moved is finished, though no row
+    comes after it."""
+    from hermes_cli.kanban_delivery import unfinished_delivery_task_ids
+
+    project = _project(owner, "Delivery Pilot")
+    task_id = _card(project, "Publish the launch page", status="done")
+    _delivery(project, task_id, "replaced")
+    with _board(project) as conn, kanban_db.write_txn(conn):  # parks this row only, unlike _parked
+        conn.execute(
+            "INSERT INTO kanban_deliveries (source_task_id, source_head, created_at, publish_refusal) "
+            "VALUES (?, ?, 0, 'head_moved')", (task_id, "b" * 40),
+        )
+
+    with _board(project) as conn:
+        assert unfinished_delivery_task_ids(conn, [task_id]) == set()
     snapshot = ow.read_project_snapshot(owner, project["slug"], delivery_state=True)
     for steward in (ow.project_steward_snapshot(project_id=project["project_id"]), snapshot["steward"]):
         assert (steward["execution"]["state"], steward["active_work"]) == ("complete", [])
