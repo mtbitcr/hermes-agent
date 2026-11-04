@@ -79,6 +79,29 @@ class ReleaseHost(HostReader, Protocol):
 
     def delete_snapshot(self, name: str) -> None: ...
 
+    def sync_environment(self) -> None:
+        """Sync the platform environment in place from the checkout's lock file, frozen and
+        inexact, with the all extra and no default groups. Raises when uv does not finish."""
+
+    def environment_matches_lock(self) -> bool:
+        """Every package the checkout's lock file names for this host is installed at its locked
+        version. Packages outside the lock, such as those installed on demand, may stay."""
+
+    def environment_differences(self) -> Sequence[str]:
+        """Each package the checkout's lock file names for this host that is not installed at its
+        locked version, by normalised name and with names and versions only: "NAME expected
+        LOCKED, installed VERSION", or "NAME expected LOCKED, missing". Raises
+        EnvironmentUnreadable, with a short reason, when the comparison cannot be read."""
+
+    def take_environment_snapshot(self, name: str) -> None:
+        """Copy the real folder the platform environment's link names, as the way back."""
+
+    def restore_environment(self) -> None:
+        """Move the environment snapshot this release took back into the same real folder. With
+        no snapshot taken, the environment never changed and nothing moves."""
+
+    def delete_environment_snapshot(self, name: str) -> None: ...
+
 
 @dataclass(frozen=True)
 class Readback:
@@ -106,8 +129,10 @@ READBACKS: tuple[tuple[str, Callable[[ReleaseHost, str], bool]], ...] = (
     ("R6", lambda host, expected: host.workspace_reads_ok()),
     ("fleet version", lambda host, expected: host.fleet_version() == expected),
     # After every move the live configuration still equals the named snapshot G11 compared it
-    # with: releases are code-only, and the restore puts that snapshot back.
+    # with: releases change no configuration, and the restore puts that snapshot back.
     ("configuration", lambda host, expected: host.live_config() == host.named_config_snapshot()),
+    # The platform environment holds the checked-out lock file's packages.
+    ("environment", lambda host, expected: host.environment_matches_lock()),
 )
 # Recovery compares the configuration only when NEW's configuration snapshot may exist (see
 # recover). Without it, the check is left out, or counts as not held.
@@ -135,6 +160,19 @@ class ReleaseResult:
 
 class ReadbackFailed(Exception):
     """A readback after a move did not hold. The failure rule treats it like any other error."""
+
+
+class EnvironmentMismatch(ReadbackFailed):
+    """The environment did not match the lock file after its sync, before any unit started."""
+
+
+class EnvironmentUnreadable(ReadbackFailed):
+    """The environment's comparison with the lock file could not be read. Its message is a short
+    reason, which names no path, address or setting."""
+
+
+# An environment mismatch names at most this many differing packages, then how many more.
+DIFFERENCES_SHOWN = 10
 
 
 def run_release(
@@ -222,27 +260,53 @@ def recover(host: ReleaseHost, pins: Pins, *, saved: bool = True) -> ReleaseResu
 
 def _snapshot(host: ReleaseHost, pins: Pins) -> None:
     # The older state snapshots go before the copy, so it needs room beside the newest one only,
-    # as G8 checked. Once the copy is made, only this release's own snapshot is kept.
+    # as G8 checked. Once the copy is made, only this release's own snapshot is kept. The
+    # environment snapshot of each name goes with its state snapshot, and this release's copy of
+    # the environment, PREV's packages, is the way back.
     for name in host.snapshots()[:-KEEP_SNAPSHOTS]:
         host.delete_snapshot(name)
+        host.delete_environment_snapshot(name)
     host.take_snapshot(pins.snapshot)
     for name in host.snapshots():
         if name != pins.snapshot:
             host.delete_snapshot(name)
+            host.delete_environment_snapshot(name)
+    host.take_environment_snapshot(pins.snapshot)
 
 
 def _forward(host: ReleaseHost, pins: Pins) -> str:
-    """Bring both units up on NEW, so the readback after the move sees NEW running."""
+    """Bring both units up on NEW, so the readback after the move sees NEW running.
+
+    NEW's lock file is synced into the environment before the start, and an environment that
+    does not match it fails the move before any unit runs NEW, naming the packages that differ;
+    one that cannot be compared fails it too, with its reason.
+    """
     host.stop_units(PLATFORM_UNITS)
     host.checkout(pins.new)
+    host.sync_environment()
+    try:
+        differences = host.environment_differences()
+    except EnvironmentUnreadable as unreadable:
+        raise EnvironmentUnreadable(
+            f"environment could not be read on {pins.new}: {unreadable}"
+        ) from None
+    if differences:
+        shown = "; ".join(differences[:DIFFERENCES_SHOWN])
+        more = len(differences) - DIFFERENCES_SHOWN
+        raise EnvironmentMismatch(
+            f"environment did not hold on {pins.new}: {shown}"
+            + (f"; and {more} more" if more > 0 else "")
+        )
     host.start_units(PLATFORM_UNITS)
     return pins.new
 
 
-# Going back brings both units up on PREV and its configuration; a restore takes the same steps.
+# Going back brings both units up on PREV, its environment and its configuration; a restore
+# takes the same steps.
 BACK_STEPS: tuple[Callable[[ReleaseHost, Pins], None], ...] = (
     lambda host, pins: host.stop_units(PLATFORM_UNITS),
     lambda host, pins: host.checkout(pins.prev),
+    lambda host, pins: host.restore_environment(),
     lambda host, pins: host.restore_config(),
     lambda host, pins: host.start_units(PLATFORM_UNITS),
 )
