@@ -19,7 +19,8 @@ concurrency:
 jobs:
   generate:
     name: "Generate slices"
-    runs-on: ubuntu-latest
+    # ubuntu-latest can resolve to ubuntu-26.04, whose default sort and sqlite3 tools differ; keep this pin (and the test job's) until those tests work on Ubuntu 26.04.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -48,7 +49,7 @@ jobs:
   test:
     name: Run tests slice ${{ matrix.slice.index }}/${{ inputs.slice_count }}
     needs: generate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
