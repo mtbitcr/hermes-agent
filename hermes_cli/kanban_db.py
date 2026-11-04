@@ -28265,8 +28265,8 @@ def _request_changes_within_txn(
     if not reason:
         return False, "reason is required"
     task_row = conn.execute(
-        "SELECT status, assignee, current_run_id, title, tenant, project_id "
-        "FROM tasks "
+        "SELECT status, assignee, current_run_id, title, tenant, project_id, "
+        "risk_tier FROM tasks "
         "WHERE id = ? AND task_kind = 'work'",
         (task_id,),
     ).fetchone()
@@ -28440,6 +28440,9 @@ def _request_changes_within_txn(
             ),
             assignee=implementer,
             parents=[task_id],
+            # The reviewed card's own recorded tier, read after any raise this
+            # verdict recorded; a card without one gives an item without one.
+            risk_tier=task_row["risk_tier"],
         )
         # The item belongs to the reviewed card's Project: the owner surfaces
         # select a Project's cards by ``project_id``, so without it the item
