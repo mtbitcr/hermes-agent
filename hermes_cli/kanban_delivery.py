@@ -2145,7 +2145,10 @@ def unfinished_delivery_task_ids(conn: sqlite3.Connection, task_ids) -> set:
     """Card C5: those of ``task_ids`` whose delivery is unfinished on the board ``conn`` reads: a row with no pull
     request yet that is not parked or is parked with head_moved (any other parked row never publishes), or a row
     open, with review cards created, with an auto-merge pending, armed, unknown or refused, whose base moved, or
-    whose close was refused. Every other state is finished. It only reads: a board with no
+    whose close was refused. Every other state is finished. The one exception, the owner decision of 2026-11-04:
+    a row parked with head_moved is finished, as if parked with superseded, once a newer row of its card is
+    merged, updated, replaced, returned for changes or closed outside, or once any row of its card is replaced
+    (its delivery moved to a replacement card); no later pass adopts it then. It only reads: a board with no
     ledger has no unfinished delivery and gets no schema; any other database error is raised."""
     ids = [str(task_id) for task_id in task_ids]
     if not ids or conn.execute(
@@ -2153,11 +2156,16 @@ def unfinished_delivery_task_ids(conn: sqlite3.Connection, task_ids) -> set:
         return set()
     unfinished = ("open", "review_cards_created", _PENDING, _ARMED, _ARM_UNKNOWN, _ARM_REFUSED, _BASE_MOVED,
                   _CLOSE_REFUSED)
+    superseding = (_MERGED, _UPDATED, _REPLACED, "returned_for_changes", _CLOSED_OUTSIDE)  # of a newer row
     return {str(row[0]) for row in conn.execute(
-        "SELECT DISTINCT source_task_id FROM kanban_deliveries WHERE source_task_id IN (SELECT value FROM "
+        "SELECT DISTINCT source_task_id FROM kanban_deliveries AS d WHERE source_task_id IN (SELECT value FROM "
         "json_each(?)) AND ((pull_request_number IS NULL AND pull_request_state IS NULL "
-        "AND (publish_refusal IS NULL OR publish_refusal = 'head_moved')) "
-        f"OR pull_request_state IN ({', '.join('?' * len(unfinished))}))", (json.dumps(ids), *unfinished))}
+        "AND (publish_refusal IS NULL OR publish_refusal = 'head_moved' AND NOT EXISTS (SELECT 1 FROM "
+        "kanban_deliveries AS other WHERE other.source_task_id = d.source_task_id AND ((other.id > d.id "
+        f"AND other.pull_request_state IN ({', '.join('?' * len(superseding))})) "
+        "OR other.pull_request_state = ?)))) "
+        f"OR pull_request_state IN ({', '.join('?' * len(unfinished))}))",
+        (json.dumps(ids), *superseding, _REPLACED, *unfinished))}
 
 
 def _off_base(db_path: Path, row: dict, merge: str) -> Optional[tuple]:
