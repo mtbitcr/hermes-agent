@@ -35,6 +35,9 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 if TYPE_CHECKING:
     from websockets.asyncio.client import ClientConnection
 
+    # Callers that want the guard build it themselves; unguarded supervisors never load it.
+    from tools.browser_supervisor_navguard import NavigationGuard
+
 logger = logging.getLogger(__name__)
 
 
@@ -310,6 +313,7 @@ class CDPSupervisor:
         *,
         dialog_policy: str = DEFAULT_DIALOG_POLICY,
         dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S,
+        navigation_guard: Optional[NavigationGuard] = None,
     ) -> None:
         if dialog_policy not in _VALID_POLICIES:
             raise ValueError(
@@ -320,6 +324,8 @@ class CDPSupervisor:
         self.cdp_url = cdp_url
         self.dialog_policy = dialog_policy
         self.dialog_timeout_s = float(dialog_timeout_s)
+        # Off unless a caller passes one (tools/browser_supervisor_navguard.py).
+        self.navigation_guard = navigation_guard
 
         # State protected by ``_state_lock`` for cross-thread reads.
         self._state_lock = threading.Lock()
@@ -766,6 +772,9 @@ class CDPSupervisor:
         # dialog response work on Browserbase (whose CDP proxy auto-dismisses
         # real native dialogs before we can call handleJavaScriptDialog).
         await self._install_dialog_bridge(self._page_session_id)
+        # Before ready: if the guard can't install, start() fails (or a reconnect retries).
+        if self.navigation_guard is not None:
+            await self.navigation_guard.install(self._cdp, self._page_session_id, target_id)
 
     async def _install_dialog_bridge(self, session_id: str) -> None:
         """Install the dialog-bridge init script + Fetch interceptor on a session.
@@ -882,6 +891,10 @@ class CDPSupervisor:
     async def _on_event(
         self, method: str, params: Dict[str, Any], session_id: Optional[str]
     ) -> None:
+        if self.navigation_guard is not None and self.navigation_guard.on_event(
+            self._cdp, method, params, session_id
+        ):
+            return
         if method == "Page.javascriptDialogOpening":
             await self._on_dialog_opening(params, session_id)
         elif method == "Page.javascriptDialogClosed":
@@ -1446,37 +1459,49 @@ class _SupervisorRegistry:
         dialog_policy: str = DEFAULT_DIALOG_POLICY,
         dialog_timeout_s: float = DEFAULT_DIALOG_TIMEOUT_S,
         start_timeout: float = 15.0,
+        navigation_guard: Optional[NavigationGuard] = None,
     ) -> CDPSupervisor:
         """Idempotently ensure a supervisor is running for ``(task_id, cdp_url)``.
 
         If a supervisor exists for this task but was bound to a different
         ``cdp_url``, the old one is stopped and a fresh one is started.
+        A ``navigation_guard`` caller never gets a supervisor without that
+        guard, and callers that pass none keep whatever guard is running.
         """
+
+        def reusable(sup: CDPSupervisor) -> bool:
+            return sup.cdp_url == cdp_url and (
+                navigation_guard is None or sup.navigation_guard is navigation_guard
+            )
+
         with self._lock:
             existing = self._by_task.get(task_id)
             if existing is not None:
-                if existing.cdp_url == cdp_url:
+                if reusable(existing):
                     thread_ok = existing._thread is not None and existing._thread.is_alive()
                     loop_ok = existing._loop is not None and existing._loop.is_running()
                     if thread_ok and loop_ok:
                         return existing
                     # Unhealthy — tear down and recreate.
-                # URL changed or unhealthy — tear down, fall through to re-create.
+                # URL or guard changed, or unhealthy — tear down, fall through to re-create.
                 self._by_task.pop(task_id, None)
         if existing is not None:
             existing.stop()
 
+        # Only passed when set, so unguarded construction is unchanged.
+        guard_kwargs = {"navigation_guard": navigation_guard} if navigation_guard is not None else {}
         supervisor = CDPSupervisor(
             task_id=task_id,
             cdp_url=cdp_url,
             dialog_policy=dialog_policy,
             dialog_timeout_s=dialog_timeout_s,
+            **guard_kwargs,
         )
         supervisor.start(timeout=start_timeout)
         with self._lock:
             # Guard against a concurrent get_or_start from another thread.
             already = self._by_task.get(task_id)
-            if already is not None and already.cdp_url == cdp_url:
+            if already is not None and reusable(already):
                 supervisor.stop()
                 return already
             self._by_task[task_id] = supervisor
