@@ -1,7 +1,7 @@
 # Fixed, non-secret settings of the journeys test stack: the default profile.
 # reset_stack.sh copies this folder into the stack's platform home. Nothing here comes from production.
 
-# One gateway serves this profile and the profile folders under profiles/ (the planner and the designer).
+# One gateway serves this profile and the profile folders under profiles/ (the planner, the designer and the business profile).
 multiplex_profiles: true
 
 kanban:

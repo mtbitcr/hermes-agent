@@ -131,11 +131,11 @@ def test_template_says_in_one_comment_line_that_every_container_needs_a_health_c
 def test_stack_home_sets_what_the_facts_say():
     default = yaml.safe_load((STACK_HOME / "config.yaml").read_text())
     profiles = sorted(p for p in (STACK_HOME / "profiles").iterdir() if p.is_dir())
-    assert [p.name for p in profiles] == ["raphael-designer", "raphael-planner"]
-    designer, planner = (yaml.safe_load((p / "config.yaml").read_text()) for p in profiles)
+    assert [p.name for p in profiles] == ["raphael-business", "raphael-designer", "raphael-planner"]
+    business, designer, planner = (yaml.safe_load((p / "config.yaml").read_text()) for p in profiles)
     multiplex = default.get("multiplex_profiles", (default.get("gateway") or {}).get("multiplex_profiles"))
     assert multiplex is True
-    for config in (default, planner, designer):
+    for config in (default, planner, designer, business):
         assert config["kanban"]["dispatch_in_gateway"] is False
         platforms = config.get("platforms") or {}
         assert set(platforms) <= {"api_server"}, "no messaging platform may be configured"
@@ -194,6 +194,16 @@ def test_stack_home_gives_the_designer_the_admitted_route_as_the_planner_has_it(
     assert_admitted_routes(
         {"raphael-designer": STACK_HOME / "profiles/raphael-designer/config.yaml"}, tmp_path, monkeypatch
     )
+
+
+def test_stack_home_gives_the_business_profile_the_admitted_route_and_no_connection(tmp_path: Path, monkeypatch):
+    """The business route is the policy's own; the profile holds no MCP server, connector or platform."""
+    path = STACK_HOME / "profiles/raphael-business/config.yaml"
+    assert_admitted_routes({"raphael-business": path}, tmp_path, monkeypatch)
+    config = yaml.safe_load(path.read_text())
+    assert set(config) <= {"kanban", "model", "agent", "fallback_providers"}, sorted(config)
+    for connection in ("mcp_servers", "connectors", "platforms", "gateway", "cron"):
+        assert connection not in config, connection
 
 
 def test_stack_home_holds_no_dotenv_and_no_values():
@@ -403,7 +413,7 @@ def test_check_still_checks_both_permitted_profiles_when_the_served_profiles_can
 
 def test_check_passes_the_names_check_when_only_the_permitted_profiles_exist(clean_check: CleanCheck):
     assert sorted(p.name for p in (clean_check.host.vol(HOME_V) / "profiles").iterdir()) == [
-        "raphael-designer", "raphael-planner"]
+        "raphael-business", "raphael-designer", "raphael-planner"]
     assert verdicts(clean_check.result)["names-on-template"] == "PASS"
 
 
@@ -416,18 +426,38 @@ def test_check_permits_the_designer_and_checks_it_like_the_planner(clean_check: 
     assert (clean_check.host.vol(HOME_V) / "profiles/raphael-designer").is_dir()
     assert clean_check.result.returncode == 0, clean_check.result.stdout
     assert verdicts(clean_check.result) == {name: "PASS" for name in CHECKS}
-    # One cron list for each of default, planner and designer: the designer is read like the planner.
-    assert len(cron_lists(clean_check.host)) == 3
+    # One cron list for each of default, planner, designer and business: the designer is read like the planner.
+    assert len(cron_lists(clean_check.host)) == 4
+
+
+def test_check_permits_the_business_profile_and_checks_it_like_the_designer(clean_check: CleanCheck):
+    assert (clean_check.host.vol(HOME_V) / "profiles/raphael-business").is_dir()
+    assert clean_check.result.returncode == 0, clean_check.result.stdout
+    assert verdicts(clean_check.result) == {name: "PASS" for name in CHECKS}
+    read = [c for c in cron_lists(clean_check.host) if "raphael-business" in c["argv"]]
+    assert len(read) == 1, "the business profile is read like the designer"
 
 
 def test_check_still_passes_on_a_stack_without_the_designer(stack: Host):
     shutil.rmtree(stack.vol(HOME_V) / "profiles/raphael-designer")
-    assert sorted(p.name for p in (stack.vol(HOME_V) / "profiles").iterdir()) == ["raphael-planner"]
+    assert sorted(p.name for p in (stack.vol(HOME_V) / "profiles").iterdir()) == [
+        "raphael-business", "raphael-planner"]
     result = run_check(stack)
     assert result.returncode == 0, result.stdout + result.stderr
     assert verdicts(result) == {name: "PASS" for name in CHECKS}
-    # Only default and planner were read: the designer is checked when the stack has it, not required.
-    assert len(cron_lists(stack)) == 2
+    # Default, planner and business were read: the designer is checked when the stack has it, not required.
+    assert len(cron_lists(stack)) == 3
+
+
+def test_check_still_passes_on_a_stack_without_the_business_profile(stack: Host):
+    shutil.rmtree(stack.vol(HOME_V) / "profiles/raphael-business")
+    assert sorted(p.name for p in (stack.vol(HOME_V) / "profiles").iterdir()) == [
+        "raphael-designer", "raphael-planner"]
+    result = run_check(stack)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert verdicts(result) == {name: "PASS" for name in CHECKS}
+    # Default, planner and designer were read: the business profile is checked when the stack has it, not required.
+    assert len(cron_lists(stack)) == 3
 
 
 @pytest.mark.parametrize("breaking", [dispatcher_on("designer"), dispatcher_unset("designer"),
@@ -438,6 +468,16 @@ def test_check_fails_the_designer_by_name_when_it_breaks_what_the_planner_may_no
     assert result.returncode == 1, result.stdout
     (failed,) = failed_checks(result)
     assert "raphael-designer" in fail_line(result, failed)
+
+
+@pytest.mark.parametrize("breaking", [dispatcher_on("business"), dispatcher_unset("business"),
+                                      cron_job("raphael-business"), platform_enabled("business")])
+def test_check_fails_the_business_profile_by_name_when_it_breaks_what_the_designer_may_not(stack: Host, breaking):
+    breaking(stack)
+    result = run_check(stack)
+    assert result.returncode == 1, result.stdout
+    (failed,) = failed_checks(result)
+    assert "raphael-business" in fail_line(result, failed)
 
 
 def test_check_still_checks_the_designer_when_the_served_profiles_cannot_be_read(stack: Host):

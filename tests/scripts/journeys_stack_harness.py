@@ -90,7 +90,7 @@ DECOY_CONTAINERS = [
 ]
 DECOY_VOLUMES = ["raphael-s2-state", "raphael-s2-state-prod", "raphael-s2-pw"]
 # Profile folder names are platform data, not container or volume names.
-NOT_RESOURCE_NAMES = {"raphael-planner", "raphael-designer"}
+NOT_RESOURCE_NAMES = {"raphael-planner", "raphael-designer", "raphael-business"}
 
 # Bytecode of the platform modules that the fake runs for real is cached here (compiling them takes seconds).
 REAL_PYC = Path(tempfile.gettempdir()) / f"journeys-stack-pyc-{os.getuid()}"
