@@ -44,9 +44,9 @@ SETTINGS = {
 }
 OWNER = "owner: hold everything"
 TOKEN = "placeholder-release-token"
-# The merged restore steps: the units stop, the checkout goes to PREV, its configuration comes
-# back, and the units start.
-RESTORE = ["stop", f"checkout {PREV}", "restore config", "start"]
+# The merged restore steps: the units stop, the checkout goes to PREV, its environment and its
+# configuration come back, and the units start.
+RESTORE = ["stop", f"checkout {PREV}", "restore environment", "restore config", "start"]
 _REPO = Path(__file__).resolve().parents[2]
 # ``hermes release COMMAND BATCH`` in its own process, as _command runs it, on a host where
 # neither version reads back, with the runner's wait between two reads replaced so none sleeps and
@@ -82,7 +82,11 @@ _PROCESS = (
 class FakeHost:
     """A release host in memory, built like the merged one, its checkout at ``head`` and its units
     running ``running``, None once they stopped. A version in ``unhealthy`` fails its health
-    check. Each action is noted in ``calls``, and the modules at the first unit stop are kept."""
+    check. Each action is noted in ``calls``, and the modules at the first unit stop are kept.
+
+    The environment holds the packages of the version ``environment`` names, at first the head's;
+    a sync installs the head's, and the restore moves back the release's copy, PREV's packages,
+    when ``environment_snapshot`` names one."""
 
     head: str = NEW
     running: str | None = NEW
@@ -93,6 +97,12 @@ class FakeHost:
     config_snapshot: str = ""  # as in the live actions: the snapshot the restore puts back
     # NEW's configuration snapshot as the live reader reads it: empty when none was published.
     saved: dict[str, str] = field(default_factory=lambda: dict(CONFIG))
+    environment: str | None = None
+    environment_snapshot: str = ""  # as in the live actions: the copy the restore moves back
+
+    def __post_init__(self):
+        if self.environment is None:
+            self.environment = self.head
 
     def checkout_head(self):
         return self.head
@@ -140,10 +150,33 @@ class FakeHost:
     def restore_config(self):
         self.calls.append("restore config")
 
+    def sync_environment(self):
+        self.environment = self.head
+
+    def environment_differences(self):
+        if self.environment == self.head:
+            return ()
+        return (f"package expected {self.head}, installed {self.environment}",)
+
+    def environment_matches_lock(self):
+        return not self.environment_differences()
+
+    def take_environment_snapshot(self, name):
+        self.environment_snapshot = name
+
+    def restore_environment(self):
+        self.calls.append("restore environment")
+        if self.environment_snapshot:
+            self.environment = PREV
+
 
 def _midway(*unhealthy: str) -> FakeHost:
-    """A host the release left midway: its units stopped, its checkout at NEW."""
-    return FakeHost(running=None, active={SANDBOX_TUNNEL_UNIT}, unhealthy=set(unhealthy))
+    """A host the release left midway: its units stopped, its checkout and environment at NEW, and
+    the copy of PREV's environment it took, named after NEW."""
+    return FakeHost(
+        running=None, active={SANDBOX_TUNNEL_UNIT}, unhealthy=set(unhealthy),
+        environment_snapshot=NEW,
+    )
 
 
 # What a release run asks of its host beyond FakeHost's reads, answered as the merged run's host
@@ -877,3 +910,60 @@ def test_a_send_that_fails_at_the_cap_changes_nothing_else_and_names_its_cause(
     assert len(named) == 1
     assert _sentinel() == before
     assert len(told) == 1 and SECRET not in shown.out + shown.err
+
+
+def test_recover_restores_environment(root, monkeypatch):
+    """A release that stopped midway after its sync comes back to PREV's packages: recovery moves
+    back the environment copy the release took, named after NEW, before the units start."""
+    batch_id = _stopped_midway()
+    _snapshots(root, f"config/{NEW}")
+    host = _midway(NEW)  # NEW's packages are installed and NEW fails its health check
+    host.environment_snapshot = ""  # only recovery names the copy it moves back
+
+    _command(monkeypatch, host, "recover", str(batch_id))
+
+    assert host.environment_snapshot == NEW
+    assert host.calls == RESTORE
+    assert (host.head, host.environment, host.running) == (PREV, PREV, PREV)
+    assert _batch(batch_id)["outcome"] == "restored"
+
+
+HELD = (
+    "R1 held, R2 held, R3 held, R4 held, R5 held, R6 held, fleet version held,"
+    " configuration held, environment held"
+)
+
+
+def _readbacks(out: str) -> list[str]:
+    """The lines a recovery printed for its readbacks, in order."""
+    return [line for line in out.splitlines() if line.startswith("Readback ")]
+
+
+@pytest.mark.parametrize("command", ["recover", "run"])
+def test_a_recovery_that_restores_prints_each_readback_in_order(
+    root, monkeypatch, capsys, command
+):
+    batch_id = _stopped_midway()
+    _snapshots(root, f"config/{NEW}")
+
+    _command(monkeypatch, _midway(NEW), command, str(batch_id))
+
+    out = capsys.readouterr().out
+    first, last = _readbacks(out)
+    # The host as recovery found it, at NEW, which did not hold; then PREV, after the restore.
+    assert first.startswith(f"Readback 1 of 2, expecting {NEW}: failed (R1 held, R2 held, ")
+    assert first.endswith(", environment held).")
+    assert last == f"Readback 2 of 2, expecting {PREV}: held ({HELD})."
+    assert _printed_outcome(out, batch_id).startswith("was rolled back")
+
+
+@pytest.mark.parametrize("command", ["recover", "run"])
+def test_a_recovery_that_keeps_new_prints_its_readback(root, monkeypatch, capsys, command):
+    batch_id = _stopped_midway()
+    _snapshots(root, f"config/{NEW}")
+
+    _command(monkeypatch, FakeHost(), command, str(batch_id))
+
+    out = capsys.readouterr().out
+    assert _readbacks(out) == [f"Readback 1 of 1, expecting {NEW}: held ({HELD})."]
+    assert _printed_outcome(out, batch_id) == "was released."

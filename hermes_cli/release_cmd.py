@@ -34,7 +34,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -52,7 +52,7 @@ from hermes_cli.config import (
 )
 from hermes_cli.release_guards import GATEWAY_UNIT, GUARDS, SERVE_UNIT, Pins, RecordedMerge
 from hermes_cli.release_host import LiveHostReader
-from hermes_cli.release_host_actions import ReleaseHostActions
+from hermes_cli.release_host_actions import SYNC_EXTRAS, ReleaseHostActions
 from hermes_cli.release_runner import SANDBOX_TUNNEL_UNIT, run_release
 from hermes_constants import get_default_hermes_root, get_hermes_home
 
@@ -64,9 +64,14 @@ _REQUIRED = {
     f"units.{SANDBOX_TUNNEL_UNIT}": "the sandbox tunnel unit",
     "health_url": "the health address",
 }
-# A required value or snapshot_dir that keeps a reference whose variable is not set refuses too:
-# its placeholder would reach the adapters, and G9 would look for NEW's state snapshot under it.
-_RESOLVED = {**_REQUIRED, "snapshot_dir": "the snapshot directory"}
+# A required value, snapshot_dir or venv_dir that keeps a reference whose variable is not set
+# refuses too: its placeholder would reach the adapters, G9 would look for NEW's state snapshot
+# under it, and G5 and G8 would look for the platform environment there.
+_RESOLVED = {
+    **_REQUIRED,
+    "snapshot_dir": "the snapshot directory",
+    "venv_dir": "the platform environment",
+}
 _WAITING = {"open": "waiting for the owner's decision", "deferred": "put off by the owner"}
 # The batches start runs: an accepted one, or one whose release began and has not ended (card 7).
 _STARTABLE = ("accepted", "releasing", "failed")
@@ -342,6 +347,8 @@ def _release(inputs: tuple[Any, ...], host: _Host, token: str) -> int:
             outcome = "refused" if result is None else result.outcome
             for refusal in refusals:
                 print(f"Refused: {refusal}.")
+            if result is not None:
+                _print_readbacks(result.readbacks)  # none when the fresh guards refused
             if result is not None and result.error:
                 print(f"The release failed after the cutover ({result.error}).")
                 for error in result.restore_errors:
@@ -517,6 +524,23 @@ def _first_line(output: object) -> str:
     if isinstance(output, bytes):
         output = output.decode("utf-8", errors="replace")
     return output.split("\n", 1)[0].rstrip() if isinstance(output, str) else ""
+
+
+def _print_readbacks(readbacks: Sequence[release_runner.Readback]) -> None:
+    """One line for each readback the runner kept, in order: the version it expected, and how
+    each check read. A read that raised shows its error's type only, as its message can name a
+    path or an address. The release record keeps only the outcome."""
+    for number, readback in enumerate(readbacks, 1):
+        checks = ", ".join(
+            f"{name} held" if held else f"{name} failed" + (
+                f" with {readback.errors[name].partition(':')[0]}" if name in readback.errors else ""
+            )
+            for name, held in readback.checks.items()
+        )
+        print(
+            f"Readback {number} of {len(readbacks)}, expecting {readback.expected}:"
+            f" {'held' if readback.ok else 'failed'} ({checks})."
+        )
 
 
 def _guards_failed(guards: list[str]) -> str:
@@ -711,9 +735,11 @@ def _recover(batch_id: int) -> int:
         )
         reader, actions = _adapters(root, settings, pins.new)
         actions.config_snapshot = pins.new  # the configuration snapshot the release saved (S-C)
+        actions.environment_snapshot = pins.new  # and the environment snapshot it took
         host = _Host(reader, actions, "")
         host.cut_over = True  # the release cut over before it stopped: every action goes through
         result = release_runner.recover(host, pins, saved=_saved(root, settings, pins.new))
+        _print_readbacks(result.readbacks)
         if result.error:
             print(f"The checked-out version did not read back ({result.error}).")
             for error in result.restore_errors:
@@ -978,13 +1004,19 @@ def _adapters(
     """The live reader and actions, from explicit keyword values only (S-E).
 
     An empty ``snapshot_dir`` means release-snapshots under the root home, and the reader's
-    named snapshot is NEW (S-C).
+    named snapshot is NEW (S-C). ``venv_dir``, the platform environment's link, is relative to the
+    checkout; empty, no environment is set, and G8 refuses. ``sync_extras`` are the extras the
+    sync installs (D3).
     """
+    checkout = get_project_root()
+    venv = str(settings.get("venv_dir") or "").strip()
+    extras = settings.get("sync_extras") or SYNC_EXTRAS
     shared = {
-        "checkout": get_project_root(),
+        "checkout": checkout,
         "root_home": root,
         "units": settings["units"],
         "snapshot_root": _snapshot_root(root, settings),
+        "venv_dir": checkout / Path(venv).expanduser() if venv else None,
     }
     return (
         LiveHostReader(**shared, snapshot_name=new),
@@ -992,6 +1024,7 @@ def _adapters(
             **shared,
             health_url=settings["health_url"],
             workspace_container=settings["workspace_container"],
+            extras=(extras,) if isinstance(extras, str) else tuple(map(str, extras)),
         ),
     )
 

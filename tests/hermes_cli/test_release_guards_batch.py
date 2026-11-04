@@ -63,6 +63,12 @@ class GitHost:
     def snapshot_bytes(self, name):
         return 0
 
+    def environment_sync_available(self):
+        return True
+
+    def environment_snapshot_bytes(self):
+        return 0
+
     def open_native_runs(self):
         return []
 

@@ -901,3 +901,305 @@ def test_fleet_version_is_one_version_or_none(tmp_path, monkeypatch):
     assert answers == {**dict.fromkeys(cases, ""), **dict.fromkeys(good, new)}
     # The gateways under this process's root are not another host root's answer.
     assert answer([(root, live, new)], root_home=tmp_path / "elsewhere") == ""
+
+
+# The stand-in uv lives only in the Hermes home's bin folder, as on the release host, where uv is
+# not on the release service's PATH. It records each call's arguments, one call to a line, and the
+# environment it was told to sync. A sync exits STAND_IN_UV_SYNC_EXIT; the lock export and the
+# installed list print the files their variables name, and fail when the file is missing.
+STAND_IN_UV = """#!/bin/sh
+printf '%s\\n' "$*" >> "$STAND_IN_UV_CALLS"
+printf 'UV_PROJECT_ENVIRONMENT=%s\\n' "$UV_PROJECT_ENVIRONMENT" >> "$STAND_IN_UV_CALLS"
+case "$1" in
+  sync) exit "${STAND_IN_UV_SYNC_EXIT:-0}" ;;
+  export) exec cat "$STAND_IN_UV_EXPORT" ;;
+  pip) exec cat "$STAND_IN_UV_INSTALLED" ;;
+esac
+"""
+
+
+@pytest.fixture
+def platform_env(tmp_path, monkeypatch) -> SimpleNamespace:
+    """A temporary Hermes home with the stand-in uv in its bin folder, and the platform environment
+    as on the release host: venv in the checkout is a link to one real folder."""
+    home = tmp_path / "home"
+    (home / "bin").mkdir(parents=True)
+    (home / "bin" / "uv").write_text(STAND_IN_UV)
+    (home / "bin" / "uv").chmod(0o755)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("STAND_IN_UV_CALLS", str(tmp_path / "uv-calls"))
+    real = tmp_path / "environments" / "hermes-env"
+    (real / "bin").mkdir(parents=True)
+    (real / "pyvenv.cfg").write_text("version_info = 3.11.15\n")
+    os.symlink(sys.executable, real / "bin" / "python")
+    site = real / "lib" / "python3.11" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "pillow.py").write_text("__version__ = '12.3.0'\n")
+    (site / "discord.py").write_text("__version__ = '2.7.1'\n")  # installed on demand
+    (real / "bin" / "hermes").write_text("#!/bin/sh\n")
+    (real / "bin" / "hermes").chmod(0o755)
+    (tmp_path / "checkout").mkdir()
+    link = tmp_path / "checkout" / "venv"
+    os.symlink(real, link)
+    return SimpleNamespace(home=home, real=real, link=link, site=site)
+
+
+def uv_calls(tmp_path: Path) -> list[str]:
+    path = tmp_path / "uv-calls"
+    return path.read_text().splitlines() if path.exists() else []
+
+
+def tree(root: Path) -> dict[str, tuple]:
+    """Every entry under root: a link by its target, a file by its bytes and mode."""
+    entries: dict[str, tuple] = {}
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            entries[rel] = ("link", os.readlink(path))
+        elif path.is_file():
+            entries[rel] = ("file", path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+        else:
+            entries[rel] = ("dir",)
+    return entries
+
+
+def test_sync_uses_frozen_and_never_resolves(tmp_path, monkeypatch, platform_env):
+    # The real uv on PATH is never used: only the one in the Hermes home's bin folder records.
+    actions = make_actions(tmp_path, venv_dir=platform_env.link, extras=("all",))
+    real = platform_env.real
+
+    actions.sync_environment()
+
+    # Frozen and inexact, with the all extra and no default groups, the locked dependencies only:
+    # the project itself is never built or installed, so its non-editable install stays as it is.
+    # In place in the real folder the link names, through that environment's own interpreter.
+    assert uv_calls(tmp_path) == [
+        f"sync --frozen --inexact --no-default-groups --no-editable --no-install-project --extra all"
+        f" --project {tmp_path / 'checkout'} --python {real / 'bin' / 'python'}",
+        f"UV_PROJECT_ENVIRONMENT={real}",
+    ]
+    assert os.readlink(platform_env.link) == str(real)
+
+    monkeypatch.setenv("STAND_IN_UV_SYNC_EXIT", "2")
+    with pytest.raises(RuntimeError):
+        actions.sync_environment()
+
+    # Without uv in the Hermes home's bin folder the sync raises before any call, uv on PATH or not.
+    (platform_env.home / "bin" / "uv").unlink()
+    with pytest.raises(FileNotFoundError, match="uv"):
+        actions.sync_environment()
+    assert len(uv_calls(tmp_path)) == 4
+    assert not any(call.split()[0] in ("lock", "add", "remove") for call in uv_calls(tmp_path))
+
+
+LOCK_EXPORT = (
+    "certifi==2026.5.20\n"
+    "pillow==12.3.0\n"
+    # Locked for another platform only: not installed here, and not missing either.
+    "pywin32==311 ; sys_platform == 'win32'\n"
+)
+INSTALLED = [
+    {"name": "certifi", "version": "2026.5.20"},
+    {"name": "Pillow", "version": "12.3.0"},
+    {"name": "discord-py", "version": "2.7.1"},  # installed on demand, outside the lock
+]
+
+
+@pytest.mark.parametrize(
+    ("export", "installed", "matches"),
+    [
+        pytest.param(LOCK_EXPORT, json.dumps(INSTALLED), True, id="every-locked-package-installed"),
+        pytest.param(
+            LOCK_EXPORT,
+            json.dumps([{**entry, "version": "12.2.0"} if entry["name"] == "Pillow" else entry
+                        for entry in INSTALLED]),
+            False,
+            id="another-version-installed",
+        ),
+        pytest.param(LOCK_EXPORT, json.dumps(INSTALLED[1:]), False, id="locked-package-missing"),
+        pytest.param(None, json.dumps(INSTALLED), False, id="lock-export-fails"),
+        pytest.param(LOCK_EXPORT, None, False, id="installed-list-fails"),
+        pytest.param(LOCK_EXPORT, "not json", False, id="installed-list-unreadable"),
+    ],
+)
+def test_environment_matches_lock_reads_false_on_difference_or_error(
+    tmp_path, monkeypatch, platform_env, export, installed, matches
+):
+    for variable, content in (("STAND_IN_UV_EXPORT", export), ("STAND_IN_UV_INSTALLED", installed)):
+        path = tmp_path / variable.lower()
+        if content is not None:
+            path.write_text(content)
+        monkeypatch.setenv(variable, str(path))
+    actions = make_actions(tmp_path, venv_dir=platform_env.link, extras=("all",))
+
+    assert actions.environment_matches_lock() is matches
+
+    # Both lists are read through uv, so nothing is imported: the lock as exported for the all
+    # extra and no default groups, and what the environment's interpreter has installed.
+    reads = [call.split()[0] for call in uv_calls(tmp_path)[::2]]
+    assert reads in (["export"], ["export", "pip"])
+    assert uv_calls(tmp_path)[0] == (
+        "export --frozen --format requirements.txt --no-hashes --no-header --no-annotate"
+        f" --no-emit-project --no-default-groups --extra all --project {tmp_path / 'checkout'}"
+    )
+    if reads == ["export", "pip"]:
+        assert uv_calls(tmp_path)[2] == (
+            f"pip list --python {platform_env.real / 'bin' / 'python'} --format json"
+        )
+
+
+def _environment_lists(tmp_path, monkeypatch, export, installed):
+    """The lock export and the installed list the stand-in uv prints; None makes that read fail."""
+    for variable, content in (("STAND_IN_UV_EXPORT", export), ("STAND_IN_UV_INSTALLED", installed)):
+        path = tmp_path / variable.lower()
+        if content is not None:
+            path.write_text(content)
+        monkeypatch.setenv(variable, str(path))
+
+
+def test_environment_differences_name_each_package_with_both_versions(
+    tmp_path, monkeypatch, platform_env
+):
+    export = "Brotlicffi==1.2.0.2\n" + LOCK_EXPORT.replace("pillow==12.3.0", "pillow==12.0.0")
+    installed = [{**entry, "version": "11.3.0"} if entry["name"] == "Pillow" else entry
+                 for entry in INSTALLED]
+    _environment_lists(tmp_path, monkeypatch, export, json.dumps(installed))
+    actions = make_actions(tmp_path, venv_dir=platform_env.link, extras=("all",))
+
+    # By normalised name, with only names and versions: a package installed at another version,
+    # and a locked one that is missing. The package installed on demand is not a difference.
+    assert actions.environment_differences() == (
+        "brotlicffi expected 1.2.0.2, missing",
+        "pillow expected 12.0.0, installed 11.3.0",
+    )
+    assert actions.environment_matches_lock() is False
+
+    _environment_lists(tmp_path, monkeypatch, LOCK_EXPORT, json.dumps(INSTALLED))
+    assert actions.environment_differences() == ()
+    assert actions.environment_matches_lock() is True
+
+
+@pytest.mark.parametrize(
+    ("export", "installed", "reason"),
+    [
+        pytest.param(None, json.dumps(INSTALLED), "the lock export failed", id="lock-export-fails"),
+        pytest.param(LOCK_EXPORT, None, "the installed list failed", id="installed-list-fails"),
+        pytest.param(
+            LOCK_EXPORT, "not json", "the installed list could not be read",
+            id="installed-list-unreadable",
+        ),
+        pytest.param(
+            "pillow>=12.0.0\n", json.dumps(INSTALLED),
+            "the lock export does not pin pillow with one ==", id="lock-line-not-one-pin",
+        ),
+        pytest.param(
+            "pillow @ https://user:secret@example.invalid/pillow.whl\n", json.dumps(INSTALLED),
+            "the lock export does not pin pillow with one ==", id="lock-line-with-an-address",
+        ),
+    ],
+)
+def test_an_unreadable_environment_comparison_raises_a_short_reason(
+    tmp_path, monkeypatch, platform_env, export, installed, reason
+):
+    from hermes_cli import release_runner
+
+    _environment_lists(tmp_path, monkeypatch, export, installed)
+    actions = make_actions(tmp_path, venv_dir=platform_env.link, extras=("all",))
+
+    with pytest.raises(release_runner.EnvironmentUnreadable) as unreadable:
+        actions.environment_differences()
+
+    # The reason names no path, address or setting, so it can go into the release's error.
+    assert str(unreadable.value) == reason
+    assert actions.environment_matches_lock() is False
+
+
+def test_an_environment_comparison_that_times_out_or_finds_no_uv_or_environment_is_unreadable(
+    tmp_path, monkeypatch, platform_env
+):
+    from hermes_cli import release_runner
+
+    _environment_lists(tmp_path, monkeypatch, None, json.dumps(INSTALLED))
+    os.mkfifo(tmp_path / "stand_in_uv_export")  # with no writer, the export never ends
+    monkeypatch.setattr(release_host_actions, "ENVIRONMENT_READ_TIMEOUT_SECONDS", 0.5)
+    cases = [
+        (make_actions(tmp_path, venv_dir=platform_env.link), "the lock export timed out"),
+        (make_actions(tmp_path, venv_dir=tmp_path / "no-such-venv"), "the platform environment is not found"),
+        (make_actions(tmp_path), "the platform environment is not found"),
+    ]
+    for actions, reason in cases:
+        with pytest.raises(release_runner.EnvironmentUnreadable, match=f"^{reason}$"):
+            actions.environment_differences()
+        assert actions.environment_matches_lock() is False
+
+    (platform_env.home / "bin" / "uv").unlink()
+    actions = make_actions(tmp_path, venv_dir=platform_env.link)
+    with pytest.raises(
+        release_runner.EnvironmentUnreadable, match="^uv is not in the Hermes home's bin folder$"
+    ):
+        actions.environment_differences()
+    assert actions.environment_matches_lock() is False
+
+
+def test_environment_matches_lock_reads_false_without_uv_or_environment(
+    tmp_path, monkeypatch, platform_env
+):
+    (tmp_path / "export").write_text(LOCK_EXPORT)
+    (tmp_path / "installed").write_text(json.dumps(INSTALLED))
+    monkeypatch.setenv("STAND_IN_UV_EXPORT", str(tmp_path / "export"))
+    monkeypatch.setenv("STAND_IN_UV_INSTALLED", str(tmp_path / "installed"))
+    assert make_actions(tmp_path, venv_dir=platform_env.link).environment_matches_lock() is True
+
+    without_environment = make_actions(tmp_path, venv_dir=tmp_path / "no-such-venv")
+    assert without_environment.environment_matches_lock() is False
+
+    (platform_env.home / "bin" / "uv").unlink()
+    assert make_actions(tmp_path, venv_dir=platform_env.link).environment_matches_lock() is False
+
+
+@pytest.mark.parametrize("role", ["gateway", "serve"])
+def test_environment_snapshot_refused_while_units_active(tmp_path, monkeypatch, platform_env, role):
+    snapshots = tmp_path / "snapshots"
+    actions = make_actions(tmp_path, venv_dir=platform_env.link)
+    monkeypatch.setenv("STAND_IN_ACTIVE", UNITS[role])
+
+    with pytest.raises(RuntimeError, match=f"the {role} unit is active"):
+        actions.take_environment_snapshot("NEW")
+    assert not snapshots.exists()  # nothing copied, staged or even made
+
+    # The sandbox tunnel is no platform unit: the release keeps it up.
+    monkeypatch.setenv("STAND_IN_ACTIVE", UNITS["sandbox-tunnel"])
+    actions.take_environment_snapshot("NEW")
+    assert tree(snapshots / "env" / "NEW") == tree(platform_env.real)
+
+
+def test_environment_snapshot_and_restore_round_trip(tmp_path, platform_env):
+    real, link, site = platform_env.real, platform_env.link, platform_env.site
+    before = tree(real)
+    actions = make_actions(tmp_path, venv_dir=link)
+    # A release that took no environment snapshot never synced: its restore changes nothing.
+    actions.restore_environment()
+    assert tree(real) == before
+
+    actions.take_environment_snapshot("NEW")
+    # The sync changes the environment in place: a raised version, a new package, one removed.
+    (site / "pillow.py").write_text("__version__ = '13.0.0'\n")
+    (site / "brotlicffi.py").write_text("__version__ = '1.2.0.2'\n")
+    (site / "discord.py").unlink()
+    actions.restore_environment()
+
+    # The same files come back into the same real folder, and the link is the same link.
+    assert tree(real) == before
+    assert link.is_symlink() and os.readlink(link) == str(real)
+    assert sorted(path.name for path in real.parent.iterdir()) == ["hermes-env"]  # none set aside
+    # The copy is kept for the next move: tier 2 goes back once, then forward again.
+    assert tree(tmp_path / "snapshots" / "env" / "NEW") == before
+
+    # A snapshot that is gone raises, and the live environment stays as it is.
+    (site / "pillow.py").write_text("__version__ = '13.0.0'\n")
+    changed = tree(real)
+    actions.delete_environment_snapshot("NEW")
+    with pytest.raises(FileNotFoundError):
+        actions.restore_environment()
+    assert tree(real) == changed
+    assert os.readlink(link) == str(real)

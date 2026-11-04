@@ -163,6 +163,10 @@ class FakeHost:
     kill_mode: str = "mixed"
     runs_readable: bool = True
     live_snapshots: bool = False
+    # The full size of the platform environment, as G8 counts it; with live_environment, what the
+    # real LiveHostReader, built with the reader's keywords, finds there instead.
+    environment_bytes: int = 0
+    live_environment: bool = False
     built: list[dict] = field(default_factory=list)
     chains: list[tuple[str, str]] = field(default_factory=list)
     asked: list[str] = field(default_factory=list)
@@ -223,6 +227,15 @@ class FakeHost:
             [reader] = [settings for settings in self.built if "snapshot_name" in settings]
             return LiveHostReader(**reader).snapshot_bytes(name)
         return 0
+
+    def environment_sync_available(self):
+        return True
+
+    def environment_snapshot_bytes(self):
+        if self.live_environment:
+            [reader] = [settings for settings in self.built if "snapshot_name" in settings]
+            return LiveHostReader(**reader).environment_snapshot_bytes()
+        return self.environment_bytes
 
     def open_native_runs(self):
         if not self.runs_readable:
@@ -554,11 +567,12 @@ def test_prepare_runs_every_guard_and_writes_nothing(root, tmp_path, monkeypatch
         "root_home": root,
         "units": UNITS,
         "snapshot_root": root / "release-snapshots",
+        "venv_dir": None,
     }
     assert host.built == [
         {**shared, "snapshot_name": NEW},
         {**shared, "health_url": SETTINGS["health_url"],
-         "workspace_container": "raphael-workspace"},
+         "workspace_container": "raphael-workspace", "extras": ("all",)},
     ]
 
     host.kill_mode, host.runs_readable = "control-group", False
@@ -681,7 +695,11 @@ def test_a_reference_that_resolves_to_an_empty_value_refuses(
 @pytest.mark.parametrize("form", REFERENCE_FORMS)
 @pytest.mark.parametrize(
     ("key", "name"),
-    [*REQUIRED, pytest.param("snapshot_dir", "the snapshot directory", id="snapshot-dir")],
+    [
+        *REQUIRED,
+        pytest.param("snapshot_dir", "the snapshot directory", id="snapshot-dir"),
+        pytest.param("venv_dir", "the platform environment", id="venv-dir"),
+    ],
 )
 def test_a_reference_to_a_variable_that_is_not_set_refuses(
     root, monkeypatch, capsys, key, name, form
@@ -723,6 +741,9 @@ def test_both_adapters_are_built_from_the_resolved_settings(root, monkeypatch, f
         "workspace_container": ref("RELEASE_REF_TEST_CONTAINER", "raphael-workspace-blue"),
         # An empty snapshot_dir, here from a reference, means release-snapshots under the root.
         "snapshot_dir": ref("RELEASE_REF_TEST_EMPTY", ""),
+        # A relative venv_dir is under the checkout.
+        "venv_dir": ref("RELEASE_REF_TEST_VENV", "venv-blue"),
+        "sync_extras": ["all", "messaging"],
     }
     (root / "config.yaml").write_text(yaml.safe_dump({"release": settings}))
     _accepted_batch(NEW)
@@ -738,6 +759,7 @@ def test_both_adapters_are_built_from_the_resolved_settings(root, monkeypatch, f
             "sandbox-tunnel": "hermes-sandbox-tunnel-blue",
         },
         "snapshot_root": root / "release-snapshots",
+        "venv_dir": Path(release_cmd.__file__).resolve().parents[1] / "venv-blue",
     }
     assert host.built == [
         {**shared, "snapshot_name": NEW},
@@ -745,6 +767,7 @@ def test_both_adapters_are_built_from_the_resolved_settings(root, monkeypatch, f
             **shared,
             "health_url": "http://127.0.0.1:9642/health",
             "workspace_container": "raphael-workspace-blue",
+            "extras": ("all", "messaging"),
         },
     ]
 
@@ -1273,3 +1296,111 @@ def test_status_needs_a_card_id_only_for_a_change_without_a_title(root, monkeypa
         "  - Later changes (https://github.com/mtbitcr/hermes-agent/pull/2)",
         "Last outcome: no release has finished yet.",
     ]
+
+
+def _g_verdicts(out: str) -> dict[str, str]:
+    return {line.split()[0]: line.split()[1] for line in out.splitlines() if line[0] == "G"}
+
+
+def test_a_missing_venv_dir_refuses(root, tmp_path, monkeypatch, capsys):
+    """Without release.venv_dir there is no environment for the release to copy and sync, so G8
+    cannot count its copy and refuses, as the real reader finds it; nothing is written."""
+    host = FakeHost(live_snapshots=True, live_environment=True)
+    release_cmd = _command(monkeypatch, host)
+    _accepted_batch(NEW)
+    before = _files(tmp_path)
+
+    assert release_cmd.prepare() != 0
+
+    verdicts = _g_verdicts(capsys.readouterr().out)
+    assert verdicts == {guard: "failed:" if guard == "G8" else "passed:" for guard, _, _ in GUARDS}
+    assert _files(tmp_path) == before
+    assert host.asked == []
+
+
+def test_g8_counts_the_full_environment_the_venv_dir_link_names(
+    root, tmp_path, monkeypatch, capsys
+):
+    """release.venv_dir is a link to one real folder; G8 counts the full size of that folder, the
+    copy the release takes. The host has 5 GiB free and no state snapshot, so 1 GiB fits and a
+    byte more does not."""
+    real = tmp_path / "environments" / "hermes-env"
+    (real / "lib").mkdir(parents=True)
+    (real / "pyvenv.cfg").write_text("version_info = 3.11.15\n")
+    os.symlink(real, tmp_path / "venv")
+    settings = {**SETTINGS, "venv_dir": str(tmp_path / "venv")}
+    (root / "config.yaml").write_text(yaml.safe_dump({"release": settings}))
+    host = FakeHost(live_snapshots=True, live_environment=True)
+    release_cmd = _command(monkeypatch, host)
+    _accepted_batch(NEW)
+    size = 1024**3 - len("version_info = 3.11.15\n")
+    with open(real / "lib" / "packages", "wb") as packages:
+        packages.truncate(size)  # sparse: its full size counts, not the blocks it holds
+
+    assert release_cmd.prepare() == 0
+    assert _g_verdicts(capsys.readouterr().out)["G8"] == "passed:"
+
+    with open(real / "lib" / "packages", "wb") as packages:
+        packages.truncate(size + 1)
+    host.built.clear()  # the next prepare builds its own reader
+    assert release_cmd.prepare() != 0
+    out = capsys.readouterr().out
+    assert _g_verdicts(out) == {guard: "failed:" if guard == "G8" else "passed:" for guard, _, _ in GUARDS}
+    assert "could not check" not in out  # the size refused it, not a read that raised
+    assert os.readlink(tmp_path / "venv") == str(real)
+
+
+def test_a_release_without_uv_is_refused_at_the_preflight_and_stops_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    """Every release syncs the platform environment, so with the lock file and the manifest
+    unchanged, a Hermes home whose bin folder holds no uv is refused by G8 at the preflight of the
+    registered ``hermes release run``, on the live adapters, though PATH holds a uv: no unit
+    stops, the platform is not left paused, and the record shows the release refused."""
+    from types import SimpleNamespace
+
+    import shutil
+
+    from agent import estop
+    from hermes_cli import build_info, main, release_host_actions
+    from tests.hermes_cli.test_release_run import (
+        SETTINGS as RUN_SETTINGS,
+        Boundary,
+        _accepted,
+        _batches,
+        _platform_environment,
+    )
+
+    home = _root_at(tmp_path, monkeypatch)
+    venv = _platform_environment(tmp_path, home)
+    settings = {**RUN_SETTINGS, "venv_dir": str(venv)}
+    (home / "config.yaml").write_text(yaml.safe_dump({"release": settings}))
+    (home / "bin" / "uv").unlink()  # the managed uv is missing; only the one on PATH is left
+    on_path = tmp_path / "on-path"
+    on_path.mkdir()
+    (on_path / "uv").write_text("#!/bin/sh\nexit 0\n")
+    (on_path / "uv").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{on_path}{os.pathsep}{os.environ['PATH']}")
+    batch_id = _accepted(1)["batch_id"]
+    boundary = Boundary(home)
+    boundary.stamp()  # the live gateway runs PREV
+    answer = SimpleNamespace(status=200)  # the health address answers
+    direct = SimpleNamespace(open=lambda url, timeout: contextlib.nullcontext(answer))
+    monkeypatch.setattr(subprocess, "run", boundary.run)
+    monkeypatch.setattr(build_info, "get_code_identity", lambda **_: {"sha": boundary.head})
+    monkeypatch.setattr(release_host_actions, "_DIRECT", direct)
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=8 * 1024**3))
+    monkeypatch.setattr(main, "_plugin_cli_discovery_needed", lambda: False)
+    parser, _subparsers = main._build_cli_parser()
+    args = parser.parse_args(["release", "run"])
+
+    code = args.func(args)
+
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "Refused: release guard G8 failed." in out.splitlines()
+    assert _printed_outcome(out, batch_id).startswith("was refused before anything changed")
+    assert not [move for move in boundary.moves if move.startswith(("stop ", "sync "))]
+    assert boundary.head == PREV
+    assert not estop.is_engaged()
+    assert [batch["outcome"] for batch in _batches()] == ["refused", None]
