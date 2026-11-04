@@ -1636,6 +1636,33 @@ class GatewayKanbanWatchersMixin:
                             pass
             return counts, unreadable
 
+        # Board rotation: each tick a pass gives the first turn to the next
+        # dispatchable board after the one that went first last tick, so the
+        # early boards cannot take every free slot (or the auto-decompose
+        # budget) while later boards' cards wait. Keyed on that slug, not a
+        # position, so boards can come and go; each pass keeps its own start.
+        went_first: dict[str, str] = {}
+
+        def _turn_order(slug: str) -> "tuple[bool, str]":
+            return (slug != _kb.DEFAULT_BOARD, slug)  # list_boards' order
+
+        def _boards_in_turn(boards: list, rotation: str) -> "list[str]":
+            """The dispatchable slugs, starting with the first one after the
+            slug that went first in ``rotation`` last tick, wrapping round."""
+            slugs = sorted((
+                b.get("slug") or _kb.DEFAULT_BOARD
+                for b in boards if _board_is_dispatchable(b)
+            ), key=_turn_order)
+            last = went_first.get(rotation)
+            start = 0 if last is None else next((
+                i for i, slug in enumerate(slugs)
+                if _turn_order(slug) > _turn_order(last)
+            ), 0)
+            slugs = slugs[start:] + slugs[:start]
+            if slugs:
+                went_first[rotation] = slugs[0]
+            return slugs
+
         def _tick_once() -> "list[tuple[str, Optional[object]]]":
             """Run one dispatch_once per board. Returns (slug, result) pairs.
 
@@ -1666,10 +1693,7 @@ class GatewayKanbanWatchersMixin:
                         ", ".join(sorted(max_in_progress_by_profile)),
                     )
             out: list[tuple[str, "Optional[object]"]] = []
-            for b in boards:
-                if not _board_is_dispatchable(b):
-                    continue
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
+            for slug in _boards_in_turn(boards, "dispatch"):
                 out.append((slug, _tick_once_for_board(
                     slug, profile_running, profile_running_unknown,
                 )))
@@ -1764,10 +1788,7 @@ class GatewayKanbanWatchersMixin:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             attempted = 0
             successes = 0
-            for b in boards:
-                if not _board_is_dispatchable(b):
-                    continue
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
+            for slug in _boards_in_turn(boards, "auto_decompose"):
                 if attempted >= auto_decompose_per_tick:
                     break
                 # Pin this board for the duration of the call — same
