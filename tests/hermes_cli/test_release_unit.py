@@ -52,9 +52,11 @@ SETTINGS = {
 # and fails anything else, so a run that begins fails its fetch and is refused. Given the user
 # manager's environment, systemd-run runs the unit's command in it, with the unit's HERMES_HOME
 # and directory, and starts it again while it fails, up to its start limit, as the user manager
-# does under Restart=on-failure and StartLimitIntervalSec=infinity; each run goes to runs.jsonl.
-# The unit's command is the real release with its send to the owner replaced: each line it would
-# send goes to told.jsonl, so no run here starts a real send.
+# does under Restart=on-failure and StartLimitIntervalSec=infinity, but not after an exit status
+# that RestartPreventExitStatus lists; given ``starts``, it makes at most that many of the starts.
+# Each run goes to runs.jsonl. The unit's command is the real release with its send to the owner
+# replaced: each line it would send goes to told.jsonl, so no run here starts a real send. No
+# platform environment is set up here, so its G12 read finds the environment as locked.
 STAND_IN = r'''
 import json, os, subprocess, sys
 from pathlib import Path
@@ -65,11 +67,12 @@ answers = json.loads((top / "answers.json").read_text(encoding="utf-8"))
 CHILD = (
     "import json, sys\n"
     "told = sys.argv.pop(1)\n"
-    "from hermes_cli import main, release_cmd\n"
+    "from hermes_cli import main, release_cmd, release_host\n"
     "def tell(line):\n"
     "    with open(told, 'a', encoding='utf-8') as log:\n"
     "        log.write(json.dumps(line) + '\\n')\n"
     "release_cmd._tell_owner = tell\n"
+    "release_host.LiveHostReader.environment_lock_differences = lambda self: ()\n"
     "main.main()\n"
 )
 if call[0] == "git":
@@ -86,7 +89,7 @@ if call[0] == "systemd-run":
     code, error = answers["launch"]
     if not code and answers["environment"] is not None:
         options, command = call[1 : call.index("--")], call[call.index("--") + 1 :]
-        env, cwd, starts = dict(answers["environment"]), None, 1
+        env, cwd, starts, final = dict(answers["environment"]), None, 1, {0}
         for option in options:
             name, _, value = option.partition("=")
             if name == "--setenv":
@@ -95,16 +98,19 @@ if call[0] == "systemd-run":
                 cwd = value
             elif value.startswith("StartLimitBurst="):
                 starts = int(value.split("=", 1)[1])
+            elif value.startswith("RestartPreventExitStatus="):
+                final.update(map(int, value.split("=", 1)[1].split()))
         # "python -m MODULE ARGS" becomes "python -c CHILD TOLD ARGS"
         command = [command[0], "-c", CHILD, str(top / "told.jsonl"), *command[3:]]
-        for _ in range(starts if "--property=Restart=on-failure" in options else 1):
+        starts = starts if "--property=Restart=on-failure" in options else 1
+        for _ in range(min(starts, answers["starts"] or starts)):
             run = subprocess.run(
                 command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True,
                 encoding="utf-8", errors="replace", timeout=120,
             )
             with open(top / "runs.jsonl", "a", encoding="utf-8") as log:
                 log.write(json.dumps([run.returncode, run.stdout, run.stderr]) + "\n")
-            if run.returncode == 0:
+            if run.returncode in final:
                 break
     sys.stderr.write(error)
     sys.exit(code)
@@ -126,13 +132,16 @@ class UserManager:
     def __init__(self, top: Path) -> None:
         self.top = top
 
-    def answer(self, *, launch=(0, ""), units=(), states=("active",), environment=None) -> None:
+    def answer(
+        self, *, launch=(0, ""), units=(), states=("active",), environment=None, starts=None
+    ) -> None:
         """systemd-run's exit code and error, the listed release units, and the read-back's
         answers in turn (the last one stays). Given the user manager's ``environment``, a launch
-        also runs the unit's command in it; git answers the checkout's head with PREV."""
+        also runs the unit's command in it, at most ``starts`` times when given: a test that reads
+        no restart makes none, or one; git answers the checkout's head with PREV."""
         answers = {
             "launch": list(launch), "units": list(units), "states": list(states),
-            "environment": environment, "head": PREV,
+            "environment": environment, "head": PREV, "starts": starts,
         }
         (self.top / "answers.json").write_text(json.dumps(answers), encoding="utf-8")
 
@@ -268,6 +277,8 @@ def _start(monkeypatch: pytest.MonkeyPatch, batch_id: int) -> tuple[int, Clock]:
 
 
 def test_start_launches_a_transient_user_service(root, manager, monkeypatch, capsys):
+    from hermes_cli import release_unit
+
     batch_id = _batch_in("accepted")
     # Started from a kanban worker under a profile home: the unit gets neither.
     profile = root / "profiles" / "coder"
@@ -288,12 +299,14 @@ def test_start_launches_a_transient_user_service(root, manager, monkeypatch, cap
     options, command = launch[1 : launch.index("--")], launch[launch.index("--") + 1 :]
     # A user service, not a scope: the user manager forks it, outside the caller's control group.
     # It is named for the batch, collected after it exits and restarted on failure, at most
-    # four starts in all, the run and one for each recovery attempt; it runs from the root home,
-    # whose HERMES_HOME is all it is given.
+    # four starts in all, the run and one for each recovery attempt, and never after the exit
+    # status of a restored outcome; it runs from the root home, whose HERMES_HOME is all it is
+    # given.
     assert sorted(options) == sorted([
         "--user", f"--unit={unit}", "--collect",
         "--property=Restart=on-failure",
         "--property=StartLimitIntervalSec=infinity", "--property=StartLimitBurst=4",
+        f"--property=RestartPreventExitStatus={release_unit.RESTORED_EXIT_STATUS}",
         f"--working-directory={root}", f"--setenv=HERMES_HOME={root}",
     ])
     assert command == [
@@ -453,7 +466,7 @@ def test_start_reports_the_state_the_record_shows_after_a_failed_read_back(
     """Owner rule 2: the unit's run changed the record before the read-back failed, so the start
     reports the state the record now shows, and not that the batch was left as it was."""
     batch_id = _batch_in("accepted")
-    manager.answer(states=["failed"], environment=_unit_environment(root))
+    manager.answer(states=["failed"], environment=_unit_environment(root), starts=1)
 
     code, clock = _start(monkeypatch, batch_id)
 
@@ -477,7 +490,7 @@ def test_no_board_variable_reaches_the_release_run(root, manager, tmp_path, monk
     manager.answer(states=["failed"], environment=_unit_environment(
         root, HERMES_KANBAN_HOME=str(board), HERMES_KANBAN_DB=str(board / "kanban.db"),
         HERMES_KANBAN_TASK="t_0badc0de", HERMES_KANBAN_FUTURE_FLAG="1",
-    ))
+    ), starts=1)  # the git calls are the first run's: a restart refuses before it reads the head
 
     _start(monkeypatch, batch_id)
 
@@ -517,8 +530,9 @@ def test_start_judges_and_reports_the_root_batch(
         monkeypatch.setenv("HERMES_HOME", str(profile))
         for name, value in WORKER.items():
             monkeypatch.setenv(name, value)
-    manager.answer(
-        states=states, environment=_unit_environment(root, HERMES_KANBAN_HOME=str(named))
+    manager.answer(  # the run, and one restart, which must not reach the named record either
+        states=states, environment=_unit_environment(root, HERMES_KANBAN_HOME=str(named)),
+        starts=2,
     )
     record = root / "kanban" / ledger.STORE_NAME
     assert _read_record(record) == ([(batch_id, root_state)], [])
@@ -552,7 +566,7 @@ def test_a_release_unit_tells_the_owner_once_how_its_batch_ended(root, manager, 
     """The unit's first run ends the release of its batch and tells the owner. Its restarts refuse
     a batch that is no longer accepted: they end no release, so they tell nothing."""
     batch_id = _batch_in("accepted")
-    manager.answer(states=["failed"], environment=_unit_environment(root))
+    manager.answer(states=["failed"], environment=_unit_environment(root), starts=2)
 
     _start(monkeypatch, batch_id)
 

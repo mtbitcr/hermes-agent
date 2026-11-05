@@ -13,10 +13,11 @@ A run that exits non-zero, or that a hard kill ends, is started again (Restart=o
 most START_LIMIT_BURST starts in all: StartLimitIntervalSec=infinity never lets the count of
 starts reset, so the user manager refuses the next one, and the unit fails and is collected.
 Every start runs the same batch, which the run refuses unless it is the accepted batch a run
-takes first, so a restart never reaches another batch. A run or recovery that ends released or
-restored exits 0, and so does one past its last recovery attempt: the unit is not started
-again. Until card 7 recovers a hard-killed batch, a restarted run of a batch that is still
-releasing refuses, as it is no longer accepted, and this limit ends the loop.
+takes first, so a restart never reaches another batch. A run or recovery that ends released
+exits 0, and so does one past its last recovery attempt; one that ends restored exits
+RESTORED_EXIT_STATUS, which the unit lists in RestartPreventExitStatus: in each case the unit is
+not started again. Until card 7 recovers a hard-killed batch, a restarted run of a batch that is
+still releasing refuses, as it is no longer accepted, and this limit ends the loop.
 
 Without systemd-run nothing starts, by the rule of update_abort_recovery.
 """
@@ -34,6 +35,13 @@ from pathlib import Path
 # release_cmd._RECOVERY_ATTEMPTS allows (3). release_cmd imports this module, so the sum is
 # written out here, and a test ties the two values.
 START_LIMIT_BURST = 4
+# The exit status of a run or recovery that ends restored, which the unit lists in
+# RestartPreventExitStatus: the outcome is final, so the unit is not started again, also when
+# the release's pause could not be removed or read back. Nothing else in a release exits 8: 0 is
+# a success, 1 a failure the unit restarts on, 2 a usage error; systemd names 3 to 7 after the
+# LSB init-script codes, and 64 to 78 are the sysexits codes, the watchdog's restart status 75
+# among them, 126 and up the shell's and the signals', 200 and up systemd's own.
+RESTORED_EXIT_STATUS = 8
 # How long the start waits for the user manager to answer active, and how often it asks.
 READBACK_SECONDS = 10.0
 POLL_SECONDS = 0.5
@@ -84,6 +92,7 @@ def launch(systemd_run: str, batch_id: int, root: Path) -> None:
         systemd_run, "--user", f"--unit={unit_name(batch_id)}", "--collect",
         "--property=Restart=on-failure", "--property=StartLimitIntervalSec=infinity",
         f"--property=StartLimitBurst={START_LIMIT_BURST}",
+        f"--property=RestartPreventExitStatus={RESTORED_EXIT_STATUS}",
         f"--working-directory={root}", f"--setenv=HERMES_HOME={root}",
         "--", sys.executable, "-m", "hermes_cli.main", "--profile", "default", "release", "run",
         str(batch_id),

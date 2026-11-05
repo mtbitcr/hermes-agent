@@ -371,18 +371,6 @@ class ReleaseHostActions:
         with contextlib.suppress(FileNotFoundError):
             shutil.rmtree(self._named(ENVIRONMENT, name))
 
-    def set_aside_snapshots(self, name: str, aside: str) -> None:
-        """Move the state, configuration and environment snapshots of NAME, those that exist, to
-        ASIDE, each by one rename in its own directory, so they keep what they hold and a later
-        release of NAME takes its own. When a snapshot of ASIDE exists already, nothing moves."""
-        moves = [(self._named(kind, name), self._named(kind, aside)) for kind in (STATE, CONFIG, ENVIRONMENT)]
-        moves = [(source, target) for source, target in moves if os.path.lexists(source)]
-        for _source, target in moves:
-            if os.path.lexists(target):
-                raise FileExistsError(f"the {target.parent.name} snapshot {aside} already exists")
-        for source, target in moves:
-            os.rename(source, target)
-
     def _environment(self) -> Path:
         """The real folder the venv_dir link names. Raises when it holds no environment."""
         if self.venv_dir is None:

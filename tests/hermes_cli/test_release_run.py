@@ -24,7 +24,9 @@ import pytest
 import yaml
 
 from agent import estop
-from hermes_cli import build_info, release_guards, release_host_actions, release_runner
+from hermes_cli import (
+    build_info, release_guards, release_host_actions, release_runner, release_unit,
+)
 from hermes_cli import release_ledger as ledger
 from hermes_cli.release_guards import GUARDS, OpenRun
 from hermes_cli.subcommands.release import build_release_parser
@@ -50,8 +52,9 @@ TIER_2 = FORWARD_ONLY[:5] + ("back", "readback", "forward", "readback") + FORWAR
 OWNER = "owner: hold everything"
 # The release token of every run here: a placeholder, which no output stream may show.
 TOKEN = "placeholder-release-token"
-# The steps before the pause; the preflight asks every guard, G10 and G12 among them.
-BEFORE_PAUSE = ["begin", "fetch", "configuration snapshot", "preflight", "G10", "G12"]
+# The steps before the pause: G12's read before anything is written, then the preflight, which
+# asks every guard, G10 and G12 among them.
+BEFORE_PAUSE = ["G12", "begin", "fetch", "configuration snapshot", "preflight", "G10", "G12"]
 # FakeHost's answers to the reads that never change: every guard passes for NEW on PREV.
 ANSWERS = {
     "first_parent_chain": [NEW], "commit_parents": (PREV, FEATURE), "commit_tree": TREE,
@@ -79,10 +82,10 @@ class Clock(list):
 @dataclass
 class FakeHost:
     """A healthy release host at PREV. Its journal notes the fetch, the configuration snapshot,
-    each guard pass (at the clean check), each G10 and G12 read, each move aside of snapshots
-    and, before them, each new pause. ``at`` maps the n-th note of an entry to a hook run after
-    it, into ``injected``. The first ``open_reads`` G10 reads see a live run; G12 finds the
-    ``unlocked`` packages. Other reads get ANSWERS; other actions succeed."""
+    each guard pass (at the clean check), each G10 and G12 read and, before them, each new pause.
+    ``at`` maps the n-th note of an entry to a hook run after it, into ``injected``. The first
+    ``open_reads`` G10 reads see a live run; G12 finds the ``unlocked`` packages. Other reads get
+    ANSWERS; other actions succeed."""
 
     head: str = PREV
     origin: str = NEW
@@ -142,9 +145,6 @@ class FakeHost:
     def environment_lock_differences(self):
         self.note("G12")
         return self.unlocked
-
-    def set_aside_snapshots(self, name, aside):
-        self.note(f"set aside {name} as {aside}")
 
     def fetch(self, commit):
         self.note("fetch")
@@ -497,8 +497,10 @@ def test_restored_resumes_and_failed_stays_paused(root, monkeypatch, unhealthy, 
     host, waits = FakeHost(unhealthy=unhealthy), []
     monkeypatch.setattr(release_runner, "_wait", waits.append)  # no wait between reads sleeps
 
-    # Restored exits 0, so the release unit does not start the run again only to refuse it.
-    assert _run(monkeypatch, host) == (0 if outcome == "restored" else 1)
+    # Restored exits with the status the release unit never restarts on: a new start would only
+    # refuse the folded batch.
+    restored = release_unit.RESTORED_EXIT_STATUS
+    assert _run(monkeypatch, host) == (restored if outcome == "restored" else 1)
     assert [result.outcome for result in host.results] == [outcome] == [_batches()[0]["outcome"]]
     # Each unhealthy version is read 12 times after its start, 5 seconds apart, and never holds.
     assert waits == [5] * 11 * len(unhealthy)
@@ -507,37 +509,61 @@ def test_restored_resumes_and_failed_stays_paused(root, monkeypatch, unhealthy, 
     assert (estop.get_state() or {}).get("reason") == (f"release {batch_id}" if paused else None)
 
 
-def test_a_restored_release_moves_news_snapshots_aside_under_its_batch(root, monkeypatch):
-    """5 November, defect 3. Once the outcome restored is recorded, NEW's snapshots move aside
-    under a name that carries the batch, before the resume: a later batch with the same NEW then
-    takes its own snapshots, and G9 lets it pass."""
+@pytest.mark.parametrize("failure", ["removal", "readback"])
+def test_a_restored_run_exits_so_the_unit_does_not_start_it_again_whatever_its_pause(
+    root, monkeypatch, capsys, failure
+):
+    """Owner rule of 5 November, item 3 (finding 2). Once the outcome restored is recorded, the
+    removal of the release's own pause fails, or its readback, both with EIO: the run keeps the
+    outcome and the pause warning, and still exits with the status the release unit never
+    restarts on."""
     batch_id = _accepted(1)["batch_id"]
-    host = FakeHost(unhealthy={NEW})
+    host, read_text, unlink = FakeHost(unhealthy={NEW}), Path.read_text, os.unlink
     monkeypatch.setattr(release_runner, "_wait", lambda seconds: None)
 
-    assert _run(monkeypatch, host) == 0
-    assert host.journal[-3:] == [
-        "outcome restored", f"set aside {NEW} as {NEW}.batch-{batch_id}", "resume",
-    ]
+    def eio(real):  # the call, failed on the pause sentinel as a failing disk fails it
+        def call(path, *args, **kwargs):
+            if Path(path).name == estop.SENTINEL_NAME:
+                raise OSError(errno.EIO, os.strerror(errno.EIO), os.fspath(path))
+            return real(path, *args, **kwargs)
+        return call
+
+    def fail():
+        if failure == "readback":
+            monkeypatch.setattr(Path, "read_text", eio(read_text))
+        monkeypatch.setattr(os, "unlink", eio(unlink))
+
+    host.at[("outcome restored", 1)] = fail
+    code = _run(monkeypatch, host)
+
+    assert code == release_unit.RESTORED_EXIT_STATUS
+    assert [batch["outcome"] for batch in _batches()] == ["restored", None]  # its changes wait
+    assert json.loads(_sentinel())["release_token"] == TOKEN  # the release's own pause stays
+    out = capsys.readouterr().out
+    assert f"Batch {batch_id} was rolled back" in out
+    if failure == "readback":
+        assert "The pause could not be read" in out
+    else:
+        assert f"The platform is still paused (release {batch_id})" in out
 
 
 def test_an_environment_not_as_locked_refuses_the_run_before_the_pause(root, monkeypatch, capsys):
-    """5 November, defect 1. An environment without packages that the checkout's lock names fails
-    G12 at the preflight: the run is refused before its pause and before any unit stops, and the
-    refusal names the first ten packages, then how many more."""
+    """5 November, defect 1, and the owner rule of 5 November, item 2. An environment without
+    packages that the checkout's lock names fails G12, read before the begin commit, the fetch
+    and the configuration snapshot: the run is refused before it writes anything, the batch stays
+    accepted, and the refusal names the first ten packages, then how many more."""
     _accepted(1)
     unlocked = tuple(f"package-{number:02} expected 1.0.{number}, missing" for number in range(12))
     host = FakeHost(unlocked=unlocked)
 
     assert _run(monkeypatch, host) == 1
     assert (host.stops, host.results, _sentinel()) == (0, [], None)
-    assert host.journal[: len(BEFORE_PAUSE)] == BEFORE_PAUSE
-    assert host.journal[-1] == "outcome refused"
-    assert not [entry for entry in host.journal if entry.startswith("pause")]  # never paused
-    assert [batch["outcome"] for batch in _batches()] == ["refused", None]
+    assert host.journal == ["G12", "G12"]  # its check, then the packages it names: nothing else
+    assert [(batch["state"], batch["outcome"]) for batch in _batches()] == [("accepted", None)]
     lines = capsys.readouterr().out.splitlines()
     assert "    Not as locked: " + "; ".join(unlocked[:10]) + "; and 2 more." in lines
     assert "Refused: release guard G12 failed." in lines
+    assert "Nothing in the release state was written." in lines
 
 
 def test_stop_signal_during_the_drain_resumes(root, monkeypatch, capsys):
@@ -1045,7 +1071,7 @@ def test_the_real_send_reaches_the_root_owner_whatever_profile_is_sticky(
     printed = _printed_outcome(out, batch_id)
     paused = " The platform stays paused." if outcome == "failed" else ""
     assert _batches()[0]["outcome"] == outcome
-    assert code == (0 if outcome in ("released", "restored") else 1)
+    assert code == {"released": 0, "restored": release_unit.RESTORED_EXIT_STATUS}.get(outcome, 1)
     assert out.splitlines().count(f"Batch {batch_id} {release_cmd._OUTCOMES[outcome]}.") == 1
     [told] = logged()
     assert told["chat_id"] == "111111", f"expected 111111, got {told['chat_id']}"
@@ -1288,7 +1314,8 @@ def test_a_release_that_did_not_end_released_starts_no_journeys(
     out_err = capsys.readouterr()
     printed = _printed_outcome(out_err.out, batch_id)
     paused = " The platform stays paused." if outcome == "failed" else ""
-    assert (code, starts, _batches()[0]["outcome"]) == (int(outcome != "restored"), [], outcome)
+    exit_status = release_unit.RESTORED_EXIT_STATUS if outcome == "restored" else 1
+    assert (code, starts, _batches()[0]["outcome"]) == (exit_status, [], outcome)
     assert sent == [f"Release {batch_id} {printed}{paused}"]
     assert "journey" not in "".join(out_err).lower()
 
@@ -1659,7 +1686,8 @@ class UnansweredHost(FakeHost):
 def test_a_restored_release_prints_its_last_readback_expecting_prev(root, monkeypatch, capsys):
     batch_id = _accepted(1)["batch_id"]
 
-    assert _run(monkeypatch, UnansweredHost()) == 0  # restored: the unit does not start it again
+    # Restored: the status the release unit never restarts on.
+    assert _run(monkeypatch, UnansweredHost()) == release_unit.RESTORED_EXIT_STATUS
 
     out = capsys.readouterr().out
     # The read that raised shows only its type; its message, with the address, is not printed.

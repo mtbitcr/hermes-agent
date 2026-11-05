@@ -1391,9 +1391,8 @@ def test_a_release_without_uv_is_refused_at_the_preflight_and_stops_nothing(
 ):
     """Every release syncs the platform environment, so with the lock file and the manifest
     unchanged, a Hermes home whose bin folder holds no uv is refused by G8 at the preflight of the
-    registered ``hermes release run``, on the live adapters, though PATH holds a uv; G12 cannot
-    compare the environment with the lock without it, and refuses too: no unit stops, the
-    platform is not left paused, and the record shows the release refused."""
+    registered ``hermes release run``, on the live adapters, though PATH holds a uv: no unit
+    stops, the platform is not left paused, and the record shows the release refused."""
     from types import SimpleNamespace
 
     import shutil
@@ -1428,6 +1427,8 @@ def test_a_release_without_uv_is_refused_at_the_preflight_and_stops_nothing(
     monkeypatch.setattr(release_host_actions, "_DIRECT", direct)
     monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=8 * 1024**3))
     monkeypatch.setattr(main, "_plugin_cli_discovery_needed", lambda: False)
+    # G12, which cannot compare the environment without uv, holds here: G8 alone is under test.
+    monkeypatch.setattr(LiveHostReader, "environment_lock_differences", lambda self: ())
     parser, _subparsers = main._build_cli_parser()
     args = parser.parse_args(["release", "run"])
 
@@ -1435,9 +1436,75 @@ def test_a_release_without_uv_is_refused_at_the_preflight_and_stops_nothing(
 
     out = capsys.readouterr().out
     assert code == 1
-    assert "Refused: release guards G8, G12 failed." in out.splitlines()
+    assert "Refused: release guard G8 failed." in out.splitlines()
     assert _printed_outcome(out, batch_id).startswith("was refused before anything changed")
     assert not [move for move in boundary.moves if move.startswith(("stop ", "sync "))]
     assert boundary.head == PREV
     assert not estop.is_engaged()
     assert [batch["outcome"] for batch in _batches()] == ["refused", None]
+
+
+def test_an_environment_not_as_locked_refuses_the_registered_run_before_it_writes(
+    tmp_path, monkeypatch, capsys
+):
+    """Owner rule of 5 November, item 2 (finding 1). The registered ``hermes release run``, on the
+    live adapters, asks G12 before the begin commit, the fetch and the configuration snapshot, and
+    only reads to do so: a platform environment missing packages that the checkout's lock names
+    is refused, the release state stays byte for byte as it was, no snapshot is published, the
+    batch stays accepted, nothing is fetched, synced or stopped, and the refusal names the first
+    ten missing packages, then how many more."""
+    from types import SimpleNamespace
+
+    import shutil
+
+    from agent import estop
+    from hermes_cli import build_info, main, release_host_actions
+    from tests.hermes_cli.test_release_run import (
+        SETTINGS as RUN_SETTINGS,
+        Boundary,
+        _accepted,
+        _batches,
+        _platform_environment,
+    )
+
+    home = _root_at(tmp_path, monkeypatch)
+    venv = _platform_environment(tmp_path, home)
+    settings = {**RUN_SETTINGS, "venv_dir": str(venv)}
+    (home / "config.yaml").write_text(yaml.safe_dump({"release": settings}))
+    batch_id = _accepted(1)["batch_id"]
+    boundary, calls = Boundary(home), []
+    boundary.stamp()  # the live gateway runs PREV
+    missing = [f"package-{number:02}" for number in range(12)]  # locked, and never installed
+
+    def run(argv, **options):  # as Boundary, but the lock export names the missing packages too
+        calls.append(list(argv))
+        done = boundary.run(argv, **options)
+        if argv[0] == str(home / "bin" / "uv") and argv[1] == "export":
+            done.stdout += "".join(f"{name}==1.0.{n}\n" for n, name in enumerate(missing))
+        return done
+
+    answer = SimpleNamespace(status=200)  # the health address answers
+    direct = SimpleNamespace(open=lambda url, timeout: contextlib.nullcontext(answer))
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(build_info, "get_code_identity", lambda **_: {"sha": boundary.head})
+    monkeypatch.setattr(release_host_actions, "_DIRECT", direct)
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=8 * 1024**3))
+    monkeypatch.setattr(main, "_plugin_cli_discovery_needed", lambda: False)
+    parser, _subparsers = main._build_cli_parser()
+    args = parser.parse_args(["release", "run"])
+    before = _release_state(tmp_path)
+
+    code = args.func(args)
+
+    out = capsys.readouterr().out
+    assert code == 1
+    assert _release_state(tmp_path) == before  # the record, and every other release file
+    assert list(tmp_path.rglob(f"*{NEW}*")) == []  # no state, configuration or environment snapshot
+    assert [(batch["batch_id"], batch["state"]) for batch in _batches()] == [(batch_id, "accepted")]
+    assert [call for call in calls if "fetch" in call] == []
+    assert (boundary.moves, boundary.head) == ([], PREV)  # nothing synced, stopped or checked out
+    assert not estop.is_engaged()
+    shown = [f"{name} expected 1.0.{n}, missing" for n, name in enumerate(missing)]
+    lines = out.splitlines()
+    assert "    Not as locked: " + "; ".join(shown[:10]) + "; and 2 more." in lines
+    assert "Refused: release guard G12 failed." in lines and WROTE_NOTHING in lines

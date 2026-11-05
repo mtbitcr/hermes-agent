@@ -252,20 +252,6 @@ def _not_as_locked(reader: LiveHostReader) -> str:
     )
 
 
-def _set_aside(actions: ReleaseHostActions, pins: Pins, batch_id: int) -> None:
-    """After an outcome of restored, move NEW's state, configuration and environment snapshots
-    aside under a name that carries the batch, so a later batch with the same NEW takes its own
-    and G9 passes it. A move that fails prints its cause: G9 then keeps refusing NEW."""
-    aside = f"{pins.snapshot}.batch-{batch_id}"
-    try:
-        actions.set_aside_snapshots(pins.snapshot, aside)
-    except Exception as error:
-        print(
-            f"The snapshots of {pins.snapshot} could not be moved aside as {aside}"
-            f" ({type(error).__name__}: {error}): G9 refuses these changes until they are."
-        )
-
-
 def run(batch_id: int | None = None) -> int:
     """Release the accepted batch between a pause and a resume, in card 5's order.
 
@@ -292,14 +278,16 @@ def run(batch_id: int | None = None) -> int:
     outcome stands. The runner's first unit stop reads the pause again and refuses the release
     for good unless it is the release's own. A runner result that never comes back fails it midway.
 
-    Once the outcome restored is recorded, NEW's snapshots move aside under a name that carries
-    the batch (see _set_aside), so a later batch with the same NEW takes its own.
+    G12 only reads, so it is asked first, before the begin commit, the fetch and the
+    configuration snapshot: an environment not as locked is refused with nothing written. The
+    preflight asks it again, and the runner just before the cutover.
 
-    Returns 0 when the batch was released or restored, so the release unit does not start it
-    again, 1 otherwise, and 1 when the release's own pause is still in place after its removal. A
-    run that returns 0 for a released batch then starts the owner journeys once (see
-    _start_journeys); the start changes neither the outcome nor the exit status nor the pause. A
-    restored batch starts none.
+    Returns 0 when the batch was released, 1 otherwise, and 1 when the release's own pause is
+    still in place after its removal. A run that returns 0 for a released batch then starts the
+    owner journeys once (see _start_journeys); the start changes neither the outcome nor the exit
+    status nor the pause. A run whose batch was restored returns release_unit's
+    RESTORED_EXIT_STATUS instead, also when its pause could not be read or removed, so the release
+    unit does not start it again.
     """
     for name in [name for name in os.environ if name.startswith("HERMES_KANBAN")]:
         del os.environ[name]
@@ -313,7 +301,13 @@ def _run(batch_id: int | None) -> int:
     inputs = _inputs(batch_id)
     if isinstance(inputs, int):  # refused before anything was written
         return inputs
-    _batch, _merges, _pins, reader, actions, _settings = inputs
+    _batch, merges, pins, reader, actions, _settings = inputs
+    # G12 only reads: an environment not as locked is refused before anything is written.
+    [(guard, rule, check)] = [entry for entry in GUARDS if entry[0] == "G12"]
+    if not check(reader, pins, merges):
+        print(f"{guard} failed: {rule}")
+        print(f"    {_not_as_locked(reader)}")
+        return _refuse(_guards_failed([guard]))
     token = secrets.token_hex(16)  # the release token: only the release's own pause carries it
     host = _Host(reader, actions, token)
     # The handlers only set the host's stop flag. They are in place before the begin commit, and
@@ -387,8 +381,6 @@ def _release(inputs: tuple[Any, ...], host: _Host, token: str) -> int:
                 for error in result.restore_errors:
                     print(f"    Going back, a step failed too: {error}")
         release_ledger.finish_release(conn, batch_id, outcome=outcome)
-        if outcome == "restored":
-            _set_aside(actions, pins, batch_id)
         paused = " The platform stays paused." if outcome == "failed" else ""
         _tell_owner(f"Release {batch_id} {_OUTCOMES[outcome]}.{paused}")
     # S-A: lift only the release's own pause, the one with its token, unless the outcome failed;
@@ -402,9 +394,11 @@ def _release(inputs: tuple[Any, ...], host: _Host, token: str) -> int:
         estop.disengage()
     print(f"Batch {batch_id} {_OUTCOMES[outcome]}.")
     after = _final_token() if lift else own
+    # A restored batch is final whatever its pause shows: the release unit does not start it again.
+    failure = release_unit.RESTORED_EXIT_STATUS if outcome == "restored" else 1
     if after is _UNREADABLE:  # the release cannot know whether its own pause is still in place
         print("The pause could not be read: the platform may still be paused by this release.")
-        return 1
+        return failure
     if state is not None and not lift:
         print(f"The platform stays paused ({state['reason'] or 'no reason given'}).")
     elif lift and after == token:  # the removal failed: the release's own pause is in place
@@ -412,11 +406,12 @@ def _release(inputs: tuple[Any, ...], host: _Host, token: str) -> int:
             f"The platform is still paused ({reason}): the release could not remove its pause"
             f" at {estop.sentinel_path()}."
         )
+        return failure
+    if outcome == "restored":
+        return release_unit.RESTORED_EXIT_STATUS
+    if outcome != "released":
         return 1
-    if outcome not in ("released", "restored"):
-        return 1
-    if outcome == "released":
-        _start_journeys()
+    _start_journeys()
     return 0
 
 
@@ -718,12 +713,10 @@ def recover(batch_id: int) -> int:
     outcome. After a passing readback, lift only the release's own pause, the one with its reason
     and a token. An owner's pause stays; a failed recovery keeps any pause.
 
-    Once the outcome restored is recorded, NEW's snapshots move aside as after a run (see
-    _set_aside).
-
-    Returns 0 when the batch was released or restored, and once its third attempt failed, so the
-    release unit does not start it again; 1 otherwise, and 1 when the pause cannot be read or the
-    release's own pause is still in place after its removal.
+    Returns 0 when the batch was released, and once its third attempt failed; 1 otherwise, and 1
+    when the pause cannot be read or the release's own pause is still in place after its removal.
+    A recovery whose batch was restored returns release_unit's RESTORED_EXIT_STATUS instead, also
+    when its pause could not be read or removed, so the release unit does not start it again.
     """
     for name in [name for name in os.environ if name.startswith("HERMES_KANBAN")]:
         del os.environ[name]
@@ -786,8 +779,6 @@ def _recover(batch_id: int) -> int:
                 print(f"    Going back, a step failed too: {error}")
         outcome = result.outcome
         release_ledger.finish_release(conn, batch_id, outcome=outcome)
-        if outcome == "restored":
-            _set_aside(actions, pins, batch_id)
         paused = " The platform stays paused." if outcome == "failed" else ""
         _tell_owner(f"Release {batch_id} {_OUTCOMES[outcome]}.{paused}")
     # S-A, as in the run: lift only the release's own pause unless the outcome failed. The removal
@@ -799,9 +790,11 @@ def _recover(batch_id: int) -> int:
         estop.disengage()
     print(f"Batch {batch_id} {_OUTCOMES[outcome]}.")
     after = _final_token() if lift else own
+    # As in the run, a restored batch is final whatever its pause shows.
+    failure = release_unit.RESTORED_EXIT_STATUS if outcome == "restored" else 1
     if after is _UNREADABLE:  # recovery cannot know whether the release's own pause is in place
         print("The pause could not be read: the platform may still be paused by this release.")
-        return 1
+        return failure
     if state is not None and not lift:
         print(f"The platform stays paused ({state['reason'] or 'no reason given'}).")
     elif lift and after == own:  # the removal failed: the release's own pause is in place
@@ -809,11 +802,13 @@ def _recover(batch_id: int) -> int:
             f"The platform is still paused ({reason}): the recovery could not remove its pause"
             f" at {estop.sentinel_path()}."
         )
-        return 1
+        return failure
     if outcome == "failed" and attempt >= _RECOVERY_ATTEMPTS:  # the unit is not started again
         print(_CAPPED.format(batch_id, _RECOVERY_ATTEMPTS))
         return 0
-    return 0 if outcome in ("released", "restored") else 1
+    if outcome == "restored":
+        return release_unit.RESTORED_EXIT_STATUS
+    return 0 if outcome == "released" else 1
 
 
 def settle() -> int:
