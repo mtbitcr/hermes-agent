@@ -2409,6 +2409,8 @@ DEFAULT_CONFIG = {
         "health_url": "",
         "workspace_container": "raphael-workspace",  # R6 reads the projects and a board in it.
         "snapshot_dir": "",  # Empty = release-snapshots under the root Hermes home.
+        # Platform environment folder, relative to the checkout, for the release environment sync.
+        "venv_dir": "venv",
         "drain_poll_seconds": 30,
     },
     "_config_version": 43,  # Config schema version - bump this when adding new required fields
