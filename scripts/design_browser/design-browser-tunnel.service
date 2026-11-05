@@ -1,0 +1,33 @@
+# The one SSH tunnel to the design browser: a systemd user unit on the control server (runbook: README.md in
+# this folder). It forwards the control server's 127.0.0.1:9222 to 127.0.0.1:9222 on the execution server, where
+# compose.yaml publishes the browser. Replace every <placeholder> in the installed copy.
+[Unit]
+Description=SSH tunnel to the design browser on the execution server
+# Never give up: the execution server may be away for longer than any start limit allows.
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/bin/ssh -N -T -L 127.0.0.1:9222:127.0.0.1:9222 \
+    -i <key-path> \
+    -o BatchMode=yes \
+    -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=yes \
+    -o UserKnownHostsFile=<known-hosts-path> \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=3 \
+    -o TCPKeepAlive=no \
+    -o RequestTTY=no \
+    -o ForwardAgent=no \
+    -o ForwardX11=no \
+    -o PermitLocalCommand=no \
+    <tunnel-user>@<execution-host>
+Restart=always
+RestartSec=5s
+TimeoutStopSec=10s
+NoNewPrivileges=yes
+PrivateTmp=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target
