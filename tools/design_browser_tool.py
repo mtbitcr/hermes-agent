@@ -55,7 +55,8 @@ from urllib.parse import urlsplit
 from agent.async_utils import safe_schedule_threadsafe
 from agent.redact import redact_cdp_url
 from agent.tool_dispatch_helpers import _maybe_wrap_untrusted
-from tools.browser_supervisor import DIALOG_POLICY_AUTO_DISMISS, SUPERVISOR_REGISTRY, CDPSupervisor
+from tools.browser_supervisor import SUPERVISOR_REGISTRY, CDPSupervisor
+from tools.browser_supervisor_dialogs import DIALOG_POLICY_AUTO_DISMISS
 from tools.browser_supervisor_navguard import NavigationGuard
 from tools.design_url_policy import design_url_refusal
 from tools.registry import registry, tool_error
@@ -781,7 +782,7 @@ def design_browser(args: Dict[str, Any], task_id: Optional[str] = None) -> Any:
 DESIGN_BROWSER_SCHEMA = {
     "name": "design_browser",
     "description": (
-        "Look at a web page in the design browser, read-only. Actions: open (go to an allowed "
+        "Look at a web page in the design browser, read-only. Actions: open (go to an allowed "  # windows-footgun: ok — description prose, not a call
         "https address), screenshot (of the window, or the full page with full_page=true; stored "
         "on your own kanban task and shown to you), read_text (the page's visible text, title "
         "and image alt text), set_viewport (window size, at most 1920x1080; default 1440x900). "
