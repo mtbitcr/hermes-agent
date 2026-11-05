@@ -1,4 +1,4 @@
-"""Release guards G1 to G11, asked of the release host through an adapter.
+"""Release guards G1 to G12, asked of the release host through an adapter.
 
 Today these guards live only in the per-release wrapper script on the release server. Here they
 keep what they mean but become checks over `HostReader`, so one pass serves both prepare mode
@@ -119,6 +119,12 @@ class HostReader(Protocol):
     def named_config_snapshot(self) -> Mapping[str, str]:
         """The same mapping for the named configuration snapshot."""
 
+    def environment_lock_differences(self) -> Sequence[str]:
+        """Each package the checkout's lock names for this host, with the sync extras, that the
+        platform environment does not hold at its locked version, compared as the readback's
+        environment check compares; empty when it holds them all. Raises when the comparison
+        cannot be read."""
+
 
 GuardCheck = Callable[[HostReader, Pins, Sequence[RecordedMerge]], bool]
 
@@ -169,6 +175,16 @@ def _snapshot_fits(host: HostReader, pins: Pins, merges: Sequence[RecordedMerge]
     sizes = [host.snapshot_bytes(name) for name in host.snapshots()]
     newest = sizes.pop() if sizes else 0
     return host.free_disk_bytes() + sum(sizes) >= newest + environment + MIN_FREE_DISK_BYTES
+
+
+def _environment_holds_lock(host: HostReader, pins: Pins, merges: Sequence[RecordedMerge]) -> bool:
+    # 5 November: a restore puts back the environment as it was before the release, so one that
+    # does not hold the checkout's lock, PREV's, fails PREV's readback after a rollback. The
+    # readback's own comparison, asked before the first stop; one that cannot be read fails.
+    try:
+        return not host.environment_lock_differences()
+    except Exception:
+        return False
 
 
 GUARDS: tuple[tuple[str, str, GuardCheck], ...] = (
@@ -235,6 +251,12 @@ GUARDS: tuple[tuple[str, str, GuardCheck], ...] = (
         "G11",
         "the live configuration equals the named configuration snapshot",
         lambda host, pins, merges: host.live_config() == host.named_config_snapshot(),
+    ),
+    (
+        "G12",
+        "the platform environment holds every package that the checkout's lock names for this"
+        " host, with the sync extras, at its locked version",
+        _environment_holds_lock,
     ),
 )
 

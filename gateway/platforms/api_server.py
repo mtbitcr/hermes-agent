@@ -13025,6 +13025,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=404,
                 )
             from hermes_cli.owner_workspace import (
+                OWNER_PROJECT_BOARD_COUNTS_CAPABILITY,
                 OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY,
                 OWNER_PROJECT_REMOVAL_STATE_CAPABILITY,
                 list_committed_projects,
@@ -13038,6 +13039,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 removal_state=_owner_workspace_capability_requested(
                     request, OWNER_PROJECT_REMOVAL_STATE_CAPABILITY,
+                ),
+                board_counts=_owner_workspace_capability_requested(
+                    request, OWNER_PROJECT_BOARD_COUNTS_CAPABILITY,
                 ),
             )
         except Exception:

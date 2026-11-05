@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -184,7 +185,7 @@ def _midway(*unhealthy: str) -> FakeHost:
 ANSWERS = {
     "origin_main": NEW, "first_parent_chain": [NEW], "commit_parents": (PREV, FEATURE),
     "commit_tree": TREE, "changed_paths": {"hermes_cli/main.py"}, "free_disk_bytes": 5 * 1024**3,
-    "snapshots": [], "open_native_runs": [],
+    "snapshots": [], "open_native_runs": [], "environment_lock_differences": (),
 }
 
 
@@ -498,7 +499,8 @@ def test_recovery_reads_back_once_after_a_start_that_failed(waits):
 
 @pytest.mark.parametrize(
     ("host", "pause", "outcome", "code"),
-    [(FakeHost, "own", "released", 0), (_midway, "own", "restored", 1),
+    [(FakeHost, "own", "released", 0),
+     (_midway, "own", "restored", release_unit.RESTORED_EXIT_STATUS),
      (FakeHost, "owner", "released", 0)],
     ids=["new-reads-back", "prev-restored", "owner-pause-stays"],
 )
@@ -562,7 +564,8 @@ def test_recover_imports_nothing(root, monkeypatch):
     batch_id, host = _stopped_midway(), _midway(NEW)
     _snapshots(root, f"config/{NEW}")
 
-    assert _command(monkeypatch, host, "recover", str(batch_id)) == 1
+    code = _command(monkeypatch, host, "recover", str(batch_id))
+    assert code == release_unit.RESTORED_EXIT_STATUS
     assert host.calls == RESTORE and _sentinel() is None
     assert set(sys.modules) - host.modules_at_stop == set()
 
@@ -609,31 +612,105 @@ def test_a_second_recovery_refuses_at_once_and_writes_nothing(root):
     assert (first_code, first_calls, _batch(batch_id)["recovery_attempts"]) == (1, RESTORE, 1)
 
 
-def test_a_release_that_fails_on_the_first_start_gets_two_recoveries(root, monkeypatch):
-    """Owner rule 456, test 1 (the finding of attachment 455, accepted by design). The release
-    unit's first start runs the release of an accepted batch on a host where neither NEW nor PREV
-    reads back, and the release ends failed under its own pause. As the merged unit does, a start
-    follows only a non-zero exit, START_LIMIT_BURST starts in all: the second and third starts
-    each make one recovery attempt, and after the third the batch stays failed with its pause,
-    and the unit has no start left."""
-    batch_id, host = _accepted(), RunHost(unhealthy={NEW, PREV})
+def _unit_starts(monkeypatch: pytest.MonkeyPatch, host: FakeHost, batch_id: int) -> tuple:
+    """Every start the merged release unit makes of ``release run BATCH``: a start follows only an
+    exit other than 0 and RESTORED_EXIT_STATUS, which the unit lists in RestartPreventExitStatus,
+    START_LIMIT_BURST starts in all. Each start's exit code, then the batch as the record shows
+    it, the host's calls and the pause after it."""
     codes, records, calls, pauses = [], [], [], []
-    while len(codes) < release_unit.START_LIMIT_BURST and (not codes or codes[-1] != 0):
+    final = (0, release_unit.RESTORED_EXIT_STATUS)
+    while len(codes) < release_unit.START_LIMIT_BURST and (not codes or codes[-1] not in final):
         done = len(host.calls)
         codes.append(_command(monkeypatch, host, "run", str(batch_id)))
         batch = _batch(batch_id)
         records.append((batch["state"], batch["outcome"], batch["recovery_attempts"]))
         calls.append(host.calls[done:])
         pauses.append(_sentinel())
+    return codes, records, calls, pauses
 
-    # Every start failed, so the unit would start again, but these were all its starts: it stops.
-    assert release_unit.START_LIMIT_BURST == 3 and codes == [1, 1, 1]
-    assert records == [("failed", "failed", attempts) for attempts in (0, 1, 2)]
+
+def test_the_unit_starts_once_for_the_run_and_once_for_each_recovery_attempt():
+    from hermes_cli import release_cmd
+
+    assert release_unit.START_LIMIT_BURST == 1 + release_cmd._RECOVERY_ATTEMPTS
+
+
+def test_a_release_that_fails_on_the_first_start_gets_three_recoveries(root, monkeypatch):
+    """Owner rule 456, test 1, as the 5 November release showed it. The release unit's first start
+    runs the release of an accepted batch on a host where neither NEW nor PREV reads back, and the
+    release ends failed under its own pause. Each later start makes one recovery attempt, all
+    three that recovery allows: after the third the batch stays failed with its pause, and that
+    start exits 0, so the unit, with a start left for each attempt, starts no more."""
+    batch_id, host = _accepted(), RunHost(unhealthy={NEW, PREV})
+
+    codes, records, calls, pauses = _unit_starts(monkeypatch, host, batch_id)
+
+    assert codes == [1, 1, 1, 0]  # four starts in all
+    assert records == [("failed", "failed", attempts) for attempts in (0, 1, 2, 3)]
     # The release: its first unit stop, the move to NEW and the restore; then one restore a start.
-    assert calls == [["stop", "stop", f"checkout {NEW}", "start", *RESTORE], RESTORE, RESTORE]
+    assert calls == [["stop", "stop", f"checkout {NEW}", "start", *RESTORE], *[RESTORE] * 3]
     pause = json.loads(pauses[0])  # the release's own: its reason and its token
     assert pause["reason"] == f"release {batch_id}" and pause["release_token"]
-    assert pauses == [pauses[0]] * 3  # kept byte for byte
+    assert pauses == [pauses[0]] * 4  # kept byte for byte
+
+
+@pytest.mark.parametrize("moment", ["release", "recovery"])
+def test_an_outcome_of_restored_takes_no_new_start(root, monkeypatch, moment):
+    """A release, or a recovery of one that stopped midway, that ends restored exits with
+    RESTORED_EXIT_STATUS: the unit does not start it again, as the next run would only refuse the
+    folded batch."""
+    if moment == "release":  # NEW never reads back; PREV does after the restore
+        batch_id, host = _accepted(), RunHost(unhealthy={NEW})
+    else:
+        batch_id, host = _stopped_midway(), _midway(NEW)
+        _snapshots(root, f"config/{NEW}")  # the release published it before its cutover (S-C)
+
+    codes, records, calls, pauses = _unit_starts(monkeypatch, host, batch_id)
+
+    attempts = 0 if moment == "release" else 1
+    assert (codes, records, pauses) == (
+        [release_unit.RESTORED_EXIT_STATUS], [("folded", "restored", attempts)], [None]
+    )
+    assert calls[0][-len(RESTORE):] == RESTORE
+
+
+@pytest.mark.parametrize("failure", ["removal", "readback"])
+def test_a_restored_recovery_exits_so_the_unit_does_not_start_it_again_whatever_its_pause(
+    root, monkeypatch, capsys, failure
+):
+    """Owner rule of 5 November, item 3 (finding 2). Once a recovery records restored, the
+    removal of the release's own pause fails, or its readback, both with EIO: recovery keeps the
+    outcome and the pause warning, and still exits with the status the release unit never
+    restarts on."""
+    batch_id, host = _stopped_midway(), _midway(NEW)
+    _snapshots(root, f"config/{NEW}")  # the release published it before its cutover (S-C)
+    finish, read_text, unlink = ledger.finish_release, Path.read_text, os.unlink
+
+    def eio(real):  # the call, failed on the pause sentinel as a failing disk fails it
+        def call(path, *args, **kwargs):
+            if Path(path).name == estop.SENTINEL_NAME:
+                raise OSError(errno.EIO, os.strerror(errno.EIO), os.fspath(path))
+            return real(path, *args, **kwargs)
+        return call
+
+    def finished(*args, **kwargs):  # the outcome is recorded; the pause fails from then on
+        finish(*args, **kwargs)
+        if failure == "readback":
+            monkeypatch.setattr(Path, "read_text", eio(read_text))
+        monkeypatch.setattr(os, "unlink", eio(unlink))
+
+    monkeypatch.setattr(ledger, "finish_release", finished)
+    code = _command(monkeypatch, host, "recover", str(batch_id))
+
+    assert code == release_unit.RESTORED_EXIT_STATUS
+    assert (_batch(batch_id)["outcome"], host.calls) == ("restored", RESTORE)
+    assert json.loads(_sentinel())["release_token"] == TOKEN  # the release's own pause stays
+    out = capsys.readouterr().out
+    assert f"Batch {batch_id} was rolled back" in out
+    if failure == "readback":
+        assert "The pause could not be read" in out
+    else:
+        assert f"The platform is still paused (release {batch_id})" in out
 
 
 def test_a_start_after_the_cap_makes_no_host_step_and_exits_cleanly(root, monkeypatch, capsys):
@@ -669,7 +746,8 @@ def test_a_release_stopped_before_its_cutover_is_kept_as_it_is(root, monkeypatch
     saved = _snapshots(root, *_BEFORE_CUTOVER[stop])
     host, before = FakeHost(head=PREV, running=PREV, saved=saved), _sentinel()
 
-    assert _command(monkeypatch, host, "recover", str(batch_id)) == 1
+    code = _command(monkeypatch, host, "recover", str(batch_id))
+    assert code == release_unit.RESTORED_EXIT_STATUS
 
     batch = _batch(batch_id)
     assert (batch["outcome"], batch["recovery_attempts"]) == ("restored", 1)
