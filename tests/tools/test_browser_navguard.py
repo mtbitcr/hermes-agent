@@ -235,7 +235,8 @@ def test_new_target_that_cannot_be_guarded_is_closed_not_resumed(fake_cdp, super
 
 
 def _attach(fake: FakeCDP, sid: str, target_id: str, kind: str = "page", *, context: str | None = None,
-            parent: str | None = None, waiting: bool = True, opener: str | None = None) -> int:
+            parent: str | None = None, waiting: bool = True, opener: str | None = None,
+            opener_frame: str | None = None) -> int:
     """Report a newly attached target; returns where its calls start in ``fake.calls``."""
     start = len(fake.calls)
     info = {"targetId": target_id, "type": kind, "url": ""}
@@ -243,6 +244,8 @@ def _attach(fake: FakeCDP, sid: str, target_id: str, kind: str = "page", *, cont
         info["browserContextId"] = context
     if opener:
         info["openerId"] = opener
+    if opener_frame:
+        info["openerFrameId"] = opener_frame
     fake.push("Target.attachedToTarget", {"sessionId": sid, "waitingForDebugger": waiting, "targetInfo": info},
               session_id=parent)
     return start
@@ -412,7 +415,7 @@ def test_pause_the_guard_did_not_cause_is_resumed(fake_cdp, supervise):
     assert not [c for c in fake_cdp.calls[start:] if c["method"] in ("Debugger.evaluateOnCallFrame", "Target.closeTarget")]
 
 
-# ── A popup's first document, which can run with no check of its own in it ──
+# ── New windows: closed while held, whatever their address ─────────────────
 
 
 def _opened(fake: FakeCDP, url: str, sid: str = "S1") -> None:
@@ -422,62 +425,51 @@ def _opened(fake: FakeCDP, url: str, sid: str = "S1") -> None:
 
 
 def _closed_while_held(fake: FakeCDP, sid: str, target_id: str, start: int) -> None:
-    """Assert ``target_id`` was closed with nothing asked of its held renderer first, and only
-    then let go - being held also holds the window its opener is still inside ``window.open``
-    for, and by the time the close has gone nothing of the page is left to run."""
+    """Assert ``target_id`` was closed with nothing asked of its held session, and let go right
+    behind the close - being held also holds the window its opener is still inside
+    ``window.open`` for, and by the time the close has gone nothing of the page is left to run."""
     closed = fake.wait_for(lambda c: c["method"] == "Target.closeTarget", start=start)
     assert closed["params"] == {"targetId": target_id}
     at = fake.calls.index(closed)
-    assert [c["method"] for c in fake.calls[start:at] if c.get("sessionId") == sid] == []
-    fake.wait_for(lambda c: c["method"] == "Runtime.runIfWaitingForDebugger" and c.get("sessionId") == sid, start=at)
+    released = fake.wait_for(lambda c: c["method"] == "Runtime.runIfWaitingForDebugger" and c.get("sessionId") == sid,
+                             start=at)
+    assert fake.calls.index(released) == at + 1
+    assert fake.methods(sid) == ["Runtime.runIfWaitingForDebugger"]
 
 
-@pytest.mark.parametrize("url", ["blob:https://raphael.agentsbridge.net/0b5e4c1d", "data:text/html,<title>x</title>",
-                                 "http://127.0.0.1:9/refused"])
-def test_held_popup_whose_first_document_is_refused_is_closed_while_held(fake_cdp, supervise, url):
-    """A popup's first document can reuse the window its opener already made: no new-document
-    script runs in it and Fetch never pauses it either. What the opener asked for is the only
-    description of that document the guard has before it runs, so the guard decides on that."""
+@pytest.mark.parametrize("opened", [
+    [], [""], ["about:blank"], ["https://raphael.agentsbridge.net/next"], ["http://127.0.0.1:9/refused"],
+    ["blob:https://raphael.agentsbridge.net/0b5e4c1d"], ["data:text/html,<title>x</title>"],
+    # A sandboxed frame's window.open, which opened no window, then the page's own popup.
+    ["https://raphael.agentsbridge.net/ok-placeholder", "blob:https://raphael.agentsbridge.net/0b5e4c1d"],
+], ids=["none", "empty", "about-blank", "allowed", "refused", "blob", "data", "window-that-never-came"])
+def test_held_popup_is_closed_while_held_whatever_it_was_opened_at(fake_cdp, supervise, monkeypatch, opened):
+    """Every new window a page or one of its frames opens is closed while it is held, before it
+    runs any document: no ``Page.windowOpen`` is taken as its address, and the policy (here one
+    that would allow anything) is not asked about it."""
+    asked = []
+    monkeypatch.setattr(navguard, "design_url_refusal", lambda url, *_args, **_kwargs: asked.append(url))
     supervise(navigation_guard=_guard())
-    _opened(fake_cdp, url)
+    for url in opened:
+        _opened(fake_cdp, url)
     _closed_while_held(fake_cdp, "S2", "T2", _attach(fake_cdp, "S2", "T2", opener="T1"))
+    assert asked == []
 
 
-@pytest.mark.parametrize("url", ["", "about:blank", "https://raphael.agentsbridge.net/next"])
-def test_held_popup_whose_first_document_is_allowed_is_gated_then_resumed(fake_cdp, supervise, url):
+def test_held_popup_known_by_its_opener_frame_only_is_closed_while_held(fake_cdp, supervise):
     supervise(navigation_guard=_guard())
-    _opened(fake_cdp, url)
-    start = _attach(fake_cdp, "S2", "T2", opener="T1")
+    _closed_while_held(fake_cdp, "S2", "T2", _attach(fake_cdp, "S2", "T2", opener_frame="F1"))
+
+
+def test_held_page_without_an_opener_is_gated_then_resumed(fake_cdp, supervise):
+    """A new page no page opened (one the tool creates, say) is locked down, gets the document
+    check and is let run, whatever window a page asked for before it."""
+    supervise(navigation_guard=_guard())
+    _opened(fake_cdp, "blob:https://raphael.agentsbridge.net/0b5e4c1d")
+    start = _attach(fake_cdp, "S2", "T2")
     resume = _resumed(fake_cdp, "S2", start)
     assert _gate_script_at(fake_cdp, "S2") < len([c for c in fake_cdp.calls[:resume] if c.get("sessionId") == "S2"])
     assert "Target.closeTarget" not in [c["method"] for c in fake_cdp.calls[start:]]
-
-
-def test_held_popup_whose_first_document_was_never_reported_is_closed_while_held(fake_cdp, supervise):
-    """Registering the gate script says nothing about a document that runs without one, so a held
-    popup the guard cannot describe is closed rather than resumed."""
-    supervise(navigation_guard=_guard())
-    _closed_while_held(fake_cdp, "S2", "T2", _attach(fake_cdp, "S2", "T2", opener="T1"))
-    assert "Page.addScriptToEvaluateOnNewDocument" not in fake_cdp.methods("S2")
-
-
-def test_held_popup_is_closed_when_the_policy_fails(fake_cdp, supervise, monkeypatch):
-    def broken(*_args, **_kwargs):
-        raise RuntimeError("policy blew up")
-
-    monkeypatch.setattr(navguard, "design_url_refusal", broken)
-    supervise(navigation_guard=_guard())
-    _opened(fake_cdp, "http://127.0.0.1:9/whatever")
-    _closed_while_held(fake_cdp, "S2", "T2", _attach(fake_cdp, "S2", "T2", opener="T1"))
-
-
-def test_each_window_the_opener_asked_for_is_answered_once(fake_cdp, supervise):
-    """Two windows in a row are answered in order, so an allowed one cannot cover a refused one."""
-    supervise(navigation_guard=_guard())
-    _opened(fake_cdp, "https://raphael.agentsbridge.net/one")
-    _opened(fake_cdp, "blob:https://raphael.agentsbridge.net/two")
-    _resumed(fake_cdp, "S2", _attach(fake_cdp, "S2", "T2", opener="T1"))
-    _closed_while_held(fake_cdp, "S3", "T3", _attach(fake_cdp, "S3", "T3", opener="T1"))
 
 
 def test_start_fails_when_the_guard_cannot_install(fake_cdp, supervise):
@@ -583,13 +575,45 @@ def _find_chrome() -> str:
     pytest.skip("no Chrome binary found")
 
 
+# Each way to a blob: document; those that open a window then ask for /ok-opened (they got past it).
 _BLOB_OPENERS = {
-    "open": "window.open(url);",
-    "noopener": "window.open(url, '_blank', 'noopener');",
+    "open": "window.open(url); fetch('/ok-opened');",
+    "noopener": "window.open(url, '_blank', 'noopener'); fetch('/ok-opened');",
     "link": ("const a = document.createElement('a'); a.href = url; a.target = '_blank';"
-             "document.body.appendChild(a); a.click();"),
+             "document.body.appendChild(a); a.click(); fetch('/ok-opened');"),
     "iframe": "const f = document.createElement('iframe'); f.src = url; document.body.appendChild(f);",
 }
+
+# The reviewer's popup cases (attachments 194-196), on this file's site.
+_POPUP_CASES = ("direct", "sandbox_window", "sandbox_form", "noopener", "allowed_popup")
+
+
+def _popup_case_page(case: str, frame: bool = False) -> str:
+    """Script of ``/ok-case?<case>``: on load, with no user gesture, it opens a window - a
+    ``blob:`` document that asks for ``/ok-marker-case``, or ``/ok-allowed-popup`` - then asks for
+    ``/ok-opened``. In the sandbox cases a frame sandboxed without ``allow-popups``
+    (``/ok-case-frame?<case>``) first tries ``window.open`` or a ``target=_blank`` form."""
+    if frame:
+        if case == "sandbox_form":
+            action = ("const f = document.createElement('form'); f.action = '/ok-placeholder';"
+                      "f.target = '_blank'; f.method = 'GET'; document.body.appendChild(f); f.submit();")
+        else:
+            action = "window.open('/ok-placeholder');"
+        return "<script>" + action + "parent.postMessage('fixture-ready', '*');</script>"
+    if case == "allowed_popup":
+        action = "window.open('/ok-allowed-popup');"
+    else:
+        action = ("const html = '<title>refused-case-popup</title><script>fetch('"
+                  " + JSON.stringify(location.origin + '/ok-marker-case') + ')<' + '/script>';"
+                  "const url = URL.createObjectURL(new Blob([html], {type: 'text/html'}));"
+                  + ("window.open(url, '_blank', 'noopener');" if case == "noopener" else "window.open(url);"))
+    action += "fetch('/ok-opened');"
+    if case.startswith("sandbox_"):
+        return ("<script>window.addEventListener('message', e => { if (e.data === 'fixture-ready') {" + action
+                + "} }, {once: true}); const f = document.createElement('iframe');"
+                "f.sandbox = 'allow-scripts allow-same-origin allow-forms';"
+                f"f.src = '/ok-case-frame?{case}'; document.body.appendChild(f);</script>")
+    return "<script>" + action + "</script>"
 
 
 class _Site(http.server.BaseHTTPRequestHandler):
@@ -620,6 +644,10 @@ class _Site(http.server.BaseHTTPRequestHandler):
                      " + JSON.stringify(location.origin + '/ok-marker-blob-popup') + ')<' + '/script>';"
                      "const url = URL.createObjectURL(new Blob([html], {type: 'text/html'}));"
                      + _BLOB_OPENERS[how] + "</script>")
+        if self.path.startswith("/ok-case?"):
+            body += _popup_case_page(self.path.partition("?")[2])
+        if self.path.startswith("/ok-case-frame?"):
+            body += _popup_case_page(self.path.partition("?")[2], frame=True)
         data = body.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
@@ -744,11 +772,14 @@ class TestRealChromium:
         assert "/redirect" in seen and "/refused" not in seen
         assert base + "/refused" in asked
 
-    def test_popup_to_refused_page_is_blocked(self, guarded, site, asked):
+    def test_popup_to_refused_page_is_blocked(self, guarded, site, asked, chrome):
+        """A new window is closed while it is held: its address is never asked for, nor is the
+        policy asked about it."""
         base, seen, _ = site
         self._navigate(guarded, base + "/ok-popup")
         assert "/ok-popup" in seen and "/refused-popup" not in seen
-        assert base + "/refused-popup" in asked
+        assert base + "/refused-popup" not in asked
+        assert self._only_page_left(chrome, base + "/ok-popup") == [base + "/ok-popup"]
 
     @staticmethod
     def _raw_navigate(chrome, url: str, until=None) -> None:
@@ -786,23 +817,39 @@ class TestRealChromium:
         with urllib.request.urlopen(pages, timeout=5) as r:
             return [t["url"] for t in json.load(r) if t["type"] == "page"]
 
+    def _only_page_left(self, chrome, url: str) -> list:
+        """Addresses of every page Chromium has open, once ``url`` is the only one (or after 10 s)."""
+        deadline = time.monotonic() + 10
+        while self._page_urls(chrome) != [url] and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return self._page_urls(chrome)
+
     @pytest.mark.parametrize("how", list(_BLOB_OPENERS))
     def test_automatic_blob_document_never_runs_and_leaves_no_page(self, guarded, site, asked, chrome, how):
         """An allowed page reaches a ``blob:`` document from its own load-time script - no user
         gesture, no request for Fetch to pause - every way it can: ``window.open`` with and
-        without an opener, a ``target="_blank"`` link, and a same-origin frame. A popup's first
-        document reuses the window the opener made, so no script of the guard's runs in it."""
+        without an opener, a ``target="_blank"`` link, and a same-origin frame. A new window is
+        closed while it is held, so the policy is never asked about it; the page's own frame is
+        checked, and refused."""
         base, seen, _ = site
-        # Wait for the guard's answer about the blob: address, then for anything it let run.
-        self._raw_navigate(chrome, f"{base}/ok-blob-popup?{how}",
-                           lambda: any(str(u).startswith("blob:") for u in asked))
+        if how == "iframe":
+            # Wait for the guard's answer about the blob: address, then for anything it let run.
+            self._raw_navigate(chrome, f"{base}/ok-blob-popup?{how}",
+                               lambda: any(str(u).startswith("blob:") for u in asked))
+        else:
+            # Wait for the page to get past opening the window, then for anything it let run.
+            self._raw_navigate(chrome, f"{base}/ok-blob-popup?{how}", lambda: "/ok-opened" in seen)
         assert f"/ok-blob-popup?{how}" in seen
         # The marker is an allowed address, so only the guard can keep it from the server.
         assert "/ok-marker-blob-popup" not in seen
         assert not [u for u in self._page_urls(chrome) if u.startswith("blob:")]
         assert "refused-blob-popup" not in self._titles(chrome)
         blobs = [u for u in asked if str(u).startswith("blob:")]
-        assert blobs and all(navguard.design_url_refusal(u, None) for u in blobs)
+        if how == "iframe":
+            assert blobs and all(navguard.design_url_refusal(u, None) for u in blobs)
+        else:
+            assert not blobs
+            assert self._only_page_left(chrome, f"{base}/ok-blob-popup?{how}") == [f"{base}/ok-blob-popup?{how}"]
 
     @pytest.mark.parametrize("how", list(_BLOB_OPENERS))
     def test_automatic_blob_document_runs_without_the_guard(self, chrome, site, how):
@@ -814,6 +861,35 @@ class TestRealChromium:
             self._raw_navigate(chrome, f"{base}/ok-blob-popup?{how}",
                                lambda: "/ok-marker-blob-popup" in seen)
             assert "/ok-marker-blob-popup" in seen
+        finally:
+            supervisor.stop()
+
+    @pytest.mark.parametrize("case", _POPUP_CASES)
+    def test_popup_is_closed_while_held_whatever_its_address(self, guarded, site, chrome, case):
+        """The reviewer's popup cases, each opened by the page's own load-time script with no user
+        gesture: a ``blob:`` document from ``window.open``, the same after a sandboxed frame's
+        ``window.open`` or ``target=_blank`` form that opened no window, a ``noopener`` one, and
+        one at an address the policy allows. Each is closed while it is held, before it runs any
+        document, and the page that opened it goes on."""
+        base, seen, _ = site
+        page = f"{base}/ok-case?{case}"
+        self._raw_navigate(chrome, page, lambda: "/ok-opened" in seen)
+        assert "/ok-opened" in seen
+        assert "/ok-marker-case" not in seen and "/ok-allowed-popup" not in seen
+        assert self._only_page_left(chrome, page) == [page]
+        assert guarded.snapshot().active
+
+    @pytest.mark.parametrize("case", _POPUP_CASES)
+    def test_popup_case_runs_without_the_guard(self, chrome, site, case):
+        """Positive control for the test above: unguarded, each popup's document runs (its marker
+        is asked for, or the allowed page loads)."""
+        base, seen, _ = site
+        expected = "/ok-allowed-popup" if case == "allowed_popup" else "/ok-marker-case"
+        supervisor = CDPSupervisor(task_id="navguard-e2e-unguarded", cdp_url=chrome)
+        supervisor.start(timeout=15)
+        try:
+            self._raw_navigate(chrome, f"{base}/ok-case?{case}", lambda: expected in seen)
+            assert expected in seen
         finally:
             supervisor.stop()
 
