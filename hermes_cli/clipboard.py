@@ -311,7 +311,10 @@ def _convert_to_png(path: Path) -> bool:
     When neither works the file is left as-is — BMP is still usable for most APIs."""
     try:
         from PIL import Image
-        Image.open(path).save(path, "PNG")
+        image = Image.open(path)
+        if image.mode == "I":  # Pillow 13 cannot write mode I as PNG; I;16 is what Pillow 12 wrote
+            image = image.convert("I;16")
+        image.save(path, "PNG")
         return True
     except ImportError:
         pass
