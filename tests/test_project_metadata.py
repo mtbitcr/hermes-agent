@@ -289,3 +289,87 @@ def test_huggingface_hub_lazy_pin_inside_transformers_window():
         "range (>=1.5.0,<2). The lazy refresh would downgrade the shared "
         "package and break Hindsight local embeddings (#60783)."
     )
+
+
+# First release fixing each package's critical OSV advisory (PEP 503 names).
+_ADVISORY_FIXED_VERSIONS = {
+    "pillow": "13.0.0",
+    "pyjwt": "2.15.0",
+    "certifi": "2026.10.18",
+    "anyio": "4.14.2",
+    "brotlicffi": "1.2.1.0",
+}
+
+
+def _uv_lock_versions_by_name() -> dict[str, set[str]]:
+    """PEP 503 name -> every version uv.lock resolves (a package may appear more than once)."""
+    from packaging.utils import canonicalize_name
+
+    lock_path = Path(__file__).resolve().parents[1] / "uv.lock"
+    with lock_path.open("rb") as handle:
+        lock = tomllib.load(handle)
+    versions: dict[str, set[str]] = {}
+    for package in lock.get("package", []):
+        if "version" in package:
+            versions.setdefault(canonicalize_name(package["name"]), set()).add(package["version"])
+    return versions
+
+
+def _requirement_specs() -> list[tuple[str, str]]:
+    """``(where, spec)`` for every requirement string in pyproject.toml and LAZY_DEPS."""
+    from tools.lazy_deps import LAZY_DEPS
+
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject_path.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    specs = [("dependencies", spec) for spec in pyproject["project"].get("dependencies", [])]
+    for extra, extra_specs in pyproject["project"].get("optional-dependencies", {}).items():
+        specs += [(f"optional-dependencies.{extra}", spec) for spec in extra_specs]
+    for group, group_specs in pyproject.get("dependency-groups", {}).items():
+        specs += [(f"dependency-groups.{group}", spec) for spec in group_specs if isinstance(spec, str)]
+    specs += [("build-system.requires", spec) for spec in pyproject.get("build-system", {}).get("requires", [])]
+    for feature, feature_specs in LAZY_DEPS.items():
+        if isinstance(feature_specs, str):
+            feature_specs = (feature_specs,)
+        specs += [(f"LAZY_DEPS[{feature}]", spec) for spec in feature_specs]
+    return specs
+
+
+def test_advisory_fixed_versions_hold():
+    """Critical OSV advisories stay fixed in the shipped lock and in every pin.
+
+    uv.lock is what `uv sync --locked` installs, so each advisory package must
+    resolve at or above its fixed release there. An exact pin that disagrees
+    with the lock is how a fix gets undone: `hermes update` and the lazy
+    refresh re-assert the pin (#31817, #60783). So every exact ``==`` pin in
+    pyproject.toml and LAZY_DEPS whose package uv.lock also resolves must name
+    a locked version.
+    """
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+    from packaging.version import Version
+
+    locked = _uv_lock_versions_by_name()
+    below_fix = {
+        package: {"uv_lock": sorted(locked.get(package, ())), "fixed_in": fixed}
+        for package, fixed in _ADVISORY_FIXED_VERSIONS.items()
+        if not locked.get(package) or any(Version(v) < Version(fixed) for v in locked[package])
+    }
+    assert not below_fix, (
+        "uv.lock resolves an advisory package below its fixed release. Raise "
+        "it by name (`uv lock --upgrade-package <name>`). Below fix: "
+        f"{below_fix}"
+    )
+
+    drift = {}
+    for where, spec in _requirement_specs():
+        requirement = Requirement(spec)
+        pins = [s.version for s in requirement.specifier if s.operator == "==" and not s.version.endswith(".*")]
+        package = canonicalize_name(requirement.name)
+        if len(pins) == 1 and package in locked and pins[0] not in locked[package]:
+            drift[f"{where}: {spec}"] = sorted(locked[package])
+    assert not drift, (
+        "Exact pins must name the version uv.lock resolves, or installs "
+        "and the lazy refresh drift back to the pinned version. Drift "
+        f"(pin: uv.lock versions): {drift}"
+    )
