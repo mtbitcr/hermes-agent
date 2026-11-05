@@ -706,6 +706,7 @@ def test_reader_writes_nothing(tmp_path, fence_home, monkeypatch):
     before = _tree_bytes(checkout, fence_home, snapshot_root)
     results = prepare(host, Pins(new=m2, prev=prev), merges)
     assert _tree_bytes(checkout, fence_home, snapshot_root) == before
-    # Every guard holds on this host, except G8 where this machine has under 4 GiB free.
-    assert [result.guard for result in results if not result.ok] in ([], ["G8"])
+    # Every guard holds on this host, except G8 where this machine has under 4 GiB free, and G12:
+    # this host has no platform environment to compare with the lock, and G12 fails closed.
+    assert [result.guard for result in results if not result.ok] in (["G12"], ["G8", "G12"])
     assert host.snapshots() == ["f" * 40, "a" * 40]  # oldest first

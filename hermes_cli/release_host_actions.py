@@ -318,28 +318,7 @@ class ReleaseHostActions:
             real = self._environment()
         except (OSError, RuntimeError, ValueError):
             raise EnvironmentUnreadable("the platform environment is not found") from None
-        extras = [argument for extra in self.extras for argument in ("--extra", extra)]
-        locked = _locked_here(_read(
-            "the lock export",
-            [uv, "export", "--frozen", "--format", "requirements.txt", "--no-hashes",
-             "--no-header", "--no-annotate", "--no-emit-project", "--no-default-groups",
-             *extras, "--project", str(self.checkout_path)],
-        ))
-        listed = _read(
-            "the installed list",
-            [uv, "pip", "list", "--python", str(real / "bin" / "python"), "--format", "json"],
-        )
-        try:
-            installed = {_package(entry["name"]): entry["version"] for entry in json.loads(listed)}
-            versions = {name: Version(installed[name]) for name in locked if name in installed}
-        except (ValueError, KeyError, TypeError):
-            raise EnvironmentUnreadable("the installed list could not be read") from None
-        return tuple(
-            f"{name} expected {version}, "
-            + (f"installed {versions[name]}" if name in versions else "missing")
-            for name, version in sorted(locked.items())
-            if versions.get(name) != version
-        )
+        return lock_differences(uv, real, self.checkout_path, self.extras)
 
     def take_environment_snapshot(self, name: str) -> None:
         """Copy the real folder the environment's link names, all of it, into env/NAME.
@@ -391,6 +370,18 @@ class ReleaseHostActions:
     def delete_environment_snapshot(self, name: str) -> None:
         with contextlib.suppress(FileNotFoundError):
             shutil.rmtree(self._named(ENVIRONMENT, name))
+
+    def set_aside_snapshots(self, name: str, aside: str) -> None:
+        """Move the state, configuration and environment snapshots of NAME, those that exist, to
+        ASIDE, each by one rename in its own directory, so they keep what they hold and a later
+        release of NAME takes its own. When a snapshot of ASIDE exists already, nothing moves."""
+        moves = [(self._named(kind, name), self._named(kind, aside)) for kind in (STATE, CONFIG, ENVIRONMENT)]
+        moves = [(source, target) for source, target in moves if os.path.lexists(source)]
+        for _source, target in moves:
+            if os.path.lexists(target):
+                raise FileExistsError(f"the {target.parent.name} snapshot {aside} already exists")
+        for source, target in moves:
+            os.rename(source, target)
 
     def _environment(self) -> Path:
         """The real folder the venv_dir link names. Raises when it holds no environment."""
@@ -527,6 +518,33 @@ def _read(what: str, argv: list[str]) -> str:
         raise EnvironmentUnreadable(f"{what} timed out") from None
     except (OSError, RuntimeError, subprocess.SubprocessError):
         raise EnvironmentUnreadable(f"{what} failed") from None
+
+
+def lock_differences(uv: str, real: Path, checkout: Path, extras: Sequence[str]) -> tuple[str, ...]:
+    """The comparison of `environment_differences`, with uv, the environment's real folder, the
+    checkout and the extras given: the release guards ask it too, before the first stop (G12)."""
+    arguments = [argument for extra in extras for argument in ("--extra", extra)]
+    locked = _locked_here(_read(
+        "the lock export",
+        [uv, "export", "--frozen", "--format", "requirements.txt", "--no-hashes",
+         "--no-header", "--no-annotate", "--no-emit-project", "--no-default-groups",
+         *arguments, "--project", str(checkout)],
+    ))
+    listed = _read(
+        "the installed list",
+        [uv, "pip", "list", "--python", str(real / "bin" / "python"), "--format", "json"],
+    )
+    try:
+        installed = {_package(entry["name"]): entry["version"] for entry in json.loads(listed)}
+        versions = {name: Version(installed[name]) for name in locked if name in installed}
+    except (ValueError, KeyError, TypeError):
+        raise EnvironmentUnreadable("the installed list could not be read") from None
+    return tuple(
+        f"{name} expected {version}, "
+        + (f"installed {versions[name]}" if name in versions else "missing")
+        for name, version in sorted(locked.items())
+        if versions.get(name) != version
+    )
 
 
 def _full_sha(commit: str) -> str:

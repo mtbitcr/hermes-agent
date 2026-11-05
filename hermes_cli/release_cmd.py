@@ -232,9 +232,38 @@ def _preflight(
         print(f"{guard} {'passed' if ok else 'failed'}: {rule}{cause}")
         if guard == "G9" and not ok and not cause:
             print(f"    {_ROLLED_BACK}")
+        if guard == "G12" and not ok:
+            print(f"    {_not_as_locked(reader)}")
         if not ok:
             failed.append(guard)
     return failed
+
+
+def _not_as_locked(reader: LiveHostReader) -> str:
+    """G12's failure in plain words: the packages the environment does not hold as locked, at most
+    as many as a readback names, or why the comparison could not be read."""
+    try:
+        differences = list(reader.environment_lock_differences())
+    except Exception as error:
+        return f"The environment could not be compared with the lock ({type(error).__name__}: {error})."
+    shown, more = release_runner.DIFFERENCES_SHOWN, len(differences) - release_runner.DIFFERENCES_SHOWN
+    return (
+        "Not as locked: " + "; ".join(differences[:shown]) + (f"; and {more} more" if more > 0 else "") + "."
+    )
+
+
+def _set_aside(actions: ReleaseHostActions, pins: Pins, batch_id: int) -> None:
+    """After an outcome of restored, move NEW's state, configuration and environment snapshots
+    aside under a name that carries the batch, so a later batch with the same NEW takes its own
+    and G9 passes it. A move that fails prints its cause: G9 then keeps refusing NEW."""
+    aside = f"{pins.snapshot}.batch-{batch_id}"
+    try:
+        actions.set_aside_snapshots(pins.snapshot, aside)
+    except Exception as error:
+        print(
+            f"The snapshots of {pins.snapshot} could not be moved aside as {aside}"
+            f" ({type(error).__name__}: {error}): G9 refuses these changes until they are."
+        )
 
 
 def run(batch_id: int | None = None) -> int:
@@ -263,10 +292,14 @@ def run(batch_id: int | None = None) -> int:
     outcome stands. The runner's first unit stop reads the pause again and refuses the release
     for good unless it is the release's own. A runner result that never comes back fails it midway.
 
-    Returns 0 when the batch was released, 1 otherwise, and 1 when the release's own pause is
-    still in place after its removal. A run that returns 0 for a released batch then starts the
-    owner journeys once (see _start_journeys); the start changes neither the outcome nor the exit
-    status nor the pause.
+    Once the outcome restored is recorded, NEW's snapshots move aside under a name that carries
+    the batch (see _set_aside), so a later batch with the same NEW takes its own.
+
+    Returns 0 when the batch was released or restored, so the release unit does not start it
+    again, 1 otherwise, and 1 when the release's own pause is still in place after its removal. A
+    run that returns 0 for a released batch then starts the owner journeys once (see
+    _start_journeys); the start changes neither the outcome nor the exit status nor the pause. A
+    restored batch starts none.
     """
     for name in [name for name in os.environ if name.startswith("HERMES_KANBAN")]:
         del os.environ[name]
@@ -354,6 +387,8 @@ def _release(inputs: tuple[Any, ...], host: _Host, token: str) -> int:
                 for error in result.restore_errors:
                     print(f"    Going back, a step failed too: {error}")
         release_ledger.finish_release(conn, batch_id, outcome=outcome)
+        if outcome == "restored":
+            _set_aside(actions, pins, batch_id)
         paused = " The platform stays paused." if outcome == "failed" else ""
         _tell_owner(f"Release {batch_id} {_OUTCOMES[outcome]}.{paused}")
     # S-A: lift only the release's own pause, the one with its token, unless the outcome failed;
@@ -378,9 +413,10 @@ def _release(inputs: tuple[Any, ...], host: _Host, token: str) -> int:
             f" at {estop.sentinel_path()}."
         )
         return 1
-    if outcome != "released":
+    if outcome not in ("released", "restored"):
         return 1
-    _start_journeys()
+    if outcome == "released":
+        _start_journeys()
     return 0
 
 
@@ -682,8 +718,12 @@ def recover(batch_id: int) -> int:
     outcome. After a passing readback, lift only the release's own pause, the one with its reason
     and a token. An owner's pause stays; a failed recovery keeps any pause.
 
-    Returns 0 when the batch was released, and once its third attempt failed; 1 otherwise, and 1
-    when the pause cannot be read or the release's own pause is still in place after its removal.
+    Once the outcome restored is recorded, NEW's snapshots move aside as after a run (see
+    _set_aside).
+
+    Returns 0 when the batch was released or restored, and once its third attempt failed, so the
+    release unit does not start it again; 1 otherwise, and 1 when the pause cannot be read or the
+    release's own pause is still in place after its removal.
     """
     for name in [name for name in os.environ if name.startswith("HERMES_KANBAN")]:
         del os.environ[name]
@@ -746,6 +786,8 @@ def _recover(batch_id: int) -> int:
                 print(f"    Going back, a step failed too: {error}")
         outcome = result.outcome
         release_ledger.finish_release(conn, batch_id, outcome=outcome)
+        if outcome == "restored":
+            _set_aside(actions, pins, batch_id)
         paused = " The platform stays paused." if outcome == "failed" else ""
         _tell_owner(f"Release {batch_id} {_OUTCOMES[outcome]}.{paused}")
     # S-A, as in the run: lift only the release's own pause unless the outcome failed. The removal
@@ -771,7 +813,7 @@ def _recover(batch_id: int) -> int:
     if outcome == "failed" and attempt >= _RECOVERY_ATTEMPTS:  # the unit is not started again
         print(_CAPPED.format(batch_id, _RECOVERY_ATTEMPTS))
         return 0
-    return 0 if outcome == "released" else 1
+    return 0 if outcome in ("released", "restored") else 1
 
 
 def settle() -> int:
@@ -1006,7 +1048,7 @@ def _adapters(
     An empty ``snapshot_dir`` means release-snapshots under the root home, and the reader's
     named snapshot is NEW (S-C). ``venv_dir``, the platform environment's link, is relative to the
     checkout; empty, no environment is set, and G8 refuses. ``sync_extras`` are the extras the
-    sync installs (D3).
+    sync installs (D3), and the ones the reader compares with the lock for G12.
     """
     checkout = get_project_root()
     venv = str(settings.get("venv_dir") or "").strip()
@@ -1017,6 +1059,7 @@ def _adapters(
         "units": settings["units"],
         "snapshot_root": _snapshot_root(root, settings),
         "venv_dir": checkout / Path(venv).expanduser() if venv else None,
+        "extras": (extras,) if isinstance(extras, str) else tuple(map(str, extras)),
     }
     return (
         LiveHostReader(**shared, snapshot_name=new),
@@ -1024,7 +1067,6 @@ def _adapters(
             **shared,
             health_url=settings["health_url"],
             workspace_container=settings["workspace_container"],
-            extras=(extras,) if isinstance(extras, str) else tuple(map(str, extras)),
         ),
     )
 

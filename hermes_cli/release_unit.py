@@ -13,9 +13,10 @@ A run that exits non-zero, or that a hard kill ends, is started again (Restart=o
 most START_LIMIT_BURST starts in all: StartLimitIntervalSec=infinity never lets the count of
 starts reset, so the user manager refuses the next one, and the unit fails and is collected.
 Every start runs the same batch, which the run refuses unless it is the accepted batch a run
-takes first, so a restart never reaches another batch. Until card 7 recovers a hard-killed
-batch, a restarted run of a batch that is still releasing refuses, as it is no longer accepted,
-and this limit ends the loop.
+takes first, so a restart never reaches another batch. A run or recovery that ends released or
+restored exits 0, and so does one past its last recovery attempt: the unit is not started
+again. Until card 7 recovers a hard-killed batch, a restarted run of a batch that is still
+releasing refuses, as it is no longer accepted, and this limit ends the loop.
 
 Without systemd-run nothing starts, by the rule of update_abort_recovery.
 """
@@ -29,8 +30,10 @@ import sys
 import time
 from pathlib import Path
 
-# Three starts in all: the first run and two restarts.
-START_LIMIT_BURST = 3
+# Four starts in all: the first run, then one for each of the recovery attempts that
+# release_cmd._RECOVERY_ATTEMPTS allows (3). release_cmd imports this module, so the sum is
+# written out here, and a test ties the two values.
+START_LIMIT_BURST = 4
 # How long the start waits for the user manager to answer active, and how often it asks.
 READBACK_SECONDS = 10.0
 POLL_SECONDS = 0.5

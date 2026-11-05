@@ -199,6 +199,10 @@ class FakeHost:
 
     def environment_differences(self):
         self.calls.append(f"environment check {self.head}")
+        return self.environment_lock_differences()
+
+    def environment_lock_differences(self):
+        """G12's read before the cutover: the same comparison, for the checked-out lock."""
         if self.head in self.environment_unreadable:
             raise release_runner.EnvironmentUnreadable("the installed list timed out")
         return tuple(
@@ -638,6 +642,21 @@ def test_a_mismatch_names_the_first_ten_differences_and_counts_the_rest():
         " and 2 more"
     )
     assert NEW not in host.started_on
+
+
+def test_an_environment_without_packages_of_prevs_lock_is_refused_before_the_first_stop():
+    """5 November: the environment never held packages that PREV's lock names for the all extra,
+    so after the restore PREV could never read back. G12 compares the environment with the
+    checkout's lock, PREV's, before the cutover, and the release refuses having written nothing."""
+    never_installed = {f"package-{number:02}": "1.0.0" for number in range(18)}
+    host = FakeHost(locks={PREV: {**LOCK, **never_installed}, NEW: {**LOCK, **never_installed}})
+
+    result = run_release(host, PINS, 2, MERGES)
+
+    assert (result.outcome, result.steps) == ("refused", ("guards",))
+    assert [check.guard for check in result.guards if not check.ok] == ["G12"]
+    assert (host.calls, host.running, host.snapshot_dirs) == ([], PREV, ["release-1"])
+    assert host.installed == {**LOCK, **ON_DEMAND} and host.environment_snapshot is None
 
 
 def test_an_unreadable_environment_fails_before_start_as_unreadable():

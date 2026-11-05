@@ -288,11 +288,12 @@ def test_start_launches_a_transient_user_service(root, manager, monkeypatch, cap
     options, command = launch[1 : launch.index("--")], launch[launch.index("--") + 1 :]
     # A user service, not a scope: the user manager forks it, outside the caller's control group.
     # It is named for the batch, collected after it exits and restarted on failure, at most
-    # three starts in all; it runs from the root home, whose HERMES_HOME is all it is given.
+    # four starts in all, the run and one for each recovery attempt; it runs from the root home,
+    # whose HERMES_HOME is all it is given.
     assert sorted(options) == sorted([
         "--user", f"--unit={unit}", "--collect",
         "--property=Restart=on-failure",
-        "--property=StartLimitIntervalSec=infinity", "--property=StartLimitBurst=3",
+        "--property=StartLimitIntervalSec=infinity", "--property=StartLimitBurst=4",
         f"--working-directory={root}", f"--setenv=HERMES_HOME={root}",
     ])
     assert command == [
@@ -426,22 +427,22 @@ def test_a_release_unit_releases_its_own_batch_and_no_other(root, manager, monke
     from hermes_cli import release_unit
 
     # The unit of the second batch, launched as the start launches it (the start itself refuses
-    # the second batch at its reads): each of its three starts refuses, writing nothing.
+    # the second batch at its reads): each of its four starts refuses, writing nothing.
     release_unit.launch(release_unit.find_systemd_run(), second, root)
 
     runs = manager.calls("runs.jsonl")
     assert _began() == [] and _states() == ["accepted", "accepted"]
-    assert [run[0] for run in runs] == [1, 1, 1]
+    assert [run[0] for run in runs] == [1, 1, 1, 1]
     assert all(out.startswith(f"Refused: batch {second} is not") for _code, out, _err in runs)
 
     # The unit of the first batch: its first run begins it and is refused, since the stand-in git
     # cannot fetch, which folds it; its restarts refuse too, and the second batch stays accepted.
     code, _clock = _start(monkeypatch, first)
 
-    runs = manager.calls("runs.jsonl")[3:]
+    runs = manager.calls("runs.jsonl")[4:]
     assert code == 1 and _began() == [first]
     assert _states() == ["folded", "accepted", "open"]
-    assert [run[0] for run in runs] == [1, 1, 1]
+    assert [run[0] for run in runs] == [1, 1, 1, 1]
     assert f"Batch {first} was refused before anything changed" in runs[0][1]
     assert all(out.startswith(f"Refused: batch {first} is not") for _code, out, _err in runs[1:])
 

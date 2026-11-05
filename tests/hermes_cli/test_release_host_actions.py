@@ -26,7 +26,10 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import backup, build_info, release_host_actions
+from hermes_cli.release_guards import GUARDS, Pins
+from hermes_cli.release_host import LiveHostReader
 from hermes_cli.release_host_actions import ReleaseHostActions
+from hermes_cli.release_runner import EnvironmentUnreadable
 from hermes_constants import mark_named_profile_deleted
 
 # Stand-in unit names, so no call could reach a real unit even by mistake.
@@ -1203,3 +1206,64 @@ def test_environment_snapshot_and_restore_round_trip(tmp_path, platform_env):
         actions.restore_environment()
     assert tree(real) == changed
     assert os.readlink(link) == str(real)
+
+
+def test_g12_reads_the_comparison_the_readback_makes(tmp_path, monkeypatch, platform_env):
+    """G12 asks the reader, before the cutover, the very comparison the readback makes after the
+    sync: the lock as exported for the sync extras, against what the environment has installed."""
+    _environment_lists(tmp_path, monkeypatch, "Brotlicffi==1.2.0.2\n" + LOCK_EXPORT, json.dumps(INSTALLED))
+    actions = make_actions(tmp_path, venv_dir=platform_env.link, extras=("all",))
+    reader = LiveHostReader(
+        checkout=tmp_path / "checkout", root_home=tmp_path / "root", units=UNITS,
+        snapshot_root=tmp_path / "snapshots", snapshot_name="NEW", venv_dir=platform_env.link,
+        extras=("all",),
+    )
+
+    assert reader.environment_lock_differences() == actions.environment_differences() == (
+        "brotlicffi expected 1.2.0.2, missing",
+    )
+    reads = uv_calls(tmp_path)
+    assert len(reads) == 8 and reads[:4] == reads[4:]  # the same two reads, made the same way
+
+    (platform_env.home / "bin" / "uv").unlink()
+    with pytest.raises(EnvironmentUnreadable, match="^uv is not in the Hermes home's bin folder$"):
+        reader.environment_lock_differences()
+
+
+def test_restored_snapshots_of_new_move_aside_whole_and_g9_passes_a_later_batch(
+    tmp_path, platform_env
+):
+    """5 November, defect 3. Once a batch ends restored, its state, configuration and environment
+    snapshots of NEW move aside under a name that carries the batch, each as it was, and no
+    snapshot of NEW is left: G9 passes a later batch with the same NEW. Once a snapshot of NEW
+    exists again, G9 refuses, and a move aside to a name already taken moves nothing."""
+    snapshots, root = tmp_path / "snapshots", tmp_path / "root"
+    root.mkdir()
+    (root / "config.yaml").write_text("model: stand-in\n")
+    actions = make_actions(tmp_path, venv_dir=platform_env.link)
+    actions.take_snapshot("OLDER")
+    actions.take_snapshot("NEW")
+    actions.save_config_snapshot("NEW")
+    actions.take_environment_snapshot("NEW")
+    kinds = ("state", "config", "env")
+    before = {kind: tree(snapshots / kind / "NEW") for kind in kinds}
+
+    actions.set_aside_snapshots("NEW", "NEW.batch-7")
+
+    assert {kind: tree(snapshots / kind / "NEW.batch-7") for kind in kinds} == before
+    assert [kind for kind in kinds if os.path.lexists(snapshots / kind / "NEW")] == []
+    reader = LiveHostReader(
+        checkout=tmp_path / "checkout", root_home=root, units=UNITS, snapshot_root=snapshots,
+        snapshot_name="NEW",
+    )
+    [g9] = [check for guard, _rule, check in GUARDS if guard == "G9"]
+    pins = Pins(new="NEW", prev="PREV")
+    assert sorted(reader.snapshots()) == ["NEW.batch-7", "OLDER"]
+    assert g9(reader, pins, []) is True
+
+    actions.take_snapshot("NEW")  # the later batch's own snapshot
+    assert g9(reader, pins, []) is False
+    with pytest.raises(FileExistsError):
+        actions.set_aside_snapshots("NEW", "NEW.batch-7")
+    assert tree(snapshots / "state" / "NEW") == before["state"]  # still in place
+    assert {kind: tree(snapshots / kind / "NEW.batch-7") for kind in kinds} == before
