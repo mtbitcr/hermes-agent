@@ -1,4 +1,4 @@
-"""T28 and T29: the release guards G1 to G11 in prepare mode, and a release refusing on each.
+"""T28 and T29: the release guards G1 to G12 in prepare mode, and a release refusing on each.
 
 Every test drives the guards through FakeHost, an in-memory release host, so no real host
 command runs.
@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from hermes_cli.release_guards import GATEWAY_UNIT, OpenRun, Pins, RecordedMerge, prepare
-from hermes_cli.release_runner import run_release
+from hermes_cli.release_runner import EnvironmentUnreadable, run_release
 
 GiB = 1024**3
 PREV = "prev-sha"
@@ -20,7 +20,7 @@ NEW = "second-merge-sha"
 # A change merged after Accept: origin main has moved past NEW.
 LATER = "later-merge-sha"
 CHECKOUT = "/srv/hermes/checkout"
-ALL_GUARDS = [f"G{number}" for number in range(1, 12)]
+ALL_GUARDS = [f"G{number}" for number in range(1, 13)]
 G5_RULE = (
     "the lock file and the project manifest are unchanged, or the release can sync the"
     " environment: lock or manifest changes need the environment sync, which needs uv in the"
@@ -97,6 +97,9 @@ class FakeHost:
     # The full size of the platform environment, the copy the release takes; None when no
     # environment is found.
     environment_size: int | None = 0
+    # G12: each package the checkout's lock names that the environment does not hold at its
+    # locked version; an exception when the comparison cannot be read.
+    unlocked: tuple[str, ...] | Exception = ()
     writes: list[tuple] = field(default_factory=list)
 
     def checkout_head(self):
@@ -164,6 +167,11 @@ class FakeHost:
 
     def environment_differences(self):
         return ()
+
+    def environment_lock_differences(self):
+        if isinstance(self.unlocked, Exception):
+            raise self.unlocked
+        return self.unlocked
 
     # Neither prepare mode nor a refused release may reach any of these.
     def stop_units(self, units):
@@ -431,6 +439,23 @@ def test_the_fresh_guards_refuse_a_release_that_cannot_sync_before_the_first_sto
             ],
         ),
         refusal("G11", "G11-live-config-drifted", config={"config.yaml": "digest-2"}),
+        # 5 November: the environment never held packages that PREV's lock names, so PREV could
+        # never read back after a restore.
+        refusal(
+            "G12",
+            "G12-environment-lacks-a-locked-package",
+            unlocked=("pyyaml expected 6.0.3, missing",),
+        ),
+        refusal(
+            "G12",
+            "G12-environment-not-at-a-locked-version",
+            unlocked=("pyyaml expected 6.0.3, installed 6.0.2",),
+        ),
+        refusal(
+            "G12",
+            "G12-comparison-cannot-be-read",
+            unlocked=EnvironmentUnreadable("the installed list could not be read"),
+        ),
     ],
 )
 def test_each_guard_refuses(guard, merges, host_setup):
