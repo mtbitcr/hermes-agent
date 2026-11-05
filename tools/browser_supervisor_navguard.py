@@ -1,7 +1,14 @@
 """Navigation guard for the CDP supervisor (design-loop plan v2, B2).
 
 Opt-in: only a ``CDPSupervisor`` built with ``navigation_guard=NavigationGuard(...)`` runs any of
-this. On attach, before ``start()`` returns, it pauses every HTTP(S) request of the whole browser
+this. It is active only in a browser that cannot open a new window: Chromium started with
+``--block-new-web-contents`` (every ``window.open`` returns null, and no link, form or frame opens
+a window) and ``--enable-automation`` (so that CDP hands out the command line). On attach it first
+reads the browser's command line with ``Browser.getBrowserCommandLine``; if the read fails or the
+first switch is not in it, it installs nothing and raises, so the supervisor neither starts nor
+reports active and the design browser tool refuses, as with no browser.
+
+Then, before ``start()`` returns, it pauses every HTTP(S) request of the whole browser
 (documents, each redirect hop, subresources, frames and workers) at one browser-level ``Fetch``
 interception, which applies to new targets from birth. A request goes on only if it is a GET that
 :func:`tools.design_url_policy.design_url_refusal` allows; anything else, a policy error included,
@@ -18,12 +25,13 @@ page, it stops at a ``debugger;`` statement; the guard reads ``location.href`` t
 document go on only if the policy allows it. A refused document, or one the guard cannot check, is
 never resumed and its page is closed. A document whose stop the guard never sees stops itself.
 
-Every new window that the page or any of its frames opens (``window.open``, a link or form with a
-target, a sandboxed frame's popup, a ``noopener`` one) is closed while it is held, before it runs
-any document, whatever its first address. Nothing is asked of its renderer first (one held from
-birth has none yet to answer with), and the policy is not asked about it. It is then let go as
-well, because being held also holds the window its opener is still inside ``window.open`` for; the
-close goes first, so by then nothing of the page is left to run.
+A new window that the page or any of its frames opens all the same (``window.open``, a link or
+form with a target, a sandboxed frame's popup, a ``noopener`` one) is closed while it is held,
+whatever its first address, as a second line of defence. Nothing is asked of its renderer first
+(one held from birth has none yet to answer with), and the policy is not asked about it. It is then
+let go as well, because being held also holds the window its opener is still inside
+``window.open`` for. The close cannot stop a document the opener writes into the window's first
+blank document at once; that is why the guard needs a browser that opens no window.
 
 CDP Fetch never pauses a WebSocket handshake (checked against Chromium 153 by
 ``tests/tools/test_browser_navguard.py``), and neither ``Network.setBlockedURLs`` nor an injected
@@ -54,6 +62,8 @@ DENIED_PERMISSIONS = (
     "midi", "background-sync", "persistent-storage", "screen-wake-lock", "idle-detection",
 )
 _AUTO_ATTACH_HELD = {"autoAttach": True, "waitForDebuggerOnStart": True, "flatten": True}
+# The switch without which the guard does not become active (owner rule 2).
+NO_NEW_WINDOWS = "--block-new-web-contents"
 _PAGE_TYPES = frozenset({"page", "iframe"})
 _BROWSER_WORKERS = frozenset({"service_worker", "shared_worker"})  # browser-level auto-attach reaches these
 
@@ -102,8 +112,12 @@ class NavigationGuard:
             return "the address policy failed"
 
     async def install(self, cdp: CDPCall, page_session_id: str, page_target_id: str) -> None:
-        """Guard the browser and the supervisor's first page. Raises if any step fails, so the
-        supervisor does not start unguarded."""
+        """Guard the browser and the supervisor's first page. Raises if the browser can open new
+        windows (or its command line cannot be read), or if any step fails, so the supervisor does
+        not start unguarded."""
+        switches = ((await cdp("Browser.getBrowserCommandLine")).get("result") or {}).get("arguments")
+        if not isinstance(switches, list) or NO_NEW_WINDOWS not in switches:
+            raise RuntimeError(f"the browser was not started with {NO_NEW_WINDOWS}")
         await self._deny(cdp)
         contexts = (await cdp("Target.getBrowserContexts")).get("result") or {}
         self._default_context = contexts.get("defaultBrowserContextId")
@@ -197,15 +211,14 @@ class NavigationGuard:
                 logger.debug("navigation guard: letting a worker go failed: %s", exc)
             return
         if held and target_type == "page" and (info.get("openerId") or info.get("openerFrameId")):
-            # A new window the page or one of its frames opened: closed while it is held, before
-            # it runs any document, whatever its first address. Nothing is asked of its renderer
-            # first (a page held from birth has none yet, and would answer none of it), and the
-            # policy is not asked about it.
+            # A new window the page or one of its frames opened, which --block-new-web-contents
+            # should never let happen: closed while it is held, whatever its first address, as a
+            # second line of defence. Nothing is asked of its renderer first (a page held from
+            # birth has none yet, and would answer none of it), and the policy is not asked about it.
             # Closed, then let go, both sent before either answers. Being held holds the window its
             # opener is still inside window.open for, and only letting the page go hands that back
             # - but by the time the close answers the session is gone and the command would be
-            # dropped. The close goes first, so nothing of the page is left to run when it is let go
-            # (checked against Chromium 153).
+            # dropped. The close cannot stop what the opener writes into the window meanwhile.
             closing = asyncio.ensure_future(self._close_page(cdp, sid, "it is a new window a page opened"))
             letting_go = asyncio.ensure_future(cdp("Runtime.runIfWaitingForDebugger", session_id=sid))
             await closing

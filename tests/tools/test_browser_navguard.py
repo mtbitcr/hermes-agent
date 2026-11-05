@@ -8,7 +8,10 @@ server that answers every command and records it) and use the real allow-list de
 is opt-in twice over: ``@pytest.mark.integration`` and ``HERMES_E2E_BROWSER=1``. Its pages come
 from a server on 127.0.0.1, which the design allow-list always refuses, so those tests swap the
 decision for one that allows only that server's ``/ok`` paths; they check what Chromium does with
-the guard's answers, not the allow-list itself. Run them with:
+the guard's answers, not the allow-list itself. Chromium runs as the design browser does, with
+``--block-new-web-contents`` and ``--enable-automation`` (owner rule 2), except in the positive
+controls that must see a popup run and the tests that the guard stays inactive without the first
+switch. Run them with:
 
     HERMES_E2E_BROWSER=1 scripts/run_tests.sh -m integration tests/tools/test_browser_navguard.py
 """
@@ -16,6 +19,7 @@ the guard's answers, not the allow-list itself. Run them with:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import http.server
 import json
 import os
@@ -35,6 +39,8 @@ from tools.browser_supervisor import CDPSupervisor, _SupervisorRegistry
 
 ALLOWED = ["raphael.agentsbridge.net", "raphael-first-project.pages.dev", "*.raphael-first-project.pages.dev"]
 PUBLIC_IP = "93.184.216.34"
+# The design browser's switches (owner rule 2): no new windows, and a command line CDP can read.
+DESIGN_BROWSER_SWITCHES = ("--block-new-web-contents", "--enable-automation")
 
 
 @pytest.fixture(autouse=True)
@@ -63,6 +69,8 @@ class FakeCDP:
         self.results = {
             "Target.getTargets": {"targetInfos": [{"targetId": "T1", "type": "page", "url": "about:blank"}]},
             "Target.attachToTarget": {"sessionId": "S1"},
+            # A browser started as the design browser is: it cannot open new windows.
+            "Browser.getBrowserCommandLine": {"arguments": ["/tmp/chromium", *DESIGN_BROWSER_SWITCHES]},
         }
         self._conn = None
         self._loop = asyncio.new_event_loop()
@@ -267,7 +275,7 @@ def test_contexts_that_exist_at_install_get_the_denials(fake_cdp, supervise):
     supervise(navigation_guard=_guard())
     for context in ("C1", "C2"):
         scoped = [c["params"] for c in fake_cdp.calls
-                  if c["method"].startswith("Browser.") and c["params"].get("browserContextId") == context]
+                  if c["method"].startswith("Browser.") and c.get("params", {}).get("browserContextId") == context]
         assert {"behavior": "deny", "browserContextId": context} in scoped
         assert {p["permission"]["name"] for p in scoped if "permission" in p} == set(navguard.DENIED_PERMISSIONS)
         assert all(p["setting"] == "denied" for p in scoped if "permission" in p)
@@ -427,7 +435,8 @@ def _opened(fake: FakeCDP, url: str, sid: str = "S1") -> None:
 def _closed_while_held(fake: FakeCDP, sid: str, target_id: str, start: int) -> None:
     """Assert ``target_id`` was closed with nothing asked of its held session, and let go right
     behind the close - being held also holds the window its opener is still inside
-    ``window.open`` for, and by the time the close has gone nothing of the page is left to run."""
+    ``window.open`` for. A second line of defence only (owner rule 2): the design browser opens no
+    new window at all."""
     closed = fake.wait_for(lambda c: c["method"] == "Target.closeTarget", start=start)
     assert closed["params"] == {"targetId": target_id}
     at = fake.calls.index(closed)
@@ -444,9 +453,9 @@ def _closed_while_held(fake: FakeCDP, sid: str, target_id: str, start: int) -> N
     ["https://raphael.agentsbridge.net/ok-placeholder", "blob:https://raphael.agentsbridge.net/0b5e4c1d"],
 ], ids=["none", "empty", "about-blank", "allowed", "refused", "blob", "data", "window-that-never-came"])
 def test_held_popup_is_closed_while_held_whatever_it_was_opened_at(fake_cdp, supervise, monkeypatch, opened):
-    """Every new window a page or one of its frames opens is closed while it is held, before it
-    runs any document: no ``Page.windowOpen`` is taken as its address, and the policy (here one
-    that would allow anything) is not asked about it."""
+    """Every new window a page or one of its frames opens is closed while it is held: no
+    ``Page.windowOpen`` is taken as its address, and the policy (here one that would allow
+    anything) is not asked about it."""
     asked = []
     monkeypatch.setattr(navguard, "design_url_refusal", lambda url, *_args, **_kwargs: asked.append(url))
     supervise(navigation_guard=_guard())
@@ -476,6 +485,43 @@ def test_start_fails_when_the_guard_cannot_install(fake_cdp, supervise):
     fake_cdp.errors.add(("Fetch.enable", None))
     with pytest.raises(RuntimeError):
         supervise(navigation_guard=_guard())
+
+
+# ── Active only in a browser that cannot open new windows ────────────────────
+
+
+def test_guard_reads_the_command_line_before_anything_else_and_is_active(fake_cdp, supervise):
+    supervisor = supervise(navigation_guard=_guard())
+    root = [c["method"] for c in fake_cdp.calls if "sessionId" not in c]
+    read = root.index("Browser.getBrowserCommandLine")
+    assert read < root.index("Browser.setDownloadBehavior") and read < root.index("Fetch.enable")
+    assert supervisor.snapshot().active
+
+
+@pytest.mark.parametrize("answer", [
+    {"arguments": ["/tmp/chromium", "--enable-automation"]}, {"arguments": []}, {}, None,
+], ids=["switch-missing", "no-arguments", "empty-answer", "read-fails"])
+def test_guard_stays_inactive_unless_the_browser_cannot_open_new_windows(fake_cdp, answer):
+    """Owner rule 2: no --block-new-web-contents in the browser's command line, or a read of it that
+    fails, and the guard installs nothing, the supervisor never reports active, and the registry
+    the design browser tool asks hands out no supervisor - as with no browser at all."""
+    if answer is None:
+        fake_cdp.errors.add(("Browser.getBrowserCommandLine", None))
+    else:
+        fake_cdp.results["Browser.getBrowserCommandLine"] = answer
+    supervisor = CDPSupervisor(task_id="navguard-test", cdp_url=fake_cdp.url, navigation_guard=_guard())
+    with pytest.raises(RuntimeError):
+        supervisor.start(timeout=10)
+    assert not supervisor.snapshot().active
+    assert "Browser.getBrowserCommandLine" in fake_cdp.methods(None)
+    assert not {"Browser.setDownloadBehavior", "Fetch.enable"} & set(fake_cdp.methods(None))
+    registry = _SupervisorRegistry()
+    try:
+        with pytest.raises(RuntimeError):
+            registry.get_or_start(task_id="design", cdp_url=fake_cdp.url, navigation_guard=_guard())
+        assert registry.get("design") is None
+    finally:
+        registry.stop_all()
 
 
 # ── Requests ─────────────────────────────────────────────────────────────────
@@ -586,34 +632,64 @@ _BLOB_OPENERS = {
 
 # The reviewer's popup cases (attachments 194-196), on this file's site.
 _POPUP_CASES = ("direct", "sandbox_window", "sandbox_form", "noopener", "allowed_popup")
+# The reviewer's cases whose opener writes a document into the window it got, at once (attachment 224).
+_WRITE_CASES = ("blank_write", "explicit_blank_write", "https_initial_write", "frame_blank_write")
+
+
+def _write_case_action(case: str) -> str:
+    """The opener's script of a ``_WRITE_CASES`` case, as attachment 224 has it: open a window and
+    write into its first document a script that marks ``top.fixtureResult.popupProof`` from the
+    window; the opener reads the mark back as ``childValue``."""
+    child = ("<title>initial-document-marker</title><script>window.fixtureExecuted=true;"
+             "window.fixtureProof={href:location.href,inPopup:window!==opener,"
+             "ownDocument:document.defaultView===window,title:'initial-document-marker'};"
+             "opener.top.fixtureResult.popupProof=window.fixtureProof;</script>")
+    address = {"explicit_blank_write": "'about:blank'", "https_initial_write": "'/ok-allowed-popup'"}.get(case, "")
+    return ("const w=window.open(" + address + "); top.fixtureResult.closedAtReturn=w ? w.closed : null; "
+            "try { w.document.open(); w.document.write(" + json.dumps(child).replace("</", "<\\/") + ");"
+            " w.document.close(); top.fixtureResult.childValue=w.fixtureExecuted===true;"
+            " top.fixtureResult.closedAtWrite=w.closed; } catch(e) {top.fixtureResult.writeError=String(e);}"
+            " top.fixtureResult.completed=true;")
 
 
 def _popup_case_page(case: str, frame: bool = False) -> str:
     """Script of ``/ok-case?<case>``: on load, with no user gesture, it opens a window - a
-    ``blob:`` document that asks for ``/ok-marker-case``, or ``/ok-allowed-popup`` - then asks for
-    ``/ok-opened``. In the sandbox cases a frame sandboxed without ``allow-popups``
-    (``/ok-case-frame?<case>``) first tries ``window.open`` or a ``target=_blank`` form."""
+    ``blob:`` document that asks for ``/ok-marker-case``, ``/ok-allowed-popup``, or (the write
+    cases) one whose first document it writes itself - notes in ``fixtureResult.opened`` whether
+    ``window.open`` returned a window, then asks for ``/ok-opened``. In the sandbox cases a frame
+    sandboxed without ``allow-popups`` (``/ok-case-frame?<case>``) first tries ``window.open`` or a
+    ``target=_blank`` form; in ``frame_blank_write`` a same-origin frame is the opener."""
     if frame:
+        if case == "frame_blank_write":
+            return ("<script>" + _write_case_action(case)
+                    + "top.fixtureResult.opened = w !== null; fetch('/ok-opened');</script>")
         if case == "sandbox_form":
             action = ("const f = document.createElement('form'); f.action = '/ok-placeholder';"
                       "f.target = '_blank'; f.method = 'GET'; document.body.appendChild(f); f.submit();")
         else:
             action = "window.open('/ok-placeholder');"
         return "<script>" + action + "parent.postMessage('fixture-ready', '*');</script>"
-    if case == "allowed_popup":
-        action = "window.open('/ok-allowed-popup');"
+    start = "window.fixtureResult = {started: true};"
+    if case == "frame_blank_write":
+        return ("<script>" + start + "const f = document.createElement('iframe');"
+                f"f.src = '/ok-case-frame?{case}'; document.body.appendChild(f);</script>")
+    if case in _WRITE_CASES:
+        action = _write_case_action(case)
+    elif case == "allowed_popup":
+        action = "const w = window.open('/ok-allowed-popup');"
     else:
         action = ("const html = '<title>refused-case-popup</title><script>fetch('"
                   " + JSON.stringify(location.origin + '/ok-marker-case') + ')<' + '/script>';"
                   "const url = URL.createObjectURL(new Blob([html], {type: 'text/html'}));"
-                  + ("window.open(url, '_blank', 'noopener');" if case == "noopener" else "window.open(url);"))
-    action += "fetch('/ok-opened');"
+                  + ("const w = window.open(url, '_blank', 'noopener');" if case == "noopener"
+                     else "const w = window.open(url);"))
+    action += "fixtureResult.opened = w !== null; fetch('/ok-opened');"
     if case.startswith("sandbox_"):
-        return ("<script>window.addEventListener('message', e => { if (e.data === 'fixture-ready') {" + action
-                + "} }, {once: true}); const f = document.createElement('iframe');"
+        return ("<script>" + start + "window.addEventListener('message', e => { if (e.data === 'fixture-ready') {"
+                + action + "} }, {once: true}); const f = document.createElement('iframe');"
                 "f.sandbox = 'allow-scripts allow-same-origin allow-forms';"
                 f"f.src = '/ok-case-frame?{case}'; document.body.appendChild(f);</script>")
-    return "<script>" + action + "</script>"
+    return "<script>" + start + action + "</script>"
 
 
 class _Site(http.server.BaseHTTPRequestHandler):
@@ -692,15 +768,17 @@ class TestRealChromium:
         yield f"http://127.0.0.1:{server.server_address[1]}", _Site.seen, handshakes
         server.shutdown()
 
-    @pytest.fixture
-    def chrome(self):
+    @staticmethod
+    @contextlib.contextmanager
+    def _launch(*switches):
+        """Headless Chromium with ``switches`` added; yields its browser CDP address."""
         profile = tempfile.mkdtemp(prefix="hermes-navguard-test-")
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
         proc = subprocess.Popen(
             [_find_chrome(), f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
-             "--no-first-run", "--no-default-browser-check", "--headless=new", "--disable-gpu"],
+             "--no-first-run", "--no-default-browser-check", "--headless=new", "--disable-gpu", *switches],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         ws_url = None
@@ -719,6 +797,18 @@ class TestRealChromium:
             proc.kill()
             proc.wait(timeout=5)
             shutil.rmtree(profile, ignore_errors=True)
+
+    @pytest.fixture
+    def chrome(self):
+        """Chromium as the design browser runs it (owner rule 2): it cannot open a new window."""
+        with self._launch(*DESIGN_BROWSER_SWITCHES) as ws_url:
+            yield ws_url
+
+    @pytest.fixture
+    def chrome_that_opens_windows(self):
+        """Chromium without ``--block-new-web-contents``, for the controls that must see a popup run."""
+        with self._launch() as ws_url:
+            yield ws_url
 
     @pytest.fixture
     def asked(self):
@@ -773,8 +863,7 @@ class TestRealChromium:
         assert base + "/refused" in asked
 
     def test_popup_to_refused_page_is_blocked(self, guarded, site, asked, chrome):
-        """A new window is closed while it is held: its address is never asked for, nor is the
-        policy asked about it."""
+        """No new window opens: its address is never asked for, nor is the policy asked about it."""
         base, seen, _ = site
         self._navigate(guarded, base + "/ok-popup")
         assert "/ok-popup" in seen and "/refused-popup" not in seen
@@ -782,11 +871,19 @@ class TestRealChromium:
         assert self._only_page_left(chrome, base + "/ok-popup") == [base + "/ok-popup"]
 
     @staticmethod
-    def _raw_navigate(chrome, url: str, until=None) -> None:
+    def _raw_navigate(chrome, url: str, until=None) -> list:
         """Navigate the page over a CDP session of our own, so the page's own load-time scripts
         run with no user gesture behind them (``evaluate_runtime`` grants one). Waits for
-        ``until`` (the page got as far as the test is about), then lets things settle."""
+        ``until`` (the page got as far as the test is about), then lets things settle. Returns
+        every other page target Chromium created meanwhile."""
         from websockets.sync.client import connect
+
+        created = []
+
+        def note(msg):
+            info = (msg.get("params") or {}).get("targetInfo") or {}
+            if msg.get("method") == "Target.targetCreated" and info.get("type") == "page":
+                created.append(info)
 
         with connect(chrome, open_timeout=5, max_size=None) as ws:
             ids = iter(range(1, 1000))
@@ -798,17 +895,27 @@ class TestRealChromium:
                 ws.send(json.dumps(msg))
                 while True:
                     reply = json.loads(ws.recv(timeout=10))
+                    note(reply)
                     if reply.get("id") == msg["id"]:
                         assert "error" not in reply, reply
                         return reply["result"]
 
             page = next(t for t in call("Target.getTargets")["targetInfos"] if t["type"] == "page")
+            call("Target.setDiscoverTargets", {"discover": True})
             session = call("Target.attachToTarget", {"targetId": page["targetId"], "flatten": True})["sessionId"]
             call("Page.navigate", {"url": url}, session)
-        deadline = time.monotonic() + 15
-        while until is not None and not until() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        time.sleep(1.5)
+
+            def wait(seconds):
+                with contextlib.suppress(TimeoutError):
+                    note(json.loads(ws.recv(timeout=seconds)))
+
+            deadline = time.monotonic() + 15
+            while until is not None and not until() and time.monotonic() < deadline:
+                wait(0.05)
+            settled = time.monotonic() + 1.5
+            while time.monotonic() < settled:
+                wait(max(0.0, settled - time.monotonic()))
+        return [t for t in created if t["targetId"] != page["targetId"]]
 
     @staticmethod
     def _page_urls(chrome) -> list:
@@ -828,9 +935,9 @@ class TestRealChromium:
     def test_automatic_blob_document_never_runs_and_leaves_no_page(self, guarded, site, asked, chrome, how):
         """An allowed page reaches a ``blob:`` document from its own load-time script - no user
         gesture, no request for Fetch to pause - every way it can: ``window.open`` with and
-        without an opener, a ``target="_blank"`` link, and a same-origin frame. A new window is
-        closed while it is held, so the policy is never asked about it; the page's own frame is
-        checked, and refused."""
+        without an opener, a ``target="_blank"`` link, and a same-origin frame. No new window
+        opens, so the policy is never asked about one; the page's own frame is checked, and
+        refused."""
         base, seen, _ = site
         if how == "iframe":
             # Wait for the guard's answer about the blob: address, then for anything it let run.
@@ -852,9 +959,10 @@ class TestRealChromium:
             assert self._only_page_left(chrome, f"{base}/ok-blob-popup?{how}") == [f"{base}/ok-blob-popup?{how}"]
 
     @pytest.mark.parametrize("how", list(_BLOB_OPENERS))
-    def test_automatic_blob_document_runs_without_the_guard(self, chrome, site, how):
+    def test_automatic_blob_document_runs_without_the_guard(self, chrome_that_opens_windows, site, how):
         """Positive control for the test above: the same pages, unguarded, do run the marker."""
         base, seen, _ = site
+        chrome = chrome_that_opens_windows
         supervisor = CDPSupervisor(task_id="navguard-e2e-unguarded", cdp_url=chrome)
         supervisor.start(timeout=15)
         try:
@@ -864,34 +972,65 @@ class TestRealChromium:
         finally:
             supervisor.stop()
 
-    @pytest.mark.parametrize("case", _POPUP_CASES)
-    def test_popup_is_closed_while_held_whatever_its_address(self, guarded, site, chrome, case):
-        """The reviewer's popup cases, each opened by the page's own load-time script with no user
-        gesture: a ``blob:`` document from ``window.open``, the same after a sandboxed frame's
-        ``window.open`` or ``target=_blank`` form that opened no window, a ``noopener`` one, and
-        one at an address the policy allows. Each is closed while it is held, before it runs any
-        document, and the page that opened it goes on."""
+    @pytest.mark.parametrize("case", _POPUP_CASES + _WRITE_CASES)
+    def test_page_cannot_open_a_window(self, guarded, site, chrome, case):
+        """Owner rule 2: the reviewer's popup cases, each run by the page's own load-time script
+        with no user gesture - a ``blob:`` document from ``window.open``, the same after a
+        sandboxed frame's ``window.open`` or ``target=_blank`` form, a ``noopener`` one, one at an
+        address the policy allows, and a window whose first document the opener (or its frame)
+        writes at once. In a browser started with ``--block-new-web-contents`` window.open returns
+        null, no new target is created, nothing runs in a popup, and the guard is active."""
         base, seen, _ = site
         page = f"{base}/ok-case?{case}"
-        self._raw_navigate(chrome, page, lambda: "/ok-opened" in seen)
+        created = self._raw_navigate(chrome, page, lambda: "/ok-opened" in seen)
         assert "/ok-opened" in seen
+        result = guarded.evaluate_runtime("window.fixtureResult")["result"]
+        assert result["opened"] is False and created == []
+        assert not result.get("childValue") and "popupProof" not in result
         assert "/ok-marker-case" not in seen and "/ok-allowed-popup" not in seen
-        assert self._only_page_left(chrome, page) == [page]
+        assert self._page_urls(chrome) == [page]
         assert guarded.snapshot().active
 
-    @pytest.mark.parametrize("case", _POPUP_CASES)
-    def test_popup_case_runs_without_the_guard(self, chrome, site, case):
-        """Positive control for the test above: unguarded, each popup's document runs (its marker
-        is asked for, or the allowed page loads)."""
+    @pytest.mark.parametrize("case", _POPUP_CASES + _WRITE_CASES)
+    def test_popup_case_runs_without_the_guard(self, chrome_that_opens_windows, site, case):
+        """Positive control for the test above: in a browser that can open windows, unguarded,
+        each popup's document runs (its marker is asked for, the allowed page loads, or the
+        written document marks itself from inside the popup)."""
         base, seen, _ = site
+        chrome = chrome_that_opens_windows
         expected = "/ok-allowed-popup" if case == "allowed_popup" else "/ok-marker-case"
         supervisor = CDPSupervisor(task_id="navguard-e2e-unguarded", cdp_url=chrome)
         supervisor.start(timeout=15)
         try:
-            self._raw_navigate(chrome, f"{base}/ok-case?{case}", lambda: expected in seen)
-            assert expected in seen
+            if case in _WRITE_CASES:
+                self._raw_navigate(chrome, f"{base}/ok-case?{case}", lambda: "/ok-opened" in seen)
+                result = supervisor.evaluate_runtime("window.fixtureResult")["result"]
+                assert result["opened"] and result["childValue"] and result["popupProof"]["inPopup"]
+            else:
+                self._raw_navigate(chrome, f"{base}/ok-case?{case}", lambda: expected in seen)
+                assert expected in seen
         finally:
             supervisor.stop()
+
+    @pytest.mark.parametrize("switches", [["--enable-automation"], []], ids=["switch-missing", "read-fails"])
+    def test_guard_stays_inactive_in_a_browser_that_can_open_windows(self, switches):
+        """Owner rule 2: without ``--block-new-web-contents`` (or without ``--enable-automation``,
+        so the command line cannot be read) the guarded supervisor does not start or report active,
+        and the registry the design browser tool asks refuses, as with no browser."""
+        with self._launch(*switches) as chrome:
+            supervisor = CDPSupervisor(task_id="navguard-e2e-inactive", cdp_url=chrome,
+                                       navigation_guard=navguard.NavigationGuard([]))
+            with pytest.raises(RuntimeError):
+                supervisor.start(timeout=15)
+            assert not supervisor.snapshot().active
+            registry = _SupervisorRegistry()
+            try:
+                with pytest.raises(RuntimeError):
+                    registry.get_or_start(task_id="design", cdp_url=chrome,
+                                          navigation_guard=navguard.NavigationGuard([]))
+                assert registry.get("design") is None
+            finally:
+                registry.stop_all()
 
     def test_websocket_is_not_seen_by_fetch_and_its_page_is_closed(self, guarded, site, asked, chrome):
         """O3: CDP Fetch does not pause WebSocket handshakes, so the guard cannot fail them like
