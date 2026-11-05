@@ -572,8 +572,12 @@ def test_prepare_runs_every_guard_and_writes_nothing(root, tmp_path, monkeypatch
         "root_home": root,
         "units": UNITS,
         "snapshot_root": root / "release-snapshots",
+<<<<<<< a8e9f16e3360d85d8076ec4ef9fcdd90faadfb24
+        "venv_dir": Path(release_cmd.__file__).resolve().parents[1] / "venv",
+=======
         "venv_dir": None,
         "extras": ("all",),
+>>>>>>> 33572fa0caa78422770e4590d0b0228ee8fbc6fe
     }
     assert host.built == [
         {**shared, "snapshot_name": NEW},
@@ -806,6 +810,18 @@ def test_both_adapters_are_built_from_the_resolved_settings(root, monkeypatch, f
             "workspace_container": "raphael-workspace-blue",
         },
     ]
+
+
+def test_the_platform_environment_defaults_to_the_venv_folder_of_the_checkout(root, monkeypatch):
+    """The owner's settings leave venv_dir out, so both adapters get the default."""
+    host = FakeHost()
+    release_cmd = _command(monkeypatch, host)
+    _accepted_batch(NEW)
+
+    assert release_cmd.prepare() == 0
+
+    venv = Path(release_cmd.__file__).resolve().parents[1] / "venv"
+    assert [settings["venv_dir"] for settings in host.built] == [venv, venv]
 
 
 @pytest.mark.parametrize("form", REFERENCE_FORMS)
@@ -1339,8 +1355,10 @@ def _g_verdicts(out: str) -> dict[str, str]:
 
 
 def test_a_missing_venv_dir_refuses(root, tmp_path, monkeypatch, capsys):
-    """Without release.venv_dir there is no environment for the release to copy and sync, so G8
-    cannot count its copy and refuses, as the real reader finds it; nothing is written."""
+    """With release.venv_dir set empty over its default, there is no environment for the release
+    to copy and sync, so G8 cannot count its copy and refuses, as the real reader finds it;
+    nothing is written."""
+    (root / "config.yaml").write_text(yaml.safe_dump({"release": _settings_with("venv_dir", "")}))
     host = FakeHost(live_snapshots=True, live_environment=True)
     release_cmd = _command(monkeypatch, host)
     _accepted_batch(NEW)
