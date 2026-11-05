@@ -166,6 +166,7 @@ def test_guard_is_off_unless_asked_for(fake_cdp, supervise):
     assert "Browser.setDownloadBehavior" not in fake_cdp.methods(None)
     auto_attach = [c for c in fake_cdp.calls if c["method"] == "Target.setAutoAttach"]
     assert auto_attach and not any(c["params"]["waitForDebuggerOnStart"] for c in auto_attach)
+    assert not [c for c in fake_cdp.calls if c["method"].startswith("Debugger.")]
 
 
 def test_registry_starts_the_guard_only_when_given_one(fake_cdp):
@@ -231,6 +232,182 @@ def test_new_target_that_cannot_be_guarded_is_closed_not_resumed(fake_cdp, super
     closed = fake_cdp.wait_for(lambda c: c["method"] == "Target.closeTarget")
     assert closed["params"] == {"targetId": "T3"}
     assert "Runtime.runIfWaitingForDebugger" not in fake_cdp.methods("S3")
+
+
+def _attach(fake: FakeCDP, sid: str, target_id: str, kind: str = "page", *, context: str | None = None,
+            parent: str | None = None, waiting: bool = True) -> int:
+    """Report a newly attached target; returns where its calls start in ``fake.calls``."""
+    start = len(fake.calls)
+    info = {"targetId": target_id, "type": kind, "url": ""}
+    if context:
+        info["browserContextId"] = context
+    fake.push("Target.attachedToTarget", {"sessionId": sid, "waitingForDebugger": waiting, "targetInfo": info},
+              session_id=parent)
+    return start
+
+
+def _resumed(fake: FakeCDP, sid: str, start: int = 0) -> int:
+    """Wait until ``sid`` is resumed; returns the index of that call in ``fake.calls``."""
+    call = fake.wait_for(lambda c: c["method"] == "Runtime.runIfWaitingForDebugger" and c.get("sessionId") == sid,
+                         start=start)
+    return fake.calls.index(call)
+
+
+# ── Downloads and permissions in every browser context ───────────────────────
+
+
+def test_contexts_that_exist_at_install_get_the_denials(fake_cdp, supervise):
+    fake_cdp.results["Target.getBrowserContexts"] = {"browserContextIds": ["C1", "C2"],
+                                                     "defaultBrowserContextId": "C0"}
+    supervise(navigation_guard=_guard())
+    for context in ("C1", "C2"):
+        scoped = [c["params"] for c in fake_cdp.calls
+                  if c["method"].startswith("Browser.") and c["params"].get("browserContextId") == context]
+        assert {"behavior": "deny", "browserContextId": context} in scoped
+        assert {p["permission"]["name"] for p in scoped if "permission" in p} == set(navguard.DENIED_PERMISSIONS)
+        assert all(p["setting"] == "denied" for p in scoped if "permission" in p)
+    assert not [c for c in fake_cdp.calls if c.get("params", {}).get("browserContextId") == "C0"]
+
+
+def test_new_context_is_denied_once_before_its_first_target_resumes(fake_cdp, supervise):
+    fake_cdp.results["Target.getBrowserContexts"] = {"browserContextIds": [], "defaultBrowserContextId": "C0"}
+    supervise(navigation_guard=_guard())
+    start = _attach(fake_cdp, "S2", "T2", context="C1")
+    before = fake_cdp.calls[start:_resumed(fake_cdp, "S2", start)]
+    scoped = [c["params"] for c in before if c["method"].startswith("Browser.")]
+    assert {"behavior": "deny", "browserContextId": "C1"} in scoped
+    assert {p["permission"]["name"] for p in scoped
+            if p.get("browserContextId") == "C1" and "permission" in p} == set(navguard.DENIED_PERMISSIONS)
+    # Once per context; the default context was done at install.
+    later = _attach(fake_cdp, "S3", "T3", context="C1")
+    _resumed(fake_cdp, "S3", later)
+    _resumed(fake_cdp, "S5", _attach(fake_cdp, "S5", "T5", "iframe", context="C1", parent="S2"))
+    _resumed(fake_cdp, "S6", _attach(fake_cdp, "S6", "T6", context="C0"))
+    assert not [c for c in fake_cdp.calls[later:] if c["method"].startswith("Browser.")]
+
+
+def test_target_whose_context_cannot_be_denied_is_closed_not_resumed(fake_cdp, supervise):
+    supervise(navigation_guard=_guard())
+    fake_cdp.errors.add(("Browser.setDownloadBehavior", None))
+    _attach(fake_cdp, "S7", "T7", context="C9")
+    closed = fake_cdp.wait_for(lambda c: c["method"] == "Target.closeTarget")
+    assert closed["params"] == {"targetId": "T7"}
+    assert "Runtime.runIfWaitingForDebugger" not in fake_cdp.methods("S7")
+
+
+# ── Documents Fetch never pauses (blob:, data:, ...) ─────────────────────────
+
+
+def _gate_script_at(fake: FakeCDP, sid: str) -> int:
+    """Index, among ``sid``'s calls, of the document gate's script: in its own world, after Page,
+    Runtime and Debugger were enabled there."""
+    calls = [c for c in fake.calls if c.get("sessionId") == sid]
+    names = [c["method"] for c in calls]
+    script = next(i for i, c in enumerate(calls)
+                  if c["method"] == "Page.addScriptToEvaluateOnNewDocument" and c["params"].get("worldName"))
+    assert "debugger;" in calls[script]["params"]["source"]
+    assert all(f"{domain}.enable" in names[:script] for domain in ("Page", "Runtime", "Debugger"))
+    return script
+
+
+def _gate_pause(fake: FakeCDP, href: str, *, function: str = "hermesNavigationGate", sid: str = "S1") -> int:
+    """Report a pause on ``sid`` whose paused document is at ``href``; returns where the guard's
+    answer starts in ``fake.calls``."""
+    fake.results["Debugger.evaluateOnCallFrame"] = {"result": {"type": "string", "value": href}}
+    start = len(fake.calls)
+    fake.push("Debugger.paused", {"reason": "other", "callFrames": [{"callFrameId": "CF1", "functionName": function}]},
+              session_id=sid)
+    return start
+
+
+def test_document_gate_is_installed_before_anything_resumes(fake_cdp, supervise):
+    supervise(navigation_guard=_guard())
+    _gate_script_at(fake_cdp, "S1")  # the first page, before start() returned
+    for sid, target_id, kind, parent in (("S2", "T2", "page", None), ("S4", "F4", "iframe", "S1")):
+        resume = _resumed(fake_cdp, sid, _attach(fake_cdp, sid, target_id, kind, parent=parent))
+        session = [c for c in fake_cdp.calls[:resume] if c.get("sessionId") == sid]
+        assert _gate_script_at(fake_cdp, sid) < len(session)
+    # Child targets are held at start too, so each gets its gate before it runs.
+    deadline = time.monotonic() + 5
+    while len([c for c in fake_cdp.calls if c["method"] == "Target.setAutoAttach" and c.get("sessionId") == "S4"]) < 2:
+        assert time.monotonic() < deadline, "the frame's own auto-attach never arrived"
+        time.sleep(0.02)
+    assert all(c["params"]["waitForDebuggerOnStart"] for c in fake_cdp.calls if c["method"] == "Target.setAutoAttach")
+
+
+def test_page_attached_twice_is_gated_once(fake_cdp, supervise):
+    """Browser-level auto-attach also attaches the first page again; a second gate there would
+    report every pause twice."""
+    supervise(navigation_guard=_guard())
+    _attach(fake_cdp, "S1b", "T1", waiting=False)
+    fake_cdp.wait_for(lambda c: c["method"] == "Network.enable" and c.get("sessionId") == "S1b")
+    time.sleep(0.2)
+    assert "Debugger.enable" not in fake_cdp.methods("S1b")
+
+
+def test_service_worker_is_guarded_through_the_browser_only(fake_cdp, supervise):
+    """A service worker is attached through its page and through the browser; Chromium answers
+    the browser's session only once the page's lets go, so that one lets go at once."""
+    supervise(navigation_guard=_guard())
+    _resumed(fake_cdp, "W1a", _attach(fake_cdp, "W1a", "W1", "service_worker", parent="S1"))
+    assert fake_cdp.methods("W1a") == ["Runtime.runIfWaitingForDebugger"]
+    resume = _resumed(fake_cdp, "W1b", _attach(fake_cdp, "W1b", "W1", "service_worker"))
+    assert "Network.enable" in [c["method"] for c in fake_cdp.calls[:resume] if c.get("sessionId") == "W1b"]
+
+
+def test_service_worker_gone_before_its_page_lets_go_is_no_error():
+    """A refused registration tears its worker down at once, often before that resume arrives."""
+
+    async def gone(method, params=None, session_id=None):
+        raise RuntimeError("Inspected target navigated or closed")
+
+    asyncio.run(_guard().guard_target(gone, {"sessionId": "W1a", "waitingForDebugger": True,
+                                             "targetInfo": {"targetId": "W1", "type": "service_worker"}}, "S1"))
+
+
+@pytest.mark.parametrize("href", ["blob:https://raphael.agentsbridge.net/0b5e4c1d", "data:text/html,<title>x</title>",
+                                  "about:srcdoc"])
+def test_refused_document_is_never_resumed_and_its_page_is_closed(fake_cdp, supervise, href):
+    supervise(navigation_guard=_guard())
+    start = _gate_pause(fake_cdp, href)
+    closed = fake_cdp.wait_for(lambda c: c["method"] == "Target.closeTarget", start=start)
+    assert closed["params"] == {"targetId": "T1"}
+    answer = fake_cdp.calls[start:]
+    assert [c["params"]["expression"] for c in answer if c["method"] == "Debugger.evaluateOnCallFrame"] == ["location.href"]
+    assert "Debugger.resume" not in [c["method"] for c in answer]
+
+
+def test_allowed_document_is_released(fake_cdp, supervise):
+    supervise(navigation_guard=_guard())
+    start = _gate_pause(fake_cdp, "https://raphael.agentsbridge.net/")
+    fake_cdp.wait_for(lambda c: c["method"] == "Debugger.resume" and c.get("sessionId") == "S1", start=start)
+    answer = fake_cdp.calls[start:]
+    assert [c["params"]["expression"] for c in answer if c["method"] == "Debugger.evaluateOnCallFrame"] == [
+        "location.href", "hermesNavigationGate.allowed = true"]
+    assert "Target.closeTarget" not in [c["method"] for c in answer]
+
+
+@pytest.mark.parametrize("failure", ["policy", "evaluate"])
+def test_document_check_that_fails_closes_the_page(fake_cdp, supervise, monkeypatch, failure):
+    if failure == "policy":
+        def broken(*_args, **_kwargs):
+            raise RuntimeError("policy blew up")
+
+        monkeypatch.setattr(navguard, "design_url_refusal", broken)
+    else:
+        fake_cdp.errors.add(("Debugger.evaluateOnCallFrame", "S1"))
+    supervise(navigation_guard=_guard())
+    start = _gate_pause(fake_cdp, "https://raphael.agentsbridge.net/")
+    closed = fake_cdp.wait_for(lambda c: c["method"] == "Target.closeTarget", start=start)
+    assert closed["params"] == {"targetId": "T1"}
+    assert "Debugger.resume" not in [c["method"] for c in fake_cdp.calls[start:]]
+
+
+def test_pause_the_guard_did_not_cause_is_resumed(fake_cdp, supervise):
+    supervise(navigation_guard=_guard())
+    start = _gate_pause(fake_cdp, "data:text/html,x", function="pageCode")
+    fake_cdp.wait_for(lambda c: c["method"] == "Debugger.resume" and c.get("sessionId") == "S1", start=start)
+    assert not [c for c in fake_cdp.calls[start:] if c["method"] in ("Debugger.evaluateOnCallFrame", "Target.closeTarget")]
 
 
 def test_start_fails_when_the_guard_cannot_install(fake_cdp, supervise):
@@ -501,3 +678,78 @@ class TestRealChromium:
         time.sleep(1.5)
         assert not [u for u in asked if f":{_Site.ws_port}" in u]  # Fetch never paused the handshake
         assert not (before & page_ids())
+
+    @staticmethod
+    def _titles(chrome) -> list:
+        """Titles of every page Chromium has open."""
+        pages = chrome.replace("ws://", "http://").split("/devtools")[0] + "/json/list"
+        with urllib.request.urlopen(pages, timeout=5) as r:
+            return [t["title"] for t in json.load(r) if t["type"] == "page"]
+
+    def test_blob_document_is_refused_before_it_runs(self, guarded, site, asked, chrome):
+        base, seen, _ = site
+        self._navigate(guarded, base + "/ok")
+        # The marker is allowed, so only the document check can keep it from the server.
+        html = f"<title>refused-blob</title><script>fetch('{base}/ok-marker-blob')</script>"
+        guarded.evaluate_runtime(
+            f"location.href = URL.createObjectURL(new Blob([{json.dumps(html)}], {{type: 'text/html'}})); true")
+        time.sleep(1.5)
+        assert "refused-blob" not in self._titles(chrome)
+        assert "/ok-marker-blob" not in seen
+        blobs = [u for u in asked if str(u).startswith("blob:")]
+        assert blobs and all(navguard.design_url_refusal(u, None) for u in blobs)
+
+    def test_data_frame_is_refused_before_it_runs(self, guarded, site, asked, chrome):
+        base, seen, _ = site
+        self._navigate(guarded, base + "/ok")
+        src = f"data:text/html,<title>refused-data</title><script>fetch('{base}/ok-marker-data')</script>"
+        guarded.evaluate_runtime(
+            "const f = document.createElement('iframe'); f.onload = () => fetch('/ok-frame-loaded'); "
+            f"f.src = {json.dumps(src)}; document.body.appendChild(f); true")
+        time.sleep(1.5)
+        assert "refused-data" not in self._titles(chrome)
+        assert "/ok-marker-data" not in seen and "/ok-frame-loaded" not in seen  # nor did its parent see it load
+        frames = [u for u in asked if str(u).startswith("data:")]
+        assert frames and all(navguard.design_url_refusal(u, None) for u in frames)
+
+    def test_allowed_navigation_and_blank_frame_still_work(self, guarded, site):
+        base, seen, _ = site
+        self._navigate(guarded, base + "/ok")
+        self._navigate(guarded, base + "/ok-again")
+        assert guarded.evaluate_runtime("[location.href, document.title]")["result"] == [base + "/ok-again", "ok"]
+        blank = guarded.evaluate_runtime(
+            "new Promise(done => { const f = document.createElement('iframe'); f.onload = () => {"
+            " f.contentDocument.body.textContent = 'written'; done([f.contentWindow.location.href,"
+            " f.contentDocument.body.textContent]); }; f.src = 'about:blank'; document.body.appendChild(f); })")
+        assert blank["result"] == ["about:blank", "written"]
+
+    def test_permissions_are_denied_in_new_and_default_contexts(self, guarded, site, chrome):
+        from websockets.sync.client import connect
+
+        base, _, _ = site
+        query = ("Promise.all(['geolocation', 'notifications', 'clipboard-read', 'clipboard-write']"
+                 ".map(async name => (await navigator.permissions.query({name})).state))")
+        self._navigate(guarded, base + "/ok")
+        assert guarded.evaluate_runtime(query)["result"] == ["denied"] * 4
+        with connect(chrome, open_timeout=5, max_size=None) as ws:
+            ids = iter(range(1, 1000))
+
+            def call(method, params=None, session_id=None):
+                msg = {"id": next(ids), "method": method, "params": params or {}}
+                if session_id:
+                    msg["sessionId"] = session_id
+                ws.send(json.dumps(msg))
+                while True:
+                    reply = json.loads(ws.recv(timeout=10))
+                    if reply.get("id") == msg["id"]:
+                        assert "error" not in reply, reply
+                        return reply["result"]
+
+            context = call("Target.createBrowserContext", {"disposeOnDetach": True})["browserContextId"]
+            target = call("Target.createTarget", {"url": "about:blank", "browserContextId": context})["targetId"]
+            session = call("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
+            call("Page.navigate", {"url": base + "/ok-context"}, session)
+            time.sleep(1.0)
+            states = call("Runtime.evaluate", {"expression": query, "awaitPromise": True, "returnByValue": True},
+                          session)
+            assert states["result"]["value"] == ["denied"] * 4

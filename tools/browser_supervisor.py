@@ -762,9 +762,10 @@ class CDPSupervisor:
         self._page_session_id = attach["result"]["sessionId"]
         await self._cdp("Page.enable", session_id=self._page_session_id)
         await self._cdp("Runtime.enable", session_id=self._page_session_id)
+        # A navigation guard holds child targets at start until it has guarded them.
         await self._cdp(
             "Target.setAutoAttach",
-            {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
+            {"autoAttach": True, "waitForDebuggerOnStart": self.navigation_guard is not None, "flatten": True},
             session_id=self._page_session_id,
         )
         # Install the dialog bridge — overrides native alert/confirm/prompt with
@@ -1323,7 +1324,7 @@ class CDPSupervisor:
             await self._cdp("Runtime.enable", session_id=sid, timeout=3.0)
             await self._cdp(
                 "Target.setAutoAttach",
-                {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
+                {"autoAttach": True, "waitForDebuggerOnStart": self.navigation_guard is not None, "flatten": True},
                 session_id=sid,
                 timeout=3.0,
             )
