@@ -2041,6 +2041,7 @@ def _set_project_dispatch_state(
 
 OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY = "lifecycle_revision"
 OWNER_PROJECT_REMOVAL_STATE_CAPABILITY = "removal_state"
+OWNER_PROJECT_BOARD_COUNTS_CAPABILITY = "board_counts_v1"
 _OWNER_PROJECT_LIFECYCLE_ACTIONS = ("archive", "restore", "pause", "resume")
 _OWNER_PROJECT_REMOVAL_ACTIONS = ("start", "confirm_permanent", "cancel", "restore")
 
@@ -2126,9 +2127,12 @@ def _project_lifecycle_revision(
 
 def list_committed_projects(
     ctx: OwnerContext, *, lifecycle_revision: bool = False,
-    removal_state: bool = False,
+    removal_state: bool = False, board_counts: bool = False,
 ) -> list[dict]:
     """Read-only projection of projects proven by committed owner receipts.
+
+    ``board_counts`` adds each item's snapshot ``board.counts`` and
+    ``board.total``, or None for a Project whose board cannot be counted.
 
     Empty means EMPTY. An absent ``projects.db`` is the only state that
     projects as "there are no Projects yet"; a database that exists but cannot
@@ -2238,10 +2242,32 @@ def list_committed_projects(
                 projection["removal_state"] = _project_removal_state(
                     conn, project_id, row["board_slug"],
                 )
+            if board_counts:
+                projection["board_counts"] = _listed_board_counts(
+                    row["board_slug"], project_id,
+                )
             projects.append(projection)
         return projects
     finally:
         conn.close()
+
+
+def _listed_board_counts(board_slug: str, project_id: str) -> Optional[dict]:
+    """The snapshot's ``board.counts`` and ``board.total``, or None when uncountable."""
+    board_path = (
+        kanban_db.kanban_home() / "kanban.db"
+        if board_slug == kanban_db.DEFAULT_BOARD
+        else kanban_db.board_dir(board_slug) / "kanban.db"
+    )
+    try:
+        conn = _open_read_only_sqlite(board_path, label="kanban.db")
+        try:
+            counts, total = _owner_board_counts(conn, project_id)
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error, OwnerWorkspaceError):
+        return None
+    return {"counts": counts, "total": total}
 
 
 _OWNER_TASK_RECEIPT_OPERATIONS = (
@@ -3413,6 +3439,23 @@ def _deleted_project_snapshot(
     }
 
 
+def _owner_board_counts(
+    conn: sqlite3.Connection, project_id: str,
+) -> tuple[dict[str, int], int]:
+    """One Project's work-task counts per status, and their total."""
+    counts = {status: 0 for status in (*_OWNER_PROJECT_COLUMNS, "archived")}
+    for row in conn.execute(
+        "SELECT status, COUNT(*) AS n FROM tasks "
+        "WHERE project_id = ? AND task_kind = 'work' GROUP BY status",
+        (project_id,),
+    ):
+        status = str(row["status"])
+        if status not in counts:
+            raise OwnerWorkspaceError("snapshot_unavailable", "kanban.db contains an unknown status")
+        counts[status] = int(row["n"])
+    return counts, sum(counts[status] for status in _OWNER_PROJECT_COLUMNS)
+
+
 def read_project_snapshot(
     ctx: OwnerContext,
     project_slug: str,
@@ -3529,16 +3572,7 @@ def read_project_snapshot(
         task_ids = [task.id for task in tasks]
         visible = set(task_ids)
 
-        counts = {status: 0 for status in (*_OWNER_PROJECT_COLUMNS, "archived")}
-        for row in conn.execute(
-            "SELECT status, COUNT(*) AS n FROM tasks "
-            "WHERE project_id = ? AND task_kind = 'work' GROUP BY status",
-            (project_id,),
-        ):
-            status = str(row["status"])
-            if status not in counts:
-                raise OwnerWorkspaceError("snapshot_unavailable", "kanban.db contains an unknown status")
-            counts[status] = int(row["n"])
+        counts, total = _owner_board_counts(conn, project_id)
 
         event_state: dict[str, dict[str, int]] = {}
         if task_ids:
@@ -3762,7 +3796,7 @@ def read_project_snapshot(
             "name": owner_project_name(metadata.get("name") or project["name"]),
             "project_id": project_id,
             "counts": counts,
-            "total": sum(counts[status] for status in _OWNER_PROJECT_COLUMNS),
+            "total": total,
         },
         "columns": [{"name": status, "tasks": columns[status]} for status in _OWNER_PROJECT_COLUMNS],
         "workers": [{
