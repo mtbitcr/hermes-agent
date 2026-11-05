@@ -5,6 +5,10 @@ Documents that ``att.read()`` cannot fetch fall back to an aiohttp download in
 ``Content-Encoding: br`` through brotlicffi. A valid Brotli stream followed by
 extra bytes is malformed: the download must fail cleanly and be logged against
 the attachment, never hang and never be cached or injected as if it were whole.
+The same stream without the trailing bytes is the control: it must download.
+
+Without brotlicffi, aiohttp rejects every br body before decoding it, which
+would prove nothing, so these tests skip unless aiohttp selected brotlicffi.
 
 The server is an in-process aiohttp app on 127.0.0.1; the deadline is enforced
 with a worker thread so it holds whether or not pytest-timeout is installed.
@@ -19,10 +23,22 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import aiohttp
-from aiohttp import web
+import pytest
+from aiohttp import compression_utils, web
 
 from gateway.config import PlatformConfig
 from plugins.platforms.discord.adapter import DiscordAdapter
+
+# aiohttp decodes br with brotlicffi if importable, else google's Brotli; HAS_BROTLI is False with neither.
+_BR_DECODER = getattr(compression_utils, "brotli", None) if compression_utils.HAS_BROTLI else None
+
+pytestmark = pytest.mark.skipif(
+    getattr(_BR_DECODER, "__name__", None) != "brotlicffi",
+    reason=(
+        "aiohttp has no brotlicffi decoder for Content-Encoding: br (brotlicffi missing); "
+        "brotlicffi==1.2.1.0 comes from the messaging extra or the platform.discord on-demand install"
+    ),
+)
 
 # brotli.compress(b"hello from a discord attachment\n"): one complete Brotli stream.
 _BROTLI_STREAM = bytes.fromhex("1b1f00f88d54b5bf0a934b0510b21e449145b0919a0cf4123b2b99ed59")
@@ -74,6 +90,20 @@ def _run_with_deadline(body: bytes) -> tuple:
     return outcome["result"]
 
 
+def test_complete_brotli_body_downloads_and_injects_text(caplog):
+    caplog.set_level(logging.WARNING, logger="plugins.platforms.discord.adapter")
+
+    media_urls, media_types, injected_text = _run_with_deadline(_BROTLI_STREAM)
+
+    assert len(media_urls) == 1 and media_types == ["text/plain"], "valid br body was not cached as one document"
+    assert injected_text == "[Content of notes.txt]:\nhello from a discord attachment\n"
+    failures = [
+        record.getMessage() for record in caplog.records
+        if record.getMessage().startswith("[Discord] Failed to cache document")
+    ]
+    assert failures == []
+
+
 def test_brotli_body_with_trailing_bytes_is_a_recorded_download_failure(caplog):
     caplog.set_level(logging.WARNING, logger="plugins.platforms.discord.adapter")
 
@@ -90,4 +120,5 @@ def test_brotli_body_with_trailing_bytes_is_a_recorded_download_failure(caplog):
     failure = failures[0]
     assert failure.levelno == logging.WARNING
     assert "content-encoding" in failure.getMessage().lower()
-    assert failure.exc_info and isinstance(failure.exc_info[1], aiohttp.ClientError)
+    # A decode failure. A missing decoder fails earlier, as a ClientResponseError, and must not count.
+    assert failure.exc_info and isinstance(failure.exc_info[1], aiohttp.ClientPayloadError)
