@@ -3,10 +3,13 @@
 The merged runner (hermes_cli/release_runner.py) drives a `ReleaseHost`. Card 2's reader answers
 the guards' reads; this class takes the actions and runs the readbacks the runner adds on top.
 Every move is one process call whose exit status is checked: `systemctl --user` for the units,
-which only the user manager drives (S-E), and git for the checkout (S-H). Snapshots live under one
-release snapshot directory, state snapshots as state/NAME and configuration snapshots as
-config/NAME (S-C). A state snapshot copies the files that the full backup's own walk yields for the
-root home (hermes_cli/backup.py).
+which only the user manager drives (S-E), git for the checkout (S-H), and uv, from the Hermes
+home's bin folder, for the platform environment. Snapshots live under one release snapshot
+directory, state snapshots as state/NAME, configuration snapshots as config/NAME (S-C) and
+environment snapshots as env/NAME. A state snapshot copies the files that the full backup's own
+walk yields for the root home (hermes_cli/backup.py). The platform environment is a link to one
+real folder (D2): its snapshot copies that folder, the sync changes it in place through the link,
+and the restore moves the copy back into the same folder, so the link never changes.
 
 The actions raise when the host refuses them, so the runner's failure rule takes the host back.
 The readbacks answer False instead, as the runner's protocol asks.
@@ -20,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import encodings.idna  # noqa: F401  (K6: sockets load it at their first host name)
 import http.client
+import json
 import os
 import re
 import shutil
@@ -32,13 +36,16 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import psutil  # noqa: F401  (K6: gateway.status loads it to ask about a process)
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 import gateway.control_socket  # noqa: F401  (K6: update_receipt loads it to ask a gateway)
 import gateway.status  # noqa: F401  (K6: update_receipt loads it to read a gateway's record)
 import hermes_cli.build_info  # noqa: F401  (K6: update_receipt loads it for the code identity)
 from hermes_cli.backup import _SQLITE_HEADER, _iter_backup_files, _safe_copy_db
+from hermes_cli.managed_uv import resolve_uv
 from hermes_cli.profiles import _PROFILE_ID_RE
-from hermes_cli.release_runner import PLATFORM_UNITS
+from hermes_cli.release_runner import PLATFORM_UNITS, EnvironmentUnreadable
 from hermes_cli.sqlite_safe_read import has_live_connection, read_header_bytes_preopen
 from hermes_cli.update_receipt import collect_fleet_versions
 from hermes_constants import get_default_hermes_root, named_profile_is_deleted
@@ -48,7 +55,11 @@ READBACK_TIMEOUT_SECONDS = 10.0
 # S-D: the configuration files of every served home.
 CONFIG_FILES = ("config.yaml", ".env")
 # S-C: each kind of snapshot has its own directory under the snapshot root.
-STATE, CONFIG = "state", "config"
+STATE, CONFIG, ENVIRONMENT = "state", "config", "env"
+# D3: the extras the sync installs; the default groups never.
+SYNC_EXTRAS = ("all",)
+SYNC_TIMEOUT_SECONDS = 900
+ENVIRONMENT_READ_TIMEOUT_SECONDS = 60
 
 _FULL_SHA = re.compile(r"[0-9a-f]{40}")
 _SNAPSHOT_NAME = re.compile(r"[0-9A-Za-z][0-9A-Za-z._-]*")
@@ -93,7 +104,8 @@ class ReleaseHostActions:
     """The actions and readbacks of `ReleaseHost` on the live host, from explicit settings (S-E).
 
     `units` maps the roles gateway, serve and sandbox-tunnel to unit names. A role without a unit
-    name is never driven and reads back False, as does an empty address.
+    name is never driven and reads back False, as does an empty address. `venv_dir` is the
+    platform environment's link, and `extras` the extras its sync installs.
     """
 
     def __init__(
@@ -105,6 +117,8 @@ class ReleaseHostActions:
         snapshot_root: str | Path,
         health_url: str,
         workspace_container: str,
+        venv_dir: str | Path | None = None,
+        extras: Sequence[str] = SYNC_EXTRAS,
     ) -> None:
         self.checkout_path = Path(checkout)  # `checkout` is the move below
         self.root_home = Path(root_home)
@@ -112,8 +126,12 @@ class ReleaseHostActions:
         self.snapshot_root = Path(snapshot_root)
         self.health_url = health_url
         self.workspace_container = workspace_container
+        self.venv_dir = None if venv_dir is None else Path(venv_dir)
+        self.extras = tuple(extras)
         # The configuration snapshot this release saved: the one the restore puts back.
         self.config_snapshot = ""
+        # The environment snapshot this release took: the one its restore moves back.
+        self.environment_snapshot = ""
 
     # Units, only through the user manager.
 
@@ -253,6 +271,142 @@ class ReleaseHostActions:
             if self.root_home / rel not in kept:
                 (self.root_home / rel).unlink(missing_ok=True)  # created after the save
 
+    # The platform environment (D2, D3).
+
+    def sync_environment(self) -> None:
+        """Sync the checkout's lock file into the environment, in place in the real folder the
+        link names, through that environment's own interpreter.
+
+        Frozen, so the lock file is used as it is and never resolved again; inexact, so packages
+        installed on demand stay; the extras set, and no default groups. The locked dependencies
+        only: the project itself is never built or installed again, because the platform's
+        setup.py refuses a wheel build, and its installed copy keeps its current install mode,
+        never editable. uv is the one in the Hermes home's bin folder, whatever PATH holds;
+        without it the sync raises before any call.
+        """
+        uv, real = self._uv(), self._environment()
+        extras = [argument for extra in self.extras for argument in ("--extra", extra)]
+        _run(
+            [uv, "sync", "--frozen", "--inexact", "--no-default-groups", "--no-editable",
+             "--no-install-project", *extras,
+             "--project", str(self.checkout_path), "--python", str(real / "bin" / "python")],
+            env={**os.environ, "UV_PROJECT_ENVIRONMENT": str(real)},
+            timeout=SYNC_TIMEOUT_SECONDS,
+        )
+
+    def environment_matches_lock(self) -> bool:
+        """Every package the checkout's lock file names for this host, with the extras and no
+        default groups, is installed at its locked version. A package outside the lock, such as
+        one installed on demand, may stay. A comparison that cannot be read reads False."""
+        try:
+            return not self.environment_differences()
+        except EnvironmentUnreadable:
+            return False
+
+    def environment_differences(self) -> tuple[str, ...]:
+        """Each package the checkout's lock file names for this host, with the extras and no
+        default groups, that is not installed at its locked version, by normalised name and in
+        name order: "NAME expected LOCKED, installed VERSION", or "NAME expected LOCKED, missing".
+        A package outside the lock, such as one installed on demand, is no difference. Both lists
+        are read through uv, so nothing is imported. A comparison that cannot be read raises
+        EnvironmentUnreadable with a short reason that names no path, address or setting."""
+        try:
+            uv = self._uv()
+        except FileNotFoundError:
+            raise EnvironmentUnreadable("uv is not in the Hermes home's bin folder") from None
+        try:
+            real = self._environment()
+        except (OSError, RuntimeError, ValueError):
+            raise EnvironmentUnreadable("the platform environment is not found") from None
+        extras = [argument for extra in self.extras for argument in ("--extra", extra)]
+        locked = _locked_here(_read(
+            "the lock export",
+            [uv, "export", "--frozen", "--format", "requirements.txt", "--no-hashes",
+             "--no-header", "--no-annotate", "--no-emit-project", "--no-default-groups",
+             *extras, "--project", str(self.checkout_path)],
+        ))
+        listed = _read(
+            "the installed list",
+            [uv, "pip", "list", "--python", str(real / "bin" / "python"), "--format", "json"],
+        )
+        try:
+            installed = {_package(entry["name"]): entry["version"] for entry in json.loads(listed)}
+            versions = {name: Version(installed[name]) for name in locked if name in installed}
+        except (ValueError, KeyError, TypeError):
+            raise EnvironmentUnreadable("the installed list could not be read") from None
+        return tuple(
+            f"{name} expected {version}, "
+            + (f"installed {versions[name]}" if name in versions else "missing")
+            for name, version in sorted(locked.items())
+            if versions.get(name) != version
+        )
+
+    def take_environment_snapshot(self, name: str) -> None:
+        """Copy the real folder the environment's link names, all of it, into env/NAME.
+
+        Taken with the platform units stopped, like the state snapshot, and refused before
+        anything is copied while the user manager answers active for one of them.
+        """
+        for role in PLATFORM_UNITS:
+            if self.unit_active(role):
+                raise RuntimeError(f"the {role} unit is active: the environment snapshot is refused")
+        real = self._environment()
+        self._write_snapshot(ENVIRONMENT, name, lambda staging: _copy_environment(real, staging), replace=False)
+        self.environment_snapshot = name
+
+    def restore_environment(self) -> None:
+        """Move the environment snapshot this release took back into the same real folder.
+
+        With no snapshot taken, the release never synced, and nothing changes. The live folder is
+        set aside beside itself and removed once the copy is in place; when the move fails, it
+        comes back. The link is never touched. The copy is then taken again from the folder, so
+        a later move back, as in tier 2, still has its way back.
+        """
+        if not self.environment_snapshot:
+            return
+        for role in PLATFORM_UNITS:
+            if self.unit_active(role):
+                raise RuntimeError(f"the {role} unit is active: the environment restore is refused")
+        name = self.environment_snapshot
+        saved = self._named(ENVIRONMENT, name)
+        if not saved.is_dir():
+            raise FileNotFoundError(f"the environment snapshot {name} is gone")
+        if self.venv_dir is None:
+            raise ValueError("release.venv_dir names no platform environment")
+        real = self.venv_dir.resolve()  # the link's own target, even when the folder is gone
+        aside = real.with_name(f".{real.name}.release-aside")
+        shutil.rmtree(aside, ignore_errors=True)
+        if os.path.lexists(real):
+            os.replace(real, aside)
+        try:
+            shutil.move(saved, real)
+        except BaseException:
+            shutil.rmtree(real, ignore_errors=True)
+            if os.path.lexists(aside):
+                os.replace(aside, real)
+            raise
+        shutil.rmtree(aside, ignore_errors=True)
+        self._write_snapshot(ENVIRONMENT, name, lambda staging: _copy_environment(real, staging), replace=True)
+
+    def delete_environment_snapshot(self, name: str) -> None:
+        with contextlib.suppress(FileNotFoundError):
+            shutil.rmtree(self._named(ENVIRONMENT, name))
+
+    def _environment(self) -> Path:
+        """The real folder the venv_dir link names. Raises when it holds no environment."""
+        if self.venv_dir is None:
+            raise ValueError("release.venv_dir names no platform environment")
+        real = self.venv_dir.resolve(strict=True)
+        if not (real / "pyvenv.cfg").is_file():
+            raise FileNotFoundError(f"{real} holds no environment")
+        return real
+
+    def _uv(self) -> str:
+        uv = resolve_uv()
+        if uv is None:
+            raise FileNotFoundError("uv is not in the Hermes home's bin folder")
+        return uv
+
     def _write_snapshot(
         self, kind: str, name: str, fill: Callable[[Path], None], *, replace: bool
     ) -> None:
@@ -364,6 +518,17 @@ def _run(argv: list[str], **options) -> subprocess.CompletedProcess[str]:
     return done
 
 
+def _read(what: str, argv: list[str]) -> str:
+    """What one uv read of the environment's comparison prints. A read that fails raises
+    EnvironmentUnreadable naming only what was read, as a failed process's error names paths."""
+    try:
+        return _run(argv, timeout=ENVIRONMENT_READ_TIMEOUT_SECONDS).stdout
+    except subprocess.TimeoutExpired:
+        raise EnvironmentUnreadable(f"{what} timed out") from None
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        raise EnvironmentUnreadable(f"{what} failed") from None
+
+
 def _full_sha(commit: str) -> str:
     """Only a full commit name moves the host: a short or symbolic one could name another."""
     if not _FULL_SHA.fullmatch(commit):
@@ -386,6 +551,39 @@ def _starts_with_header(path: Path) -> bool | None:
         return True
     head = read_header_bytes_preopen(path, length=len(_SQLITE_HEADER))
     return None if head is None else head == _SQLITE_HEADER
+
+
+def _copy_environment(real: Path, staging: Path) -> None:
+    """Copy the environment's real folder as it is: every file with its mode, every link as a
+    link, so its interpreter link still names the same interpreter."""
+    shutil.copytree(real, staging, symlinks=True, dirs_exist_ok=True)
+
+
+def _package(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _locked_here(exported: str) -> dict[str, Version]:
+    """The packages a lock export pins for this host, by normalised name. A package whose marker
+    does not hold here, such as one for another platform, is left out. An export that cannot be
+    read raises EnvironmentUnreadable, naming at most the package, never the line itself."""
+    locked = {}
+    for line in exported.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", "-")):
+            continue
+        try:
+            requirement = Requirement(line)
+            if requirement.marker is not None and not requirement.marker.evaluate():
+                continue
+            pins = list(requirement.specifier)  # an export pins each package with one ==
+            name = _package(requirement.name)
+            if len(pins) != 1 or pins[0].operator != "==":
+                raise EnvironmentUnreadable(f"the lock export does not pin {name} with one ==")
+            locked[name] = Version(pins[0].version)
+        except ValueError:
+            raise EnvironmentUnreadable("the lock export could not be read") from None
+    return locked
 
 
 def _copied(source: Path, copy: Path) -> bool:

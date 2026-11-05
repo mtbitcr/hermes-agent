@@ -5,6 +5,7 @@
 - the code identity each live gateway stamps, for G6;
 - systemd unit properties through the user manager, free disk, and the state snapshots' names
   and sizes;
+- whether the platform environment can be synced, and the full size of its real folder;
 - the open runs on every board;
 - digests of the configuration set (S-D), live and in the named configuration snapshot (S-C).
 
@@ -49,6 +50,7 @@ from hermes_cli.kanban_db import (
     kanban_home,
     list_boards,
 )
+from hermes_cli.managed_uv import resolve_uv
 from hermes_cli.profiles import profiles_to_serve
 from hermes_cli.release_guards import OpenRun
 from hermes_cli.update_receipt import collect_fleet_versions
@@ -132,7 +134,9 @@ class LiveHostReader:
 
     The keywords are the ones S-E names, plus `snapshot_name`: the NAME of S-C, which is NEW,
     the merged `Pins.snapshot`. `named_config_snapshot` takes no argument, so the reader has to
-    be told which configuration snapshot is the named one.
+    be told which configuration snapshot is the named one. `venv_dir` is the platform
+    environment: a link to the one real folder the release copies and syncs, or None when no
+    environment is set.
     """
 
     def __init__(
@@ -143,12 +147,14 @@ class LiveHostReader:
         units: Mapping[str, str],
         snapshot_root: Path,
         snapshot_name: str,
+        venv_dir: Path | None = None,
     ) -> None:
         self.checkout = Path(checkout)
         self.root_home = Path(root_home)
         self.units = dict(units)
         self.snapshot_root = Path(snapshot_root)
         self.snapshot_name = snapshot_name
+        self.venv_dir = None if venv_dir is None else Path(venv_dir)
 
     # The checkout and its history.
 
@@ -247,17 +253,35 @@ class LiveHostReader:
         return [entry.name for entry in entries]
 
     def snapshot_bytes(self, name: str) -> int:
-        # Only regular files count. Every path, the snapshot's own included, is read with lstat, so
-        # no link is followed, whether it points to a file or to a directory.
-        total, paths = 0, [self.snapshot_root / "state" / name]  # S-C
-        while paths:
-            path = paths.pop()
-            info = path.lstat()
-            if stat.S_ISDIR(info.st_mode):
-                paths.extend(path.iterdir())
-            elif stat.S_ISREG(info.st_mode):
-                total += info.st_size
-        return total
+        return _regular_bytes(self.snapshot_root / "state" / name)  # S-C
+
+    # The platform environment.
+
+    def environment_sync_available(self) -> bool:
+        # G5: the sync runs uv from the Hermes home's bin folder, where the release service finds
+        # it whatever its PATH, into the environment release.venv_dir names.
+        return resolve_uv() is not None and self._environment() is not None
+
+    def environment_snapshot_bytes(self) -> int | None:
+        # G8: the release copies the whole real folder the link names, so all of it counts. A
+        # folder that is not found, or not read to the end, gives None, and G8 fails closed.
+        real = self._environment()
+        if real is None:
+            return None
+        try:
+            return _regular_bytes(real)
+        except OSError:
+            return None
+
+    def _environment(self) -> Path | None:
+        """The real folder the venv_dir link names, when it holds an environment."""
+        if self.venv_dir is None:
+            return None
+        try:
+            real = self.venv_dir.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return None
+        return real if (real / "pyvenv.cfg").is_file() else None
 
     # Runs.
 
@@ -340,6 +364,20 @@ def _run(
 def _wait(seconds: float) -> None:
     """Every wait between two reads of origin main goes through here, so a test can replace it."""
     time.sleep(seconds)
+
+
+def _regular_bytes(root: Path) -> int:
+    # Only regular files count. Every path, the root's own included, is read with lstat, so no
+    # link is followed, whether it points to a file or to a directory.
+    total, paths = 0, [root]
+    while paths:
+        path = paths.pop()
+        info = path.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            paths.extend(path.iterdir())
+        elif stat.S_ISREG(info.st_mode):
+            total += info.st_size
+    return total
 
 
 def _digests(files: Mapping[str, Path]) -> dict[str, str]:

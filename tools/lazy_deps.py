@@ -122,7 +122,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # br" — see #12511 / #15744.
     "platform.discord": (
         "discord.py[voice]==2.7.1",
-        "brotlicffi==1.2.0.2",
+        "brotlicffi==1.2.1.0",
         "aiohttp==3.14.3",
     ),
     "platform.slack": (
@@ -182,7 +182,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # Vision image-resize recovery (Pillow). Pillow is now a CORE dependency (pyproject `dependencies`), so
     # this entry is a belt-and-suspenders fallback for stripped/source-build installs that somehow dropped
     # it. See #40490.
-    "tool.vision": ("Pillow==12.3.0",),
+    "tool.vision": ("Pillow==13.0.0",),
     "tool.doc_extract": ("firecrawl-anydoc==0.2.4",),  # imports as `anydoc`; lockstep with pyproject
     # MCP client SDK for the cua-driver, so computer_use never dead-ends on `No module named 'mcp'`.
     "tool.computer_use": (

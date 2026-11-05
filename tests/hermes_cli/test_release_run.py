@@ -57,6 +57,7 @@ ANSWERS = {
     "first_parent_chain": [NEW], "commit_parents": (PREV, FEATURE), "commit_tree": TREE,
     "checkout_root": CHECKOUT, "venv_import_root": CHECKOUT, "free_disk_bytes": 5 * 1024**3,
     "live_config": CONFIG, "named_config_snapshot": CONFIG, "snapshots": [],
+    "environment_differences": (),
 }
 
 
@@ -166,6 +167,13 @@ class Boundary:
     moves: list[str] = field(default_factory=list)
 
     def run(self, argv, **options):
+        if argv[0] == str(self.root / "bin" / "uv"):  # the sync, then both lists, all as locked
+            if argv[1] == "sync":
+                self.moves.append(f"sync {self.head}")
+            return self._done({
+                "sync": "", "export": "pyyaml==6.0.3\n",
+                "pip": json.dumps([{"name": "PyYAML", "version": "6.0.3"}]),
+            }[argv[1]])
         if argv[0] == sys.executable:  # the board reader's child: no board has an open run
             return self._done(json.dumps([[] for _path in argv[6:]]))
         if argv[0] == "systemctl":
@@ -226,8 +234,22 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home.mkdir()
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
-    (home / "config.yaml").write_text(yaml.safe_dump({"release": SETTINGS}))
+    settings = {**SETTINGS, "venv_dir": str(_platform_environment(tmp_path, home))}
+    (home / "config.yaml").write_text(yaml.safe_dump({"release": settings}))
     return home
+
+
+def _platform_environment(top: Path, home: Path) -> Path:
+    """The platform environment as on the release host, a link to one real folder, and a uv in
+    the Hermes home's bin folder, where the release finds it. Only Boundary answers its calls."""
+    real = top / "environments" / "hermes-env"
+    (real / "bin").mkdir(parents=True)
+    (real / "pyvenv.cfg").write_text("version_info = 3.11.15\n")
+    (home / "bin").mkdir()
+    (home / "bin" / "uv").write_text("#!/bin/sh\nexit 1\n")
+    (home / "bin" / "uv").chmod(0o755)
+    os.symlink(real, top / "venv")
+    return top / "venv"
 
 
 class Sent(list):
@@ -919,6 +941,8 @@ def test_nothing_is_imported_after_the_units_stop(root, monkeypatch):
     assert args.func(args) == 0
     assert boundary.head == NEW and boundary.modules_at_stop is not None
     assert set(sys.modules) - boundary.modules_at_stop == set()
+    # The sync ran after the units stopped, so it imported nothing either.
+    assert f"sync {NEW}" in boundary.moves
 
 
 def test_run_is_registered(monkeypatch):
@@ -1547,3 +1571,71 @@ def test_the_journeys_start_imports_nothing_after_the_units_stop(root, monkeypat
     assert len(starts) == (case != "invalid file")
     assert boundary.head == NEW and boundary.modules_at_stop is not None
     assert set(sys.modules) - boundary.modules_at_stop == set()
+
+
+HELD = (
+    "R1 held, R2 held, R3 held, R4 held, R5 held, R6 held, fleet version held,"
+    " configuration held, environment held"
+)
+
+
+def _readbacks(out: str) -> list[str]:
+    """The lines a run printed for its readbacks, in order."""
+    return [line for line in out.splitlines() if line.startswith("Readback ")]
+
+
+def test_a_tier_2_release_prints_each_readback_with_its_environment_check(
+    root, monkeypatch, capsys
+):
+    batch_id = _accepted(0, 2)["batch_id"]
+
+    assert _run(monkeypatch, FakeHost()) == 0
+
+    out = capsys.readouterr().out
+    # One line after every move, forward, back and forward, and after the last start: each
+    # names the version it expected and shows the environment held.
+    assert _readbacks(out) == [
+        f"Readback 1 of 4, expecting {NEW}: held ({HELD}).",
+        f"Readback 2 of 4, expecting {PREV}: held ({HELD}).",
+        f"Readback 3 of 4, expecting {NEW}: held ({HELD}).",
+        f"Readback 4 of 4, expecting {NEW}: held ({HELD}).",
+    ]
+    assert out.endswith(f"Batch {batch_id} was released.\n")
+
+
+@dataclass
+class UnansweredHost(FakeHost):
+    """FakeHost whose Workspace read raises on NEW, its message naming the health address."""
+
+    def workspace_reads_ok(self):
+        if self.head == NEW:
+            raise ConnectionError(f"{SETTINGS['health_url']} did not answer")
+        return True
+
+
+def test_a_restored_release_prints_its_last_readback_expecting_prev(root, monkeypatch, capsys):
+    batch_id = _accepted(1)["batch_id"]
+
+    assert _run(monkeypatch, UnansweredHost()) == 1
+
+    out = capsys.readouterr().out
+    # The read that raised shows only its type; its message, with the address, is not printed.
+    failed = HELD.replace("R6 held", "R6 failed with ConnectionError")
+    assert _readbacks(out) == [
+        f"Readback 1 of 2, expecting {NEW}: failed ({failed}).",
+        f"Readback 2 of 2, expecting {PREV}: held ({HELD}).",
+    ]
+    assert SETTINGS["health_url"] not in "\n".join(_readbacks(out))
+    assert out.splitlines()[-1].startswith(f"Batch {batch_id} was rolled back")
+
+
+def test_a_release_its_fresh_guards_refuse_prints_no_readback(root, monkeypatch, capsys):
+    _accepted(1)
+    host = FakeHost()
+    host.at = {("runner", 1): lambda: setattr(host, "origin", PREV)}  # G2 fails when asked again
+
+    assert _run(monkeypatch, host) == 1
+
+    out = capsys.readouterr().out
+    assert "Refused: release guard G2 failed when asked again before the stop." in out.splitlines()
+    assert _readbacks(out) == []

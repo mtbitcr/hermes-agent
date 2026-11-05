@@ -21,10 +21,17 @@ NEW = "second-merge-sha"
 LATER = "later-merge-sha"
 CHECKOUT = "/srv/hermes/checkout"
 ALL_GUARDS = [f"G{number}" for number in range(1, 12)]
+G5_RULE = (
+    "the lock file and the project manifest are unchanged, or the release can sync the"
+    " environment: lock or manifest changes need the environment sync, which needs uv in the"
+    " Hermes home's bin folder and release.venv_dir naming an existing environment"
+)
 G8_RULE = (
-    "the free disk space, plus the size of every state snapshot except the newest, is at least"
-    " the size of the newest state snapshot plus 4 GiB; with no state snapshot, at least 4 GiB"
-    " of disk are free"
+    "the release can sync the platform environment, as every release does: uv is in the Hermes"
+    " home's bin folder and release.venv_dir names an existing environment; and the free disk"
+    " space, plus the size of every state snapshot except the newest, is at least the size of the"
+    " newest state snapshot plus the full size of the environment, which the release copies, plus"
+    " 4 GiB; with no state snapshot, the newest counts as 0 bytes"
 )
 
 PINS = Pins(new=NEW, prev=PREV)
@@ -85,6 +92,11 @@ class FakeHost:
         default_factory=lambda: [OpenRun("crashed-run", worker_alive=False)]
     )
     config: dict[str, str] = field(default_factory=lambda: {"config.yaml": "digest-1"})
+    # The release can sync the environment: uv is found and release.venv_dir names one.
+    sync_available: bool = True
+    # The full size of the platform environment, the copy the release takes; None when no
+    # environment is found.
+    environment_size: int | None = 0
     writes: list[tuple] = field(default_factory=list)
 
     def checkout_head(self):
@@ -141,6 +153,18 @@ class FakeHost:
     def named_config_snapshot(self):
         return {"config.yaml": "digest-1"}
 
+    def environment_sync_available(self):
+        return self.sync_available
+
+    def environment_snapshot_bytes(self):
+        return self.environment_size
+
+    def environment_matches_lock(self):
+        return True
+
+    def environment_differences(self):
+        return ()
+
     # Neither prepare mode nor a refused release may reach any of these.
     def stop_units(self, units):
         self.writes.append(("stop_units", units))
@@ -159,6 +183,18 @@ class FakeHost:
 
     def delete_snapshot(self, name):
         self.writes.append(("delete_snapshot", name))
+
+    def sync_environment(self):
+        self.writes.append(("sync_environment",))
+
+    def take_environment_snapshot(self, name):
+        self.writes.append(("take_environment_snapshot", name))
+
+    def restore_environment(self):
+        self.writes.append(("restore_environment",))
+
+    def delete_environment_snapshot(self, name):
+        self.writes.append(("delete_environment_snapshot", name))
 
 
 def refusal(guard, case_id, merges=MERGES, **host_setup):
@@ -225,6 +261,96 @@ def test_g8_asks_for_the_newest_snapshot_plus_4_gib(snapshot_dirs, holds):
 
 
 @pytest.mark.parametrize(
+    ("changed", "sync_available"),
+    [
+        pytest.param({"hermes_cli/main.py", "uv.lock"}, True, id="lock-file-changed"),
+        pytest.param({"hermes_cli/main.py", "pyproject.toml"}, True, id="project-manifest-changed"),
+        pytest.param({"hermes_cli/main.py"}, True, id="code-only"),
+    ],
+)
+def test_g5_allows_lock_change_when_sync_available(changed, sync_available):
+    host = FakeHost(changed=changed, sync_available=sync_available)
+
+    results = prepare(host, PINS, MERGES)
+
+    assert [(result.guard, result.ok) for result in results] == [
+        (guard, True) for guard in ALL_GUARDS
+    ]
+    assert host.writes == []
+
+
+@pytest.mark.parametrize("changed", ["uv.lock", "pyproject.toml"])
+def test_g5_refuses_lock_change_without_sync(changed):
+    host = FakeHost(changed={"hermes_cli/main.py", changed}, sync_available=False)
+
+    [g5] = [result for result in prepare(host, PINS, MERGES) if result.guard == "G5"]
+    release = run_release(host, PINS, 2, MERGES)
+
+    # The refusal says why: a lock or manifest change needs the environment sync.
+    assert (g5.rule, g5.ok) == (G5_RULE, False)
+    assert (release.outcome, release.steps) == ("refused", ("guards",))
+    assert host.writes == []
+
+
+@pytest.mark.parametrize(
+    ("environment_size", "holds"),
+    [
+        # 5 GiB free and no state snapshot: the environment copy fits with exactly 4 GiB to spare.
+        pytest.param(GiB, True, id="copy-leaves-4-gib"),
+        pytest.param(GiB + 1, False, id="copy-leaves-less-than-4-gib"),
+        # An environment that cannot be found cannot be counted, so G8 does not hold.
+        pytest.param(None, False, id="no-environment"),
+    ],
+)
+def test_g8_counts_environment_snapshot(environment_size, holds):
+    host = FakeHost(free_bytes=5 * GiB, snapshot_dirs=[], environment_size=environment_size)
+
+    [g8] = [result for result in prepare(host, PINS, MERGES) if result.guard == "G8"]
+
+    assert (g8.rule, g8.ok) == (G8_RULE, holds)
+
+
+@pytest.mark.parametrize(
+    ("sync_available", "environment_size", "holds"),
+    [
+        pytest.param(True, GiB, True, id="sync-available"),
+        # uv is not in the Hermes home's bin folder: the environment is found, but cannot be synced.
+        pytest.param(False, GiB, False, id="no-uv"),
+        # release.venv_dir names no environment: there is nothing to sync, and nothing to copy.
+        pytest.param(False, None, False, id="no-environment"),
+    ],
+)
+def test_g8_asks_for_the_sync_with_the_lock_file_and_the_manifest_unchanged(
+    sync_available, environment_size, holds
+):
+    # Every release syncs the environment, so G8 asks for the sync even when nothing in the lock
+    # file or the manifest changed, and G5 holds.
+    host = FakeHost(
+        changed={"hermes_cli/main.py"}, free_bytes=5 * GiB, snapshot_dirs=[],
+        sync_available=sync_available, environment_size=environment_size,
+    )
+
+    results = prepare(host, PINS, MERGES)
+
+    assert [result.guard for result in results if not result.ok] == ([] if holds else ["G8"])
+    assert [(result.rule, result.ok) for result in results if result.guard == "G8"] == [
+        (G8_RULE, holds)
+    ]
+    assert host.writes == []
+
+
+@pytest.mark.parametrize("environment_size", [GiB, None], ids=["no-uv", "no-environment"])
+def test_the_fresh_guards_refuse_a_release_that_cannot_sync_before_the_first_stop(environment_size):
+    host = FakeHost(sync_available=False, environment_size=environment_size)
+
+    release = run_release(host, PINS, 2, MERGES)
+
+    assert [result.guard for result in release.guards if not result.ok] == ["G8"]
+    assert (release.outcome, release.steps) == ("refused", ("guards",))
+    assert host.writes == []
+
+
+@pytest.mark.parametrize(
     ("guard", "merges", "host_setup"),
     [
         refusal("G1", "G1-checkout-not-at-prev", head="other-sha"),
@@ -281,10 +407,8 @@ def test_g8_asks_for_the_newest_snapshot_plus_4_gib(snapshot_dirs, holds):
             parents={FIRST_MERGE: (PREV, "feature-a-sha"), NEW: (FIRST_MERGE,)},
         ),
         refusal("G4", "G4-prev-not-ancestor-of-new", prev_is_ancestor=False),
-        refusal("G5", "G5-lock-file-changed", changed={"hermes_cli/main.py", "uv.lock"}),
-        refusal(
-            "G5", "G5-project-manifest-changed", changed={"hermes_cli/main.py", "pyproject.toml"}
-        ),
+        # G5 never refuses alone: without the sync it needs, G8 refuses too, as for every
+        # release; test_g5_refuses_lock_change_without_sync covers it.
         refusal("G6", "G6-venv-imports-another-checkout", venv_root="/srv/hermes/old-checkout"),
         refusal(
             "G7",

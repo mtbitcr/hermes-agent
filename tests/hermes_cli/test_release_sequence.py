@@ -25,6 +25,12 @@ PINS = Pins(new=NEW, prev=PREV)
 MERGES = (
     RecordedMerge(NEW, reviewed_base=PREV, reviewed_head="feature-sha", reviewed_tree="new-tree"),
 )
+# A code-only release: both versions lock the same packages. A test that raises a version gives
+# each version its own lock (RAISED_LOCKS).
+LOCK = {"pillow": "12.3.0", "certifi": "2026.5.20"}
+RAISED_LOCKS = {PREV: LOCK, NEW: {"pillow": "13.0.0", "certifi": "2026.10.18"}}
+# Installed on demand, outside the lock: an inexact sync keeps them.
+ON_DEMAND = {"discord-py": "2.7.1", "python-telegram-bot": "22.8"}
 FORWARD_ONLY = ("guards", "stop", "snapshot", "forward", "readback", "start", "readback")
 RESTORE_AFTER_FORWARD = (
     "guards", "stop", "snapshot", "forward", "readback", "restore", "readback",
@@ -38,6 +44,13 @@ class FakeHost:
     Each switch breaks one thing; a set switch breaks it only for the versions it holds.
     `config_drifts_on_start` makes a start rewrite the configuration, as a migration or startup
     drift would, so a test can tell whether a readback compared it with the named snapshot.
+
+    The environment holds `installed`, and each version's checkout locks `locks[version]`. A sync
+    installs the checked-out lock and keeps every other package, as a frozen inexact sync does.
+    `sync_fails` makes the sync of those versions change the environment, then fail;
+    `sync_mismatches` makes it leave one package off its locked version, and
+    `environment_unreadable` makes the comparison of those versions unreadable. `calls` notes the
+    moves and the environment's reads in order.
     """
 
     head: str = PREV
@@ -59,6 +72,19 @@ class FakeHost:
     health_exits: set[str] = field(default_factory=set)
     workspace_ok: bool = True
     modules_at_stop: set[str] | None = None
+    locks: dict[str, dict[str, str]] = field(default_factory=lambda: {PREV: LOCK, NEW: LOCK})
+    installed: dict[str, str] = field(default_factory=lambda: {**LOCK, **ON_DEMAND})
+    environment_snapshots: dict[str, dict[str, str]] = field(
+        default_factory=lambda: {"release-1": {**LOCK, **ON_DEMAND}}
+    )
+    # The environment snapshot this release took: the one its restore moves back.
+    environment_snapshot: str | None = None
+    sync_fails: set[str] = field(default_factory=set)
+    sync_mismatches: set[str] = field(default_factory=set)
+    environment_unreadable: set[str] = field(default_factory=set)
+    environment_restore_fails: bool = False
+    started_on: list[str] = field(default_factory=list)
+    calls: list[str] = field(default_factory=list)
 
     def checkout_head(self):
         return self.head
@@ -103,6 +129,12 @@ class FakeHost:
     def snapshot_bytes(self, name):
         return 0
 
+    def environment_sync_available(self):
+        return True
+
+    def environment_snapshot_bytes(self):
+        return 0
+
     def open_native_runs(self):
         return []
 
@@ -129,6 +161,7 @@ class FakeHost:
         return self.running or ""
 
     def stop_units(self, units):
+        self.calls.append("stop")
         if self.running in self.will_not_stop:
             raise RuntimeError(f"units did not stop on {self.running}")
         if self.modules_at_stop is None:
@@ -137,21 +170,63 @@ class FakeHost:
         self.running = None
 
     def start_units(self, units):
+        self.calls.append("start")
         if self.head in self.will_not_start:
             raise RuntimeError(f"units failed to start on {self.head}")
         self.active |= set(units)
         # Starting units that never stopped changes nothing; they keep running what they ran.
         if self.running is None:
             self.running = self.head
+            self.started_on.append(self.head)
             if self.head in self.config_drifts_on_start:
                 self.config = dict(DRIFTED_CONFIG)
 
     def checkout(self, commit):
+        self.calls.append(f"checkout {commit}")
         if commit in self.checkout_interrupted:
             raise KeyboardInterrupt(f"checkout of {commit} interrupted")
         if commit in self.checkout_fails:
             raise OSError(f"checkout of {commit} failed")
         self.head = commit
+
+    def sync_environment(self):
+        self.calls.append(f"sync {self.head}")
+        self.installed.update(self.locks[self.head])
+        if self.head in self.sync_fails:
+            raise RuntimeError(f"uv sync exited 2 on {self.head}")
+        if self.head in self.sync_mismatches:
+            self.installed["pillow"] = "0.0.0"
+
+    def environment_differences(self):
+        self.calls.append(f"environment check {self.head}")
+        if self.head in self.environment_unreadable:
+            raise release_runner.EnvironmentUnreadable("the installed list timed out")
+        return tuple(
+            f"{name} expected {version}, "
+            + (f"installed {self.installed[name]}" if name in self.installed else "missing")
+            for name, version in sorted(self.locks[self.head].items())
+            if self.installed.get(name) != version
+        )
+
+    def environment_matches_lock(self):
+        try:
+            return not self.environment_differences()
+        except release_runner.EnvironmentUnreadable:
+            return False
+
+    def take_environment_snapshot(self, name):
+        self.environment_snapshots[name] = dict(self.installed)
+        self.environment_snapshot = name
+
+    def restore_environment(self):
+        self.calls.append("restore environment")
+        if self.environment_restore_fails:
+            raise OSError("the environment snapshot could not be moved back")
+        if self.environment_snapshot is not None:  # none taken: the environment never changed
+            self.installed = dict(self.environment_snapshots[self.environment_snapshot])
+
+    def delete_environment_snapshot(self, name):
+        self.environment_snapshots.pop(name, None)
 
     def restore_config(self):
         if self.restore_config_fails:
@@ -498,3 +573,147 @@ def test_a_release_keeps_only_its_own_snapshot():
     assert result.outcome == "released"
     assert order == ["delete a", "delete b", f"take {NEW}", "delete c"]
     assert host.snapshot_dirs == [NEW]
+
+
+def _raised(**host_setup) -> FakeHost:
+    """A host at PREV whose NEW raises versions in the lock; the environment holds PREV's lock
+    and the packages installed on demand."""
+    return FakeHost(locks=dict(RAISED_LOCKS), **host_setup)
+
+
+def test_forward_syncs_environment_before_start():
+    host = _raised()
+
+    result = run_release(host, PINS, 1, MERGES)
+
+    # The forward move: its stop, the checkout of NEW, the sync of NEW's lock, the environment
+    # check before any start, then the start.
+    forward = host.calls.index(f"checkout {NEW}") - 1
+    assert host.calls[forward : host.calls.index("start") + 1] == [
+        "stop", f"checkout {NEW}", f"sync {NEW}", f"environment check {NEW}", "start",
+    ]
+    assert result.outcome == "released"
+    assert host.installed == {**RAISED_LOCKS[NEW], **ON_DEMAND}
+
+
+def test_sync_failure_restores_previous_environment():
+    host = _raised(sync_fails={NEW})
+
+    result = run_release(host, PINS, 2, MERGES)
+
+    assert result.outcome == "restored"
+    assert result.error == f"RuntimeError: uv sync exited 2 on {NEW}"
+    assert result.steps == ("guards", "stop", "snapshot", "forward", "restore", "readback")
+    assert NEW not in host.started_on  # the units never ran NEW
+    assert host.installed == {**RAISED_LOCKS[PREV], **ON_DEMAND}
+    assert result.readbacks[-1].checks["environment"] is True
+
+
+def test_mismatch_after_sync_fails_before_start():
+    host = _raised(sync_mismatches={NEW})
+
+    result = run_release(host, PINS, 1, MERGES)
+
+    assert result.outcome == "restored"
+    # The error names the package with the version NEW's lock expects and the one installed.
+    assert result.error == (
+        f"EnvironmentMismatch: environment did not hold on {NEW}: pillow expected 13.0.0,"
+        " installed 0.0.0"
+    )
+    assert isinstance(release_runner.EnvironmentMismatch(""), release_runner.ReadbackFailed)
+    assert NEW not in host.started_on
+    assert host.installed == {**RAISED_LOCKS[PREV], **ON_DEMAND}
+
+
+def test_a_mismatch_names_the_first_ten_differences_and_counts_the_rest():
+    host = _raised()
+    missing = tuple(f"package-{number:02} expected 1.0.0, missing" for number in range(12))
+    host.environment_differences = lambda: missing if host.head == NEW else ()
+
+    result = run_release(host, PINS, 1, MERGES)
+
+    assert result.outcome == "restored"
+    assert result.error == (
+        f"EnvironmentMismatch: environment did not hold on {NEW}: {'; '.join(missing[:10])};"
+        " and 2 more"
+    )
+    assert NEW not in host.started_on
+
+
+def test_an_unreadable_environment_fails_before_start_as_unreadable():
+    host = _raised(environment_unreadable={NEW})
+
+    result = run_release(host, PINS, 1, MERGES)
+
+    # Not a mismatch: the comparison could not be read, and the error gives its short reason.
+    assert result.outcome == "restored"
+    assert result.error == (
+        f"EnvironmentUnreadable: environment could not be read on {NEW}: the installed list timed"
+        " out"
+    )
+    assert isinstance(release_runner.EnvironmentUnreadable(""), release_runner.ReadbackFailed)
+    assert NEW not in host.started_on
+    assert host.installed == {**RAISED_LOCKS[PREV], **ON_DEMAND}
+    assert result.readbacks[-1].checks["environment"] is True
+
+
+def test_start_failure_after_sync_restores_environment():
+    host = _raised(will_not_start={NEW})
+
+    result = run_release(host, PINS, 1, MERGES)
+
+    assert result.outcome == "restored"
+    assert result.error == f"RuntimeError: units failed to start on {NEW}"
+    # NEW's lock was synced before its start failed; the restore moved PREV's environment back.
+    assert host.calls.index(f"sync {NEW}") < host.calls.index("restore environment")
+    assert host.installed == {**RAISED_LOCKS[PREV], **ON_DEMAND}
+    assert result.readbacks[-1].checks["environment"] is True
+
+
+def test_environment_restore_failure_leaves_release_failed():
+    host = _raised(unhealthy={NEW}, environment_restore_fails=True)
+
+    result = run_release(host, PINS, 1, MERGES)
+
+    assert result.outcome == "failed"
+    assert result.restore_errors == ("OSError: the environment snapshot could not be moved back",)
+    readback = result.readbacks[-1]
+    assert (readback.expected, [name for name, ok in readback.checks.items() if not ok]) == (
+        PREV, ["environment"],
+    )
+
+
+def test_tier2_environment_follows_each_move():
+    host = _raised()
+
+    result = run_release(host, PINS, 2, MERGES)
+
+    assert result.outcome == "released"
+    assert [(readback.expected, readback.checks["environment"]) for readback in result.readbacks] == [
+        (NEW, True), (PREV, True), (NEW, True), (NEW, True),
+    ]
+    assert host.installed == {**RAISED_LOCKS[NEW], **ON_DEMAND}
+
+
+def test_snapshot_keeps_only_this_release_environment_copy():
+    copies = {name: {**LOCK, **ON_DEMAND} for name in ("a", "b", "c")}
+    host = _raised(snapshot_dirs=["a", "b", "c"], environment_snapshots=copies)
+
+    result = run_release(host, PINS, 2, MERGES)
+
+    assert result.outcome == "released"
+    # One state snapshot and one environment snapshot, both named after NEW; the environment
+    # copy holds PREV's packages, the way back.
+    assert host.snapshot_dirs == [NEW]
+    assert host.environment_snapshots == {NEW: {**RAISED_LOCKS[PREV], **ON_DEMAND}}
+
+
+def test_no_import_after_stop_with_sync():
+    host = _raised()
+
+    result = run_release(host, PINS, 2, MERGES)
+    imported_after_stop = set(sys.modules) - host.modules_at_stop
+
+    assert result.outcome == "released"
+    assert host.calls.count(f"sync {NEW}") == 2  # each forward move synced NEW's lock
+    assert imported_after_stop == set()

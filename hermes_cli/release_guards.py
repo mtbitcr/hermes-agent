@@ -103,6 +103,14 @@ class HostReader(Protocol):
     def snapshot_bytes(self, name: str) -> int:
         """Total size of the regular files in the state snapshot `name`; no link is followed."""
 
+    def environment_sync_available(self) -> bool:
+        """uv is in the Hermes home's bin folder and the platform environment is found."""
+
+    def environment_snapshot_bytes(self) -> int | None:
+        """Total size of the regular files in the real folder the platform environment's link
+        names, all of which the release copies; no link inside is followed. None when the
+        environment is not found."""
+
     def open_native_runs(self) -> Sequence[OpenRun]: ...
 
     def live_config(self) -> Mapping[str, str]:
@@ -148,11 +156,19 @@ def _gateway_stops_with_sigint_mixed(
 
 
 def _snapshot_fits(host: HostReader, pins: Pins, merges: Sequence[RecordedMerge]) -> bool:
-    # Before its copy, the release deletes every state snapshot but the newest, so their room
-    # counts as free. The copy needs about the newest one's size, with 4 GiB to spare.
+    # Every release syncs the environment, whatever it changes, so one the release cannot sync
+    # is refused here, before the first stop. Before its copy, the release deletes every state
+    # snapshot but the newest, so their room counts as free. The copy needs about the newest
+    # one's size, and the environment's copy its full size, with 4 GiB to spare. An environment
+    # that is not found cannot be copied.
+    if not host.environment_sync_available():
+        return False
+    environment = host.environment_snapshot_bytes()
+    if environment is None:
+        return False
     sizes = [host.snapshot_bytes(name) for name in host.snapshots()]
     newest = sizes.pop() if sizes else 0
-    return host.free_disk_bytes() + sum(sizes) >= newest + MIN_FREE_DISK_BYTES
+    return host.free_disk_bytes() + sum(sizes) >= newest + environment + MIN_FREE_DISK_BYTES
 
 
 GUARDS: tuple[tuple[str, str, GuardCheck], ...] = (
@@ -178,9 +194,12 @@ GUARDS: tuple[tuple[str, str, GuardCheck], ...] = (
     ),
     (
         "G5",
-        "the lock file and the project manifest are unchanged: releases are code-only",
-        lambda host, pins, merges: not {LOCK_FILE, PROJECT_MANIFEST}.intersection(
-            host.changed_paths(pins.prev, pins.new)
+        "the lock file and the project manifest are unchanged, or the release can sync the"
+        " environment: lock or manifest changes need the environment sync, which needs uv in the"
+        " Hermes home's bin folder and release.venv_dir naming an existing environment",
+        lambda host, pins, merges: (
+            not {LOCK_FILE, PROJECT_MANIFEST}.intersection(host.changed_paths(pins.prev, pins.new))
+            or host.environment_sync_available()
         ),
     ),
     (
@@ -195,9 +214,11 @@ GUARDS: tuple[tuple[str, str, GuardCheck], ...] = (
     ),
     (
         "G8",
-        "the free disk space, plus the size of every state snapshot except the newest, is at least"
-        " the size of the newest state snapshot plus 4 GiB; with no state snapshot, at least 4 GiB"
-        " of disk are free",
+        "the release can sync the platform environment, as every release does: uv is in the"
+        " Hermes home's bin folder and release.venv_dir names an existing environment; and the"
+        " free disk space, plus the size of every state snapshot except the newest, is at least"
+        " the size of the newest state snapshot plus the full size of the environment, which the"
+        " release copies, plus 4 GiB; with no state snapshot, the newest counts as 0 bytes",
         _snapshot_fits,
     ),
     (
