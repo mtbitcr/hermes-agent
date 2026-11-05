@@ -167,6 +167,8 @@ class FakeHost:
     # real LiveHostReader, built with the reader's keywords, finds there instead.
     environment_bytes: int = 0
     live_environment: bool = False
+    # What G12's comparison of the platform environment with the checkout's lock finds.
+    unlocked: tuple[str, ...] = ()
     built: list[dict] = field(default_factory=list)
     chains: list[tuple[str, str]] = field(default_factory=list)
     asked: list[str] = field(default_factory=list)
@@ -236,6 +238,9 @@ class FakeHost:
             [reader] = [settings for settings in self.built if "snapshot_name" in settings]
             return LiveHostReader(**reader).environment_snapshot_bytes()
         return self.environment_bytes
+
+    def environment_lock_differences(self):
+        return self.unlocked
 
     def open_native_runs(self):
         if not self.runs_readable:
@@ -568,11 +573,11 @@ def test_prepare_runs_every_guard_and_writes_nothing(root, tmp_path, monkeypatch
         "units": UNITS,
         "snapshot_root": root / "release-snapshots",
         "venv_dir": Path(release_cmd.__file__).resolve().parents[1] / "venv",
+        "extras": ("all",),
     }
     assert host.built == [
         {**shared, "snapshot_name": NEW},
-        {**shared, "health_url": SETTINGS["health_url"],
-         "workspace_container": "raphael-workspace", "extras": ("all",)},
+        {**shared, "health_url": SETTINGS["health_url"], "workspace_container": "raphael-workspace"},
     ]
 
     host.kill_mode, host.runs_readable = "control-group", False
@@ -624,6 +629,36 @@ def test_refusal_after_a_rollback_says_a_new_change_is_needed(root, monkeypatch,
     out = capsys.readouterr().out
     assert "G9 failed: this release's state snapshot does not exist yet" in out
     assert "already tried and rolled back" in out and "a new change is needed" in out
+
+
+def test_prepare_names_at_most_ten_packages_the_environment_does_not_hold(
+    root, tmp_path, monkeypatch, capsys
+):
+    """G12: an environment without every package of the checkout's lock, at its locked version,
+    is refused before anything runs. The refusal names the first ten packages the comparison
+    gives, then how many more; nothing is written and no move is asked."""
+    unlocked = tuple(f"package-{number:02} expected 1.0.{number}, missing" for number in range(12))
+    host = FakeHost(unlocked=unlocked)
+    release_cmd = _command(monkeypatch, host)
+    _accepted_batch(NEW)
+    before = _files(tmp_path)
+
+    assert release_cmd.prepare() != 0
+
+    lines = capsys.readouterr().out.splitlines()
+    assert _g_verdicts("\n".join(lines)) == {
+        guard: "failed:" if guard == "G12" else "passed:" for guard, _, _ in GUARDS
+    }
+    named = lines[next(n for n, line in enumerate(lines) if line.startswith("G12 ")) + 1]
+    assert named == "    Not as locked: " + "; ".join(unlocked[:10]) + "; and 2 more."
+    assert f"Refused: 1 of {len(GUARDS)} release guards failed." in lines
+    assert (_files(tmp_path), host.asked) == (before, [])
+
+    host.unlocked = unlocked[:3]  # three differences: all of them, and no more
+    assert release_cmd.prepare() != 0
+    lines = capsys.readouterr().out.splitlines()
+    named = lines[next(n for n, line in enumerate(lines) if line.startswith("G12 ")) + 1]
+    assert named == "    Not as locked: " + "; ".join(unlocked[:3]) + "."
 
 
 def test_prepare_refuses_under_a_profile_home(root, tmp_path, monkeypatch, capsys):
@@ -760,6 +795,8 @@ def test_both_adapters_are_built_from_the_resolved_settings(root, monkeypatch, f
         },
         "snapshot_root": root / "release-snapshots",
         "venv_dir": Path(release_cmd.__file__).resolve().parents[1] / "venv-blue",
+        # The extras the sync installs, which G12 compares the environment with the lock for too.
+        "extras": ("all", "messaging"),
     }
     assert host.built == [
         {**shared, "snapshot_name": NEW},
@@ -767,7 +804,6 @@ def test_both_adapters_are_built_from_the_resolved_settings(root, monkeypatch, f
             **shared,
             "health_url": "http://127.0.0.1:9642/health",
             "workspace_container": "raphael-workspace-blue",
-            "extras": ("all", "messaging"),
         },
     ]
 
@@ -1405,6 +1441,8 @@ def test_a_release_without_uv_is_refused_at_the_preflight_and_stops_nothing(
     monkeypatch.setattr(release_host_actions, "_DIRECT", direct)
     monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=8 * 1024**3))
     monkeypatch.setattr(main, "_plugin_cli_discovery_needed", lambda: False)
+    # G12, which cannot compare the environment without uv, holds here: G8 alone is under test.
+    monkeypatch.setattr(LiveHostReader, "environment_lock_differences", lambda self: ())
     parser, _subparsers = main._build_cli_parser()
     args = parser.parse_args(["release", "run"])
 
@@ -1418,3 +1456,69 @@ def test_a_release_without_uv_is_refused_at_the_preflight_and_stops_nothing(
     assert boundary.head == PREV
     assert not estop.is_engaged()
     assert [batch["outcome"] for batch in _batches()] == ["refused", None]
+
+
+def test_an_environment_not_as_locked_refuses_the_registered_run_before_it_writes(
+    tmp_path, monkeypatch, capsys
+):
+    """Owner rule of 5 November, item 2 (finding 1). The registered ``hermes release run``, on the
+    live adapters, asks G12 before the begin commit, the fetch and the configuration snapshot, and
+    only reads to do so: a platform environment missing packages that the checkout's lock names
+    is refused, the release state stays byte for byte as it was, no snapshot is published, the
+    batch stays accepted, nothing is fetched, synced or stopped, and the refusal names the first
+    ten missing packages, then how many more."""
+    from types import SimpleNamespace
+
+    import shutil
+
+    from agent import estop
+    from hermes_cli import build_info, main, release_host_actions
+    from tests.hermes_cli.test_release_run import (
+        SETTINGS as RUN_SETTINGS,
+        Boundary,
+        _accepted,
+        _batches,
+        _platform_environment,
+    )
+
+    home = _root_at(tmp_path, monkeypatch)
+    venv = _platform_environment(tmp_path, home)
+    settings = {**RUN_SETTINGS, "venv_dir": str(venv)}
+    (home / "config.yaml").write_text(yaml.safe_dump({"release": settings}))
+    batch_id = _accepted(1)["batch_id"]
+    boundary, calls = Boundary(home), []
+    boundary.stamp()  # the live gateway runs PREV
+    missing = [f"package-{number:02}" for number in range(12)]  # locked, and never installed
+
+    def run(argv, **options):  # as Boundary, but the lock export names the missing packages too
+        calls.append(list(argv))
+        done = boundary.run(argv, **options)
+        if argv[0] == str(home / "bin" / "uv") and argv[1] == "export":
+            done.stdout += "".join(f"{name}==1.0.{n}\n" for n, name in enumerate(missing))
+        return done
+
+    answer = SimpleNamespace(status=200)  # the health address answers
+    direct = SimpleNamespace(open=lambda url, timeout: contextlib.nullcontext(answer))
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(build_info, "get_code_identity", lambda **_: {"sha": boundary.head})
+    monkeypatch.setattr(release_host_actions, "_DIRECT", direct)
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=8 * 1024**3))
+    monkeypatch.setattr(main, "_plugin_cli_discovery_needed", lambda: False)
+    parser, _subparsers = main._build_cli_parser()
+    args = parser.parse_args(["release", "run"])
+    before = _release_state(tmp_path)
+
+    code = args.func(args)
+
+    out = capsys.readouterr().out
+    assert code == 1
+    assert _release_state(tmp_path) == before  # the record, and every other release file
+    assert list(tmp_path.rglob(f"*{NEW}*")) == []  # no state, configuration or environment snapshot
+    assert [(batch["batch_id"], batch["state"]) for batch in _batches()] == [(batch_id, "accepted")]
+    assert [call for call in calls if "fetch" in call] == []
+    assert (boundary.moves, boundary.head) == ([], PREV)  # nothing synced, stopped or checked out
+    assert not estop.is_engaged()
+    shown = [f"{name} expected 1.0.{n}, missing" for n, name in enumerate(missing)]
+    lines = out.splitlines()
+    assert "    Not as locked: " + "; ".join(shown[:10]) + "; and 2 more." in lines
+    assert "Refused: release guard G12 failed." in lines and WROTE_NOTHING in lines
