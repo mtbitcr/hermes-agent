@@ -26,7 +26,9 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import backup, build_info, release_host_actions
+from hermes_cli.release_host import LiveHostReader
 from hermes_cli.release_host_actions import ReleaseHostActions
+from hermes_cli.release_runner import EnvironmentUnreadable
 from hermes_constants import mark_named_profile_deleted
 
 # Stand-in unit names, so no call could reach a real unit even by mistake.
@@ -1203,3 +1205,26 @@ def test_environment_snapshot_and_restore_round_trip(tmp_path, platform_env):
         actions.restore_environment()
     assert tree(real) == changed
     assert os.readlink(link) == str(real)
+
+
+def test_g12_reads_the_comparison_the_readback_makes(tmp_path, monkeypatch, platform_env):
+    """G12 asks the reader, before the cutover, the very comparison the readback makes after the
+    sync: the lock as exported for the sync extras, against what the environment has installed."""
+    _environment_lists(tmp_path, monkeypatch, "Brotlicffi==1.2.0.2\n" + LOCK_EXPORT, json.dumps(INSTALLED))
+    actions = make_actions(tmp_path, venv_dir=platform_env.link, extras=("all",))
+    reader = LiveHostReader(
+        checkout=tmp_path / "checkout", root_home=tmp_path / "root", units=UNITS,
+        snapshot_root=tmp_path / "snapshots", snapshot_name="NEW", venv_dir=platform_env.link,
+        extras=("all",),
+    )
+
+    assert reader.environment_lock_differences() == actions.environment_differences() == (
+        "brotlicffi expected 1.2.0.2, missing",
+    )
+    reads = uv_calls(tmp_path)
+    assert len(reads) == 8 and reads[:4] == reads[4:]  # the same two reads, made the same way
+
+    (platform_env.home / "bin" / "uv").unlink()
+    with pytest.raises(EnvironmentUnreadable, match="^uv is not in the Hermes home's bin folder$"):
+        reader.environment_lock_differences()
+
