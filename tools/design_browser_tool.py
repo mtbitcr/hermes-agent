@@ -70,9 +70,32 @@ START_TIMEOUT_S = 15.0
 LOAD_WAIT_S = 10.0
 
 UNAVAILABLE = "browser unavailable, retry"
+PAGE_CHANGED = "the page changed since it was opened; open an allowed address again"
 # A ``browser_`` name, so the runtime's untrusted-data wrapper applies to it.
 WRAP_SOURCE = "browser_design"
 READ_WORLD = "hermes-design-reader"
+SETTLE_WAIT_MS = 3000  # how long a scroll may take to stand still
+# Scroll to ``y`` (null: stay) at once, whatever the page's scroll-behavior; then where the page
+# stood still over consecutive animation frames, or null if it never did in time.
+_SETTLE = """function (y) {
+  if (y !== null) window.scrollTo({top: y, left: 0, behavior: "instant"});
+  return new Promise(resolve => {
+    const deadline = performance.now() + %d;
+    let last = null, same = 0;
+    const tick = () => {
+      const now = Math.round(window.scrollY);
+      same = now === last ? same + 1 : 0;
+      last = now;
+      if (same >= 2) return resolve(now);
+      if (performance.now() > deadline) return resolve(null);
+      let done = false;
+      const next = () => { if (!done) { done = true; tick(); } };
+      requestAnimationFrame(next);
+      setTimeout(next, 100);
+    };
+    tick();
+  });
+}""" % SETTLE_WAIT_MS
 _READER = """(() => {
   const d = document;
   const out = {ready: String(d.readyState), url: String(location.href), title: String(d.title || "")};
@@ -93,15 +116,21 @@ class _PageGone(Exception):
     """The tool's page is no longer there (the guard closes pages it refuses)."""
 
 
+class _PageChanged(Exception):
+    """The page shows another document than the one the last successful open loaded."""
+
+
 @dataclass
 class _Session:
     supervisor: CDPSupervisor
     connection: Any  # the supervisor connection the context was made on
     context_id: str
-    target_id: str
+    target_id: str  # also the id of the page's main frame
     session_id: str
     viewport: Tuple[int, int] = DEFAULT_VIEWPORT
     opened: bool = False
+    document: Optional[str] = None  # loader id of the document the last successful open loaded
+    guard: Any = None  # the supervisor's _DesignGuard
 
 
 _LOCK = threading.Lock()
@@ -170,13 +199,60 @@ def _discover(address: str) -> str:
     return ws_url
 
 
-def _guard(key: str, hosts: List[str]) -> NavigationGuard:
+def _host(url: Any) -> str:
+    """Only the host name of ``url``: never its user info, port, path or query."""
+    try:
+        return (urlsplit(str(url or "")).hostname or "")[:253]
+    except ValueError:
+        return ""
+
+
+class _DesignGuard(NavigationGuard):
+    """The navigation guard, which also notes the first main-frame document request it refuses
+    on a frame an ``open`` is watching: the redirect hop Chromium fails, which never commits and
+    so is in no history. The note is the guard's own decision, made once, and only the host."""
+
+    # Shared by the design guards of every task: each pauses every request of the browser, and
+    # another task's guard may be the one that refuses the hop. Frame ids are unique.
+    _notes_lock = threading.Lock()
+    _watched: Dict[str, Optional[Tuple[str, str]]] = {}  # frame id -> (host, reason)
+
+    def __init__(self, policy: Any, **kwargs: Any) -> None:
+        super().__init__(policy, **kwargs)
+        self._paused: Optional[Dict[str, Any]] = None  # the paused request being answered
+
+    async def _answer(self, cdp: Any, params: Dict[str, Any]) -> None:
+        self._paused = params  # read by refusal(), which _answer calls before it awaits anything
+        await super()._answer(cdp, params)
+
+    def refusal(self, request: Dict[str, Any]) -> Optional[str]:
+        reason = super().refusal(request)
+        paused, self._paused = self._paused, None
+        if (reason is not None and paused is not None and paused.get("request") is request
+                and paused.get("resourceType") == "Document"):
+            with self._notes_lock:
+                frame = paused.get("frameId")
+                if frame in self._watched and self._watched[frame] is None:
+                    self._watched[frame] = (_host(request.get("url")), reason)
+        return reason
+
+    def watch(self, frame_id: str) -> None:
+        with self._notes_lock:
+            self._watched[frame_id] = None
+
+    def unwatch(self, frame_id: str) -> Optional[Tuple[str, str]]:
+        """Stop watching; the (host, reason) of the document request refused meanwhile, if any."""
+        with self._notes_lock:
+            return self._watched.pop(frame_id, None)
+
+
+def _guard(key: str, hosts: List[str]) -> _DesignGuard:
     """The task's guard, kept while the allow-list is unchanged: the registry reuses a supervisor
     only with the very same guard."""
     with _LOCK:
         guard = _GUARDS.get(key)
         if guard is None or guard.policy != hosts:
-            guard = _GUARDS[key] = NavigationGuard(list(hosts))
+            guard = _GUARDS[key] = _DesignGuard(list(hosts))
         return guard
 
 
@@ -207,10 +283,11 @@ def _cdp(sup: CDPSupervisor, method: str, params: Optional[Dict[str, Any]] = Non
 def _session(key: str, address: str, hosts: List[str]) -> _Session:
     """The task's page, behind an active guard; made (with its context) when there is none."""
     ws_url = _discover(address)
+    guard = _guard(key, hosts)
     try:
         sup = SUPERVISOR_REGISTRY.get_or_start(
             key, ws_url, dialog_policy=DIALOG_POLICY_AUTO_DISMISS, start_timeout=START_TIMEOUT_S,
-            navigation_guard=_guard(key, hosts))
+            navigation_guard=guard)
     except Exception as exc:
         logger.warning("design browser: its guarded supervisor did not start (%s)", type(exc).__name__)
         _SESSIONS.pop(key, None)
@@ -222,6 +299,7 @@ def _session(key: str, address: str, hosts: List[str]) -> _Session:
         session = None  # its context went with the connection it was made on
     if session is None:
         session = _SESSIONS[key] = _new_page(sup)
+    session.guard = guard  # the supervisor's own: the registry reuses one only with the same guard
     return session
 
 
@@ -258,6 +336,7 @@ def _tidy(session: _Session) -> None:
 
 
 def _drop_session(key: str) -> None:
+    """Forget the task's page and dispose its context."""
     session = _SESSIONS.pop(key, None)
     if session is not None:
         with contextlib.suppress(Exception):
@@ -265,14 +344,27 @@ def _drop_session(key: str) -> None:
                  {"browserContextId": session.context_id}, timeout=5)
 
 
+def _forget_guard(key: str) -> None:
+    with _LOCK:
+        _GUARDS.pop(key, None)
+
+
 def cleanup_design_browser(task_id: Optional[str] = None) -> None:
-    """End of task: dispose the task's context and stop its supervisor."""
-    key = supervisor_key(task_id)
-    with _task_lock(key):
-        _drop_session(key)
-        with _LOCK:
-            _GUARDS.pop(key, None)
-        SUPERVISOR_REGISTRY.stop(key)
+    """End of task, for the task-resource step of ``AIAgent.close()`` with the same task id:
+    dispose this task's incognito context (its page and requests go with it), forget its page
+    and guard, and stop its supervisor. Other tasks' browsers are left alone. Safe to call again
+    and when nothing was opened; never raises. (``ClientLifecycleMixin._close_task_resources``
+    does not call it yet; until it does, a task's context lasts until its supervisor goes.)"""
+    try:
+        key = supervisor_key(task_id)
+        with _task_lock(key):  # after any call of this task still in the browser
+            for step in (_drop_session, _forget_guard, SUPERVISOR_REGISTRY.stop):
+                try:
+                    step(key)
+                except Exception as exc:
+                    logger.debug("design browser: a cleanup step failed (%s)", type(exc).__name__)
+    except Exception as exc:
+        logger.debug("design browser: cleanup failed (%s)", type(exc).__name__)
 
 
 def _task_lock(key: str) -> threading.Lock:
@@ -288,14 +380,40 @@ def _wrapped(data: Dict[str, Any]) -> str:
     return _maybe_wrap_untrusted(WRAP_SOURCE, json.dumps(data, ensure_ascii=False))
 
 
+def _main_frame(session: _Session) -> Dict[str, Any]:
+    return _cdp(session.supervisor, "Page.getFrameTree", session_id=session.session_id)["frameTree"]["frame"]
+
+
+def _not_a_design_page(frame: Dict[str, Any], hosts: List[str]) -> Optional[str]:
+    """Why the main frame's document is no design page, or None. The guard lets the blank first
+    document and the browser's error page through; neither is ever one."""
+    if frame.get("unreachableUrl"):
+        return "the address did not load"
+    return design_url_refusal(str(frame.get("url") or ""), hosts)
+
+
+def _check_document(session: _Session, hosts: List[str]) -> None:
+    """Raise ``_PageChanged``, and end what the last open allowed, unless the page still shows
+    the document that open loaded, at an allowed address."""
+    frame = _main_frame(session)
+    if (not session.opened or not session.document or frame.get("loaderId") != session.document
+            or _not_a_design_page(frame, hosts) is not None):
+        session.opened, session.document = False, None
+        raise _PageChanged()
+
+
+def _world(session: _Session) -> int:
+    """A fresh isolated world in the page's main frame."""
+    return _cdp(session.supervisor, "Page.createIsolatedWorld",
+                {"frameId": _main_frame(session)["id"], "worldName": READ_WORLD, "grantUniveralAccess": False},
+                session_id=session.session_id)["executionContextId"]
+
+
 def _read(session: _Session, *, full: bool) -> Dict[str, Any]:
     """What the page shows, read in an isolated world: no user gesture, none of the page's
     scripts, prototypes or getters take part."""
     sup, sid = session.supervisor, session.session_id
-    frame_id = _cdp(sup, "Page.getFrameTree", session_id=sid)["frameTree"]["frame"]["id"]
-    world = _cdp(sup, "Page.createIsolatedWorld",
-                 {"frameId": frame_id, "worldName": READ_WORLD, "grantUniveralAccess": False},
-                 session_id=sid)["executionContextId"]
+    world = _world(session)
     reply = _cdp(sup, "Runtime.evaluate", {
         "expression": _READER % ("true" if full else "false"), "contextId": world,
         "returnByValue": True, "userGesture": False, "awaitPromise": False, "timeout": 5000,
@@ -348,35 +466,41 @@ def _capped(data: Dict[str, Any]) -> str:
 
 def _open(session: _Session, args: Dict[str, Any], hosts: List[str]) -> Any:
     sup, sid = session.supervisor, session.session_id
-    session.opened = False
-    nav = _cdp(sup, "Page.navigate", {"url": args["url"]}, session_id=sid, timeout=MAX_CDP_TIMEOUT_S)
-    error = nav.get("errorText")
-    if nav.get("isDownload") or error == "net::ERR_ABORTED":
-        return tool_error("download blocked or navigation aborted: the address did not load a page")
-    if error:
-        if error != "net::ERR_BLOCKED_BY_CLIENT":
+    session.opened, session.document = False, None
+    guard = session.guard if isinstance(session.guard, _DesignGuard) else None
+    if guard is not None:
+        guard.watch(session.target_id)  # the page's main frame, for this open only
+    try:
+        nav = _cdp(sup, "Page.navigate", {"url": args["url"]}, session_id=sid, timeout=MAX_CDP_TIMEOUT_S)
+        error = nav.get("errorText")
+        if nav.get("isDownload") or error == "net::ERR_ABORTED":
+            return tool_error("download blocked or navigation aborted: the address did not load a page")
+        if error and error != "net::ERR_BLOCKED_BY_CLIENT":
             return tool_error(f"navigation failed ({error[:100]})")
-        where = ""
-        with contextlib.suppress(Exception):
-            history = _cdp(sup, "Page.getNavigationHistory", session_id=sid)
-            where = str(history["entries"][history["currentIndex"]].get("url") or "")
+        state = {} if error else _wait_loaded(session)
+    finally:
+        refused = guard.unwatch(session.target_id) if guard is not None else None
+    if error:
+        host, why = refused or ("", None)
         return _wrapped({"ok": False, "error": "navigation blocked: the page or a redirect went to an address "
-                         "that is not allowed", "blocked_host": urlsplit(where).hostname or "",
-                         "reason": design_url_refusal(where, hosts) if where else None})
-    state = _wait_loaded(session)
+                         "that is not allowed", "blocked_host": host, "reason": why})
+    frame = _main_frame(session)
     url = str(state.get("url") or "")
-    reason = design_url_refusal(url, hosts)
+    reason = design_url_refusal(url, hosts) or _not_a_design_page(frame, hosts)
     if reason is not None:
+        host, why = refused or (_host(url), reason)
         return _wrapped({"ok": False, "error": "navigation blocked: the page is not at an allowed address",
-                         "blocked_host": urlsplit(url).hostname or "", "reason": reason})
+                         "blocked_host": host, "reason": why})
     _tidy(session)  # popups the page opened while it loaded
-    session.opened = True
+    session.opened, session.document = True, frame.get("loaderId") or None
     return _capped({"ok": True, "action": "open", "url": url, "title": state.get("title"),
                     "loaded": state.get("ready") == "complete"})
 
 
 def _read_text(session: _Session, args: Dict[str, Any], hosts: List[str]) -> Any:
+    _check_document(session, hosts)
     data = _read(session, full=True)
+    _check_document(session, hosts)  # what was read is that document's
     return _capped({"ok": True, "action": "read_text", "url": data.get("url"), "title": data.get("title"),
                     "text": str(data.get("text") or ""), "alts": [str(a) for a in data.get("alts") or []]})
 
@@ -455,38 +579,53 @@ def _capture_window(session: _Session):
     return raw, image
 
 
-def _scroll_to(session: _Session, world: int, y: int) -> int:
-    """Scroll the page to ``y`` from the isolated world; where it ended up."""
+class _Incomplete(Exception):
+    """The page did not scroll so that every row of it was captured."""
+
+
+def _settled_scroll(session: _Session, world: int, y: Optional[int]) -> Optional[int]:
+    """Scroll the page to ``y`` (None: leave it) from the isolated world; where it then stands
+    still, or None if it did not within ``SETTLE_WAIT_MS``."""
     reply = _cdp(session.supervisor, "Runtime.callFunctionOn", {
-        "functionDeclaration": "function (y) { window.scrollTo(0, y); return Math.round(window.scrollY); }",
-        "executionContextId": world, "arguments": [{"value": y}], "returnByValue": True,
-        "userGesture": False, "awaitPromise": False,
+        "functionDeclaration": _SETTLE, "executionContextId": world, "arguments": [{"value": y}],
+        "returnByValue": True, "userGesture": False, "awaitPromise": True,
     }, session_id=session.session_id)
     value = (reply.get("result") or {}).get("value")
-    return int(value) if isinstance(value, (int, float)) else y
+    if reply.get("exceptionDetails") or not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    return int(value)
 
 
-def _full_page(session: _Session, height: int):
+def _full_page(session: _Session, height: int, rows: int):
     """The page's first ``height`` px, stitched from window-sized captures: a capture beyond the
-    window is refused or hangs in headless Chromium. Fixed headers show once per window."""
+    window is refused or hangs in headless Chromium. Each capture is pasted at the position the
+    page settled at, only its ``rows`` page rows (none under a scrollbar); ``_Incomplete`` unless
+    the captures cover every row. Fixed headers show once per window."""
     from PIL import Image
 
-    sup, sid = session.supervisor, session.session_id
     width, window = session.viewport
-    frame_id = _cdp(sup, "Page.getFrameTree", session_id=sid)["frameTree"]["frame"]["id"]
-    world = _cdp(sup, "Page.createIsolatedWorld",
-                 {"frameId": frame_id, "worldName": READ_WORLD, "grantUniveralAccess": False},
-                 session_id=sid)["executionContextId"]
+    if not MIN_TILE_HEIGHT // 2 <= rows <= window:
+        raise _Incomplete()
+    world = _world(session)
     canvas = Image.new("RGB", (width, height), (255, 255, 255))
+    covered = 0  # rows 0 .. covered-1 are on the canvas
     try:
-        for y in range(0, height, window):
-            top = _scroll_to(session, world, y)
+        while covered < height:
+            top = _settled_scroll(session, world, covered)
+            if top is None or not top <= covered < top + rows:
+                raise _Incomplete()
             _raw, tile = _capture_window(session)
-            canvas.paste(tile.convert("RGB").crop((0, 0, min(tile.width, width), min(tile.height, height - top))),
-                         (0, top))
+            if _settled_scroll(session, world, None) != top:
+                raise _Incomplete()  # it moved while it was captured
+            bottom = min(height, top + rows, top + tile.height)
+            if bottom <= covered:
+                raise _Incomplete()
+            canvas.paste(tile.convert("RGB").crop((0, covered - top, min(tile.width, width), bottom - top)),
+                         (0, covered))
+            covered = bottom
     finally:
         with contextlib.suppress(Exception):
-            _scroll_to(session, world, 0)
+            _settled_scroll(session, world, 0)
     out = io.BytesIO()
     canvas.save(out, format="PNG")
     if out.tell() > MAX_RAW_BYTES:
@@ -501,6 +640,7 @@ def _screenshot(session: _Session, args: Dict[str, Any], hosts: List[str]) -> An
     sup, sid = session.supervisor, session.session_id
     full_page = args.get("full_page") is True
     note = None
+    _check_document(session, hosts)
     try:
         if full_page:
             if session.viewport[1] < MIN_TILE_HEIGHT:
@@ -508,13 +648,19 @@ def _screenshot(session: _Session, args: Dict[str, Any], hosts: List[str]) -> An
             metrics = _cdp(sup, "Page.getLayoutMetrics", session_id=sid)
             size = metrics.get("cssContentSize") or metrics.get("contentSize") or {}
             page_height = max(1, math.ceil(float(size.get("height") or 1)))
+            # The rows of the page a window shows: its height less any horizontal scrollbar.
+            rows = int((metrics.get("cssLayoutViewport") or {}).get("clientHeight") or session.viewport[1])
             if page_height > MAX_FULL_PAGE_HEIGHT:
                 note = f"the page is {page_height} px tall; the screenshot is cut off at {MAX_FULL_PAGE_HEIGHT} px"
-            raw, image = _full_page(session, min(page_height, MAX_FULL_PAGE_HEIGHT))
+            raw, image = _full_page(session, min(page_height, MAX_FULL_PAGE_HEIGHT), rows)
         else:
             raw, image = _capture_window(session)
     except _TooLarge:
         return tool_error(f"screenshot too large (over {MAX_RAW_BYTES // (1024 * 1024)} MB); nothing was stored")
+    except _Incomplete:
+        return tool_error("the full page was not captured completely (it did not scroll to every part of it); "
+                          "nothing was stored")
+    _check_document(session, hosts)  # what was captured is that document
     embedded = _embedded(image)
     if embedded is None:
         return tool_error("the screenshot could not be made small enough to show; nothing was stored")
@@ -601,6 +747,8 @@ def design_browser(args: Dict[str, Any], task_id: Optional[str] = None) -> Any:
             return _HANDLERS[action](session, args, hosts)
         except _Unavailable:
             return tool_error(UNAVAILABLE)
+        except _PageChanged:
+            return tool_error(PAGE_CHANGED)
         except _PageGone:
             _drop_session(key)
             return tool_error("the design page was closed (the guard closes a page it refuses); "
