@@ -85,7 +85,6 @@
   "tools/code_kernel.py": "1a755c7d56ef4de0a0113e48a708e706e9dd18838e54ed320dc2b711d8e277c5",
   "tools/code_kernel_remote.py": "ed142f7b89cd4c9248454ce36010a50ca3e24d07e21c4465934e933304e6bb91",
   "tools/cronjob_job_args.py": "e8528971a419f806b551f3d5617cc2afb393048fa817e13219e24b0b5128fe7f",
-  "tools/design_url_policy.py": "a89d26ad8ab76c1f16f2cc4d0931ec20749a16164e6cb7695a0915b82508d8c9",
   "tools/environments/local_gitbash_probe.py": "65398ac87a186b8a74e629b7c7c616fc32f1b317f79bb848af5482cfa7498fcf",
   "tools/environments/local_pythonpath.py": "5e63afb429e6d505bc824fd097183b269a9afc382bae74bdbf5db0b698ee15a9",
   "tools/environments/modal_utils.py": "8b7579a9a2ffc169898cbd9f901b92f516994fb2d6221290683036a6be708246",
