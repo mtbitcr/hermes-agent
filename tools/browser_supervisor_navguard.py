@@ -16,7 +16,17 @@ else in each new document. Unless the address is ``https://``, exactly ``about:b
 page, it stops at a ``debugger;`` statement; the guard reads ``location.href`` there, and lets the
 document go on only if the policy allows it. A refused document, or one the guard cannot check, is
 never resumed and its page is closed. A document whose stop the guard never sees stops itself.
-A popup opened straight at a ``blob:`` address is not checked: Chromium runs no such script in it.
+
+One document runs with no script of the guard's in it at all: a popup's first one, when it reuses
+the window its opener already made (``window.open(blobURL)``, a link or form with
+``target="_blank"``). Chromium starts no new context for it, so nothing runs on a new document,
+and Fetch never pauses it either. That one is decided before the popup exists: the address its
+opener asked for (``Page.windowOpen``, which arrives before the popup's target does) is checked by
+the same policy, and a held popup that the guard has no such address for, or whose address the
+policy refuses, is closed while it is still held, before its renderer is asked anything (one held
+from birth has no renderer yet to answer with). It is then let go as well, because being held also
+holds the window its opener is still inside ``window.open`` for; the close goes first, so by then
+nothing of the page is left to run.
 
 CDP Fetch never pauses a WebSocket handshake (checked against Chromium 153 by
 ``tests/tools/test_browser_navguard.py``), and neither ``Network.setBlockedURLs`` nor an injected
@@ -31,7 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Awaitable, Callable, Dict, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
 from tools.design_url_policy import design_url_refusal
 
@@ -63,6 +73,10 @@ GATE_SOURCE = """(function hermesNavigationGate() {
   window.stop();
 })();"""
 
+# Addresses a page may be opened at without the opener's word being the check: a window of their
+# own, where the document check runs (``""`` is window.open() with no address, i.e. about:blank).
+_EXEMPT_OPENS = frozenset({"", "about:blank"})
+
 
 class NavigationGuard:
     """Allow-list guard for one supervisor. ``policy`` and ``builder_host`` are passed unchanged
@@ -73,6 +87,8 @@ class NavigationGuard:
         self.policy = policy
         self.builder_host = builder_host
         self._page_of: Dict[str, str] = {}  # attached session id -> target id of its page
+        self._target_of: Dict[str, str] = {}  # attached session id -> its own target id
+        self._opened: Dict[str, List[str]] = {}  # opener target id -> addresses it asked windows for
         self._held: Set[str] = set()  # targets held at start; their first session guards them
         self._own: Set[str] = set()  # sessions the supervisor never set up; their events stay here
         self._default_context: Optional[str] = None
@@ -106,6 +122,8 @@ class NavigationGuard:
         await cdp("Fetch.enable", {"patterns": FETCH_ALL, "handleAuthRequests": False})
         # Sessions of a dropped connection are gone.
         self._page_of = {page_session_id: page_target_id}
+        self._target_of = {page_session_id: page_target_id}
+        self._opened = {}
         self._held = set()
         self._own = set()
         await self._lock_session(cdp, page_session_id, "page", gate=True)
@@ -120,6 +138,9 @@ class NavigationGuard:
             return True
         if method == "Debugger.paused":
             asyncio.create_task(self._check_document(cdp, params, session_id))
+        elif method == "Page.windowOpen":
+            # Noted here, not in a task: the target it describes is attached right after it.
+            self._note_window(session_id, params)
         elif method == "Target.attachedToTarget":
             asyncio.create_task(self.guard_target(cdp, params, session_id))
         elif method == "Network.webSocketCreated":
@@ -164,6 +185,34 @@ class NavigationGuard:
             reason = f"it could not be checked ({type(exc).__name__})"
         await self._close_page(cdp, sid, f"its document was refused: {reason}")
 
+    def _note_window(self, session_id: Optional[str], params: Dict[str, Any]) -> None:
+        """Remember, in order, each address a page asked a new window for."""
+        opener = self._target_of.get(session_id or "")
+        if opener is None:
+            return
+        self._opened.setdefault(opener, []).append(str(params.get("url") or ""))
+
+    def _first_document_refusal(self, info: Dict[str, Any]) -> Optional[str]:
+        """Why a held new page's first document cannot be let run, or None.
+
+        That document may reuse the window its opener already made (``window.open(blobURL)``, a
+        link or form with ``target="_blank"``): no script runs on a new document in it, in either
+        world, and Fetch never pauses it, so the document check never sees it. The address its
+        opener asked for is the only description of it that exists before it runs, so a held page
+        goes on only if that address is one the document check does see (a window of its own) or
+        one the policy allows.
+        """
+        opener = info.get("openerId")
+        if not opener:
+            return None  # not opened by a page: its first document gets a window, and a check
+        pending = self._opened.get(opener)
+        if not pending:
+            return "the address it was opened at was never reported"
+        url = pending.pop(0)
+        if url in _EXEMPT_OPENS or url.startswith("https://"):
+            return None
+        return self._url_refusal(url)
+
     async def guard_target(self, cdp: CDPCall, params: Dict[str, Any], parent_session_id: Optional[str]) -> None:
         """Lock a newly attached target down, then let it run. If that fails it stays held and its
         page is closed."""
@@ -176,6 +225,8 @@ class NavigationGuard:
         page = target_id if target_type == "page" else self._page_of.get(parent_session_id or "")
         if page:
             self._page_of[sid] = page
+        if target_id:
+            self._target_of[sid] = target_id
         # Held targets are new. Pages that already ran (the supervisor's own among them, attached
         # again here) keep what they had; install() checks the documents of the supervisor's page.
         held = bool(params.get("waitingForDebugger"))
@@ -189,6 +240,26 @@ class NavigationGuard:
             except Exception as exc:  # a refused registration's worker is often gone already
                 logger.debug("navigation guard: letting a worker go failed: %s", exc)
             return
+        if held and target_type == "page":
+            # Decided before anything of the page exists, because its first document may run with
+            # no check of its own in it. Nothing is asked of its renderer first: a page held from
+            # birth has none yet, and would answer none of it.
+            reason = self._first_document_refusal(info)
+            if reason is not None:
+                # Closed, then let go, both sent before either answers. Being held holds the
+                # window its opener is still inside window.open for, and only letting the page go
+                # hands that back - but by the time the close answers the session is gone and the
+                # command would be dropped. The close goes first, so nothing of the page is left
+                # to run when it is let go (checked against Chromium 153).
+                closing = asyncio.ensure_future(
+                    self._close_page(cdp, sid, f"its first document is refused: {reason}"))
+                letting_go = asyncio.ensure_future(cdp("Runtime.runIfWaitingForDebugger", session_id=sid))
+                await closing
+                try:
+                    await letting_go
+                except Exception as exc:  # the session goes with the page it belonged to
+                    logger.debug("navigation guard: letting a closed page go: %s", exc)
+                return
         repeat = target_id in self._held
         if held:
             self._held.add(target_id)
