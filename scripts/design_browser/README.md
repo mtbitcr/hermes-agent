@@ -136,9 +136,10 @@ sudo chown <tunnel-user>: /home/<tunnel-user>/.ssh/authorized_keys
 sudo chmod 600 /home/<tunnel-user>/.ssh/authorized_keys
 ```
 
-Never put this key on `<docker-user>`. The key must allow port forwarding, which also covers Unix sockets, and
-`permitopen` does not limit those. On `<docker-user>` the key would reach the rootless Docker socket, and with
-it every container.
+Never put this key on `<docker-user>`. The key must allow port forwarding. On its own, that also allows `ssh -R`
+listeners and forwards to Unix sockets, which `permitopen` does not limit. Step 4 refuses both, for
+`<tunnel-user>` only. On `<docker-user>` the key would reach the rootless Docker socket, and with it every
+container.
 
 Back on the control server, write the execution server's host key into the tunnel's own known_hosts file:
 
@@ -151,7 +152,40 @@ Compare the printed fingerprint with the one the execution server shows for
 `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`, read there through a channel you already trust. If they
 differ, delete `<known-hosts-path>` and stop.
 
-### 4. The tunnel unit (control server)
+### 4. The tunnel account's sshd limits (execution server)
+
+The key line limits where the key may connect, but not where it may listen or which Unix sockets it may reach.
+On the execution server, as an administrator, refuse both for `<tunnel-user>` in an sshd drop-in, test the
+configuration and read back what sshd will apply:
+
+```sh
+sudo tee /etc/ssh/sshd_config.d/design-browser-tunnel.conf <<'EOF'
+Match User <tunnel-user>
+    PermitListen none
+    AllowStreamLocalForwarding no
+EOF
+sudo sshd -t
+sudo sshd -T -C user=<tunnel-user>,host=localhost,addr=127.0.0.1 \
+    | grep -E '^(permitlisten|allowstreamlocalforwarding) '
+```
+
+`PermitListen none` refuses every `ssh -R` listener, and `AllowStreamLocalForwarding no` refuses Unix-socket
+forwarding in both directions. The key's one forward, to 127.0.0.1:9222, stays allowed. Ubuntu's `sshd_config`
+includes this folder at its top and sshd keeps the first value it reads, so later settings do not override
+these lines. The Match block ends at the end of the file.
+
+`sshd -t` prints nothing. The read-back prints `permitlisten none` and `allowstreamlocalforwarding no`. That
+read-back, not the file, shows that the limits apply. Only then reload sshd:
+
+```sh
+sudo systemctl reload ssh
+```
+
+If `sshd -t` prints an error or the read-back shows anything else, do not reload. Correct or delete the file and
+run both again. Keep this administrator session open until check 3 passes: it is the way back in if sshd stops
+accepting new connections.
+
+### 5. The tunnel unit (control server)
 
 From the repository checkout on the control server:
 
@@ -169,7 +203,7 @@ systemctl --user status design-browser-tunnel.service
 
 The status shows `active (running)`.
 
-### 5. The design profiles (control server)
+### 6. The design profiles (control server)
 
 ```sh
 for profile in <design-profile-1> <design-profile-2> <design-profile-3>; do
@@ -193,15 +227,26 @@ list is empty the design browser opens no page, and which hosts go there is the 
 3. **The key opens no shell and no other port.** On the control server:
 
    ```sh
-   tun() { ssh -i <key-path> -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
-             -o UserKnownHostsFile=<known-hosts-path> "$@"; }
+   tun() { timeout 15 ssh -i <key-path> -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+             -o UserKnownHostsFile=<known-hosts-path> -o ExitOnForwardFailure=yes "$@"; }
    tun <tunnel-user>@<execution-host> id; echo "exit $?"
    tun -tt <tunnel-user>@<execution-host>; echo "exit $?"
    tun -W 127.0.0.1:22 <tunnel-user>@<execution-host> </dev/null; echo "exit $?"
+   tun -W /run/dbus/system_bus_socket <tunnel-user>@<execution-host> </dev/null; echo "exit $?"
+   tun -N -R 127.0.0.1:0:127.0.0.1:9222 <tunnel-user>@<execution-host>; echo "exit $?"
+   tun -N -R /tmp/design-browser-check.sock:127.0.0.1:9222 <tunnel-user>@<execution-host>; echo "exit $?"
    ```
 
    The first two show no `uid=` line and no prompt, and end with exit 1. The second also says
-   `PTY allocation request failed`. The third says `administratively prohibited` and ends with exit 255.
+   `PTY allocation request failed`. The third says `administratively prohibited` and ends with exit 255. The
+   fourth tries the D-Bus system socket, which every account may open. It also says
+   `administratively prohibited` and ends with exit 255. The fifth says
+   `remote port forwarding failed for listen port 0`, the sixth
+   `remote port forwarding failed for listen path /tmp/design-browser-check.sock`, and both end with exit 255.
+   Port 0 asks for any free port, so a port in use cannot cause the refusal. The last three are refused only
+   because of step 4. Any other result fails the check. Exit 124, for example, means that ssh still ran after
+   15 s because the server accepted the request. Check 2 shows the other half: the same key's one forward, to
+   127.0.0.1:9222, still works.
 4. **A killed and a frozen Chromium each come back healthy within 3 minutes.** On the execution server, as
    `<docker-user>`, in the compose folder:
 
@@ -271,16 +316,11 @@ list is empty the design browser opens no page, and which hosts go there is the 
    ```
 
 The rollback leaves the following in place: rootless Docker and its linger, the built image, both accounts, the
-key files, the known_hosts file and the copied folder.
+sshd drop-in `/etc/ssh/sshd_config.d/design-browser-tunnel.conf`, the key files, the known_hosts file and the
+copied folder. The drop-in only narrows what `<tunnel-user>` may do, and keeping it avoids another sshd reload.
 
 ## Known limits
 
-- The card's key line allows more than the one forward. `port-forwarding` also lets the key listen on the
-  execution server's loopback with `ssh -R`, because the line sets no `permitlisten`. It can also forward to
-  any Unix socket that `<tunnel-user>` may open, because `permitopen` does not limit those. Giving the key its
-  own account keeps the Docker socket out of reach. Closing the rest is the owner's decision, for example with
-  `PermitListen none` and `AllowStreamLocalForwarding no` in a `Match User <tunnel-user>` block of
-  `sshd_config`.
 - `docker compose stop` and `docker compose down` take 10 s. The watchdog does not handle SIGTERM, so Docker
   kills the container after its grace period.
 - `/dev/shm` keeps Docker's default size of 64 MB. It was not seen to fail and is not raised.
