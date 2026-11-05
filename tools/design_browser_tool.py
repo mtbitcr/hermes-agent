@@ -17,10 +17,22 @@ Where it looks:
   supervisor's connection or by :func:`cleanup_design_browser`). Any other page in that context
   is closed before the tool acts.
 
+End of task: public close (``AIAgent.close()``) does not dispose a design context until the child
+card "Dispose the design browser context when a task ends" is merged. That card owns
+``agent/client_lifecycle.py`` and the call from there to :func:`cleanup_design_browser`. Until
+then a task's context lasts until that helper is called with the task's id or the supervisor
+connection it was made on closes.
+
 What comes back: page text, titles, alt text and addresses only inside the untrusted-data wrapper,
 capped at ``MAX_TEXT_CHARS``. Text is read in an isolated world, without a user gesture, so the
 page's own scripts take no part. Screenshots are stored on the caller's own kanban task under a
 fixed name, and an embedded copy is returned in the multimodal envelope ``browser_exec`` uses.
+
+Known limit of this version, denial receipts across worker processes: every design guard on the
+browser pauses every request in it, so the guard that refuses a hop can belong to another worker
+process. The refusal holds then too and the denied host gets no request, but design guards share
+their notes only within one process, so the receipt in the ``open`` result can lack the host and
+the reason (``blocked_host`` empty, ``reason`` null).
 """
 
 from __future__ import annotations
@@ -212,8 +224,9 @@ class _DesignGuard(NavigationGuard):
     on a frame an ``open`` is watching: the redirect hop Chromium fails, which never commits and
     so is in no history. The note is the guard's own decision, made once, and only the host."""
 
-    # Shared by the design guards of every task: each pauses every request of the browser, and
-    # another task's guard may be the one that refuses the hop. Frame ids are unique.
+    # Shared only by the design guards of this one process: each pauses every request of the
+    # browser, and another task's guard may be the one that refuses the hop. Frame ids are unique.
+    # Another worker process's guards keep notes of their own (the receipt limit, module docstring).
     _notes_lock = threading.Lock()
     _watched: Dict[str, Optional[Tuple[str, str]]] = {}  # frame id -> (host, reason)
 
@@ -350,11 +363,15 @@ def _forget_guard(key: str) -> None:
 
 
 def cleanup_design_browser(task_id: Optional[str] = None) -> None:
-    """End of task, for the task-resource step of ``AIAgent.close()`` with the same task id:
-    dispose this task's incognito context (its page and requests go with it), forget its page
-    and guard, and stop its supervisor. Other tasks' browsers are left alone. Safe to call again
-    and when nothing was opened; never raises. (``ClientLifecycleMixin._close_task_resources``
-    does not call it yet; until it does, a task's context lasts until its supervisor goes.)"""
+    """End of task: dispose this task's incognito context (its page and requests go with it),
+    forget its page and guard, and stop its supervisor. Other tasks' browsers are left alone.
+    Safe to call again and when nothing was opened; never raises.
+
+    Public close (``AIAgent.close()``) does not call this, so it does not dispose a design
+    context, until the child card "Dispose the design browser context when a task ends" is
+    merged. That card owns ``agent/client_lifecycle.py`` and the call from there, with the same
+    task id. Until then a task's context lasts until this is called or the supervisor connection
+    it was made on closes."""
     try:
         key = supervisor_key(task_id)
         with _task_lock(key):  # after any call of this task still in the browser
