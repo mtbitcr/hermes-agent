@@ -572,12 +572,8 @@ def test_prepare_runs_every_guard_and_writes_nothing(root, tmp_path, monkeypatch
         "root_home": root,
         "units": UNITS,
         "snapshot_root": root / "release-snapshots",
-<<<<<<< a8e9f16e3360d85d8076ec4ef9fcdd90faadfb24
         "venv_dir": Path(release_cmd.__file__).resolve().parents[1] / "venv",
-=======
-        "venv_dir": None,
         "extras": ("all",),
->>>>>>> 33572fa0caa78422770e4590d0b0228ee8fbc6fe
     }
     assert host.built == [
         {**shared, "snapshot_name": NEW},
