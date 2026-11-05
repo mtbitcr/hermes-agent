@@ -222,6 +222,7 @@ def test_check_never_creates_a_signing_key(stack: Host):
     assert result.returncode == 1
     assert failed_checks(result) == {"production-get-refused"}
     assert snapshot(stack) == before
+    assert stack.calls("curl") == []
 
 
 @pytest.mark.parametrize("how", ["missing", "stopped"])
