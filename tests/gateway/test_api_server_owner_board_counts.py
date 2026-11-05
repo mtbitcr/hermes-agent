@@ -109,7 +109,8 @@ async def test_the_token_adds_exactly_one_key_and_changes_nothing_else(ctx):
 
     plain_data = json.loads(plain)["data"]
     counted_data = json.loads(counted)["data"]
-    assert [item["project_id"] for item in counted_data] == [p["project_id"] for p in projects]
+    assert [item["project_id"] for item in counted_data] == [item["project_id"] for item in plain_data]
+    assert {item["project_id"] for item in counted_data} == {p["project_id"] for p in projects}
     assert all(set(item) - set(old) == {"board_counts"} for item, old in zip(counted_data, plain_data))
     assert [{k: v for k, v in item.items() if k != "board_counts"} for item in counted_data] == plain_data
     both_data = json.loads(both)["data"]
@@ -135,6 +136,32 @@ async def test_anything_but_one_exact_token_returns_todays_body(ctx, query):
     assert all("board_counts" not in item for item in json.loads(baseline)["data"])
 
 
+def _assert_counts_by_project(data, projects, status, missing=None) -> None:
+    by_id = {item["project_id"]: item for item in data}
+    assert len(data) == len(by_id) == len(projects)
+    for index, project in enumerate(projects):
+        counts = by_id[project["project_id"]]["board_counts"]
+        if index == missing:
+            assert counts is None
+        else:
+            assert counts["counts"][status] == index
+            assert counts["total"] == index
+
+
+def _tie_receipt_timestamps() -> None:
+    with projects_db.connect_closing() as pconn:
+        pconn.execute(
+            "UPDATE owner_workspace_receipts SET updated_at = 1700000000 "
+            "WHERE operation = 'owner_workspace_bootstrap'"
+        )
+        pconn.commit()
+        tied = pconn.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT updated_at) FROM owner_workspace_receipts "
+            "WHERE operation = 'owner_workspace_bootstrap'"
+        ).fetchone()
+    assert tuple(tied) == (18, 1)
+
+
 @pytest.mark.asyncio
 async def test_listing_eighteen_projects_never_reads_a_snapshot(ctx):
     projects = _new_projects(ctx, 18)
@@ -147,12 +174,8 @@ async def test_listing_eighteen_projects_never_reads_a_snapshot(ctx):
     with patch("hermes_cli.owner_workspace.read_project_snapshot", side_effect=fail):
         status, body = await _get(ctx, "?capabilities=board_counts_v1")
 
-    data = json.loads(body)["data"]
     assert status == 200
-    assert len(data) == 18
-    for index, item in enumerate(data):
-        assert item["board_counts"]["counts"]["ready"] == index
-        assert item["board_counts"]["total"] == index
+    _assert_counts_by_project(json.loads(body)["data"], projects, "ready")
 
 
 @pytest.mark.asyncio
@@ -164,12 +187,28 @@ async def test_a_missing_board_store_is_null_and_the_other_seventeen_keep_their_
 
     status, body = await _get(ctx, "?capabilities=board_counts_v1")
 
-    data = json.loads(body)["data"]
     assert status == 200
-    assert len(data) == 18
-    for index, item in enumerate(data):
-        if index == 5:
-            assert item["board_counts"] is None
-        else:
-            assert item["board_counts"]["counts"]["done"] == index
-            assert item["board_counts"]["total"] == index
+    _assert_counts_by_project(json.loads(body)["data"], projects, "done", missing=5)
+
+
+@pytest.mark.asyncio
+async def test_tied_receipt_timestamps_keep_the_legacy_order_and_the_right_counts(ctx):
+    projects = _new_projects(ctx, 18)
+    for index, project in enumerate(projects):
+        _add_tasks(project, ["done"] * index)
+    kanban_db.kanban_db_path(projects[5]["board"]).unlink()
+    _tie_receipt_timestamps()
+
+    def fail(*args, **kwargs):
+        raise AssertionError("read_project_snapshot must not run for the list")
+
+    with patch("hermes_cli.owner_workspace.read_project_snapshot", side_effect=fail):
+        plain_status, plain = await _get(ctx)
+        status, body = await _get(ctx, "?capabilities=board_counts_v1")
+
+    assert (plain_status, status) == (200, 200)
+    data = json.loads(body)["data"]
+    assert [item["project_id"] for item in data] == [
+        item["project_id"] for item in json.loads(plain)["data"]
+    ]
+    _assert_counts_by_project(data, projects, "done", missing=5)
