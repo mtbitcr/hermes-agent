@@ -915,7 +915,8 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
 
   // ---- Motion, shadow roots and frames: pairs of routes that differ only in a period, a speed or a rendering hint must give the same evidence. ----
 
-  const motionPage = (ms: number, smoothing: string) => `<!doctype html><meta charset=utf-8>
+  // One page per route: the animated tiny page, an animated open shadow root, and a visible shadow root (with a canvas) and srcdoc frame whose type size is `px`.
+  const motionPage = (ms: number, smoothing: string, px: number) => `<!doctype html><meta charset=utf-8>
 <style>body{margin:0;font:20px sans-serif;-webkit-font-smoothing:${smoothing}}
 @keyframes spin{to{transform:rotate(360deg)}}
 #box{width:80px;height:80px;background:#369;animation:spin ${ms}ms linear infinite}
@@ -926,13 +927,11 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
 <main><section role="region"><h2>Part one</h2><p style="font:italic 700 18px/30px Georgia,serif;color:rgba(10,20,30,.5)">Body text</p>
 <img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="A dot" width=20 height=20><button>Go</button></section></main>
 <div style="position:fixed;bottom:0;left:0;color:#369">Pinned</div>
+<h1>Outside</h1><div id=animated></div><script>animated.attachShadow({mode:'open'}).innerHTML =
+'<style>@keyframes m{to{transform:translateX(300px)}}h2{width:100px;animation:m ${ms}ms infinite linear}</style><h2>Inside</h2>'</script>
+<div id=host></div><script>host.attachShadow({mode:'open'}).innerHTML = '<p style="font-size:${px}px">Visible shadow text</p><canvas width=50 height=20></canvas>'</script>
+<iframe srcdoc="<h2 style='font-size:${px}px'>Frame text</h2><p style='position:fixed;bottom:0'>Pin</p>" style="border:0;margin:30px 30px 30px 38px"></iframe>
 <script>document.getElementById('wa').animate([{transform:'translateX(0px)'},{transform:'translateX(300px)'}],{duration:${ms},iterations:Infinity})</script>`
-
-  const shadowPage = (ms: number) => `<!doctype html><h1>Outside</h1><div id=host></div><script>host.attachShadow({mode:'open'}).innerHTML =
-'<style>@keyframes m{to{transform:translateX(300px)}}h2{width:100px;animation:m ${ms}ms infinite linear}</style><h2>Inside</h2>'</script>`
-
-  const visiblePage = (px: number) => `<h1>Outside</h1><div id=host></div><script>host.attachShadow({mode:'open'}).innerHTML = '<p style="font-size:${px}px">Visible shadow text</p><canvas width=50 height=20></canvas>'</script>
-<iframe srcdoc="<h2 style='font-size:${px}px'>Frame text</h2><p style='position:fixed;bottom:0'>Pin</p>" style="border:0;margin:30px"></iframe>`
 
   const bodyShadowPage = (ms: number) => `<!doctype html><body><script>document.body.attachShadow({mode:'open'}).innerHTML =
 '<style>@keyframes m{to{transform:translateX(300px)}}h2{width:100px;animation:m ${ms}ms infinite linear}</style><h2>Inside body</h2>'; document.currentScript.remove()</script>`
@@ -941,8 +940,7 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
 
   // The routes before the refusal of a closed shadow root.
   const motionLaunch = memo(() => launchPages({
-    'motion-a': motionPage(1000, 'antialiased'), 'motion-b': motionPage(3700, 'subpixel-antialiased'), 'shadow-a': shadowPage(1000), 'shadow-b': shadowPage(10_000),
-    'visible-10': visiblePage(10), 'visible-40': visiblePage(40), closed: closedPage,
+    'motion-a': motionPage(1000, 'antialiased', 10), 'motion-b': motionPage(3700, 'subpixel-antialiased', 10), 'motion-c': motionPage(1000, 'antialiased', 40), closed: closedPage,
   }))
 
   it('gives identical bundles and images despite CSS animation, infinite Web Animations API motion and font smoothing', async () => {
@@ -990,13 +988,13 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
 
   it('gives identical bundles and pixels for a shadow-root element with an infinite CSS animation when only its period differs', async () => {
     const run = await motionLaunch()
-    sameEvidence(run, '/shadow-a', '/shadow-b')
-    expect(byText(read(run.outDir, 1280, '/shadow-a'), 'inside').tag).toBe('h2')
+    sameEvidence(run, '/motion-a', '/motion-b')
+    expect(byText(read(run.outDir, 1280, '/motion-a'), 'inside').tag).toBe('h2')
   }, 120_000)
 
   it('measures visible shadow-root and srcdoc-iframe text with its own type values and page coordinates', async () => {
     const run = await motionLaunch()
-    const [s10, s40] = ['/visible-10', '/visible-40'].map(route => read(run.outDir, 1280, route))
+    const [s10, s40] = ['/motion-a', '/motion-c'].map(route => read(run.outDir, 1280, route))
 
     expect(byText(s10, 'visible shadow text').style['font-size']).toBe(10)
     expect(byText(s40, 'visible shadow text').style['font-size']).toBe(40)
@@ -1026,7 +1024,7 @@ r.adoptedStyleSheets = [own]; r.innerHTML = '<h2 id=s>S</h2><p id=o></p>'
 const o = r.getElementById('o'); o.textContent = getComputedStyle(r.getElementById('s')).webkitFontSmoothing + ' / ' + getComputedStyle(r.getElementById('s')).textRendering</script>
 <div id=dh><template shadowrootmode=open><style>h3{${decl}}</style><h3 id=d>D</h3><p id=e></p></template></div>
 <script>const dr = dh.shadowRoot; dr.getElementById('e').textContent = getComputedStyle(dr.getElementById('d')).webkitFontSmoothing + ' / ' + getComputedStyle(dr.getElementById('d')).textRendering</script>
-<iframe srcdoc="${frame}"></iframe>`
+<iframe srcdoc="${frame}"></iframe>${retainFragment(false)}`
   }
 
   const dynamic = (smoothing: string, rendering: string) => {
@@ -1059,16 +1057,19 @@ ${make}(document.getElementById('top'))
 host.attachShadow({mode:'open'}); ${make}(host.shadowRoot)</script><iframe srcdoc="${frame}"></iframe>`
   }
 
-  const retainPage = (retain: boolean) => `<!doctype html><p id=a>A</p><p id=o></p><script>
-const p = document.getElementById('a'), live = ${retain ? 'getComputedStyle(p)' : 'null'}
+  // A mutation path the kit cannot cover. With a retained computed style it must be refused; without one it is accepted and the page reads the normalised value.
+  const retainFragment = (retain: boolean) => `<p id=ka>A</p><p id=ko></p><script>(() => {
+const p = document.getElementById('ka'), live = ${retain ? 'getComputedStyle(p)' : 'null'}
 p.attributes.style ? 0 : p.setAttribute('style', 'color:red')
 p.attributes.style.value = 'text-rendering:optimizeSpeed!important'
-document.getElementById('o').textContent = (live || getComputedStyle(p)).textRendering</script>`
+document.getElementById('ko').textContent = (live || getComputedStyle(p)).textRendering })()</script>`
+
+  const retainPage = (retain: boolean) => `<!doctype html>${retainFragment(retain)}`
 
   const normaliseLaunch = memo(() => launchPages({
     'norm-a': normPage('subpixel-antialiased', 'optimizeSpeed'), 'norm-b': normPage('none', 'optimizeLegibility'),
     'dyn-a': dynamicPage('subpixel-antialiased', 'optimizeSpeed'), 'dyn-b': dynamicPage('none', 'optimizeLegibility'),
-    'body-shadow-a': bodyShadowPage(1000), 'body-shadow-b': bodyShadowPage(10_000), 'retain-off': retainPage(false), 'retain-on': retainPage(true),
+    'body-shadow-a': bodyShadowPage(1000), 'body-shadow-b': bodyShadowPage(10_000), 'retain-on': retainPage(true),
   }))
 
   it('visits a body-attached open shadow root with an animated h2 and gives period-independent images', async () => {
@@ -1104,7 +1105,7 @@ document.getElementById('o').textContent = (live || getComputedStyle(p)).textRen
     const run = await normaliseLaunch()
     expect(run.error?.message).toContain('normalisation could not be guaranteed')
 
-    for (const width of [1280, 375]) {expect(read(run.outDir, width, '/retain-off').elements.some((e: any) => e.text === 'geometricprecision'), `${width}`).toBe(true)}
+    for (const width of [1280, 375]) {expect(read(run.outDir, width, '/norm-a').elements.some((e: any) => e.text === 'geometricprecision'), `${width}`).toBe(true)}
   }, 120_000)
 
   const forced = '-webkit-font-smoothing:subpixel-antialiased!important;text-rendering:optimizeSpeed!important'
@@ -1124,11 +1125,10 @@ aside{position:sticky;top:0;margin-top:300px;width:200px;height:60px;background:
 iframe{position:absolute;left:400px;top:500px;width:300px;height:200px;border:0}</style>
 <header>Fixed</header><aside>Sticky</aside><main>Control</main>
 <iframe srcdoc="<body style='margin:0;height:2000px;background:linear-gradient(#fff,#369)'><p style='position:fixed;top:0;margin:0'>Frame pin</p><p style='margin-top:100px'>Frame flow</p><script>scrollTo(0,${frameY})</script>"></iframe>
-<script>${onLoad ? `addEventListener('load', () => ${scroll})` : scroll}</script>`
+<script>${onLoad ? `addEventListener('load', () => ${scroll})` : scroll}</script>${enforcePage(`b.style.setProperty('-webkit-font-smoothing', 'subpixel-antialiased', 'important');`)}`
   }
 
   const enforceLaunch = memo(() => launchPages({
-    'enforce-ok': enforcePage(`b.style.setProperty('-webkit-font-smoothing', 'subpixel-antialiased', 'important');`),
     'scroll-still': scrolledPage(0, 0, 0), 'scroll-both': scrolledPage(1000, 1000, 500, true),
     'enforce-empty': `${enforcePage('')}<script>addEventListener('load', () => document.getElementById('__dc_style').textContent = '')</script>`,
   }))
@@ -1137,7 +1137,7 @@ iframe{position:absolute;left:400px;top:500px;width:300px;height:200px;border:0}
     const run = await enforceLaunch()
 
     for (const width of [1280, 375]) {
-      expect(read(run.outDir, width, '/enforce-ok').elements.filter((e: any) => e.text === 'antialiased / geometricprecision'), `${width}`).toHaveLength(2)
+      expect(read(run.outDir, width, '/scroll-both').elements.filter((e: any) => e.text === 'antialiased / geometricprecision'), `${width}`).toHaveLength(2)
     }
 
     expect(run.error?.message).toContain('rendering normalisation is not effective')
@@ -1449,11 +1449,26 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
 <img alt="" src="${dataUri(SVG, stillSvg('red'))}"><div></div><img alt="" src="/gradient.svg"><object data="/gradient.svg" type="image/svg+xml" width="64" height="64"></object>
 <embed src="/gradient.svg" type="image/svg+xml" width="64" height="64"><img alt="" src="${dataUri(SVG, GRADIENT)}"><img alt="" src="data:image/svg+xml,${encodeURIComponent(GRADIENT)}"><img alt="" src="/still.gif"><img alt="" src="/still.png"><img alt="" src="/single.png"><img alt="" src="/still.webp"><h1>Static</h1>`
 
+  // Every other browser consumer of a data: URL that can hold an SVG document or image, each with its own malformed bytes.
+  const malformedFor = (name: string) => `<svg ${SVG_NS}><rect id="${name}"></svg>`
+  const consumerUri = (name: string) => dataUri(SVG, malformedFor(name))
+  const otherConsumers: Array<[string, string]> = [
+    ['poster', `<video poster="${consumerUri('poster')}"></video>`],
+    ['use', `<svg width="8" height="8"><use href="${consumerUri('use')}#u"/></svg>`],
+    ['cursor', `<div style="cursor:url(${consumerUri('cursor')}) 0 0,auto"></div>`],
+    ['shape', `<div style="float:left;shape-outside:url(${consumerUri('shape')})"></div>`],
+    ['filter', `<div style="filter:url(${consumerUri('filter')}#f)"></div>`],
+    ['clip', `<div style="clip-path:url(${consumerUri('clip')}#c)"></div>`],
+    ['maskbox', `<div style="-webkit-mask-box-image-source:url(${consumerUri('maskbox')})"></div>`],
+    ['fill', `<svg width="8" height="8"><rect width="8" height="8" style="fill:url(${consumerUri('fill')}#p)"/></svg>`],
+  ]
+
   const REFUSED_PAGE = `<!doctype html><style>body{margin:0}img,object,embed,div{display:block;width:64px;height:64px}
 #bg{background:url(/background-style.svg)}#mask{background:red;mask-image:url(/mask-style.svg)}#border{border-image:url(/border-style.svg) 1}</style><h1>Refused</h1>
 ${['style-element', 'style-attribute', 'animate-element', 'processing-instruction', 'reference-keyframes', 'event-attribute', 'unlisted-element'].map(n => `<img alt="" src="/${n}.svg">`).join('')}
 <object data="/object-style.svg" type="image/svg+xml"></object><embed src="/embed-style.svg" type="image/svg+xml"><div id=bg></div><div id=mask></div><div id=border></div>
-<img alt="" src="/gradient.svg"><img alt="" src="/a.gif"><img alt="" src="/a.png"><img alt="" src="/a.webp"><img alt="" src="/still.gif"><img alt="" src="/still.webp">`
+<img alt="" src="/gradient.svg"><img alt="" src="/a.gif"><img alt="" src="/a.png"><img alt="" src="/a.webp"><img alt="" src="/still.gif"><img alt="" src="/still.webp">
+${otherConsumers.map(([, html]) => html).join('')}`
 
   // One browser launch: two identical static routes, then the route that is refused (a refusal ends the launch, so it comes last).
   const svgLaunch = memo(() => launchPages({ 'static-1': STATIC_PAGE, 'static-2': STATIC_PAGE, refused: REFUSED_PAGE }, {
@@ -1497,6 +1512,15 @@ ${['style-element', 'style-attribute', 'animate-element', 'processing-instructio
     expect(message).not.toContain('/still.')
   }, 120_000)
 
+  it('refuses a malformed SVG data URL used by a video poster, use, a cursor, shape-outside, filter, clip-path, a mask box image and a paint server', async () => {
+    const message: string = (await svgLaunch()).error?.message ?? ''
+    const shas = new Set(sentences(message).map(l => (/\(sha256 ([0-9a-f]{12})\)$/.exec(l) ?? [])[1]))
+
+    for (const [name] of otherConsumers) {
+      expect(shas.has(sha12(malformedFor(name))), `${name}: ${message}`).toBe(true)
+    }
+  }, 120_000)
+
   it('refuses a style-element SVG img on the prototype side, naming the data URL', async () => {
     const run = await launchPrototype(`<!doctype html><h1>Proto</h1><img alt="" src="${dataUri(SVG, unsupportedSvgs['style-element.svg'])}">`)
     expect(run.error.message).toMatch(/^unsupported content: the kit cannot prove that this SVG is static: data:image\/svg\+xml;base64,\S+… \(sha256 [0-9a-f]{12}\)$/)
@@ -1506,37 +1530,58 @@ ${['style-element', 'style-attribute', 'animate-element', 'processing-instructio
   const MALFORMED_SVG = `<svg ${SVG_NS}><rect></svg>`
   const MALFORMED_OTHER = `<svg ${SVG_NS}><g></svg>`
 
-  const shippedCli = (args: string[]) => limited(() => new Promise<{ status: number | null, stderr: string }>(done => {
-    const child = spawn(process.execPath, [captureFile, ...args, '--out', join(scratch, `out-${++seq}`), '--run-id', 'r', '--candidate-digest', 'd'], { env: { ...process.env, CHROME_PATH: chromium } })
+  const shippedCli = (args: string[]) => limited(() => new Promise<{ status: number | null, stderr: string, out: string }>(done => {
+    const out = join(scratch, `out-${++seq}`)
+    const child = spawn(process.execPath, [captureFile, ...args, '--out', out, '--run-id', 'r', '--candidate-digest', 'd'], { env: { ...process.env, CHROME_PATH: chromium } })
 
     let stderr = ''
     child.stderr.on('data', d => { stderr += d })
-    child.on('close', status => done({ status, stderr }))
+    child.on('close', status => done({ status, stderr, out }))
   }))
 
   const sentences = (stderr: string) => stderr.split('\n').filter(l => l.startsWith('unsupported content: the kit cannot prove that this SVG is static: '))
   const DATA_LINE = /^unsupported content: the kit cannot prove that this SVG is static: data:image\/svg\+xml \(sha256 ([0-9a-f]{12})\)$/
 
-  it('refuses a malformed SVG data URL used as an img or a CSS background on the candidate side, through the shipped CLI', async () => {
-    const site = dirOf({ 'index.html': `<!doctype html><style>div{width:64px;height:64px;background:url(data:image/svg+xml,${encodeURIComponent(MALFORMED_OTHER)})}</style><h1>Bad</h1>
-<img alt="" src="${dataUri(SVG, MALFORMED_SVG)}"><div></div><img alt="" src="${dataUri(SVG, GRADIENT)}">` })
+  // An SVG filter image is a rendered consumer of a data URL as well: feImage by href and by xlink:href.
+  const feImageSvg = (attr: string, bytes: string) => `<svg width="64" height="64"><filter id="f${++seq}" x="0" y="0" width="64" height="64" filterUnits="userSpaceOnUse"><feImage ${attr}="${dataUri(SVG, bytes)}" width="64" height="64"/></filter><rect width="64" height="64" filter="url(#f${seq})"/></svg>`
+  const MALFORMED_HREF = `<svg ${SVG_NS}><circle></svg>`
+  const MALFORMED_XLINK = `<svg ${SVG_NS}><path></svg>`
+  const sha12 = (bytes: string) => createHash('sha256').update(bytes).digest('hex').slice(0, 12)
 
-    const run = await shippedCli(['--side', 'candidate', '--site', site, '--pages', '/'])
+  it('refuses a malformed SVG data URL used as an img, a CSS background or feImage (href and xlink:href) on the candidate side, and renders the valid static feImage, through the shipped CLI', async () => {
+    const site = dirOf({
+      'index.html': `<!doctype html><style>div{width:64px;height:64px;background:url(data:image/svg+xml,${encodeURIComponent(MALFORMED_OTHER)})}</style><h1>Bad</h1>
+<img alt="" src="${dataUri(SVG, MALFORMED_SVG)}"><div></div><img alt="" src="${dataUri(SVG, GRADIENT)}">${feImageSvg('href', MALFORMED_HREF)}${feImageSvg('xlink:href', MALFORMED_XLINK)}${feImageSvg('href', GRADIENT)}`,
+      'ok.html': `<!doctype html><style>body{margin:0}svg{display:block}</style>${feImageSvg('href', GRADIENT)}${feImageSvg('xlink:href', GRADIENT)}<h1>Ok</h1>`,
+    })
+
+    const run = await shippedCli(['--side', 'candidate', '--site', site, '--pages', '/ok /'])
     expect(run.status, run.stderr).toBe(1)
     const lines = sentences(run.stderr)
-    expect(lines, run.stderr).toHaveLength(2)
+    expect(lines, run.stderr).toHaveLength(4)
 
     const shas = lines.map(l => (DATA_LINE.exec(l) ?? [])[1])
-    expect(shas.sort(), run.stderr).toEqual([MALFORMED_SVG, MALFORMED_OTHER].map(b => createHash('sha256').update(b).digest('hex').slice(0, 12)).sort())
+    expect(shas.sort(), run.stderr).toEqual([MALFORMED_SVG, MALFORMED_OTHER, MALFORMED_HREF, MALFORMED_XLINK].map(sha12).sort())
     expect(run.stderr).not.toContain(Buffer.from(MALFORMED_SVG).toString('base64'))
+
+    for (const width of [1280, 375]) {
+      const image = decodePng(pngOf(run.out, width, '/ok'))
+
+      for (const y of [32, 96]) {
+        const [r, g, b] = image.at(32, y)
+        expect([Math.abs(r - 126), g, Math.abs(b - 128)].every(d => d <= 3), `${width} y=${y}: ${[r, g, b]}`).toBe(true)
+      }
+    }
   }, 120_000)
 
-  it('refuses a malformed SVG data URL used as an img on the prototype side, through the shipped CLI', async () => {
+  it('refuses a malformed SVG data URL used as an img or by feImage on the prototype side, through the shipped CLI', async () => {
     const file = join(scratch, `proto-${++seq}.html`)
-    writeFileSync(file, `<!doctype html><h1>Proto</h1><img alt="" src="${dataUri(SVG, MALFORMED_SVG)}">`)
+    writeFileSync(file, `<!doctype html><h1>Proto</h1><img alt="" src="${dataUri(SVG, MALFORMED_SVG)}">${feImageSvg('href', MALFORMED_HREF)}`)
     const run = await shippedCli(['--side', 'prototype', '--prototype', file, '--pages', '/'])
     expect(run.status, run.stderr).toBe(1)
-    expect(run.stderr.trim()).toMatch(DATA_LINE)
-    expect(DATA_LINE.exec(run.stderr.trim())?.[1]).toBe(createHash('sha256').update(MALFORMED_SVG).digest('hex').slice(0, 12))
+    const lines = run.stderr.trim().split('\n')
+    expect(lines).toHaveLength(2)
+    for (const line of lines) {expect(line).toMatch(DATA_LINE)}
+    expect(lines.map(l => (DATA_LINE.exec(l) ?? [])[1]).sort()).toEqual([MALFORMED_SVG, MALFORMED_HREF].map(sha12).sort())
   }, 120_000)
 })

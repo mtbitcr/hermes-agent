@@ -210,7 +210,10 @@
 
   // The raw strings through which the page can load an image or document from a data: URL, in every document, open shadow root and same-origin frame:
   // attributes, and the computed values (as the browser serialises them) of the image-valued properties of each element and its ::before and ::after.
-  const IMAGE_PROPERTIES = ['background-image', 'mask-image', '-webkit-mask-image', 'border-image-source', 'list-style-image', 'content']
+  const IMAGE_PROPERTIES = [
+    'background-image', 'mask-image', '-webkit-mask-image', 'border-image-source', 'list-style-image', 'content', 'cursor', 'shape-outside',
+    'mask-border-source', '-webkit-mask-box-image-source', 'filter', 'clip-path', 'fill', 'stroke', 'marker-start', 'marker-mid', 'marker-end',
+  ]
   function dataUrls() {
     const urls = new Set(), srcsets = new Set(), styles = new Set()
     const { items } = collect(document, undefined, { items: [], roots: [], lenient: true })
@@ -221,7 +224,8 @@
       if (tag === 'img' || tag === 'source') srcsets.add(attr('srcset'))
       if (tag === 'object') urls.add(attr('data'))
       if (tag === 'embed' || (tag === 'input' && String(attr('type')).toLowerCase() === 'image')) urls.add(attr('src'))
-      if (tag === 'image') { urls.add(attr('href')); urls.add(attr('xlink:href')) }
+      if (tag === 'image' || tag === 'feImage' || tag === 'use') { urls.add(attr('href')); urls.add(attr('xlink:href')) }
+      if (tag === 'video') urls.add(attr('poster'))
       for (const pseudo of [null, '::before', '::after']) {
         const cs = ctx.win.getComputedStyle(el, pseudo)
         for (const property of IMAGE_PROPERTIES) styles.add(cs.getPropertyValue(property))

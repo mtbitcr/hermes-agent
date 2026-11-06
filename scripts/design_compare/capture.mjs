@@ -313,11 +313,20 @@ const guardSource = (origin, onlyPath) => `(() => {
   if (window.fetchLater) window.fetchLater = u => refuse(u && u.url || u)
 })()`
 
+// A binary is hashed once per process while its file identity (path, size, inode, mtime, ctime) stays the same; any change to the file hashes it again.
+const hashed = new Map()
+function binaryHash(binary) {
+  let id
+  try { const st = statSync(binary); id = [binary, st.size, st.ino, st.mtimeMs, st.ctimeMs].join('\0') } catch { throw new Error(`Chromium binary is not readable: ${binary}`) }
+  if (!hashed.has(id)) {
+    try { hashed.set(id, sha256(readFileSync(binary))) } catch { throw new Error(`Chromium binary is not readable: ${binary}`) }
+  }
+  return hashed.get(id)
+}
+
 export function verifyChromium(binary, pin, deps = {}) {
   if (!/^[0-9a-f]{64}$/.test(pin.sha256 || '')) throw new Error('Chromium binary hash is not pinned (missing hash): refusing to start')
-  let bytes
-  try { bytes = readFileSync(binary) } catch { throw new Error(`Chromium binary is not readable: ${binary}`) }
-  if (sha256(bytes) !== pin.sha256) throw new Error('Chromium binary SHA-256 does not match the pin: refusing to start')
+  if (binaryHash(binary) !== pin.sha256) throw new Error('Chromium binary SHA-256 does not match the pin: refusing to start')
   const version = versionOf((deps.version || (b => execFileSync(b, ['--version'], { encoding: 'utf8' })))(binary))
   if (version !== pin.version) throw new Error(`Chromium version ${version || 'unknown'} is not the pinned version ${pin.version}`)
   return version
