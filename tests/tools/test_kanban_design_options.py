@@ -294,3 +294,22 @@ def test_a_refused_offer_names_the_limit_and_writes_nothing(worker):
 
     assert "error" in out and "2 or 3" in out["error"]
     assert _board_state(worker.stores) == before
+
+
+@pytest.mark.usefixtures("worker")
+@pytest.mark.parametrize("platform", ["cli", "cron"])
+def test_a_saved_toolset_list_still_recovers_the_kanban_toolset(platform):
+    from hermes_cli.tools_config import _get_platform_tools
+    from toolsets import resolve_toolset
+
+    # The worker's spawn pin and a cron run take their toolsets from the
+    # platform resolution. With the offer tool in the kanban toolset, a profile
+    # that saved its own list still gets kanban back, and every kanban tool with it.
+    assert TOOL in resolve_toolset("kanban", include_registry=False)
+    saved = {"platform_toolsets": {platform: ["terminal", "web"]}}
+
+    enabled = _get_platform_tools(saved, platform)
+
+    assert {"terminal", "web", "kanban"} <= enabled
+    offered = {name for toolset in enabled for name in resolve_toolset(toolset)}
+    assert {"kanban_complete", "kanban_block", TOOL} <= offered

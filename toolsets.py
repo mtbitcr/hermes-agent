@@ -90,6 +90,8 @@ _HERMES_CORE_TOOLS = [
     # kanban_recommend is narrower still: dispatcher-owned workers only, never
     # orchestrator profiles (see _check_kanban_recommend_mode).
     "kanban_recommend",
+    # Same narrow gate, on the worker's own card (see _check_design_options_mode).
+    "kanban_offer_design_options",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
 ]
