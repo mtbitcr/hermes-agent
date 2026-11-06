@@ -86,6 +86,7 @@
   "tools/code_kernel_remote.py": "ed142f7b89cd4c9248454ce36010a50ca3e24d07e21c4465934e933304e6bb91",
   "tools/cronjob_job_args.py": "e8528971a419f806b551f3d5617cc2afb393048fa817e13219e24b0b5128fe7f",
   "tools/design_compare_judge.py": "05273e25db1ec421bdff925948ad354ea372d6d1a04eee78f7829033f033d50d",
+  "tools/design_compare_pixels.py": "74289750176300c3a3275b9c0c6644d9d1501683d6838a56adc708efd18054c3",
   "tools/environments/local_gitbash_probe.py": "65398ac87a186b8a74e629b7c7c616fc32f1b317f79bb848af5482cfa7498fcf",
   "tools/environments/local_pythonpath.py": "5e63afb429e6d505bc824fd097183b269a9afc382bae74bdbf5db0b698ee15a9",
   "tools/environments/modal_utils.py": "8b7579a9a2ffc169898cbd9f901b92f516994fb2d6221290683036a6be708246",
