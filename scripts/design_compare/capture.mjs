@@ -22,8 +22,11 @@ export const CHROMIUM_SWITCHES = ['--headless=new', '--disable-gpu', '--disable-
 export const FORCED = { animation: 'none', transition: 'none', 'caret-color': 'transparent', 'scroll-behavior': 'auto',
   '-webkit-font-smoothing': 'antialiased', 'text-rendering': 'geometricPrecision' }
 export const STYLE = `@layer dc-normalise{*,*::before,*::after{${Object.entries(FORCED).map(([k, v]) => `${k}:${v}!important`).join(';')}}}`
-// Runs at document creation in every frame, before page scripts: installs the layer, then rewrites inline !important and adopts the layer into every
-// shadow root (attachShadow hook, adoptedStyleSheets setter, and a MutationObserver that the parser flushes before it runs the next script).
+// Runs at document creation in every frame, before page scripts: installs the layer, adopts it into every shadow root (attachShadow hook, adoptedStyleSheets
+// setter) and keeps author inline !important out of the forced properties. The layer cannot beat inline !important, so inline declarations are rewritten
+// synchronously on the paths a page can use to set them (setProperty, cssText, the style property and attribute) and again before every getComputedStyle
+// and computedStyleMap read. Any other path is caught by a MutationObserver (which the parser flushes before it runs the next script); if that late repair
+// had to change an element the page had already read a computed style of, the capture is marked and refused, because the page may have seen the old value.
 function earlyNormalise(forced, css) {
   const style = document.createElement('style')
   style.id = '__dc_style'
@@ -32,24 +35,33 @@ function earlyNormalise(forced, css) {
   const sheet = new CSSStyleSheet()
   sheet.replaceSync(css)
   const watch = { childList: true, subtree: true, attributes: true, attributeFilter: ['style'] }
-  const fix = el => {
-    const s = el.style
-    if (s && Array.from(s).some(p => s.getPropertyPriority(p))) for (const [n, v] of Object.entries(forced)) s.setProperty(n, v, 'important')
+  const declaration = CSSStyleDeclaration.prototype
+  const setProperty = declaration.setProperty, getPriority = declaration.getPropertyPriority
+  const cssText = Object.getOwnPropertyDescriptor(declaration, 'cssText')
+  const observed = new WeakSet()
+  // Returns true when the declaration had to be rewritten.
+  const fixDeclaration = s => {
+    if (s.parentRule !== null || !Array.from(s).some(p => getPriority.call(s, p))) return false
+    const before = cssText.get.call(s)
+    for (const [n, v] of Object.entries(forced)) setProperty.call(s, n, v, 'important')
+    return cssText.get.call(s) !== before
   }
+  const fix = el => { try { return !!el.style && fixDeclaration(el.style) } catch { return false } }
+  const late = el => { if (fix(el) && observed.has(el)) style.dataset.tainted = '1' }
   const adopt = r => {
     if (!r.adoptedStyleSheets.includes(sheet)) r.adoptedStyleSheets = [sheet, ...r.adoptedStyleSheets]
     mo.observe(r, watch)
   }
   const scan = n => {
     for (const el of n.nodeType === 1 ? [n, ...n.querySelectorAll('*')] : n.querySelectorAll('*')) {
-      fix(el)
+      late(el)
       if (el.shadowRoot) { adopt(el.shadowRoot); scan(el.shadowRoot) }
     }
   }
   const put = () => document.documentElement && !style.isConnected && document.documentElement.appendChild(style)
   const mo = new MutationObserver(records => {
     put()
-    for (const r of records) { if (r.type === 'attributes') fix(r.target); else r.addedNodes.forEach(n => n.nodeType === 1 && scan(n)) }
+    for (const r of records) { if (r.type === 'attributes') late(r.target); else r.addedNodes.forEach(n => n.nodeType === 1 && scan(n)) }
   })
   mo.observe(document, watch)
   put()
@@ -59,6 +71,28 @@ function earlyNormalise(forced, css) {
   Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', {
     ...own, set(v) { const all = Array.from(v); own.set.call(this, all.includes(sheet) ? all : [sheet, ...all]) },
   })
+  declaration.setProperty = function setProperty_(...args) { const r = setProperty.apply(this, args); fixDeclaration(this); return r }
+  Object.defineProperty(declaration, 'cssText', { ...cssText, set(v) { cssText.set.call(this, v); fixDeclaration(this) } })
+  for (const proto of [HTMLElement, SVGElement, window.MathMLElement].filter(Boolean).map(c => c.prototype)) {
+    const inline = Object.getOwnPropertyDescriptor(proto, 'style')
+    if (inline && inline.set) Object.defineProperty(proto, 'style', { ...inline, set(v) { inline.set.call(this, v); fix(this) } })
+  }
+  for (const name of ['setAttribute', 'setAttributeNS']) {
+    const original = Element.prototype[name]
+    Element.prototype[name] = function (...args) {
+      const r = original.apply(this, args)
+      if (String(args[name === 'setAttribute' ? 0 : 1]).toLowerCase() === 'style') fix(this)
+      return r
+    }
+  }
+  const read = window.getComputedStyle
+  window.getComputedStyle = function getComputedStyle_(el, ...rest) {
+    if (el && el.nodeType === 1) { fix(el); observed.add(el) }
+    return read.call(this, el, ...rest)
+  }
+  const map = Element.prototype.computedStyleMap
+  if (map) Element.prototype.computedStyleMap = function () { fix(this); observed.add(this); return map.apply(this, arguments) }
+  style.dataset.sync = '1'
 }
 const INJECT = `(${earlyNormalise})(${JSON.stringify(FORCED)}, ${JSON.stringify(STYLE)})`
 const PROTOTYPE_PREFIX = '/__prototype__/'

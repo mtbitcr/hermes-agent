@@ -17,26 +17,13 @@
     return h ? normalize(h.textContent, 40) : ''
   }
 
-  function describe(el) {
+  // The ancestor landmarks from the page root as [tag, normalized first heading (at most 40 characters)]; the judge builds the keys from them.
+  function landmarksOf(el) {
     const chain = []
     for (let p = parentOf(el); p; p = parentOf(p)) {
-      if (LANDMARKS.has(p.localName)) chain.unshift(p.localName + (headingOf(p) ? `[${headingOf(p)}]` : ''))
+      if (LANDMARKS.has(p.localName)) chain.unshift([p.localName, headingOf(p)])
     }
-    return {
-      chain: chain.join(' > '),
-      role: el.getAttribute('role') || el.localName,
-      name: normalize(el.getAttribute('aria-label') || el.getAttribute('alt') || ownText(el), 60),
-    }
-  }
-
-  function assignKeys(els) {
-    const seen = new Map()
-    return els.map(el => {
-      const { chain, role, name } = describe(el)
-      const base = `${chain}/${role}:"${name}"`
-      seen.set(base, (seen.get(base) || 0) + 1)
-      return `${base}#${seen.get(base)}`
-    })
+    return chain
   }
 
   const canvas = typeof document === 'undefined' ? null : document.createElement('canvas')
@@ -58,7 +45,25 @@
     return [d[0], d[1], d[2], Math.round((d[3] / 255) * 1000) / 1000]
   }
 
-  const unquote = f => f.split(',')[0].trim().replace(/^["']|["']$/g, '').toLowerCase()
+  // The first family of a font-family list, unquoted and lower case; a comma inside quotes does not end it. Mirrors _first_family of the judge.
+  function firstFamily(value) {
+    let quote = null, escaped = false, end = value.length
+    for (let i = 0; i < value.length; i++) {
+      const ch = value[i]
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (quote) { if (ch === quote) quote = null }
+      else if (ch === '"' || ch === "'") quote = ch
+      else if (ch === ',') { end = i; break }
+    }
+    return familyName(value.slice(0, end))
+  }
+  // One family name (a FontFace family is a single name, never a list, so its commas are part of the name), unquoted and lower case.
+  function familyName(value) {
+    const family = value.trim()
+    const quoted = family.length >= 2 && (family[0] === '"' || family[0] === "'") && family.at(-1) === family[0]
+    return (quoted ? family.slice(1, -1) : family).toLowerCase()
+  }
   const round = n => Math.round(n * 100) / 100
 
   function hiddenByOpacity(el, style = styleOf, cache = new Map()) {
@@ -93,6 +98,11 @@
       const layered = root === win.document ? !!root.getElementById('__dc_style')
         : Array.from(root.adoptedStyleSheets).some(s => s.cssRules.length && s.cssRules[0].name === 'dc-normalise')
       if (!layered) throw new Error('the normalising stylesheet was not in place before page scripts ran in every document and shadow root')
+      const marker = win.document.getElementById('__dc_style')
+      if (!marker || marker.dataset.sync !== '1') throw new Error('synchronous normalisation was not installed before page scripts ran in every document')
+      if (marker.dataset.tainted === '1') {
+        throw new Error('normalisation could not be guaranteed: page code read a computed style before a mutation path the kit cannot cover was normalised')
+      }
     }
     for (const { el } of items) {
       const inline = el.style
@@ -110,14 +120,16 @@
     const loadedIn = doc => {
       if (!loadedBy.has(doc)) {
         const set = new Set()
-        doc.fonts.forEach(f => { if (f.status === 'loaded') set.add(unquote(f.family)) })
+        doc.fonts.forEach(f => { if (f.status === 'loaded') set.add(familyName(f.family)) })
         loadedBy.set(doc, set)
       }
       return loadedBy.get(doc)
     }
     const found = []
     const masks = []
-    for (const { el, ctx } of collect().items) {
+    const { items } = collect()
+    const index = new Map(items.map(({ el }, i) => [el, i]))
+    for (const { el, ctx } of items) {
       const tag = el.localName
       const cs = ctx.win.getComputedStyle(el)
       if (cs.webkitFontSmoothing !== 'antialiased' || cs.textRendering.toLowerCase() !== 'geometricprecision') {
@@ -137,27 +149,26 @@
       const text = normalize(ownText(el))
       const own = text || (bg && bg[3] > 0) || cs.backgroundImage !== 'none' || border.some(c => c && c[3] > 0)
       if (!SIGNIFICANT.has(tag) && !own) continue
-      const family = unquote(cs.fontFamily)
+      const family = firstFamily(cs.fontFamily)
+      const parent = parentOf(el)
       found.push({
-        el,
-        record: {
-          tag, text, pinned: cs.position === 'fixed' || cs.position === 'sticky', box,
-          type: {
-            family, size: parseFloat(cs.fontSize), weight: Number(cs.fontWeight),
-            line_height: cs.lineHeight === 'normal' ? 'normal' : parseFloat(cs.lineHeight), face_loaded: loadedIn(el.ownerDocument).has(family),
-          },
-          colour: {
-            color: rgba(cs.color), background_color: bg,
-            border_top_color: border[0], border_right_color: border[1], border_bottom_color: border[2], border_left_color: border[3],
-            text_decoration_color: cs.textDecorationLine === 'none' ? null : rgba(cs.textDecorationColor),
-            fill: tag === 'svg' ? rgba(cs.fill) : null, stroke: tag === 'svg' ? rgba(cs.stroke) : null,
-          },
+        landmarks: landmarksOf(el), tag, role: el.getAttribute('role') || tag,
+        label: el.getAttribute('aria-label') || '', alt: el.getAttribute('alt') || '', text,
+        parent: parent && index.has(parent) ? index.get(parent) : null,
+        fixed: cs.position === 'fixed' || cs.position === 'sticky', box,
+        style: {
+          'font-family': cs.fontFamily, 'font-face': loadedIn(el.ownerDocument).has(family) ? family : '',
+          'font-size': parseFloat(cs.fontSize), 'font-weight': Number(cs.fontWeight),
+          'line-height': cs.lineHeight === 'normal' ? 'normal' : parseFloat(cs.lineHeight),
+          color: rgba(cs.color), 'background-color': bg,
+          'border-top-color': border[0], 'border-right-color': border[1], 'border-bottom-color': border[2], 'border-left-color': border[3],
+          'text-decoration-color': cs.textDecorationLine === 'none' ? null : rgba(cs.textDecorationColor),
+          fill: tag === 'svg' ? rgba(cs.fill) : null, stroke: tag === 'svg' ? rgba(cs.stroke) : null,
         },
       })
     }
-    const keys = assignKeys(found.map(f => f.el))
     return {
-      elements: found.map((f, i) => ({ key: keys[i], ...f.record })),
+      elements: found,
       masks,
       pageHeight: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight),
     }
@@ -180,5 +191,5 @@
     if (p === 'fixed' || p === 'sticky') el.style.setProperty('visibility', 'hidden', 'important')
   })
 
-  return { normalize, describe, assignKeys, hiddenByOpacity, prepare, fontsReady, measure, settle, hidePinned }
+  return { normalize, landmarksOf, firstFamily, familyName, hiddenByOpacity, prepare, fontsReady, measure, settle, hidePinned }
 })()

@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createSocket } from 'node:dgram'
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { createServer as createTcpServer } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -52,13 +52,30 @@ function el(localName: string, attrs: Record<string, string>, ...kids: (FakeNode
   return node
 }
 
+// Port of the key rule in tools/design_compare_judge.py _entries (C1), applied to emitted elements.
+function judgeKeys(elements: any[]) {
+  const norm = (t: string) => (t ?? '').normalize('NFKC').split(/\s+/).filter(Boolean).join(' ').toLowerCase()
+  const name = (t: string) => Array.from(norm(t)).slice(0, 60).join('')
+  const seen = new Map<string, number>()
+
+  return elements.map(e => {
+    const chain = e.landmarks.map(([tag, heading]: [string, string]) => (norm(heading) ? `${tag}:${Array.from(norm(heading)).slice(0, 40).join('')}` : tag)).join('/')
+    const role = e.role || e.tag
+    const n = name(e.label) || name(e.alt) || name(e.text)
+    const id = `${chain}\u0000${role}\u0000${n}`
+    seen.set(id, (seen.get(id) ?? 0) + 1)
+
+    return `${chain}/${role}:"${n}"#${seen.get(id)}`
+  })
+}
+
 describe('key building', () => {
   it('normalizes with NFKC, collapsed whitespace, lower case and a character limit', () => {
     expect(probe.normalize('  Ｆｕｌｌ\n  WIDTH\tText ', 60)).toBe('full width text')
     expect(probe.normalize('x'.repeat(100), 60)).toHaveLength(60)
   })
 
-  it('builds chain/role:"name"#n keys in document order', () => {
+  it('records the ancestor landmarks with their first heading, so the judge builds chain/role:"name"#n keys in document order', () => {
     const h1 = el('h1', {}, 'Hello \n World')
     const buyA = el('a', {}, 'Buy')
     const buyB = el('a', {}, ' buy ')
@@ -70,15 +87,25 @@ describe('key building', () => {
     const main = el('main', {}, section)
     el('body', {}, header, main)
 
-    const keys = probe.assignKeys([h1, logo, longHeading, buyA, buyB, close, section])
-    expect(keys).toEqual([
-      'header[hello world]/h1:"hello world"#1',
-      'header[hello world]/img:"logo"#1',
-      `main[${'a'.repeat(40)}] > section[${'a'.repeat(40)}]/h2:"${'a'.repeat(60)}"#1`,
-      `main[${'a'.repeat(40)}] > section[${'a'.repeat(40)}]/a:"buy"#1`,
-      `main[${'a'.repeat(40)}] > section[${'a'.repeat(40)}]/a:"buy"#2`,
-      `main[${'a'.repeat(40)}] > section[${'a'.repeat(40)}]/button:"close"#1`,
-      `main[${'a'.repeat(40)}]/section:""#1`,
+    const inner = [['main', 'a'.repeat(40)], ['section', 'a'.repeat(40)]]
+    expect(probe.landmarksOf(h1)).toEqual([['header', 'hello world']])
+    expect(probe.landmarksOf(longHeading)).toEqual(inner)
+    expect(probe.landmarksOf(section)).toEqual([['main', 'a'.repeat(40)]])
+    expect(probe.landmarksOf(header)).toEqual([])
+
+    const asElement = (node: FakeNode, extra: Record<string, string>) => ({ landmarks: probe.landmarksOf(node), tag: node.localName, role: node.localName, label: '', alt: '', text: '', ...extra })
+
+    expect(judgeKeys([
+      asElement(h1, { text: 'hello world' }), asElement(logo, { alt: 'Logo' }), asElement(longHeading, { text: 'a'.repeat(60) }),
+      asElement(buyA, { text: 'buy' }), asElement(buyB, { text: 'buy' }), asElement(close, { label: 'Close', text: 'x' }), asElement(section, {}),
+    ])).toEqual([
+      'header:hello world/h1:"hello world"#1',
+      'header:hello world/img:"logo"#1',
+      `main:${'a'.repeat(40)}/section:${'a'.repeat(40)}/h2:"${'a'.repeat(60)}"#1`,
+      `main:${'a'.repeat(40)}/section:${'a'.repeat(40)}/a:"buy"#1`,
+      `main:${'a'.repeat(40)}/section:${'a'.repeat(40)}/a:"buy"#2`,
+      `main:${'a'.repeat(40)}/section:${'a'.repeat(40)}/button:"close"#1`,
+      `main:${'a'.repeat(40)}/section:""#1`,
     ])
   })
 
@@ -91,13 +118,43 @@ describe('key building', () => {
     el('body', {}, el('section', {}, frame))
     const inFrame = el('h3', {}, 'Framed')
     inFrame.ownerDocument = { defaultView: { frameElement: frame } }
-    expect(probe.assignKeys([inShadow, inFrame])).toEqual(['main/h2:"inner"#1', 'section/h3:"framed"#1'])
+    expect(probe.landmarksOf(inShadow)).toEqual([['main', '']])
+    expect(probe.landmarksOf(inFrame)).toEqual([['section', '']])
+  })
+})
+
+describe('first font family', () => {
+  // Mirrors _first_family in tools/design_compare_judge.py: quote and escape aware, unquoted, lower case.
+  it('keeps a comma inside a quoted family and splits only on the comma that ends the first family', () => {
+    expect(probe.firstFamily('"Acme,Display", serif')).toBe('acme,display')
+    expect(probe.firstFamily('"Acme,Other", serif')).toBe('acme,other')
+    expect(probe.firstFamily("'Acme, Display' , serif")).toBe('acme, display')
+    expect(probe.firstFamily('Georgia, "Times New Roman", serif')).toBe('georgia')
+    expect(probe.firstFamily('  Geist Variable ,sans-serif')).toBe('geist variable')
+    expect(probe.firstFamily('"Acme"')).toBe('acme')
+    expect(probe.firstFamily('')).toBe('')
   })
 
-  it('prefers an explicit role to the tag name', () => {
-    const d = el('div', { role: 'alert' }, 'Saved')
-    el('body', {}, d)
-    expect(probe.assignKeys([d])).toEqual(['/alert:"saved"#1'])
+  it('honours backslash escapes and the other quote character inside a quoted family', () => {
+    expect(probe.firstFamily('"Ac\\"me,X", serif')).toBe('ac\\"me,x')
+    expect(probe.firstFamily('"It\'s,fine", serif')).toBe("it's,fine")
+    expect(probe.firstFamily('Acme\\,X, serif')).toBe('acme\\,x')
+  })
+
+  it('names a FontFace family as one name, so its commas are never list separators', () => {
+    expect(probe.familyName('Acme,Display')).toBe('acme,display')
+    expect(probe.familyName('"Acme,Display"')).toBe('acme,display')
+    expect(probe.familyName(" 'Acme,Other' ")).toBe('acme,other')
+    expect(probe.familyName('Acme')).toBe('acme')
+    expect(probe.familyName('Acme,Display')).toBe(probe.firstFamily('"Acme,Display", serif'))
+    expect(probe.familyName('Acme,Display')).not.toBe(probe.firstFamily('"Acme,Other", serif'))
+  })
+
+  it('gives different identities to different comma-containing names and the same one to equal names', () => {
+    const family = (v: string) => probe.firstFamily(v)
+    expect(family('"Acme,Display", serif')).not.toBe(family('"Acme,Other", serif'))
+    expect(family('"Acme,Display", serif')).toBe(family("'ACME,display', monospace"))
+    expect(family('"Acme,Display"')).toBe(probe.firstFamily('"Acme,Display", serif'))
   })
 })
 
@@ -146,68 +203,117 @@ describe('probe visibility and motion', () => {
 
 const SHA = 'a'.repeat(64)
 
-// PROVISIONAL fixture of design_compare_bundle_v1, derived from the wording of plan Q2/Q3 by this kit.
-// C1 (task t_d7a1493a) had not run when this was written, so its schema constants did not exist and this is NOT
-// a copy of them. Compare this fixture with C1's actual constants before C4 uses both.
-const BUNDLE_V1 = {
-  schema: 'design_compare_bundle_v1',
-  fields: {
-    schema: 'const', kit_sha256: 'sha256', chromium_version: 'string', run_id: 'string', candidate_digest: 'string',
-    page: 'string', width: [1280, 375], page_height: 'int', image: 'string', blocked_requests: ['string'],
-    masks: [{ x: 'number', y: 'number', width: 'number', height: 'number' }],
-    elements: [{
-      key: 'string', tag: 'string', text: 'string', pinned: 'boolean',
-      box: { x: 'number', y: 'number', width: 'number', height: 'number' },
-      type: { family: 'string', size: 'number', weight: 'number', line_height: 'number|normal', face_loaded: 'boolean' },
-      colour: {
-        color: 'rgba', background_color: 'rgba', border_top_color: 'rgba', border_right_color: 'rgba',
-        border_bottom_color: 'rgba', border_left_color: 'rgba', text_decoration_color: 'rgba', fill: 'rgba', stroke: 'rgba',
-      },
-    }],
-  },
+// C1 contract, copied literally from tools/design_compare_judge.py at ca87885d13bb4c83638cc8b1f655b70c6c55a1d6
+// (blob 593a770a561b7eac7448ffb63586d3a7b0386809). WIDTHS, COLOUR_PROPERTIES and BOX_FIELDS are the constants those four depend on.
+const SCHEMA = 'design_compare_bundle_v1'
+const WIDTHS = [1280, 375]
+
+const COLOUR_PROPERTIES = [
+  'color', 'background-color', 'border-top-color', 'border-right-color', 'border-bottom-color',
+  'border-left-color', 'text-decoration-color', 'fill', 'stroke',
+]
+
+const BUNDLE_FIELDS = ['schema', 'page', 'width', 'elements']
+const ELEMENT_FIELDS = ['landmarks', 'tag', 'role', 'label', 'alt', 'text', 'parent', 'fixed', 'box', 'style']
+const BOX_FIELDS = ['x', 'y', 'width', 'height']
+const STYLE_FIELDS = ['font-family', 'font-face', 'font-size', 'font-weight', 'line-height', ...COLOUR_PROPERTIES]
+
+// Port of _validate and _require of the same file: the first problem wins, only presence is checked, and any extra field
+// (bundle metadata, for example) is tolerated.
+function judgeValidate(bundle: any): string | null {
+  const isObject = (v: any) => v !== null && typeof v === 'object' && !Array.isArray(v)
+
+  const require = (obj: any, fields: string[], where: string) => {
+    if (!isObject(obj)) {return `${where} is not an object`}
+
+    for (const f of fields) {
+      if (!Object.hasOwn(obj, f)) {return `${where} is missing field ${f}`}
+    }
+
+    return null
+  }
+
+  if (!isObject(bundle) || bundle.schema !== SCHEMA) {return `unknown bundle schema, expected ${SCHEMA}`}
+  const top = require(bundle, BUNDLE_FIELDS, 'bundle')
+
+  if (top) {return top}
+
+  if (!WIDTHS.includes(bundle.width)) {return `bundle width ${bundle.width} is not one of ${WIDTHS}`}
+
+  for (const [i, element] of Array.from(bundle.elements as any[]).entries()) {
+    const problem = require(element, ELEMENT_FIELDS, `element ${i}`) ?? require(element.box, BOX_FIELDS, `element ${i} box`)
+      ?? require(element.style, STYLE_FIELDS, `element ${i} style`)
+
+    if (problem) {return problem}
+  }
+
+  return null
 }
 
-function conforms(value: any, spec: any, path = '$'): string[] {
-  const bad = (why: string) => [`${path}: ${why}`]
+// The value shapes compare_bundles, _entries, _shift and _style_differences of the same file rely on after _validate has passed.
+function judgeShapeProblems(bundle: any): string[] {
+  const out: string[] = []
+  const num = (v: any) => typeof v === 'number' && Number.isFinite(v)
+  const str = (v: any) => typeof v === 'string'
 
-  if (Array.isArray(spec)) {
-    if (typeof spec[0] === 'number') {return spec.includes(value) ? [] : bad(`not one of ${spec}`)}
+  const check = (ok: boolean, why: string) => { if (!ok) {out.push(why)} }
 
-    if (!Array.isArray(value)) {return bad('not an array')}
+  check(str(bundle.page), 'page is a string')
+  check(Array.isArray(bundle.elements), 'elements is a list')
 
-    return value.flatMap((v, i) => conforms(v, spec[0], `${path}[${i}]`))
+  for (const [i, e] of (bundle.elements as any[]).entries()) {
+    const at = `element ${i}`
+    check(Array.isArray(e.landmarks) && e.landmarks.every((l: any) => Array.isArray(l) && l.length === 2 && str(l[0]) && str(l[1])), `${at} landmarks are [tag, heading] pairs`)
+
+    for (const f of ['tag', 'role', 'label', 'alt', 'text']) {check(str(e[f]), `${at} ${f} is a string`)}
+
+    check(e.tag !== '' && e.role !== '', `${at} has a tag and a role`)
+    check(e.parent === null || Number.isInteger(e.parent), `${at} parent is an identity or null`)
+    check(typeof e.fixed === 'boolean', `${at} fixed is a boolean`)
+
+    for (const f of BOX_FIELDS) {check(num(e.box[f]), `${at} box.${f} is a number`)}
+
+    const s = e.style
+    check(str(s['font-family']) && s['font-family'] !== '', `${at} font-family is a string`)
+    check(str(s['font-face']), `${at} font-face is a string`)
+    check(num(s['font-size']), `${at} font-size is a number`)
+    check(num(s['font-weight']), `${at} font-weight is a number`)
+    check(s['line-height'] === 'normal' || num(s['line-height']), `${at} line-height is a number or normal`)
+
+    for (const f of COLOUR_PROPERTIES) {check(s[f] === null || (Array.isArray(s[f]) && s[f].length === 4 && s[f].every(num)), `${at} ${f} is null or [r, g, b, a]`)}
   }
 
-  if (typeof spec === 'object') {
-    if (value === null || typeof value !== 'object') {return bad('not an object')}
-    const extra = Object.keys(value).filter(k => !(k in spec)).map(k => `${path}.${k}: unexpected`)
+  return out
+}
 
-    return [...extra, ...Object.keys(spec).flatMap(k => (k in value ? conforms(value[k], spec[k], `${path}.${k}`) : bad(`missing ${k}`)))]
-  }
+// The emitted contract: the judge's fields and nothing else on an element, its box and its style; metadata only on the bundle.
+function contractProblems(bundle: any): string[] {
+  const exact = (obj: any, fields: string[], where: string) =>
+    Object.keys(obj).filter(k => !fields.includes(k)).map(k => `${where}.${k}: unexpected`)
 
-  const ok: Record<string, (v: any) => boolean> = {
-    string: v => typeof v === 'string',
-    number: v => typeof v === 'number' && Number.isFinite(v),
-    int: v => Number.isInteger(v),
-    boolean: v => typeof v === 'boolean',
-    sha256: v => typeof v === 'string' && /^[0-9a-f]{64}$/.test(v),
-    'number|normal': v => v === 'normal' || (typeof v === 'number' && Number.isFinite(v)),
-    rgba: v => v === null || (Array.isArray(v) && v.length === 4 && v.every(n => typeof n === 'number')),
-    const: v => v === BUNDLE_V1.schema,
-  }
+  const first = judgeValidate(bundle)
 
-  return ok[spec](value) ? [] : bad(`not ${spec}`)
+  if (first) {return [first]}
+
+  return [
+    ...judgeShapeProblems(bundle),
+    ...bundle.elements.flatMap((e: any, i: number) => [
+      ...exact(e, ELEMENT_FIELDS, `element ${i}`), ...exact(e.box, BOX_FIELDS, `element ${i} box`), ...exact(e.style, STYLE_FIELDS, `element ${i} style`),
+    ]),
+    ...(['kit_sha256', 'chromium_version', 'run_id', 'candidate_digest', 'page_height', 'image', 'blocked_requests', 'masks'] as const)
+      .filter(k => !(k in bundle)).map(k => `bundle is missing metadata ${k}`),
+  ]
 }
 
 const rgba = [1, 2, 3, 1]
 
 const sampleElement = {
-  key: 'header/h1:"hi"#1', tag: 'h1', text: 'hi', pinned: false,
+  landmarks: [['header', 'hi']], tag: 'h1', role: 'h1', label: '', alt: '', text: 'hi', parent: 3, fixed: false,
   box: { x: 0, y: 8, width: 100, height: 30 },
-  type: { family: 'geist', size: 16, weight: 500, line_height: 'normal', face_loaded: true },
-  colour: {
-    color: rgba, background_color: [0, 0, 0, 0], border_top_color: null, border_right_color: null,
-    border_bottom_color: null, border_left_color: null, text_decoration_color: rgba, fill: null, stroke: null,
+  style: {
+    'font-family': '"Acme,Display", serif', 'font-face': 'acme,display', 'font-size': 16, 'font-weight': 500, 'line-height': 'normal',
+    color: rgba, 'background-color': [0, 0, 0, 0], 'border-top-color': null, 'border-right-color': null, 'border-bottom-color': null,
+    'border-left-color': null, 'text-decoration-color': rgba, fill: null, stroke: null,
   },
 }
 
@@ -218,19 +324,51 @@ const bundleInput = {
 }
 
 describe('bundle', () => {
-  it('matches the provisional design_compare_bundle_v1 fixture', () => {
-    const bundle = JSON.parse(JSON.stringify(kit.buildBundle(bundleInput)))
-    expect(conforms(bundle, BUNDLE_V1.fields)).toEqual([])
-    expect(bundle.schema).toBe('design_compare_bundle_v1')
-    expect(bundle.elements[0].key).toBe(sampleElement.key)
+  it('pins the copied C1 contract constants', () => {
+    expect(SCHEMA).toBe('design_compare_bundle_v1')
+    expect(STYLE_FIELDS).toHaveLength(14)
+    expect(ELEMENT_FIELDS).toHaveLength(10)
   })
 
-  it('the fixture check rejects a missing, extra or mistyped field', () => {
+  it('a constructed bundle satisfies the C1 validator, the value shapes the comparator relies on, and keeps the capture metadata', () => {
+    const bundle = JSON.parse(JSON.stringify(kit.buildBundle(bundleInput)))
+    expect(contractProblems(bundle)).toEqual([])
+    expect(bundle).toMatchObject({ schema: SCHEMA, kit_sha256: SHA, chromium_version: '1.2.3.4', run_id: 'run-7', candidate_digest: 'digest', page: '/', width: 1280 })
+    expect(bundle.blocked_requests).toEqual(['https://beacon.example/x'])
+    expect(bundle.elements).toEqual([sampleElement])
+  })
+
+  it('the ported validator refuses the first missing field, a wrong schema or width, and tolerates extra metadata', () => {
     const good = JSON.parse(JSON.stringify(kit.buildBundle(bundleInput)))
-    const { run_id: _dropped, ...missing } = good
-    expect(conforms(missing, BUNDLE_V1.fields)).not.toEqual([])
-    expect(conforms({ ...good, surprise: 1 }, BUNDLE_V1.fields)).not.toEqual([])
-    expect(conforms({ ...good, width: 1024 }, BUNDLE_V1.fields)).not.toEqual([])
+    expect(judgeValidate(good)).toBeNull()
+    expect(judgeValidate({ ...good, surprise: 1 })).toBeNull()
+    expect(judgeValidate({ ...good, schema: 'v2' })).toMatch(/^unknown bundle schema/)
+    expect(judgeValidate({ ...good, width: 1024 })).toBe('bundle width 1024 is not one of 1280,375')
+    const { elements: _dropped, ...noElements } = good
+    expect(judgeValidate(noElements)).toBe('bundle is missing field elements')
+
+    for (const field of ELEMENT_FIELDS) {
+      const { [field]: _gone, ...rest } = sampleElement as Record<string, unknown>
+      expect(judgeValidate({ ...good, elements: [rest] }), field).toBe(`element 0 is missing field ${field}`)
+    }
+
+    const { 'font-face': _face, ...style } = sampleElement.style
+    expect(judgeValidate({ ...good, elements: [{ ...sampleElement, style }] })).toBe('element 0 style is missing field font-face')
+    const { height: _h, ...box } = sampleElement.box
+    expect(judgeValidate({ ...good, elements: [{ ...sampleElement, box }] })).toBe('element 0 box is missing field height')
+  })
+
+  it('refuses the old self-authored element shape with the reviewer\'s message, and catches mistyped values and stray element fields', () => {
+    const old = { key: 'h1', tag: 'h1', text: 'hi', pinned: false, box: sampleElement.box, type: {}, colour: {} }
+    const good = JSON.parse(JSON.stringify(kit.buildBundle(bundleInput)))
+    expect(contractProblems({ ...good, elements: [old] })).toEqual(['element 0 is missing field landmarks'])
+    const bad = { ...sampleElement, fixed: 'no', parent: 'x', landmarks: ['header'], style: { ...sampleElement.style, 'line-height': '1.5', color: [1, 2, 3] }, key: 'k' }
+    expect(contractProblems({ ...good, elements: [bad] })).toEqual(expect.arrayContaining([
+      'element 0 fixed is a boolean', 'element 0 parent is an identity or null', 'element 0 landmarks are [tag, heading] pairs',
+      'element 0 line-height is a number or normal', 'element 0 color is null or [r, g, b, a]', 'element 0.key: unexpected',
+    ]))
+    const { run_id: _run, ...noRun } = good
+    expect(contractProblems(noRun)).toEqual(['bundle is missing metadata run_id'])
   })
 })
 
@@ -409,6 +547,10 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
 #wa{width:80px;height:60px;background:red}h1{margin:16px}</style><h1>Tiny page</h1><div id=box></div><div id=wa></div><p>Some text</p>
 <div style="opacity:0"><p>Invisible text</p></div>
 <div style="visibility:hidden"><p style="visibility:visible">Shown override</p></div><p>Visible control</p>
+<header><h1>Site title</h1><nav><a href="/x" aria-label="Go home">Home</a></nav></header>
+<main><section role="region"><h2>Part one</h2><p style="font:italic 700 18px/30px Georgia,serif;color:rgba(10,20,30,.5)">Body text</p>
+<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="A dot" width=20 height=20><button>Go</button></section></main>
+<div style="position:fixed;bottom:0;left:0;color:#369">Pinned</div>
 <script>document.getElementById('wa').animate([{transform:'translateX(0px)'},{transform:'translateX(300px)'}],{duration:${ms},iterations:Infinity})</script>`
 
   let motionRuns: Promise<[Awaited<ReturnType<typeof shoot>>, Awaited<ReturnType<typeof shoot>>]> | undefined
@@ -418,13 +560,39 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
     const [a, b] = await motion()
     sameFiles(a.outDir, b.outDir)
     const bundle = JSON.parse(readFileSync(join(a.outDir, `${kit.pageSlug('/')}-1280.json`), 'utf8'))
-    expect(conforms(bundle, BUNDLE_V1.fields)).toEqual([])
+    expect(contractProblems(bundle)).toEqual([])
     expect(bundle.elements.find((e: any) => e.box.width === 80 && e.box.height === 60).box.x).toBe(0)
     expect(bundle.chromium_version).toBe('153.0.8010.0')
   }, 120_000)
 
+  it('emits bundles that satisfy the C1 contract at both widths: landmarks, role, label, alt, parent, fixed and the STYLE_FIELDS names', async () => {
+    const [{ bundles }] = await motion()
+    expect(bundles.map((b: any) => b.width)).toEqual([1280, 375])
+
+    for (const bundle of bundles) {
+      expect(contractProblems(JSON.parse(JSON.stringify(bundle))), `${bundle.width}`).toEqual([])
+      const keys = judgeKeys(bundle.elements)
+      expect(keys).toEqual(expect.arrayContaining([
+        'header:site title/h1:"site title"#1', 'header:site title/nav/a:"go home"#1', 'main:part one/region:""#1',
+        'main:part one/section:part one/img:"a dot"#1', 'main:part one/section:part one/button:"go"#1', '/div:"pinned"#1',
+      ]))
+      expect(new Set(keys).size).toBe(keys.length)
+      const body = byText(bundle, 'body text')
+      expect(body.style).toMatchObject({ 'font-size': 18, 'font-weight': 700, 'line-height': 30, color: [10, 20, 30, 0.5] })
+      expect(body.style['font-family']).toBe('Georgia, serif')
+      expect(body.landmarks).toEqual([['main', 'part one'], ['section', 'part one']])
+      expect(byText(bundle, 'pinned').fixed).toBe(true)
+      expect(body.fixed).toBe(false)
+      expect(Number.isInteger(body.parent)).toBe(true)
+      expect(bundle.elements.filter((e: any) => e.parent === body.parent).map((e: any) => e.tag)).toEqual(['h2', 'p', 'img', 'button'])
+      expect(bundle.run_id).toBe('run-1')
+      expect(bundle.candidate_digest).toBe('d1')
+      expect(bundle.kit_sha256).toMatch(/^[0-9a-f]{64}$/)
+    }
+  }, 120_000)
+
   it('excludes elements under an opacity-zero ancestor and keeps visible controls', async () => {
-    const keys = (await motion())[0].bundles[0].elements.map((e: any) => e.key)
+    const keys = judgeKeys((await motion())[0].bundles[0].elements)
     expect(keys).toContain('/p:"visible control"#1')
     expect(keys).toContain('/p:"shown override"#1')
     expect(keys.join('\n')).not.toContain('invisible text')
@@ -603,16 +771,16 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
     const runs = await Promise.all([shadow(10), shadow(40), frame(10), frame(40)].map(html => shoot({ 'index.html': html })))
     const [s10, s40, f10, f40] = runs.map(x => read(x.outDir))
 
-    expect(byText(s10, 'visible shadow text').type.size).toBe(10)
-    expect(byText(s40, 'visible shadow text').type.size).toBe(40)
-    expect(byText(f10, 'frame text').type.size).toBe(10)
-    expect(byText(f40, 'frame text').type.size).toBe(40)
+    expect(byText(s10, 'visible shadow text').style['font-size']).toBe(10)
+    expect(byText(s40, 'visible shadow text').style['font-size']).toBe(40)
+    expect(byText(f10, 'frame text').style['font-size']).toBe(10)
+    expect(byText(f40, 'frame text').style['font-size']).toBe(40)
     expect(JSON.stringify(s10)).not.toBe(JSON.stringify(s40))
     expect(JSON.stringify(f10)).not.toBe(JSON.stringify(f40))
     expect(byText(f10, 'frame text').box.x).toBeGreaterThanOrEqual(40)
     expect(byText(f10, 'frame text').box.y).toBeGreaterThan(60)
     expect(s10.masks).toContainEqual(expect.objectContaining({ width: 50, height: 20 }))
-    expect(byText(f10, 'pin').pinned).toBe(true)
+    expect(byText(f10, 'pin').fixed).toBe(true)
   }, 120_000)
 
   it('refuses closed shadow roots, declarative closed roots and unreadable frames instead of claiming complete evidence', async () => {
@@ -696,7 +864,7 @@ const o = r.getElementById('o'); o.textContent = getComputedStyle(r.getElementBy
       expect(JSON.stringify(read(b.outDir, width))).toBe(JSON.stringify(read(a.outDir, width)))
       const bodies = read(a.outDir, width).elements.filter((e: any) => e.tag === 'body')
       expect(bodies.map((e: any) => e.text).sort(), `${width} body text`).toEqual(['frame body text', 'top body text'])
-      expect(bodies.find((e: any) => e.text === 'top body text').colour.background_color).toEqual([238, 238, 238, 1])
+      expect(bodies.find((e: any) => e.text === 'top body text').style['background-color']).toEqual([238, 238, 238, 1])
     }
   }, 120_000)
 
@@ -715,5 +883,93 @@ const o = r.getElementById('o'); o.textContent = getComputedStyle(r.getElementBy
 
     const err: any = await shoot({ 'index.html': `${page('')}<script>addEventListener('load', () => document.getElementById('__dc_style').textContent = '')</script>` }).catch((e: unknown) => e)
     expect(err.message).toContain('rendering normalisation is not effective')
+  }, 120_000)
+
+  const fontPage = (face: string, used: string) => `<!doctype html><style>
+@font-face{font-family:${face};src:url(/acme.woff2) format('woff2')}
+body{margin:0;font-size:32px}#t{display:inline-block;font-family:${used};margin:0}</style><p id=t>Measured text</p>`
+
+  const fontSite = (face: string, used: string) => {
+    const site = dirOf({ 'index.html': fontPage(face, used) })
+    copyFileSync(fileURLToPath(new URL('../web/public/fonts/Mondwest-Regular.woff2', import.meta.url)), join(site, 'acme.woff2'))
+
+    return kit.capture({ side: 'candidate', siteDir: site, pages: ['/'], outDir: join(scratch, `out-${++seq}`), chromium, runId: 'r', candidateDigest: 'd' })
+  }
+
+  it('keeps comma-containing quoted font families apart on the measured element, and equal when the names match', async () => {
+    const [same, other, matching] = await Promise.all([
+      fontSite('"Acme,Display"', '"Acme,Display", serif'), fontSite('"Acme,Display"', '"Acme,Other", serif'), fontSite("'Acme,Display'", "'ACME,display', monospace"),
+    ])
+
+    for (let i = 0; i < 2; i++) {
+      const [a, b, c] = [same, other, matching].map(r => byText(r[i], 'measured text'))
+      const first = (e: any) => probe.firstFamily(e.style['font-family'])
+      expect(a.style['font-family'], `${i}`).toBe('"Acme,Display", serif')
+      expect(b.style['font-family']).toBe('"Acme,Other", serif')
+      expect([first(a), first(b)]).toEqual(['acme,display', 'acme,other'])
+      expect(a.style['font-face']).toBe('acme,display')
+      expect(b.style['font-face']).toBe('')
+      expect(a.box.width).not.toBe(b.box.width)
+      expect(first(c)).toBe(first(a))
+      expect(c.style['font-face']).toBe(first(a))
+      expect(c.box).toEqual(a.box)
+      expect(c.style['font-face']).toBe(a.style['font-face'])
+    }
+  }, 120_000)
+
+  const dynamic = (smoothing: string, rendering: string) => {
+    const decl = `-webkit-font-smoothing:${smoothing};text-rendering:${rendering}`
+
+    return `(() => {
+  const show = (root, p) => { const c = getComputedStyle(p); const q = document.createElement('p'); q.textContent = c.webkitFontSmoothing + ' / ' + c.textRendering; root.appendChild(q) }
+  const make = root => {
+    let p = document.createElement('p'); p.textContent = 'one'
+    p.style.setProperty('-webkit-font-smoothing', '${smoothing}', 'important'); p.style.setProperty('text-rendering', '${rendering}', 'important')
+    root.appendChild(p); show(root, p)
+    p = document.createElement('p'); p.textContent = 'two'; p.style.cssText = '${decl}!important'; root.appendChild(p); show(root, p)
+    p = document.createElement('p'); p.textContent = 'three'; p.setAttribute('style', '${decl}!important'); root.appendChild(p); show(root, p)
+    p = document.createElement('p'); p.textContent = 'four'; p.style = '${decl}!important'; root.appendChild(p); show(root, p)
+    const host = document.createElement('div'); root.appendChild(host); host.innerHTML = '<span style="${decl}!important">five</span>'; show(root, host.firstChild)
+    p = document.createElement('p'); p.textContent = 'six'; const live = getComputedStyle(p); root.appendChild(p)
+    p.style.setProperty('-webkit-font-smoothing', '${smoothing}', 'important'); p.style.setProperty('text-rendering', '${rendering}', 'important')
+    const q = document.createElement('p'); q.textContent = live.webkitFontSmoothing + ' / ' + live.textRendering; root.appendChild(q)
+  }
+  return make
+})()`
+  }
+
+  const dynamicPage = (smoothing: string, rendering: string) => {
+    const make = dynamic(smoothing, rendering)
+    const frame = `<body>Frame text<script>${make}(document.body)</script>`.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+
+    return `<!doctype html><body>Top text<div id=top></div><div id=host></div><script>
+${make}(document.getElementById('top'))
+host.attachShadow({mode:'open'}); ${make}(host.shadowRoot)</script><iframe srcdoc="${frame}"></iframe>`
+  }
+
+  it('normalises synchronously: created, style-set (setProperty, cssText, style attribute, style property), inserted and read-back elements in the page, an open shadow root and a srcdoc frame', async () => {
+    const [a, b] = await Promise.all([
+      shoot({ 'index.html': dynamicPage('subpixel-antialiased', 'optimizeSpeed') }), shoot({ 'index.html': dynamicPage('none', 'optimizeLegibility') }),
+    ])
+
+    for (const width of [1280, 375]) {
+      const shown = read(a.outDir, width).elements.filter((e: any) => e.text === 'antialiased / geometricprecision')
+      expect(shown, `${width}`).toHaveLength(18)
+      expect(JSON.stringify(read(b.outDir, width))).toBe(JSON.stringify(read(a.outDir, width)))
+    }
+
+    sameFiles(a.outDir, b.outDir)
+  }, 120_000)
+
+  it('refuses the capture when a retained computed style was read after a mutation path the kit cannot cover, and accepts the same bypass when nothing observed the element', async () => {
+    const page = (retain: boolean) => `<!doctype html><p id=a>A</p><p id=o></p><script>
+const p = document.getElementById('a'), live = ${retain ? 'getComputedStyle(p)' : 'null'}
+p.attributes.style ? 0 : p.setAttribute('style', 'color:red')
+p.attributes.style.value = 'text-rendering:optimizeSpeed!important'
+document.getElementById('o').textContent = (live || getComputedStyle(p)).textRendering</script>`
+
+    const [err, { bundles }]: any[] = await Promise.all([shoot({ 'index.html': page(true) }).catch((e: unknown) => e), shoot({ 'index.html': page(false) })])
+    expect(err.message).toContain('normalisation could not be guaranteed')
+    expect(bundles.map((b: any) => b.elements.some((e: any) => e.text === 'geometricprecision'))).toEqual([true, true])
   }, 120_000)
 })
