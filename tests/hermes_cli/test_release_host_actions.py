@@ -1207,6 +1207,77 @@ def test_environment_snapshot_and_restore_round_trip(tmp_path, platform_env):
     assert os.readlink(link) == str(real)
 
 
+# The bytecode Python writes beside the modules it imports, as a live environment holds it: at
+# the top of site-packages, in a package and deep inside it, where batch 67's copy failed.
+BYTECODE = (
+    "__pycache__/pillow.cpython-311.pyc",
+    "cryptography/__pycache__/__init__.cpython-311.pyc",
+    "cryptography/hazmat/bindings/__pycache__/__init__.cpython-311.pyc",
+)
+
+
+def with_bytecode(site: Path) -> list[Path]:
+    """Install a package laid out as cryptography's into site-packages, with the bytecode of
+    BYTECODE beside its modules. Returns the __pycache__ folders, the deepest last."""
+    for rel in ("cryptography/__init__.py", "cryptography/hazmat/bindings/__init__.py", *BYTECODE):
+        (site / rel).parent.mkdir(parents=True, exist_ok=True)
+        (site / rel).write_bytes(b"bytecode" if rel.endswith(".pyc") else b"")
+    return [(site / rel).parent for rel in BYTECODE]
+
+
+def without_bytecode(entries: dict[str, tuple]) -> dict[str, tuple]:
+    """The entries of a tree that lie outside every __pycache__."""
+    return {rel: entry for rel, entry in entries.items() if "__pycache__" not in rel.split("/")}
+
+
+def test_environment_snapshot_holds_no_pycache_and_every_other_entry_exactly(
+    tmp_path, platform_env
+):
+    # A snapshot needs no bytecode, which Python writes again. Everything else is copied as it is:
+    # each file with its bytes and mode, each link as a link to the same target.
+    real, site = platform_env.real, platform_env.site
+    caches = with_bytecode(site)
+    os.symlink("python", real / "bin" / "python3")  # a relative link, as venv makes them
+    os.symlink("lib", real / "lib64")  # a link to a folder, as venv makes on Linux
+    (real / "pyvenv.cfg").chmod(0o600)
+    (site / "pillow.py").chmod(0o444)
+    expected = without_bytecode(tree(real))
+
+    make_actions(tmp_path, venv_dir=platform_env.link).take_environment_snapshot("NEW")
+
+    snapshot = tmp_path / "snapshots" / "env" / "NEW"
+    assert sorted(snapshot.rglob("__pycache__")) == []
+    assert tree(snapshot) == expected
+    assert all(cache.is_dir() for cache in caches)  # the live environment keeps its bytecode
+
+
+def test_environment_snapshot_does_not_fail_when_a_pycache_is_removed_mid_copy(
+    tmp_path, monkeypatch, platform_env
+):
+    # Batch 67: a hermes command started during the release swept the environment's bytecode while
+    # the copy ran, and the copy failed on a __pycache__ that was gone. The sweep comes here at that
+    # moment, with no timing: once the copy has listed a folder and seen the __pycache__ in it, and
+    # before it reaches that __pycache__.
+    cache = with_bytecode(platform_env.site)[-1]
+    real_scandir, listed = os.scandir, []
+
+    def list_then_sweep(path="."):
+        if isinstance(path, int) or Path(path) != cache.parent or listed:
+            return real_scandir(path)
+        with real_scandir(path) as entries:
+            listed.extend(entries)
+        shutil.rmtree(cache)
+        return contextlib.nullcontext(listed)  # the folder as the copy listed it
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "scandir", list_then_sweep)
+        make_actions(tmp_path, venv_dir=platform_env.link).take_environment_snapshot("NEW")
+
+    assert "__pycache__" in [entry.name for entry in listed]  # the copy saw it before it went
+    assert not cache.exists()
+    assert tree(tmp_path / "snapshots" / "env" / "NEW") == without_bytecode(tree(platform_env.real))
+
+
 def test_g12_reads_the_comparison_the_readback_makes(tmp_path, monkeypatch, platform_env):
     """G12 asks the reader, before the cutover, the very comparison the readback makes after the
     sync: the lock as exported for the sync extras, against what the environment has installed."""

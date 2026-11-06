@@ -561,8 +561,15 @@ def _starts_with_header(path: Path) -> bool | None:
 
 def _copy_environment(real: Path, staging: Path) -> None:
     """Copy the environment's real folder as it is: every file with its mode, every link as a
-    link, so its interpreter link still names the same interpreter."""
-    shutil.copytree(real, staging, symlinks=True, dirs_exist_ok=True)
+    link, so its interpreter link still names the same interpreter. Only its __pycache__ folders
+    are left out: Python writes bytecode again, and a sweep can delete one while the copy runs."""
+    shutil.copytree(
+        real,
+        staging,
+        symlinks=True,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
 
 
 def _package(name: str) -> str:
