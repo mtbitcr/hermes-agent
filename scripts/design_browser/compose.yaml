@@ -19,5 +19,7 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    # Full-page screenshots crash the browser's graphics process with Docker's 64 MB shared memory default.
+    shm_size: 1gb
     mem_limit: 2g
     cpus: 2
