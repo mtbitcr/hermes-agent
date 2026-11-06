@@ -11,13 +11,20 @@ independent count: nothing was connected to.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import http.server
 import json
 import os
 import re
+import shutil
 import socket
 import sqlite3
+import ssl
+import subprocess
 import threading
+import time
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -406,3 +413,204 @@ def test_check_fn_answers_only_whether_the_cdp_url_is_set(kanban, endpoint):
     write_config(cdp_url="", allowed_hosts=ALLOWED, boards=["design"])
     assert design_browser_tool.check_design_browser_requirements() is False
     assert endpoint.connections == 0
+
+
+# ── The builder's own preview, with other design tasks on the same browser ──
+
+
+def test_the_builders_guard_holds_only_its_own_contexts_requests_to_its_preview():
+    """Recorded CDP calls, no browser. The builder's guard pauses the requests of the targets in
+    its own browser context on their own sessions, before they run, and answers those with its
+    own preview host; a request of another task, paused browser-wide, it answers by
+    ``design_browser.allowed_hosts`` alone, as every design guard did before."""
+    own, other = f"own-gate.{APEX}", f"other-gate.{APEX}"
+    calls = []
+
+    async def cdp(method, params=None, *, session_id=None, timeout=None):
+        calls.append((method, session_id, (params or {}).get("requestId")))
+        return {}
+
+    key = design_browser_tool.supervisor_key("scoping-test")
+    guard = design_browser_tool._guard(key, ALLOWED, own)
+    try:
+        assert (guard.policy, guard.builder_host) == (ALLOWED, None)  # the browser-wide decision is unchanged
+        guard.scope("own-context")
+
+        def paused(request_id, url, frame, kind="Document"):
+            return {"requestId": request_id, "resourceType": kind, "frameId": frame,
+                    "request": {"method": "GET", "url": url, "headers": {}}}
+
+        async def scenario():
+            for sid, context in (("own-page", "own-context"), ("other-page", "other-context")):
+                await guard.guard_target(cdp, {"sessionId": sid, "waitingForDebugger": True, "targetInfo": {
+                    "type": "page", "targetId": sid + "-target", "browserContextId": context}}, None)
+            guard.watch("own-page-target")
+            for event, sid in ((paused("hop", f"https://{other}/", "own-page-target"), "own-page"),
+                               (paused("own", f"https://{own}/app.js", "own-page-target", "Script"), "own-page"),
+                               (paused("designer", f"https://{other}/shot.png", "other-page-target", "Image"), None),
+                               (paused("outside", "https://example.com/", "other-page-target"), None)):
+                assert guard.on_event(cdp, "Fetch.requestPaused", event, sid) is True
+            for _ in range(20):
+                await asyncio.sleep(0)
+
+        asyncio.run(scenario())
+        enabled = [(m, sid) for m, sid, _ in calls if m == "Fetch.enable"]
+        assert enabled == [("Fetch.enable", "own-page")]  # never on another task's target
+        resumed = calls.index(("Runtime.runIfWaitingForDebugger", "own-page", None))
+        assert calls.index(("Fetch.enable", "own-page", None)) < resumed
+        answers = {rid: (m, sid) for m, sid, rid in calls if m in ("Fetch.continueRequest", "Fetch.failRequest")}
+        assert answers == {"hop": ("Fetch.failRequest", "own-page"), "own": ("Fetch.continueRequest", "own-page"),
+                           "designer": ("Fetch.continueRequest", None), "outside": ("Fetch.failRequest", None)}
+        reason = design_url_policy.design_url_refusal(f"https://{other}/", ALLOWED, builder_host=own)
+        assert reason and guard.unwatch("own-page-target") == (other, reason)
+    finally:
+        design_browser_tool._forget_guard(key)
+
+
+class _Previews(http.server.BaseHTTPRequestHandler):
+    """Every design host on one local TLS server, told apart by the Host header. ``hits`` counts
+    each request that reached it, as (host, path)."""
+
+    hits: list = []
+    pages: dict = {}  # (host, path) -> HTML
+    redirects: dict = {}  # (host, path) -> address it redirects to
+
+    def do_GET(self):
+        host, path = (self.headers.get("Host") or "").split(":")[0], self.path.split("?")[0]
+        _Previews.hits.append((host, path))
+        location = _Previews.redirects.get((host, path))
+        body = b"" if location else _Previews.pages.get((host, path), f"<title>{path}</title>").encode()
+        self.send_response(302 if location else 200)
+        if location:
+            self.send_header("Location", location)
+        self.send_header("Content-Type", "text/javascript" if path.endswith(".js") else "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args):
+        pass
+
+
+@pytest.fixture
+def design_chromium(tmp_path):
+    """Headless Chromium as the design browser runs, every design host mapped to one local TLS
+    server (self-signed, accepted); yields its DevTools address. Only the names are mapped, so
+    the addresses keep the default port and the tool's own address policy runs on them, with
+    only DNS stubbed (``public_dns``)."""
+    chrome = shutil.which("google-chrome") or shutil.which("chromium")
+    if not chrome or not shutil.which("openssl"):
+        pytest.skip("Chromium or openssl not installed")
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out",
+                    str(cert), "-days", "1", "-subj", f"/CN={APEX}"],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _Previews.hits, _Previews.pages, _Previews.redirects = [], {}, {}
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Previews)
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(cert, key)
+    server.socket = tls.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    site = f"127.0.0.1:{server.server_address[1]}"
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        address = f"http://127.0.0.1:{probe.getsockname()[1]}"
+    proc = subprocess.Popen(
+        [chrome, f"--remote-debugging-port={address.rsplit(':', 1)[1]}", f"--user-data-dir={tmp_path / 'profile'}",
+         "--no-first-run", "--no-default-browser-check", "--headless=new", "--disable-gpu",
+         "--block-new-web-contents", "--enable-automation", "--ignore-certificate-errors",
+         f"--host-resolver-rules=MAP *.{APEX} {site}, MAP {APEX} {site}, MAP raphael.agentsbridge.net {site}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ, "HOME": str(tmp_path)})
+    try:
+        deadline = time.monotonic() + 15
+        while True:
+            try:
+                with urllib.request.urlopen(address + "/json/version", timeout=1):
+                    break
+            except Exception:
+                if time.monotonic() > deadline:
+                    pytest.skip("Chromium didn't expose CDP in time")
+                time.sleep(0.25)
+        yield address
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+        server.shutdown()
+        server.server_close()
+
+
+def opened(result) -> dict:
+    """An ``open`` result's JSON, from inside the untrusted-data wrapper when it has one."""
+    assert isinstance(result, str), result
+    if result.startswith("{"):
+        return json.loads(result)
+    return json.loads(result.split("\n\n", 1)[1].rsplit("\n</untrusted_tool_result>", 1)[0])
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(os.environ.get("HERMES_E2E_BROWSER", "").strip() != "1",
+                    reason="real-browser E2E: set HERMES_E2E_BROWSER=1 to opt in")
+@pytest.mark.skipif(not shutil.which("google-chrome") and not shutil.which("chromium"),
+                    reason="Chrome/Chromium not installed")
+def test_live_builders_keep_to_their_own_previews_and_leave_the_designer_its_allow_list(
+        kanban, design_chromium, monkeypatch):
+    """Two builders (two tasks, two branches, two preview hosts) and the designer, each in its
+    own worker's environment and under its own supervisor key, live together on one Chromium.
+    Each page the gate permits loads from the server; nothing of the other builder's preview
+    reaches it from a builder's page (direct, redirect hop, image, frame, fetch, worker); the
+    designer still loads what ``design_browser.allowed_hosts`` allows, a builder's preview too."""
+    workers = {}
+    for name, assignee in (("first", BUILDER), ("second", BUILDER), ("designer", DESIGNER)):
+        started = kanban.start(assignee, branch="design-loop/{id}-gate" if assignee == BUILDER else None)
+        workers[name] = {"task": started["own"], "env": {var: os.environ[var] for var in ENV}}
+    write_config(cdp_url=design_chromium, allowed_hosts=ALLOWED, boards=["design"])
+
+    def use(name):
+        for var, value in workers[name]["env"].items():
+            monkeypatch.setenv(var, value)
+
+    def open_as(name, url):
+        use(name)
+        return opened(registry.dispatch("design_browser", {"action": "open", "url": url},
+                                        task_id=workers[name]["task"]))
+
+    preview = {}
+    for name in ("first", "second"):
+        ((branch,),) = kanban.raw("design", "SELECT branch_name FROM tasks WHERE id = ?", workers[name]["task"])
+        preview[name] = f"{alias(branch)}.{APEX}"
+        use(name)
+        assert access().builder_host == preview[name]
+    first, second, home = preview["first"], preview["second"], "raphael.agentsbridge.net"
+    assert first != second and len({w["task"] for w in workers.values()}) == 3
+    _Previews.redirects[(first, "/to-second")] = f"https://{second}/redirected"
+    _Previews.pages[(first, "/embeds-second")] = (
+        f"<title>embeds</title><img src='https://{second}/image.png'><iframe src='https://{second}/frame'></iframe>"
+        f"<img src='https://{home}/from-first.png'>"
+        f"<script>fetch('https://{second}/fetched').catch(() => 0); new Worker('/worker.js');</script>")
+    _Previews.pages[(first, "/worker.js")] = f"fetch('https://{second}/worker-fetched').catch(() => 0);"
+    _Previews.pages[(home, "/designer")] = f"<title>designer</title><img src='https://{first}/shown.png'>"
+    try:
+        for name, url in (("first", f"https://{first}/own"), ("second", f"https://{second}/own"),
+                          ("designer", f"https://{home}/designer"), ("designer", f"https://{second}/as-designer")):
+            data = open_as(name, url)
+            assert data["ok"] is True, (name, url, data)
+        assert {(first, "/own"), (second, "/own"), (home, "/designer"), (first, "/shown.png"),
+                (second, "/as-designer")} <= set(_Previews.hits)
+
+        assert open_as("first", f"https://{second}/direct")["error"].startswith("address refused: ")
+        hop = open_as("first", f"https://{first}/to-second")
+        assert (hop["ok"], hop["blocked_host"]) == (False, second) and hop["reason"], hop
+        assert open_as("first", f"https://{first}/embeds-second")["ok"] is True
+        time.sleep(1.5)  # the page's fetch and worker have had their time
+        assert (first, "/to-second") in _Previews.hits and (first, "/worker.js") in _Previews.hits
+        assert [path for host, path in _Previews.hits if host == second] == ["/own", "/as-designer"]
+        assert (home, "/from-first.png") not in _Previews.hits  # allowed for others, not the builder's own
+
+        shown = _Previews.hits.count((first, "/shown.png"))
+        assert open_as("designer", f"https://{home}/designer")["ok"] is True  # both builders still live
+        assert _Previews.hits.count((first, "/shown.png")) == shown + 1
+        assert open_as("second", f"https://{second}/own")["ok"] is True
+        assert _Previews.hits.count((second, "/own")) == 2
+    finally:
+        for worker in workers.values():
+            design_browser_tool.cleanup_design_browser(worker["task"])
