@@ -93,7 +93,7 @@
       const frame = FRAMES.has(el.localName)
       if (!frame && !EMBEDS.has(el.localName)) continue
       const doc = frame ? el.contentDocument : embeddedDocument(el, ctx.win)
-      if (!doc && frame) throw new Error(`unsupported content: a cross-origin or unreadable <${el.localName}> frame cannot be measured`)
+      if (!doc && frame && !out.lenient) throw new Error(`unsupported content: a cross-origin or unreadable <${el.localName}> frame cannot be measured`)
       if (!doc) continue
       const r = el.getBoundingClientRect()
       const cs = ctx.win.getComputedStyle(el)
@@ -208,6 +208,29 @@
     }
   }
 
+  // The raw strings through which the page can load an image or document from a data: URL, in every document, open shadow root and same-origin frame:
+  // attributes, and the computed values (as the browser serialises them) of the image-valued properties of each element and its ::before and ::after.
+  const IMAGE_PROPERTIES = ['background-image', 'mask-image', '-webkit-mask-image', 'border-image-source', 'list-style-image', 'content']
+  function dataUrls() {
+    const urls = new Set(), srcsets = new Set(), styles = new Set()
+    const { items } = collect(document, undefined, { items: [], roots: [], lenient: true })
+    for (const { el, ctx } of items) {
+      const tag = el.localName
+      const attr = name => el.getAttribute(name)
+      if (tag === 'img') { urls.add(attr('src')); urls.add(el.currentSrc) }
+      if (tag === 'img' || tag === 'source') srcsets.add(attr('srcset'))
+      if (tag === 'object') urls.add(attr('data'))
+      if (tag === 'embed' || (tag === 'input' && String(attr('type')).toLowerCase() === 'image')) urls.add(attr('src'))
+      if (tag === 'image') { urls.add(attr('href')); urls.add(attr('xlink:href')) }
+      for (const pseudo of [null, '::before', '::after']) {
+        const cs = ctx.win.getComputedStyle(el, pseudo)
+        for (const property of IMAGE_PROPERTIES) styles.add(cs.getPropertyValue(property))
+      }
+    }
+    const data = set => Array.from(set).filter(v => /data:/i.test(v))
+    return { urls: data(urls), srcsets: data(srcsets), styles: data(styles) }
+  }
+
   const animationsIn = () => collect().roots.flatMap(({ root }) =>
     root.getAnimations ? root.getAnimations() : Array.from(root.children).flatMap(c => c.getAnimations({ subtree: true })))
 
@@ -246,5 +269,5 @@
     if (p === 'fixed' || p === 'sticky') el.style.setProperty('visibility', 'hidden', 'important')
   })
 
-  return { normalize, landmarksOf, firstFamily, familyName, hiddenByOpacity, prepare, fontsReady, measure, settle, hidePinned, toTop, atTop, scrollToTop, assertTop, boxOf, freeze, freezeNative, htmlFrameDocuments }
+  return { normalize, landmarksOf, firstFamily, familyName, hiddenByOpacity, prepare, fontsReady, measure, settle, hidePinned, toTop, atTop, scrollToTop, assertTop, boxOf, freeze, freezeNative, htmlFrameDocuments, dataUrls }
 })()

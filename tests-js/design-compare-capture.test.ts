@@ -772,6 +772,60 @@ describe('animated resource detection', () => {
   })
 })
 
+describe('SVG data URLs a page references', () => {
+  const MALFORMED = '<svg xmlns="http://www.w3.org/2000/svg"><rect></svg>'
+  const b64 = (s: string) => `data:image/svg+xml;base64,${Buffer.from(s).toString('base64')}`
+  const sha = (s: string | Buffer) => createHash('sha256').update(s).digest('hex')
+
+  it('pulls the url("...") items out of computed style strings, unescaping quotes and backslashes, and ignores the rest', () => {
+    expect(kit.cssUrls('none')).toEqual([])
+    expect(kit.cssUrls('url("data:image/svg+xml;base64,AAA="), linear-gradient(red, blue), url("/x.png")')).toEqual(['data:image/svg+xml;base64,AAA=', '/x.png'])
+    expect(kit.cssUrls('image-set(url("data:image/svg+xml,%3Csvg%2F%3E") 1x)')).toEqual(['data:image/svg+xml,%3Csvg%2F%3E'])
+    expect(kit.cssUrls('url("a\\"b\\\\c")')).toEqual(['a"b\\c'])
+    expect(kit.cssUrls(undefined)).toEqual([])
+  })
+
+  it('splits a srcset on its candidate separators without cutting a data URL at its own comma', () => {
+    const d = 'data:image/svg+xml,%3Csvg%3E%3C/svg%3E'
+    expect(kit.srcsetUrls(`${d} 1x, /b.png 2x`)).toEqual([d, '/b.png'])
+    expect(kit.srcsetUrls(`  /a.png 100w ,\n ${d}   300w`)).toEqual(['/a.png', d])
+    expect(kit.srcsetUrls(`/a.png, ${d}`)).toEqual(['/a.png', d])
+    expect(kit.srcsetUrls('')).toEqual([])
+  })
+
+  it('decodes the exact bytes of an SVG data URL, base64 or percent-encoded, and returns null for anything else', () => {
+    expect(kit.svgDataUrlBytes(b64(MALFORMED)).toString()).toBe(MALFORMED)
+    expect(kit.svgDataUrlBytes(`data:image/svg+xml,${encodeURIComponent(MALFORMED)}`).toString()).toBe(MALFORMED)
+    expect(kit.svgDataUrlBytes(`DATA:Image/SVG+XML;charset=utf-8;BASE64,${Buffer.from(MALFORMED).toString('base64')}`).toString()).toBe(MALFORMED)
+    expect(kit.svgDataUrlBytes(`data:image/svg+xml;base64,${Buffer.from(MALFORMED).toString('base64').replace(/(.{8})/g, '$1 ')}`).toString()).toBe(MALFORMED)
+    expect(kit.svgDataUrlBytes('data:image/svg+xml,%3Csvg%2F%3E#frag').toString()).toBe('<svg/>')
+    expect([...kit.svgDataUrlBytes('data:image/svg+xml,%FF%00')]).toEqual([0xff, 0])
+
+    for (const other of ['data:image/png;base64,AAAA', 'data:text/plain,<svg/>', 'data:image/svg+xml', '/a.svg', 'http://x/a.svg', 'blob:http://x/1', '']) {
+      expect(kit.svgDataUrlBytes(other), other).toBeNull()
+    }
+  })
+
+  it('lists each distinct SVG data resource once, from every kind of reference, named by a short prefix and its sha256', () => {
+    const other = '<svg xmlns="http://www.w3.org/2000/svg"><g></svg>'
+
+    const found = kit.svgDataResources({
+      urls: [b64(MALFORMED), '/plain.svg', b64(MALFORMED), 'data:image/png;base64,AAAA'],
+      srcsets: [`/a.png 1x, ${b64(other)} 2x`],
+      styles: [`url("data:image/svg+xml,${encodeURIComponent(MALFORMED)}"), none`, 'none'],
+    })
+
+    expect(found.map((f: any) => f.sha256).sort()).toEqual([sha(MALFORMED), sha(other)].sort())
+
+    for (const f of found) {
+      expect(f.url).toBe('data:image/svg+xml')
+      expect(Buffer.isBuffer(f.bytes)).toBe(true)
+    }
+
+    expect(kit.svgDataResources({ urls: [], srcsets: [], styles: [] })).toEqual([])
+  })
+})
+
 describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium (opt-in, pinned binary from CHROME_PATH, shipped pin)', { concurrent: true }, () => {
   const chromium = process.env.CHROME_PATH as string
   let seq = 0
@@ -1393,7 +1447,7 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
 
   const STATIC_PAGE = `<!doctype html><style>body{margin:0}div{width:64px;height:64px;background:url(${dataUri(SVG, stillSvg('red'))})}img,object,embed{display:block}</style>
 <img alt="" src="${dataUri(SVG, stillSvg('red'))}"><div></div><img alt="" src="/gradient.svg"><object data="/gradient.svg" type="image/svg+xml" width="64" height="64"></object>
-<embed src="/gradient.svg" type="image/svg+xml" width="64" height="64"><img alt="" src="/still.gif"><img alt="" src="/still.png"><img alt="" src="/single.png"><img alt="" src="/still.webp"><h1>Static</h1>`
+<embed src="/gradient.svg" type="image/svg+xml" width="64" height="64"><img alt="" src="${dataUri(SVG, GRADIENT)}"><img alt="" src="data:image/svg+xml,${encodeURIComponent(GRADIENT)}"><img alt="" src="/still.gif"><img alt="" src="/still.png"><img alt="" src="/single.png"><img alt="" src="/still.webp"><h1>Static</h1>`
 
   const REFUSED_PAGE = `<!doctype html><style>body{margin:0}img,object,embed,div{display:block;width:64px;height:64px}
 #bg{background:url(/background-style.svg)}#mask{background:red;mask-image:url(/mask-style.svg)}#border{border-image:url(/border-style.svg) 1}</style><h1>Refused</h1>
@@ -1446,5 +1500,43 @@ ${['style-element', 'style-attribute', 'animate-element', 'processing-instructio
   it('refuses a style-element SVG img on the prototype side, naming the data URL', async () => {
     const run = await launchPrototype(`<!doctype html><h1>Proto</h1><img alt="" src="${dataUri(SVG, unsupportedSvgs['style-element.svg'])}">`)
     expect(run.error.message).toMatch(/^unsupported content: the kit cannot prove that this SVG is static: data:image\/svg\+xml;base64,\S+… \(sha256 [0-9a-f]{12}\)$/)
+  }, 120_000)
+
+  // A malformed SVG data URL never produces a Network response; the shipped CLI must refuse it all the same, on both sides.
+  const MALFORMED_SVG = `<svg ${SVG_NS}><rect></svg>`
+  const MALFORMED_OTHER = `<svg ${SVG_NS}><g></svg>`
+
+  const shippedCli = (args: string[]) => limited(() => new Promise<{ status: number | null, stderr: string }>(done => {
+    const child = spawn(process.execPath, [captureFile, ...args, '--out', join(scratch, `out-${++seq}`), '--run-id', 'r', '--candidate-digest', 'd'], { env: { ...process.env, CHROME_PATH: chromium } })
+
+    let stderr = ''
+    child.stderr.on('data', d => { stderr += d })
+    child.on('close', status => done({ status, stderr }))
+  }))
+
+  const sentences = (stderr: string) => stderr.split('\n').filter(l => l.startsWith('unsupported content: the kit cannot prove that this SVG is static: '))
+  const DATA_LINE = /^unsupported content: the kit cannot prove that this SVG is static: data:image\/svg\+xml \(sha256 ([0-9a-f]{12})\)$/
+
+  it('refuses a malformed SVG data URL used as an img or a CSS background on the candidate side, through the shipped CLI', async () => {
+    const site = dirOf({ 'index.html': `<!doctype html><style>div{width:64px;height:64px;background:url(data:image/svg+xml,${encodeURIComponent(MALFORMED_OTHER)})}</style><h1>Bad</h1>
+<img alt="" src="${dataUri(SVG, MALFORMED_SVG)}"><div></div><img alt="" src="${dataUri(SVG, GRADIENT)}">` })
+
+    const run = await shippedCli(['--side', 'candidate', '--site', site, '--pages', '/'])
+    expect(run.status, run.stderr).toBe(1)
+    const lines = sentences(run.stderr)
+    expect(lines, run.stderr).toHaveLength(2)
+
+    const shas = lines.map(l => (DATA_LINE.exec(l) ?? [])[1])
+    expect(shas.sort(), run.stderr).toEqual([MALFORMED_SVG, MALFORMED_OTHER].map(b => createHash('sha256').update(b).digest('hex').slice(0, 12)).sort())
+    expect(run.stderr).not.toContain(Buffer.from(MALFORMED_SVG).toString('base64'))
+  }, 120_000)
+
+  it('refuses a malformed SVG data URL used as an img on the prototype side, through the shipped CLI', async () => {
+    const file = join(scratch, `proto-${++seq}.html`)
+    writeFileSync(file, `<!doctype html><h1>Proto</h1><img alt="" src="${dataUri(SVG, MALFORMED_SVG)}">`)
+    const run = await shippedCli(['--side', 'prototype', '--prototype', file, '--pages', '/'])
+    expect(run.status, run.stderr).toBe(1)
+    expect(run.stderr.trim()).toMatch(DATA_LINE)
+    expect(DATA_LINE.exec(run.stderr.trim())?.[1]).toBe(createHash('sha256').update(MALFORMED_SVG).digest('hex').slice(0, 12))
   }, 120_000)
 })

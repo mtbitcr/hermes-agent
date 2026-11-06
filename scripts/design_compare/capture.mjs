@@ -204,6 +204,60 @@ const svgIsOnAllowlist = (base64, allowed) => {
   return plain(doc)
 }
 
+const percentDecode = text => {
+  const raw = Buffer.from(text, 'utf8')
+  const out = []
+  for (let i = 0; i < raw.length; i++) {
+    const hex = raw.toString('latin1', i + 1, i + 3)
+    if (raw[i] === 0x25 && /^[0-9a-f]{2}$/i.test(hex)) { out.push(parseInt(hex, 16)); i += 2 } else out.push(raw[i])
+  }
+  return Buffer.from(out)
+}
+
+// The bytes the browser would decode from a data: URL whose media type is image/svg+xml (base64 or percent-encoded payload), or null for any other URL.
+export function svgDataUrlBytes(url) {
+  const m = /^data:([^,]*),([\s\S]*)$/i.exec(String(url).trim())
+  if (!m) return null
+  const [type, ...params] = m[1].split(';').map(p => p.trim().toLowerCase())
+  if (type !== 'image/svg+xml') return null
+  const bytes = percentDecode(m[2].split('#')[0])
+  return params.at(-1) === 'base64' ? Buffer.from(bytes.toString('latin1').replace(/[\t\n\f\r ]/g, ''), 'base64') : bytes
+}
+
+// The url("...") items of computed style strings; the browser serialises them double-quoted with only \" \\ and hex escapes, so no CSS is parsed here.
+export function cssUrls(value) {
+  const unescape = text => text.replace(/\\(?:([0-9a-f]{1,6}) ?|([\s\S]))/gi, (_, hex, ch) => (hex ? String.fromCodePoint(parseInt(hex, 16)) : ch))
+  return Array.from(String(value ?? '').matchAll(/url\("((?:[^"\\]|\\[\s\S])*)"\)/g), m => unescape(m[1]))
+}
+
+// The URLs of a srcset attribute: a URL is a run of non-space characters (so a data URL keeps its own commas), and descriptors end at the next comma outside parentheses.
+export function srcsetUrls(value) {
+  const s = String(value ?? '')
+  const urls = []
+  for (let i = 0; i < s.length;) {
+    while (i < s.length && /[\s,]/.test(s[i])) i++
+    let j = i
+    while (j < s.length && !/\s/.test(s[j])) j++
+    let url = s.slice(i, j)
+    const trailing = /,+$/.exec(url)
+    if (trailing) url = url.slice(0, -trailing[0].length)
+    else for (let depth = 0; j < s.length && (s[j] !== ',' || depth); j++) depth += s[j] === '(' ? 1 : s[j] === ')' ? -1 : 0
+    if (url) urls.push(url)
+    i = Math.max(j, i + 1)
+  }
+  return urls
+}
+
+// Each distinct SVG data resource among the raw strings the probe collected from the page, named by a short prefix (its sha256 is printed with it).
+export function svgDataResources({ urls = [], srcsets = [], styles = [] }) {
+  const found = new Map()
+  for (const url of [...urls, ...srcsets.flatMap(srcsetUrls), ...styles.flatMap(cssUrls)]) {
+    const bytes = svgDataUrlBytes(url)
+    const hash = bytes && sha256(bytes)
+    if (bytes && !found.has(hash)) found.set(hash, { url: 'data:image/svg+xml', sha256: hash, bytes })
+  }
+  return [...found.values()]
+}
 
 // The root element names of every document shown by a frame, iframe, object or embed in a pierced CDP DOM tree (template content excluded).
 export function embeddedDocumentRoots(node) {
@@ -452,6 +506,19 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
       throw new Error(`the motion-neutralising stylesheet was not installed before page scripts ran for ${url}`)
     }
     const probe = `(${probeSource}\n)`
+    // A data: image that fails to decode never produces a Network response, so the data URLs the page references are read from the page itself.
+    const dataSeen = new Set()
+    const checkDataSvgs = async () => {
+      for (const r of svgDataResources(await run(`${probe}.dataUrls()`))) {
+        if (dataSeen.has(r.sha256)) continue
+        dataSeen.add(r.sha256)
+        if (unprovable.some(u => u.sha256 === r.sha256 && u.url.startsWith('data:'))) continue
+        try {
+          const plain = await stitcher.evaluate(`(${svgIsOnAllowlist})(${JSON.stringify(r.bytes.toString('base64'))}, ${JSON.stringify(SVG_ELEMENTS)})`)
+          if (!plain) unprovable.push({ url: r.url, sha256: r.sha256 })
+        } catch { unreadable.push({ url: r.url }) }
+      }
+    }
     await run(`${probe}.toTop()`)
     await run('document.fonts.ready.then(() => true)')
     const quiet = async (settled = true) => {
@@ -461,6 +528,7 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
         await sleep(50)
       }
       while (inspections.size) await Promise.all([...inspections])
+      await checkDataSvgs()
       assertNoAnimatedResources(animated, unreadable, unprovable)
     }
     await quiet()
