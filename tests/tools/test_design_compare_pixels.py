@@ -169,6 +169,71 @@ def test_oversized_png_shrinks_to_fit_and_pair_keeps_one_size():
     assert crops.scaled
 
 
+RED = (255, 0, 0)
+FID = "0123456789abcdef"
+
+
+def decode(data):
+    return Image.open(io.BytesIO(data)).convert("RGB")
+
+
+def count(img, colour):
+    return sum(1 for p in img.getdata() if p == colour)
+
+
+def test_missing_element_below_the_shorter_page_is_kept_on_the_side_that_has_it():
+    cand, proto = page(375, 812), block(page(375, 1200), 30, 1000, 30, 20, RED)
+    crops = px.cut_crops(cand, proto, None, box(30, 1000, 30, 20), 1, FID, 375)
+    c, p = decode(crops.candidate[1]), decode(crops.prototype[1])
+    assert c.size == p.size == (78, 68)
+    assert count(p, RED) == 600
+    assert count(c, RED) == 0
+    assert len(set(c.getdata())) == 1 and c.getpixel((0, 0)) != WHITE
+
+
+def test_extra_element_below_the_shorter_page_is_kept_on_the_side_that_has_it():
+    cand, proto = block(page(375, 1200), 30, 1000, 30, 20, RED), page(375, 812)
+    crops = px.cut_crops(cand, proto, box(30, 1000, 30, 20), None, 1, FID, 375)
+    c, p = decode(crops.candidate[1]), decode(crops.prototype[1])
+    assert c.size == p.size == (78, 68)
+    assert count(c, RED) == 600
+    assert count(p, RED) == 0
+    assert len(set(p.getdata())) == 1 and p.getpixel((0, 0)) != WHITE
+
+
+def test_box_crossing_the_shorter_page_bottom_keeps_every_element_pixel():
+    cand, proto = page(375, 812), block(page(375, 1200), 30, 802, 30, 20, RED)
+    crops = px.cut_crops(cand, proto, None, box(30, 802, 30, 20), 1, FID, 375)
+    c, p = decode(crops.candidate[1]), decode(crops.prototype[1])
+    assert c.size == p.size == (78, 68)
+    assert count(p, RED) == 600
+    assert c.getpixel((0, 0)) == WHITE and c.getpixel((0, 67)) != WHITE
+    assert count(c, RED) == 0
+
+
+def test_element_pass_excludes_masked_descendant_inside_matched_ancestor():
+    cand, proto = block(page(375, 812), 50, 50, 20, 20), page(375, 812)
+    whole = box(0, 0, 375, 812)
+    assert px.compare_element(cand, proto, whole, whole) == [box(50, 50, 20, 20)]
+    assert px.compare_element(cand, proto, whole, whole, masks=[box(50, 50, 20, 20)]) == []
+    assert px.compare_element(cand, proto, whole, whole, masks=[]) == [box(50, 50, 20, 20)]
+
+
+def test_element_pass_masks_follow_each_sides_own_crop_with_shifted_boxes():
+    cand_box, proto_box = box(20, 20, 150, 150), box(60, 40, 150, 150)
+    cand = block(block(page(375, 812), 50, 50, 20, 20), 120, 120, 12, 12, RED)
+    proto = page(375, 812)
+    assert px.compare_element(cand, proto, cand_box, proto_box) == [box(50, 50, 20, 20), box(120, 120, 12, 12)]
+    assert px.compare_element(cand, proto, cand_box, proto_box, masks=[box(50, 50, 20, 20)]) == [box(120, 120, 12, 12)]
+    proto_only = block(block(page(375, 812), 90, 70, 20, 20), 160, 140, 12, 12, RED)
+    assert px.compare_element(page(375, 812), proto_only, cand_box, proto_box,
+                              masks=[box(90, 70, 20, 20)]) == [box(120, 120, 12, 12)]
+    a_only, b_only = block(page(375, 812), 50, 50, 20, 20), block(page(375, 812), 130, 110, 20, 20)
+    assert len(px.compare_element(a_only, b_only, cand_box, proto_box)) == 2
+    assert px.compare_element(a_only, b_only, cand_box, proto_box,
+                              masks=[box(50, 50, 20, 20), box(130, 110, 20, 20)]) == []
+
+
 def test_file_names_follow_the_pattern():
     names = px.crop_names(3, "0123456789abcdef", 375)
     assert names == ("dc-r3-0123456789abcdef-375-candidate.png", "dc-r3-0123456789abcdef-375-prototype.png")
