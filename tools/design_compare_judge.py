@@ -176,7 +176,10 @@ def _first_family(value):
         elif ch == ",":
             end = i
             break
-    return value[:end].strip().strip("\"'").lower()
+    family = value[:end].strip()
+    if len(family) >= 2 and family[0] in "\"'" and family[-1] == family[0]:
+        family = family[1:-1]
+    return family.lower()
 
 
 def _style_differences(cand, proto):

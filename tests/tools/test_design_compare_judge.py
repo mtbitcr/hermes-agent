@@ -128,6 +128,28 @@ def test_font_family_identical_quoted_comma_family_has_no_finding():
     assert _family_props('"ACME, One", Arial', '"ACME, One", Arial') == []
 
 
+@pytest.mark.parametrize("width", [1280, 375])
+@pytest.mark.parametrize("cand", ['"\'ACME", Arial', '"ACME\'", Arial'])
+def test_font_family_literal_apostrophe_inside_quotes_is_part_of_the_name(cand, width):
+    found = j.compare_bundles(bundle(el("a", style={"font-family": cand}), width=width),
+                              bundle(el("a", style={"font-family": "ACME, Arial"}), width=width)).findings
+    assert [f.property for f in found] == ["font-family"]
+
+
+@pytest.mark.parametrize("width", [1280, 375])
+def test_font_family_identical_quoted_apostrophe_family_ignores_fallbacks(width):
+    for family in ('"\'ACME", Arial', '"ACME\'", Arial'):
+        cand = bundle(el("a", style={"font-family": family}), width=width)
+        proto = bundle(el("a", style={"font-family": family.split(",")[0] + ", serif, monospace"}), width=width)
+        assert j.compare_bundles(cand, proto).findings == ()
+
+
+@pytest.mark.parametrize("quoted", ['"ACME", Arial', "'ACME', Arial"])
+def test_font_family_matching_surrounding_quotes_equal_plain_family(quoted):
+    assert _family_props(quoted, "ACME, Arial") == []
+    assert _family_props("ACME, Arial", quoted) == []
+
+
 def test_colour_tolerance_is_delta_e_two_and_alpha_point_zero_two(monkeypatch):
     proto = bundle(el("a", style={"color": [10, 20, 30, 1]}))
     cand = bundle(el("a", style={"color": [11, 20, 30, 1]}))
