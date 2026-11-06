@@ -16,14 +16,51 @@ export const CHROMIUM_PIN = {
 export const VIEWPORTS = [[1280, 800], [375, 812]]
 export const MAX_PAGE_HEIGHT = 8000
 export const CHROMIUM_SWITCHES = ['--headless=new', '--disable-gpu', '--disable-lcd-text', '--font-render-hinting=none',
-  '--force-color-profile=srgb', '--hide-scrollbars', '--disable-features=PaintHolding', '--lang=en-US']
-// Forced values: from a cascade layer declared first they also beat author ID-selector !important rules; inline !important is rewritten by probe.prepare.
+  '--force-color-profile=srgb', '--hide-scrollbars', '--disable-features=PaintHolding', '--lang=en-US',
+  '--force-webrtc-ip-handling-policy=disable_non_proxied_udp']
+// Forced values: from a cascade layer declared first they also beat author ID-selector !important rules; inline !important is rewritten.
 export const FORCED = { animation: 'none', transition: 'none', 'caret-color': 'transparent', 'scroll-behavior': 'auto',
   '-webkit-font-smoothing': 'antialiased', 'text-rendering': 'geometricPrecision' }
 export const STYLE = `@layer dc-normalise{*,*::before,*::after{${Object.entries(FORCED).map(([k, v]) => `${k}:${v}!important`).join(';')}}}`
-const INJECT = `(()=>{const s=document.createElement('style');s.id='__dc_style';s.dataset.early=document.readyState==='loading'?'1':'0';s.textContent=${JSON.stringify(STYLE)};`
-  + 'const put=()=>document.documentElement&&(document.documentElement.appendChild(s),true);'
-  + 'if(!put())new MutationObserver((_,o)=>put()&&o.disconnect()).observe(document,{childList:true})})()'
+// Runs at document creation in every frame, before page scripts: installs the layer, then rewrites inline !important and adopts the layer into every
+// shadow root (attachShadow hook, adoptedStyleSheets setter, and a MutationObserver that the parser flushes before it runs the next script).
+function earlyNormalise(forced, css) {
+  const style = document.createElement('style')
+  style.id = '__dc_style'
+  style.dataset.early = document.readyState === 'loading' ? '1' : '0'
+  style.textContent = css
+  const sheet = new CSSStyleSheet()
+  sheet.replaceSync(css)
+  const watch = { childList: true, subtree: true, attributes: true, attributeFilter: ['style'] }
+  const fix = el => {
+    const s = el.style
+    if (s && Array.from(s).some(p => s.getPropertyPriority(p))) for (const [n, v] of Object.entries(forced)) s.setProperty(n, v, 'important')
+  }
+  const adopt = r => {
+    if (!r.adoptedStyleSheets.includes(sheet)) r.adoptedStyleSheets = [sheet, ...r.adoptedStyleSheets]
+    mo.observe(r, watch)
+  }
+  const scan = n => {
+    for (const el of n.nodeType === 1 ? [n, ...n.querySelectorAll('*')] : n.querySelectorAll('*')) {
+      fix(el)
+      if (el.shadowRoot) { adopt(el.shadowRoot); scan(el.shadowRoot) }
+    }
+  }
+  const put = () => document.documentElement && !style.isConnected && document.documentElement.appendChild(style)
+  const mo = new MutationObserver(records => {
+    put()
+    for (const r of records) { if (r.type === 'attributes') fix(r.target); else r.addedNodes.forEach(n => n.nodeType === 1 && scan(n)) }
+  })
+  mo.observe(document, watch)
+  put()
+  const attach = Element.prototype.attachShadow
+  Element.prototype.attachShadow = function (init) { const r = attach.call(this, init); adopt(r); return r }
+  const own = Object.getOwnPropertyDescriptor(ShadowRoot.prototype, 'adoptedStyleSheets')
+  Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', {
+    ...own, set(v) { const all = Array.from(v); own.set.call(this, all.includes(sheet) ? all : [sheet, ...all]) },
+  })
+}
+const INJECT = `(${earlyNormalise})(${JSON.stringify(FORCED)}, ${JSON.stringify(STYLE)})`
 const PROTOTYPE_PREFIX = '/__prototype__/'
 const TYPES = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.mjs': 'text/javascript', '.json': 'application/json',
   '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.webp': 'image/webp', '.woff2': 'font/woff2', '.woff': 'font/woff' }
@@ -58,24 +95,32 @@ export function findClosedShadowRoot(node) {
   return null
 }
 
-// Runs before any page script in every frame: the Fetch gate cannot see WebSocket handshakes, so refuse them at the API.
+// Runs before any page script in every frame: the Fetch gate cannot see WebSocket handshakes, WebRTC/ICE or WebTransport, so refuse those at the API.
 const guardSource = (origin, onlyPath) => `(() => {
   const classify = ${classifyRequest}, origin = ${JSON.stringify(origin)}, only = ${JSON.stringify(onlyPath)}
   const report = window.__dcBlock
   const abs = u => { try { return new URL(u, location.href).href } catch { return String(u) } }
   const ok = u => classify(abs(u), origin, only) === 'allowed'
-  const refuse = u => { report(abs(u)); throw new DOMException('outside request refused', 'SecurityError') }
+  const refuseAll = urls => { urls.forEach(u => report(abs(u))); throw new DOMException('outside request refused', 'SecurityError') }
+  const refuse = u => refuseAll([u])
   window.open = u => { report(abs(u || 'about:blank')); return null }
-  window.WebSocket = class WebSocket { constructor(u) { refuse(u) } }
   const Source = window.EventSource
   window.EventSource = class extends Source { constructor(u, o) { if (!ok(u)) refuse(u); super(u, o) } }
   // Worker globals cannot be guarded from here, so no worker may start at all.
-  for (const name of ['Worker', 'SharedWorker']) window[name] = class { constructor(u) { refuse(u) } }
+  for (const name of ['Worker', 'SharedWorker', 'WebSocket', 'WebSocketStream', 'WebTransport']) {
+    if (name in window) window[name] = class { constructor(u) { refuse(u) } }
+  }
+  // ICE servers (STUN/TURN) and data channels never go through Fetch: refuse before construction and report every server named.
+  const ice = c => { try { return c.iceServers.flatMap(s => [].concat(s.urls)).map(String) } catch { return [] } }
+  for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel']) {
+    if (name in window) window[name] = class { constructor(c) { refuseAll(['webrtc:' + name, ...ice(c)]) } }
+  }
   if (window.ServiceWorkerContainer) {
     ServiceWorkerContainer.prototype.register = function (u) { report(abs(u)); return Promise.reject(new DOMException('outside request refused', 'SecurityError')) }
   }
   const beacon = Navigator.prototype.sendBeacon
   Navigator.prototype.sendBeacon = function (u, d) { if (ok(u)) return beacon.call(this, u, d); report(abs(u)); return false }
+  if (window.fetchLater) window.fetchLater = u => refuse(u && u.url || u)
 })()`
 
 export function verifyChromium(binary, pin, deps = {}) {
@@ -252,7 +297,7 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
     const probe = `(${probeSource}\n)`
     const closed = findClosedShadowRoot((await t.send('DOM.getDocument', { depth: -1, pierce: true })).root)
     if (closed) throw new Error(`unsupported content: a closed shadow root under <${closed.toLowerCase()}> cannot be measured`)
-    await run(`${probe}.prepare(${JSON.stringify(FORCED)}, ${JSON.stringify(STYLE)})`)
+    await run(`${probe}.prepare(${JSON.stringify(FORCED)})`)
     await run(`${probe}.fontsReady()`)
     await run(frames)
     await run(`${probe}.settle()`)

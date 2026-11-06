@@ -67,10 +67,12 @@
     return cache.get(el)
   }
 
-  // Every element of the top body, of each open shadow root and of each same-origin child frame, with the page position of its viewport.
+  // Every element of each document (its html and body elements included), of each open shadow root and of each same-origin child frame,
+  // with the page position of its viewport.
   function collect(root = document, ctx = { win: window, x: scrollX, y: scrollY }, out = { items: [], roots: [] }) {
     out.roots.push({ root, win: ctx.win })
-    for (const el of (root.body || root).querySelectorAll('*')) {
+    const all = root.documentElement ? [root.documentElement, ...(root.body ? [root.body, ...root.body.querySelectorAll('*')] : [])] : root.querySelectorAll('*')
+    for (const el of all) {
       out.items.push({ el, ctx })
       if (el.shadowRoot) collect(el.shadowRoot, ctx, out)
       if (!FRAMES.has(el.localName)) continue
@@ -83,14 +85,14 @@
     return out
   }
 
-  // Author inline !important beats every stylesheet, so those elements get the forced values inline; shadow roots get the stylesheet.
-  function prepare(forced, css) {
+  // The early script already normalised every document and shadow root before page code ran; a scope it did not reach cannot be trusted, so refuse.
+  // Elements whose author inline !important was added late are caught up here.
+  function prepare(forced) {
     const { items, roots } = collect()
     for (const { root, win } of roots) {
-      if (root === win.document) continue
-      const sheet = new win.CSSStyleSheet()
-      sheet.replaceSync(css)
-      root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet]
+      const layered = root === win.document ? !!root.getElementById('__dc_style')
+        : Array.from(root.adoptedStyleSheets).some(s => s.cssRules.length && s.cssRules[0].name === 'dc-normalise')
+      if (!layered) throw new Error('the normalising stylesheet was not in place before page scripts ran in every document and shadow root')
     }
     for (const { el } of items) {
       const inline = el.style

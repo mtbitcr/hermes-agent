@@ -1,7 +1,9 @@
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { createSocket } from 'node:dgram'
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
+import { createServer as createTcpServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -130,7 +132,7 @@ describe('probe visibility and motion', () => {
 
   const settleWith = (...list: Record<string, any>[]) => {
     const live = () => list.filter(a => a.playState !== 'idle')
-    const { settle } = runInNewContext(probeSource, { window: {}, scrollX: 0, scrollY: 0, document: { createElement: () => ({}), getAnimations: live, body: { querySelectorAll: () => [] } } })
+    const { settle } = runInNewContext(probeSource, { window: {}, scrollX: 0, scrollY: 0, document: { createElement: () => ({}), getAnimations: live, documentElement: {}, body: { querySelectorAll: () => [] } } })
     settle()
 
     return list.map(a => a.calls)
@@ -626,20 +628,92 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
     }
   }, 120_000)
 
-  it('enforces the rendering values against ID-selector and inline !important declarations, and fails when it cannot', async () => {
+  const stunTurn = async () => {
+    const seen = { packets: 0, connections: 0 }
+    const udp = createSocket('udp4')
+    udp.on('message', () => { seen.packets++ })
+    await new Promise<void>(r => udp.bind(0, '127.0.0.1', r))
+    const tcp = createTcpServer(socket => { seen.connections++; socket.destroy() })
+    await new Promise<void>(r => tcp.listen(0, '127.0.0.1', r))
+    const stun = `stun:127.0.0.1:${udp.address().port}`
+    const turn = `turn:127.0.0.1:${(tcp.address() as { port: number }).port}?transport=tcp`
+
+    return { seen, stun, turn, close: () => Promise.all([new Promise<void>(r => udp.close(() => r())), new Promise<void>(r => tcp.close(() => r()))]) }
+  }
+
+  it('refuses WebRTC, WebTransport and data channels in the page, srcdoc and script-made frames before ICE reaches a STUN or TURN receiver, on both sides', async () => {
+    const r = await stunTurn()
+    const ice = `{iceServers:[{urls:'${r.stun}'},{urls:'${r.turn}',username:'u',credential:'c'}]}`
+
+    const run = `for (const C of [RTCPeerConnection, webkitRTCPeerConnection]) { try { const pc = new C(${ice}); pc.createDataChannel('x'); pc.createOffer().then(o => pc.setLocalDescription(o)).catch(() => {}) } catch {} }
+try { new WebTransport('https://127.0.0.1:9/') } catch {}`
+
+    const page = `<!doctype html><h1>rtc</h1><script>${run}</script><iframe srcdoc="<h2>frame</h2><script>${run}</script>"></iframe>
+<script>const f = document.body.appendChild(document.createElement('iframe')); try { new f.contentWindow.RTCPeerConnection(${ice}) } catch {}</script>`
+
+    const { bundles } = await shoot({ 'index.html': page })
+
+    for (const b of bundles) {expect(b.blocked_requests).toEqual(expect.arrayContaining([r.stun, r.turn, 'webrtc:RTCPeerConnection', 'https://127.0.0.1:9/']))}
+
+    const err: any = await asPrototype(page)
+    expect(err.message).toBe('the chosen design file is not self-contained')
+    expect(err.blocked).toEqual(expect.arrayContaining([r.stun, r.turn]))
+    await new Promise(done => setTimeout(done, 1000))
+    await r.close()
+    expect(r.seen).toEqual({ packets: 0, connections: 0 })
+  }, 120_000)
+
+  const bodyShadowPage = (ms: number) => `<!doctype html><body><script>document.body.attachShadow({mode:'open'}).innerHTML =
+'<style>@keyframes m{to{transform:translateX(300px)}}h2{width:100px;animation:m ${ms}ms infinite linear}</style><h2>Inside body</h2>'; document.currentScript.remove()</script>`
+
+  it('visits a body-attached open shadow root with an animated h2 and gives period-independent images', async () => {
+    const [a, b] = await Promise.all([shoot({ 'index.html': bodyShadowPage(1000) }), shoot({ 'index.html': bodyShadowPage(10_000) })])
+    sameFiles(a.outDir, b.outDir)
+
+    for (const width of [1280, 375]) {expect(byText(read(a.outDir, width), 'inside body').tag).toBe('h2')}
+  }, 120_000)
+
+  it('normalises before page code reads it and measures each body: one synchronous computed-style read of inline !important, a shadow root, a declarative shadow root and a srcdoc frame', async () => {
+    const page = (smoothing: string, rendering: string) => {
+      const decl = `-webkit-font-smoothing:${smoothing};text-rendering:${rendering}`
+      const reflect = (id: string, out: string) => `${out}.textContent = getComputedStyle(${id}).webkitFontSmoothing + ' / ' + getComputedStyle(${id}).textRendering`
+      const frame = `Frame body text<p id=a style='${decl}!important'>A</p><p id=o></p><script>${reflect('a', 'o')}</script>`.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+
+      return `<!doctype html><body style="background:#eee">Top body text<p id=a style="${decl}!important">Inline</p><p id=ra></p><script>${reflect('a', 'ra')}</script>
+<div id=host></div><script>const r = host.attachShadow({mode:'open'}), own = new CSSStyleSheet(); own.replaceSync('h2{${decl}}')
+r.adoptedStyleSheets = [own]; r.innerHTML = '<h2 id=s>S</h2><p id=o></p>'
+const o = r.getElementById('o'); o.textContent = getComputedStyle(r.getElementById('s')).webkitFontSmoothing + ' / ' + getComputedStyle(r.getElementById('s')).textRendering</script>
+<div id=dh><template shadowrootmode=open><style>h3{${decl}}</style><h3 id=d>D</h3><p id=e></p></template></div>
+<script>const dr = dh.shadowRoot; dr.getElementById('e').textContent = getComputedStyle(dr.getElementById('d')).webkitFontSmoothing + ' / ' + getComputedStyle(dr.getElementById('d')).textRendering</script>
+<iframe srcdoc="${frame}"></iframe>`
+    }
+
+    const [a, b] = await Promise.all([shoot({ 'index.html': page('subpixel-antialiased', 'optimizeSpeed') }), shoot({ 'index.html': page('none', 'optimizeLegibility') })])
+
+    for (const width of [1280, 375]) {
+      const shown = read(a.outDir, width).elements.filter((e: any) => e.text === 'antialiased / geometricprecision')
+      expect(shown, `${width}`).toHaveLength(4)
+      expect(JSON.stringify(read(b.outDir, width))).toBe(JSON.stringify(read(a.outDir, width)))
+      const bodies = read(a.outDir, width).elements.filter((e: any) => e.tag === 'body')
+      expect(bodies.map((e: any) => e.text).sort(), `${width} body text`).toEqual(['frame body text', 'top body text'])
+      expect(bodies.find((e: any) => e.text === 'top body text').colour.background_color).toEqual([238, 238, 238, 1])
+    }
+  }, 120_000)
+
+  it('enforces the rendering values against ID-selector declarations and inline !important set again by the page, and fails when the page empties the layer', async () => {
     const forced = '-webkit-font-smoothing:subpixel-antialiased!important;text-rendering:optimizeSpeed!important'
 
     const page = (script: string) => `<style>#a{${forced}}</style><h1 id=a>AVAVATAR</h1><p id=b style="${forced}">Inline</p><p id=ra></p><p id=rb></p>
 <script>const show = () => { for (const [s, d] of [[a, ra], [b, rb]]) { const c = getComputedStyle(s); d.textContent = c.webkitFontSmoothing + ' / ' + c.textRendering } ${script} requestAnimationFrame(show) }; show()</script>`
 
-    const { outDir } = await shoot({ 'index.html': page('') })
+    const { outDir } = await shoot({ 'index.html': page(`b.style.setProperty('-webkit-font-smoothing', 'subpixel-antialiased', 'important');`) })
 
     for (const width of [1280, 375]) {
       const shown = read(outDir, width).elements.filter((e: any) => e.text === 'antialiased / geometricprecision')
       expect(shown, `${width}`).toHaveLength(2)
     }
 
-    const err: any = await shoot({ 'index.html': page(`b.style.setProperty('-webkit-font-smoothing', 'subpixel-antialiased', 'important');`) }).catch((e: unknown) => e)
+    const err: any = await shoot({ 'index.html': `${page('')}<script>addEventListener('load', () => document.getElementById('__dc_style').textContent = '')</script>` }).catch((e: unknown) => e)
     expect(err.message).toContain('rendering normalisation is not effective')
   }, 120_000)
 })
