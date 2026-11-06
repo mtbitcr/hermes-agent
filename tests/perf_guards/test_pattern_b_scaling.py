@@ -12,7 +12,10 @@ Guard design rules (to stay CI-stable):
    over time at N — never absolute wall-clock.  Linear paths give ~4 (with
    allocator noise), quadratic paths give ~16.  Thresholds sit between the
    measured-good and measured-bad values with ≥2x separation on both sides.
-3. min-of-K timing samples to reject scheduler noise.
+3. Reject scheduler noise: best-of-K for the single-path guards; for the
+   tool-call guard, a warm-up pass, small/large samples interleaved, medians
+   of per-thread CPU time (``time.thread_time``: preemption by other
+   processes on a loaded runner is not counted) and short samples.
 
 Baseline measurements (2026-08-28, macOS arm64, Python 3.12):
 - streamed-text accumulation on main: 4N/N ratio ≈ 9.6 (superlinear —
@@ -29,6 +32,7 @@ PR that merges its fix (or immediately after).
 
 from __future__ import annotations
 
+import statistics
 import time
 from pathlib import Path
 
@@ -43,6 +47,35 @@ def _min_time(fn, *, repeat: int = 5) -> float:
         fn()
         best = min(best, time.perf_counter() - t0)
     return best
+
+
+def _scaling_ratio(fn, n_small: int, n_large: int, *, rounds: int) -> float:
+    """Median CPU time of ``fn(n_large)`` over median of ``fn(n_small)``.
+
+    One untimed warm-up call per size, then ``rounds`` interleaved samples of
+    each so slow drift hits both sizes alike.
+    """
+    fn(n_small)
+    fn(n_large)
+    small: list[float] = []
+    large: list[float] = []
+    for _ in range(rounds):
+        for n, samples in ((n_small, small), (n_large, large)):
+            t0 = time.thread_time()
+            fn(n)
+            samples.append(time.thread_time() - t0)
+    return statistics.median(large) / max(statistics.median(small), 1e-9)
+
+
+def _assert_linear_scaling(
+    assemble, *, n_small: int, n_large: int, frag: str, rounds: int, max_ratio: float
+) -> None:
+    ratio = _scaling_ratio(lambda n: assemble(n, frag), n_small, n_large, rounds=rounds)
+    assert ratio < max_ratio, (
+        f"tool-call fragment assembly is superlinear: {n_large // n_small}x "
+        f"fragments cost {ratio:.1f}x time. Fragments must be buffered in a "
+        f"list and joined once (PR #92242 shape), never `+=` into a dict field."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +220,13 @@ class TestToolCallFragmentAssemblyLinear:
     """
 
     FRAG = "y" * 64
-    # Sized so the small case takes ≥2ms even on fast hardware: sub-ms bases
-    # make the ratio jitter on noisy CI runners (measured 0.185ms at 8k).
-    N_SMALL = 128_000
-    N_LARGE = 512_000
-    MAX_RATIO = 8.0  # linear ≈ 4; dict-field quadratic measured >> 10
+    # Linear ≈ 4, dict-field ``+=`` ≥ 16 (measured 27-100+).  8 leaves 2x on
+    # each side.  Sizes keep each sample to a few ms so most samples fit inside
+    # one scheduler slice even on a loaded runner; the median ignores the rest.
+    N_SMALL = 16_000
+    N_LARGE = 64_000
+    ROUNDS = 15
+    MAX_RATIO = 8.0
 
     @staticmethod
     def _assemble_dict_field(n_frags: int, frag: str) -> int:
@@ -202,12 +237,36 @@ class TestToolCallFragmentAssemblyLinear:
             entry["function"]["arguments_parts"].append(frag)
         return len("".join(entry["function"]["arguments_parts"]))
 
+    @staticmethod
+    def _assemble_dict_field_concat(n_frags: int, frag: str) -> int:
+        """Deliberately quadratic stand-in: ``+=`` into a dict field."""
+        acc = {0: {"function": {"name": "tool", "arguments": ""}}}
+        entry = acc[0]
+        for _ in range(n_frags):
+            entry["function"]["arguments"] += frag
+        return len(entry["function"]["arguments"])
+
     def test_4x_fragments_cost_about_4x_time(self):
-        t_small = _min_time(lambda: self._assemble_dict_field(self.N_SMALL, self.FRAG), repeat=3)
-        t_large = _min_time(lambda: self._assemble_dict_field(self.N_LARGE, self.FRAG), repeat=3)
-        ratio = t_large / max(t_small, 1e-9)
-        assert ratio < self.MAX_RATIO, (
-            f"tool-call fragment assembly is superlinear: 4x fragments cost "
-            f"{ratio:.1f}x time. Fragments must be buffered in a list and "
-            f"joined once (PR #92242 shape), never `+=` into a dict field."
+        _assert_linear_scaling(
+            self._assemble_dict_field,
+            n_small=self.N_SMALL,
+            n_large=self.N_LARGE,
+            frag=self.FRAG,
+            rounds=self.ROUNDS,
+            max_ratio=self.MAX_RATIO,
         )
+
+
+class TestFragmentScalingGuardDetectsQuadratic:
+    """The scaling assertion must fail against a deliberately quadratic model."""
+
+    def test_dict_field_concat_is_flagged(self):
+        with pytest.raises(AssertionError, match="superlinear"):
+            _assert_linear_scaling(
+                TestToolCallFragmentAssemblyLinear._assemble_dict_field_concat,
+                n_small=2_000,
+                n_large=8_000,
+                frag=TestToolCallFragmentAssemblyLinear.FRAG,
+                rounds=5,
+                max_ratio=TestToolCallFragmentAssemblyLinear.MAX_RATIO,
+            )
