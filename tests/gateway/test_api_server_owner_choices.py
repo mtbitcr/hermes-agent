@@ -67,12 +67,16 @@ def _store(board: str):
     return folder / "kanban.db"
 
 
-def _designer_card(project: dict, title: str = "Design the home page", count: int = 3) -> SimpleNamespace:
+def _designer_card(
+    project: dict, title: str = "Design the home page", count: int = 3, parents: tuple[str, ...] = (),
+) -> SimpleNamespace:
     """A designer card of *project* that attached *count* pictures to itself and offered them as options (card 1),
-    so that it waits for the owner's choice."""
+    so that it waits for the owner's choice. Each of *parents*, a completed card, is linked to it before it declares."""
     board = project["board"]
     with contextlib.closing(kb.connect(board=board)) as conn:
         task_id = kb.create_task(conn, title=title, assignee="designer", project_id=project["project_id"])
+        for parent in parents:
+            kb.link_tasks(conn, parent, task_id)
         claimed = kb.claim_task(conn, task_id)
         assert claimed is not None and claimed.status == "running"
         ids = [
@@ -341,6 +345,69 @@ async def test_5_a_comment_on_the_waiting_card_keeps_its_options_and_the_choice_
     assert seen["comments"] == [
         (owner.actor, "Please keep the logo at the top."), (owner.actor, f"The owner chose option 2: {SENTENCES[1]}"),
     ]
+    assert (seen["status"], seen["unblocked"]) == ("ready", 1)
+
+
+def _completed_card(project: dict, title: str) -> str:
+    """A card of *project* that its run has completed."""
+    with contextlib.closing(kb.connect(board=project["board"])) as conn:
+        task_id = kb.create_task(conn, title=title, assignee="default", project_id=project["project_id"])
+        assert kb.claim_task(conn, task_id) is not None
+        assert kb.complete_task(conn, task_id, summary="The brief is written.")
+    return task_id
+
+
+def _upkeep(card, upkeep: str, parent: str) -> None:
+    """One piece of upkeep on the waiting *card*, by the kernel call the native ``hermes kanban`` verb makes
+    (``attach-rm``, ``assign``, ``link``, ``unlink``); none of them changes the card's status or holds it again."""
+    with contextlib.closing(kb.connect(board=card.board)) as conn:
+        if upkeep == "attach_rm_note":
+            note = kb.store_attachment_bytes(
+                conn, card.task_id, "opening-hours.txt", b"Open from 8 to 4.", content_type="text/plain",
+                uploaded_by="default", board=card.board,
+            )
+            assert kb.delete_attachment(conn, note) is not None
+        elif upkeep == "attach_rm_picture":
+            # The picture of option 2, the option the owner then chooses by its sentence.
+            assert kb.delete_attachment(conn, int(card.attachment_ids[1])) is not None
+        elif upkeep == "assign_same_designer":
+            assert kb.assign_task(conn, card.task_id, "designer")
+        elif upkeep == "link_completed_parent":
+            kb.link_tasks(conn, parent, card.task_id)
+            assert kb.parent_ids(conn, card.task_id) == [parent]
+        else:
+            assert kb.unlink_tasks(conn, parent, card.task_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("upkeep", [
+    "attach_rm_note", "attach_rm_picture", "assign_same_designer", "link_completed_parent", "unlink_completed_parent",
+])
+async def test_5_upkeep_that_leaves_the_card_held_keeps_its_options_and_the_choice_releases_it(owner, upkeep):
+    """Upkeep that leaves the card's status as it is does not end the hold its declaration made: removing an
+    unrelated note or one offered picture, assigning the card again to its designer, linking a completed parent to it,
+    or unlinking a completed parent linked before it declared. The card stays held, the options stay listed as
+    declared, and the choice, by its sentence where its picture was removed, is recorded and releases the card."""
+    project = _project(owner, "Bakery Website")
+    parent = _completed_card(project, "Write the brief")
+    card = _designer_card(project, parents=(parent,) if upkeep == "unlink_completed_parent" else ())
+    async with TestClient(TestServer(_app())) as client:
+        ref = await _ref(client, card)
+        _upkeep(card, upkeep, parent)
+        held = _observed(card)
+        _status, _raw, feed = await _feed(client, "design_options_v1")
+        chosen = await _choose(client, ref, 2)
+
+    assert (held["status"], held["block_kind"], held["chosen"], held["comments"]) == ("blocked", "needs_input", [], [])
+    (item,) = feed["data"]
+    seen = _observed(card)
+    assert item["decision_ref"] == ref and item["design_options"] == seen["declared"][0]
+    assert chosen == (200, {
+        "object": "hermes.owner_workspace.design_choice", "decision_ref": ref, "n": 2, "released": True,
+    })
+    (recorded,) = seen["chosen"]
+    assert (recorded["n"], recorded["sentence"], recorded["attachment_id"]) == (2, SENTENCES[1], card.attachment_ids[1])
+    assert seen["comments"] == [(owner.actor, f"The owner chose option 2: {SENTENCES[1]}")]
     assert (seen["status"], seen["unblocked"]) == ("ready", 1)
 
 

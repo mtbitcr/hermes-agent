@@ -40,9 +40,6 @@ SCHEMA_VERSION = 1
 DECLARED_EVENT = "design_options_declared"
 # The task event that records the owner's choice (card 2).
 CHOSEN_EVENT = "design_option_chosen"
-# The task events that leave a waiting card's hold as it is: a comment or an
-# attachment. Any other later event ends the hold its declaration made.
-_HOLD_KEEPING_EVENTS = frozenset({"commented", "attached"})
 # How many decided design choices the Decisions list returns (section D).
 RECENT_LIMIT = 10
 # The one owner reason of the hold. It passes the owner text policy
@@ -223,34 +220,48 @@ def declare_design_options(
 
 
 def _waiting_declarations(conn: sqlite3.Connection, task_ids: list[str]) -> dict[str, dict]:
-    """The declaration of each of *task_ids* whose declared hold is still its current hold.
+    """The declaration of each of *task_ids* that still waits for the owner's choice.
 
-    The declared hold is the ``needs_input`` hold written in the declaration's
-    own transaction, so the card's next event after its declaration. It is
-    current while the card is still held ``needs_input`` and each later event
-    of the card, in id order, is a comment or an attachment. Any other later
-    event ends it, a choice included, and a card it cannot be shown for is
-    left out.
+    The one rule the feed and the choice both use. A declaration waits exactly
+    while all three are true: the card is blocked now with block kind
+    ``needs_input``, by the kernel's own reading of the status changes it
+    records (``task_owner_waits``); the card's newest ``blocked`` event is the
+    one the declaration wrote in its own transaction, its first after the
+    declaration, so since then no status change and no later block; and no
+    choice is recorded. Every event that leaves the card's status as it is
+    leaves the hold as it is too. Batched: a few queries for all of
+    *task_ids* together, never one per card.
     """
-    if not task_ids:
+    from hermes_cli import kanban_db
+
+    held = [
+        task_id for task_id, wait in kanban_db.task_owner_waits(conn, task_ids).items()
+        if wait["kind"] == "needs_input"
+    ]
+    if not held:
         return {}
     declared: dict[str, dict] = {}
-    later: dict[str, list[str]] = {}
-    for task_id, kind, payload in conn.execute(
-        "SELECT task_id, kind, payload FROM task_events "
-        "WHERE task_id IN (SELECT id FROM tasks WHERE status = 'blocked' "
-        "AND block_kind = 'needs_input' AND task_kind = 'work' "
-        "AND id IN (" + ", ".join("?" for _ in task_ids) + ")) ORDER BY id",
-        task_ids,
+    hold: dict[str, int] = {}
+    newest: dict[str, int] = {}
+    chosen: set[str] = set()
+    for task_id, event_id, kind, payload in conn.execute(
+        "SELECT task_id, id, kind, payload FROM task_events WHERE kind IN (?, 'blocked', ?) "
+        "AND task_id IN (" + ", ".join("?" for _ in held) + ") ORDER BY id",
+        (DECLARED_EVENT, CHOSEN_EVENT, *held),
     ).fetchall():
-        if str(task_id) in declared:
-            later[str(task_id)].append(kind)
-        elif kind == DECLARED_EVENT:
-            declared[str(task_id)], later[str(task_id)] = json.loads(payload), []
+        task_id = str(task_id)
+        if kind == DECLARED_EVENT:
+            declared.setdefault(task_id, json.loads(payload))
+        elif task_id not in declared:
+            continue
+        elif kind == CHOSEN_EVENT:
+            chosen.add(task_id)
+        else:
+            hold.setdefault(task_id, int(event_id))
+            newest[task_id] = int(event_id)
     return {
         task_id: payload for task_id, payload in declared.items()
-        if later[task_id][:1] == ["blocked"]
-        and all(kind in _HOLD_KEEPING_EVENTS for kind in later[task_id][1:])
+        if task_id in hold and hold[task_id] == newest[task_id] and task_id not in chosen
     }
 
 
@@ -259,14 +270,15 @@ def decision_design_options(conn: sqlite3.Connection, task_ids: list[str]) -> di
 
     For the Decisions feed read with ``design_options_v1`` (card 2), on a
     read-only connection to the cards' own store: the declaration payload of
-    each card whose declared hold is still its current hold, the section A
-    object as declared, so exactly the cards :func:`accept_choice` takes a
-    choice for. Options are listed only while the ``needs_input`` hold their
-    declaration made lasts: a release, a move, a new claim, an archive, a
-    completion or any later block ends it for good, and a comment or an
-    attachment does not. A card without one is left out and stays today's
-    item. Read from the events only: a picture that can no longer be read is
-    the app's to show as such (section B).
+    each card whose declaration still waits, the section A object as
+    declared, so exactly the cards :func:`accept_choice` takes a choice for.
+    Options are listed only while the ``needs_input`` hold their declaration
+    made lasts: a change of the card's status or a later block ends it for
+    good, and an event that leaves the status as it is, such as a comment, an
+    attachment added or removed, an assignment, a link or an unlink, does
+    not. A card without one is left out and stays today's item. Read from the
+    events only: a picture that can no longer be read is the app's to show as
+    such, and the owner can still choose by the option's sentence (section B).
     """
     return _waiting_declarations(conn, task_ids)
 
@@ -276,9 +288,9 @@ def accept_choice(conn: sqlite3.Connection, task_id: str, n: int, *, actor: str)
 
     For the owner choose route (card 2), which resolved *task_id* through the
     owner's own Decisions feed. In one write transaction on *conn*: the
-    ``needs_input`` hold the card's declaration made must still be its current
-    hold, by the rule :func:`decision_design_options` lists by, so a card held
-    again after that hold ended never takes a choice; the declaration must
+    card's declaration must still wait, by the one rule
+    :func:`decision_design_options` lists by, so a card held again after the
+    hold its declaration made ended never takes a choice; the declaration must
     offer option *n*; one ``design_option_chosen`` event
     ``{n, sentence, attachment_id, actor, chosen_at}`` is written; *actor*
     comments on the card in plain words; and the card is released as
