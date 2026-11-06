@@ -17,8 +17,10 @@ export const VIEWPORTS = [[1280, 800], [375, 812]]
 export const MAX_PAGE_HEIGHT = 8000
 export const CHROMIUM_SWITCHES = ['--headless=new', '--disable-gpu', '--disable-lcd-text', '--font-render-hinting=none',
   '--force-color-profile=srgb', '--hide-scrollbars', '--disable-features=PaintHolding', '--lang=en-US']
-const STYLE = '*,*::before,*::after{animation:none!important;transition:none!important;caret-color:transparent!important;'
-  + 'scroll-behavior:auto!important;-webkit-font-smoothing:antialiased!important;text-rendering:geometricPrecision!important}'
+// Forced values: from a cascade layer declared first they also beat author ID-selector !important rules; inline !important is rewritten by probe.prepare.
+export const FORCED = { animation: 'none', transition: 'none', 'caret-color': 'transparent', 'scroll-behavior': 'auto',
+  '-webkit-font-smoothing': 'antialiased', 'text-rendering': 'geometricPrecision' }
+export const STYLE = `@layer dc-normalise{*,*::before,*::after{${Object.entries(FORCED).map(([k, v]) => `${k}:${v}!important`).join(';')}}}`
 const INJECT = `(()=>{const s=document.createElement('style');s.id='__dc_style';s.dataset.early=document.readyState==='loading'?'1':'0';s.textContent=${JSON.stringify(STYLE)};`
   + 'const put=()=>document.documentElement&&(document.documentElement.appendChild(s),true);'
   + 'if(!put())new MutationObserver((_,o)=>put()&&o.disconnect()).observe(document,{childList:true})})()'
@@ -45,6 +47,17 @@ export function assertSelfContained(blocked) {
   if (blocked.length) throw Object.assign(new Error('the chosen design file is not self-contained'), { blocked })
 }
 
+// Walks a pierced CDP DOM tree (shadow roots and frame documents included, template content excluded); returns the host's node name.
+export function findClosedShadowRoot(node) {
+  const roots = node.shadowRoots || []
+  if (roots.some(r => r.shadowRootType === 'closed')) return node.nodeName
+  for (const kid of [...roots, ...(node.children || []), ...(node.contentDocument ? [node.contentDocument] : [])]) {
+    const hit = findClosedShadowRoot(kid)
+    if (hit) return hit
+  }
+  return null
+}
+
 // Runs before any page script in every frame: the Fetch gate cannot see WebSocket handshakes, so refuse them at the API.
 const guardSource = (origin, onlyPath) => `(() => {
   const classify = ${classifyRequest}, origin = ${JSON.stringify(origin)}, only = ${JSON.stringify(onlyPath)}
@@ -52,6 +65,7 @@ const guardSource = (origin, onlyPath) => `(() => {
   const abs = u => { try { return new URL(u, location.href).href } catch { return String(u) } }
   const ok = u => classify(abs(u), origin, only) === 'allowed'
   const refuse = u => { report(abs(u)); throw new DOMException('outside request refused', 'SecurityError') }
+  window.open = u => { report(abs(u || 'about:blank')); return null }
   window.WebSocket = class WebSocket { constructor(u) { refuse(u) } }
   const Source = window.EventSource
   window.EventSource = class extends Source { constructor(u, o) { if (!ok(u)) refuse(u); super(u, o) } }
@@ -162,23 +176,50 @@ async function openTarget(browser) {
 
 const frames = 'new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))'
 
+const AUTO_ATTACH = { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }
+
 async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPath, width, height }) {
   const t = await openTarget(browser)
   const blocked = []
   const leaked = []
   const open = new Set()
+  const guarded = new Set([t.sessionId])
+  const source = `${INJECT};${guardSource(origin, onlyPath)}`
   let lastActivity = Date.now()
   let onLoad
   const loaded = new Promise(r => { onLoad = r })
+  // The same gates for the capture page and for every frame session, applied while the session is still paused at start.
+  const gate = async send => {
+    for (const m of ['Page.enable', 'Network.enable', 'Runtime.enable']) await send(m)
+    await send('Runtime.addBinding', { name: '__dcBlock' })
+    await send('Fetch.enable', { patterns: [{ urlPattern: '*' }] })
+    await send('Target.setAutoAttach', AUTO_ATTACH)
+    await send('Page.addScriptToEvaluateOnNewDocument', { source })
+  }
   browser.on(m => {
-    if (m.sessionId !== t.sessionId) return
+    if (m.method === 'Target.attachedToTarget') {
+      const { sessionId, targetInfo: info, waitingForDebugger } = m.params
+      if (!waitingForDebugger) return
+      if (m.sessionId === undefined) {
+        // A new top-level target is a popup: never resumed, so it never makes a request.
+        blocked.push(info.url || 'about:blank')
+        browser.send('Target.closeTarget', { targetId: info.targetId }).catch(() => {})
+      } else if (guarded.has(m.sessionId) && info.type === 'iframe') {
+        guarded.add(sessionId)
+        const send = (method, params) => browser.send(method, params, sessionId)
+        gate(send).then(() => send('Runtime.runIfWaitingForDebugger')).catch(() => {})
+      } else blocked.push(info.url || info.type)
+      return
+    }
+    if (!guarded.has(m.sessionId)) return
     const { requestId, request } = m.params
+    const send = (method, params) => browser.send(method, params, m.sessionId).catch(() => {})
     lastActivity = Date.now()
     if (m.method === 'Fetch.requestPaused') {
       if (classifyRequest(request.url, origin, onlyPath) === 'blocked') {
         blocked.push(request.url)
-        t.send('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' }).catch(() => {})
-      } else t.send('Fetch.continueRequest', { requestId }).catch(() => {})
+        send('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' })
+      } else send('Fetch.continueRequest', { requestId })
     } else if (m.method === 'Runtime.bindingCalled') blocked.push(m.params.payload)
     else if (m.method === 'Network.webSocketCreated') { blocked.push(m.params.url); leaked.push(m.params.url) }
     else if (m.method === 'Network.requestWillBeSent') open.add(requestId)
@@ -187,14 +228,12 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
   })
   try {
     // Runtime.enable makes Chromium create the script context at document start; otherwise a scriptless page runs the injected script after load.
-    for (const m of ['Page.enable', 'Network.enable', 'Runtime.enable']) await t.send(m)
-    await t.send('Runtime.addBinding', { name: '__dcBlock' })
-    await t.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] })
+    await browser.send('Target.setAutoAttach', AUTO_ATTACH)
+    await gate(t.send)
     await t.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false })
     await t.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] })
     await t.send('Emulation.setTimezoneOverride', { timezoneId: 'UTC' })
     await t.send('Emulation.setLocaleOverride', { locale: 'en-US' })
-    await t.send('Page.addScriptToEvaluateOnNewDocument', { source: `${INJECT};${guardSource(origin, onlyPath)}` })
     const nav = await t.send('Page.navigate', { url })
     if (nav.errorText) throw new Error(`cannot load ${url}: ${nav.errorText}`)
     await Promise.race([loaded, new Promise((_, no) => setTimeout(() => no(new Error(`timed out loading ${url}`)), 30000).unref())])
@@ -210,8 +249,12 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
       if (Date.now() > deadline) throw new Error(`network never went quiet for ${url}`)
       await sleep(50)
     }
-    await run(frames)
     const probe = `(${probeSource}\n)`
+    const closed = findClosedShadowRoot((await t.send('DOM.getDocument', { depth: -1, pierce: true })).root)
+    if (closed) throw new Error(`unsupported content: a closed shadow root under <${closed.toLowerCase()}> cannot be measured`)
+    await run(`${probe}.prepare(${JSON.stringify(FORCED)}, ${JSON.stringify(STYLE)})`)
+    await run(`${probe}.fontsReady()`)
+    await run(frames)
     await run(`${probe}.settle()`)
     const measurement = await run(`${probe}.measure()`)
     const pageHeight = Math.min(measurement.pageHeight, MAX_PAGE_HEIGHT)
@@ -237,6 +280,7 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
     })(${JSON.stringify(tiles)}, ${width}, ${pageHeight})`)
     return { blocked, measurement, pageHeight, png: Buffer.from(png, 'base64') }
   } finally {
+    await browser.send('Target.setAutoAttach', { ...AUTO_ATTACH, autoAttach: false }).catch(() => {})
     await t.close().catch(() => {})
   }
 }

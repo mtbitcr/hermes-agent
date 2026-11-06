@@ -80,6 +80,18 @@ describe('key building', () => {
     ])
   })
 
+  it('continues the landmark chain through shadow hosts and frame elements', () => {
+    const inShadow = el('h2', {}, 'Inner')
+    const host = el('div', {})
+    el('body', {}, el('main', {}, host))
+    inShadow.getRootNode = () => ({ host })
+    const frame = el('iframe', {})
+    el('body', {}, el('section', {}, frame))
+    const inFrame = el('h3', {}, 'Framed')
+    inFrame.ownerDocument = { defaultView: { frameElement: frame } }
+    expect(probe.assignKeys([inShadow, inFrame])).toEqual(['main/h2:"inner"#1', 'section/h3:"framed"#1'])
+  })
+
   it('prefers an explicit role to the tag name', () => {
     const d = el('div', { role: 'alert' }, 'Saved')
     el('body', {}, d)
@@ -118,7 +130,7 @@ describe('probe visibility and motion', () => {
 
   const settleWith = (...list: Record<string, any>[]) => {
     const live = () => list.filter(a => a.playState !== 'idle')
-    const { settle } = runInNewContext(probeSource, { document: { createElement: () => ({}), getAnimations: live } })
+    const { settle } = runInNewContext(probeSource, { window: {}, scrollX: 0, scrollY: 0, document: { createElement: () => ({}), getAnimations: live, body: { querySelectorAll: () => [] } } })
     settle()
 
     return list.map(a => a.calls)
@@ -251,6 +263,28 @@ describe('requests and Chromium pin', () => {
   it('fails closed with the exact sentence when a prototype asked for anything outside itself', () => {
     expect(() => kit.assertSelfContained([])).not.toThrow()
     expect(() => kit.assertSelfContained(['https://fonts.example/f.woff2'])).toThrow(/^the chosen design file is not self-contained$/)
+  })
+
+  it('finds closed shadow roots anywhere in a pierced DOM tree, including frame documents, and ignores the rest', () => {
+    const node = (nodeName: string, extra: Record<string, unknown> = {}) => ({ nodeName, ...extra })
+    const root = (shadowRootType: string) => node('#document-fragment', { shadowRootType, children: [node('H2')] })
+    const page = (...kids: unknown[]) => node('#document', { children: [node('HTML', { children: kids })] })
+
+    expect(kit.findClosedShadowRoot(page(node('DIV', { shadowRoots: [root('open'), root('user-agent')] })))).toBeNull()
+    expect(kit.findClosedShadowRoot(page(node('TEMPLATE', { templateContent: page(node('P', { shadowRoots: [root('closed')] })) })))).toBeNull()
+    expect(kit.findClosedShadowRoot(page(node('SECTION', { shadowRoots: [root('closed')] })))).toBe('SECTION')
+    expect(kit.findClosedShadowRoot(page(node('IFRAME', { contentDocument: page(node('X-CARD', { shadowRoots: [root('open'), root('closed')] })) })))).toBe('X-CARD')
+    expect(kit.findClosedShadowRoot(page(node('DIV', { shadowRoots: [{ ...root('open'), children: [node('ASIDE', { shadowRoots: [root('closed')] })] }] })))).toBe('ASIDE')
+  })
+
+  it('forces the rendering values from a cascade layer that is declared first, so it also beats ID-selector important rules', () => {
+    expect(kit.STYLE.startsWith('@layer ')).toBe(true)
+
+    for (const [name, value] of Object.entries(kit.FORCED)) {
+      expect(kit.STYLE, name).toContain(`${name}:${value}!important`)
+    }
+
+    expect(kit.FORCED).toMatchObject({ '-webkit-font-smoothing': 'antialiased', 'text-rendering': 'geometricPrecision', animation: 'none' })
   })
 
   it('names outputs with a readable slug plus a digest of the exact route', () => {
@@ -499,5 +533,113 @@ for (const f of [() => new WebSocket('ws://${r.base}/socket'), () => new EventSo
     const dup = cli('/a-b /a-b', join(scratch, 'cli-dup'))
     expect(dup.status).toBe(1)
     expect(dup.stderr).toContain('refusing to overwrite')
+  }, 120_000)
+
+  const settleHits = () => new Promise(r => setTimeout(r, 500))
+
+  const asPrototype = (html: string) => {
+    const file = join(scratch, `proto-${++seq}.html`)
+    writeFileSync(file, html)
+
+    return kit.capture({ side: 'prototype', prototypeFile: file, pages: ['/'], outDir: join(scratch, `out-${++seq}`), chromium, runId: 'r', candidateDigest: 'd' })
+      .catch((e: unknown) => e)
+  }
+
+  const read = (outDir: string, width = 1280) => JSON.parse(readFileSync(join(outDir, `${kit.pageSlug('/')}-${width}.json`), 'utf8'))
+  const byText = (bundle: any, text: string) => bundle.elements.find((e: any) => e.text === text)
+
+  const escapes: [string, (base: string) => string][] = [
+    ['direct popup navigation', base => `<h1>popup</h1><script>window.open('http://${base}/popup')</script>`],
+    ['an about:blank popup native WebSocket', base => `<h1>realm</h1><script>const p = window.open('about:blank'); new p.WebSocket('ws://${base}/clean-socket')</script>`],
+  ]
+
+  for (const [name, page] of escapes) {
+    it(`never lets ${name} reach a separate receiver, on the candidate and on the prototype side`, async () => {
+      const r = await receiver()
+      const { bundles } = await shoot({ 'index.html': page(r.base) })
+
+      for (const b of bundles) {expect(b.blocked_requests.length).toBeGreaterThan(0)}
+
+      const err: any = await asPrototype(page(r.base))
+      expect(err.message).toBe('the chosen design file is not self-contained')
+      expect(err.blocked.length).toBeGreaterThan(0)
+      await settleHits()
+      await r.close()
+      expect(r.hits).toEqual([])
+    }, 120_000)
+  }
+
+  it('also keeps link, form, frame-realm and cross-site frame routes from reaching a separate receiver', async () => {
+    const r = await receiver()
+    const other = r.base.replace('127.0.0.1', 'localhost')
+
+    const routes = `<h1>routes</h1><a id=a target=_blank href="http://${r.base}/link">l</a><form id=f target=_blank action="http://${r.base}/form"></form><script>
+const frame = () => document.body.appendChild(document.createElement('iframe'))
+for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWindow.WebSocket)('ws://${r.base}/frame-socket'),
+  () => frame().contentWindow.open('http://${r.base}/frame-popup'), () => { frame().src = 'http://${other}/frame' }]) { try { f() } catch {} }</script>`
+
+    // The blocked cross-site frame cannot be read, so the capture itself is refused; what matters is that nothing reached the receiver.
+    await shoot({ 'index.html': routes }).catch(() => {})
+    await settleHits()
+    await r.close()
+    expect(r.hits).toEqual([])
+  }, 120_000)
+
+  const shadowPage = (ms: number) => `<!doctype html><h1>Outside</h1><div id=host></div><script>host.attachShadow({mode:'open'}).innerHTML =
+'<style>@keyframes m{to{transform:translateX(300px)}}h2{width:100px;animation:m ${ms}ms infinite linear}</style><h2>Inside</h2>'</script>`
+
+  it('gives identical bundles and pixels for a shadow-root element with an infinite CSS animation when only its period differs', async () => {
+    const [a, b] = await Promise.all([shoot({ 'index.html': shadowPage(1000) }), shoot({ 'index.html': shadowPage(10_000) })])
+    sameFiles(a.outDir, b.outDir)
+    expect(byText(read(a.outDir), 'inside').tag).toBe('h2')
+  }, 120_000)
+
+  it('measures visible shadow-root and srcdoc-iframe text with its own type values and page coordinates', async () => {
+    const shadow = (px: number) => `<h1>Outside</h1><div id=host></div><script>host.attachShadow({mode:'open'}).innerHTML = '<p style="font-size:${px}px">Visible shadow text</p><canvas width=50 height=20></canvas>'</script>`
+    const frame = (px: number) => `<h1>Outside</h1><iframe srcdoc="<h2 style='font-size:${px}px'>Frame text</h2><p style='position:fixed;bottom:0'>Pin</p>" style="border:0;margin:30px"></iframe>`
+
+    const runs = await Promise.all([shadow(10), shadow(40), frame(10), frame(40)].map(html => shoot({ 'index.html': html })))
+    const [s10, s40, f10, f40] = runs.map(x => read(x.outDir))
+
+    expect(byText(s10, 'visible shadow text').type.size).toBe(10)
+    expect(byText(s40, 'visible shadow text').type.size).toBe(40)
+    expect(byText(f10, 'frame text').type.size).toBe(10)
+    expect(byText(f40, 'frame text').type.size).toBe(40)
+    expect(JSON.stringify(s10)).not.toBe(JSON.stringify(s40))
+    expect(JSON.stringify(f10)).not.toBe(JSON.stringify(f40))
+    expect(byText(f10, 'frame text').box.x).toBeGreaterThanOrEqual(40)
+    expect(byText(f10, 'frame text').box.y).toBeGreaterThan(60)
+    expect(s10.masks).toContainEqual(expect.objectContaining({ width: 50, height: 20 }))
+    expect(byText(f10, 'pin').pinned).toBe(true)
+  }, 120_000)
+
+  it('refuses closed shadow roots, declarative closed roots and unreadable frames instead of claiming complete evidence', async () => {
+    const pages = {
+      closed: '<div id=h></div><script>h.attachShadow({mode:"closed"}).innerHTML = "<h2>Hidden</h2>"</script>',
+      declarative: '<div><template shadowrootmode="closed"><h2>Hidden</h2></template></div>',
+      sandboxed: '<iframe sandbox srcdoc="<h2>Opaque</h2>"></iframe>',
+    }
+
+    for (const [name, html] of Object.entries(pages)) {
+      const err: any = await shoot({ 'index.html': html }).catch((e: unknown) => e)
+      expect(err.message, name).toMatch(name === 'sandboxed' ? /frame/ : /closed shadow root/)
+    }
+  }, 120_000)
+
+  it('enforces the rendering values against ID-selector and inline !important declarations, and fails when it cannot', async () => {
+    const forced = '-webkit-font-smoothing:subpixel-antialiased!important;text-rendering:optimizeSpeed!important'
+
+    const page = (script: string) => `<style>#a{${forced}}</style><h1 id=a>AVAVATAR</h1><p id=b style="${forced}">Inline</p><p id=ra></p><p id=rb></p>
+<script>const show = () => { for (const [s, d] of [[a, ra], [b, rb]]) { const c = getComputedStyle(s); d.textContent = c.webkitFontSmoothing + ' / ' + c.textRendering } ${script} requestAnimationFrame(show) }; show()</script>`
+
+    const { outDir } = await shoot({ 'index.html': page('') })
+
+    for (const width of [1280, 375]) {
+      const shown = read(outDir, width).elements.filter((e: any) => e.text === 'antialiased / geometricprecision')
+      expect(shown, `${width}`).toHaveLength(2)
+    }
+
+    const err: any = await shoot({ 'index.html': page(`b.style.setProperty('-webkit-font-smoothing', 'subpixel-antialiased', 'important');`) }).catch((e: unknown) => e)
+    expect(err.message).toContain('rendering normalisation is not effective')
   }, 120_000)
 })
