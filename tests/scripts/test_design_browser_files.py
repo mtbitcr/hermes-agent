@@ -1,8 +1,9 @@
-"""Tests for the design browser files in scripts/design_browser: image, compose file, watchdog, tunnel unit and
-the runbook's sshd limits for the tunnel account.
+"""Tests for the design browser files in scripts/design_browser: image, compose file, watchdog, tunnel unit, and
+the runbook's sshd limits for the tunnel account with the check 3 that tries them.
 
 Everything is read as data; the watchdog is only parsed with ``bash -n`` and, when it is installed, checked by
-shellcheck. No image is built, no container started, no tunnel opened, no sshd changed and no network used.
+shellcheck. Check 3's probes are read, not run. No image is built, no container started, no tunnel opened, no
+sshd changed and no network used.
 """
 
 from __future__ import annotations
@@ -38,6 +39,16 @@ DIGEST_REF = re.compile(r".+@sha256:(?!(.)\1{63}$)[0-9a-f]{64}")
 # The key line limits where the key may connect, not where it may listen or which Unix sockets it may reach.
 TUNNEL_SSHD_MATCH = ["Match", "User", "<tunnel-user>"]
 TUNNEL_SSHD_LIMITS = [["PermitListen", "none"], ["AllowStreamLocalForwarding", "no"]]
+# Check 3's probes -> the exit status and a text of their refusal by OpenSSH 9.6p1 (Ubuntu 24.04).
+REFUSALS = {
+    "remote command": (1, ""),
+    "terminal": (255, "PTY allocation request failed"),
+    "forward to 127.0.0.1:22": (255, "administratively prohibited"),
+    "forward to a Unix socket": (255, "connect failed"),
+    "TCP listener": (255, "remote port forwarding failed for listen port"),
+    "Unix-socket listener": (255, "remote port forwarding failed for listen path"),
+}
+MKTEMP_ASSIGNMENT = re.compile(r"(\w+)=\$\(mktemp -u (\S+)\)")
 
 
 # --- readers -----------------------------------------------------------------------------------------
@@ -165,6 +176,51 @@ def runs(words: list[str], program: str, *arguments: str) -> bool:
     )
 
 
+def check_3_lines() -> list[str]:
+    """The lines of check 3's code blocks, in order, backslash continuations joined."""
+    _, checks = readme_parts()
+    return [line for block in fenced_lines(numbered_items(checks)[3]) for line in block]
+
+
+def shell_words(line: str) -> list[str]:
+    """The words of a shell line, comments dropped, with ;, & and | as words of their own."""
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=";&|")
+    lexer.whitespace_split = True
+    return list(lexer)
+
+
+def function_body(lines: list[str], name: str) -> list[str]:
+    """The lines between `name() {` and the next line that is only `}`."""
+    start = next(index for index, line in enumerate(lines) if line.startswith(f"{name}() {{"))
+    return lines[start + 1 : lines.index("}", start)]
+
+
+def probe_calls(lines: list[str]) -> list[tuple[int, list[str]]]:
+    """The index and words of each line that calls check 3's probe helper."""
+    calls = [(index, shell_words(line)) for index, line in enumerate(lines)]
+    return [(index, words) for index, words in calls if words[:1] == ["probe"]]
+
+
+def probe_kind(arguments: list[str]) -> str:
+    """Which probe of check 3 the ssh arguments are; a listen spec that starts with $ is a variable path."""
+    if "-tt" in arguments:
+        return "terminal"
+    for flag, spec in zip(arguments, arguments[1:]):
+        if flag == "-W":
+            return "forward to a Unix socket" if spec.startswith("/") else f"forward to {spec}"
+        if flag == "-R":
+            return "Unix-socket listener" if spec.startswith(("/", "$")) else "TCP listener"
+    return "remote command" if len(arguments) > 1 and not any(word.startswith("-") for word in arguments) else "?"
+
+
+def mktemp_path(lines: list[str]) -> tuple[str, str]:
+    """The variable that check 3 assigns from mktemp -u, and its template."""
+    assignments = [MKTEMP_ASSIGNMENT.fullmatch(line) for line in lines]
+    found = [match.groups() for match in assignments if match]
+    assert len(found) == 1, f"check 3 must assign one path from mktemp -u, got {found}"
+    return found[0]
+
+
 # --- the image ---------------------------------------------------------------------------------------
 
 
@@ -253,7 +309,7 @@ def test_the_tunnel_exits_when_its_forward_fails_and_systemd_always_restarts_it(
 
 
 def test_the_runbook_installs_sshd_limits_for_the_tunnel_account_and_check_3_tries_what_they_refuse():
-    install, checks = readme_parts()
+    install, _ = readme_parts()
     blocks = [[line.split() for line in block] for block in fenced_lines(install)]
     match_blocks = [block for block in blocks if TUNNEL_SSHD_MATCH in block]
     assert len(match_blocks) == 1, "the install must write one sshd Match block for <tunnel-user>"
@@ -266,9 +322,19 @@ def test_the_runbook_installs_sshd_limits_for_the_tunnel_account_and_check_3_tri
     reloads = [index for index, words in enumerate(lines) if runs(words, "systemctl", "reload", "ssh")]
     assert validations and reloads, "the install must run sshd -t and reload ssh"
     assert lines.index(TUNNEL_SSHD_MATCH) < validations[0] < reloads[0], "sshd -t must come before the reload"
+    # The read-back, not the file, shows that the limits apply.
+    readbacks = [index for index, words in enumerate(lines) if runs(words, "sshd", "-T")]
+    assert readbacks, "the install must read the limits back with sshd -T"
+    readback = " ".join(lines[readbacks[0]])
+    assert all(name.lower() in readback for name, _ in TUNNEL_SSHD_LIMITS), readback
+    assert validations[0] < readbacks[0] < reloads[0], "the read-back must come between sshd -t and the reload"
 
-    check_3 = fenced_lines(numbered_items(checks)[3])
-    probes = [shlex.split(line, comments=True) for block in check_3 for line in block]
+    # Check 3's Unix-socket listener uses a path from mktemp -u; read it as that template.
+    variable, template = mktemp_path(check_3_lines())
+    probes = [
+        [word.replace(f"${variable}", template) for word in shlex.split(line, comments=True)]
+        for line in check_3_lines()
+    ]
     forwards = [pair for words in probes for pair in zip(words, words[1:]) if pair[0] in {"-L", "-R", "-W"}]
     reverse = [spec for flag, spec in forwards if flag == "-R"]
     assert any(not spec.startswith("/") for spec in reverse), "check 3 tries no reverse TCP listener"
@@ -276,3 +342,70 @@ def test_the_runbook_installs_sshd_limits_for_the_tunnel_account_and_check_3_tri
     assert any(flag in {"-L", "-W"} and spec.rsplit(":", 1)[-1].startswith("/") for flag, spec in forwards), (
         "check 3 tries no forward to a Unix socket"
     )
+
+
+def test_check_3_judges_a_probe_only_once_ssh_shows_that_the_key_logged_in():
+    body = [shell_words(line) for line in function_body(check_3_lines(), "probe")]
+    [ssh] = [index for index, words in enumerate(body) if "ssh" in words]
+    assert ssh_options(body[ssh])["loglevel"] == "VERBOSE", "ssh prints Authenticated to ... at VERBOSE"
+    logged_in = [index for index, words in enumerate(body) if "grep" in words and "^Authenticated to " in words]
+    judged = [
+        index
+        for index, words in enumerate(body)
+        if any("$text" in word or "$want" in word or word.startswith("pass") for word in words)
+    ]
+    assert logged_in and judged, "the helper must look for Authenticated to and judge the text and exit status"
+    assert ssh < logged_in[0] < min(judged), "the helper must find Authenticated to before it judges the probe"
+
+
+def test_every_probe_of_check_3_expects_the_exit_status_and_text_of_its_refusal():
+    lines = check_3_lines()
+    body = set(function_body(lines, "probe"))
+    assert not [line for line in lines if line not in body and "ssh" in shell_words(line)], (
+        "check 3 must run ssh only through its probe helper"
+    )
+    probes = {}
+    for _, words in probe_calls(lines):
+        status, text, *arguments = words[1:]
+        probes.setdefault(probe_kind(arguments), []).append((int(status), text))
+    assert sorted(probes) == sorted(REFUSALS), probes
+    for kind, (status, part) in REFUSALS.items():
+        [(expected_status, expected_text)] = probes[kind]
+        assert expected_status == status and expected_text and part in expected_text, (kind, probes[kind])
+    # sshd refuses a Unix-socket forward as a failed connect, not as administratively prohibited.
+    [(_, socket_text)] = probes["forward to a Unix socket"]
+    assert "administratively prohibited" not in socket_text, socket_text
+
+
+def test_check_3_listens_on_a_fresh_mktemp_path_and_afterwards_fails_on_and_removes_anything_there():
+    lines = check_3_lines()
+    variable, template = mktemp_path(lines)
+    assert template.startswith("/tmp/") and template.endswith("XXX"), template
+    assert [line for line in lines if line.startswith(f"{variable}=")] == [f"{variable}=$(mktemp -u {template})"], (
+        f"check 3 must set {variable} only from mktemp -u"
+    )
+    calls = probe_calls(lines)
+    [listen_spec] = [
+        words[words.index("-R") + 1] for _, words in calls if probe_kind(words[3:]) == "Unix-socket listener"
+    ]
+    assert listen_spec.split(":", 1)[0] in {f"${variable}", f"${{{variable}}}"}, listen_spec
+
+    last_probe = max(index for index, _ in calls)
+    after = [shell_words(line) for line in lines[last_probe + 1 :]]
+    assert any(runs(words, "test", "-e", f"${variable}") for words in after), "check 3 must test the path after"
+    assert any(runs(words, "rm", "-f", f"${variable}") for words in after), "check 3 must remove the path after"
+
+
+def test_check_3_first_connects_to_the_socket_of_its_unix_socket_forward_as_the_tunnel_account():
+    lines = check_3_lines()
+    calls = probe_calls(lines)
+    [path] = [words[words.index("-W") + 1] for _, words in calls if probe_kind(words[3:]) == "forward to a Unix socket"]
+    connects = []
+    for index, line in enumerate(lines):
+        words = shell_words(line)
+        if runs(words, "sudo", "-u", "<tunnel-user>", "python3", "-c"):
+            code = words[words.index("-c") + 1]
+            if "socket.AF_UNIX" in code and f'.connect("{path}")' in code:
+                connects.append(index)
+    assert connects, f"check 3 must connect to {path} as <tunnel-user>"
+    assert connects[0] < min(index for index, _ in calls), "the connect must come before the probes"

@@ -224,29 +224,87 @@ list is empty the design browser opens no page, and which hosts go there is the 
 2. **`/json/version` answers through the tunnel.** On the control server,
    `curl -fsS http://127.0.0.1:9222/json/version` prints a JSON object with
    `"webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/..."`.
-3. **The key opens no shell and no other port.** On the control server:
+3. **The key opens no shell and no other port.** This check has three parts. Check 2 shows the other half: the
+   same key's one forward, to 127.0.0.1:9222, still works.
+
+   First, on the execution server, in the administrator session kept open since step 4:
 
    ```sh
-   tun() { timeout 15 ssh -i <key-path> -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
-             -o UserKnownHostsFile=<known-hosts-path> -o ExitOnForwardFailure=yes "$@"; }
-   tun <tunnel-user>@<execution-host> id; echo "exit $?"
-   tun -tt <tunnel-user>@<execution-host>; echo "exit $?"
-   tun -W 127.0.0.1:22 <tunnel-user>@<execution-host> </dev/null; echo "exit $?"
-   tun -W /run/dbus/system_bus_socket <tunnel-user>@<execution-host> </dev/null; echo "exit $?"
-   tun -N -R 127.0.0.1:0:127.0.0.1:9222 <tunnel-user>@<execution-host>; echo "exit $?"
-   tun -N -R /tmp/design-browser-check.sock:127.0.0.1:9222 <tunnel-user>@<execution-host>; echo "exit $?"
+   sudo -u <tunnel-user> python3 -c 'import socket; socket.socket(socket.AF_UNIX).connect("/run/dbus/system_bus_socket")'
+   sock=$(mktemp -u /tmp/design-browser-check.XXXXXXXXXX)
+   echo "sock=$sock"
    ```
 
-   The first two show no `uid=` line and no prompt, and end with exit 1. The second also says
-   `PTY allocation request failed`. The third says `administratively prohibited` and ends with exit 255. The
-   fourth tries the D-Bus system socket, which every account may open. It also says
-   `administratively prohibited` and ends with exit 255. The fifth says
-   `remote port forwarding failed for listen port 0`, the sixth
-   `remote port forwarding failed for listen path /tmp/design-browser-check.sock`, and both end with exit 255.
-   Port 0 asks for any free port, so a port in use cannot cause the refusal. The last three are refused only
-   because of step 4. Any other result fails the check. Exit 124, for example, means that ssh still ran after
-   15 s because the server accepted the request. Check 2 shows the other half: the same key's one forward, to
-   127.0.0.1:9222, still works.
+   The first line prints nothing when `<tunnel-user>` can connect to the D-Bus system socket, which the fourth
+   probe below tries. If it prints an error, check 3 fails. `mktemp -u` prints a name that no file has at that
+   moment, and creates nothing. The last line prints `sock=` with that name.
+
+   Then, on the control server, paste that `sock=` line into the shell and run:
+
+   ```sh
+   probe() {  # probe <exit status> <text> <ssh arguments ...>
+     want=$1 text=$2
+     shift 2
+     out=$(timeout 15 ssh -i <key-path> -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+             -o UserKnownHostsFile=<known-hosts-path> -o ExitOnForwardFailure=yes -o LogLevel=VERBOSE "$@" \
+             </dev/null 2>&1)
+     code=$?
+     if ! grep -q '^Authenticated to ' <<<"$out"; then reason="not logged in"
+     elif ! grep -qF "$text" <<<"$out"; then reason="text not found"
+     elif [ "$code" -ne "$want" ]; then reason="exit status not $want"
+     else echo "pass: $*"; return
+     fi
+     printf 'FAIL: %s: %s, exit %s\n%s\n' "$*" "$reason" "$code" "$out"
+   }
+   probe 1 'This account is currently not available.' <tunnel-user>@<execution-host> id
+   probe 255 'PTY allocation request failed' -tt <tunnel-user>@<execution-host>
+   probe 255 'open failed: administratively prohibited' -W 127.0.0.1:22 <tunnel-user>@<execution-host>
+   probe 255 'open failed: connect failed: open failed' -W /run/dbus/system_bus_socket <tunnel-user>@<execution-host>
+   probe 255 'remote port forwarding failed for listen port 0' -N -R 127.0.0.1:0:127.0.0.1:9222 <tunnel-user>@<execution-host>
+   probe 255 "remote port forwarding failed for listen path $sock" -N -R "$sock:127.0.0.1:9222" <tunnel-user>@<execution-host>
+   ```
+
+   Each probe runs ssh once and prints `pass` only when the key logged in, ssh printed the text and the exit
+   status is the expected one. Otherwise it prints `FAIL` with the reason and the exit status, then all that ssh
+   printed. At `LogLevel=VERBOSE` ssh prints `Authenticated to ...` once the key has logged in. An
+   authentication, host key or network failure never prints it, though it also ends with exit 255. No probe
+   reads the terminal, so `timeout` cannot leave the `-tt` probe stopped, and the block also works in a script.
+
+   The texts are those of OpenSSH 9.6p1, the version of Ubuntu 24.04. On a server, `ssh -V` shows its version.
+
+   - The first probe shows no `uid=` line. sshd runs the key's command through the account's login shell,
+     `/usr/sbin/nologin`, which prints `This account is currently not available.` and exits 1. `/bin/false`
+     would also exit 1.
+   - The key's `restrict` refuses the second probe's terminal. ssh ends with exit 255 when a terminal that `-tt`
+     forces is refused.
+   - The key's `permitopen` refuses the third. A forward that sshd allowed but could not connect would say
+     `connect failed` instead.
+   - Step 4 refuses the fourth, and the key's `permitopen`, which holds no socket path, may refuse it as well.
+     In this version sshd gives the same text for a socket it cannot reach. The first part shows that
+     `<tunnel-user>` can reach this one.
+   - Port 0 in the fifth asks for any free port, so a port in use cannot cause the refusal. Without step 4 sshd
+     accepts it: ssh prints `Allocated port ... for remote forward to 127.0.0.1:9222`, keeps running, and
+     `timeout` ends it with exit 124.
+   - Without step 4 sshd accepts the sixth too. The fifth and the sixth are the probes that step 4 decides.
+
+   Last, back on the execution server, in the same administrator session, where `sock` is still set:
+
+   ```sh
+   if sudo test -e "$sock"; then
+     echo "FAIL: $sock exists"
+     sudo rm -f "$sock"
+   else
+     echo "pass: nothing at $sock"
+   fi
+   ```
+
+   A listener that sshd accepted leaves its socket file behind after ssh ends. A file that exists makes sshd
+   refuse the listener whether or not step 4 applies. So the sixth probe's refusal counts only when its path was
+   free before and is still free after. If anything exists there, check 3 fails, and `sudo rm -f` removes it. A
+   retry starts again at the `mktemp` line, with a new path.
+
+   Check 3 passes only when the D-Bus connect succeeds, all six probes print `pass`, and the path check prints
+   `pass`.
 4. **A killed and a frozen Chromium each come back healthy within 3 minutes.** On the execution server, as
    `<docker-user>`, in the compose folder:
 
