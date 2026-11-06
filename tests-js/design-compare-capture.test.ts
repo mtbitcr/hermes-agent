@@ -1,14 +1,18 @@
-import { execFileSync } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { runInNewContext } from 'node:vm'
+import { inflateSync } from 'node:zlib'
 
 import { afterAll, describe, expect, it } from 'vitest'
 
 const kitDir = new URL('../scripts/design_compare/', import.meta.url)
 const capturePath = new URL('capture.mjs', kitDir).href
+const captureFile = fileURLToPath(new URL('capture.mjs', kitDir))
 const probeSource = readFileSync(new URL('probe.js', kitDir), 'utf8')
 const kit = await import(/* @vite-ignore */ capturePath)
 const probe = runInNewContext(probeSource, {})
@@ -83,9 +87,54 @@ describe('key building', () => {
   })
 })
 
+describe('probe visibility and motion', () => {
+  const node = (opacity: string, parent: FakeNode | null = null): FakeNode => ({ opacity, parentElement: parent })
+  const style = (n: FakeNode) => ({ opacity: n.opacity })
+
+  it('treats an element under an opacity-zero ancestor as invisible, and keeps visible controls', () => {
+    const hidden = node('0')
+    const child = node('1', hidden)
+    const grandchild = node('0.5', child)
+    const control = node('1', node('0.5'))
+    expect(probe.hiddenByOpacity(hidden, style)).toBe(true)
+    expect(probe.hiddenByOpacity(child, style)).toBe(true)
+    expect(probe.hiddenByOpacity(grandchild, style)).toBe(true)
+    expect(probe.hiddenByOpacity(control, style)).toBe(false)
+  })
+
+  const animation = (endTime: number, failFinish = false, stays = false) => {
+    const a: Record<string, any> = { calls: [] as string[], playState: 'running', effect: { getComputedTiming: () => ({ endTime }) } }
+
+    a.finish = () => { a.calls.push('finish');
+
+ if (failFinish) {throw new Error('InvalidStateError')} a.playState = 'finished' }
+
+    a.cancel = () => { a.calls.push('cancel');
+
+ if (!stays) {a.playState = 'idle'} }
+
+    return a
+  }
+
+  const settleWith = (...list: Record<string, any>[]) => {
+    const live = () => list.filter(a => a.playState !== 'idle')
+    const { settle } = runInNewContext(probeSource, { document: { createElement: () => ({}), getAnimations: live } })
+    settle()
+
+    return list.map(a => a.calls)
+  }
+
+  it('finishes finite animations, cancels infinite ones and fails when one is still running', () => {
+    expect(settleWith(animation(500), animation(Infinity), animation(500, true))).toEqual([['finish'], ['cancel'], ['finish', 'cancel']])
+    expect(() => settleWith(animation(Infinity, false, true))).toThrow('still running')
+  })
+})
+
 const SHA = 'a'.repeat(64)
 
-// Literal fixture of design_compare_bundle_v1 (C1 owns the schema; copied here field for field).
+// PROVISIONAL fixture of design_compare_bundle_v1, derived from the wording of plan Q2/Q3 by this kit.
+// C1 (task t_d7a1493a) had not run when this was written, so its schema constants did not exist and this is NOT
+// a copy of them. Compare this fixture with C1's actual constants before C4 uses both.
 const BUNDLE_V1 = {
   schema: 'design_compare_bundle_v1',
   fields: {
@@ -155,7 +204,7 @@ const bundleInput = {
 }
 
 describe('bundle', () => {
-  it('matches design_compare_bundle_v1 field for field', () => {
+  it('matches the provisional design_compare_bundle_v1 fixture', () => {
     const bundle = JSON.parse(JSON.stringify(kit.buildBundle(bundleInput)))
     expect(conforms(bundle, BUNDLE_V1.fields)).toEqual([])
     expect(bundle.schema).toBe('design_compare_bundle_v1')
@@ -187,9 +236,29 @@ describe('requests and Chromium pin', () => {
     }
   })
 
-  it('fails closed when a prototype asked for anything outside itself', () => {
+  it('on the prototype side only the prototype document and inline resources are allowed', () => {
+    const only = '/__prototype__/design.html'
+
+    for (const url of [`${origin}${only}`, `${origin}${only}?x=1`, 'data:image/png;base64,AA==', 'blob:http://127.0.0.1:5000/1', 'about:srcdoc']) {
+      expect(kit.classifyRequest(url, origin, only), url).toBe('allowed')
+    }
+
+    for (const url of [`${origin}/`, `${origin}/missing.css`, `${origin}/__prototype__/other.css`, 'https://fonts.example/f.woff2']) {
+      expect(kit.classifyRequest(url, origin, only), url).toBe('blocked')
+    }
+  })
+
+  it('fails closed with the exact sentence when a prototype asked for anything outside itself', () => {
     expect(() => kit.assertSelfContained([])).not.toThrow()
-    expect(() => kit.assertSelfContained(['https://fonts.example/f.woff2'])).toThrow('not self-contained')
+    expect(() => kit.assertSelfContained(['https://fonts.example/f.woff2'])).toThrow(/^the chosen design file is not self-contained$/)
+  })
+
+  it('names outputs with a readable slug plus a digest of the exact route', () => {
+    const digest = (route: string) => createHash('sha256').update(route).digest('hex').slice(0, 8)
+    expect(kit.pageSlug('/a-b')).toBe(`a-b-${digest('/a-b')}`)
+    expect(kit.pageSlug('/a/b')).toBe(`a-b-${digest('/a/b')}`)
+    expect(kit.pageSlug('/a-b')).not.toBe(kit.pageSlug('/a/b'))
+    expect(kit.pageSlug('/')).toBe(`index-${digest('/')}`)
   })
 
   const binary = join(scratch, 'fake-chrome')
@@ -209,42 +278,226 @@ describe('requests and Chromium pin', () => {
     expect(() => kit.verifyChromium(join(scratch, 'absent'), { version: '153.0.8010.0', sha256: sha }, deps)).toThrow()
   })
 
-  it('ships a pinned version and refuses to start while its hash is unset', () => {
+  it('ships a valid pin and refuses a binary with a different hash', () => {
     expect(kit.CHROMIUM_PIN.version).toBe('153.0.8010.0')
-    expect(() => kit.verifyChromium(binary, kit.CHROMIUM_PIN, deps)).toThrow()
+    expect(kit.CHROMIUM_PIN.package).toBe('@sparticuz/chromium@153.0.0')
+    expect(kit.CHROMIUM_PIN.sha256).toMatch(/^[0-9a-f]{64}$/)
+    expect(kit.CHROMIUM_PIN.sha256).toBe('53a15d6c3a3d27dfb54c4ba60278b1683136f70cf1e67e989da7dfbd3d451ef0')
+    expect(() => kit.verifyChromium(binary, kit.CHROMIUM_PIN, deps)).toThrow('does not match the pin')
+  })
+
+  it('the shipped CLI gets past the pin check and refuses the wrong binary by hash', () => {
+    const run = spawnSync(process.execPath, [captureFile, '--side', 'candidate', '--pages', '/', '--out', join(scratch, 'cli-out'),
+      '--run-id', 'r', '--candidate-digest', 'd', '--chromium', binary], { encoding: 'utf8' })
+
+    expect(run.status).toBe(1)
+    expect(run.stderr).toContain('does not match the pin')
+    expect(run.stderr).not.toContain('not pinned')
   })
 })
 
-describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium (opt-in)', () => {
-  const page = (anim: string, smoothing: string) => `<!doctype html><meta charset=utf-8>
+// PNG decoding for the stitched-image regressions (8-bit RGB or RGBA, as Chromium's canvas writes).
+function decodePng(buf: Buffer) {
+  const idat: Buffer[] = []
+  let w = 0, h = 0, bpp = 4
+
+  for (let p = 8; p < buf.length;) {
+    const len = buf.readUInt32BE(p), type = buf.toString('latin1', p + 4, p + 8), data = buf.subarray(p + 8, p + 8 + len)
+
+    if (type === 'IHDR') { w = data.readUInt32BE(0); h = data.readUInt32BE(4); bpp = data[9] === 6 ? 4 : 3 }
+
+    if (type === 'IDAT') {idat.push(data)}
+
+    p += 12 + len
+  }
+
+  const raw = inflateSync(Buffer.concat(idat)), stride = w * bpp, px = Buffer.alloc(h * stride)
+
+  for (let y = 0; y < h; y++) {
+    const filter = raw[y * (stride + 1)]
+
+    for (let x = 0; x < stride; x++) {
+      const a = x >= bpp ? px[y * stride + x - bpp] : 0, b = y ? px[(y - 1) * stride + x] : 0
+      const c = x >= bpp && y ? px[(y - 1) * stride + x - bpp] : 0
+      const pa = Math.abs(b - c), pb = Math.abs(a - c), pc = Math.abs(a + b - 2 * c)
+      const paeth = pa <= pb && pa <= pc ? a : pb <= pc ? b : c
+      px[y * stride + x] = (raw[y * (stride + 1) + 1 + x] + [0, a, b, (a + b) >> 1, paeth][filter]) & 255
+    }
+  }
+
+  return { w, h, at: (x: number, y: number) => [...px.subarray(y * stride + x * bpp, y * stride + x * bpp + 3)] }
+}
+
+describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium (opt-in, pinned binary from CHROME_PATH, shipped pin)', () => {
+  const chromium = process.env.CHROME_PATH as string
+  let seq = 0
+
+  const dirOf = (files: Record<string, string>) => {
+    const d = join(scratch, `case-${++seq}`)
+
+    for (const [name, body] of Object.entries(files)) {
+      mkdirSync(join(d, name, '..'), { recursive: true })
+      writeFileSync(join(d, name), body)
+    }
+
+    return d
+  }
+
+  const shoot = (site: Record<string, string>, pages = ['/']) => {
+    const outDir = join(scratch, `out-${++seq}`)
+
+    return kit.capture({ side: 'candidate', siteDir: dirOf(site), pages, outDir, chromium, runId: 'run-1', candidateDigest: 'd1' })
+      .then((bundles: any[]) => ({ bundles, outDir }))
+  }
+
+  const sameFiles = (a: string, b: string, route = '/') => {
+    for (const file of ['1280.json', '375.json', '1280.png', '375.png']) {
+      const name = `${kit.pageSlug(route)}-${file}`
+      expect(readFileSync(join(a, name)).equals(readFileSync(join(b, name))), name).toBe(true)
+    }
+  }
+
+  const receiver = async () => {
+    const hits: string[] = []
+    const server = createServer((req, res) => { hits.push(req.url as string); res.end('x') })
+    server.on('upgrade', (req, socket) => { hits.push(`upgrade ${req.url}`); socket.destroy() })
+    await new Promise<void>(r => server.listen(0, '127.0.0.1', r))
+
+    return { base: `127.0.0.1:${(server.address() as { port: number }).port}`, hits, close: () => new Promise(r => server.close(r)) }
+  }
+
+  const motionPage = (ms: number, smoothing: string) => `<!doctype html><meta charset=utf-8>
 <style>body{margin:0;font:20px sans-serif;-webkit-font-smoothing:${smoothing}}
 @keyframes spin{to{transform:rotate(360deg)}}
-#box{width:80px;height:80px;background:#369;animation:spin ${anim} linear infinite}
-h1{margin:16px}</style><h1>Tiny page</h1><div id=box></div><p>Some text</p>`
+#box{width:80px;height:80px;background:#369;animation:spin ${ms}ms linear infinite}
+#wa{width:80px;height:60px;background:red}h1{margin:16px}</style><h1>Tiny page</h1><div id=box></div><div id=wa></div><p>Some text</p>
+<div style="opacity:0"><p>Invisible text</p></div>
+<div style="visibility:hidden"><p style="visibility:visible">Shown override</p></div><p>Visible control</p>
+<script>document.getElementById('wa').animate([{transform:'translateX(0px)'},{transform:'translateX(300px)'}],{duration:${ms},iterations:Infinity})</script>`
 
-  it('gives identical bundles and images despite animation and font smoothing', async () => {
-    const chromium = process.env.CHROME_PATH as string
-    const version = /\d+(\.\d+){3}/.exec(execFileSync(chromium, ['--version'], { encoding: 'utf8' }))![0]
-    const pin = { version, sha256: createHash('sha256').update(readFileSync(chromium)).digest('hex') }
-    const out: string[] = []
+  let motionRuns: Promise<[Awaited<ReturnType<typeof shoot>>, Awaited<ReturnType<typeof shoot>>]> | undefined
+  const motion = () => (motionRuns ??= Promise.all([shoot({ 'index.html': motionPage(1000, 'antialiased') }), shoot({ 'index.html': motionPage(3700, 'subpixel-antialiased') })]))
 
-    for (const [name, anim, smoothing] of [['a', '1s', 'antialiased'], ['b', '3.7s', 'subpixel-antialiased']]) {
-      const site = join(scratch, `site-${name}`)
-      mkdirSync(site)
-      writeFileSync(join(site, 'index.html'), page(anim, smoothing))
-      const outDir = join(scratch, `out-${name}`)
-      await kit.capture({
-        side: 'candidate', siteDir: site, pages: ['/'], outDir, chromium, pin, runId: 'run-1', candidateDigest: 'd1',
-      })
-      out.push(outDir)
-    }
-
-    for (const file of ['index-1280.json', 'index-375.json', 'index-1280.png', 'index-375.png']) {
-      expect(readFileSync(join(out[0], file)).equals(readFileSync(join(out[1], file))), file).toBe(true)
-    }
-
-    const bundle = JSON.parse(readFileSync(join(out[0], 'index-1280.json'), 'utf8'))
+  it('gives identical bundles and images despite CSS animation, infinite Web Animations API motion and font smoothing', async () => {
+    const [a, b] = await motion()
+    sameFiles(a.outDir, b.outDir)
+    const bundle = JSON.parse(readFileSync(join(a.outDir, `${kit.pageSlug('/')}-1280.json`), 'utf8'))
     expect(conforms(bundle, BUNDLE_V1.fields)).toEqual([])
-    expect(bundle.elements.length).toBeGreaterThan(2)
+    expect(bundle.elements.find((e: any) => e.box.width === 80 && e.box.height === 60).box.x).toBe(0)
+    expect(bundle.chromium_version).toBe('153.0.8010.0')
+  }, 120_000)
+
+  it('excludes elements under an opacity-zero ancestor and keeps visible controls', async () => {
+    const keys = (await motion())[0].bundles[0].elements.map((e: any) => e.key)
+    expect(keys).toContain('/p:"visible control"#1')
+    expect(keys).toContain('/p:"shown override"#1')
+    expect(keys.join('\n')).not.toContain('invisible text')
+  }, 120_000)
+
+  it('refuses outside WebSocket, EventSource, beacon, workers and fetch before they reach a separate receiver', async () => {
+    const r = await receiver()
+
+    const page = `<!doctype html><h1>net</h1><script>
+for (const f of [() => new WebSocket('ws://${r.base}/socket'), () => new EventSource('http://${r.base}/es'),
+  () => navigator.sendBeacon('http://${r.base}/beacon', 'x'), () => new Worker('http://${r.base}/w.js'), () => new Worker('/w.js'),
+  () => new SharedWorker('/w.js'), () => navigator.serviceWorker.register('/w.js'),
+  () => fetch('http://${r.base}/fetch').catch(() => {})]) { try { f() } catch {} }</script>`
+
+    const { bundles } = await shoot({ 'index.html': page, 'w.js': `new WebSocket('ws://${r.base}/from-worker')` })
+    const wanted = [`ws://${r.base}/socket`, `http://${r.base}/es`, `http://${r.base}/beacon`, `http://${r.base}/w.js`, `http://${r.base}/fetch`]
+
+    for (const b of bundles) {
+      expect(b.blocked_requests).toEqual(expect.arrayContaining(wanted))
+      expect(b.blocked_requests.some((u: string) => u.endsWith('/w.js') && !u.includes(r.base))).toBe(true)
+    }
+
+    const proto = join(scratch, 'net-proto.html')
+    writeFileSync(proto, page)
+    await expect(kit.capture({ side: 'prototype', prototypeFile: proto, pages: ['/'], outDir: join(scratch, 'net-proto-out'), chromium, runId: 'r', candidateDigest: 'd' }))
+      .rejects.toThrow(/^the chosen design file is not self-contained$/)
+    await r.close()
+    expect(r.hits).toEqual([])
+  }, 120_000)
+
+  it('stops a prototype that references same-origin or outside resources, and accepts an inline one', async () => {
+    const r = await receiver()
+    const site = dirOf({ 'missing-required.css': 'h1{color:red}', 'asset.css': 'h1{color:red}' })
+    const file = join(scratch, 'proto-leaks.html')
+    writeFileSync(file, `<link rel=stylesheet href="asset.css"><link rel=stylesheet href="/missing-required.css">
+<link rel=stylesheet href="http://${r.base}/x.css"><h1>P</h1>`)
+
+    const err: any = await kit.capture({ side: 'prototype', siteDir: site, prototypeFile: file, pages: ['/'], outDir: join(scratch, 'proto-out-leaks'), chromium, runId: 'r', candidateDigest: 'd' })
+      .catch((e: unknown) => e)
+
+    expect(err.message).toBe('the chosen design file is not self-contained')
+
+    for (const suffix of ['/__prototype__/asset.css', '/missing-required.css', `${r.base}/x.css`]) {
+      expect(err.blocked.some((u: string) => u.endsWith(suffix)), suffix).toBe(true)
+    }
+
+    await r.close()
+    expect(r.hits).toEqual([])
+    const ok = join(scratch, 'proto-ok.html')
+    writeFileSync(ok, '<style>h1{color:#369}</style><h1>P</h1><img alt=dot src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">')
+    const bundles = await kit.capture({ side: 'prototype', siteDir: site, prototypeFile: ok, pages: ['/'], outDir: join(scratch, 'proto-out-ok'), chromium, runId: 'r', candidateDigest: 'd' })
+    expect(bundles.map((b: any) => b.blocked_requests)).toEqual([[], []])
+  }, 120_000)
+
+  it('keeps first-tile pixels when the last tile overlaps and fixed or sticky elements are hidden', async () => {
+    const stripe = (y: number) => (Math.floor(y / 50) % 2 ? [51, 153, 204] : [204, 51, 51])
+
+    const page = (height: number) => `<!doctype html><style>html,body{margin:0}
+#s{box-sizing:border-box;padding-top:300px;height:${height}px;background:repeating-linear-gradient(#cc3333 0 50px,#3399cc 50px 100px)}
+#k{position:sticky;top:0;width:200px;height:40px;background:#00aa00}
+#h{position:fixed;top:0;left:0;width:80px;height:60px;background:#ff0000}</style><div id=s><div id=k></div></div><div id=h></div>`
+
+    const { outDir } = await shoot({ 'a.html': page(836), 'b.html': page(1750) }, ['/a', '/b'])
+
+    for (const [route, height] of [['/a', 836], ['/b', 1750]] as const) {
+      for (const width of [1280, 375]) {
+        const png = decodePng(readFileSync(join(outDir, `${kit.pageSlug(route)}-${width}.png`)))
+        expect(png.h, `${route} ${width} height`).toBe(height)
+
+        for (let y = 0; y < height; y++) {
+          const label = `${route} ${width} y=${y}`
+          expect(png.at(300, y), label).toEqual(stripe(y))
+          expect(png.at(40, y), `${label} x=40`).toEqual(y < 60 ? [255, 0, 0] : y >= 300 && y < 340 ? [0, 170, 0] : stripe(y))
+        }
+
+        expect(png.at(10, 59), `${route} ${width} header bottom`).toEqual([255, 0, 0])
+      }
+    }
+  }, 120_000)
+
+  it('writes one bundle and PNG per route and width through the shipped CLI, never overwriting', async () => {
+    const site = dirOf({ 'a-b.html': '<h1>Dash route</h1>', 'a/b.html': '<h1>Slash route</h1>' })
+    const out = join(scratch, 'cli-e2e')
+
+    const cli = (pages: string, outDir = out) => spawnSync(process.execPath, [captureFile, '--side', 'candidate', '--site', site, '--pages', pages,
+      '--out', outDir, '--run-id', 'r', '--candidate-digest', 'd'], { encoding: 'utf8', env: { ...process.env, CHROME_PATH: chromium } })
+
+    const run = cli('/a-b /a/b')
+    expect(run.status, run.stderr).toBe(0)
+    const files = readdirSync(out)
+    expect(files.filter(f => f.endsWith('.json'))).toHaveLength(4)
+    expect(files.filter(f => f.endsWith('.png'))).toHaveLength(4)
+
+    for (const [route, heading] of [['/a-b', 'dash route'], ['/a/b', 'slash route']]) {
+      for (const width of [1280, 375]) {
+        const bundle = JSON.parse(readFileSync(join(out, `${kit.pageSlug(route)}-${width}.json`), 'utf8'))
+        expect(bundle.page).toBe(route)
+        expect(bundle.image).toBe(`${kit.pageSlug(route)}-${width}.png`)
+        expect(bundle.elements.map((e: any) => e.text)).toContain(heading)
+        expect(files).toContain(bundle.image)
+      }
+    }
+
+    const again = cli('/a-b')
+    expect(again.status).toBe(1)
+    expect(again.stderr).toContain('refusing to overwrite')
+    expect(readdirSync(out)).toHaveLength(8)
+    const dup = cli('/a-b /a-b', join(scratch, 'cli-dup'))
+    expect(dup.status).toBe(1)
+    expect(dup.stderr).toContain('refusing to overwrite')
   }, 120_000)
 })

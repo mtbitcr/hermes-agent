@@ -8,15 +8,18 @@ import { basename, extname, join, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
 
-// The binary hash of Chromium 153.0.8010.0 is not recorded in the plan; until it is set here the kit refuses to start.
-export const CHROMIUM_PIN = { version: '153.0.8010.0', sha256: '' }
+// Chromium 153.0.8010.0 as extracted from the npm package below; any other binary or hash is refused.
+export const CHROMIUM_PIN = {
+  package: '@sparticuz/chromium@153.0.0', version: '153.0.8010.0',
+  sha256: '53a15d6c3a3d27dfb54c4ba60278b1683136f70cf1e67e989da7dfbd3d451ef0',
+}
 export const VIEWPORTS = [[1280, 800], [375, 812]]
 export const MAX_PAGE_HEIGHT = 8000
 export const CHROMIUM_SWITCHES = ['--headless=new', '--disable-gpu', '--disable-lcd-text', '--font-render-hinting=none',
   '--force-color-profile=srgb', '--hide-scrollbars', '--disable-features=PaintHolding', '--lang=en-US']
 const STYLE = '*,*::before,*::after{animation:none!important;transition:none!important;caret-color:transparent!important;'
   + 'scroll-behavior:auto!important;-webkit-font-smoothing:antialiased!important;text-rendering:geometricPrecision!important}'
-const INJECT = `(()=>{const s=document.createElement('style');s.textContent=${JSON.stringify(STYLE)};`
+const INJECT = `(()=>{const s=document.createElement('style');s.id='__dc_style';s.dataset.early=document.readyState==='loading'?'1':'0';s.textContent=${JSON.stringify(STYLE)};`
   + 'const put=()=>document.documentElement&&(document.documentElement.appendChild(s),true);'
   + 'if(!put())new MutationObserver((_,o)=>put()&&o.disconnect()).observe(document,{childList:true})})()'
 const PROTOTYPE_PREFIX = '/__prototype__/'
@@ -27,19 +30,39 @@ const sleep = ms => new Promise(r => setTimeout(r, ms))
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex')
 const versionOf = text => (/\d+(\.\d+){3}/.exec(text) || [''])[0]
 
-export function classifyRequest(url, origin) {
+// onlyPath is set on the prototype side: then the prototype document itself is the only local URL allowed.
+export function classifyRequest(url, origin, onlyPath = null) {
   try {
     const u = new URL(url)
     if (['data:', 'blob:', 'about:'].includes(u.protocol)) return 'allowed'
-    return u.protocol === 'http:' && u.origin === origin ? 'allowed' : 'blocked'
+    return u.protocol === 'http:' && u.origin === origin && (onlyPath === null || u.pathname === onlyPath) ? 'allowed' : 'blocked'
   } catch {
     return 'blocked'
   }
 }
 
 export function assertSelfContained(blocked) {
-  if (blocked.length) throw new Error(`the chosen design file is not self-contained (it requested ${blocked[0]})`)
+  if (blocked.length) throw Object.assign(new Error('the chosen design file is not self-contained'), { blocked })
 }
+
+// Runs before any page script in every frame: the Fetch gate cannot see WebSocket handshakes, so refuse them at the API.
+const guardSource = (origin, onlyPath) => `(() => {
+  const classify = ${classifyRequest}, origin = ${JSON.stringify(origin)}, only = ${JSON.stringify(onlyPath)}
+  const report = window.__dcBlock
+  const abs = u => { try { return new URL(u, location.href).href } catch { return String(u) } }
+  const ok = u => classify(abs(u), origin, only) === 'allowed'
+  const refuse = u => { report(abs(u)); throw new DOMException('outside request refused', 'SecurityError') }
+  window.WebSocket = class WebSocket { constructor(u) { refuse(u) } }
+  const Source = window.EventSource
+  window.EventSource = class extends Source { constructor(u, o) { if (!ok(u)) refuse(u); super(u, o) } }
+  // Worker globals cannot be guarded from here, so no worker may start at all.
+  for (const name of ['Worker', 'SharedWorker']) window[name] = class { constructor(u) { refuse(u) } }
+  if (window.ServiceWorkerContainer) {
+    ServiceWorkerContainer.prototype.register = function (u) { report(abs(u)); return Promise.reject(new DOMException('outside request refused', 'SecurityError')) }
+  }
+  const beacon = Navigator.prototype.sendBeacon
+  Navigator.prototype.sendBeacon = function (u, d) { if (ok(u)) return beacon.call(this, u, d); report(abs(u)); return false }
+})()`
 
 export function verifyChromium(binary, pin, deps = {}) {
   if (!/^[0-9a-f]{64}$/.test(pin.sha256 || '')) throw new Error('Chromium binary hash is not pinned (missing hash): refusing to start')
@@ -59,7 +82,7 @@ export function buildBundle(i) {
   }
 }
 
-export const pageSlug = route => route.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '') || 'index'
+export const pageSlug = route => `${route.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '') || 'index'}-${sha256(route).slice(0, 8)}`
 
 export async function startServer({ siteDir, prototypeFile }) {
   const isFile = p => existsSync(p) && statSync(p).isFile()
@@ -139,9 +162,10 @@ async function openTarget(browser) {
 
 const frames = 'new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))'
 
-async function capturePage(browser, stitcher, probeSource, { url, origin, width, height }) {
+async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPath, width, height }) {
   const t = await openTarget(browser)
   const blocked = []
+  const leaked = []
   const open = new Set()
   let lastActivity = Date.now()
   let onLoad
@@ -151,28 +175,35 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, width,
     const { requestId, request } = m.params
     lastActivity = Date.now()
     if (m.method === 'Fetch.requestPaused') {
-      if (classifyRequest(request.url, origin) === 'blocked') {
+      if (classifyRequest(request.url, origin, onlyPath) === 'blocked') {
         blocked.push(request.url)
         t.send('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' }).catch(() => {})
       } else t.send('Fetch.continueRequest', { requestId }).catch(() => {})
-    } else if (m.method === 'Network.requestWillBeSent') open.add(requestId)
+    } else if (m.method === 'Runtime.bindingCalled') blocked.push(m.params.payload)
+    else if (m.method === 'Network.webSocketCreated') { blocked.push(m.params.url); leaked.push(m.params.url) }
+    else if (m.method === 'Network.requestWillBeSent') open.add(requestId)
     else if (m.method === 'Network.loadingFinished' || m.method === 'Network.loadingFailed') open.delete(requestId)
     else if (m.method === 'Page.loadEventFired') onLoad()
   })
   try {
-    for (const m of ['Page.enable', 'Network.enable']) await t.send(m)
+    // Runtime.enable makes Chromium create the script context at document start; otherwise a scriptless page runs the injected script after load.
+    for (const m of ['Page.enable', 'Network.enable', 'Runtime.enable']) await t.send(m)
+    await t.send('Runtime.addBinding', { name: '__dcBlock' })
     await t.send('Fetch.enable', { patterns: [{ urlPattern: '*' }] })
     await t.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false })
     await t.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] })
     await t.send('Emulation.setTimezoneOverride', { timezoneId: 'UTC' })
     await t.send('Emulation.setLocaleOverride', { locale: 'en-US' })
-    await t.send('Page.addScriptToEvaluateOnNewDocument', { source: INJECT })
+    await t.send('Page.addScriptToEvaluateOnNewDocument', { source: `${INJECT};${guardSource(origin, onlyPath)}` })
     const nav = await t.send('Page.navigate', { url })
     if (nav.errorText) throw new Error(`cannot load ${url}: ${nav.errorText}`)
-    await Promise.race([loaded, sleep(30000).then(() => { throw new Error(`timed out loading ${url}`) })])
+    await Promise.race([loaded, new Promise((_, no) => setTimeout(() => no(new Error(`timed out loading ${url}`)), 30000).unref())])
     const { frameTree } = await t.send('Page.getFrameTree')
     const world = await t.send('Page.createIsolatedWorld', { frameId: frameTree.frame.id, worldName: 'design_compare' })
     const run = expr => t.evaluate(expr, world.executionContextId)
+    if (!await run("(() => { const s = document.getElementById('__dc_style'); return !!s && s.dataset.early === '1' })()")) {
+      throw new Error(`the motion-neutralising stylesheet was not installed before page scripts ran for ${url}`)
+    }
     await run('document.fonts.ready.then(() => true)')
     const deadline = Date.now() + 30000
     while (open.size || Date.now() - lastActivity < 500) {
@@ -191,12 +222,16 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, width,
       if (n === 1) await run(`${probe}.hidePinned()`)
       tiles.push({ top, data: (await t.send('Page.captureScreenshot', { format: 'png' })).data })
     }
+    if (leaked.length) throw new Error(`outside WebSocket handshake observed: ${leaked.join(' ')}`)
     const png = await stitcher.evaluate(`(async (tiles, w, h) => {
       const c = document.createElement('canvas'); c.width = w; c.height = h
       const ctx = c.getContext('2d')
+      let covered = 0
       for (const t of tiles) {
         const img = new Image(); img.src = 'data:image/png;base64,' + t.data; await img.decode()
-        ctx.drawImage(img, 0, t.top)
+        const skip = covered - t.top
+        ctx.drawImage(img, 0, skip, img.width, img.height - skip, 0, covered, img.width, img.height - skip)
+        covered = t.top + img.height
       }
       return c.toDataURL('image/png').split(',')[1]
     })(${JSON.stringify(tiles)}, ${width}, ${pageHeight})`)
@@ -211,24 +246,28 @@ export async function capture({ side, siteDir, prototypeFile, pages, outDir, run
   const chromiumVersion = verifyChromium(chromium, pin)
   const probeSource = readFileSync(join(dir, 'probe.js'), 'utf8')
   const kitSha256 = sha256(Buffer.concat([readFileSync(join(dir, 'capture.mjs')), Buffer.from(probeSource)]))
+  const targets = pages.flatMap(route => VIEWPORTS.flatMap(([width]) => ['png', 'json'].map(ext => join(outDir, `${pageSlug(route)}-${width}.${ext}`))))
+  const taken = targets.find((f, i) => existsSync(f) || targets.indexOf(f) !== i)
+  if (taken) throw new Error(`refusing to overwrite ${taken}`)
   mkdirSync(outDir, { recursive: true })
-  const server = await startServer({ siteDir, prototypeFile })
+  const server = await startServer({ siteDir: side === 'candidate' ? siteDir : undefined, prototypeFile })
   const browser = await launch(chromium)
   const bundles = []
   try {
     const stitcher = await openTarget(browser)
     for (const route of pages) {
-      const url = side === 'prototype' ? `${server.origin}${PROTOTYPE_PREFIX}${encodeURIComponent(basename(prototypeFile))}` : `${server.origin}${route}`
+      const onlyPath = side === 'prototype' ? new URL(`${PROTOTYPE_PREFIX}${encodeURIComponent(basename(prototypeFile))}`, server.origin).pathname : null
+      const url = onlyPath === null ? `${server.origin}${route}` : `${server.origin}${onlyPath}`
       for (const [width, height] of VIEWPORTS) {
-        const shot = await capturePage(browser, stitcher, probeSource, { url, origin: server.origin, width, height })
+        const shot = await capturePage(browser, stitcher, probeSource, { url, origin: server.origin, onlyPath, width, height })
         if (side === 'prototype') assertSelfContained(shot.blocked)
         const name = `${pageSlug(route)}-${width}`
         const bundle = buildBundle({
           kitSha256, chromiumVersion, runId, candidateDigest, page: route, width, pageHeight: shot.pageHeight, image: `${name}.png`,
           blockedRequests: shot.blocked, measurement: shot.measurement,
         })
-        writeFileSync(join(outDir, `${name}.png`), shot.png)
-        writeFileSync(join(outDir, `${name}.json`), `${JSON.stringify(bundle, null, 2)}\n`)
+        writeFileSync(join(outDir, `${name}.png`), shot.png, { flag: 'wx' })
+        writeFileSync(join(outDir, `${name}.json`), `${JSON.stringify(bundle, null, 2)}\n`, { flag: 'wx' })
         bundles.push(bundle)
       }
     }
@@ -257,5 +296,5 @@ async function main() {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  main().catch(e => { console.error(e.message); process.exit(1) })
+  main().catch(e => { console.error(e.message, ...(e.blocked || []).map(u => `\n  requested: ${u}`)); process.exit(1) })
 }

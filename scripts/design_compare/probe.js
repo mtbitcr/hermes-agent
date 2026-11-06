@@ -57,7 +57,14 @@
   const unquote = f => f.split(',')[0].trim().replace(/^["']|["']$/g, '').toLowerCase()
   const round = n => Math.round(n * 100) / 100
 
+  function hiddenByOpacity(el, style = getComputedStyle, cache = new Map()) {
+    if (!el) return false
+    if (!cache.has(el)) cache.set(el, parseFloat(style(el).opacity) <= 0 || hiddenByOpacity(el.parentElement, style, cache))
+    return cache.get(el)
+  }
+
   function measure() {
+    const opacity = new Map()
     const loaded = new Set()
     document.fonts.forEach(f => { if (f.status === 'loaded') loaded.add(unquote(f.family)) })
     const found = []
@@ -68,7 +75,7 @@
       if (SKIP.has(tag) || (svg && svg !== el) || (el.parentElement && el.parentElement.closest('canvas,video'))) continue
       const r = el.getBoundingClientRect()
       const cs = getComputedStyle(el)
-      if (r.width < 1 || r.height < 1 || cs.visibility !== 'visible' || parseFloat(cs.opacity) <= 0) continue
+      if (r.width < 1 || r.height < 1 || cs.visibility !== 'visible' || hiddenByOpacity(el, getComputedStyle, opacity)) continue
       const box = { x: round(r.left + scrollX), y: round(r.top + scrollY), width: round(r.width), height: round(r.height) }
       if (tag === 'canvas' || tag === 'video') masks.push(box)
       const border = SIDES.map(s => {
@@ -105,11 +112,19 @@
     }
   }
 
-  const settle = () => document.getAnimations().forEach(a => { try { a.finish() } catch { /* infinite animation */ } })
+  function settle() {
+    for (const a of document.getAnimations()) {
+      const end = a.effect ? a.effect.getComputedTiming().endTime : Infinity
+      if (!Number.isFinite(end)) { a.cancel(); continue }
+      try { a.finish() } catch { a.cancel() }
+    }
+    const running = document.getAnimations().filter(a => a.playState === 'running' || a.pending)
+    if (running.length) throw new Error(`${running.length} animation(s) still running after settle`)
+  }
   const hidePinned = () => document.querySelectorAll('body *').forEach(el => {
     const p = getComputedStyle(el).position
     if (p === 'fixed' || p === 'sticky') el.style.setProperty('visibility', 'hidden', 'important')
   })
 
-  return { normalize, describe, assignKeys, measure, settle, hidePinned }
+  return { normalize, describe, assignKeys, hiddenByOpacity, measure, settle, hidePinned }
 })()
