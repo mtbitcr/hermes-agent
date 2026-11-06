@@ -274,9 +274,10 @@ CLOSED_VOCABULARIES = (
     ("runs", ("error", "type"), frozenset({"invalid_request_error"})),
 
     # owner_decisions (the next card): the decision list and decision routes.
-    # api_server.py:13252, :13340
+    # api_server.py:13252, :13340; owner_design_choices.py:37; api_server_owner_choices.py:69
     ("owner_decisions", ("object",), frozenset({
         "hermes.owner_workspace.decision_list", "hermes.owner_workspace.decision",
+        "hermes.owner_workspace.design_options", "hermes.owner_workspace.design_choice",
     })),
     # owner_workspace.py:3906, :3914, :3919; api_server.py:13240
     ("owner_decisions", (_DECISION_LIST, "data", "kind"),

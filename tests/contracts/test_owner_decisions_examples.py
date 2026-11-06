@@ -8,8 +8,10 @@ in the per-test home: ``GET /v1/owner-workspace/decisions`` over
 own in-memory run statuses, set as the run route sets them while a run waits
 for the owner's approval. The list read with ``owner_input_upload_v1`` holds a
 card the real apply path declared and the claim held for the owner's files
-(card C2 of the named inputs plan). What is asserted is described in
-tests/contracts/conftest.py.
+(card C2 of the named inputs plan). The design choice examples come from
+``POST /v1/owner-workspace/decisions/{ref}/choose/{n}`` and the list read
+with ``design_options_v1`` (card 2 of the design options plan). What is
+asserted is described in tests/contracts/conftest.py.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from gateway.platforms.api_server import (
 from hermes_cli import kanban_db, owner_named_inputs as oni, owner_workspace as ow
 from plugins.dashboard_auth.raphael_workspace import model_policy
 from tests.contracts import conftest as contract
+from tests.gateway.test_api_server_owner_choices import _designer_card, _ref
 from tests.gateway.test_api_server_owner_suggestion_decisions import (  # noqa: F401  (owner is a fixture)
     _ROUTES,
     _pending_suggestion,
@@ -212,6 +215,51 @@ async def test_the_decision_list_read_with_owner_input_upload_names_the_missing_
             "n": 1, "name": "price list",
             "type_label": oni.TYPE_LABELS["csv"], "max_bytes": oni.MAX_INPUT_BYTES,
         }]
+
+
+@pytest.mark.asyncio
+async def test_the_design_choice_examples_come_from_the_real_list_and_choose_routes(
+    owner, owner_payload_example,
+):
+    """Platform test 7 of the design options plan: a designer card declared
+    its options (card 1) and the owner chose one through the choose route;
+    the list read with ``design_options_v1`` holds a second card still
+    waiting, with its options, and the record of that choice."""
+    project = _project(owner, "Bakery Website")
+    decided = _designer_card(project, title="Design the menu page", count=2)
+    waiting = _designer_card(project, title="Design the home page")
+    _adapter, app = _app()
+    async with TestClient(TestServer(app)) as client:
+        ref = await _ref(client, decided)
+        answers = {}
+        for name in ("design_choice_recorded", "design_choice_not_waiting"):
+            resp = await client.post(f"/v1/owner-workspace/decisions/{ref}/choose/2")
+            answers[name] = {"status": resp.status, "body": await resp.json()}
+        resp = await client.get(
+            "/v1/owner-workspace/decisions",
+            params={"capabilities": "design_options_v1"},
+        )
+        answers["decision_list_design_options"] = {"status": resp.status, "body": await resp.json()}
+
+    saved = {name: owner_payload_example(FAMILY, name, live) for name, live in answers.items()}
+
+    for live in (answers, saved):
+        assert live["design_choice_recorded"] == {"status": 200, "body": {
+            "object": "hermes.owner_workspace.design_choice",
+            "decision_ref": ref, "n": 2, "released": True,
+        }}
+        refused = live["design_choice_not_waiting"]
+        assert refused["status"] == 404
+        assert refused["body"]["error"]["message"] == "This choice is no longer waiting."
+        assert refused["body"]["error"]["code"] == "decision_not_found"
+        listed = live["decision_list_design_options"]
+        assert listed["status"] == 200
+        (item,) = listed["body"]["data"]
+        assert item["title"] == waiting.title and item["kind"] == "owner_input"
+        assert [option["n"] for option in item["design_options"]["options"]] == [1, 2, 3]
+        (record,) = listed["body"]["recent_design_choices"]
+        assert (record["n"], [option["n"] for option in record["options"]]) == (2, [1, 2])
+        assert [option["picture"]["attachment_id"] for option in record["options"]] == decided.attachment_ids
 
 
 def test_the_decision_examples_keep_to_every_closed_vocabulary():
