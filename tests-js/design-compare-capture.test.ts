@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createSocket } from 'node:dgram'
-import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { createServer as createTcpServer } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -727,36 +727,13 @@ describe('animated resource detection', () => {
     expect(kit.webpIsAnimated(gif([10, 10]))).toBe(false)
   })
 
-  it('finds SMIL, CSS animation, script and entity-hidden markup in an SVG, and leaves static SVG alone', () => {
-    for (const animated of [
-      smil(1000, 'a'), '<svg><animateTransform attributeName="transform"/></svg>', '<svg><animateMotion path="M0,0"/></svg>', '<svg><set attributeName="fill" to="red"/></svg>',
-      '<s:svg xmlns:s="http://www.w3.org/2000/svg"><s:animate attributeName="x"/></s:svg>', '<svg><SET attributeName="x"/></svg>', '<svg><script>run()</script></svg>',
-      '<svg><style>@keyframes k{to{x:1}}</style></svg>', '<svg><rect style="animation: k 1s infinite"/></svg>', '<svg><rect style="animation-name:k"/></svg>',
-      '<!DOCTYPE svg [<!ENTITY m "&#60;animate/>">]><svg>&m;</svg>', '<svg><discard/></svg>',
-    ]) {
-      expect(kit.svgIsAnimated(animated), animated).toBe(true)
-    }
-
-    for (const still of [
-      stillSvg('s'), '<svg><text>animate me, set the script</text><g id="setup"><settings/></g></svg>', '<svg><style>rect{fill:red;transition:fill 1s}</style><rect/></svg>',
-      '<svg><defs><linearGradient id="g"/></defs><path d="M0 0L9 9" fill="url(#g)"/></svg>',
-    ]) {
-      expect(kit.svgIsAnimated(still), still).toBe(false)
-    }
-  })
-
-  it('names the kind of an animated resource, including images nested in an SVG as data URLs, and nothing for still images', () => {
+  it('names the kind of an animated raster resource and nothing for still images; SVG is judged by the browser allowlist, not here', () => {
     expect(kit.animatedResource(gif([10, 1000]), 'image/gif')).toBe('gif')
     expect(kit.animatedResource(apng([10, 1000]), 'image/png')).toBe('apng')
     expect(kit.animatedResource(ANIMATED_WEBP, 'image/webp')).toBe('webp')
-    expect(kit.animatedResource(Buffer.from(smil(1000, 'k')), SVG)).toBe('svg')
     expect(kit.animatedResource(gif([10, 1000]), 'application/octet-stream')).toBe('gif')
-    expect(kit.animatedResource(Buffer.from(smil(1000, 'k')), 'text/plain')).toBeNull()
-    const nested = (uri: string) => Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg"><image href="${uri}"/></svg>`)
-    expect(kit.animatedResource(nested(dataUri('image/gif', gif([10, 1000]))), SVG)).toBe('gif')
-    expect(kit.animatedResource(nested(`data:image/svg+xml,${encodeURIComponent(smil(1000, 'n'))}`), SVG)).toBe('svg')
-    expect(kit.animatedResource(nested(dataUri('image/gif', gif([10]))), SVG)).toBeNull()
-    expect(kit.animatedResource(nested('https://example.test/a.gif'), SVG)).toBeNull()
+    expect(kit.animatedResource(Buffer.from(smil(1000, 'k')), SVG)).toBeNull()
+    expect(kit.svgIsAnimated).toBeUndefined()
 
     for (const still of [[gif([10]), 'image/gif'], [staticPng(), 'image/png'], [apng([10]), 'image/png'], [STATIC_WEBP, 'image/webp'], [Buffer.from(stillSvg('s')), SVG],
       [Buffer.from([0xff, 0xd8, 0xff, 0xe0]), 'image/jpeg'], [Buffer.alloc(0), 'image/png'], [Buffer.from('<h1>hi</h1>'), 'text/html']] as const) {
@@ -781,12 +758,17 @@ describe('animated resource detection', () => {
     expect(kit.embeddedDocumentRoots(doc('html', { nodeName: 'TEMPLATE', templateContent: doc('html', owner('OBJECT', doc('html'))), children: [] }))).toEqual([])
   })
 
-  it('refuses with one sentence per kind of problem, naming every animated resource and unreadable one', () => {
+  it('refuses with one sentence per kind of problem, naming every animated, unprovable and unreadable resource', () => {
     expect(() => kit.assertNoAnimatedResources([], [])).not.toThrow()
+    expect(() => kit.assertNoAnimatedResources([], [], [])).not.toThrow()
     const long = `data:image/gif;base64,${'A'.repeat(100)}`
-    const found = [{ kind: 'gif', url: 'http://127.0.0.1:1/a.gif', sha256: 'a'.repeat(64) }, { kind: 'svg', url: long, sha256: 'b'.repeat(64) }]
-    expect(() => kit.assertNoAnimatedResources(found, [])).toThrow(`unsupported content: animated resources whose timelines cannot be frozen: gif http://127.0.0.1:1/a.gif (sha256 ${'a'.repeat(12)}), svg ${long.slice(0, 60)}… (sha256 ${'b'.repeat(12)})`)
+    const found = [{ kind: 'gif', url: 'http://127.0.0.1:1/a.gif', sha256: 'a'.repeat(64) }, { kind: 'apng', url: long, sha256: 'b'.repeat(64) }]
+    expect(() => kit.assertNoAnimatedResources(found, [])).toThrow(`unsupported content: animated resources whose timelines cannot be frozen: gif http://127.0.0.1:1/a.gif (sha256 ${'a'.repeat(12)}), apng ${long.slice(0, 60)}… (sha256 ${'b'.repeat(12)})`)
     expect(() => kit.assertNoAnimatedResources([], [{ url: 'http://127.0.0.1:1/x.png' }])).toThrow('unsupported content: an image or document resource could not be read to check it for animation: http://127.0.0.1:1/x.png')
+
+    const unprovable = [{ url: 'http://127.0.0.1:1/s.svg', sha256: 'c'.repeat(64) }, { url: long, sha256: 'd'.repeat(64) }]
+    expect(() => kit.assertNoAnimatedResources([], [], unprovable)).toThrow(
+      `unsupported content: the kit cannot prove that this SVG is static: http://127.0.0.1:1/s.svg (sha256 ${'c'.repeat(12)})\nunsupported content: the kit cannot prove that this SVG is static: ${long.slice(0, 60)}… (sha256 ${'d'.repeat(12)})`)
   })
 })
 
@@ -794,19 +776,14 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
   const chromium = process.env.CHROME_PATH as string
   let seq = 0
 
-  // The tests run concurrently, but never more than two Chromium captures at once.
-  const slots = { free: 2, waiting: [] as (() => void)[] }
+  // The tests run concurrently but capture one at a time: two browsers exhaust the 64 MB /dev/shm of a default container, and captures then stall or fail.
+  let queue: Promise<unknown> = Promise.resolve()
 
-  const limited = async <T>(job: () => Promise<T>) => {
-    if (slots.free > 0) {slots.free--} else {await new Promise<void>(r => slots.waiting.push(r))}
+  const limited = <T>(job: () => Promise<T>) => {
+    const run = queue.then(job)
+    queue = run.catch(() => {})
 
-    try {
-      return await job()
-    } finally {
-      const next = slots.waiting.shift()
-
-      if (next) {next()} else {slots.free++}
-    }
+    return run
   }
 
   const capture = (options: Record<string, unknown>): Promise<any[]> => limited(() => kit.capture(options))
@@ -822,17 +799,41 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
     return d
   }
 
-  const shoot = (site: Record<string, string | Buffer>, pages = ['/']) => {
-    const outDir = join(scratch, `out-${++seq}`)
+  const memo = <T>(job: () => Promise<T>) => {
+    let started: Promise<T> | undefined
 
-    return capture({ side: 'candidate', siteDir: dirOf(site), pages, outDir, chromium, runId: 'run-1', candidateDigest: 'd1' })
-      .then((bundles: any[]) => ({ bundles, outDir }))
+    return () => (started ??= job())
   }
 
-  const sameFiles = (a: string, b: string, route = '/') => {
-    for (const file of ['1280.json', '375.json', '1280.png', '375.png']) {
-      const name = `${kit.pageSlug(route)}-${file}`
-      expect(readFileSync(join(a, name)).equals(readFileSync(join(b, name))), name).toBe(true)
+  // A browser launch costs far more than a page, so every launch captures many routes. A refusal ends a launch: the routes before it keep their files, and the
+  // refusal (if any) is returned with them, so a launch holds any number of successful routes and at most one refused route, which comes last.
+  const launchPages = (pages: Record<string, string>, extra: Record<string, string | Buffer> = {}) => {
+    const outDir = join(scratch, `out-${++seq}`)
+    const site = { ...Object.fromEntries(Object.entries(pages).map(([name, html]) => [`${name}.html`, html])), ...extra }
+
+    return capture({ side: 'candidate', siteDir: dirOf(site), pages: Object.keys(pages).map(name => `/${name}`), outDir, chromium, runId: 'run-1', candidateDigest: 'd1' })
+      .then(() => ({ outDir, error: undefined as any }), (error: any) => ({ outDir, error }))
+  }
+
+  const launchPrototype = (html: string) => {
+    const file = join(scratch, `proto-${++seq}.html`)
+    const outDir = join(scratch, `out-${++seq}`)
+    writeFileSync(file, html)
+
+    return capture({ side: 'prototype', prototypeFile: file, pages: ['/'], outDir, chromium, runId: 'r', candidateDigest: 'd' })
+      .then(() => ({ outDir, error: undefined as any }), (error: any) => ({ outDir, error }))
+  }
+
+  const read = (outDir: string, width: number, route: string) => JSON.parse(readFileSync(join(outDir, `${kit.pageSlug(route)}-${width}.json`), 'utf8'))
+  const pngOf = (outDir: string, width: number, route: string) => readFileSync(join(outDir, `${kit.pageSlug(route)}-${width}.png`))
+  const byText = (bundle: any, text: string) => bundle.elements.find((e: any) => e.text === text)
+
+  // Two routes of one launch hold the same evidence when everything but their own name is byte-identical.
+  const sameEvidence = (run: { outDir: string }, a: string, b: string) => {
+    for (const width of [1280, 375]) {
+      const [x, y] = [a, b].map(route => JSON.stringify({ ...read(run.outDir, width, route), page: '', image: '' }))
+      expect(x, `${a} ${b} ${width} bundle`).toBe(y)
+      expect(pngOf(run.outDir, width, a).equals(pngOf(run.outDir, width, b)), `${a} ${b} ${width} image`).toBe(true)
     }
   }
 
@@ -844,6 +845,21 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
 
     return { base: `127.0.0.1:${(server.address() as { port: number }).port}`, hits, close: () => new Promise(r => server.close(r)) }
   }
+
+  const stunTurn = async () => {
+    const seen = { packets: 0, connections: 0 }
+    const udp = createSocket('udp4')
+    udp.on('message', () => { seen.packets++ })
+    await new Promise<void>(r => udp.bind(0, '127.0.0.1', r))
+    const tcp = createTcpServer(socket => { seen.connections++; socket.destroy() })
+    await new Promise<void>(r => tcp.listen(0, '127.0.0.1', r))
+    const stun = `stun:127.0.0.1:${udp.address().port}`
+    const turn = `turn:127.0.0.1:${(tcp.address() as { port: number }).port}?transport=tcp`
+
+    return { seen, stun, turn, close: () => Promise.all([new Promise<void>(r => udp.close(() => r())), new Promise<void>(r => tcp.close(() => r()))]) }
+  }
+
+  // ---- Motion, shadow roots and frames: pairs of routes that differ only in a period, a speed or a rendering hint must give the same evidence. ----
 
   const motionPage = (ms: number, smoothing: string) => `<!doctype html><meta charset=utf-8>
 <style>body{margin:0;font:20px sans-serif;-webkit-font-smoothing:${smoothing}}
@@ -858,24 +874,39 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
 <div style="position:fixed;bottom:0;left:0;color:#369">Pinned</div>
 <script>document.getElementById('wa').animate([{transform:'translateX(0px)'},{transform:'translateX(300px)'}],{duration:${ms},iterations:Infinity})</script>`
 
-  let motionRuns: Promise<[Awaited<ReturnType<typeof shoot>>, Awaited<ReturnType<typeof shoot>>]> | undefined
-  const motion = () => (motionRuns ??= Promise.all([shoot({ 'index.html': motionPage(1000, 'antialiased') }), shoot({ 'index.html': motionPage(3700, 'subpixel-antialiased') })]))
+  const shadowPage = (ms: number) => `<!doctype html><h1>Outside</h1><div id=host></div><script>host.attachShadow({mode:'open'}).innerHTML =
+'<style>@keyframes m{to{transform:translateX(300px)}}h2{width:100px;animation:m ${ms}ms infinite linear}</style><h2>Inside</h2>'</script>`
+
+  const visiblePage = (px: number) => `<h1>Outside</h1><div id=host></div><script>host.attachShadow({mode:'open'}).innerHTML = '<p style="font-size:${px}px">Visible shadow text</p><canvas width=50 height=20></canvas>'</script>
+<iframe srcdoc="<h2 style='font-size:${px}px'>Frame text</h2><p style='position:fixed;bottom:0'>Pin</p>" style="border:0;margin:30px"></iframe>`
+
+  const bodyShadowPage = (ms: number) => `<!doctype html><body><script>document.body.attachShadow({mode:'open'}).innerHTML =
+'<style>@keyframes m{to{transform:translateX(300px)}}h2{width:100px;animation:m ${ms}ms infinite linear}</style><h2>Inside body</h2>'; document.currentScript.remove()</script>`
+
+  const closedPage = '<div id=h></div><script>h.attachShadow({mode:"closed"}).innerHTML = "<h2>Hidden</h2>"</script>'
+
+  // The routes before the refusal of a closed shadow root.
+  const motionLaunch = memo(() => launchPages({
+    'motion-a': motionPage(1000, 'antialiased'), 'motion-b': motionPage(3700, 'subpixel-antialiased'), 'shadow-a': shadowPage(1000), 'shadow-b': shadowPage(10_000),
+    'visible-10': visiblePage(10), 'visible-40': visiblePage(40), closed: closedPage,
+  }))
 
   it('gives identical bundles and images despite CSS animation, infinite Web Animations API motion and font smoothing', async () => {
-    const [a, b] = await motion()
-    sameFiles(a.outDir, b.outDir)
-    const bundle = JSON.parse(readFileSync(join(a.outDir, `${kit.pageSlug('/')}-1280.json`), 'utf8'))
+    const run = await motionLaunch()
+    sameEvidence(run, '/motion-a', '/motion-b')
+    const bundle = read(run.outDir, 1280, '/motion-a')
     expect(contractProblems(bundle)).toEqual([])
     expect(bundle.elements.find((e: any) => e.box.width === 80 && e.box.height === 60).box.x).toBe(0)
     expect(bundle.chromium_version).toBe('153.0.8010.0')
   }, 120_000)
 
   it('emits bundles that satisfy the C1 contract at both widths: landmarks, role, label, alt, parent, fixed and the STYLE_FIELDS names', async () => {
-    const [{ bundles }] = await motion()
-    expect(bundles.map((b: any) => b.width)).toEqual([1280, 375])
+    const run = await motionLaunch()
 
-    for (const bundle of bundles) {
-      expect(contractProblems(JSON.parse(JSON.stringify(bundle))), `${bundle.width}`).toEqual([])
+    for (const width of [1280, 375]) {
+      const bundle = read(run.outDir, width, '/motion-a')
+      expect(bundle.width).toBe(width)
+      expect(contractProblems(JSON.parse(JSON.stringify(bundle))), `${width}`).toEqual([])
       const keys = judgeKeys(bundle.elements)
       expect(keys).toEqual(expect.arrayContaining([
         'header:site title/h1:"site title"#1', 'header:site title/nav/a:"go home"#1', 'main:part one/region:""#1',
@@ -897,189 +928,21 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
   }, 120_000)
 
   it('excludes elements under an opacity-zero ancestor and keeps visible controls', async () => {
-    const keys = judgeKeys((await motion())[0].bundles[0].elements)
+    const keys = judgeKeys(read((await motionLaunch()).outDir, 1280, '/motion-a').elements)
     expect(keys).toContain('/p:"visible control"#1')
     expect(keys).toContain('/p:"shown override"#1')
     expect(keys.join('\n')).not.toContain('invisible text')
   }, 120_000)
 
-  it('refuses outside WebSocket, EventSource, beacon, workers and fetch before they reach a separate receiver', async () => {
-    const r = await receiver()
-
-    const page = `<!doctype html><h1>net</h1><script>
-for (const f of [() => new WebSocket('ws://${r.base}/socket'), () => new EventSource('http://${r.base}/es'),
-  () => navigator.sendBeacon('http://${r.base}/beacon', 'x'), () => new Worker('http://${r.base}/w.js'), () => new Worker('/w.js'),
-  () => new SharedWorker('/w.js'), () => navigator.serviceWorker.register('/w.js'),
-  () => fetch('http://${r.base}/fetch').catch(() => {})]) { try { f() } catch {} }</script>`
-
-    const { bundles } = await shoot({ 'index.html': page, 'w.js': `new WebSocket('ws://${r.base}/from-worker')` })
-    const wanted = [`ws://${r.base}/socket`, `http://${r.base}/es`, `http://${r.base}/beacon`, `http://${r.base}/w.js`, `http://${r.base}/fetch`]
-
-    for (const b of bundles) {
-      expect(b.blocked_requests).toEqual(expect.arrayContaining(wanted))
-      expect(b.blocked_requests.some((u: string) => u.endsWith('/w.js') && !u.includes(r.base))).toBe(true)
-    }
-
-    const proto = join(scratch, 'net-proto.html')
-    writeFileSync(proto, page)
-    await expect(capture({ side: 'prototype', prototypeFile: proto, pages: ['/'], outDir: join(scratch, 'net-proto-out'), chromium, runId: 'r', candidateDigest: 'd' }))
-      .rejects.toThrow(/^the chosen design file is not self-contained$/)
-    await r.close()
-    expect(r.hits).toEqual([])
-  }, 120_000)
-
-  it('stops a prototype that references same-origin or outside resources, and accepts an inline one', async () => {
-    const r = await receiver()
-    const site = dirOf({ 'missing-required.css': 'h1{color:red}', 'asset.css': 'h1{color:red}' })
-    const file = join(scratch, 'proto-leaks.html')
-    writeFileSync(file, `<link rel=stylesheet href="asset.css"><link rel=stylesheet href="/missing-required.css">
-<link rel=stylesheet href="http://${r.base}/x.css"><h1>P</h1>`)
-
-    const err: any = await capture({ side: 'prototype', siteDir: site, prototypeFile: file, pages: ['/'], outDir: join(scratch, 'proto-out-leaks'), chromium, runId: 'r', candidateDigest: 'd' })
-      .catch((e: unknown) => e)
-
-    expect(err.message).toBe('the chosen design file is not self-contained')
-
-    for (const suffix of ['/__prototype__/asset.css', '/missing-required.css', `${r.base}/x.css`]) {
-      expect(err.blocked.some((u: string) => u.endsWith(suffix)), suffix).toBe(true)
-    }
-
-    await r.close()
-    expect(r.hits).toEqual([])
-    const ok = join(scratch, 'proto-ok.html')
-    writeFileSync(ok, '<style>h1{color:#369}</style><h1>P</h1><img alt=dot src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">')
-    const bundles = await capture({ side: 'prototype', siteDir: site, prototypeFile: ok, pages: ['/'], outDir: join(scratch, 'proto-out-ok'), chromium, runId: 'r', candidateDigest: 'd' })
-    expect(bundles.map((b: any) => b.blocked_requests)).toEqual([[], []])
-  }, 120_000)
-
-  it('keeps first-tile pixels when the last tile overlaps and fixed or sticky elements are hidden', async () => {
-    const stripe = (y: number) => (Math.floor(y / 50) % 2 ? [51, 153, 204] : [204, 51, 51])
-
-    const page = (height: number) => `<!doctype html><style>html,body{margin:0}
-#s{box-sizing:border-box;padding-top:300px;height:${height}px;background:repeating-linear-gradient(#cc3333 0 50px,#3399cc 50px 100px)}
-#k{position:sticky;top:0;width:200px;height:40px;background:#00aa00}
-#h{position:fixed;top:0;left:0;width:80px;height:60px;background:#ff0000}</style><div id=s><div id=k></div></div><div id=h></div>`
-
-    const { outDir } = await shoot({ 'a.html': page(836), 'b.html': page(1750) }, ['/a', '/b'])
-
-    for (const [route, height] of [['/a', 836], ['/b', 1750]] as const) {
-      for (const width of [1280, 375]) {
-        const png = decodePng(readFileSync(join(outDir, `${kit.pageSlug(route)}-${width}.png`)))
-        expect(png.h, `${route} ${width} height`).toBe(height)
-
-        for (let y = 0; y < height; y++) {
-          const label = `${route} ${width} y=${y}`
-          expect(png.at(300, y), label).toEqual(stripe(y))
-          expect(png.at(40, y), `${label} x=40`).toEqual(y < 60 ? [255, 0, 0] : y >= 300 && y < 340 ? [0, 170, 0] : stripe(y))
-        }
-
-        expect(png.at(10, 59), `${route} ${width} header bottom`).toEqual([255, 0, 0])
-      }
-    }
-  }, 120_000)
-
-  it('writes one bundle and PNG per route and width through the shipped CLI, never overwriting', async () => {
-    const site = dirOf({ 'a-b.html': '<h1>Dash route</h1>', 'a/b.html': '<h1>Slash route</h1>' })
-    const out = join(scratch, 'cli-e2e')
-
-    const cli = (pages: string, outDir = out) => limited(() => new Promise<{ status: number | null, stderr: string }>(done => {
-      const child = spawn(process.execPath, [captureFile, '--side', 'candidate', '--site', site, '--pages', pages,
-        '--out', outDir, '--run-id', 'r', '--candidate-digest', 'd'], { env: { ...process.env, CHROME_PATH: chromium } })
-
-      let stderr = ''
-      child.stderr.on('data', d => { stderr += d })
-      child.on('close', status => done({ status, stderr }))
-    }))
-
-    const run = await cli('/a-b /a/b')
-    expect(run.status, run.stderr).toBe(0)
-    const files = readdirSync(out)
-    expect(files.filter(f => f.endsWith('.json'))).toHaveLength(4)
-    expect(files.filter(f => f.endsWith('.png'))).toHaveLength(4)
-
-    for (const [route, heading] of [['/a-b', 'dash route'], ['/a/b', 'slash route']]) {
-      for (const width of [1280, 375]) {
-        const bundle = JSON.parse(readFileSync(join(out, `${kit.pageSlug(route)}-${width}.json`), 'utf8'))
-        expect(bundle.page).toBe(route)
-        expect(bundle.image).toBe(`${kit.pageSlug(route)}-${width}.png`)
-        expect(bundle.elements.map((e: any) => e.text)).toContain(heading)
-        expect(files).toContain(bundle.image)
-      }
-    }
-
-    const again = await cli('/a-b')
-    expect(again.status).toBe(1)
-    expect(again.stderr).toContain('refusing to overwrite')
-    expect(readdirSync(out)).toHaveLength(8)
-    const dup = await cli('/a-b /a-b', join(scratch, 'cli-dup'))
-    expect(dup.status).toBe(1)
-    expect(dup.stderr).toContain('refusing to overwrite')
-  }, 120_000)
-
-  const settleHits = () => new Promise(r => setTimeout(r, 500))
-
-  const asPrototype = (html: string) => {
-    const file = join(scratch, `proto-${++seq}.html`)
-    writeFileSync(file, html)
-
-    return capture({ side: 'prototype', prototypeFile: file, pages: ['/'], outDir: join(scratch, `out-${++seq}`), chromium, runId: 'r', candidateDigest: 'd' })
-      .catch((e: unknown) => e)
-  }
-
-  const read = (outDir: string, width = 1280) => JSON.parse(readFileSync(join(outDir, `${kit.pageSlug('/')}-${width}.json`), 'utf8'))
-  const byText = (bundle: any, text: string) => bundle.elements.find((e: any) => e.text === text)
-
-  const escapes: [string, (base: string) => string][] = [
-    ['direct popup navigation', base => `<h1>popup</h1><script>window.open('http://${base}/popup')</script>`],
-    ['an about:blank popup native WebSocket', base => `<h1>realm</h1><script>const p = window.open('about:blank'); new p.WebSocket('ws://${base}/clean-socket')</script>`],
-  ]
-
-  for (const [name, page] of escapes) {
-    it(`never lets ${name} reach a separate receiver, on the candidate and on the prototype side`, async () => {
-      const r = await receiver()
-      const { bundles } = await shoot({ 'index.html': page(r.base) })
-
-      for (const b of bundles) {expect(b.blocked_requests.length).toBeGreaterThan(0)}
-
-      const err: any = await asPrototype(page(r.base))
-      expect(err.message).toBe('the chosen design file is not self-contained')
-      expect(err.blocked.length).toBeGreaterThan(0)
-      await settleHits()
-      await r.close()
-      expect(r.hits).toEqual([])
-    }, 120_000)
-  }
-
-  it('also keeps link, form, frame-realm and cross-site frame routes from reaching a separate receiver', async () => {
-    const r = await receiver()
-    const other = r.base.replace('127.0.0.1', 'localhost')
-
-    const routes = `<h1>routes</h1><a id=a target=_blank href="http://${r.base}/link">l</a><form id=f target=_blank action="http://${r.base}/form"></form><script>
-const frame = () => document.body.appendChild(document.createElement('iframe'))
-for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWindow.WebSocket)('ws://${r.base}/frame-socket'),
-  () => frame().contentWindow.open('http://${r.base}/frame-popup'), () => { frame().src = 'http://${other}/frame' }]) { try { f() } catch {} }</script>`
-
-    // The blocked cross-site frame cannot be read, so the capture itself is refused; what matters is that nothing reached the receiver.
-    await shoot({ 'index.html': routes }).catch(() => {})
-    await settleHits()
-    await r.close()
-    expect(r.hits).toEqual([])
-  }, 120_000)
-
-  const shadowPage = (ms: number) => `<!doctype html><h1>Outside</h1><div id=host></div><script>host.attachShadow({mode:'open'}).innerHTML =
-'<style>@keyframes m{to{transform:translateX(300px)}}h2{width:100px;animation:m ${ms}ms infinite linear}</style><h2>Inside</h2>'</script>`
-
   it('gives identical bundles and pixels for a shadow-root element with an infinite CSS animation when only its period differs', async () => {
-    const [a, b] = await Promise.all([shoot({ 'index.html': shadowPage(1000) }), shoot({ 'index.html': shadowPage(10_000) })])
-    sameFiles(a.outDir, b.outDir)
-    expect(byText(read(a.outDir), 'inside').tag).toBe('h2')
+    const run = await motionLaunch()
+    sameEvidence(run, '/shadow-a', '/shadow-b')
+    expect(byText(read(run.outDir, 1280, '/shadow-a'), 'inside').tag).toBe('h2')
   }, 120_000)
 
   it('measures visible shadow-root and srcdoc-iframe text with its own type values and page coordinates', async () => {
-    const page = (px: number) => `<h1>Outside</h1><div id=host></div><script>host.attachShadow({mode:'open'}).innerHTML = '<p style="font-size:${px}px">Visible shadow text</p><canvas width=50 height=20></canvas>'</script>
-<iframe srcdoc="<h2 style='font-size:${px}px'>Frame text</h2><p style='position:fixed;bottom:0'>Pin</p>" style="border:0;margin:30px"></iframe>`
-
-    const [s10, s40] = (await Promise.all([page(10), page(40)].map(html => shoot({ 'index.html': html })))).map(x => read(x.outDir))
+    const run = await motionLaunch()
+    const [s10, s40] = ['/visible-10', '/visible-40'].map(route => read(run.outDir, 1280, route))
 
     expect(byText(s10, 'visible shadow text').style['font-size']).toBe(10)
     expect(byText(s40, 'visible shadow text').style['font-size']).toBe(40)
@@ -1092,141 +955,25 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
     expect(byText(s10, 'pin').fixed).toBe(true)
   }, 120_000)
 
-  it('refuses closed shadow roots, declarative closed roots and unreadable frames instead of claiming complete evidence', async () => {
-    const pages = {
-      closed: '<div id=h></div><script>h.attachShadow({mode:"closed"}).innerHTML = "<h2>Hidden</h2>"</script>',
-      declarative: '<div><template shadowrootmode="closed"><h2>Hidden</h2></template></div>',
-      sandboxed: '<iframe sandbox srcdoc="<h2>Opaque</h2>"></iframe>',
-      object: '<object data="data:text/html,%3Ch2%3EOpaque%3C/h2%3E" type="text/html"></object>',
-      embed: '<embed src="data:text/html,%3Ch2%3EOpaque%3C/h2%3E" type="text/html">',
-    }
-
-    for (const [name, html] of Object.entries(pages)) {
-      const err: any = await shoot({ 'index.html': html }).catch((e: unknown) => e)
-      expect(err.message, name).toMatch(name === 'sandboxed' ? /<iframe>.*cannot be measured/ : name === 'object' || name === 'embed' ? /unreadable <object> or <embed> document cannot be measured/ : /closed shadow root/)
-    }
+  it('refuses a closed shadow root instead of claiming complete evidence', async () => {
+    expect((await motionLaunch()).error?.message).toMatch(/closed shadow root/)
   }, 120_000)
 
-  const stunTurn = async () => {
-    const seen = { packets: 0, connections: 0 }
-    const udp = createSocket('udp4')
-    udp.on('message', () => { seen.packets++ })
-    await new Promise<void>(r => udp.bind(0, '127.0.0.1', r))
-    const tcp = createTcpServer(socket => { seen.connections++; socket.destroy() })
-    await new Promise<void>(r => tcp.listen(0, '127.0.0.1', r))
-    const stun = `stun:127.0.0.1:${udp.address().port}`
-    const turn = `turn:127.0.0.1:${(tcp.address() as { port: number }).port}?transport=tcp`
+  // ---- Rendering normalisation: what the page can read, set and retain. ----
 
-    return { seen, stun, turn, close: () => Promise.all([new Promise<void>(r => udp.close(() => r())), new Promise<void>(r => tcp.close(() => r()))]) }
-  }
+  const normPage = (smoothing: string, rendering: string) => {
+    const decl = `-webkit-font-smoothing:${smoothing};text-rendering:${rendering}`
+    const reflect = (id: string, out: string) => `${out}.textContent = getComputedStyle(${id}).webkitFontSmoothing + ' / ' + getComputedStyle(${id}).textRendering`
+    const frame = `Frame body text<p id=a style='${decl}!important'>A</p><p id=o></p><script>${reflect('a', 'o')}</script>`.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
 
-  it('refuses WebRTC, WebTransport and data channels in the page, srcdoc and script-made frames before ICE reaches a STUN or TURN receiver, on both sides', async () => {
-    const r = await stunTurn()
-    const ice = `{iceServers:[{urls:'${r.stun}'},{urls:'${r.turn}',username:'u',credential:'c'}]}`
-
-    const run = `for (const C of [RTCPeerConnection, webkitRTCPeerConnection]) { try { const pc = new C(${ice}); pc.createDataChannel('x'); pc.createOffer().then(o => pc.setLocalDescription(o)).catch(() => {}) } catch {} }
-try { new WebTransport('https://127.0.0.1:9/') } catch {}`
-
-    const page = `<!doctype html><h1>rtc</h1><script>${run}</script><iframe srcdoc="<h2>frame</h2><script>${run}</script>"></iframe>
-<script>const f = document.body.appendChild(document.createElement('iframe')); try { new f.contentWindow.RTCPeerConnection(${ice}) } catch {}</script>`
-
-    const { bundles } = await shoot({ 'index.html': page })
-
-    for (const b of bundles) {expect(b.blocked_requests).toEqual(expect.arrayContaining([r.stun, r.turn, 'webrtc:RTCPeerConnection', 'https://127.0.0.1:9/']))}
-
-    const err: any = await asPrototype(page)
-    expect(err.message).toBe('the chosen design file is not self-contained')
-    expect(err.blocked).toEqual(expect.arrayContaining([r.stun, r.turn]))
-    await new Promise(done => setTimeout(done, 1000))
-    await r.close()
-    expect(r.seen).toEqual({ packets: 0, connections: 0 })
-  }, 120_000)
-
-  const bodyShadowPage = (ms: number) => `<!doctype html><body><script>document.body.attachShadow({mode:'open'}).innerHTML =
-'<style>@keyframes m{to{transform:translateX(300px)}}h2{width:100px;animation:m ${ms}ms infinite linear}</style><h2>Inside body</h2>'; document.currentScript.remove()</script>`
-
-  it('visits a body-attached open shadow root with an animated h2 and gives period-independent images', async () => {
-    const [a, b] = await Promise.all([shoot({ 'index.html': bodyShadowPage(1000) }), shoot({ 'index.html': bodyShadowPage(10_000) })])
-    sameFiles(a.outDir, b.outDir)
-
-    for (const width of [1280, 375]) {expect(byText(read(a.outDir, width), 'inside body').tag).toBe('h2')}
-  }, 120_000)
-
-  it('normalises before page code reads it and measures each body: one synchronous computed-style read of inline !important, a shadow root, a declarative shadow root and a srcdoc frame', async () => {
-    const page = (smoothing: string, rendering: string) => {
-      const decl = `-webkit-font-smoothing:${smoothing};text-rendering:${rendering}`
-      const reflect = (id: string, out: string) => `${out}.textContent = getComputedStyle(${id}).webkitFontSmoothing + ' / ' + getComputedStyle(${id}).textRendering`
-      const frame = `Frame body text<p id=a style='${decl}!important'>A</p><p id=o></p><script>${reflect('a', 'o')}</script>`.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
-
-      return `<!doctype html><body style="background:#eee">Top body text<p id=a style="${decl}!important">Inline</p><p id=ra></p><script>${reflect('a', 'ra')}</script>
+    return `<!doctype html><body style="background:#eee">Top body text<p id=a style="${decl}!important">Inline</p><p id=ra></p><script>${reflect('a', 'ra')}</script>
 <div id=host></div><script>const r = host.attachShadow({mode:'open'}), own = new CSSStyleSheet(); own.replaceSync('h2{${decl}}')
 r.adoptedStyleSheets = [own]; r.innerHTML = '<h2 id=s>S</h2><p id=o></p>'
 const o = r.getElementById('o'); o.textContent = getComputedStyle(r.getElementById('s')).webkitFontSmoothing + ' / ' + getComputedStyle(r.getElementById('s')).textRendering</script>
 <div id=dh><template shadowrootmode=open><style>h3{${decl}}</style><h3 id=d>D</h3><p id=e></p></template></div>
 <script>const dr = dh.shadowRoot; dr.getElementById('e').textContent = getComputedStyle(dr.getElementById('d')).webkitFontSmoothing + ' / ' + getComputedStyle(dr.getElementById('d')).textRendering</script>
 <iframe srcdoc="${frame}"></iframe>`
-    }
-
-    const [a, b] = await Promise.all([shoot({ 'index.html': page('subpixel-antialiased', 'optimizeSpeed') }), shoot({ 'index.html': page('none', 'optimizeLegibility') })])
-
-    for (const width of [1280, 375]) {
-      const shown = read(a.outDir, width).elements.filter((e: any) => e.text === 'antialiased / geometricprecision')
-      expect(shown, `${width}`).toHaveLength(4)
-      expect(JSON.stringify(read(b.outDir, width))).toBe(JSON.stringify(read(a.outDir, width)))
-      const bodies = read(a.outDir, width).elements.filter((e: any) => e.tag === 'body')
-      expect(bodies.map((e: any) => e.text).sort(), `${width} body text`).toEqual(['frame body text', 'top body text'])
-      expect(bodies.find((e: any) => e.text === 'top body text').style['background-color']).toEqual([238, 238, 238, 1])
-    }
-  }, 120_000)
-
-  it('enforces the rendering values against ID-selector declarations and inline !important set again by the page, and fails when the page empties the layer', async () => {
-    const forced = '-webkit-font-smoothing:subpixel-antialiased!important;text-rendering:optimizeSpeed!important'
-
-    const page = (script: string) => `<style>#a{${forced}}</style><h1 id=a>AVAVATAR</h1><p id=b style="${forced}">Inline</p><p id=ra></p><p id=rb></p>
-<script>const show = () => { for (const [s, d] of [[a, ra], [b, rb]]) { const c = getComputedStyle(s); d.textContent = c.webkitFontSmoothing + ' / ' + c.textRendering } ${script} requestAnimationFrame(show) }; show()</script>`
-
-    const { outDir } = await shoot({ 'index.html': page(`b.style.setProperty('-webkit-font-smoothing', 'subpixel-antialiased', 'important');`) })
-
-    for (const width of [1280, 375]) {
-      const shown = read(outDir, width).elements.filter((e: any) => e.text === 'antialiased / geometricprecision')
-      expect(shown, `${width}`).toHaveLength(2)
-    }
-
-    const err: any = await shoot({ 'index.html': `${page('')}<script>addEventListener('load', () => document.getElementById('__dc_style').textContent = '')</script>` }).catch((e: unknown) => e)
-    expect(err.message).toContain('rendering normalisation is not effective')
-  }, 120_000)
-
-  const fontPage = (face: string, used: string) => `<!doctype html><style>
-@font-face{font-family:${face};src:url(/acme.woff2) format('woff2')}
-body{margin:0;font-size:32px}#t{display:inline-block;font-family:${used};margin:0}</style><p id=t>Measured text</p>`
-
-  const fontSite = (face: string, used: string) => {
-    const site = dirOf({ 'index.html': fontPage(face, used) })
-    copyFileSync(fileURLToPath(new URL('../web/public/fonts/Mondwest-Regular.woff2', import.meta.url)), join(site, 'acme.woff2'))
-
-    return capture({ side: 'candidate', siteDir: site, pages: ['/'], outDir: join(scratch, `out-${++seq}`), chromium, runId: 'r', candidateDigest: 'd' })
   }
-
-  it('keeps comma-containing quoted font families apart on the measured element, and equal when the names match', async () => {
-    const [same, other, matching] = await Promise.all([
-      fontSite('"Acme,Display"', '"Acme,Display", serif'), fontSite('"Acme,Display"', '"Acme,Other", serif'), fontSite("'Acme,Display'", "'ACME,display', monospace"),
-    ])
-
-    for (let i = 0; i < 2; i++) {
-      const [a, b, c] = [same, other, matching].map(r => byText(r[i], 'measured text'))
-      const first = (e: any) => probe.firstFamily(e.style['font-family'])
-      expect(a.style['font-family'], `${i}`).toBe('"Acme,Display", serif')
-      expect(b.style['font-family']).toBe('"Acme,Other", serif')
-      expect([first(a), first(b)]).toEqual(['acme,display', 'acme,other'])
-      expect(a.style['font-face']).toBe('acme,display')
-      expect(b.style['font-face']).toBe('')
-      expect(a.box.width).not.toBe(b.box.width)
-      expect(first(c)).toBe(first(a))
-      expect(c.style['font-face']).toBe(first(a))
-      expect(c.box).toEqual(a.box)
-      expect(c.style['font-face']).toBe(a.style['font-face'])
-    }
-  }, 120_000)
 
   const dynamic = (smoothing: string, rendering: string) => {
     const decl = `-webkit-font-smoothing:${smoothing};text-rendering:${rendering}`
@@ -1258,31 +1005,60 @@ ${make}(document.getElementById('top'))
 host.attachShadow({mode:'open'}); ${make}(host.shadowRoot)</script><iframe srcdoc="${frame}"></iframe>`
   }
 
-  it('normalises synchronously: created, style-set (setProperty, cssText, style attribute, style property), inserted and read-back elements in the page, an open shadow root and a srcdoc frame', async () => {
-    const [a, b] = await Promise.all([
-      shoot({ 'index.html': dynamicPage('subpixel-antialiased', 'optimizeSpeed') }), shoot({ 'index.html': dynamicPage('none', 'optimizeLegibility') }),
-    ])
-
-    for (const width of [1280, 375]) {
-      const shown = read(a.outDir, width).elements.filter((e: any) => e.text === 'antialiased / geometricprecision')
-      expect(shown, `${width}`).toHaveLength(18)
-      expect(JSON.stringify(read(b.outDir, width))).toBe(JSON.stringify(read(a.outDir, width)))
-    }
-
-    sameFiles(a.outDir, b.outDir)
-  }, 120_000)
-
-  it('refuses the capture when a retained computed style was read after a mutation path the kit cannot cover, and accepts the same bypass when nothing observed the element', async () => {
-    const page = (retain: boolean) => `<!doctype html><p id=a>A</p><p id=o></p><script>
+  const retainPage = (retain: boolean) => `<!doctype html><p id=a>A</p><p id=o></p><script>
 const p = document.getElementById('a'), live = ${retain ? 'getComputedStyle(p)' : 'null'}
 p.attributes.style ? 0 : p.setAttribute('style', 'color:red')
 p.attributes.style.value = 'text-rendering:optimizeSpeed!important'
 document.getElementById('o').textContent = (live || getComputedStyle(p)).textRendering</script>`
 
-    const [err, { bundles }]: any[] = await Promise.all([shoot({ 'index.html': page(true) }).catch((e: unknown) => e), shoot({ 'index.html': page(false) })])
-    expect(err.message).toContain('normalisation could not be guaranteed')
-    expect(bundles.map((b: any) => b.elements.some((e: any) => e.text === 'geometricprecision'))).toEqual([true, true])
+  const normaliseLaunch = memo(() => launchPages({
+    'norm-a': normPage('subpixel-antialiased', 'optimizeSpeed'), 'norm-b': normPage('none', 'optimizeLegibility'),
+    'dyn-a': dynamicPage('subpixel-antialiased', 'optimizeSpeed'), 'dyn-b': dynamicPage('none', 'optimizeLegibility'),
+    'body-shadow-a': bodyShadowPage(1000), 'body-shadow-b': bodyShadowPage(10_000), 'retain-off': retainPage(false), 'retain-on': retainPage(true),
+  }))
+
+  it('visits a body-attached open shadow root with an animated h2 and gives period-independent images', async () => {
+    const run = await normaliseLaunch()
+    sameEvidence(run, '/body-shadow-a', '/body-shadow-b')
+
+    for (const width of [1280, 375]) {expect(byText(read(run.outDir, width, '/body-shadow-a'), 'inside body').tag).toBe('h2')}
   }, 120_000)
+
+  it('normalises before page code reads it and measures each body: one synchronous computed-style read of inline !important, a shadow root, a declarative shadow root and a srcdoc frame', async () => {
+    const run = await normaliseLaunch()
+    sameEvidence(run, '/norm-a', '/norm-b')
+
+    for (const width of [1280, 375]) {
+      const bundle = read(run.outDir, width, '/norm-a')
+      expect(bundle.elements.filter((e: any) => e.text === 'antialiased / geometricprecision'), `${width}`).toHaveLength(4)
+      const bodies = bundle.elements.filter((e: any) => e.tag === 'body')
+      expect(bodies.map((e: any) => e.text).sort(), `${width} body text`).toEqual(['frame body text', 'top body text'])
+      expect(bodies.find((e: any) => e.text === 'top body text').style['background-color']).toEqual([238, 238, 238, 1])
+    }
+  }, 120_000)
+
+  it('normalises synchronously: created, style-set (setProperty, cssText, style attribute, style property), inserted and read-back elements in the page, an open shadow root and a srcdoc frame', async () => {
+    const run = await normaliseLaunch()
+    sameEvidence(run, '/dyn-a', '/dyn-b')
+
+    for (const width of [1280, 375]) {
+      expect(read(run.outDir, width, '/dyn-a').elements.filter((e: any) => e.text === 'antialiased / geometricprecision'), `${width}`).toHaveLength(18)
+    }
+  }, 120_000)
+
+  it('refuses the capture when a retained computed style was read after a mutation path the kit cannot cover, and accepts the same bypass when nothing observed the element', async () => {
+    const run = await normaliseLaunch()
+    expect(run.error?.message).toContain('normalisation could not be guaranteed')
+
+    for (const width of [1280, 375]) {expect(read(run.outDir, width, '/retain-off').elements.some((e: any) => e.text === 'geometricprecision'), `${width}`).toBe(true)}
+  }, 120_000)
+
+  const forced = '-webkit-font-smoothing:subpixel-antialiased!important;text-rendering:optimizeSpeed!important'
+
+  const enforcePage = (script: string) => `<style>#a{${forced}}</style><h1 id=a>AVAVATAR</h1><p id=b style="${forced}">Inline</p><p id=ra></p><p id=rb></p>
+<script>const show = () => { for (const [s, d] of [[a, ra], [b, rb]]) { const c = getComputedStyle(s); d.textContent = c.webkitFontSmoothing + ' / ' + c.textRendering } ${script} requestAnimationFrame(show) }; show()</script>`
+
+  // ---- Scroll, native motion and tiling, ending in the refusal of the page that empties the normalisation layer. ----
 
   // The same page except for where the page, and a same-origin frame, are scrolled while loading.
   const scrolledPage = (x: number, y: number, frameY: number, onLoad = false) => {
@@ -1297,12 +1073,28 @@ iframe{position:absolute;left:400px;top:500px;width:300px;height:200px;border:0}
 <script>${onLoad ? `addEventListener('load', () => ${scroll})` : scroll}</script>`
   }
 
-  it('measures fixed and sticky boxes in viewport coordinates, the rest in document coordinates, and captures the same page whatever the initial scroll', async () => {
-    const [still, both] = await Promise.all([shoot({ 'index.html': scrolledPage(0, 0, 0) }), shoot({ 'index.html': scrolledPage(1000, 1000, 500, true) })])
-    sameFiles(still.outDir, both.outDir)
+  const enforceLaunch = memo(() => launchPages({
+    'enforce-ok': enforcePage(`b.style.setProperty('-webkit-font-smoothing', 'subpixel-antialiased', 'important');`),
+    'scroll-still': scrolledPage(0, 0, 0), 'scroll-both': scrolledPage(1000, 1000, 500, true),
+    'enforce-empty': `${enforcePage('')}<script>addEventListener('load', () => document.getElementById('__dc_style').textContent = '')</script>`,
+  }))
+
+  it('enforces the rendering values against ID-selector declarations and inline !important set again by the page, and fails when the page empties the layer', async () => {
+    const run = await enforceLaunch()
 
     for (const width of [1280, 375]) {
-      const bundle = read(both.outDir, width)
+      expect(read(run.outDir, width, '/enforce-ok').elements.filter((e: any) => e.text === 'antialiased / geometricprecision'), `${width}`).toHaveLength(2)
+    }
+
+    expect(run.error?.message).toContain('rendering normalisation is not effective')
+  }, 120_000)
+
+  it('measures fixed and sticky boxes in viewport coordinates, the rest in document coordinates, and captures the same page whatever the initial scroll', async () => {
+    const run = await enforceLaunch()
+    sameEvidence(run, '/scroll-still', '/scroll-both')
+
+    for (const width of [1280, 375]) {
+      const bundle = read(run.outDir, width, '/scroll-both')
       expect(byText(bundle, 'fixed')).toMatchObject({ fixed: true, box: { x: 0, y: 0, width: 200, height: 50 } })
       expect(byText(bundle, 'sticky')).toMatchObject({ fixed: true, box: { x: 0, y: 300, width: 200, height: 60 } })
       expect(byText(bundle, 'control').fixed).toBe(false)
@@ -1311,14 +1103,7 @@ iframe{position:absolute;left:400px;top:500px;width:300px;height:200px;border:0}
     }
   }, 120_000)
 
-  it('refuses the capture when the page keeps the scroll away from the top-of-page state', async () => {
-    const page = `<!doctype html><style>body{margin:0;height:3000px}</style><h1>Stuck</h1><script>
-addEventListener('scroll', () => { if (scrollY === 0) scrollTo(0, 400) }); scrollTo(0, 400)</script>`
-
-    await expect(shoot({ 'index.html': page })).rejects.toThrow('top-of-page scroll state')
-  }, 120_000)
-
-  const nativeMotionSite = (ms: number, amount: number) => {
+  const nativeMotion = (tag: string, ms: number, amount: number) => {
     const root = (kids: string) => `<svg xmlns="http://www.w3.org/2000/svg" width="360" height="120" style="display:block">${kids}</svg>`
 
     const shapes = `<rect y="20" width="60" height="40" fill="red"><animate attributeName="x" from="0" to="280" dur="${ms}ms" repeatCount="indefinite"/></rect>
@@ -1327,60 +1112,339 @@ addEventListener('scroll', () => { if (scrollY === 0) scrollTo(0, 400) }); scrol
 <rect x="300" y="20" width="30" height="30" fill="black"><set attributeName="fill" to="white" begin="${ms / 2}ms"/></rect>`
 
     const marquees = `<marquee scrollamount="${amount}" style="display:block;width:300px">Moving text control</marquee><marquee direction="up" height="60" scrollamount="${amount}">Up</marquee>`
-
     const inner = `<!doctype html><style>body{margin:0}</style>${root(shapes)}<marquee scrollamount="${amount}">Inner mover</marquee>`
 
-    return { 'inner.html': inner, 'index.html': `<!doctype html><style>body{margin:0}</style><h1>Native motion</h1>${root(shapes)}${marquees}<div id=host></div>
-<object data="/inner.html" type="text/html" width="380" height="130" style="display:block"></object><embed src="/inner.html" type="text/html" width="380" height="130" style="display:block">
+    return { [`inner-${tag}.html`]: inner, [`native-${tag}.html`]: `<!doctype html><style>body{margin:0}</style><h1>Native motion</h1>${root(shapes)}${marquees}<div id=host></div>
+<object data="/inner-${tag}.html" type="text/html" width="380" height="130" style="display:block"></object><embed src="/inner-${tag}.html" type="text/html" width="380" height="130" style="display:block">
 <iframe style="border:0;width:380px;height:130px" srcdoc='${root(shapes).replace(/'/g, '&#39;')}'></iframe>
 <script>document.getElementById('host').attachShadow({mode:'open'}).innerHTML = '${root(shapes)}<marquee scrollamount="${amount}">Shadow mover</marquee>'</script>` }
   }
 
+  const tilesPage = (height: number) => `<!doctype html><style>html,body{margin:0}
+#s{box-sizing:border-box;padding-top:300px;height:${height}px;background:repeating-linear-gradient(#cc3333 0 50px,#3399cc 50px 100px)}
+#k{position:sticky;top:0;width:200px;height:40px;background:#00aa00}
+#h{position:fixed;top:0;left:0;width:80px;height:60px;background:#ff0000}</style><div id=s><div id=k></div></div><div id=h></div>`
+
+  const declarativePage = '<div><template shadowrootmode="closed"><h2>Hidden</h2></template></div>'
+
+  const nativeLaunch = memo(() => {
+    const [fast, slow] = [nativeMotion('fast', 1000, 40), nativeMotion('slow', 10_000, 1)]
+
+    return launchPages({ 'native-fast': fast['native-fast.html'], 'native-slow': slow['native-slow.html'], 'tiles-a': tilesPage(836), 'tiles-b': tilesPage(1750), declarative: declarativePage },
+      { 'inner-fast.html': fast['inner-fast.html'], 'inner-slow.html': slow['inner-slow.html'] })
+  })
+
   it('freezes SMIL animate, animateTransform, animateMotion and set, and stops marquee, in the page, an open shadow root, a frame and a same-origin object and embed document, whatever their duration or speed', async () => {
-    const [fast, slow] = await Promise.all([shoot(nativeMotionSite(1000, 40)), shoot(nativeMotionSite(10_000, 1))])
-    sameFiles(fast.outDir, slow.outDir)
-    const png = decodePng(readFileSync(join(fast.outDir, `${kit.pageSlug('/')}-1280.png`)))
-    const top = read(fast.outDir).elements.find((e: any) => e.tag === 'svg').box.y
+    const run = await nativeLaunch()
+    sameEvidence(run, '/native-fast', '/native-slow')
+    const png = decodePng(pngOf(run.outDir, 1280, '/native-fast'))
+    const top = read(run.outDir, 1280, '/native-fast').elements.find((e: any) => e.tag === 'svg').box.y
     expect(png.at(30, Math.round(top) + 40), 'animate rect at its start').toEqual([255, 0, 0])
   }, 120_000)
 
+  it('keeps first-tile pixels when the last tile overlaps and fixed or sticky elements are hidden', async () => {
+    const run = await nativeLaunch()
+    const stripe = (y: number) => (Math.floor(y / 50) % 2 ? [51, 153, 204] : [204, 51, 51])
+
+    for (const [route, height] of [['/tiles-a', 836], ['/tiles-b', 1750]] as const) {
+      for (const width of [1280, 375]) {
+        const png = decodePng(pngOf(run.outDir, width, route))
+        expect(png.h, `${route} ${width} height`).toBe(height)
+
+        for (let y = 0; y < height; y++) {
+          const label = `${route} ${width} y=${y}`
+          expect(png.at(300, y), label).toEqual(stripe(y))
+          expect(png.at(40, y), `${label} x=40`).toEqual(y < 60 ? [255, 0, 0] : y >= 300 && y < 340 ? [0, 170, 0] : stripe(y))
+        }
+
+        expect(png.at(10, 59), `${route} ${width} header bottom`).toEqual([255, 0, 0])
+      }
+    }
+  }, 120_000)
+
+  it('refuses declarative closed shadow roots instead of claiming complete evidence', async () => {
+    expect((await nativeLaunch()).error?.message).toMatch(/closed shadow root/)
+  }, 120_000)
+
+  // ---- Fonts, then the refusal of unreadable object and embed documents, a sandboxed frame and a page that holds the scroll away from the top. ----
+
+  const fontPage = (face: string, used: string) => `<!doctype html><style>
+@font-face{font-family:${face};src:url(/acme.woff2) format('woff2')}
+body{margin:0;font-size:32px}#t{display:inline-block;font-family:${used};margin:0}</style><p id=t>Measured text</p>`
+
+  const fontLaunch = memo(() => launchPages({
+    'font-same': fontPage('"Acme,Display"', '"Acme,Display", serif'), 'font-other': fontPage('"Acme,Display"', '"Acme,Other", serif'),
+    'font-matching': fontPage("'Acme,Display'", "'ACME,display', monospace"),
+    object: '<object data="data:text/html,%3Ch2%3EOpaque%3C/h2%3E" type="text/html"></object>',
+  }, { 'acme.woff2': readFileSync(fileURLToPath(new URL('../web/public/fonts/Mondwest-Regular.woff2', import.meta.url))) }))
+
+  it('keeps comma-containing quoted font families apart on the measured element, and equal when the names match', async () => {
+    const run = await fontLaunch()
+
+    for (const width of [1280, 375]) {
+      const [a, b, c] = ['/font-same', '/font-other', '/font-matching'].map(route => byText(read(run.outDir, width, route), 'measured text'))
+      const first = (e: any) => probe.firstFamily(e.style['font-family'])
+      expect(a.style['font-family'], `${width}`).toBe('"Acme,Display", serif')
+      expect(b.style['font-family']).toBe('"Acme,Other", serif')
+      expect([first(a), first(b)]).toEqual(['acme,display', 'acme,other'])
+      expect(a.style['font-face']).toBe('acme,display')
+      expect(b.style['font-face']).toBe('')
+      expect(a.box.width).not.toBe(b.box.width)
+      expect(first(c)).toBe(first(a))
+      expect(c.style['font-face']).toBe(first(a))
+      expect(c.box).toEqual(a.box)
+      expect(c.style['font-face']).toBe(a.style['font-face'])
+    }
+  }, 120_000)
+
+  it('refuses an unreadable <object> document instead of claiming complete evidence', async () => {
+    expect((await fontLaunch()).error?.message).toMatch(/unreadable <object> or <embed> document cannot be measured/)
+  }, 120_000)
+
+  const sandboxedLaunch = memo(() => launchPages({ sandboxed: '<iframe sandbox srcdoc="<h2>Opaque</h2>"></iframe>' }))
+  const embedLaunch = memo(() => launchPages({ embed: '<embed src="data:text/html,%3Ch2%3EOpaque%3C/h2%3E" type="text/html">' }))
+
+  it('refuses an unreadable <embed> document instead of claiming complete evidence', async () => {
+    expect((await embedLaunch()).error?.message).toMatch(/unreadable <object> or <embed> document cannot be measured/)
+  }, 120_000)
+
+  it('refuses a sandboxed frame instead of claiming complete evidence', async () => {
+    expect((await sandboxedLaunch()).error?.message).toMatch(/<iframe>.*cannot be measured/)
+  }, 120_000)
+
+  const stuckLaunch = memo(() => launchPages({
+    stuck: `<!doctype html><style>body{margin:0;height:3000px}</style><h1>Stuck</h1><script>
+addEventListener('scroll', () => { if (scrollY === 0) scrollTo(0, 400) }); scrollTo(0, 400)</script>`,
+  }))
+
+  it('refuses the capture when the page keeps the scroll away from the top-of-page state', async () => {
+    expect((await stuckLaunch()).error?.message).toContain('top-of-page scroll state')
+  }, 120_000)
+
+  // ---- Requests that leave the page: one launch on each side, and receivers that must never be reached. ----
+
+  const outside = memo(async () => {
+    const r = await receiver()
+    const s = await stunTurn()
+    const ice = `{iceServers:[{urls:'${s.stun}'},{urls:'${s.turn}',username:'u',credential:'c'}]}`
+
+    const network = `<h1>net</h1><script>
+for (const f of [() => new WebSocket('ws://${r.base}/socket'), () => new EventSource('http://${r.base}/es'),
+  () => navigator.sendBeacon('http://${r.base}/beacon', 'x'), () => new Worker('http://${r.base}/w.js'), () => new Worker('/w.js'),
+  () => new SharedWorker('/w.js'), () => navigator.serviceWorker.register('/w.js'),
+  () => fetch('http://${r.base}/fetch').catch(() => {})]) { try { f() } catch {} }</script>`
+
+    const popup = `<h1>popup</h1><script>window.open('http://${r.base}/popup')</script>`
+    const realm = `<h1>realm</h1><script>const p = window.open('about:blank'); new p.WebSocket('ws://${r.base}/clean-socket')</script>`
+
+    const run = `for (const C of [RTCPeerConnection, webkitRTCPeerConnection]) { try { const pc = new C(${ice}); pc.createDataChannel('x'); pc.createOffer().then(o => pc.setLocalDescription(o)).catch(() => {}) } catch {} }
+try { new WebTransport('https://127.0.0.1:9/') } catch {}`
+
+    const rtc = `<h1>rtc</h1><script>${run}</script><iframe srcdoc="<h2>frame</h2><script>${run}</script>"></iframe>
+<script>const f = document.body.appendChild(document.createElement('iframe')); try { new f.contentWindow.RTCPeerConnection(${ice}) } catch {}</script>`
+
+    // The blocked cross-site frame cannot be read, so this capture is refused; what matters is that nothing reached a receiver.
+    const other = r.base.replace('127.0.0.1', 'localhost')
+
+    const routes = `<h1>routes</h1><a id=a target=_blank href="http://${r.base}/link">l</a><form id=f target=_blank action="http://${r.base}/form"></form><script>
+const frame = () => document.body.appendChild(document.createElement('iframe'))
+for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWindow.WebSocket)('ws://${r.base}/frame-socket'),
+  () => frame().contentWindow.open('http://${r.base}/frame-popup'), () => { frame().src = 'http://${other}/frame' }]) { try { f() } catch {} }</script>`
+
+    const leaks = `<link rel=stylesheet href="asset.css"><link rel=stylesheet href="/missing-required.css"><link rel=stylesheet href="http://${r.base}/x.css">`
+
+    const [candidate, prototype] = await Promise.all([
+      launchPages({ net: `<!doctype html>${network}`, popup: `<!doctype html>${popup}`, realm: `<!doctype html>${realm}`, rtc: `<!doctype html>${rtc}`, routes: `<!doctype html>${routes}` },
+        { 'w.js': `new WebSocket('ws://${r.base}/from-worker')` }),
+      launchPrototype(`<!doctype html>${network}${popup}${realm}${rtc}${leaks}`),
+    ])
+
+    await new Promise(done => setTimeout(done, 1000))
+    await Promise.all([r.close(), s.close()])
+
+    return { candidate, prototype, r, s }
+  })
+
+  it('refuses outside WebSocket, EventSource, beacon, workers and fetch before they reach a separate receiver', async () => {
+    const { candidate, prototype, r } = await outside()
+    const wanted = [`ws://${r.base}/socket`, `http://${r.base}/es`, `http://${r.base}/beacon`, `http://${r.base}/w.js`, `http://${r.base}/fetch`]
+
+    for (const width of [1280, 375]) {
+      const { blocked_requests: blocked } = read(candidate.outDir, width, '/net')
+      expect(blocked).toEqual(expect.arrayContaining(wanted))
+      expect(blocked.some((u: string) => u.endsWith('/w.js') && !u.includes(r.base))).toBe(true)
+    }
+
+    expect(prototype.error.message).toBe('the chosen design file is not self-contained')
+    expect(prototype.error.blocked).toEqual(expect.arrayContaining(wanted))
+    expect(r.hits).toEqual([])
+  }, 120_000)
+
+  it('stops a prototype that references same-origin or outside resources', async () => {
+    const { prototype, r } = await outside()
+    expect(prototype.error.message).toBe('the chosen design file is not self-contained')
+
+    for (const suffix of ['/__prototype__/asset.css', '/missing-required.css', `${r.base}/x.css`]) {
+      expect(prototype.error.blocked.some((u: string) => u.endsWith(suffix)), suffix).toBe(true)
+    }
+
+    expect(r.hits).toEqual([])
+  }, 120_000)
+
+  it('never lets direct popup navigation or an about:blank popup native WebSocket reach a separate receiver, on the candidate and on the prototype side', async () => {
+    const { candidate, prototype, r } = await outside()
+
+    for (const route of ['/popup', '/realm']) {
+      for (const width of [1280, 375]) {expect(read(candidate.outDir, width, route).blocked_requests.length, `${route} ${width}`).toBeGreaterThan(0)}
+    }
+
+    expect(prototype.error.blocked).toEqual(expect.arrayContaining([`http://${r.base}/popup`, 'about:blank']))
+    expect(r.hits).toEqual([])
+  }, 120_000)
+
+  it('also keeps link, form, frame-realm and cross-site frame routes from reaching a separate receiver', async () => {
+    const { r } = await outside()
+    expect(r.hits).toEqual([])
+  }, 120_000)
+
+  it('refuses WebRTC, WebTransport and data channels in the page, srcdoc and script-made frames before ICE reaches a STUN or TURN receiver, on both sides', async () => {
+    const { candidate, prototype, s } = await outside()
+
+    for (const width of [1280, 375]) {
+      expect(read(candidate.outDir, width, '/rtc').blocked_requests).toEqual(expect.arrayContaining([s.stun, s.turn, 'webrtc:RTCPeerConnection', 'https://127.0.0.1:9/']))
+    }
+
+    expect(prototype.error.blocked).toEqual(expect.arrayContaining([s.stun, s.turn]))
+    expect(s.seen).toEqual({ packets: 0, connections: 0 })
+  }, 120_000)
+
+  const protoOk = memo(() => launchPrototype('<style>h1{color:#369}</style><h1>P</h1><img alt=dot src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">'))
+
+  it('accepts an inline prototype', async () => {
+    const run = await protoOk()
+    expect(run.error).toBeUndefined()
+
+    for (const width of [1280, 375]) {expect(read(run.outDir, width, '/').blocked_requests).toEqual([])}
+  }, 120_000)
+
+  // ---- The shipped CLI. ----
+
+  it('writes one bundle and PNG per route and width through the shipped CLI, never overwriting', async () => {
+    const site = dirOf({ 'a-b.html': '<h1>Dash route</h1>', 'a/b.html': '<h1>Slash route</h1>' })
+    const out = join(scratch, 'cli-e2e')
+
+    const cli = (pages: string, outDir = out) => limited(() => new Promise<{ status: number | null, stderr: string }>(done => {
+      const child = spawn(process.execPath, [captureFile, '--side', 'candidate', '--site', site, '--pages', pages,
+        '--out', outDir, '--run-id', 'r', '--candidate-digest', 'd'], { env: { ...process.env, CHROME_PATH: chromium } })
+
+      let stderr = ''
+      child.stderr.on('data', d => { stderr += d })
+      child.on('close', status => done({ status, stderr }))
+    }))
+
+    const run = await cli('/a-b /a/b')
+    expect(run.status, run.stderr).toBe(0)
+    const files = readdirSync(out)
+    expect(files.filter(f => f.endsWith('.json'))).toHaveLength(4)
+    expect(files.filter(f => f.endsWith('.png'))).toHaveLength(4)
+
+    for (const [route, heading] of [['/a-b', 'dash route'], ['/a/b', 'slash route']]) {
+      for (const width of [1280, 375]) {
+        const bundle = read(out, width, route)
+        expect(bundle.page).toBe(route)
+        expect(bundle.image).toBe(`${kit.pageSlug(route)}-${width}.png`)
+        expect(bundle.elements.map((e: any) => e.text)).toContain(heading)
+        expect(files).toContain(bundle.image)
+      }
+    }
+
+    const again = await cli('/a-b')
+    expect(again.status).toBe(1)
+    expect(again.stderr).toContain('refusing to overwrite')
+    expect(readdirSync(out)).toHaveLength(8)
+    const dup = await cli('/a-b /a-b', join(scratch, 'cli-dup'))
+    expect(dup.status).toBe(1)
+    expect(dup.stderr).toContain('refusing to overwrite')
+  }, 120_000)
+
+  // ---- SVG resources: the allowlist. ----
+
   const stillRaster = { 'still.gif': gif([10]), 'still.png': staticPng(), 'single.png': apng([10]), 'still.webp': STATIC_WEBP }
+  const SVG_NS = 'xmlns="http://www.w3.org/2000/svg"'
+  const svgDoc = (inner: string) => `<svg ${SVG_NS} width="64" height="64">${inner}</svg>`
+  const fill = '<rect width="64" height="64" fill="red"/>'
+  const GRADIENT = `<?xml version="1.0" encoding="UTF-8"?>${svgDoc(`<title>gradient</title><desc>path and gradient</desc><defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#f00"/><stop offset="1" stop-color="#00f"/></linearGradient></defs><path d="M0 0H64V64H0Z" fill="url(#g)"/>`)}`
 
-  it('refuses every rendered animated resource on the candidate side, whatever the duration, in an img, a CSS background, an object and an embed', async () => {
-    const page = `<!doctype html><style>body{margin:0}div{width:64px;height:64px;background:url(${dataUri(SVG, smil(3000, 'bg'))})}</style><h1>Animated</h1>
-<img alt="" src="${dataUri(SVG, smil(1000, 'img-fast'))}"><img alt="" src="${dataUri(SVG, smil(10_000, 'img-slow'))}"><div></div>
-<object data="/obj.svg" type="image/svg+xml" width="64" height="64"></object><embed src="/emb.svg" type="image/svg+xml" width="64" height="64">
-<img alt="" src="/a.gif"><img alt="" src="/a.png"><img alt="" src="/a.webp"><img alt="" src="${dataUri('image/gif', gif([1, 1]))}">`
+  // Each of these is outside the allowlist for its own reason; the last-but-five writes @keyframes with a character reference.
+  const unsupportedSvgs: Record<string, string> = {
+    'style-element.svg': svgDoc(`<style>rect{fill:red}</style>${fill}`),
+    'style-attribute.svg': svgDoc('<rect width="64" height="64" style="fill:red"/>'),
+    'animate-element.svg': smil(1000, 'a'),
+    'processing-instruction.svg': `<?xml-stylesheet type="text/css" href="data:text/css,rect%7Bfill:red%7D"?>${svgDoc(fill)}`,
+    'reference-keyframes.svg': svgDoc(`<style>&#64;keyframes k{to{x:1}}rect{animation:k 1s infinite}</style>${fill}`),
+    'event-attribute.svg': svgDoc('<rect width="64" height="64" onclick="x()"/>'),
+    'unlisted-element.svg': svgDoc('<use href="#u"/>'),
+    'object-style.svg': svgDoc(`<style>rect{fill:red}</style><title>object</title>${fill}`),
+    'embed-style.svg': svgDoc(`<style>rect{fill:red}</style><title>embed</title>${fill}`),
+    'background-style.svg': svgDoc(`<style>rect{fill:red}</style><title>background</title>${fill}`),
+    'mask-style.svg': svgDoc(`<style>rect{fill:red}</style><title>mask</title>${fill}`),
+    'border-style.svg': svgDoc(`<style>rect{fill:red}</style><title>border</title>${fill}`),
+  }
 
-    const err: any = await shoot({ 'index.html': page, 'obj.svg': smil(2000, 'obj'), 'emb.svg': smil(4000, 'emb'), 'a.gif': gif([10, 1000]), 'a.png': apng([10, 1000]), 'a.webp': ANIMATED_WEBP, ...stillRaster }).catch((e: unknown) => e)
-    expect(err.message).toMatch(/^unsupported content: animated resources whose timelines cannot be frozen: /)
-    const kinds = err.message.split('frozen: ')[1].split(', ').map((x: string) => x.split(' ')[0])
-    expect(kinds.sort()).toEqual(['apng', 'gif', 'gif', 'svg', 'svg', 'svg', 'svg', 'svg', 'webp'])
+  const STATIC_PAGE = `<!doctype html><style>body{margin:0}div{width:64px;height:64px;background:url(${dataUri(SVG, stillSvg('red'))})}img,object,embed{display:block}</style>
+<img alt="" src="${dataUri(SVG, stillSvg('red'))}"><div></div><img alt="" src="/gradient.svg"><object data="/gradient.svg" type="image/svg+xml" width="64" height="64"></object>
+<embed src="/gradient.svg" type="image/svg+xml" width="64" height="64"><img alt="" src="/still.gif"><img alt="" src="/still.png"><img alt="" src="/single.png"><img alt="" src="/still.webp"><h1>Static</h1>`
 
-    for (const where of ['/a.gif', '/a.png', '/a.webp', '/obj.svg', '/emb.svg', 'data:image/svg+xml']) {expect(err.message, where).toContain(where)}
+  const REFUSED_PAGE = `<!doctype html><style>body{margin:0}img,object,embed,div{display:block;width:64px;height:64px}
+#bg{background:url(/background-style.svg)}#mask{background:red;mask-image:url(/mask-style.svg)}#border{border-image:url(/border-style.svg) 1}</style><h1>Refused</h1>
+${['style-element', 'style-attribute', 'animate-element', 'processing-instruction', 'reference-keyframes', 'event-attribute', 'unlisted-element'].map(n => `<img alt="" src="/${n}.svg">`).join('')}
+<object data="/object-style.svg" type="image/svg+xml"></object><embed src="/embed-style.svg" type="image/svg+xml"><div id=bg></div><div id=mask></div><div id=border></div>
+<img alt="" src="/gradient.svg"><img alt="" src="/a.gif"><img alt="" src="/a.png"><img alt="" src="/a.webp"><img alt="" src="/still.gif"><img alt="" src="/still.webp">`
+
+  // One browser launch: two identical static routes, then the route that is refused (a refusal ends the launch, so it comes last).
+  const svgLaunch = memo(() => launchPages({ 'static-1': STATIC_PAGE, 'static-2': STATIC_PAGE, refused: REFUSED_PAGE }, {
+    'gradient.svg': GRADIENT, ...unsupportedSvgs, 'a.gif': gif([10, 1000]), 'a.png': apng([10, 1000]), 'a.webp': ANIMATED_WEBP, ...stillRaster,
+  }))
+
+  it('captures a static SVG (path and gradient) as img, background, object and embed, with single-frame rasters, identically on two runs, keeping the pixels', async () => {
+    const run = await svgLaunch()
+    sameEvidence(run, '/static-1', '/static-2')
+    expect(decodePng(pngOf(run.outDir, 1280, '/static-1')).at(30, 30)).toEqual([255, 0, 0])
+    expect(contractProblems(read(run.outDir, 1280, '/static-1'))).toEqual([])
   }, 120_000)
 
-  it('refuses animated resources on the prototype side, whatever the duration, and an animated image inside an inline SVG image', async () => {
-    const nested = dataUri(SVG, `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><image width="64" height="64" href="${dataUri('image/gif', gif([10, 1000]))}"/></svg>`)
+  it('refuses an SVG img with a style element, a style attribute, an animate element, a processing instruction or a style element writing @keyframes by character reference', async () => {
+    const message: string = (await svgLaunch()).error?.message ?? ''
+    const lines = message.split('\n').filter(l => l.startsWith('unsupported content: the kit cannot prove that this SVG is static'))
+    expect(lines.length, message).toBeGreaterThan(0)
 
-    const page = `<!doctype html><style>div{width:64px;height:64px;background:url(${dataUri(SVG, smil(3000, 'pb'))})}</style><h1>Proto</h1><div></div><img alt="" src="${dataUri('image/gif', gif([10, 1000]))}"><img alt="" src="${dataUri(SVG, smil(1000, 'p1'))}"><img alt="" src="${dataUri(SVG, smil(10_000, 'p2'))}"><img alt="" src="${nested}">
-<img alt="" src="${dataUri('image/png', apng([10, 1000]))}"><object data="${dataUri(SVG, smil(2000, 'po'))}" type="image/svg+xml" width="64" height="64"></object><embed src="${dataUri(SVG, smil(2000, 'pe'))}" type="image/svg+xml" width="64" height="64">`
+    for (const name of ['style-element', 'style-attribute', 'animate-element', 'processing-instruction', 'reference-keyframes', 'event-attribute', 'unlisted-element']) {
+      expect(lines.some(l => l.includes(`/${name}.svg`)), `${name}: ${message}`).toBe(true)
+    }
 
-    const err: any = await asPrototype(page)
-    expect(err.message).toMatch(/^unsupported content: animated resources whose timelines cannot be frozen: /)
-    expect(err.message.split('frozen: ')[1].split(', ').map((x: string) => x.split(' ')[0]).sort()).toEqual(['apng', 'gif', 'gif', 'svg', 'svg', 'svg', 'svg', 'svg'])
+    expect(message).not.toContain('gradient.svg')
   }, 120_000)
 
-  it('still captures static SVG and single-frame GIF, PNG, WebP and APNG in every context, and keeps their pixels', async () => {
-    const red = dataUri(SVG, stillSvg('red'))
+  it('refuses a style-element SVG as an object, an embed, a CSS background, a mask and a border image', async () => {
+    const message: string = (await svgLaunch()).error?.message ?? ''
 
-    const page = `<!doctype html><style>body{margin:0}div{width:64px;height:64px;background:url(${red})}img,object,embed{display:block}</style>
-<img alt="" src="${red}"><div></div><object data="/still.svg" type="image/svg+xml" width="64" height="64"></object><embed src="/still.svg" type="image/svg+xml" width="64" height="64">
-<img alt="" src="/still.gif"><img alt="" src="/still.png"><img alt="" src="/single.png"><img alt="" src="/still.webp">`
-
-    const { bundles, outDir } = await shoot({ 'index.html': page, 'still.svg': stillSvg('file'), ...stillRaster })
-    expect(bundles).toHaveLength(2)
-    expect(decodePng(readFileSync(join(outDir, `${kit.pageSlug('/')}-1280.png`))).at(30, 30)).toEqual([255, 0, 0])
+    for (const name of ['object-style', 'embed-style', 'background-style', 'mask-style', 'border-style']) {
+      expect(message, name).toMatch(new RegExp(`cannot prove that this SVG is static: [^\\n]*/${name}\\.svg \\(sha256 [0-9a-f]{12}\\)`))
+    }
   }, 120_000)
 
+  it('still refuses animated GIF, APNG and WebP resources and lets single-frame ones through', async () => {
+    const message: string = (await svgLaunch()).error?.message ?? ''
+    const kinds = (/animated resources whose timelines cannot be frozen: ([^\n]*)/.exec(message) ?? ['', ''])[1].split(', ').map(x => x.split(' ')[0])
+    expect(kinds.sort(), message).toEqual(['apng', 'gif', 'webp'])
+
+    for (const where of ['/a.gif', '/a.png', '/a.webp']) {expect(message, where).toContain(where)}
+
+    expect(message).not.toContain('/still.')
+  }, 120_000)
+
+  it('refuses a style-element SVG img on the prototype side, naming the data URL', async () => {
+    const run = await launchPrototype(`<!doctype html><h1>Proto</h1><img alt="" src="${dataUri(SVG, unsupportedSvgs['style-element.svg'])}">`)
+    expect(run.error.message).toMatch(/^unsupported content: the kit cannot prove that this SVG is static: data:image\/svg\+xml;base64,\S+… \(sha256 [0-9a-f]{12}\)$/)
+  }, 120_000)
 })

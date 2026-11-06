@@ -7,7 +7,6 @@ import { tmpdir } from 'node:os'
 import { basename, extname, join, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
-import { gunzipSync } from 'node:zlib'
 
 // Chromium 153.0.8010.0 as extracted from the npm package below; any other binary or hash is refused.
 export const CHROMIUM_PIN = {
@@ -130,8 +129,8 @@ export function findClosedShadowRoot(node) {
   return null
 }
 
-// Rendered native timelines (SMIL and CSS in an SVG image, GIF/APNG/WebP/AVIF frames) cannot be paused or rewound from the page, so a capture whose
-// resources contain one is refused. Every check reads the response bytes, so it works the same for http, data: and blob: resources.
+// Rendered native timelines cannot be paused or rewound from the page, so a capture whose resources contain one is refused. Raster formats are judged from
+// the response bytes (GIF/APNG/WebP/AVIF frames); SVG resources by the allowlist below. Both read the response, so http, data: and blob: resources work alike.
 const u32 = (b, i) => b.readUInt32BE(i)
 
 export function gifFrameCount(buf) {
@@ -167,32 +166,8 @@ export function webpIsAnimated(buf) {
   return b.length >= 21 && b.toString('latin1', 0, 4) === 'RIFF' && b.toString('latin1', 8, 12) === 'WEBP' && b.toString('latin1', 12, 16) === 'VP8X' && !!(b[20] & 2)
 }
 
-const svgText = b => {
-  if (b[0] === 0x1f && b[1] === 0x8b) { try { return svgText(gunzipSync(b)) } catch { return '<script/>' } }
-  if (b[0] === 0xff && b[1] === 0xfe) return b.toString('utf16le', 2)
-  if (b[0] === 0xfe && b[1] === 0xff) return Buffer.from(b.subarray(2)).swap16().toString('utf16le')
-  return b.toString('utf8')
-}
-const SVG_MOTION = [/<(?:[\w.-]+:)?(?:animate|animatetransform|animatemotion|animatecolor|set|discard|script)\b/i, /@keyframes/i, /\banimation(?:-[a-z-]+)?\s*[:=]/i, /<!ENTITY/i]
-
-// SVG as an image cannot run scripts or load files, so its bytes are all there is: SMIL elements, CSS animation, script, or entities that could hide them.
-export function svgIsAnimated(input) {
-  const text = typeof input === 'string' ? input : svgText(Buffer.from(input))
-  return SVG_MOTION.some(re => re.test(text))
-}
-
-const dataUri = uri => {
-  const comma = uri.indexOf(',')
-  if (comma < 0) return null
-  const head = uri.slice(5, comma).split(';')
-  const payload = uri.slice(comma + 1)
-  let body
-  try { body = head.includes('base64') ? Buffer.from(payload, 'base64') : Buffer.from(decodeURIComponent(payload)) } catch { body = Buffer.from(payload) }
-  return { mime: head[0].trim().toLowerCase(), body }
-}
-
-// The kind of animated image or document these bytes are, or null. Nested data: images of an SVG image are checked too.
-export function animatedResource(buf, mime = '', depth = 0) {
+// The kind of animated raster image these bytes are, or null.
+export function animatedResource(buf, mime = '') {
   const b = Buffer.from(buf)
   const type = String(mime).split(';')[0].trim().toLowerCase()
   if (gifFrameCount(b) > 1) return 'gif'
@@ -200,16 +175,35 @@ export function animatedResource(buf, mime = '', depth = 0) {
   if (webpIsAnimated(b)) return 'webp'
   if (b.toString('latin1', 4, 8) === 'ftyp' && b.toString('latin1', 8, Math.min(b.length, Math.max(u32(b, 0), 12))).includes('avis')) return 'avif'
   if (type === 'image/jxl' || (b[0] === 0xff && b[1] === 0x0a) || b.toString('hex', 0, 12) === '0000000c4a584c200d0a870a') return 'jxl'
-  if (type !== 'image/svg+xml') return null
-  if (svgIsAnimated(b)) return 'svg'
-  if (depth >= 8) return 'svg'
-  for (const m of svgText(b).matchAll(/(?:href|src)\s*=\s*["'](data:[^"']*)["']|url\(\s*["']?(data:[^)"']*)/gi)) {
-    const nested = dataUri(m[1] || m[2])
-    const kind = nested && animatedResource(nested.body, nested.mime, depth + 1)
-    if (kind) return kind
-  }
   return null
 }
+
+const SVG_ELEMENTS = ['svg', 'g', 'defs', 'title', 'desc', 'path', 'rect', 'circle', 'ellipse', 'line', 'polyline', 'polygon', 'text', 'tspan',
+  'linearGradient', 'radialGradient', 'stop', 'clipPath', 'mask', 'pattern']
+
+// Runs in a blank browser page, never in the captured page: parses the exact bytes of an SVG resource with the browser's own XML parser (so character
+// references and entities are decoded) and passes only a document without parse errors, processing instructions, unlisted elements, style attributes
+// or on* attributes. Nothing in such a document can start a timeline, and CSS is not parsed at all.
+const svgIsOnAllowlist = (base64, allowed) => {
+  const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0))
+  const encoding = bytes[0] === 0xff && bytes[1] === 0xfe ? 'utf-16le' : bytes[0] === 0xfe && bytes[1] === 0xff ? 'utf-16be' : 'utf-8'
+  const doc = new DOMParser().parseFromString(new TextDecoder(encoding).decode(bytes), 'image/svg+xml')
+  if (doc.getElementsByTagNameNS('*', 'parsererror').length) return false
+  const plain = node => {
+    for (let n = node.firstChild; n; n = n.nextSibling) {
+      if (n.nodeType === 7) return false
+      if (n.nodeType !== 1) continue
+      if (!allowed.includes(n.localName)) return false
+      for (const a of n.attributes) {
+        if ([a.name, a.localName].some(name => name.toLowerCase() === 'style' || name.toLowerCase().startsWith('on'))) return false
+      }
+      if (!plain(n)) return false
+    }
+    return true
+  }
+  return plain(doc)
+}
+
 
 // The root element names of every document shown by a frame, iframe, object or embed in a pierced CDP DOM tree (template content excluded).
 export function embeddedDocumentRoots(node) {
@@ -225,11 +219,12 @@ export function embeddedDocumentRoots(node) {
 
 const shortUrl = url => (url.length > 60 ? `${url.slice(0, 60)}…` : url)
 
-export function assertNoAnimatedResources(found, unreadable) {
+export function assertNoAnimatedResources(found, unreadable, unprovable = []) {
   const problems = []
   if (found.length) {
     problems.push(`unsupported content: animated resources whose timelines cannot be frozen: ${found.map(f => `${f.kind} ${shortUrl(f.url)} (sha256 ${f.sha256.slice(0, 12)})`).join(', ')}`)
   }
+  for (const u of unprovable) problems.push(`unsupported content: the kit cannot prove that this SVG is static: ${shortUrl(u.url)} (sha256 ${u.sha256.slice(0, 12)})`)
   if (unreadable.length) {
     problems.push(`unsupported content: an image or document resource could not be read to check it for animation: ${unreadable.map(u => shortUrl(u.url)).join(', ')}`)
   }
@@ -372,6 +367,7 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
   const responses = new Map()
   const inspections = new Set()
   const animated = []
+  const unprovable = []
   const unreadable = []
   const guarded = new Set([t.sessionId])
   const source = `${INJECT};${guardSource(origin, onlyPath)}`
@@ -421,11 +417,17 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
       const response = responses.get(key)
       responses.delete(key)
       if (m.method === 'Network.loadingFinished' && response && ['Image', 'Document', 'Other'].includes(response.type)) {
-        const check = browser.send('Network.getResponseBody', { requestId }, m.sessionId).then(({ body, base64Encoded }) => {
+        const check = (async () => {
+          const { body, base64Encoded } = await browser.send('Network.getResponseBody', { requestId }, m.sessionId)
           const bytes = Buffer.from(body, base64Encoded ? 'base64' : 'utf8')
           const kind = animatedResource(bytes, response.mimeType)
-          if (kind && !animated.some(a => a.url === response.url && a.kind === kind)) animated.push({ kind, url: response.url, sha256: sha256(bytes) })
-        }, () => { unreadable.push({ url: response.url }) })
+          if (kind) {
+            if (!animated.some(a => a.url === response.url && a.kind === kind)) animated.push({ kind, url: response.url, sha256: sha256(bytes) })
+          } else if (String(response.mimeType).split(';')[0].trim().toLowerCase() === 'image/svg+xml') {
+            const plain = await stitcher.evaluate(`(${svgIsOnAllowlist})(${JSON.stringify(bytes.toString('base64'))}, ${JSON.stringify(SVG_ELEMENTS)})`)
+            if (!plain && !unprovable.some(u => u.url === response.url && u.sha256 === sha256(bytes))) unprovable.push({ url: response.url, sha256: sha256(bytes) })
+          }
+        })().catch(() => { unreadable.push({ url: response.url }) })
         inspections.add(check)
         check.then(() => inspections.delete(check))
       }
@@ -459,7 +461,7 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
         await sleep(50)
       }
       while (inspections.size) await Promise.all([...inspections])
-      assertNoAnimatedResources(animated, unreadable)
+      assertNoAnimatedResources(animated, unreadable, unprovable)
     }
     await quiet()
     const tree = (await t.send('DOM.getDocument', { depth: -1, pierce: true })).root
