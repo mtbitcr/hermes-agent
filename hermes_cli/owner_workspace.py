@@ -95,6 +95,7 @@ from hermes_cli.kanban_risk_tier import (
     pinned_reasoning_effort,
     recovered_root_risk_tier,
 )
+from hermes_cli.owner_design_choices import decision_design_options, recent_design_choices
 from hermes_cli.owner_named_inputs import (
     decision_missing_inputs,
     declare_named_inputs,
@@ -2703,6 +2704,8 @@ OWNER_PROJECT_SUMMARY_CAPABILITY = "project_summary"
 # the owner (card C2 of the named inputs plan). Without it every Decision keeps
 # today's keys exactly; only a reader naming it gets ``missing_inputs``.
 OWNER_INPUT_UPLOAD_CAPABILITY = "owner_input_upload_v1"
+# The same for a designer card's pictured options (card 2 of the design options plan): ``design_options`` and ``recent_design_choices``.
+DESIGN_OPTIONS_CAPABILITY = "design_options_v1"
 _OWNER_STOPPED_WORK_PROVIDER_WAIT = "provider_wait"
 _OWNER_PROVIDER_WAITING_SUMMARY = (
     "Waiting for the AI provider. Work resumes by itself after {time} UTC."
@@ -3992,7 +3995,7 @@ _SUGGESTION_FALLBACK_TITLE = "A suggested capability change"
 
 
 def list_owner_decisions(
-    ctx: OwnerContext, *, owner_waiting: bool = False, owner_input_upload: bool = False,
+    ctx: OwnerContext, *, owner_waiting: bool = False, owner_input_upload: bool = False, design_options: bool = False,
 ) -> dict:
     """Project pending native gates into one owner-safe read-only inbox.
 
@@ -4023,6 +4026,7 @@ def list_owner_decisions(
     has not given yet (see :func:`decision_missing_inputs`).
     """
     decisions: list[dict] = []
+    recent: list[dict] = []
     truncated = False
     projects = list_committed_projects(ctx)
     for project in projects:
@@ -4046,6 +4050,7 @@ def list_owner_decisions(
 
         waits: dict[str, dict] = {}
         missing: dict[str, list[dict]] = {}
+        options: dict[str, dict] = {}
         conn = _open_read_only_sqlite(board_path, label="kanban.db")
         try:
             columns = {
@@ -4102,6 +4107,11 @@ def list_owner_decisions(
                 missing = decision_missing_inputs(conn, [
                     str(row["id"]) for row in rows[:_OWNER_DECISIONS_LIMIT]
                 ])
+            if design_options:
+                options = decision_design_options(conn, [
+                    str(row["id"]) for row in rows[:_OWNER_DECISIONS_LIMIT]
+                ])
+                recent = recent_design_choices(conn, project, recent)
         except sqlite3.Error as exc:
             raise OwnerWorkspaceError(
                 "snapshot_unavailable", "the Project decisions could not be read"
@@ -4180,6 +4190,8 @@ def list_owner_decisions(
                 decisions[-1]["created_at"] = _owner_timestamp(wait["since"])
             if kind == "owner_input" and str(row["id"]) in missing:
                 decisions[-1]["missing_inputs"] = missing[str(row["id"])]
+            if kind == "owner_input" and str(row["id"]) in options:
+                decisions[-1]["design_options"] = options[str(row["id"])]
 
     authority_order = {"owner_input": 0, "capability": 1}
     decisions.sort(
@@ -4193,6 +4205,7 @@ def list_owner_decisions(
     return {
         "data": decisions[:_OWNER_DECISIONS_LIMIT],
         "truncated": truncated or len(decisions) > _OWNER_DECISIONS_LIMIT,
+        **({"recent_design_choices": recent} if design_options else {}),
     }
 
 
