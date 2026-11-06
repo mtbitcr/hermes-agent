@@ -201,6 +201,105 @@ describe('probe visibility and motion', () => {
   })
 })
 
+describe('probe canonical scroll state and native motion freeze', () => {
+  const win = (x = 0, y = 0, pinned = false) => {
+    const w: Record<string, any> = { scrollX: x, scrollY: y }
+
+    w.scrollTo = (o: { left: number, top: number, behavior: string }) => {
+      w.last = o
+
+      if (!pinned) { w.scrollX = o.left; w.scrollY = o.top }
+    }
+
+    return w
+  }
+
+  it('scrolls every window to 0,0 instantly and refuses when one cannot get there', () => {
+    const [a, b] = [win(1000, 1000), win(0, 500)]
+    probe.scrollToTop([a, b])
+    expect([a.scrollX, a.scrollY, b.scrollX, b.scrollY]).toEqual([0, 0, 0, 0])
+    expect(a.last).toEqual({ left: 0, top: 0, behavior: 'instant' })
+    expect(() => probe.scrollToTop([win(0, 0), win(0, 300, true)])).toThrow('top-of-page scroll state')
+  })
+
+  it('asserts the canonical state without moving anything', () => {
+    const w = win(0, 0)
+    probe.assertTop([w])
+    expect(w.last).toBeUndefined()
+    expect(() => probe.assertTop([win(0, 0), win(40, 0)])).toThrow('top-of-page scroll state')
+    expect(() => probe.assertTop([win(0, 1000)])).toThrow('top-of-page scroll state')
+  })
+
+  it('gives fixed and sticky boxes viewport coordinates and every other box document coordinates, without adding the offsets twice', () => {
+    const rect = { left: 10.126, top: 20.5, width: 30, height: 40 }
+    const ctx = { win: { scrollX: 5, scrollY: 7 }, x: 100, y: 200 }
+    expect(probe.boxOf(rect, ctx, true)).toEqual({ x: 110.13, y: 220.5, width: 30, height: 40 })
+    expect(probe.boxOf(rect, ctx, false)).toEqual({ x: 115.13, y: 227.5, width: 30, height: 40 })
+  })
+
+  const svgRoot = (opts: { stuck?: boolean } = {}) => {
+    const s: Record<string, any> = { localName: 'svg', paused: false, time: 9, calls: [] as string[] }
+
+    s.pauseAnimations = () => { s.calls.push('pause'); s.paused = true }
+
+    s.setCurrentTime = (t: number) => { s.calls.push(`time ${t}`);
+
+ if (!opts.stuck) { s.time = t } }
+
+    s.animationsPaused = () => s.paused
+    s.getCurrentTime = () => s.time
+
+    return s
+  }
+
+  const marquee = () => {
+    const kids = ['text', 'b']
+    const fresh: Record<string, any> = { localName: 'marquee', kids: [] as string[], stopped: false }
+
+    fresh.appendChild = (k: string) => { fresh.kids.push(k); kids.shift() }
+
+    fresh.stop = () => { fresh.stopped = true }
+    const old: Record<string, any> = { localName: 'marquee', parentNode: {}, replacedBy: null }
+    Object.defineProperty(old, 'firstChild', { get: () => kids[0] ?? null })
+
+    old.cloneNode = (deep: boolean) => { old.deep = deep;
+
+ return fresh }
+
+    old.replaceWith = (n: unknown) => { old.replacedBy = n }
+
+    return { old, fresh }
+  }
+
+  it('pauses every svg root at time 0 and verifies it, ignoring other elements', () => {
+    const [a, b] = [svgRoot(), svgRoot()]
+    probe.freezeNative([a, { localName: 'div' }, b])
+    expect(a.calls).toEqual(['pause', 'time 0'])
+    expect(b.calls).toEqual(['pause', 'time 0'])
+    expect(a.time).toBe(0)
+    expect(() => probe.freezeNative([svgRoot({ stuck: true })])).toThrow('unsupported content')
+  })
+
+  it('replaces a marquee by a stopped, never-started copy that keeps the original children, and refuses a marquee that cannot stop', () => {
+    const { old, fresh } = marquee()
+    probe.freezeNative([old])
+    expect(old.deep).toBe(false)
+    expect(old.replacedBy).toBe(fresh)
+    expect(fresh.kids).toEqual(['text', 'b'])
+    expect(fresh.stopped).toBe(true)
+    const broken = marquee()
+    delete broken.fresh.stop
+    expect(() => probe.freezeNative([broken.old])).toThrow('unsupported content')
+  })
+
+  it('is idempotent on repeated assertions and leaves unrelated elements alone', () => {
+    const s = svgRoot()
+    probe.freezeNative([s, { localName: 'p' }])
+    probe.freezeNative([s, { localName: 'p' }])
+    expect(s.calls).toEqual(['pause', 'time 0', 'pause', 'time 0'])
+  })
+})
+
 const SHA = 'a'.repeat(64)
 
 // C1 contract, copied literally from tools/design_compare_judge.py at ca87885d13bb4c83638cc8b1f655b70c6c55a1d6
@@ -972,4 +1071,62 @@ document.getElementById('o').textContent = (live || getComputedStyle(p)).textRen
     expect(err.message).toContain('normalisation could not be guaranteed')
     expect(bundles.map((b: any) => b.elements.some((e: any) => e.text === 'geometricprecision'))).toEqual([true, true])
   }, 120_000)
+
+  // The same page except for where the page, and a same-origin frame, are scrolled while loading.
+  const scrolledPage = (x: number, y: number, frameY: number, onLoad = false) => {
+    const scroll = `scrollTo(${x},${y})`
+
+    return `<!doctype html><style>body{margin:0;width:2400px;height:2400px}
+header{position:fixed;left:0;top:0;width:200px;height:50px;background:#abc}
+aside{position:sticky;top:0;margin-top:300px;width:200px;height:60px;background:#cba}
+iframe{position:absolute;left:400px;top:500px;width:300px;height:200px;border:0}</style>
+<header>Fixed</header><aside>Sticky</aside><main>Control</main>
+<iframe srcdoc="<body style='margin:0;height:2000px;background:linear-gradient(#fff,#369)'><p style='position:fixed;top:0;margin:0'>Frame pin</p><p style='margin-top:100px'>Frame flow</p><script>scrollTo(0,${frameY})</script>"></iframe>
+<script>${onLoad ? `addEventListener('load', () => ${scroll})` : scroll}</script>`
+  }
+
+  it('measures fixed and sticky boxes in viewport coordinates, the rest in document coordinates, and captures the same page whatever the initial scroll', async () => {
+    const [still, both] = await Promise.all([shoot({ 'index.html': scrolledPage(0, 0, 0) }), shoot({ 'index.html': scrolledPage(1000, 1000, 500, true) })])
+    sameFiles(still.outDir, both.outDir)
+
+    for (const width of [1280, 375]) {
+      const bundle = read(both.outDir, width)
+      expect(byText(bundle, 'fixed')).toMatchObject({ fixed: true, box: { x: 0, y: 0, width: 200, height: 50 } })
+      expect(byText(bundle, 'sticky')).toMatchObject({ fixed: true, box: { x: 0, y: 300, width: 200, height: 60 } })
+      expect(byText(bundle, 'control').fixed).toBe(false)
+      expect(byText(bundle, 'frame pin')).toMatchObject({ fixed: true, box: { x: 400, y: 500 } })
+      expect(byText(bundle, 'frame flow').box).toMatchObject({ x: 400, y: 600 })
+    }
+  }, 120_000)
+
+  it('refuses the capture when the page keeps the scroll away from the top-of-page state', async () => {
+    const page = `<!doctype html><style>body{margin:0;height:3000px}</style><h1>Stuck</h1><script>
+addEventListener('scroll', () => { if (scrollY === 0) scrollTo(0, 400) }); scrollTo(0, 400)</script>`
+
+    await expect(shoot({ 'index.html': page })).rejects.toThrow('top-of-page scroll state')
+  }, 120_000)
+
+  const nativeMotionPage = (ms: number, amount: number) => {
+    const root = (kids: string) => `<svg xmlns="http://www.w3.org/2000/svg" width="360" height="120" style="display:block">${kids}</svg>`
+
+    const shapes = `<rect y="20" width="60" height="40" fill="red"><animate attributeName="x" from="0" to="280" dur="${ms}ms" repeatCount="indefinite"/></rect>
+<rect x="100" y="70" width="40" height="40" fill="green"><animateTransform attributeName="transform" type="rotate" from="0 120 90" to="360 120 90" dur="${ms}ms" repeatCount="indefinite"/></rect>
+<circle r="10" cy="100" fill="blue"><animateMotion path="M200,0 L340,0" dur="${ms}ms" repeatCount="indefinite"/></circle>
+<rect x="300" y="20" width="30" height="30" fill="black"><set attributeName="fill" to="white" begin="${ms / 2}ms"/></rect>`
+
+    const marquees = `<marquee scrollamount="${amount}" style="display:block;width:300px">Moving text control</marquee><marquee direction="up" height="60" scrollamount="${amount}">Up</marquee>`
+
+    return `<!doctype html><style>body{margin:0}</style><h1>Native motion</h1>${root(shapes)}${marquees}<div id=host></div>
+<iframe style="border:0;width:380px;height:130px" srcdoc='${root(shapes).replace(/'/g, '&#39;')}'></iframe>
+<script>document.getElementById('host').attachShadow({mode:'open'}).innerHTML = '${root(shapes)}<marquee scrollamount="${amount}">Shadow mover</marquee>'</script>`
+  }
+
+  it('freezes SMIL animate, animateTransform, animateMotion and set, and stops marquee, in the page, an open shadow root and a frame, whatever their duration or speed', async () => {
+    const [fast, slow] = await Promise.all([shoot({ 'index.html': nativeMotionPage(1000, 40) }), shoot({ 'index.html': nativeMotionPage(10_000, 1) })])
+    sameFiles(fast.outDir, slow.outDir)
+    const png = decodePng(readFileSync(join(fast.outDir, `${kit.pageSlug('/')}-1280.png`)))
+    const top = read(fast.outDir).elements.find((e: any) => e.tag === 'svg').box.y
+    expect(png.at(30, Math.round(top) + 40), 'animate rect at its start').toEqual([255, 0, 0])
+  }, 120_000)
+
 })

@@ -322,15 +322,17 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
     if (!await run("(() => { const s = document.getElementById('__dc_style'); return !!s && s.dataset.early === '1' })()")) {
       throw new Error(`the motion-neutralising stylesheet was not installed before page scripts ran for ${url}`)
     }
+    const probe = `(${probeSource}\n)`
+    await run(`${probe}.toTop()`)
     await run('document.fonts.ready.then(() => true)')
     const deadline = Date.now() + 30000
     while (open.size || Date.now() - lastActivity < 500) {
       if (Date.now() > deadline) throw new Error(`network never went quiet for ${url}`)
       await sleep(50)
     }
-    const probe = `(${probeSource}\n)`
     const closed = findClosedShadowRoot((await t.send('DOM.getDocument', { depth: -1, pierce: true })).root)
     if (closed) throw new Error(`unsupported content: a closed shadow root under <${closed.toLowerCase()}> cannot be measured`)
+    await run(`${probe}.toTop()`)
     await run(`${probe}.prepare(${JSON.stringify(FORCED)})`)
     await run(`${probe}.fontsReady()`)
     await run(frames)
@@ -340,7 +342,7 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
     const tiles = []
     for (let y = 0, n = 0; y < pageHeight; y += height, n++) {
       const top = Math.min(y, Math.max(pageHeight - height, 0))
-      await run(`window.scrollTo(0, ${top}); ${frames}`)
+      await run(`(async () => { const p = ${probe}\n; ${n === 0 ? 'p.toTop()' : `window.scrollTo(0, ${top})`}; p.freeze(); await ${frames}; ${n === 0 ? 'p.atTop()' : ''} })()`)
       if (n === 1) await run(`${probe}.hidePinned()`)
       tiles.push({ top, data: (await t.send('Page.captureScreenshot', { format: 'png' })).data })
     }

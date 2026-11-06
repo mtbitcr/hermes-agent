@@ -73,8 +73,8 @@
   }
 
   // Every element of each document (its html and body elements included), of each open shadow root and of each same-origin child frame,
-  // with the page position of its viewport.
-  function collect(root = document, ctx = { win: window, x: scrollX, y: scrollY }, out = { items: [], roots: [] }) {
+  // with the position of its viewport in the top viewport (the top document is at 0, 0).
+  function collect(root = document, ctx = { win: window, x: 0, y: 0 }, out = { items: [], roots: [] }) {
     out.roots.push({ root, win: ctx.win })
     const all = root.documentElement ? [root.documentElement, ...(root.body ? [root.body, ...root.body.querySelectorAll('*')] : [])] : root.querySelectorAll('*')
     for (const el of all) {
@@ -112,6 +112,25 @@
     }
   }
 
+  // The one canonical state of every capture: the top document and every same-origin frame at scroll 0, 0.
+  function assertTop(wins) {
+    const off = wins.find(w => w.scrollX !== 0 || w.scrollY !== 0)
+    if (off) throw new Error(`the page cannot be held in its top-of-page scroll state (scroll ${off.scrollX}, ${off.scrollY}): refusing to capture`)
+  }
+  function scrollToTop(wins) {
+    wins.forEach(w => w.scrollTo({ left: 0, top: 0, behavior: 'instant' }))
+    assertTop(wins)
+  }
+  const windows = () => Array.from(new Set(collect().roots.map(r => r.win)))
+  const toTop = () => scrollToTop(windows())
+  const atTop = () => assertTop(windows())
+
+  // Fixed and sticky boxes are viewport coordinates; every other box is a document coordinate (the viewport origin plus the document's own scroll).
+  const boxOf = (r, ctx, fixed) => ({
+    x: round(r.left + ctx.x + (fixed ? 0 : ctx.win.scrollX)), y: round(r.top + ctx.y + (fixed ? 0 : ctx.win.scrollY)),
+    width: round(r.width), height: round(r.height),
+  })
+
   const fontsReady = () => Promise.all(collect().roots.map(r => r.win.document.fonts.ready)).then(() => true)
 
   function measure() {
@@ -127,6 +146,7 @@
     }
     const found = []
     const masks = []
+    atTop()
     const { items } = collect()
     const index = new Map(items.map(({ el }, i) => [el, i]))
     for (const { el, ctx } of items) {
@@ -139,7 +159,8 @@
       if (SKIP.has(tag) || (svg && svg !== el) || (el.parentElement && el.parentElement.closest('canvas,video'))) continue
       const r = el.getBoundingClientRect()
       if (r.width < 1 || r.height < 1 || cs.visibility !== 'visible' || hiddenByOpacity(el, styleOf, opacity)) continue
-      const box = { x: round(r.left + ctx.x), y: round(r.top + ctx.y), width: round(r.width), height: round(r.height) }
+      const pinned = cs.position === 'fixed' || cs.position === 'sticky'
+      const box = boxOf(r, ctx, pinned)
       if (tag === 'canvas' || tag === 'video') masks.push(box)
       const border = SIDES.map(s => {
         const k = `border${s[0].toUpperCase()}${s.slice(1)}`
@@ -155,7 +176,7 @@
         landmarks: landmarksOf(el), tag, role: el.getAttribute('role') || tag,
         label: el.getAttribute('aria-label') || '', alt: el.getAttribute('alt') || '', text,
         parent: parent && index.has(parent) ? index.get(parent) : null,
-        fixed: cs.position === 'fixed' || cs.position === 'sticky', box,
+        fixed: pinned, box,
         style: {
           'font-family': cs.fontFamily, 'font-face': loadedIn(el.ownerDocument).has(family) ? family : '',
           'font-size': parseFloat(cs.fontSize), 'font-weight': Number(cs.fontWeight),
@@ -177,6 +198,26 @@
   const animationsIn = () => collect().roots.flatMap(({ root }) =>
     root.getAnimations ? root.getAnimations() : Array.from(root.children).flatMap(c => c.getAnimations({ subtree: true })))
 
+  // Browser-native timelines that getAnimations() does not list. Every SVG root is paused at time 0 (this covers animate, animateTransform,
+  // animateMotion and set); a marquee is replaced by a stopped copy that never started, because a running one cannot be rewound.
+  // Idempotent, so it can be asserted again before every screenshot.
+  function freezeNative(els) {
+    for (const el of els) {
+      if (el.localName === 'svg' && typeof el.pauseAnimations === 'function') {
+        el.pauseAnimations()
+        el.setCurrentTime(0)
+        if (!el.animationsPaused() || el.getCurrentTime() !== 0) throw new Error('unsupported content: an SVG animation timeline cannot be frozen')
+      } else if (el.localName === 'marquee' && el.parentNode) {
+        const fresh = el.cloneNode(false)
+        while (el.firstChild) fresh.appendChild(el.firstChild)
+        el.replaceWith(fresh)
+        if (typeof fresh.stop !== 'function') throw new Error('unsupported content: a marquee cannot be stopped')
+        fresh.stop()
+      }
+    }
+  }
+  const freeze = () => freezeNative(collect().items.map(i => i.el))
+
   function settle() {
     for (const a of animationsIn()) {
       const end = a.effect ? a.effect.getComputedTiming().endTime : Infinity
@@ -185,11 +226,12 @@
     }
     const running = animationsIn().filter(a => a.playState === 'running' || a.pending)
     if (running.length) throw new Error(`${running.length} animation(s) still running after settle`)
+    freeze()
   }
   const hidePinned = () => collect().items.forEach(({ el, ctx }) => {
     const p = ctx.win.getComputedStyle(el).position
     if (p === 'fixed' || p === 'sticky') el.style.setProperty('visibility', 'hidden', 'important')
   })
 
-  return { normalize, landmarksOf, firstFamily, familyName, hiddenByOpacity, prepare, fontsReady, measure, settle, hidePinned }
+  return { normalize, landmarksOf, firstFamily, familyName, hiddenByOpacity, prepare, fontsReady, measure, settle, hidePinned, toTop, atTop, scrollToTop, assertTop, boxOf, freeze, freezeNative }
 })()
