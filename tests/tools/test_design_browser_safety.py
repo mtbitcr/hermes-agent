@@ -393,7 +393,7 @@ def worker(tmp_path, monkeypatch):
     for board in ("design", "elsewhere"):
         kb.create_board(board)
         conn = kb.connect(board=board)
-        tasks[board] = [kb.create_task(conn, title=title) for title in ("own", "sibling")]
+        tasks[board] = [kb.create_task(conn, title=title, assignee="raphael-designer") for title in ("own", "sibling")]
         conn.close()
     conn = kb.connect(board="design")
     own = tasks["design"][0]
@@ -428,7 +428,7 @@ def stored_files(worker) -> list[Path]:
 @pytest.fixture
 def design(discovery, worker):
     """The tool configured for the fake browser, with the real allow-list."""
-    write_config({"cdp_url": discovery.url, "allowed_hosts": ALLOWED})
+    write_config({"cdp_url": discovery.url, "allowed_hosts": ALLOWED, "boards": ["design"]})
     return discovery
 
 
@@ -717,7 +717,7 @@ class TestScreenshots:
     def test_outside_a_kanban_task_nothing_is_captured_or_stored(self, fake, design, worker, monkeypatch):
         run({"action": "open", "url": HOME_PAGE})
         monkeypatch.delenv("HERMES_KANBAN_TASK")
-        assert "kanban task" in refused(run({"action": "screenshot"}))
+        assert "only inside a kanban task" in refused(run({"action": "screenshot"}))
         assert fake.sent("Page.captureScreenshot") == []
         assert attachment_rows(worker) == [] and stored_files(worker) == []
 
@@ -881,7 +881,7 @@ class TestRefusals:
     def test_no_design_address_refuses_and_never_touches_the_general_browser(self, fake, worker, monkeypatch):
         decoy = Discovery(fake.url)
         try:
-            write_config({"cdp_url": "", "allowed_hosts": ALLOWED}, browser={"cdp_url": decoy.url})
+            write_config({"cdp_url": "", "allowed_hosts": ALLOWED, "boards": ["design"]}, browser={"cdp_url": decoy.url})
             monkeypatch.setenv("BROWSER_CDP_URL", decoy.url)
             launched = []
             import tools.browser_lightpanda as lightpanda
@@ -902,23 +902,23 @@ class TestRefusals:
         # The configured address is the fake browser's own: a raw fallback would connect to it.
         port = fake.url.split(":")[2].split("/")[0]
         if mode == "down":
-            write_config({"cdp_url": f"http://127.0.0.1:{port}", "allowed_hosts": ALLOWED})
+            write_config({"cdp_url": f"http://127.0.0.1:{port}", "allowed_hosts": ALLOWED, "boards": ["design"]})
         else:
             discovery.mode = mode
             discovery.ws_url = fake.url
-            write_config({"cdp_url": discovery.url, "allowed_hosts": ALLOWED})
+            write_config({"cdp_url": discovery.url, "allowed_hosts": ALLOWED, "boards": ["design"]})
         assert "browser unavailable, retry" in refused(run({"action": "open", "url": HOME_PAGE}))
         assert fake.connections == 0
 
     def test_address_is_never_logged_unredacted(self, fake, discovery, worker, caplog):
-        write_config({"cdp_url": discovery.url + "/?token=hunter2", "allowed_hosts": ALLOWED})
+        write_config({"cdp_url": discovery.url + "/?token=hunter2", "allowed_hosts": ALLOWED, "boards": ["design"]})
         discovery.mode = "500"
         with caplog.at_level("DEBUG"):
             run({"action": "open", "url": HOME_PAGE})
         assert "hunter2" not in caplog.text
 
     def test_empty_allow_list_refuses_everything(self, fake, discovery, worker):
-        write_config({"cdp_url": discovery.url, "allowed_hosts": []})
+        write_config({"cdp_url": discovery.url, "allowed_hosts": [], "boards": ["design"]})
         assert refused(run({"action": "open", "url": HOME_PAGE}))
         assert fake.sent("Page.navigate") == []
 
@@ -931,9 +931,9 @@ class TestRefusals:
         assert not fake.sent("Page.navigate") and not fake.sent("Runtime.evaluate")
 
     def test_check_fn_answers_only_whether_the_address_is_configured(self, worker):
-        write_config({"cdp_url": "", "allowed_hosts": ALLOWED})
+        write_config({"cdp_url": "", "allowed_hosts": ALLOWED, "boards": ["design"]})
         assert design_browser_tool.check_design_browser_requirements() is False
-        write_config({"cdp_url": "http://design-browser:9222", "allowed_hosts": []})
+        write_config({"cdp_url": "http://design-browser:9222", "allowed_hosts": [], "boards": ["design"]})
         assert design_browser_tool.check_design_browser_requirements() is True
 
 
@@ -1110,7 +1110,7 @@ class TestRealChromium:
     @pytest.fixture
     def chrome(self, worker, local_policy):
         with self._launch(*DESIGN_BROWSER_SWITCHES) as (address, home):
-            write_config({"cdp_url": address, "allowed_hosts": ["127.0.0.1"]})
+            write_config({"cdp_url": address, "allowed_hosts": ["127.0.0.1"], "boards": ["design"]})
             yield home
 
     def test_open_screenshot_and_read_text_of_an_allowed_page(self, chrome, site, worker):
@@ -1192,7 +1192,7 @@ class TestRealChromium:
             "<title>timer</title><script>const t = new URLSearchParams(location.search).get('t');"
             "setInterval(() => fetch('/ok-alive?t=' + t), 200)</script>"))
         with self._launch(*DESIGN_BROWSER_SWITCHES, "--ignore-certificate-errors") as (address, _home):
-            write_config({"cdp_url": address, "allowed_hosts": ["127.0.0.1"]})
+            write_config({"cdp_url": address, "allowed_hosts": ["127.0.0.1"], "boards": ["design"]})
             self._two_tasks_then_cleanup(base, seen, key, other_key)
 
     @staticmethod
@@ -1276,7 +1276,7 @@ class TestRealChromium:
     def test_browser_that_can_open_windows_is_refused(self, worker, local_policy, site):
         base, seen = site
         with self._launch("--enable-automation") as (address, _home):
-            write_config({"cdp_url": address, "allowed_hosts": ["127.0.0.1"]})
+            write_config({"cdp_url": address, "allowed_hosts": ["127.0.0.1"], "boards": ["design"]})
             for args in [{"action": "open", "url": base + "/ok"}, *EVERY_ACTION[1:]]:
                 assert refused(run(args))
         assert seen == []

@@ -6,13 +6,17 @@ uploads, downloads, form posts, scripts of the model's choosing or raw CDP.
 
 Where it looks:
 
+* Only when the board and role gate (:mod:`tools.design_access`, plan v2 B4) allows it, checked
+  first at every call: a kanban task on a board in ``design_browser.boards``, its current run,
+  and a design role. The builder may open only its own build's preview host.
 * Only the browser at ``design_browser.cdp_url``, found through that address's ``/json/version``.
   A failed discovery is "browser unavailable"; the configured address itself is never connected to.
   It never reads ``browser.cdp_url`` or ``BROWSER_CDP_URL`` and never starts or borrows a browser
   through the general browser tools.
 * Only through its own guarded supervisor (``design_browser:<task>`` in the supervisor registry),
   whose navigation guard is built from ``design_browser.allowed_hosts``. Every action is refused
-  unless that supervisor started and is active at that call.
+  unless that supervisor started and is active at that call. A builder's guard also holds the
+  requests of the builder's own page, and only those, to its preview host.
 * Only on a page it made itself, in a fresh incognito context of its own (disposed with the
   supervisor's connection or by :func:`cleanup_design_browser`). Any other page in that context
   is closed before the tool acts.
@@ -32,14 +36,17 @@ Known limit of this version, denial receipts across worker processes: every desi
 browser pauses every request in it, so the guard that refuses a hop can belong to another worker
 process. The refusal holds then too and the denied host gets no request, but design guards share
 their notes only within one process, so the receipt in the ``open`` result can lack the host and
-the reason (``blocked_host`` empty, ``reason`` null).
+the reason (``blocked_host`` empty, ``reason`` null). A builder's receipt is whole: its own guard
+pauses its page's requests before any other guard does, so it is the one that refuses a hop.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import concurrent.futures
 import contextlib
+import functools
 import io
 import json
 import logging
@@ -49,7 +56,7 @@ import threading
 import time
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlsplit
 
 from agent.async_utils import safe_schedule_threadsafe
@@ -57,7 +64,8 @@ from agent.redact import redact_cdp_url
 from agent.tool_dispatch_helpers import _maybe_wrap_untrusted
 from tools.browser_supervisor import SUPERVISOR_REGISTRY, CDPSupervisor
 from tools.browser_supervisor_dialogs import DIALOG_POLICY_AUTO_DISMISS
-from tools.browser_supervisor_navguard import NavigationGuard
+from tools.browser_supervisor_navguard import FETCH_ALL, NavigationGuard
+from tools.design_access import check_design_access
 from tools.design_url_policy import design_url_refusal
 from tools.registry import registry, tool_error
 
@@ -223,7 +231,18 @@ def _host(url: Any) -> str:
 class _DesignGuard(NavigationGuard):
     """The navigation guard, which also notes the first main-frame document request it refuses
     on a frame an ``open`` is watching: the redirect hop Chromium fails, which never commits and
-    so is in no history. The note is the guard's own decision, made once, and only the host."""
+    so is in no history. The note is the guard's own decision, made once, and only the host.
+
+    A builder's guard (``preview_host``) also holds its own page to that one host. Its policy for
+    the whole browser stays ``design_browser.allowed_hosts``, as every design guard's does: each
+    one pauses every request of the browser, other tasks' among them, so a narrower one there
+    would refuse the other builders' previews and the designer's pages too. Instead every target
+    in the builder's own browser context is held at start until its own ``Fetch`` interception
+    is on, and the requests paused there are answered with the preview host alone. Chromium asks
+    a target's own interception before the browser-wide ones and sends nothing any of them fails,
+    so this covers each redirect hop and subresource of the page: its frames (one in another
+    process, or a shared worker, is a target with an interception of its own) and its dedicated
+    workers (whose requests pause on their page's session; they have no ``Fetch`` themselves)."""
 
     # Shared only by the design guards of this one process: each pauses every request of the
     # browser, and another task's guard may be the one that refuses the hop. Frame ids are unique.
@@ -231,24 +250,72 @@ class _DesignGuard(NavigationGuard):
     _notes_lock = threading.Lock()
     _watched: Dict[str, Optional[Tuple[str, str]]] = {}  # frame id -> (host, reason)
 
-    def __init__(self, policy: Any, **kwargs: Any) -> None:
+    def __init__(self, policy: Any, *, preview_host: Optional[str] = None, **kwargs: Any) -> None:
         super().__init__(policy, **kwargs)
-        self._paused: Optional[Dict[str, Any]] = None  # the paused request being answered
+        self.preview_host = preview_host
+        self._paused: Optional[Tuple[Dict[str, Any], bool]] = None  # the paused request being answered, own or not
+        self._context: Optional[str] = None  # the builder's own browser context
+        self._held_own: Set[str] = set()  # held sessions there, until their interception is on
+        self._scoped: Set[str] = set()  # sessions whose requests this guard pauses on the session
+        self._ready: Set[str] = set()  # pages of the builder's own context whose interception is on
 
-    async def _answer(self, cdp: Any, params: Dict[str, Any]) -> None:
-        self._paused = params  # read by refusal(), which _answer calls before it awaits anything
+    def scope(self, context_id: str) -> None:
+        """The builder's own browser context, told before any target is made there."""
+        self._context = context_id
+
+    def holds(self, target_id: str) -> bool:
+        """Whether the requests of this page of the builder's own context pause on its session."""
+        return target_id in self._ready
+
+    def on_event(self, cdp: Any, method: str, params: Dict[str, Any], session_id: Optional[str]) -> bool:
+        if method == "Fetch.requestPaused" and session_id in self._scoped:
+            asyncio.create_task(self._answer(cdp, params, session_id))
+            return True
+        return super().on_event(cdp, method, params, session_id)
+
+    async def guard_target(self, cdp: Any, params: Dict[str, Any], parent_session_id: Optional[str]) -> None:
+        info = params.get("targetInfo") or {}
+        if (self.preview_host is not None and params.get("waitingForDebugger") and params.get("sessionId")
+                and self._context is not None and info.get("browserContextId") == self._context):
+            self._held_own.add(params["sessionId"])
+        await super().guard_target(cdp, params, parent_session_id)
+
+    async def _lock_session(self, cdp: Any, sid: str, target_type: Optional[str], *, gate: bool) -> None:
+        # Called while the target is still held; if this raises it stays held and its page is closed.
+        if sid in self._held_own and target_type != "worker":
+            self._scoped.add(sid)
+            await cdp("Fetch.enable", {"patterns": FETCH_ALL, "handleAuthRequests": False}, session_id=sid)
+            if target_type == "page":
+                self._ready.add(self._page_of.get(sid) or "")
+        await super()._lock_session(cdp, sid, target_type, gate=gate)
+
+    async def _answer(self, cdp: Any, params: Dict[str, Any], session_id: Optional[str] = None) -> None:
+        self._paused = (params, session_id is not None)  # read by refusal(), which _answer calls before it awaits anything
+        if session_id is not None:  # answered on the session it paused on
+            cdp = functools.partial(cdp, session_id=session_id)
         await super()._answer(cdp, params)
 
     def refusal(self, request: Dict[str, Any]) -> Optional[str]:
         reason = super().refusal(request)
         paused, self._paused = self._paused, None
-        if (reason is not None and paused is not None and paused.get("request") is request
-                and paused.get("resourceType") == "Document"):
+        if paused is not None and paused[0].get("request") is not request:
+            paused = None
+        if reason is None and paused is not None and paused[1]:
+            reason = self._own_refusal(request.get("url"))
+        if reason is not None and paused is not None and paused[0].get("resourceType") == "Document":
             with self._notes_lock:
-                frame = paused.get("frameId")
+                frame = paused[0].get("frameId")
                 if frame in self._watched and self._watched[frame] is None:
                     self._watched[frame] = (_host(request.get("url")), reason)
         return reason
+
+    def _own_refusal(self, url: Any) -> Optional[str]:
+        """The policy narrowed to the preview host, for a request of the builder's own page."""
+        try:
+            return design_url_refusal(url, self.policy, builder_host=self.preview_host)
+        except Exception as exc:
+            logger.warning("design browser: address policy failed, request refused: %s", type(exc).__name__)
+            return "the address policy failed"
 
     def watch(self, frame_id: str) -> None:
         with self._notes_lock:
@@ -260,13 +327,13 @@ class _DesignGuard(NavigationGuard):
             return self._watched.pop(frame_id, None)
 
 
-def _guard(key: str, hosts: List[str]) -> _DesignGuard:
-    """The task's guard, kept while the allow-list is unchanged: the registry reuses a supervisor
-    only with the very same guard."""
+def _guard(key: str, hosts: List[str], preview_host: Optional[str]) -> _DesignGuard:
+    """The task's guard, kept while the allow-list and the builder's preview host are unchanged:
+    the registry reuses a supervisor only with the very same guard."""
     with _LOCK:
         guard = _GUARDS.get(key)
-        if guard is None or guard.policy != hosts:
-            guard = _GUARDS[key] = _DesignGuard(list(hosts))
+        if guard is None or guard.policy != hosts or guard.preview_host != preview_host:
+            guard = _GUARDS[key] = _DesignGuard(list(hosts), preview_host=preview_host)
         return guard
 
 
@@ -294,10 +361,10 @@ def _cdp(sup: CDPSupervisor, method: str, params: Optional[Dict[str, Any]] = Non
     return reply.get("result") or {}
 
 
-def _session(key: str, address: str, hosts: List[str]) -> _Session:
+def _session(key: str, address: str, hosts: List[str], preview_host: Optional[str]) -> _Session:
     """The task's page, behind an active guard; made (with its context) when there is none."""
     ws_url = _discover(address)
-    guard = _guard(key, hosts)
+    guard = _guard(key, hosts, preview_host)
     try:
         sup = SUPERVISOR_REGISTRY.get_or_start(
             key, ws_url, dialog_policy=DIALOG_POLICY_AUTO_DISMISS, start_timeout=START_TIMEOUT_S,
@@ -312,23 +379,31 @@ def _session(key: str, address: str, hosts: List[str]) -> _Session:
     if session is not None and (session.supervisor is not sup or session.connection is not sup._ws):
         session = None  # its context went with the connection it was made on
     if session is None:
-        session = _SESSIONS[key] = _new_page(sup)
+        session = _SESSIONS[key] = _new_page(sup, guard)
     session.guard = guard  # the supervisor's own: the registry reuses one only with the same guard
     return session
 
 
-def _new_page(sup: CDPSupervisor) -> _Session:
+def _new_page(sup: CDPSupervisor, guard: _DesignGuard) -> _Session:
     """A fresh incognito context, downloads denied in it, and one blank page there. The tool's
     own session on that page has Page events on, so the page's dialogs reach the supervisor's
-    auto-dismiss (the guard keeps the events of the session it holds the page with)."""
+    auto-dismiss (the guard keeps the events of the session it holds the page with). A builder's
+    page is not used before its guard pauses the page's own requests (``_DesignGuard``)."""
     connection = sup._ws
     context_id = _cdp(sup, "Target.createBrowserContext", {"disposeOnDetach": True})["browserContextId"]
+    guard.scope(context_id)
     try:
         _cdp(sup, "Browser.setDownloadBehavior", {"behavior": "deny", "browserContextId": context_id})
         target_id = _cdp(sup, "Target.createTarget", {"url": "about:blank", "browserContextId": context_id})["targetId"]
         session_id = _cdp(sup, "Target.attachToTarget", {"targetId": target_id, "flatten": True})["sessionId"]
         _cdp(sup, "Page.enable", session_id=session_id)
         _set_metrics(sup, session_id, DEFAULT_VIEWPORT)
+        deadline = time.monotonic() + START_TIMEOUT_S
+        while guard.preview_host is not None and not guard.holds(target_id):
+            if time.monotonic() >= deadline:
+                logger.warning("design browser: the builder's page was not held to its preview in time")
+                raise _Unavailable()
+            time.sleep(0.05)
     except Exception:
         with contextlib.suppress(Exception):
             _cdp(sup, "Target.disposeBrowserContext", {"browserContextId": context_id}, timeout=5)
@@ -728,18 +803,22 @@ def _invalid(args: Dict[str, Any]) -> Optional[str]:
 
 def design_browser(args: Dict[str, Any], task_id: Optional[str] = None) -> Any:
     """Handler. Never calls another tool or the registry."""
-    # ── B4's board and role gate goes here, before anything else runs. ──
+    config = _design_config()
+    access = check_design_access(config)
+    if not access.allowed:
+        return tool_error("design browser refused: " + access.reason)
 
     args = args if isinstance(args, dict) else {}
     problem = _invalid(args)
     if problem:
         return tool_error(problem)
     action = args["action"]
-    config = _design_config()
     address = _configured_address(config)
     if not address:
         return tool_error("the design browser is not configured (design_browser.cdp_url is empty)")
-    hosts = _allowed_hosts(config)
+    allowed = hosts = _allowed_hosts(config)  # the guard's policy for the whole browser
+    if access.builder_host is not None:
+        hosts = [access.builder_host]  # the builder sees only its own build's preview
     if action == "open":
         reason = design_url_refusal(args["url"].strip(), hosts)
         if reason is not None:
@@ -751,7 +830,7 @@ def design_browser(args: Dict[str, Any], task_id: Optional[str] = None) -> Any:
     key = supervisor_key(task_id)
     with _task_lock(key):
         try:
-            session = _session(key, address, hosts)
+            session = _session(key, address, allowed, access.builder_host)
             try:
                 _tidy(session)
             except _PageGone:
@@ -759,7 +838,7 @@ def design_browser(args: Dict[str, Any], task_id: Optional[str] = None) -> Any:
                 if action != "open":
                     return tool_error("the design page was closed (the guard closes a page it refuses); "
                                       "open an address again")
-                session = _session(key, address, hosts)
+                session = _session(key, address, allowed, access.builder_host)
             if action in ("screenshot", "read_text") and not session.opened:
                 return tool_error("open an allowed address first")
             return _HANDLERS[action](session, args, hosts)
