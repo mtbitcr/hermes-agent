@@ -51,6 +51,25 @@ def test_sweep_clears_pycache_when_checkout_changed(monkeypatch, tmp_path):
     assert recorded.strip().endswith("b" * 40)
 
 
+def test_sweep_leaves_the_release_environment_under_hermes_runtime_intact(monkeypatch, tmp_path):
+    # The real folder of release.venv_dir lives under .hermes-runtime, and a release copies it
+    # while it moves the checkout: a sweep started then must not delete its bytecode mid-copy.
+    repo = _make_repo(tmp_path, sha="b" * 40)
+    cache = _make_pycache(repo)
+    environment_cache = _make_pycache(
+        repo, ".hermes-runtime/sync2e/hermes-env/lib/python3.11/site-packages/cryptography/hazmat"
+    )
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", repo)
+    (repo / main_web_build._BYTECODE_FINGERPRINT_FILE).write_text(
+        "git:refs/heads/main:" + "a" * 40, encoding="utf-8"
+    )
+
+    hermes_main._sweep_stale_bytecode_if_checkout_changed()
+
+    assert not cache.exists()
+    assert (environment_cache / "main.cpython-311.pyc").read_bytes() == b"stale"
+
+
 
 
 
