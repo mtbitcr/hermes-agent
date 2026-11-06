@@ -93,7 +93,6 @@
   "tools/file_operations_search.py": "0dd5c95cb0d3fae9f4699707880e88871d6455623a2bd8d8d3b1158805c7a959",
   "tools/file_tools_write_guards.py": "c5c9485980edad90e3b85579d0cd697742afad5e4b0f80fdbbd05e339ff13f15",
   "tools/homeassistant_tool.py": "5f7c9fefef2372119ebc8cde78cb8e5c6d7ee4a1a0bd3a5f100436267ce83ae9",
-  "tools/kanban_tools_schemas.py": "8c866663e883bab5572b7a77bd052339aab05f3c3f7f681911aaf3e2509c4f9d",
   "tools/mcp_oauth_device.py": "9627f881dae8d93554f8243e1ad0b2f55e61470cb605f79718f6f5bfa0e6084d",
   "tools/mcp_oauth_provider.py": "173aceec86e1d764f347a5ba636970aa0769ff3e283afe146530d94224613ccc",
   "tools/openrouter_client.py": "7f36efd2063720a13f3f660c3b0219ec5eb4fbce10641c6a71cf4e19d40efb06",

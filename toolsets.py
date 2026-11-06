@@ -429,6 +429,7 @@ TOOLSETS = {
             "kanban_unblock",
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
             "kanban_recommend",
+            "kanban_offer_design_options",
         ],
         "includes": [],
     },
