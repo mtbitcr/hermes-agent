@@ -806,6 +806,67 @@ describe('SVG data URLs a page references', () => {
     }
   })
 
+  const STYLED = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><style>rect{fill:rgb(0,255,0)}</style><rect width="64" height="64" fill="red"/></svg>'
+
+  it('recognises an SVG resource by its bytes whatever media type claims it: image/svg+xml, text/xml, application/xml, any +xml type, none, or a wrong one', () => {
+    const svg = Buffer.from(STYLED)
+
+    for (const mime of ['image/svg+xml', 'IMAGE/SVG+XML; charset=utf-8', 'text/xml', 'application/xml', 'text/xml; charset=UTF-8', 'application/xhtml+xml', 'application/vnd.example+xml',
+      'application/octet-stream', 'text/plain', 'image/png', '', undefined]) {
+      expect(kit.isSvgResource(svg, mime), String(mime)).toBe(true)
+    }
+
+    const bom = Buffer.from([0xef, 0xbb, 0xbf])
+    const utf16 = (s: string) => Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(s, 'utf16le')])
+
+    for (const variant of [
+      Buffer.concat([bom, svg]),
+      Buffer.from(`  \n<?xml version="1.0" encoding="UTF-8"?>\n<!-- <html> --><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "x.dtd" [<!ENTITY a "b">]>\n${STYLED}`),
+      Buffer.from(STYLED.replace(/<(\/?)(svg|rect|style)/g, '<$1s:$2').replace('xmlns=', 'xmlns:s=')),
+      Buffer.from('<svg/>'),
+      utf16(`<?xml version="1.0" encoding="UTF-16"?>${STYLED}`),
+      Buffer.from(`<?xml version="1.0" encoding="UTF-16LE"?>${STYLED}`, 'utf16le'),
+      Buffer.from(`<?xml version="1.0" encoding="UTF-16BE"?>${STYLED}`, 'utf16le').swap16(),
+    ]) {
+      expect(kit.isSvgResource(variant, 'text/xml'), variant.toString('latin1')).toBe(true)
+    }
+
+    expect(kit.isSvgResource(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><rect></svg>'), 'application/xml')).toBe(true)
+    expect(kit.isSvgResource(Buffer.from('not xml at all'), 'image/svg+xml')).toBe(true)
+    expect(kit.isSvgResource(Buffer.alloc(0), 'image/svg+xml')).toBe(true)
+  })
+
+  it('does not take any other resource for an SVG: other XML, HTML, text, rasters, empty bytes', () => {
+    for (const [body, mime] of [
+      ['<rss version="2.0"><svg/></rss>', 'text/xml'], ['<html><svg></svg></html>', 'text/html'], ['<!doctype html><svg></svg>', 'text/html'],
+      ['<svgish/>', 'application/xml'], ['<!-- <svg/> -->\n<feed/>', 'text/xml'], ['<?xml version="1.0"?><note/>', 'application/xml'],
+      ['plain text mentioning <svg>', 'text/plain'], ['', 'text/xml'], ['<', 'text/xml'],
+    ] as const) {
+      expect(kit.isSvgResource(Buffer.from(body), mime), `${mime}: ${body}`).toBe(false)
+    }
+
+    for (const raster of [staticPng(), gif([10]), STATIC_WEBP, Buffer.from([0xff, 0xd8, 0xff, 0xe0])]) {
+      expect(kit.isSvgResource(raster, 'image/png')).toBe(false)
+      expect(kit.isSvgResource(raster, 'text/xml')).toBe(false)
+    }
+  })
+
+  it('decodes the exact bytes of a data URL labelled text/xml, application/xml or +xml that holds an SVG, and nothing else', () => {
+    for (const type of ['text/xml', 'application/xml', 'application/xhtml+xml', 'TEXT/XML']) {
+      expect(kit.svgDataUrlBytes(`data:${type};base64,${Buffer.from(STYLED).toString('base64')}`).toString(), type).toBe(STYLED)
+      expect(kit.svgDataUrlBytes(`data:${type};charset=utf-8,${encodeURIComponent(STYLED)}`).toString(), type).toBe(STYLED)
+    }
+
+    for (const other of [`data:text/xml,${encodeURIComponent('<rss/>')}`, `data:application/xml;base64,${Buffer.from('<note/>').toString('base64')}`, 'data:text/xml,', 'data:text/xml',
+      `data:text/html,${encodeURIComponent(STYLED)}`, `data:text/plain,${encodeURIComponent(STYLED)}`, `data:image/png;base64,${Buffer.from(STYLED).toString('base64')}`]) {
+      expect(kit.svgDataUrlBytes(other), other).toBeNull()
+    }
+
+    const found = kit.svgDataResources({ urls: [`data:text/xml;base64,${Buffer.from(STYLED).toString('base64')}`, `data:application/xml,${encodeURIComponent(STYLED)}`, `data:text/xml,${encodeURIComponent('<rss/>')}`] })
+    expect(found.map((f: any) => f.url)).toEqual(['data:text/xml'])
+    expect(found[0].sha256).toBe(sha(STYLED))
+  })
+
   it('lists each distinct SVG data resource once, from every kind of reference, named by a short prefix and its sha256', () => {
     const other = '<svg xmlns="http://www.w3.org/2000/svg"><g></svg>'
 
@@ -1222,13 +1283,15 @@ iframe{position:absolute;left:400px;top:500px;width:300px;height:200px;border:0}
 
   // ---- Fonts, then the refusal of unreadable object and embed documents, a sandboxed frame and a page that holds the scroll away from the top. ----
 
-  const fontPage = (face: string, used: string) => `<!doctype html><style>
-@font-face{font-family:${face};src:url(/acme.woff2) format('woff2')}
-body{margin:0;font-size:32px}#t{display:inline-block;font-family:${used};margin:0}</style><p id=t>Measured text</p>`
+  // Three texts at the same place, set in the same face: its name quoted with a double and with a single quote, a name that is not loaded, and the loaded name in other case.
+  const fontPage = `<!doctype html><style>
+@font-face{font-family:"Acme,Display";src:url(/acme.woff2) format('woff2')}
+@font-face{font-family:'Acme,Display';src:url(/acme.woff2) format('woff2')}
+body{margin:0;font-size:32px}p{position:absolute;left:0;top:0;margin:0}</style>
+<p style='font-family:"Acme,Display", serif'>Measured text</p><p style='font-family:"Acme,Other", serif'>Measured text</p><p style="font-family:'ACME,display', monospace">Measured text</p>`
 
   const fontLaunch = memo(() => launchPages({
-    'font-same': fontPage('"Acme,Display"', '"Acme,Display", serif'), 'font-other': fontPage('"Acme,Display"', '"Acme,Other", serif'),
-    'font-matching': fontPage("'Acme,Display'", "'ACME,display', monospace"),
+    font: fontPage,
     object: '<object data="data:text/html,%3Ch2%3EOpaque%3C/h2%3E" type="text/html"></object>',
   }, { 'acme.woff2': readFileSync(fileURLToPath(new URL('../web/public/fonts/Mondwest-Regular.woff2', import.meta.url))) }))
 
@@ -1236,7 +1299,8 @@ body{margin:0;font-size:32px}#t{display:inline-block;font-family:${used};margin:
     const run = await fontLaunch()
 
     for (const width of [1280, 375]) {
-      const [a, b, c] = ['/font-same', '/font-other', '/font-matching'].map(route => byText(read(run.outDir, width, route), 'measured text'))
+      const [a, b, c, ...more] = read(run.outDir, width, '/font').elements.filter((e: any) => e.text === 'measured text')
+      expect(more, `${width}`).toEqual([])
       const first = (e: any) => probe.firstFamily(e.style['font-family'])
       expect(a.style['font-family'], `${width}`).toBe('"Acme,Display", serif')
       expect(b.style['font-family']).toBe('"Acme,Other", serif')
@@ -1387,7 +1451,8 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
     const site = dirOf({ 'a-b.html': '<h1>Dash route</h1>', 'a/b.html': '<h1>Slash route</h1>' })
     const out = join(scratch, 'cli-e2e')
 
-    const cli = (pages: string, outDir = out) => limited(() => new Promise<{ status: number | null, stderr: string }>(done => {
+    // A run that is refused for overwriting stops before it starts a browser, so only a run that captures waits for its turn in the queue.
+    const cli = (pages: string, outDir = out, captures = true) => (captures ? limited : <T>(job: () => Promise<T>) => job())(() => new Promise<{ status: number | null, stderr: string }>(done => {
       const child = spawn(process.execPath, [captureFile, '--side', 'candidate', '--site', site, '--pages', pages,
         '--out', outDir, '--run-id', 'r', '--candidate-digest', 'd'], { env: { ...process.env, CHROME_PATH: chromium } })
 
@@ -1412,11 +1477,11 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
       }
     }
 
-    const again = await cli('/a-b')
+    const again = await cli('/a-b', out, false)
     expect(again.status).toBe(1)
     expect(again.stderr).toContain('refusing to overwrite')
     expect(readdirSync(out)).toHaveLength(8)
-    const dup = await cli('/a-b /a-b', join(scratch, 'cli-dup'))
+    const dup = await cli('/a-b /a-b', join(scratch, 'cli-dup'), false)
     expect(dup.status).toBe(1)
     expect(dup.stderr).toContain('refusing to overwrite')
   }, 120_000)
@@ -1452,6 +1517,7 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
   // Every other browser consumer of a data: URL that can hold an SVG document or image, each with its own malformed bytes.
   const malformedFor = (name: string) => `<svg ${SVG_NS}><rect id="${name}"></svg>`
   const consumerUri = (name: string) => dataUri(SVG, malformedFor(name))
+
   const otherConsumers: Array<[string, string]> = [
     ['poster', `<video poster="${consumerUri('poster')}"></video>`],
     ['use', `<svg width="8" height="8"><use href="${consumerUri('use')}#u"/></svg>`],
@@ -1548,16 +1614,51 @@ ${otherConsumers.map(([, html]) => html).join('')}`
   const MALFORMED_XLINK = `<svg ${SVG_NS}><path></svg>`
   const sha12 = (bytes: string) => createHash('sha256').update(bytes).digest('hex').slice(0, 12)
 
-  it('refuses a malformed SVG data URL used as an img, a CSS background or feImage (href and xlink:href) on the candidate side, and renders the valid static feImage, through the shipped CLI', async () => {
+  // An SVG document under a generic XML media type is rendered as an SVG by object, embed, img and CSS images, so its style element is refused like any other.
+  const XML_TYPES = ['text/xml', 'application/xml']
+  const xmlStyled = (label: string) => svgDoc(`<style>rect{fill:rgb(0,255,0)}</style><title>${label}</title>${fill}`)
+
+  const xmlConsumers = XML_TYPES.flatMap(type => ['object', 'embed', 'img', 'background'].map(kind => {
+    const svg = xmlStyled(`${type} ${kind}`)
+    const uri = dataUri(type, svg)
+
+    const html = kind === 'object' ? `<object data="${uri}" width="64" height="64"></object>` : kind === 'embed' ? `<embed src="${uri}" width="64" height="64">`
+      : kind === 'img' ? `<img alt="" src="${uri}">` : `<div style="width:64px;height:64px;background:url(${uri})"></div>`
+
+    return { type, kind, svg, html }
+  }))
+
+  const xmlShas = (stderr: string) => sentences(stderr).map(l => (/\(sha256 ([0-9a-f]{12})\)$/.exec(l) ?? [])[1]).sort()
+
+  // The same media types around a style-free SVG, captured on the ok page of the malformed-data test below: they must not be refused.
+  const xmlStill = XML_TYPES.map(type => `<img alt="" src="${dataUri(type, stillSvg(type))}"><div style="width:64px;height:64px;background:url(${dataUri(type, GRADIENT)})"></div>`).join('')
+
+  // One shipped-CLI process per side serves both the malformed-data tests and the XML-labelled tests: every refusal of a page is reported together.
+  const malformedCandidate = memo(() => {
     const site = dirOf({
-      'index.html': `<!doctype html><style>div{width:64px;height:64px;background:url(data:image/svg+xml,${encodeURIComponent(MALFORMED_OTHER)})}</style><h1>Bad</h1>
-<img alt="" src="${dataUri(SVG, MALFORMED_SVG)}"><div></div><img alt="" src="${dataUri(SVG, GRADIENT)}">${feImageSvg('href', MALFORMED_HREF)}${feImageSvg('xlink:href', MALFORMED_XLINK)}${feImageSvg('href', GRADIENT)}`,
-      'ok.html': `<!doctype html><style>body{margin:0}svg{display:block}</style>${feImageSvg('href', GRADIENT)}${feImageSvg('xlink:href', GRADIENT)}<h1>Ok</h1>`,
+      'index.html': `<!doctype html><style>img,object,embed{display:block}div{width:64px;height:64px;background:url(data:image/svg+xml,${encodeURIComponent(MALFORMED_OTHER)})}</style><h1>Bad</h1>
+<img alt="" src="${dataUri(SVG, MALFORMED_SVG)}"><div></div><img alt="" src="${dataUri(SVG, GRADIENT)}">${feImageSvg('href', MALFORMED_HREF)}${feImageSvg('xlink:href', MALFORMED_XLINK)}${feImageSvg('href', GRADIENT)}${xmlConsumers.map(c => c.html).join('')}`,
+      'ok.html': `<!doctype html><style>body{margin:0}svg,img,div{display:block}</style>${feImageSvg('href', GRADIENT)}${feImageSvg('xlink:href', GRADIENT)}<h1>Ok</h1>${xmlStill}`,
     })
 
-    const run = await shippedCli(['--side', 'candidate', '--site', site, '--pages', '/ok /'])
+    return shippedCli(['--side', 'candidate', '--site', site, '--pages', '/ok /'])
+  })
+
+  const malformedPrototype = memo(() => {
+    const file = join(scratch, `proto-${++seq}.html`)
+    writeFileSync(file, `<!doctype html><h1>Proto</h1><img alt="" src="${dataUri(SVG, MALFORMED_SVG)}">${feImageSvg('href', MALFORMED_HREF)}${xmlConsumers.map(c => c.html).join('')}`)
+
+    return shippedCli(['--side', 'prototype', '--prototype', file, '--pages', '/'])
+  })
+
+  const isXmlLine = (line: string) => / data:(?:text|application)\/xml[ ;]/.test(line)
+
+  it('refuses a malformed SVG data URL used as an img, a CSS background or feImage (href and xlink:href) on the candidate side, and renders the valid static feImage, through the shipped CLI', async () => {
+    const run = await malformedCandidate()
     expect(run.status, run.stderr).toBe(1)
-    const lines = sentences(run.stderr)
+    const all = sentences(run.stderr)
+    expect(all, run.stderr).toHaveLength(4 + xmlConsumers.length)
+    const lines = all.filter(l => !isXmlLine(l))
     expect(lines, run.stderr).toHaveLength(4)
 
     const shas = lines.map(l => (DATA_LINE.exec(l) ?? [])[1])
@@ -1565,6 +1666,7 @@ ${otherConsumers.map(([, html]) => html).join('')}`
     expect(run.stderr).not.toContain(Buffer.from(MALFORMED_SVG).toString('base64'))
 
     for (const width of [1280, 375]) {
+      expect(contractProblems(read(run.out, width, '/ok')), `${width}`).toEqual([])
       const image = decodePng(pngOf(run.out, width, '/ok'))
 
       for (const y of [32, 96]) {
@@ -1575,13 +1677,30 @@ ${otherConsumers.map(([, html]) => html).join('')}`
   }, 120_000)
 
   it('refuses a malformed SVG data URL used as an img or by feImage on the prototype side, through the shipped CLI', async () => {
-    const file = join(scratch, `proto-${++seq}.html`)
-    writeFileSync(file, `<!doctype html><h1>Proto</h1><img alt="" src="${dataUri(SVG, MALFORMED_SVG)}">${feImageSvg('href', MALFORMED_HREF)}`)
-    const run = await shippedCli(['--side', 'prototype', '--prototype', file, '--pages', '/'])
+    const run = await malformedPrototype()
     expect(run.status, run.stderr).toBe(1)
-    const lines = run.stderr.trim().split('\n')
+    const all = run.stderr.trim().split('\n')
+    expect(all).toHaveLength(2 + xmlConsumers.length)
+    const lines = all.filter(l => !isXmlLine(l))
     expect(lines).toHaveLength(2)
+
     for (const line of lines) {expect(line).toMatch(DATA_LINE)}
     expect(lines.map(l => (DATA_LINE.exec(l) ?? [])[1]).sort()).toEqual([MALFORMED_SVG, MALFORMED_HREF].map(sha12).sort())
+  }, 120_000)
+
+  it('refuses a style-element SVG labelled text/xml or application/xml as an object, an embed, an img and a CSS background on the candidate side, through the shipped CLI', async () => {
+    const run = await malformedCandidate()
+    expect(run.status, run.stderr).toBe(1)
+    const lines = sentences(run.stderr).filter(isXmlLine)
+    expect(lines, run.stderr).toHaveLength(xmlConsumers.length)
+    expect(xmlShas(lines.join('\n')), run.stderr).toEqual(xmlConsumers.map(c => sha12(c.svg)).sort())
+  }, 120_000)
+
+  it('refuses a style-element SVG labelled text/xml or application/xml as an object, an embed, an img and a CSS background on the prototype side, through the shipped CLI', async () => {
+    const run = await malformedPrototype()
+    expect(run.status, run.stderr).toBe(1)
+    const lines = sentences(run.stderr).filter(isXmlLine)
+    expect(lines, run.stderr).toHaveLength(xmlConsumers.length)
+    expect(xmlShas(lines.join('\n')), run.stderr).toEqual(xmlConsumers.map(c => sha12(c.svg)).sort())
   }, 120_000)
 })

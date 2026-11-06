@@ -73,12 +73,12 @@
     return cache.get(el)
   }
 
-  // An object or embed shows a document in a child frame of the window that holds it (image and plugin content has none). An SVG document is not
-  // traversed: the normaliser does not run in XML documents, and its animations are refused by the capture's byte scan of the resource.
+  // An object or embed shows a document in a child frame of the window that holds it (image and plugin content has none). An SVG document is traversed
+  // like any other, but the normaliser does not run in XML documents, so it is judged by the capture's allowlist of its bytes and never measured.
   function embeddedDocument(el, win) {
     try {
       const doc = el.localName === 'object' ? el.contentDocument : (Array.from({ length: win.length }, (_, i) => win[i]).find(w => w.frameElement === el) || {}).document
-      return doc && doc.documentElement && doc.documentElement.localName !== 'svg' ? doc : null
+      return doc && doc.documentElement ? doc : null
     } catch { return null }
   }
 
@@ -86,7 +86,7 @@
   // with the position of its viewport in the top viewport (the top document is at 0, 0).
   function collect(root = document, ctx = { win: window, x: 0, y: 0 }, out = { items: [], roots: [] }) {
     out.roots.push({ root, win: ctx.win })
-    const all = root.documentElement ? [root.documentElement, ...(root.body ? [root.body, ...root.body.querySelectorAll('*')] : [])] : root.querySelectorAll('*')
+    const all = root.documentElement && root.body ? [root.documentElement, root.body, ...root.body.querySelectorAll('*')] : root.querySelectorAll('*')
     for (const el of all) {
       out.items.push({ el, ctx })
       if (el.shadowRoot) collect(el.shadowRoot, ctx, out)
@@ -107,6 +107,7 @@
   function prepare(forced) {
     const { items, roots } = collect()
     for (const { root, win } of roots) {
+      if (isSvgDocument(root)) continue
       const layered = root === win.document ? !!root.getElementById('__dc_style')
         : Array.from(root.adoptedStyleSheets).some(s => s.cssRules.length && s.cssRules[0].name === 'dc-normalise')
       if (!layered) throw new Error('the normalising stylesheet was not in place before page scripts ran in every document and shadow root')
@@ -124,6 +125,8 @@
     }
   }
 
+  const isSvgDocument = root => root.nodeType === 9 && !!root.documentElement && root.documentElement.localName === 'svg'
+
   // The one canonical state of every capture: the top document and every same-origin frame at scroll 0, 0.
   function assertTop(wins) {
     const off = wins.find(w => w.scrollX !== 0 || w.scrollY !== 0)
@@ -133,7 +136,7 @@
     wins.forEach(w => w.scrollTo({ left: 0, top: 0, behavior: 'instant' }))
     assertTop(wins)
   }
-  const htmlFrameDocuments = () => collect().roots.filter(({ root }) => root.nodeType === 9 && root !== document && root.documentElement && root.documentElement.localName !== 'svg').length
+  const htmlFrameDocuments = () => collect().roots.filter(({ root }) => root.nodeType === 9 && root !== document && root.documentElement).length
   const windows = () => Array.from(new Set(collect().roots.map(r => r.win)))
   const toTop = () => scrollToTop(windows())
   const atTop = () => assertTop(windows())
@@ -164,6 +167,7 @@
     const index = new Map(items.map(({ el }, i) => [el, i]))
     for (const { el, ctx } of items) {
       const tag = el.localName
+      if (isSvgDocument(el.ownerDocument)) continue
       const cs = ctx.win.getComputedStyle(el)
       if (cs.webkitFontSmoothing !== 'antialiased' || cs.textRendering.toLowerCase() !== 'geometricprecision') {
         throw new Error(`rendering normalisation is not effective for <${tag}>: -webkit-font-smoothing ${cs.webkitFontSmoothing}, text-rendering ${cs.textRendering}`)
