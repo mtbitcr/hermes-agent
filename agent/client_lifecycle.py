@@ -123,7 +123,12 @@ class ClientLifecycleMixin:
             from tools.computer_use.tool import release_computer_use_session
             release_computer_use_session(task_id)
 
-        for step in (kill_processes, lambda: cleanup_vm(task_id), lambda: cleanup_browser(task_id), release_computer_use):
+        def dispose_design_browser() -> None:
+            from tools.design_browser_tool import cleanup_design_browser
+            cleanup_design_browser(task_id)
+
+        for step in (kill_processes, lambda: cleanup_vm(task_id), lambda: cleanup_browser(task_id), release_computer_use,
+                     dispose_design_browser):
             _quietly(step)
 
     def _client_log_context(self) -> str:
