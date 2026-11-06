@@ -163,7 +163,20 @@ def _colour(value):
 
 
 def _first_family(value):
-    return value.split(",")[0].strip().strip("\"'").lower()
+    quote, escaped, end = None, False, len(value)
+    for i, ch in enumerate(value):
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif quote:
+            quote = None if ch == quote else quote
+        elif ch in "\"'":
+            quote = ch
+        elif ch == ",":
+            end = i
+            break
+    return value[:end].strip().strip("\"'").lower()
 
 
 def _style_differences(cand, proto):

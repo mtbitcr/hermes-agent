@@ -105,6 +105,29 @@ def test_type_tolerances(prop, base, inside, outside):
         assert props(bundle(el("a", style={prop: 22.99})), proto) == [prop]
 
 
+def _family_props(cand_family, proto_family):
+    return props(bundle(el("a", style={"font-family": cand_family})),
+                 bundle(el("a", style={"font-family": proto_family})))
+
+
+@pytest.mark.parametrize("cand,proto", [
+    ('"ACME, Two", Arial', '"ACME, One", Arial'),
+    ("'ACME, Two', Arial", "'ACME, One', Arial"),
+    (r'"ACME\", Two", Arial', r'"ACME\", One", Arial'),
+    (r"ACME\, Two, Arial", r"ACME\, One, Arial"),
+])
+def test_font_family_comma_inside_first_family_is_not_a_separator(cand, proto):
+    assert _family_props(cand, proto) == ["font-family"]
+
+
+def test_font_family_same_first_family_ignores_fallbacks():
+    assert _family_props('"ACME, One", Arial', "'acme, one', serif, monospace") == []
+
+
+def test_font_family_identical_quoted_comma_family_has_no_finding():
+    assert _family_props('"ACME, One", Arial', '"ACME, One", Arial') == []
+
+
 def test_colour_tolerance_is_delta_e_two_and_alpha_point_zero_two(monkeypatch):
     proto = bundle(el("a", style={"color": [10, 20, 30, 1]}))
     cand = bundle(el("a", style={"color": [11, 20, 30, 1]}))
