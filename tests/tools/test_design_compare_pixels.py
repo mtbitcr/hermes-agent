@@ -215,8 +215,8 @@ def test_element_pass_excludes_masked_descendant_inside_matched_ancestor():
     cand, proto = block(page(375, 812), 50, 50, 20, 20), page(375, 812)
     whole = box(0, 0, 375, 812)
     assert px.compare_element(cand, proto, whole, whole) == [box(50, 50, 20, 20)]
-    assert px.compare_element(cand, proto, whole, whole, masks=[box(50, 50, 20, 20)]) == []
-    assert px.compare_element(cand, proto, whole, whole, masks=[]) == [box(50, 50, 20, 20)]
+    assert px.compare_element(cand, proto, whole, whole, candidate_masks=[box(50, 50, 20, 20)]) == []
+    assert px.compare_element(cand, proto, whole, whole, candidate_masks=[], prototype_masks=[]) == [box(50, 50, 20, 20)]
 
 
 def test_element_pass_masks_follow_each_sides_own_crop_with_shifted_boxes():
@@ -224,14 +224,26 @@ def test_element_pass_masks_follow_each_sides_own_crop_with_shifted_boxes():
     cand = block(block(page(375, 812), 50, 50, 20, 20), 120, 120, 12, 12, RED)
     proto = page(375, 812)
     assert px.compare_element(cand, proto, cand_box, proto_box) == [box(50, 50, 20, 20), box(120, 120, 12, 12)]
-    assert px.compare_element(cand, proto, cand_box, proto_box, masks=[box(50, 50, 20, 20)]) == [box(120, 120, 12, 12)]
+    assert px.compare_element(cand, proto, cand_box, proto_box,
+                              candidate_masks=[box(50, 50, 20, 20)]) == [box(120, 120, 12, 12)]
     proto_only = block(block(page(375, 812), 90, 70, 20, 20), 160, 140, 12, 12, RED)
     assert px.compare_element(page(375, 812), proto_only, cand_box, proto_box,
-                              masks=[box(90, 70, 20, 20)]) == [box(120, 120, 12, 12)]
+                              prototype_masks=[box(90, 70, 20, 20)]) == [box(120, 120, 12, 12)]
     a_only, b_only = block(page(375, 812), 50, 50, 20, 20), block(page(375, 812), 130, 110, 20, 20)
     assert len(px.compare_element(a_only, b_only, cand_box, proto_box)) == 2
     assert px.compare_element(a_only, b_only, cand_box, proto_box,
-                              masks=[box(50, 50, 20, 20), box(130, 110, 20, 20)]) == []
+                              candidate_masks=[box(50, 50, 20, 20)], prototype_masks=[box(130, 110, 20, 20)]) == []
+
+
+def test_element_pass_masks_keep_their_source_image_ownership():
+    cand_box, proto_box = box(20, 20, 150, 150), box(60, 40, 150, 150)
+    cand_mask, proto_mask = box(50, 50, 20, 20), box(90, 70, 20, 20)
+    cand = block(block(page(375, 812), 50, 50, 20, 20), 90, 70, 12, 12, RED)
+    proto = block(page(375, 812), 90, 70, 20, 20)
+    assert px.compare_element(cand, proto, cand_box, proto_box,
+                              candidate_masks=[cand_mask], prototype_masks=[proto_mask]) == [box(90, 70, 12, 12)]
+    assert px.compare_element(proto, cand, proto_box, cand_box,
+                              candidate_masks=[proto_mask], prototype_masks=[cand_mask]) == [box(130, 90, 12, 12)]
 
 
 def test_file_names_follow_the_pattern():

@@ -101,16 +101,18 @@ def compare_pages(candidate, prototype, masks=(), row_limit=None):
     return _regions(_different(cand.crop(cut), proto.crop(cut), masks))
 
 
-def compare_element(candidate, prototype, candidate_box, prototype_box, masks=()):
+def compare_element(candidate, prototype, candidate_box, prototype_box, candidate_masks=(), prototype_masks=()):
     """Element pass: each side cut at its own box, compared over the common size; regions in candidate page coordinates.
-    masks are page-coordinate boxes, moved into each side's crop; a pixel covered on either side is excluded."""
+    candidate_masks are candidate-page boxes and prototype_masks prototype-page boxes; each list is moved only by
+    its own side's crop origin, and a pixel covered by either local exclusion is excluded."""
     cand, proto = _pair(candidate, prototype)
     cl, ct, cr, cb = _rect([candidate_box], cand.size)
     pl, pt, pr, pb = _rect([prototype_box], proto.size)
     w, h = min(cr - cl, pr - pl), min(cb - ct, pb - pt)
     if w <= 0 or h <= 0:
         return []
-    local = [{**m, "x": m["x"] - ox, "y": m["y"] - oy} for m in masks for ox, oy in ((cl, ct), (pl, pt))]
+    local = [{**m, "x": m["x"] - ox, "y": m["y"] - oy}
+             for boxes, ox, oy in ((candidate_masks, cl, ct), (prototype_masks, pl, pt)) for m in boxes]
     mask = _different(cand.crop((cl, ct, cl + w, ct + h)), proto.crop((pl, pt, pl + w, pt + h)), local)
     return _regions(mask, cl, ct)
 
