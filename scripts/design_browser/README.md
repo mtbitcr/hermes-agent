@@ -381,4 +381,6 @@ copied folder. The drop-in only narrows what `<tunnel-user>` may do, and keeping
 
 - `docker compose stop` and `docker compose down` take 10 s. The watchdog does not handle SIGTERM, so Docker
   kills the container after its grace period.
-- `/dev/shm` keeps Docker's default size of 64 MB. It was not seen to fail and is not raised.
+- The browser container is given `shm_size` 1gb because the 64 MB Docker default crashes its graphics process on
+  full-page screenshots. An older install picks up the change by running `docker compose up -d` from the design
+  browser folder (`scripts/design_browser`).
