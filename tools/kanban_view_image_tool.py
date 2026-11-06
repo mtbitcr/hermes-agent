@@ -32,6 +32,10 @@ One call names one ``attachment_id``, and the image comes back to the agent's na
    - Transparency is laid over a fixed grey checkerboard. This covers an alpha channel, a
      palette's tRNS and a tRNS colour key. The checkerboard is drawn after the picture is fitted
      to the embed size, so its squares stay crisp.
+   - A tRNS colour key is compared with the stored samples at their own bit depth, 16 bits
+     included, before anything is reduced to 8 bits. Its exact mask is then turned and fitted
+     with the picture. A key the PNG standard does not allow is refused, since decoders read it
+     differently.
    The summary's ``note`` says when the orientation or the transparency was normalized.
 
 The tool is strictly read-only and writes no attachment, event or comment. Every refusal is a
@@ -44,6 +48,8 @@ import base64
 import io
 import json
 import logging
+import struct
+from functools import reduce
 from typing import Any, Dict, List, Tuple, Union
 
 from tools.design_access import check_design_access
@@ -60,6 +66,7 @@ MAX_PIXELS = 40_000_000
 _MIME = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}  # by Pillow format name
 _SQUARE = 16  # px at the embed size: the checkerboard transparent areas are shown on
 _GREYS = (102, 153)  # its two mid-greys, so black and white shapes both stand out on either square
+_KEY_DEPTH = {"1": 1, "L;2": 2, "L;4": 4, "L": 8, "I;16B": 16, "RGB": 8, "RGB;16B": 16}  # by Pillow's PNG raw mode
 
 
 def kanban_view_image(args: Dict[str, Any], **_kw) -> Union[str, Dict[str, Any]]:
@@ -136,9 +143,12 @@ def _view(args: Dict[str, Any]) -> Union[str, Dict[str, Any]]:
                                                                 max_pixels=MAX_PIXELS):
         return tool_error(f"attachment {attachment_id} does not decode completely; nothing is shown")
 
-    with Image.open(io.BytesIO(data), formats=[fmt]) as image:
-        looks, notes = _as_it_looks(image)
-        embedded = _embedded(looks)
+    try:
+        with Image.open(io.BytesIO(data), formats=[fmt]) as image:
+            looks, notes = _as_it_looks(image, data)
+            embedded = _embedded(looks)
+    except _Unshowable as reason:
+        return tool_error(f"attachment {attachment_id} {reason}; nothing is shown")
     if embedded is None or max(embedded[1]) > MAX_EMBED_SIDE or len(embedded[0]) > MAX_EMBED_BYTES:
         return tool_error(f"attachment {attachment_id} could not be made small enough to show; nothing is shown")
 
@@ -161,7 +171,11 @@ def _view(args: Dict[str, Any]) -> Union[str, Dict[str, Any]]:
     }
 
 
-def _as_it_looks(image) -> Tuple[Any, List[str]]:
+class _Unshowable(Exception):
+    """A picture this module cannot show as it looks: refused with this reason, never shown falsely."""
+
+
+def _as_it_looks(image, data: bytes) -> Tuple[Any, List[str]]:
     """``image`` as a viewer shows it: the opaque, upright, 8-bit sRGB picture the imported encoder
     assumes, with a note for each orientation or transparency applied. A picture that already is
     one is returned as it is."""
@@ -170,9 +184,17 @@ def _as_it_looks(image) -> Tuple[Any, List[str]]:
     notes = []
     icc = image.info.get("icc_profile")
     raw = image.tile[0][3] if image.tile else None  # how the pixels are stored, known until they are decoded
-    if raw in ("L;2", "L;4") and isinstance(image.info.get("transparency"), int):
-        # 2- or 4-bit grey: Pillow scales its pixels to 8 bits, but not its tRNS colour key
-        image.info["transparency"] *= 85 if raw == "L;2" else 17
+    mask = None
+    if image.format == "PNG" and raw in _KEY_DEPTH:  # grey or truecolour, which a tRNS colour key can make transparent
+        image.load()  # Pillow reads a tRNS chunk after the pixels, too
+        if "transparency" in image.info:
+            mask = _key_mask(image, raw, data)
+            del image.info["transparency"]  # Pillow's own conversions never see the key
+    if image.mode.startswith("I"):  # 16-bit grey, which a plain conversion clips at 255
+        image = image.convert("I").point([round(v / 257) for v in range(65536)], "L")
+    if mask is not None:  # the key's exact mask, as an alpha channel turned and fitted with the picture
+        image = image.convert("RGB" if image.mode == "RGB" else "L")
+        image.putalpha(mask)
     try:
         orientation = image.getexif().get(ExifTags.Base.Orientation)
         upright = ImageOps.exif_transpose(image) if orientation in range(2, 9) else None
@@ -181,11 +203,6 @@ def _as_it_looks(image) -> Tuple[Any, List[str]]:
     if upright is not None:
         image = upright
         notes.append("EXIF orientation applied")
-    if image.mode.startswith("I"):  # 16-bit grey, which a plain conversion clips at 255
-        wide, key = image.convert("I"), image.info.get("transparency")
-        image = wide.point([round(v / 257) for v in range(65536)], "L")
-        if isinstance(key, int):  # its tRNS colour key, as an alpha channel
-            image.putalpha(wide.point([0 if v == key else 255 for v in range(65536)], "L"))
     grey = image.mode in ("1", "L", "LA")
     alpha = None
     if image.has_transparency_data:  # an alpha channel, a palette's tRNS or a tRNS colour key
@@ -213,6 +230,53 @@ def _as_it_looks(image) -> Tuple[Any, List[str]]:
         board.paste(image, mask=alpha)
         image = board
     return image, notes
+
+
+def _key_mask(image, raw: str, data: bytes):
+    """A PNG's tRNS colour key as an alpha channel: 0 where all of a pixel's stored samples equal the key's, 255
+    elsewhere. The key is read from the stored chunk and compared at the stored bit depth, before anything is
+    reduced to 8 bits. Pillow scales 1, 2 and 4-bit grey to 8 bits one to one and keeps 16-bit grey whole, but
+    keeps only the high byte of 16-bit truecolour; so its low bytes are decoded once more, by Pillow's own
+    decoder with the unpacker that reads the other byte of each sample."""
+    from PIL import Image, ImageChops
+
+    depth = _KEY_DEPTH[raw]
+    key = _stored_key(data, depth, 3 if image.mode == "RGB" else 1)
+    if raw == "RGB;16B":
+        with Image.open(io.BytesIO(data), formats=["PNG"]) as low:
+            if len(low.tile) != 1 or (low.tile[0][0], low.tile[0][3]) != ("zip", raw):
+                raise _Unshowable("is a 16-bit PNG whose tRNS colour key cannot be compared at full precision")
+            low.tile = [(*low.tile[0][:3], "RGB;16L")]  # byte 1 of each two-byte sample: here its low byte
+            low.load()
+            samples = [*image.split(), *low.split()]
+        wanted = [k >> 8 for k in key] + [k & 255 for k in key]
+    elif raw == "I;16B":
+        samples, wanted = [image.convert("I")], list(key)
+    else:
+        samples = list((image.convert("L") if image.mode == "1" else image).split())
+        wanted = [k * 255 // ((1 << depth) - 1) for k in key]
+    matches = [band.point([255 * (v == k) for v in range(65536 if band.mode == "I" else 256)], "L")
+               for band, k in zip(samples, wanted)]
+    return ImageChops.invert(reduce(ImageChops.multiply, matches))
+
+
+def _stored_key(data: bytes, depth: int, count: int) -> Tuple[int, ...]:
+    """The key's ``count`` samples, read from the PNG's tRNS chunk. The PNG standard allows one tRNS chunk,
+    before the pixel data, of two bytes per sample, each below 2 ** ``depth``. Decoders read any other key
+    differently, so no one picture is the true one: it is refused."""
+    keys, pos, late = [], 8, False
+    while pos + 8 <= len(data):
+        length, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        if kind == b"IEND":
+            break
+        if kind == b"tRNS":
+            body = data[pos + 8:pos + 8 + length]
+            keys.append(None if late or len(body) != 2 * count else struct.unpack(f">{count}H", body))
+        late = late or kind == b"IDAT"
+        pos += 12 + length
+    if len(keys) != 1 or keys[0] is None or max(keys[0]) >> depth:
+        raise _Unshowable("has a tRNS colour key that the PNG standard does not allow")
+    return keys[0]
 
 
 def _checkerboard(size: Tuple[int, int]):

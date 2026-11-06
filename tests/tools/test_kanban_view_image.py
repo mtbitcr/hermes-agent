@@ -818,3 +818,185 @@ def test_a_picture_with_nothing_to_normalize_is_the_encoders_own_copy(kanban, ma
     assert "note" not in summary
     assert base64.b64decode(result["content"][1]["image_url"]["url"].partition(",")[2]) == expected
     assert_halves(embedded)
+
+
+# ── 11. A tRNS colour key is compared at the stored bit depth ────────────────
+# A PNG's tRNS colour key makes transparent exactly the pixels whose stored samples all equal it, compared
+# before anything is reduced to 8 bits. Pillow cannot write most of these PNGs, so they are written here sample
+# by sample; the expected picture is composited here too, from what was written.
+
+
+ADAM7 = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
+INK_BOX = (40, 8, 72, 24)  # the opaque ink's box on an 80 x 40 picture whose other pixels are the key
+KEYED = {  # bit depth, colour type, the key's samples, the ink's, and the ink as shown (8-bit RGB)
+    "grey-1": (1, 0, (1,), (0,), (0, 0, 0)),
+    "grey-2": (2, 0, (2,), (3,), (255, 255, 255)),
+    "grey-4": (4, 0, (15,), (14,), (238, 238, 238)),
+    "grey-8": (8, 0, (255,), (254,), (254, 254, 254)),
+    "grey-16": (16, 0, (0x4040,), (0x4041,), (64, 64, 64)),
+    "truecolour-8": (8, 2, (64, 128, 192), (64, 128, 193), (64, 128, 193)),
+    "truecolour-16": (16, 2, (0x4040, 0x8080, 0xC0C0), (0x4041, 0x8081, 0xC0C1), (64, 128, 192)),
+    # A palette's tRNS: index 0, the background, is transparent; index 1, the ink, is the same colour but opaque.
+    **{f"palette-{depth}": (depth, 3, (0,), (1,), (64, 128, 192)) for depth in (1, 2, 4, 8)},
+}
+TRUECOLOUR_16 = {  # the key and the opaque ink next to it, which shares the key's high bytes unless it is black
+    "mid-key-black-ink": ((16384, 32768, 49152), (0, 0, 0)),
+    "mid-key-near-ink": ((16384, 32768, 49152), (16385, 32769, 49153)),
+    "equal-bytes-key-near-ink": ((16448, 32896, 49344), (16449, 32897, 49345)),
+    "white-key-near-ink": ((65535, 65535, 65535), (65534, 65534, 65534)),
+    "black-key-near-ink": ((0, 0, 0), (1, 1, 1)),
+}
+NOT_ALLOWED = "has a tRNS colour key that the PNG standard does not allow"
+
+
+def chunk(kind: bytes, body: bytes) -> bytes:
+    return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+
+
+def written(rows, depth: int, colour: int, *, trns=(), late=(), palette=b"", interlaced=False, exif=None) -> bytes:
+    """A PNG of ``rows`` of pixels, each a tuple of samples: Adam7-interlaced or not, with a PLTE chunk for
+    ``palette``, an eXIf chunk for ``exif`` and the tRNS chunks ``trns`` before the pixel data, ``late`` after it."""
+    lines = {}
+
+    def line(row, x, dx):  # the rows are few distinct lists, each packed once per pass
+        if (id(row), x, dx) not in lines:
+            samples = [s for pixel in row[x::dx] for s in pixel]
+            if depth == 16:
+                packed = struct.pack(f">{len(samples)}H", *samples)
+            else:
+                per = 8 // depth
+                samples += [0] * (-len(samples) % per)
+                packed = bytes(sum(s << (8 - depth * (j + 1)) for j, s in enumerate(samples[i:i + per]))
+                               for i in range(0, len(samples), per))
+            lines[id(row), x, dx] = b"\0" + packed  # filter type 0
+        return lines[id(row), x, dx]
+
+    passes = ADAM7 if interlaced else ((0, 0, 1, 1),)
+    pixels = b"".join(line(row, x, dx) for x, y, dx, dy in passes for row in rows[y::dy] if row[x::dx])
+    out = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", len(rows[0]), len(rows), depth, colour,
+                                                              0, 0, int(interlaced)))
+    if exif is not None:
+        out += chunk(b"eXIf", exif.tobytes()[6:])  # without the "Exif\0\0" a JPEG puts first
+    if palette:
+        out += chunk(b"PLTE", palette)
+    out += b"".join(chunk(b"tRNS", body) for body in trns) + chunk(b"IDAT", zlib.compress(pixels))
+    return out + b"".join(chunk(b"tRNS", body) for body in late) + chunk(b"IEND", b"")
+
+
+def boxed(size, box, outside, inside):
+    """Rows of ``size``: ``inside`` in the box, ``outside`` around it."""
+    plain = [outside] * size[0]
+    crossed = [outside] * box[0] + [inside] * (box[2] - box[0]) + [outside] * (size[0] - box[2])
+    return [crossed if box[1] <= y < box[3] else plain for y in range(size[1])]
+
+
+def keyed(depth: int, colour: int, key, ink, *, interlaced=False, orientation=None) -> bytes:
+    """An 80 x 40 PNG: ``ink`` in INK_BOX, every other pixel the tRNS key ``key`` (a palette's: index 0)."""
+    palette, trns = (bytes((64, 128, 192)) * 2, b"\0") if colour == 3 else (b"", struct.pack(f">{len(key)}H", *key))
+    return written(boxed((80, 40), INK_BOX, key, ink), depth, colour, trns=[trns], palette=palette,
+                   interlaced=interlaced, exif=exif_orientation(orientation) if orientation else None)
+
+
+def composited(ink, orientation=None):
+    """The expected picture, composited here: the ink in INK_BOX, the grey checkerboard of 16 px squares (102 and
+    153, from the top left corner) everywhere else, turned 90 degrees clockwise for orientation 6."""
+    mask = Image.new("L", (80, 40))
+    ImageDraw.Draw(mask).rectangle((INK_BOX[0], INK_BOX[1], INK_BOX[2] - 1, INK_BOX[3] - 1), fill=255)
+    if orientation == 6:
+        mask = mask.transpose(Image.Transpose.ROTATE_270)
+    expected = Image.new("RGB", mask.size)
+    expected.putdata([(g, g, g) for y in range(mask.height) for x in range(mask.width)
+                      for g in [(102, 153)[(x // 16 + y // 16) % 2]]])
+    expected.paste(ink, mask=mask)
+    return expected
+
+
+def assert_shown_exactly(result, expected) -> dict:
+    """The embedded copy is the encoder's own copy of ``expected``, byte for byte."""
+    summary, embedded = shown(result)
+    golden = design_browser_tool._embedded(expected)[0]
+    seen = Image.open(io.BytesIO(golden))
+    assert embedded.size == seen.size == expected.size
+    points = [(x, y) for y in range(4, expected.height, 8) for x in range(4, expected.width, 8)]
+    assert [embedded.getpixel(p) for p in points] == [seen.getpixel(p) for p in points]  # where they differ
+    assert base64.b64decode(result["content"][1]["image_url"]["url"].partition(",")[2]) == golden
+    return summary
+
+
+@pytest.mark.parametrize("case", list(TRUECOLOUR_16))
+def test_a_16_bit_truecolour_trns_key_is_compared_at_full_precision(kanban, case):
+    """Only the pixels whose three 16-bit samples all equal the key are transparent; ink that shares the key's
+    high bytes, and so its 8-bit colour, stays opaque."""
+    key, ink = TRUECOLOUR_16[case]
+    started = kanban.start(DESIGNER)
+    allow()
+    data = keyed(16, 2, key, ink)
+    with Image.open(io.BytesIO(data)) as stored:
+        assert (stored.mode, stored.size, stored.info["transparency"]) == ("RGB", (80, 40), key)
+        stored.verify()
+    summary = assert_shown_exactly(handled(kanban.attach(started["own"], data, f"{case}.png")),
+                                   composited(tuple(v >> 8 for v in ink)))
+    assert summary["note"] == "transparent areas shown on a grey checkerboard"
+
+
+@pytest.mark.parametrize("orientation", [None, 6], ids=["upright", "exif-6"])
+@pytest.mark.parametrize("interlaced", [False, True], ids=["plain", "adam7"])
+@pytest.mark.parametrize("case", list(KEYED))
+def test_every_png_that_can_carry_a_trns_key_is_shown_exactly(kanban, case, interlaced, orientation):
+    """Grey of 1, 2, 4, 8 and 16 bits, truecolour of 8 and 16 bits and palettes, interlaced or not, turned by an
+    eXIf orientation or not: the key's exact mask is the transparency shown, turned with the picture."""
+    depth, colour, key, ink, as_shown = KEYED[case]
+    started = kanban.start(DESIGNER)
+    allow()
+    data = keyed(depth, colour, key, ink, interlaced=interlaced, orientation=orientation)
+    with Image.open(io.BytesIO(data)) as stored:
+        assert stored.size == (80, 40) and bool(stored.info.get("interlace")) == interlaced
+        assert stored.getexif().get(ExifTags.Base.Orientation) == orientation
+    summary = assert_shown_exactly(handled(kanban.attach(started["own"], data, f"{case}.png")),
+                                   composited(as_shown, orientation))
+    assert (summary["width"], summary["height"]) == (80, 40)
+    assert "checkerboard" in summary["note"] and ("EXIF orientation" in summary["note"]) == bool(orientation)
+
+
+@pytest.mark.parametrize("orientation", [None, 6], ids=["upright", "exif-6"])
+def test_the_exact_trns_mask_is_carried_through_the_resize_to_the_embed_size(kanban, orientation):
+    """Twice the embed size, shown 3,136 x 1,568 px and fitted to 1,568 x 784: the ink next to the 16-bit key
+    stays opaque and the key's pixels are the checkerboard, after the turn and the fit."""
+    key, ink = TRUECOLOUR_16["equal-bytes-key-near-ink"]
+    started = kanban.start(DESIGNER)
+    allow()
+    if orientation:  # stored upright as 1,568 x 3,136, turned clockwise to 3,136 x 1,568: the same box, as shown
+        rows = boxed((1568, 3136), (392, 784, 1176, 1568), key, ink)
+    else:
+        rows = boxed((3136, 1568), (1568, 392, 2352, 1176), key, ink)
+    data = written(rows, 16, 2, trns=[struct.pack(">3H", *key)],
+                   exif=exif_orientation(orientation) if orientation else None)
+    summary, embedded = shown(handled(kanban.attach(started["own"], data, "wide.png")))
+    assert embedded.size == (1568, 784)
+    assert all(abs(a - b) <= 8 for a, b in zip(embedded.getpixel((980, 392)), (64, 128, 192))), \
+        embedded.getpixel((980, 392))
+    assert_checkerboard(embedded.getpixel((x, 100)) for x in range(1568))
+    assert_checkerboard(embedded.getpixel((x, 700)) for x in range(1568))
+    assert "checkerboard" in summary["note"] and ("EXIF orientation" in summary["note"]) == bool(orientation)
+
+
+@pytest.mark.parametrize("depth, colour, trns, late", [
+    (2, 0, [struct.pack(">H", 4)], []),
+    (8, 0, [struct.pack(">H", 0x1FE)], []),
+    (8, 2, [struct.pack(">3H", 0x140, 128, 192)], []),
+    (1, 0, [struct.pack(">H", 2)], []),
+    (16, 2, [struct.pack(">3H", 1, 2, 3), struct.pack(">3H", 4, 5, 6)], []),
+    (16, 2, [], [struct.pack(">3H", 1, 2, 3)]),
+    (8, 2, [struct.pack(">4H", 64, 128, 192, 0)], []),
+], ids=["2-bit-out-of-range", "8-bit-out-of-range", "truecolour-out-of-range", "1-bit-out-of-range",
+        "two-keys", "after-the-pixels", "too-long"])
+def test_a_trns_key_the_png_standard_does_not_allow_is_refused(kanban, depth, colour, trns, late):
+    """Decoders read such a key differently, so no one picture is the true one: refused, never shown."""
+    started = kanban.start(DESIGNER)
+    allow()
+    sample = (1,) * (3 if colour == 2 else 1)
+    data = written(boxed((80, 40), INK_BOX, sample, (0,) * len(sample)), depth, colour, trns=trns, late=late)
+    with Image.open(io.BytesIO(data)) as stored:
+        stored.load()
+        assert "transparency" in stored.info  # Pillow reads a key from it
+    assert NOT_ALLOWED in error_of(handled(kanban.attach(started["own"], data, "odd.png")))
