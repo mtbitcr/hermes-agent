@@ -12,6 +12,7 @@
     || (n.ownerDocument && n.ownerDocument.defaultView && n.ownerDocument.defaultView.frameElement) || null
   const styleOf = el => el.ownerDocument.defaultView.getComputedStyle(el)
   const FRAMES = new Set(['iframe', 'frame'])
+  const EMBEDS = new Set(['object', 'embed'])
   const headingOf = el => {
     const h = el.querySelector('h1,h2,h3,h4,h5,h6')
     return h ? normalize(h.textContent, 40) : ''
@@ -72,7 +73,16 @@
     return cache.get(el)
   }
 
-  // Every element of each document (its html and body elements included), of each open shadow root and of each same-origin child frame,
+  // An object or embed shows a document in a child frame of the window that holds it (image and plugin content has none). An SVG document is not
+  // traversed: the normaliser does not run in XML documents, and its animations are refused by the capture's byte scan of the resource.
+  function embeddedDocument(el, win) {
+    try {
+      const doc = el.localName === 'object' ? el.contentDocument : (Array.from({ length: win.length }, (_, i) => win[i]).find(w => w.frameElement === el) || {}).document
+      return doc && doc.documentElement && doc.documentElement.localName !== 'svg' ? doc : null
+    } catch { return null }
+  }
+
+  // Every element of each document (its html and body elements included), of each open shadow root and of each same-origin child frame or object/embed document,
   // with the position of its viewport in the top viewport (the top document is at 0, 0).
   function collect(root = document, ctx = { win: window, x: 0, y: 0 }, out = { items: [], roots: [] }) {
     out.roots.push({ root, win: ctx.win })
@@ -80,9 +90,11 @@
     for (const el of all) {
       out.items.push({ el, ctx })
       if (el.shadowRoot) collect(el.shadowRoot, ctx, out)
-      if (!FRAMES.has(el.localName)) continue
-      const doc = el.contentDocument
-      if (!doc) throw new Error(`unsupported content: a cross-origin or unreadable <${el.localName}> frame cannot be measured`)
+      const frame = FRAMES.has(el.localName)
+      if (!frame && !EMBEDS.has(el.localName)) continue
+      const doc = frame ? el.contentDocument : embeddedDocument(el, ctx.win)
+      if (!doc && frame) throw new Error(`unsupported content: a cross-origin or unreadable <${el.localName}> frame cannot be measured`)
+      if (!doc) continue
       const r = el.getBoundingClientRect()
       const cs = ctx.win.getComputedStyle(el)
       collect(doc, { win: doc.defaultView, x: ctx.x + r.left + el.clientLeft + parseFloat(cs.paddingLeft), y: ctx.y + r.top + el.clientTop + parseFloat(cs.paddingTop) }, out)
@@ -121,6 +133,7 @@
     wins.forEach(w => w.scrollTo({ left: 0, top: 0, behavior: 'instant' }))
     assertTop(wins)
   }
+  const htmlFrameDocuments = () => collect().roots.filter(({ root }) => root.nodeType === 9 && root !== document && root.documentElement && root.documentElement.localName !== 'svg').length
   const windows = () => Array.from(new Set(collect().roots.map(r => r.win)))
   const toTop = () => scrollToTop(windows())
   const atTop = () => assertTop(windows())
@@ -233,5 +246,5 @@
     if (p === 'fixed' || p === 'sticky') el.style.setProperty('visibility', 'hidden', 'important')
   })
 
-  return { normalize, landmarksOf, firstFamily, familyName, hiddenByOpacity, prepare, fontsReady, measure, settle, hidePinned, toTop, atTop, scrollToTop, assertTop, boxOf, freeze, freezeNative }
+  return { normalize, landmarksOf, firstFamily, familyName, hiddenByOpacity, prepare, fontsReady, measure, settle, hidePinned, toTop, atTop, scrollToTop, assertTop, boxOf, freeze, freezeNative, htmlFrameDocuments }
 })()

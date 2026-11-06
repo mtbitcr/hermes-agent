@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createSocket } from 'node:dgram'
 import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { runInNewContext } from 'node:vm'
-import { inflateSync } from 'node:zlib'
+import { deflateSync, inflateSync } from 'node:zlib'
 
 import { afterAll, describe, expect, it } from 'vitest'
 
@@ -601,11 +601,217 @@ function decodePng(buf: Buffer) {
   return { w, h, at: (x: number, y: number) => [...px.subarray(y * stride + x * bpp, y * stride + x * bpp + 3)] }
 }
 
-describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium (opt-in, pinned binary from CHROME_PATH, shipped pin)', () => {
+// Byte-level fixtures: valid 64x64 GIF, PNG and APNG files (red, then blue) with one frame per playback delay (1/100 s), and minimal WebP/AVIF/JXL headers.
+const SIZE = 64
+const COLOURS = [[255, 0, 0], [0, 0, 255]]
+
+const crc32 = (b: Buffer) => {
+  let c = ~0
+
+  for (const x of b) {
+    c ^= x
+
+    for (let k = 0; k < 8; k++) {c = (c >>> 1) ^ (0xedb88320 & -(c & 1))}
+  }
+
+  return ~c >>> 0
+}
+
+const be = (...n: number[]) => {
+  const b = Buffer.alloc(4 * n.length)
+  n.forEach((v, i) => b.writeUInt32BE(v, 4 * i))
+
+  return b
+}
+
+const pngChunk = (type: string, data: Buffer) => {
+  const body = Buffer.concat([Buffer.from(type, 'latin1'), data])
+
+  return Buffer.concat([be(data.length), body, be(crc32(body))])
+}
+
+const pixels = (rgb: number[]) => deflateSync(Buffer.concat(Array.from({ length: SIZE }, () => Buffer.from([0, ...Array.from({ length: SIZE }, () => rgb).flat()]))))
+const PNG_SIGNATURE = Buffer.from('\x89PNG\r\n\x1a\n', 'latin1')
+const IHDR = pngChunk('IHDR', Buffer.concat([be(SIZE, SIZE), Buffer.from([8, 2, 0, 0, 0])]))
+
+function apng(delays: number[], animated = true) {
+  let seq = 0
+  const parts = [PNG_SIGNATURE, IHDR, ...(animated ? [pngChunk('acTL', be(delays.length, 0))] : [])]
+
+  delays.forEach((delay, i) => {
+    if (animated) {parts.push(pngChunk('fcTL', Buffer.concat([be(seq++, SIZE, SIZE, 0, 0), Buffer.from([delay >> 8, delay & 255, 0, 100, 0, 0])])))}
+
+    const data = pixels(COLOURS[i % 2])
+    parts.push(i === 0 ? pngChunk('IDAT', data) : pngChunk('fdAT', Buffer.concat([be(seq++), data])))
+  })
+
+  return Buffer.concat([...parts, pngChunk('IEND', Buffer.alloc(0))])
+}
+
+const staticPng = () => apng([0], false)
+
+function gif(delays: number[]) {
+  const lzw = (index: number) => {
+    const out: number[] = []
+    let acc = 0, bits = 0
+
+    for (const code of [...Array.from({ length: 2 * SIZE * SIZE }, (_, i) => (i % 2 ? index : 4)), 5]) {
+      acc |= code << bits
+      bits += 3
+
+      while (bits >= 8) { out.push(acc & 255); acc >>= 8; bits -= 8 }
+    }
+
+    if (bits) {out.push(acc)}
+
+    return Buffer.concat([...Array.from({ length: Math.ceil(out.length / 255) }, (_, i) => Buffer.from([Math.min(255, out.length - 255 * i), ...out.slice(255 * i, 255 * i + 255)])), Buffer.from([0])])
+  }
+
+  const frames = delays.map((delay, i) => Buffer.concat([Buffer.from([0x21, 0xf9, 4, 4, delay & 255, delay >> 8, 0, 0, 0x2c, 0, 0, 0, 0, SIZE, 0, SIZE, 0, 0, 2]), lzw(i % 2)]))
+
+  return Buffer.concat([Buffer.from('GIF89a'), Buffer.from([SIZE, 0, SIZE, 0, 0x80, 0, 0, 255, 0, 0, 0, 0, 255]),
+    Buffer.from('!\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00', 'latin1'), ...frames, Buffer.from(';')])
+}
+
+const le32 = (n: number) => { const b = Buffer.alloc(4); b.writeUInt32LE(n);
+
+ return b }
+
+const webp = (flags: number) => {
+  const chunk = (type: string, data: Buffer) => Buffer.concat([Buffer.from(type), le32(data.length), data])
+  const body = Buffer.concat([Buffer.from('WEBP'), chunk('VP8X', Buffer.concat([Buffer.from([flags, 0, 0, 0]), Buffer.alloc(6)])), chunk('VP8L', Buffer.alloc(8))])
+
+  return Buffer.concat([Buffer.from('RIFF'), le32(body.length), body])
+}
+
+const ftyp = (...brands: string[]) => Buffer.concat([be(8 + 8 * brands.length), Buffer.from('ftyp'), ...brands.map(b => Buffer.concat([Buffer.from(b), be(0)]))])
+
+// The animation test of libwebp's own feature probe: a VP8X header with the animation flag, an ANIM chunk and one ANMF frame; and its lossless still counterpart.
+const ANIMATED_WEBP = Buffer.from('UklGRlIAAABXRUJQVlA4WAoAAAASAAAAAAAAAAAAQU5JTQYAAAD/////AABBTk1GJgAAAAAAAAAAAAAAAAAAAGQAAABWUDhMDQAAAC8AAAAQBxAREYiI/gcA', 'base64')
+const STATIC_WEBP = Buffer.from('UklGRhoAAABXRUJQVlA4TA0AAAAvAAAAEAcQERGIiP4HAA==', 'base64')
+
+const smil = (ms: number, id: string, extra = '') => `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><rect id="${id}" y="20" width="20" height="20" fill="red"><animate attributeName="x" from="0" to="40" dur="${ms}ms" repeatCount="indefinite"/></rect>${extra}</svg>`
+const stillSvg = (id: string) => `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><title>${id}</title><rect width="64" height="64" fill="red"/></svg>`
+const dataUri = (mime: string, body: Buffer | string) => `data:${mime};base64,${Buffer.from(body).toString('base64')}`
+const SVG = 'image/svg+xml'
+
+describe('animated resource detection', () => {
+  it('counts GIF frames by walking the blocks, and reports 0 for anything that is not a GIF', () => {
+    expect(kit.gifFrameCount(gif([10, 1000]))).toBe(2)
+    expect(kit.gifFrameCount(gif([1, 1, 1, 1]))).toBe(4)
+    expect(kit.gifFrameCount(gif([10]))).toBe(1)
+    expect(kit.gifFrameCount(gif([10, 1000]).subarray(0, 60))).toBe(1)
+    expect(kit.gifFrameCount(Buffer.from('GIF89a'))).toBe(0)
+    expect(kit.gifFrameCount(staticPng())).toBe(0)
+    expect(kit.gifFrameCount(Buffer.alloc(0))).toBe(0)
+  })
+
+  it('reads the acTL frame count of a PNG only when it precedes the image data, and 1 for an ordinary PNG', () => {
+    expect(kit.apngFrameCount(apng([10, 1000]))).toBe(2)
+    expect(kit.apngFrameCount(apng([5, 5, 5]))).toBe(3)
+    expect(kit.apngFrameCount(apng([10]))).toBe(1)
+    expect(kit.apngFrameCount(staticPng())).toBe(1)
+    const idat = staticPng().subarray(PNG_SIGNATURE.length + IHDR.length)
+    expect(kit.apngFrameCount(Buffer.concat([PNG_SIGNATURE, IHDR, idat.subarray(0, idat.length - 12), pngChunk('acTL', be(2, 0)), idat.subarray(idat.length - 12)]))).toBe(1)
+    expect(kit.apngFrameCount(gif([10]))).toBe(0)
+    expect(kit.apngFrameCount(PNG_SIGNATURE)).toBe(1)
+  })
+
+  it('reads the WebP animation flag from the VP8X header', () => {
+    expect(kit.webpIsAnimated(webp(0x02))).toBe(true)
+    expect(kit.webpIsAnimated(webp(0x12))).toBe(true)
+    expect(kit.webpIsAnimated(webp(0x10))).toBe(false)
+    expect(kit.webpIsAnimated(webp(0))).toBe(false)
+    expect(kit.webpIsAnimated(ANIMATED_WEBP)).toBe(true)
+    expect(kit.webpIsAnimated(STATIC_WEBP)).toBe(false)
+    expect(kit.webpIsAnimated(gif([10, 10]))).toBe(false)
+  })
+
+  it('finds SMIL, CSS animation, script and entity-hidden markup in an SVG, and leaves static SVG alone', () => {
+    for (const animated of [
+      smil(1000, 'a'), '<svg><animateTransform attributeName="transform"/></svg>', '<svg><animateMotion path="M0,0"/></svg>', '<svg><set attributeName="fill" to="red"/></svg>',
+      '<s:svg xmlns:s="http://www.w3.org/2000/svg"><s:animate attributeName="x"/></s:svg>', '<svg><SET attributeName="x"/></svg>', '<svg><script>run()</script></svg>',
+      '<svg><style>@keyframes k{to{x:1}}</style></svg>', '<svg><rect style="animation: k 1s infinite"/></svg>', '<svg><rect style="animation-name:k"/></svg>',
+      '<!DOCTYPE svg [<!ENTITY m "&#60;animate/>">]><svg>&m;</svg>', '<svg><discard/></svg>',
+    ]) {
+      expect(kit.svgIsAnimated(animated), animated).toBe(true)
+    }
+
+    for (const still of [
+      stillSvg('s'), '<svg><text>animate me, set the script</text><g id="setup"><settings/></g></svg>', '<svg><style>rect{fill:red;transition:fill 1s}</style><rect/></svg>',
+      '<svg><defs><linearGradient id="g"/></defs><path d="M0 0L9 9" fill="url(#g)"/></svg>',
+    ]) {
+      expect(kit.svgIsAnimated(still), still).toBe(false)
+    }
+  })
+
+  it('names the kind of an animated resource, including images nested in an SVG as data URLs, and nothing for still images', () => {
+    expect(kit.animatedResource(gif([10, 1000]), 'image/gif')).toBe('gif')
+    expect(kit.animatedResource(apng([10, 1000]), 'image/png')).toBe('apng')
+    expect(kit.animatedResource(ANIMATED_WEBP, 'image/webp')).toBe('webp')
+    expect(kit.animatedResource(Buffer.from(smil(1000, 'k')), SVG)).toBe('svg')
+    expect(kit.animatedResource(gif([10, 1000]), 'application/octet-stream')).toBe('gif')
+    expect(kit.animatedResource(Buffer.from(smil(1000, 'k')), 'text/plain')).toBeNull()
+    const nested = (uri: string) => Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg"><image href="${uri}"/></svg>`)
+    expect(kit.animatedResource(nested(dataUri('image/gif', gif([10, 1000]))), SVG)).toBe('gif')
+    expect(kit.animatedResource(nested(`data:image/svg+xml,${encodeURIComponent(smil(1000, 'n'))}`), SVG)).toBe('svg')
+    expect(kit.animatedResource(nested(dataUri('image/gif', gif([10]))), SVG)).toBeNull()
+    expect(kit.animatedResource(nested('https://example.test/a.gif'), SVG)).toBeNull()
+
+    for (const still of [[gif([10]), 'image/gif'], [staticPng(), 'image/png'], [apng([10]), 'image/png'], [STATIC_WEBP, 'image/webp'], [Buffer.from(stillSvg('s')), SVG],
+      [Buffer.from([0xff, 0xd8, 0xff, 0xe0]), 'image/jpeg'], [Buffer.alloc(0), 'image/png'], [Buffer.from('<h1>hi</h1>'), 'text/html']] as const) {
+      expect(kit.animatedResource(still[0], still[1]), still[1]).toBeNull()
+    }
+  })
+
+  it('treats an AVIF image sequence as animated and a JPEG XL file as unverifiable, but a still AVIF as fine', () => {
+    expect(kit.animatedResource(ftyp('avis', 'avis', 'mif1'), 'image/avif')).toBe('avif')
+    expect(kit.animatedResource(ftyp('avif', 'mif1', 'avis'), 'image/avif')).toBe('avif')
+    expect(kit.animatedResource(ftyp('avif', 'mif1', 'miaf'), 'image/avif')).toBeNull()
+    expect(kit.animatedResource(Buffer.from([0xff, 0x0a, 1, 2, 3]), 'image/jxl')).toBe('jxl')
+    expect(kit.animatedResource(Buffer.from([0, 0, 0, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a]), 'image/jxl')).toBe('jxl')
+  })
+
+  it('lists the embedded documents of a pierced DOM tree with their root element, skipping template content', () => {
+    const doc = (root: string, ...kids: unknown[]) => ({ nodeName: '#document', children: [{ nodeType: 10, nodeName: 'html' }, { nodeType: 1, nodeName: root.toUpperCase(), localName: root, children: kids }] })
+    const owner = (nodeName: string, contentDocument?: unknown) => ({ nodeName, nodeType: 1, children: [], ...(contentDocument ? { contentDocument } : {}) })
+
+    expect(kit.embeddedDocumentRoots(doc('html'))).toEqual([])
+    expect(kit.embeddedDocumentRoots(doc('html', owner('IMG'), owner('OBJECT'), owner('EMBED', doc('svg')), owner('IFRAME', doc('html', owner('OBJECT', doc('html'))))))).toEqual(['svg', 'html', 'html'])
+    expect(kit.embeddedDocumentRoots(doc('html', { nodeName: 'TEMPLATE', templateContent: doc('html', owner('OBJECT', doc('html'))), children: [] }))).toEqual([])
+  })
+
+  it('refuses with one sentence per kind of problem, naming every animated resource and unreadable one', () => {
+    expect(() => kit.assertNoAnimatedResources([], [])).not.toThrow()
+    const long = `data:image/gif;base64,${'A'.repeat(100)}`
+    const found = [{ kind: 'gif', url: 'http://127.0.0.1:1/a.gif', sha256: 'a'.repeat(64) }, { kind: 'svg', url: long, sha256: 'b'.repeat(64) }]
+    expect(() => kit.assertNoAnimatedResources(found, [])).toThrow(`unsupported content: animated resources whose timelines cannot be frozen: gif http://127.0.0.1:1/a.gif (sha256 ${'a'.repeat(12)}), svg ${long.slice(0, 60)}… (sha256 ${'b'.repeat(12)})`)
+    expect(() => kit.assertNoAnimatedResources([], [{ url: 'http://127.0.0.1:1/x.png' }])).toThrow('unsupported content: an image or document resource could not be read to check it for animation: http://127.0.0.1:1/x.png')
+  })
+})
+
+describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium (opt-in, pinned binary from CHROME_PATH, shipped pin)', { concurrent: true }, () => {
   const chromium = process.env.CHROME_PATH as string
   let seq = 0
 
-  const dirOf = (files: Record<string, string>) => {
+  // The tests run concurrently, but never more than two Chromium captures at once.
+  const slots = { free: 2, waiting: [] as (() => void)[] }
+
+  const limited = async <T>(job: () => Promise<T>) => {
+    if (slots.free > 0) {slots.free--} else {await new Promise<void>(r => slots.waiting.push(r))}
+
+    try {
+      return await job()
+    } finally {
+      const next = slots.waiting.shift()
+
+      if (next) {next()} else {slots.free++}
+    }
+  }
+
+  const capture = (options: Record<string, unknown>): Promise<any[]> => limited(() => kit.capture(options))
+
+  const dirOf = (files: Record<string, string | Buffer>) => {
     const d = join(scratch, `case-${++seq}`)
 
     for (const [name, body] of Object.entries(files)) {
@@ -616,10 +822,10 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
     return d
   }
 
-  const shoot = (site: Record<string, string>, pages = ['/']) => {
+  const shoot = (site: Record<string, string | Buffer>, pages = ['/']) => {
     const outDir = join(scratch, `out-${++seq}`)
 
-    return kit.capture({ side: 'candidate', siteDir: dirOf(site), pages, outDir, chromium, runId: 'run-1', candidateDigest: 'd1' })
+    return capture({ side: 'candidate', siteDir: dirOf(site), pages, outDir, chromium, runId: 'run-1', candidateDigest: 'd1' })
       .then((bundles: any[]) => ({ bundles, outDir }))
   }
 
@@ -716,7 +922,7 @@ for (const f of [() => new WebSocket('ws://${r.base}/socket'), () => new EventSo
 
     const proto = join(scratch, 'net-proto.html')
     writeFileSync(proto, page)
-    await expect(kit.capture({ side: 'prototype', prototypeFile: proto, pages: ['/'], outDir: join(scratch, 'net-proto-out'), chromium, runId: 'r', candidateDigest: 'd' }))
+    await expect(capture({ side: 'prototype', prototypeFile: proto, pages: ['/'], outDir: join(scratch, 'net-proto-out'), chromium, runId: 'r', candidateDigest: 'd' }))
       .rejects.toThrow(/^the chosen design file is not self-contained$/)
     await r.close()
     expect(r.hits).toEqual([])
@@ -729,7 +935,7 @@ for (const f of [() => new WebSocket('ws://${r.base}/socket'), () => new EventSo
     writeFileSync(file, `<link rel=stylesheet href="asset.css"><link rel=stylesheet href="/missing-required.css">
 <link rel=stylesheet href="http://${r.base}/x.css"><h1>P</h1>`)
 
-    const err: any = await kit.capture({ side: 'prototype', siteDir: site, prototypeFile: file, pages: ['/'], outDir: join(scratch, 'proto-out-leaks'), chromium, runId: 'r', candidateDigest: 'd' })
+    const err: any = await capture({ side: 'prototype', siteDir: site, prototypeFile: file, pages: ['/'], outDir: join(scratch, 'proto-out-leaks'), chromium, runId: 'r', candidateDigest: 'd' })
       .catch((e: unknown) => e)
 
     expect(err.message).toBe('the chosen design file is not self-contained')
@@ -742,7 +948,7 @@ for (const f of [() => new WebSocket('ws://${r.base}/socket'), () => new EventSo
     expect(r.hits).toEqual([])
     const ok = join(scratch, 'proto-ok.html')
     writeFileSync(ok, '<style>h1{color:#369}</style><h1>P</h1><img alt=dot src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">')
-    const bundles = await kit.capture({ side: 'prototype', siteDir: site, prototypeFile: ok, pages: ['/'], outDir: join(scratch, 'proto-out-ok'), chromium, runId: 'r', candidateDigest: 'd' })
+    const bundles = await capture({ side: 'prototype', siteDir: site, prototypeFile: ok, pages: ['/'], outDir: join(scratch, 'proto-out-ok'), chromium, runId: 'r', candidateDigest: 'd' })
     expect(bundles.map((b: any) => b.blocked_requests)).toEqual([[], []])
   }, 120_000)
 
@@ -776,10 +982,16 @@ for (const f of [() => new WebSocket('ws://${r.base}/socket'), () => new EventSo
     const site = dirOf({ 'a-b.html': '<h1>Dash route</h1>', 'a/b.html': '<h1>Slash route</h1>' })
     const out = join(scratch, 'cli-e2e')
 
-    const cli = (pages: string, outDir = out) => spawnSync(process.execPath, [captureFile, '--side', 'candidate', '--site', site, '--pages', pages,
-      '--out', outDir, '--run-id', 'r', '--candidate-digest', 'd'], { encoding: 'utf8', env: { ...process.env, CHROME_PATH: chromium } })
+    const cli = (pages: string, outDir = out) => limited(() => new Promise<{ status: number | null, stderr: string }>(done => {
+      const child = spawn(process.execPath, [captureFile, '--side', 'candidate', '--site', site, '--pages', pages,
+        '--out', outDir, '--run-id', 'r', '--candidate-digest', 'd'], { env: { ...process.env, CHROME_PATH: chromium } })
 
-    const run = cli('/a-b /a/b')
+      let stderr = ''
+      child.stderr.on('data', d => { stderr += d })
+      child.on('close', status => done({ status, stderr }))
+    }))
+
+    const run = await cli('/a-b /a/b')
     expect(run.status, run.stderr).toBe(0)
     const files = readdirSync(out)
     expect(files.filter(f => f.endsWith('.json'))).toHaveLength(4)
@@ -795,11 +1007,11 @@ for (const f of [() => new WebSocket('ws://${r.base}/socket'), () => new EventSo
       }
     }
 
-    const again = cli('/a-b')
+    const again = await cli('/a-b')
     expect(again.status).toBe(1)
     expect(again.stderr).toContain('refusing to overwrite')
     expect(readdirSync(out)).toHaveLength(8)
-    const dup = cli('/a-b /a-b', join(scratch, 'cli-dup'))
+    const dup = await cli('/a-b /a-b', join(scratch, 'cli-dup'))
     expect(dup.status).toBe(1)
     expect(dup.stderr).toContain('refusing to overwrite')
   }, 120_000)
@@ -810,7 +1022,7 @@ for (const f of [() => new WebSocket('ws://${r.base}/socket'), () => new EventSo
     const file = join(scratch, `proto-${++seq}.html`)
     writeFileSync(file, html)
 
-    return kit.capture({ side: 'prototype', prototypeFile: file, pages: ['/'], outDir: join(scratch, `out-${++seq}`), chromium, runId: 'r', candidateDigest: 'd' })
+    return capture({ side: 'prototype', prototypeFile: file, pages: ['/'], outDir: join(scratch, `out-${++seq}`), chromium, runId: 'r', candidateDigest: 'd' })
       .catch((e: unknown) => e)
   }
 
@@ -864,22 +1076,20 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
   }, 120_000)
 
   it('measures visible shadow-root and srcdoc-iframe text with its own type values and page coordinates', async () => {
-    const shadow = (px: number) => `<h1>Outside</h1><div id=host></div><script>host.attachShadow({mode:'open'}).innerHTML = '<p style="font-size:${px}px">Visible shadow text</p><canvas width=50 height=20></canvas>'</script>`
-    const frame = (px: number) => `<h1>Outside</h1><iframe srcdoc="<h2 style='font-size:${px}px'>Frame text</h2><p style='position:fixed;bottom:0'>Pin</p>" style="border:0;margin:30px"></iframe>`
+    const page = (px: number) => `<h1>Outside</h1><div id=host></div><script>host.attachShadow({mode:'open'}).innerHTML = '<p style="font-size:${px}px">Visible shadow text</p><canvas width=50 height=20></canvas>'</script>
+<iframe srcdoc="<h2 style='font-size:${px}px'>Frame text</h2><p style='position:fixed;bottom:0'>Pin</p>" style="border:0;margin:30px"></iframe>`
 
-    const runs = await Promise.all([shadow(10), shadow(40), frame(10), frame(40)].map(html => shoot({ 'index.html': html })))
-    const [s10, s40, f10, f40] = runs.map(x => read(x.outDir))
+    const [s10, s40] = (await Promise.all([page(10), page(40)].map(html => shoot({ 'index.html': html })))).map(x => read(x.outDir))
 
     expect(byText(s10, 'visible shadow text').style['font-size']).toBe(10)
     expect(byText(s40, 'visible shadow text').style['font-size']).toBe(40)
-    expect(byText(f10, 'frame text').style['font-size']).toBe(10)
-    expect(byText(f40, 'frame text').style['font-size']).toBe(40)
+    expect(byText(s10, 'frame text').style['font-size']).toBe(10)
+    expect(byText(s40, 'frame text').style['font-size']).toBe(40)
     expect(JSON.stringify(s10)).not.toBe(JSON.stringify(s40))
-    expect(JSON.stringify(f10)).not.toBe(JSON.stringify(f40))
-    expect(byText(f10, 'frame text').box.x).toBeGreaterThanOrEqual(40)
-    expect(byText(f10, 'frame text').box.y).toBeGreaterThan(60)
+    expect(byText(s10, 'frame text').box.x).toBeGreaterThanOrEqual(40)
+    expect(byText(s10, 'frame text').box.y).toBeGreaterThan(60)
     expect(s10.masks).toContainEqual(expect.objectContaining({ width: 50, height: 20 }))
-    expect(byText(f10, 'pin').fixed).toBe(true)
+    expect(byText(s10, 'pin').fixed).toBe(true)
   }, 120_000)
 
   it('refuses closed shadow roots, declarative closed roots and unreadable frames instead of claiming complete evidence', async () => {
@@ -887,11 +1097,13 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
       closed: '<div id=h></div><script>h.attachShadow({mode:"closed"}).innerHTML = "<h2>Hidden</h2>"</script>',
       declarative: '<div><template shadowrootmode="closed"><h2>Hidden</h2></template></div>',
       sandboxed: '<iframe sandbox srcdoc="<h2>Opaque</h2>"></iframe>',
+      object: '<object data="data:text/html,%3Ch2%3EOpaque%3C/h2%3E" type="text/html"></object>',
+      embed: '<embed src="data:text/html,%3Ch2%3EOpaque%3C/h2%3E" type="text/html">',
     }
 
     for (const [name, html] of Object.entries(pages)) {
       const err: any = await shoot({ 'index.html': html }).catch((e: unknown) => e)
-      expect(err.message, name).toMatch(name === 'sandboxed' ? /frame/ : /closed shadow root/)
+      expect(err.message, name).toMatch(name === 'sandboxed' ? /<iframe>.*cannot be measured/ : name === 'object' || name === 'embed' ? /unreadable <object> or <embed> document cannot be measured/ : /closed shadow root/)
     }
   }, 120_000)
 
@@ -992,7 +1204,7 @@ body{margin:0;font-size:32px}#t{display:inline-block;font-family:${used};margin:
     const site = dirOf({ 'index.html': fontPage(face, used) })
     copyFileSync(fileURLToPath(new URL('../web/public/fonts/Mondwest-Regular.woff2', import.meta.url)), join(site, 'acme.woff2'))
 
-    return kit.capture({ side: 'candidate', siteDir: site, pages: ['/'], outDir: join(scratch, `out-${++seq}`), chromium, runId: 'r', candidateDigest: 'd' })
+    return capture({ side: 'candidate', siteDir: site, pages: ['/'], outDir: join(scratch, `out-${++seq}`), chromium, runId: 'r', candidateDigest: 'd' })
   }
 
   it('keeps comma-containing quoted font families apart on the measured element, and equal when the names match', async () => {
@@ -1106,7 +1318,7 @@ addEventListener('scroll', () => { if (scrollY === 0) scrollTo(0, 400) }); scrol
     await expect(shoot({ 'index.html': page })).rejects.toThrow('top-of-page scroll state')
   }, 120_000)
 
-  const nativeMotionPage = (ms: number, amount: number) => {
+  const nativeMotionSite = (ms: number, amount: number) => {
     const root = (kids: string) => `<svg xmlns="http://www.w3.org/2000/svg" width="360" height="120" style="display:block">${kids}</svg>`
 
     const shapes = `<rect y="20" width="60" height="40" fill="red"><animate attributeName="x" from="0" to="280" dur="${ms}ms" repeatCount="indefinite"/></rect>
@@ -1116,17 +1328,59 @@ addEventListener('scroll', () => { if (scrollY === 0) scrollTo(0, 400) }); scrol
 
     const marquees = `<marquee scrollamount="${amount}" style="display:block;width:300px">Moving text control</marquee><marquee direction="up" height="60" scrollamount="${amount}">Up</marquee>`
 
-    return `<!doctype html><style>body{margin:0}</style><h1>Native motion</h1>${root(shapes)}${marquees}<div id=host></div>
+    const inner = `<!doctype html><style>body{margin:0}</style>${root(shapes)}<marquee scrollamount="${amount}">Inner mover</marquee>`
+
+    return { 'inner.html': inner, 'index.html': `<!doctype html><style>body{margin:0}</style><h1>Native motion</h1>${root(shapes)}${marquees}<div id=host></div>
+<object data="/inner.html" type="text/html" width="380" height="130" style="display:block"></object><embed src="/inner.html" type="text/html" width="380" height="130" style="display:block">
 <iframe style="border:0;width:380px;height:130px" srcdoc='${root(shapes).replace(/'/g, '&#39;')}'></iframe>
-<script>document.getElementById('host').attachShadow({mode:'open'}).innerHTML = '${root(shapes)}<marquee scrollamount="${amount}">Shadow mover</marquee>'</script>`
+<script>document.getElementById('host').attachShadow({mode:'open'}).innerHTML = '${root(shapes)}<marquee scrollamount="${amount}">Shadow mover</marquee>'</script>` }
   }
 
-  it('freezes SMIL animate, animateTransform, animateMotion and set, and stops marquee, in the page, an open shadow root and a frame, whatever their duration or speed', async () => {
-    const [fast, slow] = await Promise.all([shoot({ 'index.html': nativeMotionPage(1000, 40) }), shoot({ 'index.html': nativeMotionPage(10_000, 1) })])
+  it('freezes SMIL animate, animateTransform, animateMotion and set, and stops marquee, in the page, an open shadow root, a frame and a same-origin object and embed document, whatever their duration or speed', async () => {
+    const [fast, slow] = await Promise.all([shoot(nativeMotionSite(1000, 40)), shoot(nativeMotionSite(10_000, 1))])
     sameFiles(fast.outDir, slow.outDir)
     const png = decodePng(readFileSync(join(fast.outDir, `${kit.pageSlug('/')}-1280.png`)))
     const top = read(fast.outDir).elements.find((e: any) => e.tag === 'svg').box.y
     expect(png.at(30, Math.round(top) + 40), 'animate rect at its start').toEqual([255, 0, 0])
+  }, 120_000)
+
+  const stillRaster = { 'still.gif': gif([10]), 'still.png': staticPng(), 'single.png': apng([10]), 'still.webp': STATIC_WEBP }
+
+  it('refuses every rendered animated resource on the candidate side, whatever the duration, in an img, a CSS background, an object and an embed', async () => {
+    const page = `<!doctype html><style>body{margin:0}div{width:64px;height:64px;background:url(${dataUri(SVG, smil(3000, 'bg'))})}</style><h1>Animated</h1>
+<img alt="" src="${dataUri(SVG, smil(1000, 'img-fast'))}"><img alt="" src="${dataUri(SVG, smil(10_000, 'img-slow'))}"><div></div>
+<object data="/obj.svg" type="image/svg+xml" width="64" height="64"></object><embed src="/emb.svg" type="image/svg+xml" width="64" height="64">
+<img alt="" src="/a.gif"><img alt="" src="/a.png"><img alt="" src="/a.webp"><img alt="" src="${dataUri('image/gif', gif([1, 1]))}">`
+
+    const err: any = await shoot({ 'index.html': page, 'obj.svg': smil(2000, 'obj'), 'emb.svg': smil(4000, 'emb'), 'a.gif': gif([10, 1000]), 'a.png': apng([10, 1000]), 'a.webp': ANIMATED_WEBP, ...stillRaster }).catch((e: unknown) => e)
+    expect(err.message).toMatch(/^unsupported content: animated resources whose timelines cannot be frozen: /)
+    const kinds = err.message.split('frozen: ')[1].split(', ').map((x: string) => x.split(' ')[0])
+    expect(kinds.sort()).toEqual(['apng', 'gif', 'gif', 'svg', 'svg', 'svg', 'svg', 'svg', 'webp'])
+
+    for (const where of ['/a.gif', '/a.png', '/a.webp', '/obj.svg', '/emb.svg', 'data:image/svg+xml']) {expect(err.message, where).toContain(where)}
+  }, 120_000)
+
+  it('refuses animated resources on the prototype side, whatever the duration, and an animated image inside an inline SVG image', async () => {
+    const nested = dataUri(SVG, `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><image width="64" height="64" href="${dataUri('image/gif', gif([10, 1000]))}"/></svg>`)
+
+    const page = `<!doctype html><style>div{width:64px;height:64px;background:url(${dataUri(SVG, smil(3000, 'pb'))})}</style><h1>Proto</h1><div></div><img alt="" src="${dataUri('image/gif', gif([10, 1000]))}"><img alt="" src="${dataUri(SVG, smil(1000, 'p1'))}"><img alt="" src="${dataUri(SVG, smil(10_000, 'p2'))}"><img alt="" src="${nested}">
+<img alt="" src="${dataUri('image/png', apng([10, 1000]))}"><object data="${dataUri(SVG, smil(2000, 'po'))}" type="image/svg+xml" width="64" height="64"></object><embed src="${dataUri(SVG, smil(2000, 'pe'))}" type="image/svg+xml" width="64" height="64">`
+
+    const err: any = await asPrototype(page)
+    expect(err.message).toMatch(/^unsupported content: animated resources whose timelines cannot be frozen: /)
+    expect(err.message.split('frozen: ')[1].split(', ').map((x: string) => x.split(' ')[0]).sort()).toEqual(['apng', 'gif', 'gif', 'svg', 'svg', 'svg', 'svg', 'svg'])
+  }, 120_000)
+
+  it('still captures static SVG and single-frame GIF, PNG, WebP and APNG in every context, and keeps their pixels', async () => {
+    const red = dataUri(SVG, stillSvg('red'))
+
+    const page = `<!doctype html><style>body{margin:0}div{width:64px;height:64px;background:url(${red})}img,object,embed{display:block}</style>
+<img alt="" src="${red}"><div></div><object data="/still.svg" type="image/svg+xml" width="64" height="64"></object><embed src="/still.svg" type="image/svg+xml" width="64" height="64">
+<img alt="" src="/still.gif"><img alt="" src="/still.png"><img alt="" src="/single.png"><img alt="" src="/still.webp">`
+
+    const { bundles, outDir } = await shoot({ 'index.html': page, 'still.svg': stillSvg('file'), ...stillRaster })
+    expect(bundles).toHaveLength(2)
+    expect(decodePng(readFileSync(join(outDir, `${kit.pageSlug('/')}-1280.png`))).at(30, 30)).toEqual([255, 0, 0])
   }, 120_000)
 
 })

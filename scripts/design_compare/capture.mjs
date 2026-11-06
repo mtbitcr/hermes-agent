@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { basename, extname, join, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
+import { gunzipSync } from 'node:zlib'
 
 // Chromium 153.0.8010.0 as extracted from the npm package below; any other binary or hash is refused.
 export const CHROMIUM_PIN = {
@@ -127,6 +128,112 @@ export function findClosedShadowRoot(node) {
     if (hit) return hit
   }
   return null
+}
+
+// Rendered native timelines (SMIL and CSS in an SVG image, GIF/APNG/WebP/AVIF frames) cannot be paused or rewound from the page, so a capture whose
+// resources contain one is refused. Every check reads the response bytes, so it works the same for http, data: and blob: resources.
+const u32 = (b, i) => b.readUInt32BE(i)
+
+export function gifFrameCount(buf) {
+  const b = Buffer.from(buf)
+  if (b.length < 13 || !/^GIF8[79]a$/.test(b.toString('latin1', 0, 6))) return 0
+  let i = 13 + (b[10] & 0x80 ? 3 * 2 ** ((b[10] & 7) + 1) : 0)
+  let frames = 0
+  const skipBlocks = at => { while (at < b.length && b[at]) at += b[at] + 1; return at + 1 }
+  while (i < b.length) {
+    if (b[i] === 0x21) i = skipBlocks(i + 2)
+    else if (b[i] === 0x2c) {
+      frames++
+      i = b.length < i + 10 ? b.length : skipBlocks(i + 11 + (b[i + 9] & 0x80 ? 3 * 2 ** ((b[i + 9] & 7) + 1) : 0))
+    } else break
+  }
+  return frames
+}
+
+// The frame count a PNG announces in an acTL chunk that precedes its image data (1 for an ordinary PNG, 0 when it is not a PNG).
+export function apngFrameCount(buf) {
+  const b = Buffer.from(buf)
+  if (b.length < 8 || b.toString('latin1', 1, 4) !== 'PNG') return 0
+  for (let i = 8; i + 8 <= b.length; i += 12 + u32(b, i)) {
+    const type = b.toString('latin1', i + 4, i + 8)
+    if (type === 'acTL') return i + 16 <= b.length ? u32(b, i + 8) : 1
+    if (type === 'IDAT' || type === 'IEND') return 1
+  }
+  return 1
+}
+
+export function webpIsAnimated(buf) {
+  const b = Buffer.from(buf)
+  return b.length >= 21 && b.toString('latin1', 0, 4) === 'RIFF' && b.toString('latin1', 8, 12) === 'WEBP' && b.toString('latin1', 12, 16) === 'VP8X' && !!(b[20] & 2)
+}
+
+const svgText = b => {
+  if (b[0] === 0x1f && b[1] === 0x8b) { try { return svgText(gunzipSync(b)) } catch { return '<script/>' } }
+  if (b[0] === 0xff && b[1] === 0xfe) return b.toString('utf16le', 2)
+  if (b[0] === 0xfe && b[1] === 0xff) return Buffer.from(b.subarray(2)).swap16().toString('utf16le')
+  return b.toString('utf8')
+}
+const SVG_MOTION = [/<(?:[\w.-]+:)?(?:animate|animatetransform|animatemotion|animatecolor|set|discard|script)\b/i, /@keyframes/i, /\banimation(?:-[a-z-]+)?\s*[:=]/i, /<!ENTITY/i]
+
+// SVG as an image cannot run scripts or load files, so its bytes are all there is: SMIL elements, CSS animation, script, or entities that could hide them.
+export function svgIsAnimated(input) {
+  const text = typeof input === 'string' ? input : svgText(Buffer.from(input))
+  return SVG_MOTION.some(re => re.test(text))
+}
+
+const dataUri = uri => {
+  const comma = uri.indexOf(',')
+  if (comma < 0) return null
+  const head = uri.slice(5, comma).split(';')
+  const payload = uri.slice(comma + 1)
+  let body
+  try { body = head.includes('base64') ? Buffer.from(payload, 'base64') : Buffer.from(decodeURIComponent(payload)) } catch { body = Buffer.from(payload) }
+  return { mime: head[0].trim().toLowerCase(), body }
+}
+
+// The kind of animated image or document these bytes are, or null. Nested data: images of an SVG image are checked too.
+export function animatedResource(buf, mime = '', depth = 0) {
+  const b = Buffer.from(buf)
+  const type = String(mime).split(';')[0].trim().toLowerCase()
+  if (gifFrameCount(b) > 1) return 'gif'
+  if (apngFrameCount(b) > 1) return 'apng'
+  if (webpIsAnimated(b)) return 'webp'
+  if (b.toString('latin1', 4, 8) === 'ftyp' && b.toString('latin1', 8, Math.min(b.length, Math.max(u32(b, 0), 12))).includes('avis')) return 'avif'
+  if (type === 'image/jxl' || (b[0] === 0xff && b[1] === 0x0a) || b.toString('hex', 0, 12) === '0000000c4a584c200d0a870a') return 'jxl'
+  if (type !== 'image/svg+xml') return null
+  if (svgIsAnimated(b)) return 'svg'
+  if (depth >= 8) return 'svg'
+  for (const m of svgText(b).matchAll(/(?:href|src)\s*=\s*["'](data:[^"']*)["']|url\(\s*["']?(data:[^)"']*)/gi)) {
+    const nested = dataUri(m[1] || m[2])
+    const kind = nested && animatedResource(nested.body, nested.mime, depth + 1)
+    if (kind) return kind
+  }
+  return null
+}
+
+// The root element names of every document shown by a frame, iframe, object or embed in a pierced CDP DOM tree (template content excluded).
+export function embeddedDocumentRoots(node) {
+  const roots = []
+  const walk = n => {
+    const doc = n.contentDocument
+    if (doc) roots.push(((doc.children || []).find(c => c.nodeType === 1) || {}).localName || '')
+    for (const kid of [...(n.shadowRoots || []), ...(n.children || []), ...(doc ? [doc] : [])]) walk(kid)
+  }
+  walk(node)
+  return roots
+}
+
+const shortUrl = url => (url.length > 60 ? `${url.slice(0, 60)}…` : url)
+
+export function assertNoAnimatedResources(found, unreadable) {
+  const problems = []
+  if (found.length) {
+    problems.push(`unsupported content: animated resources whose timelines cannot be frozen: ${found.map(f => `${f.kind} ${shortUrl(f.url)} (sha256 ${f.sha256.slice(0, 12)})`).join(', ')}`)
+  }
+  if (unreadable.length) {
+    problems.push(`unsupported content: an image or document resource could not be read to check it for animation: ${unreadable.map(u => shortUrl(u.url)).join(', ')}`)
+  }
+  if (problems.length) throw new Error(problems.join('\n'))
 }
 
 // Runs before any page script in every frame: the Fetch gate cannot see WebSocket handshakes, WebRTC/ICE or WebTransport, so refuse those at the API.
@@ -262,6 +369,10 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
   const blocked = []
   const leaked = []
   const open = new Set()
+  const responses = new Map()
+  const inspections = new Set()
+  const animated = []
+  const unreadable = []
   const guarded = new Set([t.sessionId])
   const source = `${INJECT};${guardSource(origin, onlyPath)}`
   let lastActivity = Date.now()
@@ -270,6 +381,7 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
   // The same gates for the capture page and for every frame session, applied while the session is still paused at start.
   const gate = async send => {
     for (const m of ['Page.enable', 'Network.enable', 'Runtime.enable']) await send(m)
+    await send('Network.setCacheDisabled', { cacheDisabled: true })
     await send('Runtime.addBinding', { name: '__dcBlock' })
     await send('Fetch.enable', { patterns: [{ urlPattern: '*' }] })
     await send('Target.setAutoAttach', AUTO_ATTACH)
@@ -302,7 +414,22 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
     } else if (m.method === 'Runtime.bindingCalled') blocked.push(m.params.payload)
     else if (m.method === 'Network.webSocketCreated') { blocked.push(m.params.url); leaked.push(m.params.url) }
     else if (m.method === 'Network.requestWillBeSent') open.add(requestId)
-    else if (m.method === 'Network.loadingFinished' || m.method === 'Network.loadingFailed') open.delete(requestId)
+    else if (m.method === 'Network.responseReceived') responses.set(`${m.sessionId}:${requestId}`, { ...m.params.response, type: m.params.type })
+    else if (m.method === 'Network.loadingFinished' || m.method === 'Network.loadingFailed') {
+      open.delete(requestId)
+      const key = `${m.sessionId}:${requestId}`
+      const response = responses.get(key)
+      responses.delete(key)
+      if (m.method === 'Network.loadingFinished' && response && ['Image', 'Document', 'Other'].includes(response.type)) {
+        const check = browser.send('Network.getResponseBody', { requestId }, m.sessionId).then(({ body, base64Encoded }) => {
+          const bytes = Buffer.from(body, base64Encoded ? 'base64' : 'utf8')
+          const kind = animatedResource(bytes, response.mimeType)
+          if (kind && !animated.some(a => a.url === response.url && a.kind === kind)) animated.push({ kind, url: response.url, sha256: sha256(bytes) })
+        }, () => { unreadable.push({ url: response.url }) })
+        inspections.add(check)
+        check.then(() => inspections.delete(check))
+      }
+    }
     else if (m.method === 'Page.loadEventFired') onLoad()
   })
   try {
@@ -325,13 +452,23 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
     const probe = `(${probeSource}\n)`
     await run(`${probe}.toTop()`)
     await run('document.fonts.ready.then(() => true)')
-    const deadline = Date.now() + 30000
-    while (open.size || Date.now() - lastActivity < 500) {
-      if (Date.now() > deadline) throw new Error(`network never went quiet for ${url}`)
-      await sleep(50)
+    const quiet = async (settled = true) => {
+      const deadline = Date.now() + 30000
+      while (open.size || (settled && Date.now() - lastActivity < 500)) {
+        if (Date.now() > deadline) throw new Error(`network never went quiet for ${url}`)
+        await sleep(50)
+      }
+      while (inspections.size) await Promise.all([...inspections])
+      assertNoAnimatedResources(animated, unreadable)
     }
-    const closed = findClosedShadowRoot((await t.send('DOM.getDocument', { depth: -1, pierce: true })).root)
+    await quiet()
+    const tree = (await t.send('DOM.getDocument', { depth: -1, pierce: true })).root
+    const closed = findClosedShadowRoot(tree)
     if (closed) throw new Error(`unsupported content: a closed shadow root under <${closed.toLowerCase()}> cannot be measured`)
+    const readable = await run(`${probe}.htmlFrameDocuments()`)
+    if (embeddedDocumentRoots(tree).filter(name => name !== 'svg').length !== readable) {
+      throw new Error('unsupported content: a cross-origin or unreadable <object> or <embed> document cannot be measured')
+    }
     await run(`${probe}.toTop()`)
     await run(`${probe}.prepare(${JSON.stringify(FORCED)})`)
     await run(`${probe}.fontsReady()`)
@@ -346,6 +483,7 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
       if (n === 1) await run(`${probe}.hidePinned()`)
       tiles.push({ top, data: (await t.send('Page.captureScreenshot', { format: 'png' })).data })
     }
+    await quiet(false)
     if (leaked.length) throw new Error(`outside WebSocket handshake observed: ${leaked.join(' ')}`)
     const png = await stitcher.evaluate(`(async (tiles, w, h) => {
       const c = document.createElement('canvas'); c.width = w; c.height = h
