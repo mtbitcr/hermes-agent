@@ -1,0 +1,23 @@
+# Look-only browser for the design roles, run by rootless Docker on the execution server.
+# Runbook: README.md in this folder. Start or update it from this folder: docker compose up -d --build
+services:
+  design-browser:
+    build:
+      context: .
+      dockerfile: browser.Dockerfile
+    # Rootless Docker restarts a container only when it exits; watchdog.sh exits whenever Chromium fails.
+    restart: unless-stopped
+    # Loopback only: the SSH tunnel from the control server is the one way in.
+    ports:
+      - "127.0.0.1:9222:9222"
+    # Nothing from the image is writable; the browser profile and /tmp are tmpfs, empty at every start.
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /profile
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    cpus: 2
