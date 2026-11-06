@@ -1,0 +1,89 @@
+{
+  "body": {
+    "data": [
+      {
+        "authority": "task",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_d7e601c69c0034ec1330e1042e849a4d",
+        "design_options": {
+          "object": "hermes.owner_workspace.design_options",
+          "options": [
+            {
+              "n": 1,
+              "pictures": [
+                {
+                  "alt": "The home page with a wide photo above a short welcome.",
+                  "attachment_id": "3",
+                  "bytes": 32,
+                  "media_type": "image/png"
+                }
+              ],
+              "sentence": "A calm layout with a large photo at the top."
+            },
+            {
+              "n": 2,
+              "pictures": [
+                {
+                  "alt": "The home page with a large title and two buttons below it.",
+                  "attachment_id": "4",
+                  "bytes": 28,
+                  "media_type": "image/jpeg"
+                }
+              ],
+              "sentence": "A bold layout with a big title and two buttons."
+            },
+            {
+              "n": 3,
+              "pictures": [
+                {
+                  "alt": "The home page with one line of text on a plain background.",
+                  "attachment_id": "5",
+                  "bytes": 32,
+                  "media_type": "image/webp"
+                }
+              ],
+              "sentence": "A simple layout with one short welcome line."
+            }
+          ],
+          "question": "Which home page should Raphael build?",
+          "schema_version": 1
+        },
+        "kind": "owner_input",
+        "project_name": "Bakery Website",
+        "project_slug": "bakery-website",
+        "reason": "Raphael needs your answer before this work can continue.",
+        "title": "Design the home page"
+      }
+    ],
+    "object": "hermes.owner_workspace.decision_list",
+    "recent_design_choices": [
+      {
+        "chosen_at": "2026-09-21T14:13:20Z",
+        "n": 2,
+        "options": [
+          {
+            "n": 1,
+            "picture": {
+              "alt": "The home page with a wide photo above a short welcome.",
+              "attachment_id": "1"
+            },
+            "sentence": "A calm layout with a large photo at the top."
+          },
+          {
+            "n": 2,
+            "picture": {
+              "alt": "The home page with a large title and two buttons below it.",
+              "attachment_id": "2"
+            },
+            "sentence": "A bold layout with a big title and two buttons."
+          }
+        ],
+        "project_name": "Bakery Website",
+        "project_slug": "bakery-website",
+        "question": "Which home page should Raphael build?"
+      }
+    ],
+    "truncated": false
+  },
+  "status": 200
+}

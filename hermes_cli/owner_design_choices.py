@@ -14,12 +14,21 @@ transaction that holds the card ``needs_input`` with :data:`HOLD_SENTENCE`.
 Its payload is the section A object; the platform adds each picture's media
 type and size from the attachment it checked. Nothing here is shown to the
 owner.
+
+Card 2 lists and records the owner's choice. :func:`decision_design_options`
+gives a waiting card's declaration to the Decisions feed;
+:func:`accept_choice` records the owner's choice once, as the task event
+``design_option_chosen``, comments on the card and releases it; and
+:func:`recent_design_choices` reads the record of past choices back from both
+events.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
+import time
 from typing import Any
 
 from hermes_cli.owner_text import check_owner_text
@@ -29,6 +38,10 @@ OBJECT = "hermes.owner_workspace.design_options"
 SCHEMA_VERSION = 1
 # The task event that records a card's design options.
 DECLARED_EVENT = "design_options_declared"
+# The task event that records the owner's choice (card 2).
+CHOSEN_EVENT = "design_option_chosen"
+# How many decided design choices the Decisions list returns (section D).
+RECENT_LIMIT = 10
 # The one owner reason of the hold. It passes the owner text policy
 # unchanged, so the shared policy copy never has to change.
 HOLD_SENTENCE = "Raphael needs you to choose one design."
@@ -204,3 +217,130 @@ def declare_design_options(
         reason=HOLD_SENTENCE,
     )
     return True
+
+
+def decision_design_options(conn: sqlite3.Connection, task_ids: list[str]) -> dict[str, dict]:
+    """The design options each of *task_ids* waits for the owner to choose from.
+
+    For the Decisions feed read with ``design_options_v1`` (card 2), on a
+    read-only connection to the cards' own store: the declaration payload of
+    each card held ``needs_input`` that declared options and has no recorded
+    choice, the section A object as declared, so exactly the cards
+    :func:`accept_choice` takes a choice for. A card without one is left out
+    and stays today's item. Read from the events only: a picture that can no
+    longer be read is the app's to show as such (section B).
+    """
+    if not task_ids:
+        return {}
+    declared: dict[str, dict] = {}
+    chosen: set[str] = set()
+    for task_id, kind, payload in conn.execute(
+        "SELECT task_id, kind, payload FROM task_events WHERE kind IN (?, ?) "
+        "AND task_id IN (SELECT id FROM tasks WHERE status = 'blocked' "
+        "AND block_kind = 'needs_input' AND task_kind = 'work' "
+        "AND id IN (" + ", ".join("?" for _ in task_ids) + ")) ORDER BY id",
+        (DECLARED_EVENT, CHOSEN_EVENT, *task_ids),
+    ).fetchall():
+        if kind == CHOSEN_EVENT:
+            chosen.add(str(task_id))
+        else:
+            declared.setdefault(str(task_id), json.loads(payload))
+    return {
+        task_id: payload for task_id, payload in declared.items()
+        if task_id not in chosen
+    }
+
+
+def accept_choice(conn: sqlite3.Connection, task_id: str, n: int, *, actor: str) -> str:
+    """Record the owner's choice of option *n* on a waiting designer card.
+
+    For the owner choose route (card 2), which resolved *task_id* through the
+    owner's own Decisions feed. In one write transaction on *conn*: the card
+    must still be held ``needs_input``, with a declaration that offers option
+    *n* and no recorded choice; one ``design_option_chosen`` event
+    ``{n, sentence, attachment_id, actor, chosen_at}`` is written; *actor*
+    comments on the card in plain words; and the card is released as
+    ``unblock_task`` releases it, to todo while a parent is not done.
+
+    Returns "released", or "recorded" when the card is parked for
+    re-approval instead; or "not_waiting", and then nothing was written. The
+    first choice is never rewritten.
+    """
+    from hermes_cli import kanban_db
+    from hermes_cli.owner_workspace import _owner_timestamp
+
+    now = int(time.time())
+    with kanban_db.write_txn(conn):
+        held = conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ? AND status = 'blocked' "
+            "AND block_kind = 'needs_input' AND task_kind = 'work'",
+            (task_id,),
+        ).fetchone()
+        events = kanban_db.list_events(conn, task_id) if held else []
+        declared = _declarations(events)
+        option = next(
+            (option for option in declared[0]["options"] if option["n"] == n), None,
+        ) if declared and all(event.kind != CHOSEN_EVENT for event in events) else None
+        if option is None:
+            return "not_waiting"
+        kanban_db._append_event(conn, task_id, CHOSEN_EVENT, {
+            "n": n,
+            "sentence": option["sentence"],
+            "attachment_id": option["pictures"][0]["attachment_id"],
+            "actor": actor,
+            "chosen_at": _owner_timestamp(now),
+        })
+        kanban_db.add_comment(
+            conn, task_id, actor, f"The owner chose option {n}: {option['sentence']}",
+        )
+        released = kanban_db._unblock_task_within_txn(conn, task_id, now)
+    return "released" if released else "recorded"
+
+
+def recent_design_choices(
+    conn: sqlite3.Connection, project: dict, recent: list[dict],
+) -> list[dict]:
+    """*recent* with the choices made on *project*'s cards, newest first.
+
+    For the Decisions list read with ``design_options_v1`` (section D), on a
+    read-only connection to the Project's own store. Each entry is read from
+    a card's ``design_options_declared`` and ``design_option_chosen`` events:
+    the Project's name and slug, the question, the chosen ``n`` and
+    ``chosen_at``, and every option with its sentence and its picture. At
+    most :data:`RECENT_LIMIT` are returned.
+    """
+    from hermes_cli.owner_workspace import owner_project_name
+
+    entries = list(recent)
+    for task_id, payload in conn.execute(
+        "SELECT e.task_id, e.payload FROM task_events e JOIN tasks t ON t.id = e.task_id "
+        "WHERE t.project_id = ? AND e.kind = ? ORDER BY e.id DESC LIMIT ?",
+        (str(project["project_id"]), CHOSEN_EVENT, RECENT_LIMIT),
+    ).fetchall():
+        declared = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id LIMIT 1",
+            (task_id, DECLARED_EVENT),
+        ).fetchone()
+        if declared is None:
+            continue
+        chosen, offered = json.loads(payload), json.loads(declared[0])
+        entries.append({
+            "project_slug": str(project["slug"]),
+            "project_name": owner_project_name(project["name"]),
+            "question": offered["question"],
+            "n": chosen["n"],
+            "chosen_at": chosen["chosen_at"],
+            "options": [
+                {
+                    "n": option["n"],
+                    "sentence": option["sentence"],
+                    "picture": {
+                        "attachment_id": option["pictures"][0]["attachment_id"],
+                        "alt": option["pictures"][0]["alt"],
+                    },
+                }
+                for option in offered["options"]
+            ],
+        })
+    entries.sort(key=lambda entry: entry["chosen_at"], reverse=True)
+    return entries[:RECENT_LIMIT]

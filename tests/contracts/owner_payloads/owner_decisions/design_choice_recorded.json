@@ -1,0 +1,9 @@
+{
+  "body": {
+    "decision_ref": "decision_2ee3d445ac7178ed5ee231e781515086",
+    "n": 2,
+    "object": "hermes.owner_workspace.design_choice",
+    "released": true
+  },
+  "status": 200
+}

@@ -6959,6 +6959,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "/v1/owner-workspace/decisions/{ref}/inputs/{n}",
                 __import__("gateway.platforms.api_server_owner_inputs", fromlist=["route"]).route(self),
             ),
+            ("POST", "/v1/owner-workspace/decisions/{ref}/choose/{n}", __import__("gateway.platforms.api_server_owner_choices", fromlist=["route"]).route(self)),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -13259,6 +13260,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=404,
                 )
             from hermes_cli.owner_workspace import (
+                DESIGN_OPTIONS_CAPABILITY,
                 OWNER_INPUT_UPLOAD_CAPABILITY,
                 OWNER_WAITING_CAPABILITY,
                 list_owner_decisions,
@@ -13279,6 +13281,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, OWNER_INPUT_UPLOAD_CAPABILITY
             ):
                 waiting["owner_input_upload"] = True
+            # The same for design_options_v1 and its keyword (design options card 2).
+            if _owner_workspace_capability_requested(request, DESIGN_OPTIONS_CAPABILITY):
+                waiting["design_options"] = True
             owner = resolve_owner_context()
             projected = list_owner_decisions(owner, **waiting)
             decisions = list(projected["data"])
@@ -13347,6 +13352,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # everything Raphael is waiting on.
             "truncated": truncated or len(decisions) > 100,
             "data": decisions[:100],
+            **({"recent_design_choices": projected["recent_design_choices"]} if "recent_design_choices" in projected else {}),
         })
 
     async def _handle_owner_workspace_suggestion_decision(
