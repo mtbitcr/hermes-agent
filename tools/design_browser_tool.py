@@ -6,6 +6,9 @@ uploads, downloads, form posts, scripts of the model's choosing or raw CDP.
 
 Where it looks:
 
+* Only when the board and role gate (:mod:`tools.design_access`, plan v2 B4) allows it, checked
+  first at every call: a kanban task on a board in ``design_browser.boards``, its current run,
+  and a design role. The builder may open only its own build's preview host.
 * Only the browser at ``design_browser.cdp_url``, found through that address's ``/json/version``.
   A failed discovery is "browser unavailable"; the configured address itself is never connected to.
   It never reads ``browser.cdp_url`` or ``BROWSER_CDP_URL`` and never starts or borrows a browser
@@ -58,6 +61,7 @@ from agent.tool_dispatch_helpers import _maybe_wrap_untrusted
 from tools.browser_supervisor import SUPERVISOR_REGISTRY, CDPSupervisor
 from tools.browser_supervisor_dialogs import DIALOG_POLICY_AUTO_DISMISS
 from tools.browser_supervisor_navguard import NavigationGuard
+from tools.design_access import check_design_access
 from tools.design_url_policy import design_url_refusal
 from tools.registry import registry, tool_error
 
@@ -728,18 +732,22 @@ def _invalid(args: Dict[str, Any]) -> Optional[str]:
 
 def design_browser(args: Dict[str, Any], task_id: Optional[str] = None) -> Any:
     """Handler. Never calls another tool or the registry."""
-    # ── B4's board and role gate goes here, before anything else runs. ──
+    config = _design_config()
+    access = check_design_access(config)
+    if not access.allowed:
+        return tool_error("design browser refused: " + access.reason)
 
     args = args if isinstance(args, dict) else {}
     problem = _invalid(args)
     if problem:
         return tool_error(problem)
     action = args["action"]
-    config = _design_config()
     address = _configured_address(config)
     if not address:
         return tool_error("the design browser is not configured (design_browser.cdp_url is empty)")
     hosts = _allowed_hosts(config)
+    if access.builder_host is not None:
+        hosts = [access.builder_host]  # the builder sees only its own build's preview
     if action == "open":
         reason = design_url_refusal(args["url"].strip(), hosts)
         if reason is not None:
