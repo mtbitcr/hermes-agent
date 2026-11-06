@@ -40,6 +40,9 @@ SCHEMA_VERSION = 1
 DECLARED_EVENT = "design_options_declared"
 # The task event that records the owner's choice (card 2).
 CHOSEN_EVENT = "design_option_chosen"
+# The task events that leave a waiting card's hold as it is: a comment or an
+# attachment. Any other later event ends the hold its declaration made.
+_HOLD_KEEPING_EVENTS = frozenset({"commented", "attached"})
 # How many decided design choices the Decisions list returns (section D).
 RECENT_LIMIT = 10
 # The one owner reason of the hold. It passes the owner text policy
@@ -219,45 +222,64 @@ def declare_design_options(
     return True
 
 
+def _waiting_declarations(conn: sqlite3.Connection, task_ids: list[str]) -> dict[str, dict]:
+    """The declaration of each of *task_ids* whose declared hold is still its current hold.
+
+    The declared hold is the ``needs_input`` hold written in the declaration's
+    own transaction, so the card's next event after its declaration. It is
+    current while the card is still held ``needs_input`` and each later event
+    of the card, in id order, is a comment or an attachment. Any other later
+    event ends it, a choice included, and a card it cannot be shown for is
+    left out.
+    """
+    if not task_ids:
+        return {}
+    declared: dict[str, dict] = {}
+    later: dict[str, list[str]] = {}
+    for task_id, kind, payload in conn.execute(
+        "SELECT task_id, kind, payload FROM task_events "
+        "WHERE task_id IN (SELECT id FROM tasks WHERE status = 'blocked' "
+        "AND block_kind = 'needs_input' AND task_kind = 'work' "
+        "AND id IN (" + ", ".join("?" for _ in task_ids) + ")) ORDER BY id",
+        task_ids,
+    ).fetchall():
+        if str(task_id) in declared:
+            later[str(task_id)].append(kind)
+        elif kind == DECLARED_EVENT:
+            declared[str(task_id)], later[str(task_id)] = json.loads(payload), []
+    return {
+        task_id: payload for task_id, payload in declared.items()
+        if later[task_id][:1] == ["blocked"]
+        and all(kind in _HOLD_KEEPING_EVENTS for kind in later[task_id][1:])
+    }
+
+
 def decision_design_options(conn: sqlite3.Connection, task_ids: list[str]) -> dict[str, dict]:
     """The design options each of *task_ids* waits for the owner to choose from.
 
     For the Decisions feed read with ``design_options_v1`` (card 2), on a
     read-only connection to the cards' own store: the declaration payload of
-    each card held ``needs_input`` that declared options and has no recorded
-    choice, the section A object as declared, so exactly the cards
-    :func:`accept_choice` takes a choice for. A card without one is left out
-    and stays today's item. Read from the events only: a picture that can no
-    longer be read is the app's to show as such (section B).
+    each card whose declared hold is still its current hold, the section A
+    object as declared, so exactly the cards :func:`accept_choice` takes a
+    choice for. Options are listed only while the ``needs_input`` hold their
+    declaration made lasts: a release, a move, a new claim, an archive, a
+    completion or any later block ends it for good, and a comment or an
+    attachment does not. A card without one is left out and stays today's
+    item. Read from the events only: a picture that can no longer be read is
+    the app's to show as such (section B).
     """
-    if not task_ids:
-        return {}
-    declared: dict[str, dict] = {}
-    chosen: set[str] = set()
-    for task_id, kind, payload in conn.execute(
-        "SELECT task_id, kind, payload FROM task_events WHERE kind IN (?, ?) "
-        "AND task_id IN (SELECT id FROM tasks WHERE status = 'blocked' "
-        "AND block_kind = 'needs_input' AND task_kind = 'work' "
-        "AND id IN (" + ", ".join("?" for _ in task_ids) + ")) ORDER BY id",
-        (DECLARED_EVENT, CHOSEN_EVENT, *task_ids),
-    ).fetchall():
-        if kind == CHOSEN_EVENT:
-            chosen.add(str(task_id))
-        else:
-            declared.setdefault(str(task_id), json.loads(payload))
-    return {
-        task_id: payload for task_id, payload in declared.items()
-        if task_id not in chosen
-    }
+    return _waiting_declarations(conn, task_ids)
 
 
 def accept_choice(conn: sqlite3.Connection, task_id: str, n: int, *, actor: str) -> str:
     """Record the owner's choice of option *n* on a waiting designer card.
 
     For the owner choose route (card 2), which resolved *task_id* through the
-    owner's own Decisions feed. In one write transaction on *conn*: the card
-    must still be held ``needs_input``, with a declaration that offers option
-    *n* and no recorded choice; one ``design_option_chosen`` event
+    owner's own Decisions feed. In one write transaction on *conn*: the
+    ``needs_input`` hold the card's declaration made must still be its current
+    hold, by the rule :func:`decision_design_options` lists by, so a card held
+    again after that hold ended never takes a choice; the declaration must
+    offer option *n*; one ``design_option_chosen`` event
     ``{n, sentence, attachment_id, actor, chosen_at}`` is written; *actor*
     comments on the card in plain words; and the card is released as
     ``unblock_task`` releases it, to todo while a parent is not done.
@@ -271,16 +293,10 @@ def accept_choice(conn: sqlite3.Connection, task_id: str, n: int, *, actor: str)
 
     now = int(time.time())
     with kanban_db.write_txn(conn):
-        held = conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ? AND status = 'blocked' "
-            "AND block_kind = 'needs_input' AND task_kind = 'work'",
-            (task_id,),
-        ).fetchone()
-        events = kanban_db.list_events(conn, task_id) if held else []
-        declared = _declarations(events)
+        declared = _waiting_declarations(conn, [task_id]).get(task_id)
         option = next(
-            (option for option in declared[0]["options"] if option["n"] == n), None,
-        ) if declared and all(event.kind != CHOSEN_EVENT for event in events) else None
+            (option for option in declared["options"] if option["n"] == n), None,
+        ) if declared else None
         if option is None:
             return "not_waiting"
         kanban_db._append_event(conn, task_id, CHOSEN_EVENT, {

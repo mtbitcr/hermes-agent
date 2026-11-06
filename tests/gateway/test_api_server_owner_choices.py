@@ -38,6 +38,8 @@ from tests.gateway.test_api_server_owner_suggestion_decisions import (  # noqa: 
     owner,
 )
 from tests.hermes_cli.test_owner_design_choices import ALTS, JPEG, PNG, QUESTION, SENTENCES, WEBP
+# The owner's approval of a move, as the owner move tests give it.
+from tests.hermes_cli.test_owner_workspace import _with_approver
 
 _ROUTE = "/v1/owner-workspace/decisions/{ref}/choose/{n}"
 _FEED = "/v1/owner-workspace/decisions"
@@ -267,6 +269,79 @@ async def test_5_a_card_held_again_after_the_choice_never_takes_a_second_choice(
     _assert_refused(again, 404, _NOT_WAITING, "decision_not_found")
     assert _observed(card) == held
     assert [entry["n"] for entry in held["chosen"]] == [3]
+
+
+def _owner_move_to_ready(owner: ow.OwnerContext, card) -> None:
+    """The owner's own move of the held *card* to ready, through the real owner kernel and its approval."""
+    mover = ow.OwnerContext(actor=owner.actor, profile=owner.profile, session="run_owner_choices")
+    with contextlib.closing(kb.connect(board=card.board)) as conn:
+        revision = kb.task_event_revision(conn, card.task_id)
+    approver = _with_approver(mover.session)
+    moved = ow.move_task(
+        mover, idempotency_key="move-blocked-to-ready", task_id=card.task_id, to_status="ready",
+        expected_status="blocked", expected_revision=revision, project_id=card.project_id,
+    )
+    approver.join()
+    assert (moved["ok"], moved["status"]) == (True, "ready")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("release", ["unblock_task", "owner_move"])
+async def test_5_a_card_released_and_held_again_for_another_question_no_longer_offers_its_options(owner, release):
+    """The options belong to the hold their declaration made. Released by unblock_task or by the owner's own move to
+    ready, claimed by a new run and held again for another answer, the card is listed as today's plain item, and a
+    choice on its key is refused, with no key or a fresh one, and changes nothing."""
+    project = _project(owner, "Bakery Website")
+    card = _designer_card(project)
+    async with TestClient(TestServer(_app())) as client:
+        ref = await _ref(client, card)
+        if release == "unblock_task":
+            with contextlib.closing(kb.connect(board=card.board)) as conn:
+                assert kb.unblock_task(conn, card.task_id)
+        else:
+            _owner_move_to_ready(owner, card)
+        with contextlib.closing(kb.connect(board=card.board)) as conn:
+            assert kb.claim_task(conn, card.task_id) is not None
+            assert kb.block_task(conn, card.task_id, reason="Which date should we use?", kind="needs_input")
+        held = _observed(card)
+        _status, _raw, feed = await _feed(client, "design_options_v1")
+        answers = [
+            await _choose(client, ref, 2),
+            await _choose(client, ref, 2, {"Idempotency-Key": f"choice-{release}-" + "4b7e0c93" * 4}),
+        ]
+
+    (item,) = feed["data"]
+    assert (item["decision_ref"], item["kind"]) == (ref, "owner_input") and "design_options" not in item
+    for answer in answers:
+        _assert_refused(answer, 404, _NOT_WAITING, "decision_not_found")
+    assert _observed(card) == held
+    assert (held["status"], held["block_kind"], held["chosen"], held["comments"]) == ("blocked", "needs_input", [], [])
+
+
+@pytest.mark.asyncio
+async def test_5_a_comment_on_the_waiting_card_keeps_its_options_and_the_choice_releases_it(owner):
+    """A comment written while the card waits does not end the hold its declaration made: the options stay listed,
+    and the choice is recorded and releases the card."""
+    project = _project(owner, "Bakery Website")
+    card = _designer_card(project)
+    async with TestClient(TestServer(_app())) as client:
+        ref = await _ref(client, card)
+        with contextlib.closing(kb.connect(board=card.board)) as conn:
+            kb.add_comment(conn, card.task_id, owner.actor, "Please keep the logo at the top.")
+        _status, _raw, feed = await _feed(client, "design_options_v1")
+        chosen = await _choose(client, ref, 2)
+
+    (item,) = feed["data"]
+    seen = _observed(card)
+    assert item["decision_ref"] == ref and item["design_options"] == seen["declared"][0]
+    assert chosen == (200, {
+        "object": "hermes.owner_workspace.design_choice", "decision_ref": ref, "n": 2, "released": True,
+    })
+    assert [entry["n"] for entry in seen["chosen"]] == [2]
+    assert seen["comments"] == [
+        (owner.actor, "Please keep the logo at the top."), (owner.actor, f"The owner chose option 2: {SENTENCES[1]}"),
+    ]
+    assert (seen["status"], seen["unblocked"]) == ("ready", 1)
 
 
 @pytest.mark.asyncio
