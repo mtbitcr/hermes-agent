@@ -23,7 +23,16 @@ One call names one ``attachment_id``, and the image comes back to the agent's na
    - The whole image must decode.
    The byte sniff and the full-decode check come from ``tools.vision_tools_image_prep`` (O7).
 4. What is shown is a newly encoded JPEG copy made by the design browser's ``_embedded``: at
-   most 1,568 px on its long side and 1.5 MB. The stored bytes are never returned.
+   most 1,568 px on its long side and 1.5 MB. The stored bytes are never returned. That encoder
+   assumes an opaque, upright, 8-bit sRGB picture, so any other picture is first made one, as an
+   image viewer shows it:
+   - An EXIF orientation is applied.
+   - 16-bit grey is scaled to 8 bits.
+   - An ICC profile that ImageCms reads is converted to sRGB.
+   - Transparency is laid over a fixed grey checkerboard. This covers an alpha channel, a
+     palette's tRNS and a tRNS colour key. The checkerboard is drawn after the picture is fitted
+     to the embed size, so its squares stay crisp.
+   The summary's ``note`` says when the orientation or the transparency was normalized.
 
 The tool is strictly read-only and writes no attachment, event or comment. Every refusal is a
 plain tool error, and the handler never raises.
@@ -35,7 +44,7 @@ import base64
 import io
 import json
 import logging
-from typing import Any, Dict, Union
+from typing import Any, Dict, List, Tuple, Union
 
 from tools.design_access import check_design_access
 from tools.design_browser_tool import MAX_EMBED_BYTES, MAX_EMBED_SIDE, _design_config, _embedded
@@ -49,6 +58,8 @@ MAX_STORED_BYTES = 10 * 1024 * 1024
 MAX_SIDE = 8000
 MAX_PIXELS = 40_000_000
 _MIME = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}  # by Pillow format name
+_SQUARE = 16  # px at the embed size: the checkerboard transparent areas are shown on
+_GREYS = (102, 153)  # its two mid-greys, so black and white shapes both stand out on either square
 
 
 def kanban_view_image(args: Dict[str, Any], **_kw) -> Union[str, Dict[str, Any]]:
@@ -126,13 +137,16 @@ def _view(args: Dict[str, Any]) -> Union[str, Dict[str, Any]]:
         return tool_error(f"attachment {attachment_id} does not decode completely; nothing is shown")
 
     with Image.open(io.BytesIO(data), formats=[fmt]) as image:
-        embedded = _embedded(image)
+        looks, notes = _as_it_looks(image)
+        embedded = _embedded(looks)
     if embedded is None or max(embedded[1]) > MAX_EMBED_SIDE or len(embedded[0]) > MAX_EMBED_BYTES:
         return tool_error(f"attachment {attachment_id} could not be made small enough to show; nothing is shown")
 
     summary = {"ok": True, "attachment_id": att.id, "task_id": att.task_id, "filename": att.filename,
                "type": found, "width": width, "height": height, "stored_bytes": len(data),
                "embedded": f"{embedded[1][0]}x{embedded[1][1]} JPEG"}
+    if notes:
+        summary["note"] = "; ".join(notes)
     text = json.dumps(summary)
     return {
         "_multimodal": True,
@@ -145,6 +159,70 @@ def _view(args: Dict[str, Any]) -> Union[str, Dict[str, Any]]:
         "text_summary": text,
         "meta": {"attachment_id": att.id, "native_vision": True},
     }
+
+
+def _as_it_looks(image) -> Tuple[Any, List[str]]:
+    """``image`` as a viewer shows it: the opaque, upright, 8-bit sRGB picture the imported encoder
+    assumes, with a note for each orientation or transparency applied. A picture that already is
+    one is returned as it is."""
+    from PIL import ExifTags, Image, ImageOps
+
+    notes = []
+    icc = image.info.get("icc_profile")
+    raw = image.tile[0][3] if image.tile else None  # how the pixels are stored, known until they are decoded
+    if raw in ("L;2", "L;4") and isinstance(image.info.get("transparency"), int):
+        # 2- or 4-bit grey: Pillow scales its pixels to 8 bits, but not its tRNS colour key
+        image.info["transparency"] *= 85 if raw == "L;2" else 17
+    try:
+        orientation = image.getexif().get(ExifTags.Base.Orientation)
+        upright = ImageOps.exif_transpose(image) if orientation in range(2, 9) else None
+    except Exception:  # EXIF that Pillow cannot read: shown as stored
+        upright = None
+    if upright is not None:
+        image = upright
+        notes.append("EXIF orientation applied")
+    if image.mode.startswith("I"):  # 16-bit grey, which a plain conversion clips at 255
+        wide, key = image.convert("I"), image.info.get("transparency")
+        image = wide.point([round(v / 257) for v in range(65536)], "L")
+        if isinstance(key, int):  # its tRNS colour key, as an alpha channel
+            image.putalpha(wide.point([0 if v == key else 255 for v in range(65536)], "L"))
+    grey = image.mode in ("1", "L", "LA")
+    alpha = None
+    if image.has_transparency_data:  # an alpha channel, a palette's tRNS or a tRNS colour key
+        image = image.convert("LA" if grey else "RGBA")
+        if image.getchannel("A").getextrema()[0] < 255:
+            longest = max(image.size)
+            if longest > MAX_EMBED_SIDE:  # fitted as the encoder fits it: the squares are drawn at the embed size
+                scale = MAX_EMBED_SIDE / longest
+                image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                                     Image.LANCZOS)
+            alpha = image.getchannel("A")
+            notes.append("transparent areas shown on a grey checkerboard")
+        image = image.convert("L" if grey else "RGB")
+    if icc:
+        try:
+            from PIL import ImageCms
+
+            colours = image if image.mode in ("L", "RGB", "CMYK") else image.convert("L" if grey else "RGB")
+            image = ImageCms.profileToProfile(colours, ImageCms.ImageCmsProfile(io.BytesIO(icc)),
+                                              ImageCms.createProfile("sRGB"), outputMode="RGB")
+        except Exception:  # a profile ImageCms cannot read or apply: the pixels as they are
+            pass
+    if alpha is not None:
+        board = _checkerboard(image.size).convert(image.mode)
+        board.paste(image, mask=alpha)
+        image = board
+    return image, notes
+
+
+def _checkerboard(size: Tuple[int, int]):
+    """The fixed checkerboard of ``size``, its squares counted from the top left corner."""
+    from PIL import Image
+
+    columns, rows = -(-size[0] // _SQUARE), -(-size[1] // _SQUARE)
+    squares = Image.new("L", (columns, rows))
+    squares.putdata([_GREYS[(x + y) % 2] for y in range(rows) for x in range(columns)])
+    return squares.resize((columns * _SQUARE, rows * _SQUARE), Image.NEAREST).crop((0, 0, *size))
 
 
 KANBAN_VIEW_IMAGE_SCHEMA = {
