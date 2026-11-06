@@ -433,6 +433,17 @@ TOOLSETS = {
         "includes": [],
     },
 
+    # Opt-in only: no bundle, posture or core list reaches it. A design role
+    # names it explicitly (design-loop plan v2, B3).
+    "design_vision": {
+        "description": (
+            "Look-only design browser (open, screenshot, read_text, set_viewport "
+            "on allowed addresses) and kanban image viewing, for design review"
+        ),
+        "tools": ["design_browser", "kanban_view_image"],
+        "includes": [],
+    },
+
     "discord": {
         "description": "Discord read and participate tools (fetch messages, search members, create threads)",
         "tools": ["discord"],

@@ -6,6 +6,8 @@
 - systemd unit properties through the user manager, free disk, and the state snapshots' names
   and sizes;
 - whether the platform environment can be synced, and the full size of its real folder;
+- what the platform environment does not hold of the checkout's lock, compared as the readback
+  compares it (G12);
 - the open runs on every board;
 - digests of the configuration set (S-D), live and in the named configuration snapshot (S-C).
 
@@ -53,6 +55,8 @@ from hermes_cli.kanban_db import (
 from hermes_cli.managed_uv import resolve_uv
 from hermes_cli.profiles import profiles_to_serve
 from hermes_cli.release_guards import OpenRun
+from hermes_cli.release_host_actions import SYNC_EXTRAS, lock_differences
+from hermes_cli.release_runner import EnvironmentUnreadable
 from hermes_cli.update_receipt import collect_fleet_versions
 from hermes_constants import get_default_hermes_root
 
@@ -136,7 +140,8 @@ class LiveHostReader:
     the merged `Pins.snapshot`. `named_config_snapshot` takes no argument, so the reader has to
     be told which configuration snapshot is the named one. `venv_dir` is the platform
     environment: a link to the one real folder the release copies and syncs, or None when no
-    environment is set.
+    environment is set. `extras` are the sync extras, which G12 compares with the lock as the
+    readback does.
     """
 
     def __init__(
@@ -148,6 +153,7 @@ class LiveHostReader:
         snapshot_root: Path,
         snapshot_name: str,
         venv_dir: Path | None = None,
+        extras: Sequence[str] = SYNC_EXTRAS,
     ) -> None:
         self.checkout = Path(checkout)
         self.root_home = Path(root_home)
@@ -155,6 +161,7 @@ class LiveHostReader:
         self.snapshot_root = Path(snapshot_root)
         self.snapshot_name = snapshot_name
         self.venv_dir = None if venv_dir is None else Path(venv_dir)
+        self.extras = tuple(extras)
 
     # The checkout and its history.
 
@@ -272,6 +279,16 @@ class LiveHostReader:
             return _regular_bytes(real)
         except OSError:
             return None
+
+    def environment_lock_differences(self) -> Sequence[str]:
+        # G12: the readback's own comparison, of release_host_actions, asked before the first stop.
+        uv = resolve_uv()
+        if uv is None:
+            raise EnvironmentUnreadable("uv is not in the Hermes home's bin folder")
+        real = self._environment()
+        if real is None:
+            raise EnvironmentUnreadable("the platform environment is not found")
+        return lock_differences(uv, real, self.checkout, self.extras)
 
     def _environment(self) -> Path | None:
         """The real folder the venv_dir link names, when it holds an environment."""
