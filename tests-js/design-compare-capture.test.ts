@@ -298,29 +298,31 @@ describe('probe canonical scroll state and native motion freeze', () => {
 const REFUSAL = 'unsupported content: the kit captures single documents only'
 
 describe('single documents only', () => {
-  const tag = (localName: string, extra: Record<string, unknown> = {}) => ({ localName, ...extra })
-  const shadow = (...kids: FakeNode[]) => ({ querySelectorAll: () => kids })
+  const node = (nodeName: string, extra: Record<string, unknown> = {}) => ({ nodeName, ...extra })
+  const root = (...children: unknown[]) => node('#document', { children: [node('HTML', { children: [node('HEAD'), node('BODY', { children })] })] })
 
-  const probeOf = (...page: FakeNode[]) =>
-    runInNewContext(probeSource, { window: {}, document: { createElement: () => ({}), documentElement: {}, body: { querySelectorAll: () => page } } })
-
-  it('refuses an iframe, frame, fencedframe, object or embed element and names it', () => {
+  it('refuses an iframe, frame, fencedframe, object or embed element in any case and names it in lower case', () => {
     for (const name of ['iframe', 'frame', 'fencedframe', 'object', 'embed']) {
-      const page = probeOf(tag('h1'), tag(name))
-      expect(() => page.assertSingleDocument(), name).toThrow(`${REFUSAL}: found <${name}>`)
+      for (const written of [name, name.toUpperCase()]) {
+        expect(() => kit.assertNoEmbeddingElements(root(node('H1'), node(written))), written).toThrow(`${REFUSAL}: found <${name}>`)
+      }
     }
   })
 
-  it('finds the element inside an open shadow root, also a nested one', () => {
-    expect(() => probeOf(tag('div', { shadowRoot: shadow(tag('p'), tag('iframe')) })).assertSingleDocument()).toThrow(`${REFUSAL}: found <iframe>`)
-    expect(() => probeOf(tag('div', { shadowRoot: shadow(tag('section', { shadowRoot: shadow(tag('embed')) })) })).assertSingleDocument()).toThrow(`${REFUSAL}: found <embed>`)
+  it('finds the element in the head, beside the body, and in an open, nested or closed shadow root', () => {
+    const html = (...children: unknown[]) => node('#document', { children: [node('HTML', { children })] })
+    expect(() => kit.assertNoEmbeddingElements(html(node('HEAD', { children: [node('OBJECT')] }), node('BODY')))).toThrow(`${REFUSAL}: found <object>`)
+    expect(() => kit.assertNoEmbeddingElements(html(node('HEAD'), node('BODY'), node('EMBED')))).toThrow(`${REFUSAL}: found <embed>`)
+    expect(() => kit.assertNoEmbeddingElements(html(node('HEAD', { children: [node('DIV', { shadowRoots: [node('#document-fragment', { shadowRootType: 'open', children: [node('IFRAME')] })] })] })))).toThrow(`${REFUSAL}: found <iframe>`)
+    expect(() => kit.assertNoEmbeddingElements(root(node('DIV', { shadowRoots: [node('#document-fragment', { shadowRootType: 'open', children: [node('SECTION', { shadowRoots: [node('#document-fragment', { shadowRootType: 'open', children: [node('EMBED')] })] })] })] })))).toThrow(`${REFUSAL}: found <embed>`)
+    expect(() => kit.assertNoEmbeddingElements(root(node('DIV', { shadowRoots: [node('#document-fragment', { shadowRootType: 'closed', children: [node('OBJECT')] })] })))).toThrow(`${REFUSAL}: found <object>`)
   })
 
   it('passes a page without such an element, also with an img, svg, canvas and video', () => {
-    const plain = ['html', 'h1', 'p', 'a', 'img', 'svg', 'canvas', 'video', 'input', 'picture', 'source'].map(n => tag(n))
-    expect(() => probeOf().assertSingleDocument()).not.toThrow()
-    expect(() => probeOf(...plain).assertSingleDocument()).not.toThrow()
-    expect(() => probeOf(tag('div', { shadowRoot: shadow(...plain) })).assertSingleDocument()).not.toThrow()
+    const plain = ['H1', 'P', 'A', 'IMG', 'svg', 'CANVAS', 'VIDEO', 'INPUT', 'PICTURE', 'SOURCE'].map(n => node(n))
+    expect(() => kit.assertNoEmbeddingElements(root())).not.toThrow()
+    expect(() => kit.assertNoEmbeddingElements(root(...plain))).not.toThrow()
+    expect(() => kit.assertNoEmbeddingElements(root(node('DIV', { shadowRoots: [node('#document-fragment', { shadowRootType: 'open', children: plain })] })))).not.toThrow()
   })
 
   it('refuses a page whose frame tree holds a child frame, by url or by id, and passes a lone main frame', () => {
@@ -1350,6 +1352,30 @@ addEventListener('scroll', () => { if (scrollY > 0 && !document.querySelector('i
   it('refuses a prototype with an embedded document, by the same sentence', async () => {
     const run = await embeddedLaunches.prototype()
     expect(run.error?.message).toBe(`${REFUSAL}: found <iframe>`)
+    expect(readdirSync(run.outDir)).toEqual([])
+  }, 120_000)
+
+  // The whole document is read through the DevTools Protocol, so an element outside the body is refused as well: in the head, in an open shadow root that a head
+  // element hosts, as a sibling of body, and in a closed shadow root. Resource-free elements that a script appends are enough.
+  const outsideBody = (script: string, body = '<h1>Single</h1>') => `<!doctype html><head><script>${script}</script></head><body>${body}</body>`
+  const append = (tag: string) => `document.createElement('${tag}')`
+
+  const outsideCases = ['object', 'embed'].flatMap(tag => [
+    ['in the head', outsideBody(`document.head.appendChild(${append(tag)})`)],
+    ['in an open shadow root hosted in the head', outsideBody(`const h = document.createElement('div'); document.head.appendChild(h); h.attachShadow({ mode: 'open' }).appendChild(${append(tag)})`)],
+    ['as a sibling of body', outsideBody(`document.documentElement.appendChild(${append(tag)})`)],
+  ].flatMap(([where, html]) => [
+    { name: `${tag} ${where}`, tag, side: 'candidate', html },
+    { name: `${tag} ${where}`, tag, side: 'prototype', html },
+  ]))
+
+  const closedCase = { name: 'object in a closed shadow root', tag: 'object', side: 'candidate', html: outsideBody('', `<h1>Single</h1><div id=h></div><script>h.attachShadow({ mode: 'closed' }).appendChild(${append('object')})</script>`) }
+
+  const outsideLaunches = new Map([...outsideCases, closedCase].map(c => [c, memo(() => (c.side === 'candidate' ? launchPages({ outside: c.html }) : launchPrototype(c.html)))]))
+
+  it.each([...outsideCases, closedCase])('refuses a $side page with an $name, by the same sentence', async c => {
+    const run = await outsideLaunches.get(c)!()
+    expect(run.error?.message).toBe(`${REFUSAL}: found <${c.tag}>`)
     expect(readdirSync(run.outDir)).toEqual([])
   }, 120_000)
 

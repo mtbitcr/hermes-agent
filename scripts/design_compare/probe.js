@@ -87,7 +87,6 @@
     const hit = items.find(({ el }) => EMBEDDING.has(el.localName))
     if (hit) throw new Error(`unsupported content: the kit captures single documents only: found <${hit.el.localName}>`)
   }
-  const assertSingleDocument = () => refuseEmbedding(collect().items)
 
   // The early script already normalised every document and shadow root before page code ran; a scope it did not reach cannot be trusted, so refuse.
   // Elements whose author inline !important was added late are caught up here.
@@ -263,5 +262,5 @@
     if (p === 'fixed' || p === 'sticky') el.style.setProperty('visibility', 'hidden', 'important')
   })
 
-  return { normalize, landmarksOf, firstFamily, familyName, hiddenByOpacity, prepare, fontsReady, measure, settle, hidePinned, toTop, atTop, scrollToTop, assertTop, boxOf, freeze, freezeNative, dataUrls, assertSingleDocument }
+  return { normalize, landmarksOf, firstFamily, familyName, hiddenByOpacity, prepare, fontsReady, measure, settle, hidePinned, toTop, atTop, scrollToTop, assertTop, boxOf, freeze, freezeNative, dataUrls }
 })()

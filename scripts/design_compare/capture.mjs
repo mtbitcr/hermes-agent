@@ -276,6 +276,15 @@ export function assertNoChildFrames(frameTree) {
   if (child) throw new Error(`${REFUSAL}: found a frame ${child.frame.url || child.frame.id}`)
 }
 
+const EMBEDDING = new Set(['iframe', 'frame', 'fencedframe', 'object', 'embed'])
+
+// Walks a pierced CDP DOM tree (the head, every child of html, open and closed shadow roots); an element that embeds another document refuses the capture.
+export function assertNoEmbeddingElements(node) {
+  const name = String(node.nodeName).toLowerCase()
+  if (EMBEDDING.has(name)) throw new Error(`${REFUSAL}: found <${name}>`)
+  for (const kid of [...(node.shadowRoots || []), ...(node.children || [])]) assertNoEmbeddingElements(kid)
+}
+
 const shortUrl = url => (url.length > 60 ? `${url.slice(0, 60)}…` : url)
 
 export function assertNoAnimatedResources(found, unreadable, unprovable = []) {
@@ -523,8 +532,7 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
     // The DOM and the frame tree are both read each time, so a frame that cannot be read, or is attached out of process, is refused as well.
     const assertSingleDocument = async () => {
       if (embedded) throw embedded
-      const refusal = await run(`(() => { try { ${probe}.assertSingleDocument(); return '' } catch (e) { return e.message } })()`)
-      if (refusal) throw new Error(refusal)
+      assertNoEmbeddingElements((await t.send('DOM.getDocument', { depth: -1, pierce: true })).root)
       assertNoChildFrames((await t.send('Page.getFrameTree')).frameTree)
     }
     await assertSingleDocument()
