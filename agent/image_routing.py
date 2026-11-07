@@ -290,6 +290,13 @@ def _probe_models_dev(provider: str, model: str, cfg: Optional[Dict[str, Any]]) 
     return None if caps is None else bool(caps.supports_vision)
 
 
+def _probe_native_claude(provider: str, model: str, cfg: Optional[Dict[str, Any]]) -> Optional[bool]:
+    """Main-route verdict: every ``claude-`` model on the ``anthropic`` provider sees images, so a
+    model the catalog does not list yet keeps its tool pictures. Runs after the catalog, whose
+    explicit False still wins; any other provider gets None."""
+    return True if _clean_str(provider).lower() == "anthropic" and _clean_str(model).startswith("claude-") else None
+
+
 def _probe_ollama(provider: str, model: str, cfg: Optional[Dict[str, Any]]) -> Optional[bool]:
     """Ollama ``/api/show`` verdict for local endpoints (see :func:`_should_probe_ollama_vision`)."""
     base_url = _resolve_inference_base_url(cfg, provider)
@@ -308,6 +315,7 @@ def _probe_ollama(provider: str, model: str, cfg: Optional[Dict[str, Any]]) -> O
 _VISION_PROBES: Tuple[Tuple[str, Callable[..., Optional[bool]]], ...] = (
     ("managed-runtime caps lookup", _probe_managed_runtime),
     ("caps lookup", _probe_models_dev),
+    ("native claude fallback", _probe_native_claude),
     ("ollama vision probe", _probe_ollama),
 )
 
@@ -322,7 +330,8 @@ def _lookup_supports_vision(
     """Return True/False if vision capability can be resolved, None if unknown.
 
     Order: config ``supports_vision`` override → :data:`_VISION_PROBES`
-    (managed local runtime → models.dev catalog → Ollama probe).
+    (managed local runtime → models.dev catalog → ``anthropic`` ``claude-`` models →
+    Ollama probe).
     """
     # Named custom providers are canonicalized to ``provider="custom"``; the
     # original name lives in the context-local main runtime. Borrow it only on an
