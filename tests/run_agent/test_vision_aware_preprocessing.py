@@ -161,6 +161,9 @@ class TestModelSupportsVision:
     def test_none_caps_returns_false(self):
         agent = _make_agent()
         with patch("agent.models_dev.get_model_capabilities", return_value=None):
+            assert agent._model_supports_vision() is True
+            agent.provider = "custom"
+            agent.model = "my-text-model"
             assert agent._model_supports_vision() is False
 
 
