@@ -181,14 +181,17 @@ export function animatedResource(buf, mime = '') {
 const SVG_ELEMENTS = ['svg', 'g', 'defs', 'title', 'desc', 'path', 'rect', 'circle', 'ellipse', 'line', 'polyline', 'polygon', 'text', 'tspan',
   'linearGradient', 'radialGradient', 'stop', 'clipPath', 'mask', 'pattern']
 
-// Runs in a blank browser page, never in the captured page: parses the exact bytes of an SVG resource with the browser's own XML parser (so character
-// references and entities are decoded) and passes only a document without parse errors, processing instructions, unlisted elements, style attributes
-// or on* attributes. Nothing in such a document can start a timeline, and CSS is not parsed at all.
-const svgIsOnAllowlist = (base64, allowed) => {
+// Runs in a blank browser page, never in the captured page: parses the COMPLETE bytes of a resource with the browser's own XML parser (so prologs, comments,
+// doctypes, character references and entities are decoded by the browser, not guessed at) and says whether the resource may pass. An SVG passes only without
+// processing instructions, unlisted elements, style attributes or on* attributes; nothing in such a document can start a timeline, and CSS is not parsed at all.
+// Bytes that are not well-formed XML cannot be classified, so they are refused when `claimsXml` says the browser may still show them as an SVG or XML document.
+const svgMayPass = (base64, allowed, claimsXml) => {
   const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0))
-  const encoding = bytes[0] === 0xff && bytes[1] === 0xfe ? 'utf-16le' : bytes[0] === 0xfe && bytes[1] === 0xff ? 'utf-16be' : 'utf-8'
+  const encoding = bytes[0] === 0xff && bytes[1] === 0xfe || bytes[0] === 0x3c && bytes[1] === 0 ? 'utf-16le'
+    : bytes[0] === 0xfe && bytes[1] === 0xff || bytes[0] === 0 && bytes[1] === 0x3c ? 'utf-16be' : 'utf-8'
   const doc = new DOMParser().parseFromString(new TextDecoder(encoding).decode(bytes), 'image/svg+xml')
-  if (doc.getElementsByTagNameNS('*', 'parsererror').length) return false
+  if (doc.getElementsByTagNameNS('*', 'parsererror').length) return !claimsXml
+  if (!doc.documentElement || doc.documentElement.localName !== 'svg') return true
   const plain = node => {
     for (let n = node.firstChild; n; n = n.nextSibling) {
       if (n.nodeType === 7) return false
@@ -216,37 +219,19 @@ const percentDecode = text => {
 
 const XML_TYPE = /^(?:(?:text|application)\/xml|[a-z0-9.+-]+\/[a-z0-9.+-]*\+xml)$/
 const mediaType = mime => String(mime ?? '').split(';')[0].trim().toLowerCase()
-const XML_PROLOG = /^(?:\s|<\?[\s\S]*?\?>|<!--[\s\S]*?-->|<!DOCTYPE(?!\s+html[\s>])(?:[^[>]|\[[\s\S]*?\])*>)*/i
 
-// The local name of the root element of XML-looking bytes (any BOM or UTF-16 form, after declarations, comments and a doctype), or '' if there is none.
-function xmlRootName(bytes) {
-  const b = Buffer.from(bytes.subarray(0, 65536))
-  const even = n => b.subarray(n, n + ((b.length - n) & ~1))
-  const text = b[0] === 0xff && b[1] === 0xfe ? even(2).toString('utf16le')
-    : b[0] === 0xfe && b[1] === 0xff ? Buffer.from(even(2)).swap16().toString('utf16le')
-      : b[0] === 0x3c && b[1] === 0 ? even(0).toString('utf16le')
-        : b[0] === 0 && b[1] === 0x3c ? Buffer.from(even(0)).swap16().toString('utf16le')
-          : b.toString('utf8').replace(/^\uFEFF/, '')
-  const rest = text.slice(XML_PROLOG.exec(text)[0].length)
-  return (/^<(?:[^\s/>:]+:)?([^\s/>:]+)[\s/>]/.exec(rest) || [])[1] || ''
-}
+// Whether the media type says the browser may show the bytes as an SVG image or an XML document.
+export const claimsXml = mime => mediaType(mime) === 'image/svg+xml' || XML_TYPE.test(mediaType(mime))
 
-// Whether the browser may show these bytes as an SVG image or document, whatever media type claims them: image/svg+xml, or any bytes whose root element is svg
-// (an SVG under text/xml, application/xml, another +xml type, none or a wrong one). Only the bytes and image/svg+xml decide; the claim never clears a resource.
-export function isSvgResource(bytes, mime = '') {
-  return mediaType(mime) === 'image/svg+xml' || xmlRootName(bytes) === 'svg'
-}
-
-// The bytes the browser would decode from a data: URL that holds an SVG, labelled image/svg+xml or by an XML media type (base64 or percent-encoded payload),
-// or null for any other URL.
+// The bytes the browser would decode from a data: URL labelled image/svg+xml or by an XML media type (base64 or percent-encoded payload), or null for any other
+// URL. What the bytes hold is for the browser to say.
 export function svgDataUrlBytes(url) {
   const m = /^data:([^,]*),([\s\S]*)$/i.exec(String(url).trim())
   if (!m) return null
   const [type, ...params] = m[1].split(';').map(p => p.trim().toLowerCase())
-  if (type !== 'image/svg+xml' && !XML_TYPE.test(type)) return null
+  if (!claimsXml(type)) return null
   const raw = percentDecode(m[2].split('#')[0])
-  const bytes = params.at(-1) === 'base64' ? Buffer.from(raw.toString('latin1').replace(/[\t\n\f\r ]/g, ''), 'base64') : raw
-  return isSvgResource(bytes, type) ? bytes : null
+  return params.at(-1) === 'base64' ? Buffer.from(raw.toString('latin1').replace(/[\t\n\f\r ]/g, ''), 'base64') : raw
 }
 
 // The url("...") items of computed style strings; the browser serialises them double-quoted with only \" \\ and hex escapes, so no CSS is parsed here.
@@ -511,8 +496,8 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
           const kind = animatedResource(bytes, response.mimeType)
           if (kind) {
             if (!animated.some(a => a.url === response.url && a.kind === kind)) animated.push({ kind, url: response.url, sha256: sha256(bytes) })
-          } else if (isSvgResource(bytes, response.mimeType)) {
-            const plain = await stitcher.evaluate(`(${svgIsOnAllowlist})(${JSON.stringify(bytes.toString('base64'))}, ${JSON.stringify(SVG_ELEMENTS)})`)
+          } else {
+            const plain = await stitcher.evaluate(`(${svgMayPass})(${JSON.stringify(bytes.toString('base64'))}, ${JSON.stringify(SVG_ELEMENTS)}, ${claimsXml(response.mimeType)})`)
             if (!plain && !unprovable.some(u => u.url === response.url && u.sha256 === sha256(bytes))) unprovable.push({ url: response.url, sha256: sha256(bytes) })
           }
         })().catch(() => { unreadable.push({ url: response.url }) })
@@ -548,7 +533,7 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
         dataSeen.add(r.sha256)
         if (unprovable.some(u => u.sha256 === r.sha256 && u.url.startsWith('data:'))) continue
         try {
-          const plain = await stitcher.evaluate(`(${svgIsOnAllowlist})(${JSON.stringify(r.bytes.toString('base64'))}, ${JSON.stringify(SVG_ELEMENTS)})`)
+          const plain = await stitcher.evaluate(`(${svgMayPass})(${JSON.stringify(r.bytes.toString('base64'))}, ${JSON.stringify(SVG_ELEMENTS)}, true)`)
           if (!plain) unprovable.push({ url: r.url, sha256: r.sha256 })
         } catch { unreadable.push({ url: r.url }) }
       }

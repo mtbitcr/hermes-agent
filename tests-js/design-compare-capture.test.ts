@@ -694,6 +694,10 @@ const smil = (ms: number, id: string, extra = '') => `<svg xmlns="http://www.w3.
 const stillSvg = (id: string) => `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><title>${id}</title><rect width="64" height="64" fill="red"/></svg>`
 const dataUri = (mime: string, body: Buffer | string) => `data:${mime};base64,${Buffer.from(body).toString('base64')}`
 const SVG = 'image/svg+xml'
+type ScrollKnobs = { x: number, y: number, frameY: number, onLoad: boolean }
+
+// Prologs the old raw-text scan could not get past: a 70,000-character comment, and a DOCTYPE whose entity value holds "]>".
+const PROLOGS: Record<string, string> = { 'long-comment': `<!-- ${'x'.repeat(70_000)} -->\n`, 'entity-doctype': '<!DOCTYPE svg [<!ENTITY closer "]>">]>\n' }
 
 describe('animated resource detection', () => {
   it('counts GIF frames by walking the blocks, and reports 0 for anything that is not a GIF', () => {
@@ -808,63 +812,44 @@ describe('SVG data URLs a page references', () => {
 
   const STYLED = '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><style>rect{fill:rgb(0,255,0)}</style><rect width="64" height="64" fill="red"/></svg>'
 
-  it('recognises an SVG resource by its bytes whatever media type claims it: image/svg+xml, text/xml, application/xml, any +xml type, none, or a wrong one', () => {
-    const svg = Buffer.from(STYLED)
-
-    for (const mime of ['image/svg+xml', 'IMAGE/SVG+XML; charset=utf-8', 'text/xml', 'application/xml', 'text/xml; charset=UTF-8', 'application/xhtml+xml', 'application/vnd.example+xml',
-      'application/octet-stream', 'text/plain', 'image/png', '', undefined]) {
-      expect(kit.isSvgResource(svg, mime), String(mime)).toBe(true)
+  it('leaves what bytes hold to the browser: only a media type that may show them as SVG or XML (image/svg+xml, text/xml, application/xml, any +xml) makes unparseable bytes unprovable', () => {
+    for (const mime of ['image/svg+xml', 'IMAGE/SVG+XML; charset=utf-8', 'text/xml', 'application/xml', 'text/xml; charset=UTF-8', 'application/xhtml+xml', 'application/vnd.example+xml']) {
+      expect(kit.claimsXml(mime), mime).toBe(true)
     }
 
-    const bom = Buffer.from([0xef, 0xbb, 0xbf])
-    const utf16 = (s: string) => Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(s, 'utf16le')])
-
-    for (const variant of [
-      Buffer.concat([bom, svg]),
-      Buffer.from(`  \n<?xml version="1.0" encoding="UTF-8"?>\n<!-- <html> --><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "x.dtd" [<!ENTITY a "b">]>\n${STYLED}`),
-      Buffer.from(STYLED.replace(/<(\/?)(svg|rect|style)/g, '<$1s:$2').replace('xmlns=', 'xmlns:s=')),
-      Buffer.from('<svg/>'),
-      utf16(`<?xml version="1.0" encoding="UTF-16"?>${STYLED}`),
-      Buffer.from(`<?xml version="1.0" encoding="UTF-16LE"?>${STYLED}`, 'utf16le'),
-      Buffer.from(`<?xml version="1.0" encoding="UTF-16BE"?>${STYLED}`, 'utf16le').swap16(),
-    ]) {
-      expect(kit.isSvgResource(variant, 'text/xml'), variant.toString('latin1')).toBe(true)
-    }
-
-    expect(kit.isSvgResource(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><rect></svg>'), 'application/xml')).toBe(true)
-    expect(kit.isSvgResource(Buffer.from('not xml at all'), 'image/svg+xml')).toBe(true)
-    expect(kit.isSvgResource(Buffer.alloc(0), 'image/svg+xml')).toBe(true)
-  })
-
-  it('does not take any other resource for an SVG: other XML, HTML, text, rasters, empty bytes', () => {
-    for (const [body, mime] of [
-      ['<rss version="2.0"><svg/></rss>', 'text/xml'], ['<html><svg></svg></html>', 'text/html'], ['<!doctype html><svg></svg>', 'text/html'],
-      ['<svgish/>', 'application/xml'], ['<!-- <svg/> -->\n<feed/>', 'text/xml'], ['<?xml version="1.0"?><note/>', 'application/xml'],
-      ['plain text mentioning <svg>', 'text/plain'], ['', 'text/xml'], ['<', 'text/xml'],
-    ] as const) {
-      expect(kit.isSvgResource(Buffer.from(body), mime), `${mime}: ${body}`).toBe(false)
-    }
-
-    for (const raster of [staticPng(), gif([10]), STATIC_WEBP, Buffer.from([0xff, 0xd8, 0xff, 0xe0])]) {
-      expect(kit.isSvgResource(raster, 'image/png')).toBe(false)
-      expect(kit.isSvgResource(raster, 'text/xml')).toBe(false)
+    for (const mime of ['application/octet-stream', 'text/plain', 'text/html', 'image/png', 'image/gif', 'font/woff2', 'application/json', 'text/xmlish', '', undefined]) {
+      expect(kit.claimsXml(mime), String(mime)).toBe(false)
     }
   })
 
-  it('decodes the exact bytes of a data URL labelled text/xml, application/xml or +xml that holds an SVG, and nothing else', () => {
+  it('decodes the exact bytes of a data URL labelled text/xml, application/xml or +xml, and of nothing else', () => {
     for (const type of ['text/xml', 'application/xml', 'application/xhtml+xml', 'TEXT/XML']) {
       expect(kit.svgDataUrlBytes(`data:${type};base64,${Buffer.from(STYLED).toString('base64')}`).toString(), type).toBe(STYLED)
       expect(kit.svgDataUrlBytes(`data:${type};charset=utf-8,${encodeURIComponent(STYLED)}`).toString(), type).toBe(STYLED)
     }
 
-    for (const other of [`data:text/xml,${encodeURIComponent('<rss/>')}`, `data:application/xml;base64,${Buffer.from('<note/>').toString('base64')}`, 'data:text/xml,', 'data:text/xml',
-      `data:text/html,${encodeURIComponent(STYLED)}`, `data:text/plain,${encodeURIComponent(STYLED)}`, `data:image/png;base64,${Buffer.from(STYLED).toString('base64')}`]) {
+    for (const other of ['data:text/xml', `data:text/html,${encodeURIComponent(STYLED)}`, `data:text/plain,${encodeURIComponent(STYLED)}`, `data:image/png;base64,${Buffer.from(STYLED).toString('base64')}`]) {
       expect(kit.svgDataUrlBytes(other), other).toBeNull()
     }
 
-    const found = kit.svgDataResources({ urls: [`data:text/xml;base64,${Buffer.from(STYLED).toString('base64')}`, `data:application/xml,${encodeURIComponent(STYLED)}`, `data:text/xml,${encodeURIComponent('<rss/>')}`] })
-    expect(found.map((f: any) => f.url)).toEqual(['data:text/xml'])
-    expect(found[0].sha256).toBe(sha(STYLED))
+    const rss = '<rss/>'
+    const found = kit.svgDataResources({ urls: [`data:text/xml;base64,${Buffer.from(STYLED).toString('base64')}`, `data:application/xml,${encodeURIComponent(STYLED)}`, `data:text/xml,${encodeURIComponent(rss)}`] })
+    expect(found.map((f: any) => f.url)).toEqual(['data:text/xml', 'data:text/xml'])
+    expect(found.map((f: any) => f.sha256).sort()).toEqual([sha(STYLED), sha(rss)].sort())
+  })
+
+  it('hands every SVG data URL to the browser check whole, behind any prolog: a 70,000-character comment or a DOCTYPE entity holding "]>", under any SVG or XML media type', () => {
+    for (const [name, prolog] of Object.entries(PROLOGS)) {
+      const svg = prolog + STYLED
+
+      for (const type of ['image/svg+xml', 'text/xml', 'application/xml']) {
+        expect(sha(kit.svgDataUrlBytes(dataUri(type, svg)) ?? ''), `${name} ${type}`).toBe(sha(svg))
+        expect(sha(kit.svgDataUrlBytes(`data:${type},${encodeURIComponent(svg)}`) ?? ''), `${name} ${type} percent`).toBe(sha(svg))
+      }
+
+      const found = kit.svgDataResources({ urls: [dataUri('text/xml', svg), dataUri('application/xml', svg)] })
+      expect(found.map((f: any) => f.sha256), name).toEqual([sha(svg)])
+    }
   })
 
   it('lists each distinct SVG data resource once, from every kind of reference, named by a short prefix and its sha256', () => {
@@ -976,12 +961,15 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
 
   // ---- Motion, shadow roots and frames: pairs of routes that differ only in a period, a speed or a rendering hint must give the same evidence. ----
 
-  // One page per route: the animated tiny page, an animated open shadow root, and a visible shadow root (with a canvas) and srcdoc frame whose type size is `px`.
-  const motionPage = (ms: number, smoothing: string, px: number) => `<!doctype html><meta charset=utf-8>
-<style>body{margin:0;font:20px sans-serif;-webkit-font-smoothing:${smoothing}}
+  // One page per route: the animated tiny page, an animated open shadow root, a visible shadow root (with a canvas) and a srcdoc frame at 10 px and again at 40 px, then `native` (SMIL and marquee), the scroll fragment, which comes first so that its sticky box stays at 300 px, the rendering-normalisation fragment `nd`, and a shadow root on the body (first, before any frame or object is parsed) whose animation period differs too.
+  const motionPage = (ms: number, smoothing: string, native: string, scroll: ScrollKnobs, nd: string, bodyShadowMs: number) => `<!doctype html><meta charset=utf-8>
+<style>body{margin:0;width:2400px;height:2400px;font:20px sans-serif;-webkit-font-smoothing:${smoothing}}
+.sh{position:fixed;left:0;top:0;width:200px;height:50px;background:#abc}
+.sa{position:sticky;top:0;margin-top:300px;width:200px;height:60px;background:#cba}
+.sf{position:absolute;left:400px;top:500px;width:300px;height:200px;border:0}
 @keyframes spin{to{transform:rotate(360deg)}}
 #box{width:80px;height:80px;background:#369;animation:spin ${ms}ms linear infinite}
-#wa{width:80px;height:60px;background:red}h1{margin:16px}</style><h1>Tiny page</h1><div id=box></div><div id=wa></div><p>Some text</p>
+#wa{width:80px;height:60px;background:red}h1{margin:16px}</style><body style="background:#eee">${bodyShadowScript(bodyShadowMs)}${scrollFragment(scroll)}<h1>Tiny page</h1><div id=box></div><div id=wa></div><p>Some text</p>
 <div style="opacity:0"><p>Invisible text</p></div>
 <div style="visibility:hidden"><p style="visibility:visible">Shown override</p></div><p>Visible control</p>
 <header><h1>Site title</h1><nav><a href="/x" aria-label="Go home">Home</a></nav></header>
@@ -990,19 +978,26 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
 <div style="position:fixed;bottom:0;left:0;color:#369">Pinned</div>
 <h1>Outside</h1><div id=animated></div><script>animated.attachShadow({mode:'open'}).innerHTML =
 '<style>@keyframes m{to{transform:translateX(300px)}}h2{width:100px;animation:m ${ms}ms infinite linear}</style><h2>Inside</h2>'</script>
-<div id=host></div><script>host.attachShadow({mode:'open'}).innerHTML = '<p style="font-size:${px}px">Visible shadow text</p><canvas width=50 height=20></canvas>'</script>
-<iframe srcdoc="<h2 style='font-size:${px}px'>Frame text</h2><p style='position:fixed;bottom:0'>Pin</p>" style="border:0;margin:30px 30px 30px 38px"></iframe>
+<div id=host></div><script>host.attachShadow({mode:'open'}).innerHTML = '<p style="font-size:10px">Visible shadow text</p><canvas width=50 height=20></canvas><p style="font-size:40px">Big shadow text</p>'</script>
+<iframe srcdoc="<h2 style='font-size:10px'>Frame text</h2><p style='position:fixed;bottom:0'>Pin</p>" style="border:0;margin:30px 30px 30px 38px"></iframe>
+<iframe srcdoc="<h2 style='font-size:40px'>Big frame text</h2>" style="border:0;margin:30px 30px 30px 38px"></iframe>${native}
+${nd}
 <script>document.getElementById('wa').animate([{transform:'translateX(0px)'},{transform:'translateX(300px)'}],{duration:${ms},iterations:Infinity})</script>`
 
-  const bodyShadowPage = (ms: number) => `<!doctype html><body><script>document.body.attachShadow({mode:'open'}).innerHTML =
-'<style>@keyframes m{to{transform:translateX(300px)}}h2{width:100px;animation:m ${ms}ms infinite linear}</style><h2>Inside body</h2>'; document.currentScript.remove()</script>`
+  // Attaches an open shadow root to the body itself, with a slot so the page stays visible.
+  const bodyShadowScript = (ms: number) => `<script>document.body.attachShadow({mode:'open'}).innerHTML =
+'<style>@keyframes m{to{transform:translateX(300px)}}h2{width:100px;animation:m ${ms}ms infinite linear}</style><slot></slot><h2>Inside body</h2>'; document.currentScript.remove()</script>`
 
   const closedPage = '<div id=h></div><script>h.attachShadow({mode:"closed"}).innerHTML = "<h2>Hidden</h2>"</script>'
 
-  // The routes before the refusal of a closed shadow root.
-  const motionLaunch = memo(() => launchPages({
-    'motion-a': motionPage(1000, 'antialiased', 10), 'motion-b': motionPage(3700, 'subpixel-antialiased', 10), 'motion-c': motionPage(1000, 'antialiased', 40), closed: closedPage,
-  }))
+  // The routes before the refusal of a closed shadow root. The two routes differ in every period, speed and rendering hint, and must still give the same evidence.
+  const motionLaunch = memo(() => {
+    const [fast, slow] = [nativeMotion('fast', 1000, 40), nativeMotion('slow', 10_000, 1)]
+
+    return launchPages({ 'motion-a': motionPage(1000, 'antialiased', fast.body, { x: 0, y: 0, frameY: 0, onLoad: false }, ndFragment('subpixel-antialiased', 'optimizeSpeed'), 1000),
+      'motion-b': motionPage(3700, 'subpixel-antialiased', slow.body, { x: 1000, y: 1000, frameY: 500, onLoad: true }, ndFragment('none', 'optimizeLegibility'), 10_000), closed: closedPage },
+      { 'inner-fast.html': fast['inner-fast.html'], 'inner-slow.html': slow['inner-slow.html'], 'acme.woff2': readFileSync(fileURLToPath(new URL('../web/public/fonts/Mondwest-Regular.woff2', import.meta.url))) })
+  })
 
   it('gives identical bundles and images despite CSS animation, infinite Web Animations API motion and font smoothing', async () => {
     const run = await motionLaunch()
@@ -1055,17 +1050,18 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
 
   it('measures visible shadow-root and srcdoc-iframe text with its own type values and page coordinates', async () => {
     const run = await motionLaunch()
-    const [s10, s40] = ['/motion-a', '/motion-c'].map(route => read(run.outDir, 1280, route))
+    const bundle = read(run.outDir, 1280, '/motion-a')
 
-    expect(byText(s10, 'visible shadow text').style['font-size']).toBe(10)
-    expect(byText(s40, 'visible shadow text').style['font-size']).toBe(40)
-    expect(byText(s10, 'frame text').style['font-size']).toBe(10)
-    expect(byText(s40, 'frame text').style['font-size']).toBe(40)
-    expect(JSON.stringify(s10)).not.toBe(JSON.stringify(s40))
-    expect(byText(s10, 'frame text').box.x).toBeGreaterThanOrEqual(40)
-    expect(byText(s10, 'frame text').box.y).toBeGreaterThan(60)
-    expect(s10.masks).toContainEqual(expect.objectContaining({ width: 50, height: 20 }))
-    expect(byText(s10, 'pin').fixed).toBe(true)
+    expect(byText(bundle, 'visible shadow text').style['font-size']).toBe(10)
+    expect(byText(bundle, 'big shadow text').style['font-size']).toBe(40)
+    expect(byText(bundle, 'frame text').style['font-size']).toBe(10)
+    expect(byText(bundle, 'big frame text').style['font-size']).toBe(40)
+    expect(byText(bundle, 'big shadow text').box.height).toBeGreaterThan(byText(bundle, 'visible shadow text').box.height)
+    expect(byText(bundle, 'big frame text').box.height).toBeGreaterThan(byText(bundle, 'frame text').box.height)
+    expect(byText(bundle, 'frame text').box.x).toBeGreaterThanOrEqual(40)
+    expect(byText(bundle, 'frame text').box.y).toBeGreaterThan(60)
+    expect(bundle.masks).toContainEqual(expect.objectContaining({ width: 50, height: 20 }))
+    expect(byText(bundle, 'pin').fixed).toBe(true)
   }, 120_000)
 
   it('refuses a closed shadow root instead of claiming complete evidence', async () => {
@@ -1074,18 +1070,18 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
 
   // ---- Rendering normalisation: what the page can read, set and retain. ----
 
-  const normPage = (smoothing: string, rendering: string) => {
+  const normFragment = (smoothing: string, rendering: string, more = '') => {
     const decl = `-webkit-font-smoothing:${smoothing};text-rendering:${rendering}`
     const reflect = (id: string, out: string) => `${out}.textContent = getComputedStyle(${id}).webkitFontSmoothing + ' / ' + getComputedStyle(${id}).textRendering`
     const frame = `Frame body text<p id=a style='${decl}!important'>A</p><p id=o></p><script>${reflect('a', 'o')}</script>`.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
 
-    return `<!doctype html><body style="background:#eee">Top body text<p id=a style="${decl}!important">Inline</p><p id=ra></p><script>${reflect('a', 'ra')}</script>
-<div id=host></div><script>const r = host.attachShadow({mode:'open'}), own = new CSSStyleSheet(); own.replaceSync('h2{${decl}}')
+    return `Top body text<p id=na style="${decl}!important">Inline</p><p id=nra></p><script>${reflect('na', 'nra')}</script>
+<div id=rhost></div><script>const r = rhost.attachShadow({mode:'open'}), own = new CSSStyleSheet(); own.replaceSync('h2{${decl}}')
 r.adoptedStyleSheets = [own]; r.innerHTML = '<h2 id=s>S</h2><p id=o></p>'
 const o = r.getElementById('o'); o.textContent = getComputedStyle(r.getElementById('s')).webkitFontSmoothing + ' / ' + getComputedStyle(r.getElementById('s')).textRendering</script>
 <div id=dh><template shadowrootmode=open><style>h3{${decl}}</style><h3 id=d>D</h3><p id=e></p></template></div>
 <script>const dr = dh.shadowRoot; dr.getElementById('e').textContent = getComputedStyle(dr.getElementById('d')).webkitFontSmoothing + ' / ' + getComputedStyle(dr.getElementById('d')).textRendering</script>
-<iframe srcdoc="${frame}"></iframe>${retainFragment(false)}`
+<iframe srcdoc="${frame}"></iframe>${retainFragment(false)}${more}`
   }
 
   const dynamic = (smoothing: string, rendering: string) => {
@@ -1109,14 +1105,24 @@ const o = r.getElementById('o'); o.textContent = getComputedStyle(r.getElementBy
 })()`
   }
 
-  const dynamicPage = (smoothing: string, rendering: string) => {
+  const dynamicFragment = (smoothing: string, rendering: string) => {
     const make = dynamic(smoothing, rendering)
-    const frame = `<body>Frame text<script>${make}(document.body)</script>`.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+    const frame = `<body>Dynamic frame text<script>${make}(document.body)</script>`.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
 
-    return `<!doctype html><body>Top text<div id=top></div><div id=host></div><script>
-${make}(document.getElementById('top'))
-host.attachShadow({mode:'open'}); ${make}(host.shadowRoot)</script><iframe srcdoc="${frame}"></iframe>`
+    return `<div id=dtop></div><div id=dhost></div><script>
+${make}(document.getElementById('dtop'))
+dhost.attachShadow({mode:'open'}); ${make}(dhost.shadowRoot)</script><iframe srcdoc="${frame}"></iframe>`
   }
+
+  // Three texts at the same place, set in the same face: its name quoted with a double and with a single quote, a name that is not loaded, and the loaded name in other case.
+  const fontFragment = `<style>
+@font-face{font-family:"Acme,Display";src:url(/acme.woff2) format('woff2')}
+@font-face{font-family:'Acme,Display';src:url(/acme.woff2) format('woff2')}
+.fonts{position:relative;font-size:32px}.fonts p{position:absolute;left:0;top:0;margin:0}</style>
+<div class=fonts><p style='font-family:"Acme,Display", serif'>Measured text</p><p style='font-family:"Acme,Other", serif'>Measured text</p><p style="font-family:'ACME,display', monospace">Measured text</p></div>`
+
+  // The fragment of the motion pages that holds the rendering-hint reads, the synchronous-normalisation paths and the font faces.
+  const ndFragment = (smoothing: string, rendering: string) => normFragment(smoothing, rendering, `${dynamicFragment(smoothing, rendering)}${fontFragment}`)
 
   // A mutation path the kit cannot cover. With a retained computed style it must be refused; without one it is accepted and the page reads the normalised value.
   const retainFragment = (retain: boolean) => `<p id=ka>A</p><p id=ko></p><script>(() => {
@@ -1127,46 +1133,45 @@ document.getElementById('ko').textContent = (live || getComputedStyle(p)).textRe
 
   const retainPage = (retain: boolean) => `<!doctype html>${retainFragment(retain)}`
 
-  const normaliseLaunch = memo(() => launchPages({
-    'norm-a': normPage('subpixel-antialiased', 'optimizeSpeed'), 'norm-b': normPage('none', 'optimizeLegibility'),
-    'dyn-a': dynamicPage('subpixel-antialiased', 'optimizeSpeed'), 'dyn-b': dynamicPage('none', 'optimizeLegibility'),
-    'body-shadow-a': bodyShadowPage(1000), 'body-shadow-b': bodyShadowPage(10_000), 'retain-on': retainPage(true),
-  }))
+  // Every paragraph that reads back the normalised values shows them as this text: 2 from the enforcement page, 4 from the first group of reads, 18 from the synchronous paths.
+  const NORMALISED = 'antialiased / geometricprecision'
+
+  const normaliseLaunch = memo(() => launchPages({ 'retain-on': retainPage(true) }))
 
   it('visits a body-attached open shadow root with an animated h2 and gives period-independent images', async () => {
-    const run = await normaliseLaunch()
-    sameEvidence(run, '/body-shadow-a', '/body-shadow-b')
+    const run = await motionLaunch()
+    sameEvidence(run, '/motion-a', '/motion-b')
 
-    for (const width of [1280, 375]) {expect(byText(read(run.outDir, width, '/body-shadow-a'), 'inside body').tag).toBe('h2')}
+    for (const width of [1280, 375]) {expect(byText(read(run.outDir, width, '/motion-a'), 'inside body').tag).toBe('h2')}
   }, 120_000)
 
   it('normalises before page code reads it and measures each body: one synchronous computed-style read of inline !important, a shadow root, a declarative shadow root and a srcdoc frame', async () => {
-    const run = await normaliseLaunch()
-    sameEvidence(run, '/norm-a', '/norm-b')
+    const run = await motionLaunch()
+    sameEvidence(run, '/motion-a', '/motion-b')
 
     for (const width of [1280, 375]) {
-      const bundle = read(run.outDir, width, '/norm-a')
-      expect(bundle.elements.filter((e: any) => e.text === 'antialiased / geometricprecision'), `${width}`).toHaveLength(4)
+      const bundle = read(run.outDir, width, '/motion-a')
+      expect(bundle.elements.filter((e: any) => e.text === NORMALISED), `${width}`).toHaveLength(2 + 4 + 18)
       const bodies = bundle.elements.filter((e: any) => e.tag === 'body')
-      expect(bodies.map((e: any) => e.text).sort(), `${width} body text`).toEqual(['frame body text', 'top body text'])
+      expect(bodies.map((e: any) => e.text).sort(), `${width} body text`).toEqual(['', 'dynamic frame text', 'frame body text', 'top body text'])
       expect(bodies.find((e: any) => e.text === 'top body text').style['background-color']).toEqual([238, 238, 238, 1])
     }
   }, 120_000)
 
   it('normalises synchronously: created, style-set (setProperty, cssText, style attribute, style property), inserted and read-back elements in the page, an open shadow root and a srcdoc frame', async () => {
-    const run = await normaliseLaunch()
-    sameEvidence(run, '/dyn-a', '/dyn-b')
+    const run = await motionLaunch()
+    sameEvidence(run, '/motion-a', '/motion-b')
 
     for (const width of [1280, 375]) {
-      expect(read(run.outDir, width, '/dyn-a').elements.filter((e: any) => e.text === 'antialiased / geometricprecision'), `${width}`).toHaveLength(18)
+      expect(read(run.outDir, width, '/motion-a').elements.filter((e: any) => e.text === NORMALISED), `${width}`).toHaveLength(2 + 4 + 18)
     }
   }, 120_000)
 
   it('refuses the capture when a retained computed style was read after a mutation path the kit cannot cover, and accepts the same bypass when nothing observed the element', async () => {
-    const run = await normaliseLaunch()
+    const [run, motion] = [await normaliseLaunch(), await motionLaunch()]
     expect(run.error?.message).toContain('normalisation could not be guaranteed')
 
-    for (const width of [1280, 375]) {expect(read(run.outDir, width, '/norm-a').elements.some((e: any) => e.text === 'geometricprecision'), `${width}`).toBe(true)}
+    for (const width of [1280, 375]) {expect(read(motion.outDir, width, '/motion-a').elements.some((e: any) => e.text === 'geometricprecision'), `${width}`).toBe(true)}
   }, 120_000)
 
   const forced = '-webkit-font-smoothing:subpixel-antialiased!important;text-rendering:optimizeSpeed!important'
@@ -1176,40 +1181,35 @@ document.getElementById('ko').textContent = (live || getComputedStyle(p)).textRe
 
   // ---- Scroll, native motion and tiling, ending in the refusal of the page that empties the normalisation layer. ----
 
-  // The same page except for where the page, and a same-origin frame, are scrolled while loading.
-  const scrolledPage = (x: number, y: number, frameY: number, onLoad = false) => {
+  // Fixed, sticky and in-frame boxes; the page, and a same-origin frame, are scrolled while loading. Its styles are the .sh, .sa and .sf rules of the motion page.
+  const scrollFragment = ({ x, y, frameY, onLoad }: ScrollKnobs) => {
     const scroll = `scrollTo(${x},${y})`
 
-    return `<!doctype html><style>body{margin:0;width:2400px;height:2400px}
-header{position:fixed;left:0;top:0;width:200px;height:50px;background:#abc}
-aside{position:sticky;top:0;margin-top:300px;width:200px;height:60px;background:#cba}
-iframe{position:absolute;left:400px;top:500px;width:300px;height:200px;border:0}</style>
-<header>Fixed</header><aside>Sticky</aside><main>Control</main>
-<iframe srcdoc="<body style='margin:0;height:2000px;background:linear-gradient(#fff,#369)'><p style='position:fixed;top:0;margin:0'>Frame pin</p><p style='margin-top:100px'>Frame flow</p><script>scrollTo(0,${frameY})</script>"></iframe>
+    return `<header class=sh>Fixed</header><aside class=sa>Sticky</aside><main>Control</main>
+<iframe class=sf srcdoc="<body style='margin:0;height:2000px;background:linear-gradient(#fff,#369)'><p style='position:fixed;top:0;margin:0'>Frame pin</p><p style='margin-top:100px'>Frame flow</p><script>scrollTo(0,${frameY})</script>"></iframe>
 <script>${onLoad ? `addEventListener('load', () => ${scroll})` : scroll}</script>${enforcePage(`b.style.setProperty('-webkit-font-smoothing', 'subpixel-antialiased', 'important');`)}`
   }
 
   const enforceLaunch = memo(() => launchPages({
-    'scroll-still': scrolledPage(0, 0, 0), 'scroll-both': scrolledPage(1000, 1000, 500, true),
     'enforce-empty': `${enforcePage('')}<script>addEventListener('load', () => document.getElementById('__dc_style').textContent = '')</script>`,
   }))
 
   it('enforces the rendering values against ID-selector declarations and inline !important set again by the page, and fails when the page empties the layer', async () => {
-    const run = await enforceLaunch()
+    const [run, motion] = [await enforceLaunch(), await motionLaunch()]
 
     for (const width of [1280, 375]) {
-      expect(read(run.outDir, width, '/scroll-both').elements.filter((e: any) => e.text === 'antialiased / geometricprecision'), `${width}`).toHaveLength(2)
+      expect(read(motion.outDir, width, '/motion-b').elements.filter((e: any) => e.text === NORMALISED), `${width}`).toHaveLength(2 + 4 + 18)
     }
 
     expect(run.error?.message).toContain('rendering normalisation is not effective')
   }, 120_000)
 
   it('measures fixed and sticky boxes in viewport coordinates, the rest in document coordinates, and captures the same page whatever the initial scroll', async () => {
-    const run = await enforceLaunch()
-    sameEvidence(run, '/scroll-still', '/scroll-both')
+    const run = await motionLaunch()
+    sameEvidence(run, '/motion-a', '/motion-b')
 
     for (const width of [1280, 375]) {
-      const bundle = read(run.outDir, width, '/scroll-both')
+      const bundle = read(run.outDir, width, '/motion-b')
       expect(byText(bundle, 'fixed')).toMatchObject({ fixed: true, box: { x: 0, y: 0, width: 200, height: 50 } })
       expect(byText(bundle, 'sticky')).toMatchObject({ fixed: true, box: { x: 0, y: 300, width: 200, height: 60 } })
       expect(byText(bundle, 'control').fixed).toBe(false)
@@ -1229,41 +1229,52 @@ iframe{position:absolute;left:400px;top:500px;width:300px;height:200px;border:0}
     const marquees = `<marquee scrollamount="${amount}" style="display:block;width:300px">Moving text control</marquee><marquee direction="up" height="60" scrollamount="${amount}">Up</marquee>`
     const inner = `<!doctype html><style>body{margin:0}</style>${root(shapes)}<marquee scrollamount="${amount}">Inner mover</marquee>`
 
-    return { [`inner-${tag}.html`]: inner, [`native-${tag}.html`]: `<!doctype html><style>body{margin:0}</style><h1>Native motion</h1>${root(shapes)}${marquees}<div id=host></div>
+    return { [`inner-${tag}.html`]: inner, body: `<h1>Native motion</h1>${root(shapes)}${marquees}<div id=nhost></div>
 <object data="/inner-${tag}.html" type="text/html" width="380" height="130" style="display:block"></object><embed src="/inner-${tag}.html" type="text/html" width="380" height="130" style="display:block">
 <iframe style="border:0;width:380px;height:130px" srcdoc='${root(shapes).replace(/'/g, '&#39;')}'></iframe>
-<script>document.getElementById('host').attachShadow({mode:'open'}).innerHTML = '${root(shapes)}<marquee scrollamount="${amount}">Shadow mover</marquee>'</script>` }
+<script>document.getElementById('nhost').attachShadow({mode:'open'}).innerHTML = '${root(shapes)}<marquee scrollamount="${amount}">Shadow mover</marquee>'</script>` }
   }
 
-  const tilesPage = (height: number) => `<!doctype html><style>html,body{margin:0}
+  const tilesPage = (height: number, label: string) => `<!doctype html><style>html,body{margin:0}
 #s{box-sizing:border-box;padding-top:300px;height:${height}px;background:repeating-linear-gradient(#cc3333 0 50px,#3399cc 50px 100px)}
 #k{position:sticky;top:0;width:200px;height:40px;background:#00aa00}
-#h{position:fixed;top:0;left:0;width:80px;height:60px;background:#ff0000}</style><div id=s><div id=k></div></div><div id=h></div>`
+#h{position:fixed;top:0;left:0;width:80px;height:60px;background:#ff0000}</style><div id=s><div id=k></div></div><div id=h></div><h1 style="position:absolute;left:100px;top:100px;margin:0;font:20px sans-serif">${label}</h1>`
 
   const declarativePage = '<div><template shadowrootmode="closed"><h2>Hidden</h2></template></div>'
 
-  const nativeLaunch = memo(() => {
-    const [fast, slow] = [nativeMotion('fast', 1000, 40), nativeMotion('slow', 10_000, 1)]
+  const nativeLaunch = memo(() => launchPages({ declarative: declarativePage }))
 
-    return launchPages({ 'native-fast': fast['native-fast.html'], 'native-slow': slow['native-slow.html'], 'tiles-a': tilesPage(836), 'tiles-b': tilesPage(1750), declarative: declarativePage },
-      { 'inner-fast.html': fast['inner-fast.html'], 'inner-slow.html': slow['inner-slow.html'] })
-  })
+  const cliSite = dirOf({ 'a-b.html': tilesPage(836, 'Dash route'), 'a/b.html': tilesPage(1750, 'Slash route') })
+  const cliOut = join(scratch, 'cli-e2e')
+
+  // A run that is refused for overwriting stops before it starts a browser, so only a run that captures waits for its turn in the queue.
+  const cli = (pages: string, outDir = cliOut, captures = true) => (captures ? limited : <T>(job: () => Promise<T>) => job())(() => new Promise<{ status: number | null, stderr: string }>(done => {
+    const child = spawn(process.execPath, [captureFile, '--side', 'candidate', '--site', cliSite, '--pages', pages,
+      '--out', outDir, '--run-id', 'r', '--candidate-digest', 'd'], { env: { ...process.env, CHROME_PATH: chromium } })
+
+    let stderr = ''
+    child.stderr.on('data', d => { stderr += d })
+    child.on('close', status => done({ status, stderr }))
+  }))
+
+  const cliRun = memo(() => cli('/a-b /a/b'))
 
   it('freezes SMIL animate, animateTransform, animateMotion and set, and stops marquee, in the page, an open shadow root, a frame and a same-origin object and embed document, whatever their duration or speed', async () => {
-    const run = await nativeLaunch()
-    sameEvidence(run, '/native-fast', '/native-slow')
-    const png = decodePng(pngOf(run.outDir, 1280, '/native-fast'))
-    const top = read(run.outDir, 1280, '/native-fast').elements.find((e: any) => e.tag === 'svg').box.y
+    const run = await motionLaunch()
+    sameEvidence(run, '/motion-a', '/motion-b')
+    const png = decodePng(pngOf(run.outDir, 1280, '/motion-a'))
+    const top = read(run.outDir, 1280, '/motion-a').elements.find((e: any) => e.tag === 'svg').box.y
     expect(png.at(30, Math.round(top) + 40), 'animate rect at its start').toEqual([255, 0, 0])
   }, 120_000)
 
   it('keeps first-tile pixels when the last tile overlaps and fixed or sticky elements are hidden', async () => {
-    const run = await nativeLaunch()
+    const run = await cliRun()
+    expect(run.status, run.stderr).toBe(0)
     const stripe = (y: number) => (Math.floor(y / 50) % 2 ? [51, 153, 204] : [204, 51, 51])
 
-    for (const [route, height] of [['/tiles-a', 836], ['/tiles-b', 1750]] as const) {
+    for (const [route, height] of [['/a-b', 836], ['/a/b', 1750]] as const) {
       for (const width of [1280, 375]) {
-        const png = decodePng(pngOf(run.outDir, width, route))
+        const png = decodePng(pngOf(cliOut, width, route))
         expect(png.h, `${route} ${width} height`).toBe(height)
 
         for (let y = 0; y < height; y++) {
@@ -1283,23 +1294,13 @@ iframe{position:absolute;left:400px;top:500px;width:300px;height:200px;border:0}
 
   // ---- Fonts, then the refusal of unreadable object and embed documents, a sandboxed frame and a page that holds the scroll away from the top. ----
 
-  // Three texts at the same place, set in the same face: its name quoted with a double and with a single quote, a name that is not loaded, and the loaded name in other case.
-  const fontPage = `<!doctype html><style>
-@font-face{font-family:"Acme,Display";src:url(/acme.woff2) format('woff2')}
-@font-face{font-family:'Acme,Display';src:url(/acme.woff2) format('woff2')}
-body{margin:0;font-size:32px}p{position:absolute;left:0;top:0;margin:0}</style>
-<p style='font-family:"Acme,Display", serif'>Measured text</p><p style='font-family:"Acme,Other", serif'>Measured text</p><p style="font-family:'ACME,display', monospace">Measured text</p>`
-
-  const fontLaunch = memo(() => launchPages({
-    font: fontPage,
-    object: '<object data="data:text/html,%3Ch2%3EOpaque%3C/h2%3E" type="text/html"></object>',
-  }, { 'acme.woff2': readFileSync(fileURLToPath(new URL('../web/public/fonts/Mondwest-Regular.woff2', import.meta.url))) }))
+  const objectLaunch = memo(() => launchPages({ object: '<object data="data:text/html,%3Ch2%3EOpaque%3C/h2%3E" type="text/html"></object>' }))
 
   it('keeps comma-containing quoted font families apart on the measured element, and equal when the names match', async () => {
-    const run = await fontLaunch()
+    const run = await motionLaunch()
 
     for (const width of [1280, 375]) {
-      const [a, b, c, ...more] = read(run.outDir, width, '/font').elements.filter((e: any) => e.text === 'measured text')
+      const [a, b, c, ...more] = read(run.outDir, width, '/motion-a').elements.filter((e: any) => e.text === 'measured text')
       expect(more, `${width}`).toEqual([])
       const first = (e: any) => probe.firstFamily(e.style['font-family'])
       expect(a.style['font-family'], `${width}`).toBe('"Acme,Display", serif')
@@ -1316,7 +1317,7 @@ body{margin:0;font-size:32px}p{position:absolute;left:0;top:0;margin:0}</style>
   }, 120_000)
 
   it('refuses an unreadable <object> document instead of claiming complete evidence', async () => {
-    expect((await fontLaunch()).error?.message).toMatch(/unreadable <object> or <embed> document cannot be measured/)
+    expect((await objectLaunch()).error?.message).toMatch(/unreadable <object> or <embed> document cannot be measured/)
   }, 120_000)
 
   const sandboxedLaunch = memo(() => launchPages({ sandboxed: '<iframe sandbox srcdoc="<h2>Opaque</h2>"></iframe>' }))
@@ -1372,7 +1373,7 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
     const leaks = `<link rel=stylesheet href="asset.css"><link rel=stylesheet href="/missing-required.css"><link rel=stylesheet href="http://${r.base}/x.css">`
 
     const [candidate, prototype] = await Promise.all([
-      launchPages({ net: `<!doctype html>${network}`, popup: `<!doctype html>${popup}`, realm: `<!doctype html>${realm}`, rtc: `<!doctype html>${rtc}`, routes: `<!doctype html>${routes}` },
+      launchPages({ net: `<!doctype html>${network}${popup}${realm}${rtc}`, routes: `<!doctype html>${routes}` },
         { 'w.js': `new WebSocket('ws://${r.base}/from-worker')` }),
       launchPrototype(`<!doctype html>${network}${popup}${realm}${rtc}${leaks}`),
     ])
@@ -1412,8 +1413,10 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
   it('never lets direct popup navigation or an about:blank popup native WebSocket reach a separate receiver, on the candidate and on the prototype side', async () => {
     const { candidate, prototype, r } = await outside()
 
-    for (const route of ['/popup', '/realm']) {
-      for (const width of [1280, 375]) {expect(read(candidate.outDir, width, route).blocked_requests.length, `${route} ${width}`).toBeGreaterThan(0)}
+    for (const width of [1280, 375]) {
+      const { blocked_requests: blocked } = read(candidate.outDir, width, '/net')
+      expect(blocked, `popup ${width}`).toContain(`http://${r.base}/popup`)
+      expect(blocked, `realm ${width}`).toContain('about:blank')
     }
 
     expect(prototype.error.blocked).toEqual(expect.arrayContaining([`http://${r.base}/popup`, 'about:blank']))
@@ -1429,7 +1432,7 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
     const { candidate, prototype, s } = await outside()
 
     for (const width of [1280, 375]) {
-      expect(read(candidate.outDir, width, '/rtc').blocked_requests).toEqual(expect.arrayContaining([s.stun, s.turn, 'webrtc:RTCPeerConnection', 'https://127.0.0.1:9/']))
+      expect(read(candidate.outDir, width, '/net').blocked_requests).toEqual(expect.arrayContaining([s.stun, s.turn, 'webrtc:RTCPeerConnection', 'https://127.0.0.1:9/']))
     }
 
     expect(prototype.error.blocked).toEqual(expect.arrayContaining([s.stun, s.turn]))
@@ -1448,28 +1451,15 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
   // ---- The shipped CLI. ----
 
   it('writes one bundle and PNG per route and width through the shipped CLI, never overwriting', async () => {
-    const site = dirOf({ 'a-b.html': '<h1>Dash route</h1>', 'a/b.html': '<h1>Slash route</h1>' })
-    const out = join(scratch, 'cli-e2e')
-
-    // A run that is refused for overwriting stops before it starts a browser, so only a run that captures waits for its turn in the queue.
-    const cli = (pages: string, outDir = out, captures = true) => (captures ? limited : <T>(job: () => Promise<T>) => job())(() => new Promise<{ status: number | null, stderr: string }>(done => {
-      const child = spawn(process.execPath, [captureFile, '--side', 'candidate', '--site', site, '--pages', pages,
-        '--out', outDir, '--run-id', 'r', '--candidate-digest', 'd'], { env: { ...process.env, CHROME_PATH: chromium } })
-
-      let stderr = ''
-      child.stderr.on('data', d => { stderr += d })
-      child.on('close', status => done({ status, stderr }))
-    }))
-
-    const run = await cli('/a-b /a/b')
+    const run = await cliRun()
     expect(run.status, run.stderr).toBe(0)
-    const files = readdirSync(out)
+    const files = readdirSync(cliOut)
     expect(files.filter(f => f.endsWith('.json'))).toHaveLength(4)
     expect(files.filter(f => f.endsWith('.png'))).toHaveLength(4)
 
     for (const [route, heading] of [['/a-b', 'dash route'], ['/a/b', 'slash route']]) {
       for (const width of [1280, 375]) {
-        const bundle = read(out, width, route)
+        const bundle = read(cliOut, width, route)
         expect(bundle.page).toBe(route)
         expect(bundle.image).toBe(`${kit.pageSlug(route)}-${width}.png`)
         expect(bundle.elements.map((e: any) => e.text)).toContain(heading)
@@ -1477,10 +1467,10 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
       }
     }
 
-    const again = await cli('/a-b', out, false)
+    const again = await cli('/a-b', cliOut, false)
     expect(again.status).toBe(1)
     expect(again.stderr).toContain('refusing to overwrite')
-    expect(readdirSync(out)).toHaveLength(8)
+    expect(readdirSync(cliOut)).toHaveLength(8)
     const dup = await cli('/a-b /a-b', join(scratch, 'cli-dup'), false)
     expect(dup.status).toBe(1)
     expect(dup.stderr).toContain('refusing to overwrite')
@@ -1508,6 +1498,8 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
     'background-style.svg': svgDoc(`<style>rect{fill:red}</style><title>background</title>${fill}`),
     'mask-style.svg': svgDoc(`<style>rect{fill:red}</style><title>mask</title>${fill}`),
     'border-style.svg': svgDoc(`<style>rect{fill:red}</style><title>border</title>${fill}`),
+    'long-comment.svg': PROLOGS['long-comment'] + svgDoc(`<style>rect{fill:red}</style><title>long comment</title>${fill}`),
+    'entity-doctype.svg': PROLOGS['entity-doctype'] + svgDoc(`<style>rect{fill:red}</style><title>entity doctype</title>${fill}`),
   }
 
   const STATIC_PAGE = `<!doctype html><style>body{margin:0}div{width:64px;height:64px;background:url(${dataUri(SVG, stillSvg('red'))})}img,object,embed{display:block}</style>
@@ -1531,7 +1523,7 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
 
   const REFUSED_PAGE = `<!doctype html><style>body{margin:0}img,object,embed,div{display:block;width:64px;height:64px}
 #bg{background:url(/background-style.svg)}#mask{background:red;mask-image:url(/mask-style.svg)}#border{border-image:url(/border-style.svg) 1}</style><h1>Refused</h1>
-${['style-element', 'style-attribute', 'animate-element', 'processing-instruction', 'reference-keyframes', 'event-attribute', 'unlisted-element'].map(n => `<img alt="" src="/${n}.svg">`).join('')}
+${['style-element', 'style-attribute', 'animate-element', 'processing-instruction', 'reference-keyframes', 'event-attribute', 'unlisted-element', 'long-comment', 'entity-doctype'].map(n => `<img alt="" src="/${n}.svg">`).join('')}
 <object data="/object-style.svg" type="image/svg+xml"></object><embed src="/embed-style.svg" type="image/svg+xml"><div id=bg></div><div id=mask></div><div id=border></div>
 <img alt="" src="/gradient.svg"><img alt="" src="/a.gif"><img alt="" src="/a.png"><img alt="" src="/a.webp"><img alt="" src="/still.gif"><img alt="" src="/still.webp">
 ${otherConsumers.map(([, html]) => html).join('')}`
@@ -1553,7 +1545,7 @@ ${otherConsumers.map(([, html]) => html).join('')}`
     const lines = message.split('\n').filter(l => l.startsWith('unsupported content: the kit cannot prove that this SVG is static'))
     expect(lines.length, message).toBeGreaterThan(0)
 
-    for (const name of ['style-element', 'style-attribute', 'animate-element', 'processing-instruction', 'reference-keyframes', 'event-attribute', 'unlisted-element']) {
+    for (const name of ['style-element', 'style-attribute', 'animate-element', 'processing-instruction', 'reference-keyframes', 'event-attribute', 'unlisted-element', 'long-comment', 'entity-doctype']) {
       expect(lines.some(l => l.includes(`/${name}.svg`)), `${name}: ${message}`).toBe(true)
     }
 
@@ -1618,20 +1610,24 @@ ${otherConsumers.map(([, html]) => html).join('')}`
   const XML_TYPES = ['text/xml', 'application/xml']
   const xmlStyled = (label: string) => svgDoc(`<style>rect{fill:rgb(0,255,0)}</style><title>${label}</title>${fill}`)
 
-  const xmlConsumers = XML_TYPES.flatMap(type => ['object', 'embed', 'img', 'background'].map(kind => {
-    const svg = xmlStyled(`${type} ${kind}`)
+  // Plain with all four consumers; behind a 70,000-character comment and behind a DOCTYPE entity holding "]>" as object, embed and img.
+  const XML_CASES: Array<[string, string[]]> = [['', ['object', 'embed', 'img', 'background']], ['long-comment', ['object', 'embed', 'img']], ['entity-doctype', ['object', 'embed', 'img']]]
+
+  const xmlConsumers = XML_TYPES.flatMap(type => XML_CASES.flatMap(([prolog, kinds]) => kinds.map(kind => {
+    const svg = (PROLOGS[prolog] ?? '') + xmlStyled(`${type} ${prolog} ${kind}`)
     const uri = dataUri(type, svg)
 
     const html = kind === 'object' ? `<object data="${uri}" width="64" height="64"></object>` : kind === 'embed' ? `<embed src="${uri}" width="64" height="64">`
       : kind === 'img' ? `<img alt="" src="${uri}">` : `<div style="width:64px;height:64px;background:url(${uri})"></div>`
 
     return { type, kind, svg, html }
-  }))
+  })))
 
   const xmlShas = (stderr: string) => sentences(stderr).map(l => (/\(sha256 ([0-9a-f]{12})\)$/.exec(l) ?? [])[1]).sort()
 
   // The same media types around a style-free SVG, captured on the ok page of the malformed-data test below: they must not be refused.
-  const xmlStill = XML_TYPES.map(type => `<img alt="" src="${dataUri(type, stillSvg(type))}"><div style="width:64px;height:64px;background:url(${dataUri(type, GRADIENT)})"></div>`).join('')
+  const xmlStill = XML_TYPES.map(type => `<img alt="" src="${dataUri(type, stillSvg(type))}"><div style="width:64px;height:64px;background:url(${dataUri(type, GRADIENT)})"></div>`
+    + Object.entries(PROLOGS).map(([name, prolog]) => `<img alt="" src="${dataUri(type, prolog + stillSvg(`${type} ${name}`))}">`).join('')).join('')
 
   // One shipped-CLI process per side serves both the malformed-data tests and the XML-labelled tests: every refusal of a page is reported together.
   const malformedCandidate = memo(() => {
@@ -1688,7 +1684,7 @@ ${otherConsumers.map(([, html]) => html).join('')}`
     expect(lines.map(l => (DATA_LINE.exec(l) ?? [])[1]).sort()).toEqual([MALFORMED_SVG, MALFORMED_HREF].map(sha12).sort())
   }, 120_000)
 
-  it('refuses a style-element SVG labelled text/xml or application/xml as an object, an embed, an img and a CSS background on the candidate side, through the shipped CLI', async () => {
+  it('refuses a style-element SVG labelled text/xml or application/xml as an object, an embed, an img and a CSS background, also behind a 70,000-character comment or a DOCTYPE entity holding "]>", on the candidate side, through the shipped CLI', async () => {
     const run = await malformedCandidate()
     expect(run.status, run.stderr).toBe(1)
     const lines = sentences(run.stderr).filter(isXmlLine)
@@ -1696,7 +1692,7 @@ ${otherConsumers.map(([, html]) => html).join('')}`
     expect(xmlShas(lines.join('\n')), run.stderr).toEqual(xmlConsumers.map(c => sha12(c.svg)).sort())
   }, 120_000)
 
-  it('refuses a style-element SVG labelled text/xml or application/xml as an object, an embed, an img and a CSS background on the prototype side, through the shipped CLI', async () => {
+  it('refuses a style-element SVG labelled text/xml or application/xml as an object, an embed, an img and a CSS background, also behind a 70,000-character comment or a DOCTYPE entity holding "]>", on the prototype side, through the shipped CLI', async () => {
     const run = await malformedPrototype()
     expect(run.status, run.stderr).toBe(1)
     const lines = sentences(run.stderr).filter(isXmlLine)
