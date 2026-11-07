@@ -17,6 +17,8 @@ export const VIEWPORTS = [[1280, 800], [375, 812]]
 export const MAX_PAGE_HEIGHT = 8000
 export const CHROMIUM_SWITCHES = ['--headless=new', '--disable-gpu', '--disable-lcd-text', '--font-render-hinting=none',
   '--force-color-profile=srgb', '--hide-scrollbars', '--disable-features=PaintHolding', '--lang=en-US',
+  // The review machine has only 64 MiB of shared memory: full-page captures of the real website filled it and crashed the renderer while stitching, so Chromium keeps it in the temp folder.
+  '--disable-dev-shm-usage',
   '--force-webrtc-ip-handling-policy=disable_non_proxied_udp']
 // Forced values: from a cascade layer declared first they also beat author ID-selector !important rules; inline !important is rewritten.
 export const FORCED = { animation: 'none', transition: 'none', 'caret-color': 'transparent', 'scroll-behavior': 'auto',
