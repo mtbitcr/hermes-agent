@@ -8,11 +8,9 @@
   const normalize = (s, max = Infinity) =>
     Array.from(String(s).normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase()).slice(0, max).join('')
   const ownText = el => Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.nodeValue).join('')
-  const parentOf = n => n.parentElement || (n.getRootNode && n.getRootNode().host)
-    || (n.ownerDocument && n.ownerDocument.defaultView && n.ownerDocument.defaultView.frameElement) || null
+  const parentOf = n => n.parentElement || (n.getRootNode && n.getRootNode().host) || null
   const styleOf = el => el.ownerDocument.defaultView.getComputedStyle(el)
-  const FRAMES = new Set(['iframe', 'frame'])
-  const EMBEDS = new Set(['object', 'embed'])
+  const EMBEDDING = new Set(['iframe', 'frame', 'fencedframe', 'object', 'embed'])
   const headingOf = el => {
     const h = el.querySelector('h1,h2,h3,h4,h5,h6')
     return h ? normalize(h.textContent, 40) : ''
@@ -73,34 +71,23 @@
     return cache.get(el)
   }
 
-  // An object or embed shows a document in a child frame of the window that holds it (image and plugin content has none). An SVG document is traversed
-  // like any other, but the normaliser does not run in XML documents, so it is judged by the capture's allowlist of its bytes and never measured.
-  function embeddedDocument(el, win) {
-    try {
-      const doc = el.localName === 'object' ? el.contentDocument : (Array.from({ length: win.length }, (_, i) => win[i]).find(w => w.frameElement === el) || {}).document
-      return doc && doc.documentElement ? doc : null
-    } catch { return null }
-  }
-
-  // Every element of each document (its html and body elements included), of each open shadow root and of each same-origin child frame or object/embed document,
-  // with the position of its viewport in the top viewport (the top document is at 0, 0).
-  function collect(root = document, ctx = { win: window, x: 0, y: 0 }, out = { items: [], roots: [] }) {
+  // Every element of the document (its html and body elements included) and of each open shadow root.
+  function collect(root = document, ctx = { win: window }, out = { items: [], roots: [] }) {
     out.roots.push({ root, win: ctx.win })
     const all = root.documentElement && root.body ? [root.documentElement, root.body, ...root.body.querySelectorAll('*')] : root.querySelectorAll('*')
     for (const el of all) {
       out.items.push({ el, ctx })
       if (el.shadowRoot) collect(el.shadowRoot, ctx, out)
-      const frame = FRAMES.has(el.localName)
-      if (!frame && !EMBEDS.has(el.localName)) continue
-      const doc = frame ? el.contentDocument : embeddedDocument(el, ctx.win)
-      if (!doc && frame && !out.lenient) throw new Error(`unsupported content: a cross-origin or unreadable <${el.localName}> frame cannot be measured`)
-      if (!doc) continue
-      const r = el.getBoundingClientRect()
-      const cs = ctx.win.getComputedStyle(el)
-      collect(doc, { win: doc.defaultView, x: ctx.x + r.left + el.clientLeft + parseFloat(cs.paddingLeft), y: ctx.y + r.top + el.clientTop + parseFloat(cs.paddingTop) }, out)
     }
     return out
   }
+
+  // The kit captures a page only when it is one document: an element that embeds another document refuses the capture.
+  function refuseEmbedding(items) {
+    const hit = items.find(({ el }) => EMBEDDING.has(el.localName))
+    if (hit) throw new Error(`unsupported content: the kit captures single documents only: found <${hit.el.localName}>`)
+  }
+  const assertSingleDocument = () => refuseEmbedding(collect().items)
 
   // The early script already normalised every document and shadow root before page code ran; a scope it did not reach cannot be trusted, so refuse.
   // Elements whose author inline !important was added late are caught up here.
@@ -127,7 +114,7 @@
 
   const isSvgDocument = root => root.nodeType === 9 && !!root.documentElement && root.documentElement.localName === 'svg'
 
-  // The one canonical state of every capture: the top document and every same-origin frame at scroll 0, 0.
+  // The one canonical state of every capture: the document at scroll 0, 0.
   function assertTop(wins) {
     const off = wins.find(w => w.scrollX !== 0 || w.scrollY !== 0)
     if (off) throw new Error(`the page cannot be held in its top-of-page scroll state (scroll ${off.scrollX}, ${off.scrollY}): refusing to capture`)
@@ -136,14 +123,13 @@
     wins.forEach(w => w.scrollTo({ left: 0, top: 0, behavior: 'instant' }))
     assertTop(wins)
   }
-  const htmlFrameDocuments = () => collect().roots.filter(({ root }) => root.nodeType === 9 && root !== document && root.documentElement).length
   const windows = () => Array.from(new Set(collect().roots.map(r => r.win)))
   const toTop = () => scrollToTop(windows())
   const atTop = () => assertTop(windows())
 
   // Fixed and sticky boxes are viewport coordinates; every other box is a document coordinate (the viewport origin plus the document's own scroll).
   const boxOf = (r, ctx, fixed) => ({
-    x: round(r.left + ctx.x + (fixed ? 0 : ctx.win.scrollX)), y: round(r.top + ctx.y + (fixed ? 0 : ctx.win.scrollY)),
+    x: round(r.left + (fixed ? 0 : ctx.win.scrollX)), y: round(r.top + (fixed ? 0 : ctx.win.scrollY)),
     width: round(r.width), height: round(r.height),
   })
 
@@ -164,6 +150,7 @@
     const masks = []
     atTop()
     const { items } = collect()
+    refuseEmbedding(items)
     const index = new Map(items.map(({ el }, i) => [el, i]))
     for (const { el, ctx } of items) {
       const tag = el.localName
@@ -212,7 +199,7 @@
     }
   }
 
-  // The raw strings through which the page can load an image or document from a data: URL, in every document, open shadow root and same-origin frame:
+  // The raw strings through which the page can load an image or document from a data: URL, in the document and every open shadow root:
   // attributes, and the computed values (as the browser serialises them) of the image-valued properties of each element and its ::before and ::after.
   const IMAGE_PROPERTIES = [
     'background-image', 'mask-image', '-webkit-mask-image', 'border-image-source', 'list-style-image', 'content', 'cursor', 'shape-outside',
@@ -220,14 +207,13 @@
   ]
   function dataUrls() {
     const urls = new Set(), srcsets = new Set(), styles = new Set()
-    const { items } = collect(document, undefined, { items: [], roots: [], lenient: true })
+    const { items } = collect()
     for (const { el, ctx } of items) {
       const tag = el.localName
       const attr = name => el.getAttribute(name)
       if (tag === 'img') { urls.add(attr('src')); urls.add(el.currentSrc) }
       if (tag === 'img' || tag === 'source') srcsets.add(attr('srcset'))
-      if (tag === 'object') urls.add(attr('data'))
-      if (tag === 'embed' || (tag === 'input' && String(attr('type')).toLowerCase() === 'image')) urls.add(attr('src'))
+      if (tag === 'input' && String(attr('type')).toLowerCase() === 'image') urls.add(attr('src'))
       if (tag === 'image' || tag === 'feImage' || tag === 'use') { urls.add(attr('href')); urls.add(attr('xlink:href')) }
       if (tag === 'video') urls.add(attr('poster'))
       for (const pseudo of [null, '::before', '::after']) {
@@ -277,5 +263,5 @@
     if (p === 'fixed' || p === 'sticky') el.style.setProperty('visibility', 'hidden', 'important')
   })
 
-  return { normalize, landmarksOf, firstFamily, familyName, hiddenByOpacity, prepare, fontsReady, measure, settle, hidePinned, toTop, atTop, scrollToTop, assertTop, boxOf, freeze, freezeNative, htmlFrameDocuments, dataUrls }
+  return { normalize, landmarksOf, firstFamily, familyName, hiddenByOpacity, prepare, fontsReady, measure, settle, hidePinned, toTop, atTop, scrollToTop, assertTop, boxOf, freeze, freezeNative, dataUrls, assertSingleDocument }
 })()

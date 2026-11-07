@@ -109,17 +109,12 @@ describe('key building', () => {
     ])
   })
 
-  it('continues the landmark chain through shadow hosts and frame elements', () => {
+  it('continues the landmark chain through shadow hosts', () => {
     const inShadow = el('h2', {}, 'Inner')
     const host = el('div', {})
     el('body', {}, el('main', {}, host))
     inShadow.getRootNode = () => ({ host })
-    const frame = el('iframe', {})
-    el('body', {}, el('section', {}, frame))
-    const inFrame = el('h3', {}, 'Framed')
-    inFrame.ownerDocument = { defaultView: { frameElement: frame } }
     expect(probe.landmarksOf(inShadow)).toEqual([['main', '']])
-    expect(probe.landmarksOf(inFrame)).toEqual([['section', '']])
   })
 })
 
@@ -230,11 +225,11 @@ describe('probe canonical scroll state and native motion freeze', () => {
     expect(() => probe.assertTop([win(0, 1000)])).toThrow('top-of-page scroll state')
   })
 
-  it('gives fixed and sticky boxes viewport coordinates and every other box document coordinates, without adding the offsets twice', () => {
+  it('gives fixed and sticky boxes viewport coordinates and every other box document coordinates, without adding the scroll twice', () => {
     const rect = { left: 10.126, top: 20.5, width: 30, height: 40 }
-    const ctx = { win: { scrollX: 5, scrollY: 7 }, x: 100, y: 200 }
-    expect(probe.boxOf(rect, ctx, true)).toEqual({ x: 110.13, y: 220.5, width: 30, height: 40 })
-    expect(probe.boxOf(rect, ctx, false)).toEqual({ x: 115.13, y: 227.5, width: 30, height: 40 })
+    const ctx = { win: { scrollX: 5, scrollY: 7 } }
+    expect(probe.boxOf(rect, ctx, true)).toEqual({ x: 10.13, y: 20.5, width: 30, height: 40 })
+    expect(probe.boxOf(rect, ctx, false)).toEqual({ x: 15.13, y: 27.5, width: 30, height: 40 })
   })
 
   const svgRoot = (opts: { stuck?: boolean } = {}) => {
@@ -297,6 +292,43 @@ describe('probe canonical scroll state and native motion freeze', () => {
     probe.freezeNative([s, { localName: 'p' }])
     probe.freezeNative([s, { localName: 'p' }])
     expect(s.calls).toEqual(['pause', 'time 0', 'pause', 'time 0'])
+  })
+})
+
+const REFUSAL = 'unsupported content: the kit captures single documents only'
+
+describe('single documents only', () => {
+  const tag = (localName: string, extra: Record<string, unknown> = {}) => ({ localName, ...extra })
+  const shadow = (...kids: FakeNode[]) => ({ querySelectorAll: () => kids })
+
+  const probeOf = (...page: FakeNode[]) =>
+    runInNewContext(probeSource, { window: {}, document: { createElement: () => ({}), documentElement: {}, body: { querySelectorAll: () => page } } })
+
+  it('refuses an iframe, frame, fencedframe, object or embed element and names it', () => {
+    for (const name of ['iframe', 'frame', 'fencedframe', 'object', 'embed']) {
+      const page = probeOf(tag('h1'), tag(name))
+      expect(() => page.assertSingleDocument(), name).toThrow(`${REFUSAL}: found <${name}>`)
+    }
+  })
+
+  it('finds the element inside an open shadow root, also a nested one', () => {
+    expect(() => probeOf(tag('div', { shadowRoot: shadow(tag('p'), tag('iframe')) })).assertSingleDocument()).toThrow(`${REFUSAL}: found <iframe>`)
+    expect(() => probeOf(tag('div', { shadowRoot: shadow(tag('section', { shadowRoot: shadow(tag('embed')) })) })).assertSingleDocument()).toThrow(`${REFUSAL}: found <embed>`)
+  })
+
+  it('passes a page without such an element, also with an img, svg, canvas and video', () => {
+    const plain = ['html', 'h1', 'p', 'a', 'img', 'svg', 'canvas', 'video', 'input', 'picture', 'source'].map(n => tag(n))
+    expect(() => probeOf().assertSingleDocument()).not.toThrow()
+    expect(() => probeOf(...plain).assertSingleDocument()).not.toThrow()
+    expect(() => probeOf(tag('div', { shadowRoot: shadow(...plain) })).assertSingleDocument()).not.toThrow()
+  })
+
+  it('refuses a page whose frame tree holds a child frame, by url or by id, and passes a lone main frame', () => {
+    const frame = (id: string, url = '') => ({ id, url })
+    expect(() => kit.assertNoChildFrames({ frame: frame('main', 'http://x/') })).not.toThrow()
+    expect(() => kit.assertNoChildFrames({ frame: frame('main'), childFrames: [] })).not.toThrow()
+    expect(() => kit.assertNoChildFrames({ frame: frame('main'), childFrames: [{ frame: frame('kid', 'http://other.test/f') }] })).toThrow(`${REFUSAL}: found a frame http://other.test/f`)
+    expect(() => kit.assertNoChildFrames({ frame: frame('main'), childFrames: [{ frame: frame('kid-7') }] })).toThrow(`${REFUSAL}: found a frame kid-7`)
   })
 })
 
@@ -504,7 +536,7 @@ describe('requests and Chromium pin', () => {
     expect(() => kit.assertSelfContained(['https://fonts.example/f.woff2'])).toThrow(/^the chosen design file is not self-contained$/)
   })
 
-  it('finds closed shadow roots anywhere in a pierced DOM tree, including frame documents, and ignores the rest', () => {
+  it('finds closed shadow roots anywhere in a pierced DOM tree and ignores the rest', () => {
     const node = (nodeName: string, extra: Record<string, unknown> = {}) => ({ nodeName, ...extra })
     const root = (shadowRootType: string) => node('#document-fragment', { shadowRootType, children: [node('H2')] })
     const page = (...kids: unknown[]) => node('#document', { children: [node('HTML', { children: kids })] })
@@ -512,7 +544,6 @@ describe('requests and Chromium pin', () => {
     expect(kit.findClosedShadowRoot(page(node('DIV', { shadowRoots: [root('open'), root('user-agent')] })))).toBeNull()
     expect(kit.findClosedShadowRoot(page(node('TEMPLATE', { templateContent: page(node('P', { shadowRoots: [root('closed')] })) })))).toBeNull()
     expect(kit.findClosedShadowRoot(page(node('SECTION', { shadowRoots: [root('closed')] })))).toBe('SECTION')
-    expect(kit.findClosedShadowRoot(page(node('IFRAME', { contentDocument: page(node('X-CARD', { shadowRoots: [root('open'), root('closed')] })) })))).toBe('X-CARD')
     expect(kit.findClosedShadowRoot(page(node('DIV', { shadowRoots: [{ ...root('open'), children: [node('ASIDE', { shadowRoots: [root('closed')] })] }] })))).toBe('ASIDE')
   })
 
@@ -694,7 +725,7 @@ const smil = (ms: number, id: string, extra = '') => `<svg xmlns="http://www.w3.
 const stillSvg = (id: string) => `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><title>${id}</title><rect width="64" height="64" fill="red"/></svg>`
 const dataUri = (mime: string, body: Buffer | string) => `data:${mime};base64,${Buffer.from(body).toString('base64')}`
 const SVG = 'image/svg+xml'
-type ScrollKnobs = { x: number, y: number, frameY: number, onLoad: boolean }
+type ScrollKnobs = { x: number, y: number, onLoad: boolean }
 
 // Prologs the old raw-text scan could not get past: a 70,000-character comment, and a DOCTYPE whose entity value holds "]>".
 const PROLOGS: Record<string, string> = { 'long-comment': `<!-- ${'x'.repeat(70_000)} -->\n`, 'entity-doctype': '<!DOCTYPE svg [<!ENTITY closer "]>">]>\n' }
@@ -751,15 +782,6 @@ describe('animated resource detection', () => {
     expect(kit.animatedResource(ftyp('avif', 'mif1', 'miaf'), 'image/avif')).toBeNull()
     expect(kit.animatedResource(Buffer.from([0xff, 0x0a, 1, 2, 3]), 'image/jxl')).toBe('jxl')
     expect(kit.animatedResource(Buffer.from([0, 0, 0, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a]), 'image/jxl')).toBe('jxl')
-  })
-
-  it('lists the embedded documents of a pierced DOM tree with their root element, skipping template content', () => {
-    const doc = (root: string, ...kids: unknown[]) => ({ nodeName: '#document', children: [{ nodeType: 10, nodeName: 'html' }, { nodeType: 1, nodeName: root.toUpperCase(), localName: root, children: kids }] })
-    const owner = (nodeName: string, contentDocument?: unknown) => ({ nodeName, nodeType: 1, children: [], ...(contentDocument ? { contentDocument } : {}) })
-
-    expect(kit.embeddedDocumentRoots(doc('html'))).toEqual([])
-    expect(kit.embeddedDocumentRoots(doc('html', owner('IMG'), owner('OBJECT'), owner('EMBED', doc('svg')), owner('IFRAME', doc('html', owner('OBJECT', doc('html'))))))).toEqual(['svg', 'html', 'html'])
-    expect(kit.embeddedDocumentRoots(doc('html', { nodeName: 'TEMPLATE', templateContent: doc('html', owner('OBJECT', doc('html'))), children: [] }))).toEqual([])
   })
 
   it('refuses with one sentence per kind of problem, naming every animated, unprovable and unreadable resource', () => {
@@ -959,14 +981,13 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
     return { seen, stun, turn, close: () => Promise.all([new Promise<void>(r => udp.close(() => r())), new Promise<void>(r => tcp.close(() => r()))]) }
   }
 
-  // ---- Motion, shadow roots and frames: pairs of routes that differ only in a period, a speed or a rendering hint must give the same evidence. ----
+  // ---- Motion and shadow roots: pairs of routes that differ only in a period, a speed or a rendering hint must give the same evidence. ----
 
-  // One page per route: the animated tiny page, an animated open shadow root, a visible shadow root (with a canvas) and a srcdoc frame at 10 px and again at 40 px, then `native` (SMIL and marquee), the scroll fragment, which comes first so that its sticky box stays at 300 px, the rendering-normalisation fragment `nd`, and a shadow root on the body (first, before any frame or object is parsed) whose animation period differs too.
+  // One page per route: the animated tiny page, an animated open shadow root and a visible shadow root (with a canvas), then `native` (SMIL and marquee), the scroll fragment, which comes first so that its sticky box stays at 300 px, the rendering-normalisation fragment `nd`, and a shadow root on the body (first, before the rest of the page is parsed) whose animation period differs too.
   const motionPage = (ms: number, smoothing: string, native: string, scroll: ScrollKnobs, nd: string, bodyShadowMs: number) => `<!doctype html><meta charset=utf-8>
 <style>body{margin:0;width:2400px;height:2400px;font:20px sans-serif;-webkit-font-smoothing:${smoothing}}
 .sh{position:fixed;left:0;top:0;width:200px;height:50px;background:#abc}
 .sa{position:sticky;top:0;margin-top:300px;width:200px;height:60px;background:#cba}
-.sf{position:absolute;left:400px;top:500px;width:300px;height:200px;border:0}
 @keyframes spin{to{transform:rotate(360deg)}}
 #box{width:80px;height:80px;background:#369;animation:spin ${ms}ms linear infinite}
 #wa{width:80px;height:60px;background:red}h1{margin:16px}</style><body style="background:#eee">${bodyShadowScript(bodyShadowMs)}${scrollFragment(scroll)}<h1>Tiny page</h1><div id=box></div><div id=wa></div><p>Some text</p>
@@ -979,8 +1000,7 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
 <h1>Outside</h1><div id=animated></div><script>animated.attachShadow({mode:'open'}).innerHTML =
 '<style>@keyframes m{to{transform:translateX(300px)}}h2{width:100px;animation:m ${ms}ms infinite linear}</style><h2>Inside</h2>'</script>
 <div id=host></div><script>host.attachShadow({mode:'open'}).innerHTML = '<p style="font-size:10px">Visible shadow text</p><canvas width=50 height=20></canvas><p style="font-size:40px">Big shadow text</p>'</script>
-<iframe srcdoc="<h2 style='font-size:10px'>Frame text</h2><p style='position:fixed;bottom:0'>Pin</p>" style="border:0;margin:30px 30px 30px 38px"></iframe>
-<iframe srcdoc="<h2 style='font-size:40px'>Big frame text</h2>" style="border:0;margin:30px 30px 30px 38px"></iframe>${native}
+${native}
 ${nd}
 <script>document.getElementById('wa').animate([{transform:'translateX(0px)'},{transform:'translateX(300px)'}],{duration:${ms},iterations:Infinity})</script>`
 
@@ -992,11 +1012,11 @@ ${nd}
 
   // The routes before the refusal of a closed shadow root. The two routes differ in every period, speed and rendering hint, and must still give the same evidence.
   const motionLaunch = memo(() => {
-    const [fast, slow] = [nativeMotion('fast', 1000, 40), nativeMotion('slow', 10_000, 1)]
+    const [fast, slow] = [nativeMotion(1000, 40), nativeMotion(10_000, 1)]
 
-    return launchPages({ 'motion-a': motionPage(1000, 'antialiased', fast.body, { x: 0, y: 0, frameY: 0, onLoad: false }, ndFragment('subpixel-antialiased', 'optimizeSpeed'), 1000),
-      'motion-b': motionPage(3700, 'subpixel-antialiased', slow.body, { x: 1000, y: 1000, frameY: 500, onLoad: true }, ndFragment('none', 'optimizeLegibility'), 10_000), closed: closedPage },
-      { 'inner-fast.html': fast['inner-fast.html'], 'inner-slow.html': slow['inner-slow.html'], 'acme.woff2': readFileSync(fileURLToPath(new URL('../web/public/fonts/Mondwest-Regular.woff2', import.meta.url))) })
+    return launchPages({ 'motion-a': motionPage(1000, 'antialiased', fast.body, { x: 0, y: 0, onLoad: false }, ndFragment('subpixel-antialiased', 'optimizeSpeed'), 1000),
+      'motion-b': motionPage(3700, 'subpixel-antialiased', slow.body, { x: 1000, y: 1000, onLoad: true }, ndFragment('none', 'optimizeLegibility'), 10_000), closed: closedPage },
+      { 'acme.woff2': readFileSync(fileURLToPath(new URL('../web/public/fonts/Mondwest-Regular.woff2', import.meta.url))) })
   })
 
   it('gives identical bundles and images despite CSS animation, infinite Web Animations API motion and font smoothing', async () => {
@@ -1048,20 +1068,14 @@ ${nd}
     expect(byText(read(run.outDir, 1280, '/motion-a'), 'inside').tag).toBe('h2')
   }, 120_000)
 
-  it('measures visible shadow-root and srcdoc-iframe text with its own type values and page coordinates', async () => {
+  it('measures visible shadow-root text with its own type values and page coordinates', async () => {
     const run = await motionLaunch()
     const bundle = read(run.outDir, 1280, '/motion-a')
 
     expect(byText(bundle, 'visible shadow text').style['font-size']).toBe(10)
     expect(byText(bundle, 'big shadow text').style['font-size']).toBe(40)
-    expect(byText(bundle, 'frame text').style['font-size']).toBe(10)
-    expect(byText(bundle, 'big frame text').style['font-size']).toBe(40)
     expect(byText(bundle, 'big shadow text').box.height).toBeGreaterThan(byText(bundle, 'visible shadow text').box.height)
-    expect(byText(bundle, 'big frame text').box.height).toBeGreaterThan(byText(bundle, 'frame text').box.height)
-    expect(byText(bundle, 'frame text').box.x).toBeGreaterThanOrEqual(40)
-    expect(byText(bundle, 'frame text').box.y).toBeGreaterThan(60)
     expect(bundle.masks).toContainEqual(expect.objectContaining({ width: 50, height: 20 }))
-    expect(byText(bundle, 'pin').fixed).toBe(true)
   }, 120_000)
 
   it('refuses a closed shadow root instead of claiming complete evidence', async () => {
@@ -1073,7 +1087,6 @@ ${nd}
   const normFragment = (smoothing: string, rendering: string, more = '') => {
     const decl = `-webkit-font-smoothing:${smoothing};text-rendering:${rendering}`
     const reflect = (id: string, out: string) => `${out}.textContent = getComputedStyle(${id}).webkitFontSmoothing + ' / ' + getComputedStyle(${id}).textRendering`
-    const frame = `Frame body text<p id=a style='${decl}!important'>A</p><p id=o></p><script>${reflect('a', 'o')}</script>`.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
 
     return `Top body text<p id=na style="${decl}!important">Inline</p><p id=nra></p><script>${reflect('na', 'nra')}</script>
 <div id=rhost></div><script>const r = rhost.attachShadow({mode:'open'}), own = new CSSStyleSheet(); own.replaceSync('h2{${decl}}')
@@ -1081,7 +1094,7 @@ r.adoptedStyleSheets = [own]; r.innerHTML = '<h2 id=s>S</h2><p id=o></p>'
 const o = r.getElementById('o'); o.textContent = getComputedStyle(r.getElementById('s')).webkitFontSmoothing + ' / ' + getComputedStyle(r.getElementById('s')).textRendering</script>
 <div id=dh><template shadowrootmode=open><style>h3{${decl}}</style><h3 id=d>D</h3><p id=e></p></template></div>
 <script>const dr = dh.shadowRoot; dr.getElementById('e').textContent = getComputedStyle(dr.getElementById('d')).webkitFontSmoothing + ' / ' + getComputedStyle(dr.getElementById('d')).textRendering</script>
-<iframe srcdoc="${frame}"></iframe>${retainFragment(false)}${more}`
+${retainFragment(false)}${more}`
   }
 
   const dynamic = (smoothing: string, rendering: string) => {
@@ -1107,11 +1120,10 @@ const o = r.getElementById('o'); o.textContent = getComputedStyle(r.getElementBy
 
   const dynamicFragment = (smoothing: string, rendering: string) => {
     const make = dynamic(smoothing, rendering)
-    const frame = `<body>Dynamic frame text<script>${make}(document.body)</script>`.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
 
     return `<div id=dtop></div><div id=dhost></div><script>
 ${make}(document.getElementById('dtop'))
-dhost.attachShadow({mode:'open'}); ${make}(dhost.shadowRoot)</script><iframe srcdoc="${frame}"></iframe>`
+dhost.attachShadow({mode:'open'}); ${make}(dhost.shadowRoot)</script>`
   }
 
   // Three texts at the same place, set in the same face: its name quoted with a double and with a single quote, a name that is not loaded, and the loaded name in other case.
@@ -1133,7 +1145,7 @@ document.getElementById('ko').textContent = (live || getComputedStyle(p)).textRe
 
   const retainPage = (retain: boolean) => `<!doctype html>${retainFragment(retain)}`
 
-  // Every paragraph that reads back the normalised values shows them as this text: 2 from the enforcement page, 4 from the first group of reads, 18 from the synchronous paths.
+  // Every paragraph that reads back the normalised values shows them as this text: 2 from the enforcement page, 3 from the first group of reads, 12 from the synchronous paths.
   const NORMALISED = 'antialiased / geometricprecision'
 
   const normaliseLaunch = memo(() => launchPages({ 'retain-on': retainPage(true) }))
@@ -1145,25 +1157,25 @@ document.getElementById('ko').textContent = (live || getComputedStyle(p)).textRe
     for (const width of [1280, 375]) {expect(byText(read(run.outDir, width, '/motion-a'), 'inside body').tag).toBe('h2')}
   }, 120_000)
 
-  it('normalises before page code reads it and measures each body: one synchronous computed-style read of inline !important, a shadow root, a declarative shadow root and a srcdoc frame', async () => {
+  it('normalises before page code reads it and measures the body: one synchronous computed-style read of inline !important, a shadow root and a declarative shadow root', async () => {
     const run = await motionLaunch()
     sameEvidence(run, '/motion-a', '/motion-b')
 
     for (const width of [1280, 375]) {
       const bundle = read(run.outDir, width, '/motion-a')
-      expect(bundle.elements.filter((e: any) => e.text === NORMALISED), `${width}`).toHaveLength(2 + 4 + 18)
+      expect(bundle.elements.filter((e: any) => e.text === NORMALISED), `${width}`).toHaveLength(2 + 3 + 12)
       const bodies = bundle.elements.filter((e: any) => e.tag === 'body')
-      expect(bodies.map((e: any) => e.text).sort(), `${width} body text`).toEqual(['', 'dynamic frame text', 'frame body text', 'top body text'])
+      expect(bodies.map((e: any) => e.text), `${width} body text`).toEqual(['top body text'])
       expect(bodies.find((e: any) => e.text === 'top body text').style['background-color']).toEqual([238, 238, 238, 1])
     }
   }, 120_000)
 
-  it('normalises synchronously: created, style-set (setProperty, cssText, style attribute, style property), inserted and read-back elements in the page, an open shadow root and a srcdoc frame', async () => {
+  it('normalises synchronously: created, style-set (setProperty, cssText, style attribute, style property), inserted and read-back elements in the page and an open shadow root', async () => {
     const run = await motionLaunch()
     sameEvidence(run, '/motion-a', '/motion-b')
 
     for (const width of [1280, 375]) {
-      expect(read(run.outDir, width, '/motion-a').elements.filter((e: any) => e.text === NORMALISED), `${width}`).toHaveLength(2 + 4 + 18)
+      expect(read(run.outDir, width, '/motion-a').elements.filter((e: any) => e.text === NORMALISED), `${width}`).toHaveLength(2 + 3 + 12)
     }
   }, 120_000)
 
@@ -1181,12 +1193,11 @@ document.getElementById('ko').textContent = (live || getComputedStyle(p)).textRe
 
   // ---- Scroll, native motion and tiling, ending in the refusal of the page that empties the normalisation layer. ----
 
-  // Fixed, sticky and in-frame boxes; the page, and a same-origin frame, are scrolled while loading. Its styles are the .sh, .sa and .sf rules of the motion page.
-  const scrollFragment = ({ x, y, frameY, onLoad }: ScrollKnobs) => {
+  // Fixed and sticky boxes; the page is scrolled while loading. Its styles are the .sh and .sa rules of the motion page.
+  const scrollFragment = ({ x, y, onLoad }: ScrollKnobs) => {
     const scroll = `scrollTo(${x},${y})`
 
     return `<header class=sh>Fixed</header><aside class=sa>Sticky</aside><main>Control</main>
-<iframe class=sf srcdoc="<body style='margin:0;height:2000px;background:linear-gradient(#fff,#369)'><p style='position:fixed;top:0;margin:0'>Frame pin</p><p style='margin-top:100px'>Frame flow</p><script>scrollTo(0,${frameY})</script>"></iframe>
 <script>${onLoad ? `addEventListener('load', () => ${scroll})` : scroll}</script>${enforcePage(`b.style.setProperty('-webkit-font-smoothing', 'subpixel-antialiased', 'important');`)}`
   }
 
@@ -1198,7 +1209,7 @@ document.getElementById('ko').textContent = (live || getComputedStyle(p)).textRe
     const [run, motion] = [await enforceLaunch(), await motionLaunch()]
 
     for (const width of [1280, 375]) {
-      expect(read(motion.outDir, width, '/motion-b').elements.filter((e: any) => e.text === NORMALISED), `${width}`).toHaveLength(2 + 4 + 18)
+      expect(read(motion.outDir, width, '/motion-b').elements.filter((e: any) => e.text === NORMALISED), `${width}`).toHaveLength(2 + 3 + 12)
     }
 
     expect(run.error?.message).toContain('rendering normalisation is not effective')
@@ -1213,12 +1224,10 @@ document.getElementById('ko').textContent = (live || getComputedStyle(p)).textRe
       expect(byText(bundle, 'fixed')).toMatchObject({ fixed: true, box: { x: 0, y: 0, width: 200, height: 50 } })
       expect(byText(bundle, 'sticky')).toMatchObject({ fixed: true, box: { x: 0, y: 300, width: 200, height: 60 } })
       expect(byText(bundle, 'control').fixed).toBe(false)
-      expect(byText(bundle, 'frame pin')).toMatchObject({ fixed: true, box: { x: 400, y: 500 } })
-      expect(byText(bundle, 'frame flow').box).toMatchObject({ x: 400, y: 600 })
     }
   }, 120_000)
 
-  const nativeMotion = (tag: string, ms: number, amount: number) => {
+  const nativeMotion = (ms: number, amount: number) => {
     const root = (kids: string) => `<svg xmlns="http://www.w3.org/2000/svg" width="360" height="120" style="display:block">${kids}</svg>`
 
     const shapes = `<rect y="20" width="60" height="40" fill="red"><animate attributeName="x" from="0" to="280" dur="${ms}ms" repeatCount="indefinite"/></rect>
@@ -1227,11 +1236,8 @@ document.getElementById('ko').textContent = (live || getComputedStyle(p)).textRe
 <rect x="300" y="20" width="30" height="30" fill="black"><set attributeName="fill" to="white" begin="${ms / 2}ms"/></rect>`
 
     const marquees = `<marquee scrollamount="${amount}" style="display:block;width:300px">Moving text control</marquee><marquee direction="up" height="60" scrollamount="${amount}">Up</marquee>`
-    const inner = `<!doctype html><style>body{margin:0}</style>${root(shapes)}<marquee scrollamount="${amount}">Inner mover</marquee>`
 
-    return { [`inner-${tag}.html`]: inner, body: `<h1>Native motion</h1>${root(shapes)}${marquees}<div id=nhost></div>
-<object data="/inner-${tag}.html" type="text/html" width="380" height="130" style="display:block"></object><embed src="/inner-${tag}.html" type="text/html" width="380" height="130" style="display:block">
-<iframe style="border:0;width:380px;height:130px" srcdoc='${root(shapes).replace(/'/g, '&#39;')}'></iframe>
+    return { body: `<h1>Native motion</h1>${root(shapes)}${marquees}<div id=nhost></div>
 <script>document.getElementById('nhost').attachShadow({mode:'open'}).innerHTML = '${root(shapes)}<marquee scrollamount="${amount}">Shadow mover</marquee>'</script>` }
   }
 
@@ -1259,7 +1265,7 @@ document.getElementById('ko').textContent = (live || getComputedStyle(p)).textRe
 
   const cliRun = memo(() => cli('/a-b /a/b'))
 
-  it('freezes SMIL animate, animateTransform, animateMotion and set, and stops marquee, in the page, an open shadow root, a frame and a same-origin object and embed document, whatever their duration or speed', async () => {
+  it('freezes SMIL animate, animateTransform, animateMotion and set, and stops marquee, in the page and an open shadow root, whatever their duration or speed', async () => {
     const run = await motionLaunch()
     sameEvidence(run, '/motion-a', '/motion-b')
     const png = decodePng(pngOf(run.outDir, 1280, '/motion-a'))
@@ -1292,9 +1298,7 @@ document.getElementById('ko').textContent = (live || getComputedStyle(p)).textRe
     expect((await nativeLaunch()).error?.message).toMatch(/closed shadow root/)
   }, 120_000)
 
-  // ---- Fonts, then the refusal of unreadable object and embed documents, a sandboxed frame and a page that holds the scroll away from the top. ----
-
-  const objectLaunch = memo(() => launchPages({ object: '<object data="data:text/html,%3Ch2%3EOpaque%3C/h2%3E" type="text/html"></object>' }))
+  // ---- Fonts, then the refusal of embedded documents and a page that holds the scroll away from the top. ----
 
   it('keeps comma-containing quoted font families apart on the measured element, and equal when the names match', async () => {
     const run = await motionLaunch()
@@ -1316,19 +1320,43 @@ document.getElementById('ko').textContent = (live || getComputedStyle(p)).textRe
     }
   }, 120_000)
 
-  it('refuses an unreadable <object> document instead of claiming complete evidence', async () => {
-    expect((await objectLaunch()).error?.message).toMatch(/unreadable <object> or <embed> document cannot be measured/)
+  // Each refused page ends its launch, so every kind of embedded document has its own. The pages are refused with one plain message that names the element or the frame.
+  const embeddedLaunches = {
+    iframe: memo(() => launchPages({ iframe: '<h1>Single</h1><iframe srcdoc="<h2>Inner</h2>"></iframe>' })),
+    object: memo(() => launchPages({ object: '<h1>Single</h1><object data="data:text/html,%3Ch2%3EInner%3C/h2%3E" type="text/html"></object>' })),
+    embed: memo(() => launchPages({ embed: '<h1>Single</h1><embed src="data:text/html,%3Ch2%3EInner%3C/h2%3E" type="text/html">' })),
+    sandboxed: memo(() => launchPages({ sandboxed: '<h1>Single</h1><iframe sandbox srcdoc="<h2>Opaque</h2>"></iframe>' })),
+    crossSite: memo(() => launchPages({ cross: '<h1>Single</h1><iframe src="http://localhost:9/other"></iframe>' })),
+    prototype: memo(() => launchPrototype('<h1>Proto</h1><iframe srcdoc="<h2>Inner</h2>"></iframe>')),
+  }
+
+  // The page embeds a frame only once the kit has scrolled it to the second tile, after the checks at the start and before the first screenshot have passed.
+  const lateLaunch = memo(() => launchPages({
+    late: `<!doctype html><style>body{margin:0;height:2000px}</style><h1>Late</h1><script>
+addEventListener('scroll', () => { if (scrollY > 0 && !document.querySelector('iframe')) document.body.appendChild(document.createElement('iframe')) })</script>`,
+  }))
+
+  it.each(['iframe', 'object', 'embed'] as const)('refuses a candidate page with an <%s> element and names it', async name => {
+    const run = await embeddedLaunches[name]()
+    expect(run.error?.message).toBe(`${REFUSAL}: found <${name}>`)
+    expect(readdirSync(run.outDir)).toEqual([])
   }, 120_000)
 
-  const sandboxedLaunch = memo(() => launchPages({ sandboxed: '<iframe sandbox srcdoc="<h2>Opaque</h2>"></iframe>' }))
-  const embedLaunch = memo(() => launchPages({ embed: '<embed src="data:text/html,%3Ch2%3EOpaque%3C/h2%3E" type="text/html">' }))
-
-  it('refuses an unreadable <embed> document instead of claiming complete evidence', async () => {
-    expect((await embedLaunch()).error?.message).toMatch(/unreadable <object> or <embed> document cannot be measured/)
+  it('refuses a sandboxed or cross-site frame whose document the kit cannot read, by the same sentence', async () => {
+    expect((await embeddedLaunches.sandboxed()).error?.message).toMatch(new RegExp(`^${REFUSAL}: found <iframe>`))
+    expect((await embeddedLaunches.crossSite()).error?.message).toMatch(new RegExp(`^${REFUSAL}: found (<iframe>|a frame )`))
   }, 120_000)
 
-  it('refuses a sandboxed frame instead of claiming complete evidence', async () => {
-    expect((await sandboxedLaunch()).error?.message).toMatch(/<iframe>.*cannot be measured/)
+  it('refuses a prototype with an embedded document, by the same sentence', async () => {
+    const run = await embeddedLaunches.prototype()
+    expect(run.error?.message).toBe(`${REFUSAL}: found <iframe>`)
+    expect(readdirSync(run.outDir)).toEqual([])
+  }, 120_000)
+
+  it('refuses a page that gains a frame after the first checks, before it is screenshot', async () => {
+    const run = await lateLaunch()
+    expect(run.error?.message).toMatch(new RegExp(`^${REFUSAL}: found (<iframe>|a frame )`))
+    expect(readdirSync(run.outDir)).toEqual([])
   }, 120_000)
 
   const stuckLaunch = memo(() => launchPages({
@@ -1359,16 +1387,10 @@ for (const f of [() => new WebSocket('ws://${r.base}/socket'), () => new EventSo
     const run = `for (const C of [RTCPeerConnection, webkitRTCPeerConnection]) { try { const pc = new C(${ice}); pc.createDataChannel('x'); pc.createOffer().then(o => pc.setLocalDescription(o)).catch(() => {}) } catch {} }
 try { new WebTransport('https://127.0.0.1:9/') } catch {}`
 
-    const rtc = `<h1>rtc</h1><script>${run}</script><iframe srcdoc="<h2>frame</h2><script>${run}</script>"></iframe>
-<script>const f = document.body.appendChild(document.createElement('iframe')); try { new f.contentWindow.RTCPeerConnection(${ice}) } catch {}</script>`
-
-    // The blocked cross-site frame cannot be read, so this capture is refused; what matters is that nothing reached a receiver.
-    const other = r.base.replace('127.0.0.1', 'localhost')
+    const rtc = `<h1>rtc</h1><script>${run}</script>`
 
     const routes = `<h1>routes</h1><a id=a target=_blank href="http://${r.base}/link">l</a><form id=f target=_blank action="http://${r.base}/form"></form><script>
-const frame = () => document.body.appendChild(document.createElement('iframe'))
-for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWindow.WebSocket)('ws://${r.base}/frame-socket'),
-  () => frame().contentWindow.open('http://${r.base}/frame-popup'), () => { frame().src = 'http://${other}/frame' }]) { try { f() } catch {} }</script>`
+for (const f of [() => a.click(), () => f.submit()]) { try { f() } catch {} }</script>`
 
     const leaks = `<link rel=stylesheet href="asset.css"><link rel=stylesheet href="/missing-required.css"><link rel=stylesheet href="http://${r.base}/x.css">`
 
@@ -1423,12 +1445,12 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
     expect(r.hits).toEqual([])
   }, 120_000)
 
-  it('also keeps link, form, frame-realm and cross-site frame routes from reaching a separate receiver', async () => {
+  it('also keeps link and form routes from reaching a separate receiver', async () => {
     const { r } = await outside()
     expect(r.hits).toEqual([])
   }, 120_000)
 
-  it('refuses WebRTC, WebTransport and data channels in the page, srcdoc and script-made frames before ICE reaches a STUN or TURN receiver, on both sides', async () => {
+  it('refuses WebRTC, WebTransport and data channels in the page before ICE reaches a STUN or TURN receiver, on both sides', async () => {
     const { candidate, prototype, s } = await outside()
 
     for (const width of [1280, 375]) {
@@ -1439,11 +1461,12 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
     expect(s.seen).toEqual({ packets: 0, connections: 0 })
   }, 120_000)
 
-  const protoOk = memo(() => launchPrototype('<style>h1{color:#369}</style><h1>P</h1><img alt=dot src="data:image/gif;base64,R0lGODlhAQABAAAAACw=">'))
+  const protoOk = memo(() => launchPrototype('<style>h1{color:#369}</style><h1>P</h1><img alt=dot src="data:image/gif;base64,R0lGODlhAQABAAAAACw="><svg width=10 height=10><rect width=10 height=10 /></svg><canvas width=10 height=10></canvas><video width=10 height=10></video>'))
 
-  it('accepts an inline prototype', async () => {
+  it('accepts an inline prototype, also with an img, svg, canvas and video', async () => {
     const run = await protoOk()
     expect(run.error).toBeUndefined()
+    expect(read(run.outDir, 1280, '/').masks).toHaveLength(2)
 
     for (const width of [1280, 375]) {expect(read(run.outDir, width, '/').blocked_requests).toEqual([])}
   }, 120_000)
@@ -1493,8 +1516,6 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
     'reference-keyframes.svg': svgDoc(`<style>&#64;keyframes k{to{x:1}}rect{animation:k 1s infinite}</style>${fill}`),
     'event-attribute.svg': svgDoc('<rect width="64" height="64" onclick="x()"/>'),
     'unlisted-element.svg': svgDoc('<use href="#u"/>'),
-    'object-style.svg': svgDoc(`<style>rect{fill:red}</style><title>object</title>${fill}`),
-    'embed-style.svg': svgDoc(`<style>rect{fill:red}</style><title>embed</title>${fill}`),
     'background-style.svg': svgDoc(`<style>rect{fill:red}</style><title>background</title>${fill}`),
     'mask-style.svg': svgDoc(`<style>rect{fill:red}</style><title>mask</title>${fill}`),
     'border-style.svg': svgDoc(`<style>rect{fill:red}</style><title>border</title>${fill}`),
@@ -1502,9 +1523,8 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
     'entity-doctype.svg': PROLOGS['entity-doctype'] + svgDoc(`<style>rect{fill:red}</style><title>entity doctype</title>${fill}`),
   }
 
-  const STATIC_PAGE = `<!doctype html><style>body{margin:0}div{width:64px;height:64px;background:url(${dataUri(SVG, stillSvg('red'))})}img,object,embed{display:block}</style>
-<img alt="" src="${dataUri(SVG, stillSvg('red'))}"><div></div><img alt="" src="/gradient.svg"><object data="/gradient.svg" type="image/svg+xml" width="64" height="64"></object>
-<embed src="/gradient.svg" type="image/svg+xml" width="64" height="64"><img alt="" src="${dataUri(SVG, GRADIENT)}"><img alt="" src="data:image/svg+xml,${encodeURIComponent(GRADIENT)}"><img alt="" src="/still.gif"><img alt="" src="/still.png"><img alt="" src="/single.png"><img alt="" src="/still.webp"><h1>Static</h1>`
+  const STATIC_PAGE = `<!doctype html><style>body{margin:0}div{width:64px;height:64px;background:url(${dataUri(SVG, stillSvg('red'))})}img{display:block}</style>
+<img alt="" src="${dataUri(SVG, stillSvg('red'))}"><div></div><img alt="" src="/gradient.svg"><img alt="" src="${dataUri(SVG, GRADIENT)}"><img alt="" src="data:image/svg+xml,${encodeURIComponent(GRADIENT)}"><img alt="" src="/still.gif"><img alt="" src="/still.png"><img alt="" src="/single.png"><img alt="" src="/still.webp"><h1>Static</h1>`
 
   // Every other browser consumer of a data: URL that can hold an SVG document or image, each with its own malformed bytes.
   const malformedFor = (name: string) => `<svg ${SVG_NS}><rect id="${name}"></svg>`
@@ -1521,10 +1541,10 @@ for (const f of [() => a.click(), () => f.submit(), () => new (frame().contentWi
     ['fill', `<svg width="8" height="8"><rect width="8" height="8" style="fill:url(${consumerUri('fill')}#p)"/></svg>`],
   ]
 
-  const REFUSED_PAGE = `<!doctype html><style>body{margin:0}img,object,embed,div{display:block;width:64px;height:64px}
+  const REFUSED_PAGE = `<!doctype html><style>body{margin:0}img,div{display:block;width:64px;height:64px}
 #bg{background:url(/background-style.svg)}#mask{background:red;mask-image:url(/mask-style.svg)}#border{border-image:url(/border-style.svg) 1}</style><h1>Refused</h1>
 ${['style-element', 'style-attribute', 'animate-element', 'processing-instruction', 'reference-keyframes', 'event-attribute', 'unlisted-element', 'long-comment', 'entity-doctype'].map(n => `<img alt="" src="/${n}.svg">`).join('')}
-<object data="/object-style.svg" type="image/svg+xml"></object><embed src="/embed-style.svg" type="image/svg+xml"><div id=bg></div><div id=mask></div><div id=border></div>
+<div id=bg></div><div id=mask></div><div id=border></div>
 <img alt="" src="/gradient.svg"><img alt="" src="/a.gif"><img alt="" src="/a.png"><img alt="" src="/a.webp"><img alt="" src="/still.gif"><img alt="" src="/still.webp">
 ${otherConsumers.map(([, html]) => html).join('')}`
 
@@ -1533,7 +1553,7 @@ ${otherConsumers.map(([, html]) => html).join('')}`
     'gradient.svg': GRADIENT, ...unsupportedSvgs, 'a.gif': gif([10, 1000]), 'a.png': apng([10, 1000]), 'a.webp': ANIMATED_WEBP, ...stillRaster,
   }))
 
-  it('captures a static SVG (path and gradient) as img, background, object and embed, with single-frame rasters, identically on two runs, keeping the pixels', async () => {
+  it('captures a static SVG (path and gradient) as img and background, with single-frame rasters, identically on two runs, keeping the pixels', async () => {
     const run = await svgLaunch()
     sameEvidence(run, '/static-1', '/static-2')
     expect(decodePng(pngOf(run.outDir, 1280, '/static-1')).at(30, 30)).toEqual([255, 0, 0])
@@ -1552,10 +1572,10 @@ ${otherConsumers.map(([, html]) => html).join('')}`
     expect(message).not.toContain('gradient.svg')
   }, 120_000)
 
-  it('refuses a style-element SVG as an object, an embed, a CSS background, a mask and a border image', async () => {
+  it('refuses a style-element SVG as a CSS background, a mask and a border image', async () => {
     const message: string = (await svgLaunch()).error?.message ?? ''
 
-    for (const name of ['object-style', 'embed-style', 'background-style', 'mask-style', 'border-style']) {
+    for (const name of ['background-style', 'mask-style', 'border-style']) {
       expect(message, name).toMatch(new RegExp(`cannot prove that this SVG is static: [^\\n]*/${name}\\.svg \\(sha256 [0-9a-f]{12}\\)`))
     }
   }, 120_000)
@@ -1606,19 +1626,18 @@ ${otherConsumers.map(([, html]) => html).join('')}`
   const MALFORMED_XLINK = `<svg ${SVG_NS}><path></svg>`
   const sha12 = (bytes: string) => createHash('sha256').update(bytes).digest('hex').slice(0, 12)
 
-  // An SVG document under a generic XML media type is rendered as an SVG by object, embed, img and CSS images, so its style element is refused like any other.
+  // An SVG document under a generic XML media type is rendered as an SVG by img and CSS images, so its style element is refused like any other.
   const XML_TYPES = ['text/xml', 'application/xml']
   const xmlStyled = (label: string) => svgDoc(`<style>rect{fill:rgb(0,255,0)}</style><title>${label}</title>${fill}`)
 
-  // Plain with all four consumers; behind a 70,000-character comment and behind a DOCTYPE entity holding "]>" as object, embed and img.
-  const XML_CASES: Array<[string, string[]]> = [['', ['object', 'embed', 'img', 'background']], ['long-comment', ['object', 'embed', 'img']], ['entity-doctype', ['object', 'embed', 'img']]]
+  // Plain with both consumers; behind a 70,000-character comment and behind a DOCTYPE entity holding "]>" as img.
+  const XML_CASES: Array<[string, string[]]> = [['', ['img', 'background']], ['long-comment', ['img']], ['entity-doctype', ['img']]]
 
   const xmlConsumers = XML_TYPES.flatMap(type => XML_CASES.flatMap(([prolog, kinds]) => kinds.map(kind => {
     const svg = (PROLOGS[prolog] ?? '') + xmlStyled(`${type} ${prolog} ${kind}`)
     const uri = dataUri(type, svg)
 
-    const html = kind === 'object' ? `<object data="${uri}" width="64" height="64"></object>` : kind === 'embed' ? `<embed src="${uri}" width="64" height="64">`
-      : kind === 'img' ? `<img alt="" src="${uri}">` : `<div style="width:64px;height:64px;background:url(${uri})"></div>`
+    const html = kind === 'img' ? `<img alt="" src="${uri}">` : `<div style="width:64px;height:64px;background:url(${uri})"></div>`
 
     return { type, kind, svg, html }
   })))
@@ -1632,7 +1651,7 @@ ${otherConsumers.map(([, html]) => html).join('')}`
   // One shipped-CLI process per side serves both the malformed-data tests and the XML-labelled tests: every refusal of a page is reported together.
   const malformedCandidate = memo(() => {
     const site = dirOf({
-      'index.html': `<!doctype html><style>img,object,embed{display:block}div{width:64px;height:64px;background:url(data:image/svg+xml,${encodeURIComponent(MALFORMED_OTHER)})}</style><h1>Bad</h1>
+      'index.html': `<!doctype html><style>img{display:block}div{width:64px;height:64px;background:url(data:image/svg+xml,${encodeURIComponent(MALFORMED_OTHER)})}</style><h1>Bad</h1>
 <img alt="" src="${dataUri(SVG, MALFORMED_SVG)}"><div></div><img alt="" src="${dataUri(SVG, GRADIENT)}">${feImageSvg('href', MALFORMED_HREF)}${feImageSvg('xlink:href', MALFORMED_XLINK)}${feImageSvg('href', GRADIENT)}${xmlConsumers.map(c => c.html).join('')}`,
       'ok.html': `<!doctype html><style>body{margin:0}svg,img,div{display:block}</style>${feImageSvg('href', GRADIENT)}${feImageSvg('xlink:href', GRADIENT)}<h1>Ok</h1>${xmlStill}`,
     })
@@ -1684,7 +1703,7 @@ ${otherConsumers.map(([, html]) => html).join('')}`
     expect(lines.map(l => (DATA_LINE.exec(l) ?? [])[1]).sort()).toEqual([MALFORMED_SVG, MALFORMED_HREF].map(sha12).sort())
   }, 120_000)
 
-  it('refuses a style-element SVG labelled text/xml or application/xml as an object, an embed, an img and a CSS background, also behind a 70,000-character comment or a DOCTYPE entity holding "]>", on the candidate side, through the shipped CLI', async () => {
+  it('refuses a style-element SVG labelled text/xml or application/xml as an img and a CSS background, also behind a 70,000-character comment or a DOCTYPE entity holding "]>" as an img, on the candidate side, through the shipped CLI', async () => {
     const run = await malformedCandidate()
     expect(run.status, run.stderr).toBe(1)
     const lines = sentences(run.stderr).filter(isXmlLine)
@@ -1692,7 +1711,7 @@ ${otherConsumers.map(([, html]) => html).join('')}`
     expect(xmlShas(lines.join('\n')), run.stderr).toEqual(xmlConsumers.map(c => sha12(c.svg)).sort())
   }, 120_000)
 
-  it('refuses a style-element SVG labelled text/xml or application/xml as an object, an embed, an img and a CSS background, also behind a 70,000-character comment or a DOCTYPE entity holding "]>", on the prototype side, through the shipped CLI', async () => {
+  it('refuses a style-element SVG labelled text/xml or application/xml as an img and a CSS background, also behind a 70,000-character comment or a DOCTYPE entity holding "]>" as an img, on the prototype side, through the shipped CLI', async () => {
     const run = await malformedPrototype()
     expect(run.status, run.stderr).toBe(1)
     const lines = sentences(run.stderr).filter(isXmlLine)

@@ -96,6 +96,7 @@ function earlyNormalise(forced, css) {
 }
 const INJECT = `(${earlyNormalise})(${JSON.stringify(FORCED)}, ${JSON.stringify(STYLE)})`
 const PROTOTYPE_PREFIX = '/__prototype__/'
+const REFUSAL = 'unsupported content: the kit captures single documents only'
 const TYPES = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.mjs': 'text/javascript', '.json': 'application/json',
   '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.webp': 'image/webp', '.woff2': 'font/woff2', '.woff': 'font/woff' }
 const dir = fileURLToPath(new URL('.', import.meta.url))
@@ -118,11 +119,11 @@ export function assertSelfContained(blocked) {
   if (blocked.length) throw Object.assign(new Error('the chosen design file is not self-contained'), { blocked })
 }
 
-// Walks a pierced CDP DOM tree (shadow roots and frame documents included, template content excluded); returns the host's node name.
+// Walks a pierced CDP DOM tree (shadow roots included, template content excluded); returns the host's node name.
 export function findClosedShadowRoot(node) {
   const roots = node.shadowRoots || []
   if (roots.some(r => r.shadowRootType === 'closed')) return node.nodeName
-  for (const kid of [...roots, ...(node.children || []), ...(node.contentDocument ? [node.contentDocument] : [])]) {
+  for (const kid of [...roots, ...(node.children || [])]) {
     const hit = findClosedShadowRoot(kid)
     if (hit) return hit
   }
@@ -269,16 +270,10 @@ export function svgDataResources({ urls = [], srcsets = [], styles = [] }) {
   return [...found.values()]
 }
 
-// The root element names of every document shown by a frame, iframe, object or embed in a pierced CDP DOM tree (template content excluded).
-export function embeddedDocumentRoots(node) {
-  const roots = []
-  const walk = n => {
-    const doc = n.contentDocument
-    if (doc) roots.push(((doc.children || []).find(c => c.nodeType === 1) || {}).localName || '')
-    for (const kid of [...(n.shadowRoots || []), ...(n.children || []), ...(doc ? [doc] : [])]) walk(kid)
-  }
-  walk(node)
-  return roots
+// The kit captures a page only when it is one document: a child frame in the CDP frame tree (readable or not, in this process or another) refuses the capture.
+export function assertNoChildFrames(frameTree) {
+  const child = (frameTree.childFrames || [])[0]
+  if (child) throw new Error(`${REFUSAL}: found a frame ${child.frame.url || child.frame.id}`)
 }
 
 const shortUrl = url => (url.length > 60 ? `${url.slice(0, 60)}…` : url)
@@ -442,12 +437,16 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
   const animated = []
   const unprovable = []
   const unreadable = []
-  const guarded = new Set([t.sessionId])
   const source = `${INJECT};${guardSource(origin, onlyPath)}`
   let lastActivity = Date.now()
   let onLoad
   const loaded = new Promise(r => { onLoad = r })
-  // The same gates for the capture page and for every frame session, applied while the session is still paused at start.
+  // A frame that Chromium attaches as its own target is never resumed, so it never makes a request and never finishes loading: it ends the wait for the load.
+  let embedded = null
+  let onEmbedded
+  const embeddedEarly = new Promise((_, no) => { onEmbedded = no })
+  embeddedEarly.catch(() => {})
+  // The gates of the capture page, applied while the session is still paused at start.
   const gate = async send => {
     for (const m of ['Page.enable', 'Network.enable', 'Runtime.enable']) await send(m)
     await send('Network.setCacheDisabled', { cacheDisabled: true })
@@ -458,20 +457,19 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
   }
   browser.on(m => {
     if (m.method === 'Target.attachedToTarget') {
-      const { sessionId, targetInfo: info, waitingForDebugger } = m.params
+      const { targetInfo: info, waitingForDebugger } = m.params
       if (!waitingForDebugger) return
       if (m.sessionId === undefined) {
         // A new top-level target is a popup: never resumed, so it never makes a request.
         blocked.push(info.url || 'about:blank')
         browser.send('Target.closeTarget', { targetId: info.targetId }).catch(() => {})
-      } else if (guarded.has(m.sessionId) && info.type === 'iframe') {
-        guarded.add(sessionId)
-        const send = (method, params) => browser.send(method, params, sessionId)
-        gate(send).then(() => send('Runtime.runIfWaitingForDebugger')).catch(() => {})
+      } else if (m.sessionId === t.sessionId && info.type === 'iframe') {
+        embedded ??= new Error(`${REFUSAL}: found a frame ${info.url || info.targetId}`)
+        onEmbedded(embedded)
       } else blocked.push(info.url || info.type)
       return
     }
-    if (!guarded.has(m.sessionId)) return
+    if (m.sessionId !== t.sessionId) return
     const { requestId, request } = m.params
     const send = (method, params) => browser.send(method, params, m.sessionId).catch(() => {})
     lastActivity = Date.now()
@@ -517,14 +515,22 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
     await t.send('Emulation.setLocaleOverride', { locale: 'en-US' })
     const nav = await t.send('Page.navigate', { url })
     if (nav.errorText) throw new Error(`cannot load ${url}: ${nav.errorText}`)
-    await Promise.race([loaded, new Promise((_, no) => setTimeout(() => no(new Error(`timed out loading ${url}`)), 30000).unref())])
+    await Promise.race([loaded, embeddedEarly, new Promise((_, no) => setTimeout(() => no(new Error(`timed out loading ${url}`)), 30000).unref())])
     const { frameTree } = await t.send('Page.getFrameTree')
     const world = await t.send('Page.createIsolatedWorld', { frameId: frameTree.frame.id, worldName: 'design_compare' })
     const run = expr => t.evaluate(expr, world.executionContextId)
+    const probe = `(${probeSource}\n)`
+    // The DOM and the frame tree are both read each time, so a frame that cannot be read, or is attached out of process, is refused as well.
+    const assertSingleDocument = async () => {
+      if (embedded) throw embedded
+      const refusal = await run(`(() => { try { ${probe}.assertSingleDocument(); return '' } catch (e) { return e.message } })()`)
+      if (refusal) throw new Error(refusal)
+      assertNoChildFrames((await t.send('Page.getFrameTree')).frameTree)
+    }
+    await assertSingleDocument()
     if (!await run("(() => { const s = document.getElementById('__dc_style'); return !!s && s.dataset.early === '1' })()")) {
       throw new Error(`the motion-neutralising stylesheet was not installed before page scripts ran for ${url}`)
     }
-    const probe = `(${probeSource}\n)`
     // A data: image that fails to decode never produces a Network response, so the data URLs the page references are read from the page itself.
     const dataSeen = new Set()
     const checkDataSvgs = async () => {
@@ -554,15 +560,12 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
     const tree = (await t.send('DOM.getDocument', { depth: -1, pierce: true })).root
     const closed = findClosedShadowRoot(tree)
     if (closed) throw new Error(`unsupported content: a closed shadow root under <${closed.toLowerCase()}> cannot be measured`)
-    const readable = await run(`${probe}.htmlFrameDocuments()`)
-    if (embeddedDocumentRoots(tree).length !== readable) {
-      throw new Error('unsupported content: a cross-origin or unreadable <object> or <embed> document cannot be measured')
-    }
     await run(`${probe}.toTop()`)
     await run(`${probe}.prepare(${JSON.stringify(FORCED)})`)
     await run(`${probe}.fontsReady()`)
     await run(frames)
     await run(`${probe}.settle()`)
+    await assertSingleDocument()
     const measurement = await run(`${probe}.measure()`)
     const pageHeight = Math.min(measurement.pageHeight, MAX_PAGE_HEIGHT)
     const tiles = []
@@ -570,6 +573,7 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
       const top = Math.min(y, Math.max(pageHeight - height, 0))
       await run(`(async () => { const p = ${probe}\n; ${n === 0 ? 'p.toTop()' : `window.scrollTo(0, ${top})`}; p.freeze(); await ${frames}; ${n === 0 ? 'p.atTop()' : ''} })()`)
       if (n === 1) await run(`${probe}.hidePinned()`)
+      await assertSingleDocument()
       tiles.push({ top, data: (await t.send('Page.captureScreenshot', { format: 'png' })).data })
     }
     await quiet(false)
