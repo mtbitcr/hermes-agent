@@ -132,7 +132,7 @@ def two_tasks(worker, tls_site, monkeypatch):
     with launch as (address, _home):
         agent = new_agent(TASK_A)
         try:
-            safety.write_config({"cdp_url": address, "allowed_hosts": ["127.0.0.1"]})
+            safety.write_config({"cdp_url": address, "allowed_hosts": ["127.0.0.1"], "boards": ["design"]})
             for task in (TASK_A, TASK_B):
                 assert safety.page_data(call({"action": "open", "url": f"{base}/ok-timer?t={task}"}, task))["ok"]
             time.sleep(0.8)

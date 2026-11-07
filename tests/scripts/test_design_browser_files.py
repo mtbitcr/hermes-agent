@@ -289,6 +289,11 @@ def test_compose_restarts_the_browser_unless_it_was_stopped():
     assert browser_service()["restart"] == "unless-stopped"
 
 
+def test_compose_gives_the_browser_1gb_of_shared_memory():
+    # The 64 MB Docker default crashes the graphics process on full-page screenshots.
+    assert browser_service()["shm_size"] == "1gb"
+
+
 # --- the tunnel unit ---------------------------------------------------------------------------------
 
 

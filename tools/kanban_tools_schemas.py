@@ -513,3 +513,72 @@ KANBAN_LINK_SCHEMA = _schema(
     },
     ["parent_id", "child_id"],
 )
+
+# Built without ``_schema``: no ``board`` and no ``task_id``. The options are
+# always offered on the worker's own current task, on that task's own board
+# (tools.kanban_design_options).
+KANBAN_OFFER_DESIGN_OPTIONS_SCHEMA = {
+    "name": "kanban_offer_design_options",
+    "description": (
+        "Offer the owner 2 or 3 design options for your task and wait for "
+        "the owner to choose one. First attach each option's picture to "
+        "your own task with kanban_attach: a PNG, JPEG or WebP file of at "
+        "most 4 MiB. Then call this once with the question and the "
+        "options, each one plain sentence and one picture with its "
+        "alternative text. Every limit is checked before anything is "
+        "written; on success the task is held as needing the owner's "
+        "choice, so end your turn."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "question": _prop("string", (
+                "The question the owner answers, as one plain sentence of "
+                "at most 160 characters (e.g. 'Which home page should "
+                "Raphael build?')."
+            )),
+            "options": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 3,
+                "description": "2 or 3 options, in the order the owner should see them.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "n": {
+                            "type": "integer",
+                            "description": "The option's position: 1, 2, 3 in order, with no gaps.",
+                        },
+                        "sentence": _prop("string", (
+                            "What this option is, as one plain sentence of at "
+                            "most 160 characters."
+                        )),
+                        "pictures": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 1,
+                            "description": "Exactly one picture.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "attachment_id": _prop("string", (
+                                        "The attachment_id kanban_attach returned "
+                                        "for the picture, as a decimal string."
+                                    )),
+                                    "alt": _prop("string", (
+                                        "What the picture shows, in plain words, "
+                                        "for an owner who cannot see it; at most "
+                                        "160 characters."
+                                    )),
+                                },
+                                "required": ["attachment_id", "alt"],
+                            },
+                        },
+                    },
+                    "required": ["n", "sentence", "pictures"],
+                },
+            },
+        },
+        "required": ["question", "options"],
+    },
+}
