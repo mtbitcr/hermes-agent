@@ -945,7 +945,7 @@ class TestToolset:
         import toolsets
 
         spec = toolsets.TOOLSETS["design_vision"]
-        assert sorted(spec["tools"]) == ["design_browser", "kanban_view_image"] and spec["includes"] == []
+        assert sorted(spec["tools"]) == ["design_browser", "design_compare", "kanban_view_image"] and spec["includes"] == []
         assert "design_browser" not in toolsets._HERMES_CORE_TOOLS
         assert "kanban_view_image" not in toolsets._HERMES_CORE_TOOLS
         for name in toolsets.TOOLSETS:

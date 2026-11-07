@@ -443,7 +443,7 @@ TOOLSETS = {
             "Look-only design browser (open, screenshot, read_text, set_viewport "
             "on allowed addresses) and kanban image viewing, for design review"
         ),
-        "tools": ["design_browser", "kanban_view_image"],
+        "tools": ["design_browser", "kanban_view_image", "design_compare"],
         "includes": [],
     },
 
