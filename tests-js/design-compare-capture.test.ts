@@ -298,7 +298,8 @@ describe('probe canonical scroll state and native motion freeze', () => {
 const REFUSAL = 'unsupported content: the kit captures single documents only'
 
 describe('single documents only', () => {
-  const node = (nodeName: string, extra: Record<string, unknown> = {}) => ({ nodeName, ...extra })
+  // CDP gives an element its canonical localName beside its qualified nodeName; documents and fragments have an empty one.
+  const node = (nodeName: string, extra: Record<string, unknown> = {}) => ({ nodeName, localName: nodeName.startsWith('#') ? '' : nodeName.toLowerCase(), ...extra })
   const root = (...children: unknown[]) => node('#document', { children: [node('HTML', { children: [node('HEAD'), node('BODY', { children })] })] })
 
   it('refuses an iframe, frame, fencedframe, object or embed element in any case and names it in lower case', () => {
@@ -316,6 +317,16 @@ describe('single documents only', () => {
     expect(() => kit.assertNoEmbeddingElements(html(node('HEAD', { children: [node('DIV', { shadowRoots: [node('#document-fragment', { shadowRootType: 'open', children: [node('IFRAME')] })] })] })))).toThrow(`${REFUSAL}: found <iframe>`)
     expect(() => kit.assertNoEmbeddingElements(root(node('DIV', { shadowRoots: [node('#document-fragment', { shadowRootType: 'open', children: [node('SECTION', { shadowRoots: [node('#document-fragment', { shadowRootType: 'open', children: [node('EMBED')] })] })] })] })))).toThrow(`${REFUSAL}: found <embed>`)
     expect(() => kit.assertNoEmbeddingElements(root(node('DIV', { shadowRoots: [node('#document-fragment', { shadowRootType: 'closed', children: [node('OBJECT')] })] })))).toThrow(`${REFUSAL}: found <object>`)
+  })
+
+  it('classifies by the canonical localName, so a namespace-prefixed HTML element is refused and a prefixed look-alike is not', () => {
+    const prefixed = (name: string) => node(`X:${name.toUpperCase()}`, { localName: name })
+
+    for (const name of ['iframe', 'frame', 'fencedframe', 'object', 'embed']) {
+      expect(() => kit.assertNoEmbeddingElements(root(prefixed(name))), name).toThrow(`${REFUSAL}: found <${name}>`)
+    }
+
+    expect(() => kit.assertNoEmbeddingElements(root(node('OBJECT:X', { localName: 'x' }), node('SPAN', { localName: 'span' })))).not.toThrow()
   })
 
   it('passes a page without such an element, also with an img, svg, canvas and video', () => {
@@ -1360,14 +1371,22 @@ addEventListener('scroll', () => { if (scrollY > 0 && !document.querySelector('i
   const outsideBody = (script: string, body = '<h1>Single</h1>') => `<!doctype html><head><script>${script}</script></head><body>${body}</body>`
   const append = (tag: string) => `document.createElement('${tag}')`
 
-  const outsideCases = ['object', 'embed'].flatMap(tag => [
-    ['in the head', outsideBody(`document.head.appendChild(${append(tag)})`)],
-    ['in an open shadow root hosted in the head', outsideBody(`const h = document.createElement('div'); document.head.appendChild(h); h.attachShadow({ mode: 'open' }).appendChild(${append(tag)})`)],
-    ['as a sibling of body', outsideBody(`document.documentElement.appendChild(${append(tag)})`)],
-  ].flatMap(([where, html]) => [
-    { name: `${tag} ${where}`, tag, side: 'candidate', html },
-    { name: `${tag} ${where}`, tag, side: 'prototype', html },
-  ]))
+  const prefixed = (tag: string) => `document.createElementNS('http://www.w3.org/1999/xhtml', 'x:${tag}')`
+
+  // The prefixed element is a genuine HTML object or embed: CDP reports nodeName 'X:OBJECT' and localName 'object'.
+  const outsideCases = ['object', 'embed', 'x:object', 'x:embed'].flatMap(written => {
+    const tag = written.replace('x:', '')
+    const make = written === tag ? append(tag) : prefixed(tag)
+
+    return [
+      ['in the head', outsideBody(`document.head.appendChild(${make})`)],
+      ['in an open shadow root hosted in the head', outsideBody(`const h = document.createElement('div'); document.head.appendChild(h); h.attachShadow({ mode: 'open' }).appendChild(${make})`)],
+      ['as a sibling of body', outsideBody(`document.documentElement.appendChild(${make})`)],
+    ].flatMap(([where, html]) => [
+      { name: `${written} ${where}`, tag, side: 'candidate', html },
+      { name: `${written} ${where}`, tag, side: 'prototype', html },
+    ])
+  })
 
   const closedCase = { name: 'object in a closed shadow root', tag: 'object', side: 'candidate', html: outsideBody('', `<h1>Single</h1><div id=h></div><script>h.attachShadow({ mode: 'closed' }).appendChild(${append('object')})</script>`) }
 
@@ -1377,6 +1396,22 @@ addEventListener('scroll', () => { if (scrollY > 0 && !document.querySelector('i
     const run = await outsideLaunches.get(c)!()
     expect(run.error?.message).toBe(`${REFUSAL}: found <${c.tag}>`)
     expect(readdirSync(run.outDir)).toEqual([])
+  }, 120_000)
+
+  // A page that rewrites its DOM every animation frame floods the session with DOM mutation events (DOM.getDocument enables them), but it makes no request
+  // and looks the same: it is quiet, and is captured at both widths.
+  const STEADY = '<!doctype html><p id=proof>Steady</p><script>function tick(){document.getElementById(\'proof\').textContent=\'Steady\';requestAnimationFrame(tick)}tick()</script>'
+  const steadyLaunches = { candidate: memo(() => launchPages({ steady: STEADY })), prototype: memo(() => launchPrototype(STEADY)) }
+
+  it.each(['candidate', 'prototype'] as const)('captures a visually constant, network-free %s page that rewrites its DOM every animation frame, at both widths', async side => {
+    const run = await steadyLaunches[side]()
+    expect(run.error?.message).toBeUndefined()
+
+    for (const width of [1280, 375]) {
+      const route = side === 'candidate' ? '/steady' : '/'
+      expect(read(run.outDir, width, route).width, `${width}`).toBe(width)
+      expect(pngOf(run.outDir, width, route).length, `${width}`).toBeGreaterThan(0)
+    }
   }, 120_000)
 
   it('refuses a page that gains a frame after the first checks, before it is screenshot', async () => {

@@ -280,7 +280,7 @@ const EMBEDDING = new Set(['iframe', 'frame', 'fencedframe', 'object', 'embed'])
 
 // Walks a pierced CDP DOM tree (the head, every child of html, open and closed shadow roots); an element that embeds another document refuses the capture.
 export function assertNoEmbeddingElements(node) {
-  const name = String(node.nodeName).toLowerCase()
+  const name = String(node.localName || '').toLowerCase()
   if (EMBEDDING.has(name)) throw new Error(`${REFUSAL}: found <${name}>`)
   for (const kid of [...(node.shadowRoots || []), ...(node.children || [])]) assertNoEmbeddingElements(kid)
 }
@@ -481,7 +481,7 @@ async function capturePage(browser, stitcher, probeSource, { url, origin, onlyPa
     if (m.sessionId !== t.sessionId) return
     const { requestId, request } = m.params
     const send = (method, params) => browser.send(method, params, m.sessionId).catch(() => {})
-    lastActivity = Date.now()
+    if (m.method === 'Fetch.requestPaused' || m.method === 'Runtime.bindingCalled' || m.method.startsWith('Network.')) lastActivity = Date.now()
     if (m.method === 'Fetch.requestPaused') {
       if (classifyRequest(request.url, origin, onlyPath) === 'blocked') {
         blocked.push(request.url)
