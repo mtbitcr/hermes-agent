@@ -94,8 +94,8 @@ def elements(width, change=None):
     return list(els.values())
 
 
-def png(width, *blocks) -> bytes:
-    image = Image.new("RGB", (width, HEIGHT), "white")
+def png(width, *blocks, height=HEIGHT) -> bytes:
+    image = Image.new("RGB", (width, height), "white")
     for block in filter(None, blocks):  # red, unless a colour follows the corners
         ImageDraw.Draw(image).rectangle(block[:4], fill=block[4:] or (200, 0, 0))
     out = io.BytesIO()
@@ -456,6 +456,50 @@ def test_pixels_an_element_finding_explains_are_not_judged_again(kanban, change,
         crops = [f"dc-r1-{fid}-{width}-candidate.png", f"dc-r1-{fid}-{width}-prototype.png"]
         assert finding["impact"].endswith(f"; crops {crops[0]} and {crops[1]}")
         assert [stored_in_run(kanban, ctx["task"], name) for name in crops] == [[ctx["run"]]] * 2
+
+
+@pytest.mark.parametrize("case", ["fractional-box", "translated-element", "separate-pixel-region"])
+def test_a_finding_explains_the_regions_in_its_rectangle_of_whole_raster_cells_and_no_others(kanban, case):
+    """Owner rule 2 with the review's .pause button, in a section of a 1200 px page: its CSS box is
+    (48, 1047.59, 149.69, 44) at 1280 px and (20, 1061.36, 149.69, 44) at 375 px, and its picture fills the
+    raster cells (48, 1048, 150, 44) and (20, 1061, 150, 44) inside a half-dark 2 px border."""
+    ctx, captures, key = kanban.start(), [], 'main/section/button:"pause motion"#1'
+    with contextlib.closing(kanban.kb.connect()) as conn:
+        for width, x, y, moved in ((1280, 48, 1047.59, 1053.59), (375, 20, 1061.36, 1067.36)):  # translateY(6px)
+            files = []
+            for side in ("candidate", "prototype"):
+                changed = side == "candidate"
+                box_y = moved if changed and case == "translated-element" else y
+                fill = (224, 0, 96) if changed and case != "translated-element" else (0, 90, 200)
+                button = el("button", "Pause motion", (x, box_y, 149.69, 44),
+                            landmarks=(("main", ""), ("section", "")), background_color=[*fill, 1])
+                bundle = {"schema": "design_compare_bundle_v1", "kit_sha256": KIT, "chromium_version": "153.0.8010.0",
+                          "run_id": str(ctx["run"]), "candidate_digest": ctx["digest"], "page": "/", "width": width,
+                          "page_height": 1200, "image": f"index-{width}.png", "blocked_requests": [], "masks": [],
+                          "elements": [*elements(width), el("section", "", (0, 1000, width, 160)), button]}
+                top = round(box_y)
+                blocks = [(x, top, x + 149, top + 43, *(v // 2 for v in fill)),
+                          (x + 2, top + 2, x + 147, top + 41, *fill)]
+                if changed and case == "separate-pixel-region" and width == 1280:
+                    blocks.append((204, 1064, 215, 1075))  # no finding, 4 px right of the button's 2 px widening
+                files += [(f"{side}-{width}.json", json.dumps(bundle).encode()),
+                          (f"{side}-{width}.png", png(width, *blocks, height=1200))]
+            captures.append({k: kanban.kb.store_attachment_bytes(
+                conn, ctx["task"], name, data, uploaded_by="agent", board="web", expected_run_id=ctx["run"])
+                for k, (name, data) in zip(CAPTURE_KEYS, files)})
+    if case == "separate-pixel-region":
+        shown = call({"action": "judge", "captures": captures})
+        assert isinstance(shown, dict), shown
+        assert [(r["width"], r["box"]) for r in json.loads(shown["text_summary"])["regions"]] == [
+            (1280, {"x": 204, "y": 1064, "width": 12, "height": 12})]
+    else:
+        kind, prop = ("layout", "box.y") if case == "translated-element" else ("colour", "background-color")
+        findings = judge(captures)["findings"]  # no undecided region, no pixel_judged finding
+        assert [f["problem"] for f in findings] == [
+            f"{kind} difference in {prop} [dc:{finding_id('/', width, kind, key, prop)}]" for width in (1280, 375)]
+        if kind == "layout":  # the CSS measurements, not the raster cells
+            assert [f["impact"].split(", tolerance")[0] for f in findings] == [
+                "measured 1053.59 px, expected 1047.59 px", "measured 1067.36 px, expected 1061.36 px"]
 
 
 def test_a_text_pair_finding_crops_the_union_of_both_boxes(kanban):

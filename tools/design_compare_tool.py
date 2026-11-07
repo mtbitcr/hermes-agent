@@ -20,11 +20,11 @@ from typing import NamedTuple, Optional
 
 from tools.design_access import REVIEWER, check_design_access
 from tools.design_compare_judge import (
-    PIXEL_CHANNEL_DELTA, PIXEL_REGION_MIN_PIXELS, PIXEL_REGION_MIN_SIDE, WIDTHS, Finding, _entries, _name,
-    compare_bundles, parse_allowed_changes,
+    BOX_TOLERANCE, PIXEL_CHANNEL_DELTA, PIXEL_REGION_MIN_PIXELS, PIXEL_REGION_MIN_SIDE, WIDTHS, Finding, _entries,
+    _name, compare_bundles, parse_allowed_changes,
 )
 from tools.design_compare_pixels import (
-    MAX_CROP_BYTES, _rgb, attach_regions, compare_element, compare_pages, cut_crops,
+    MAX_CROP_BYTES, _rect, _rgb, attach_regions, compare_element, compare_pages, cut_crops,
 )
 from tools.registry import registry, tool_error
 
@@ -178,6 +178,13 @@ def _union(*boxes):
             "height": max(b["y"] + b["height"] for b in boxes) - top}
 
 
+def _explanation(box, size) -> dict:
+    """Owner rule 2: the rectangle whose regions an element's finding explains, its CSS box expanded to whole
+    raster cells, widened by the box tolerance on each side and clipped to the page."""
+    left, top, right, bottom = _rect([box], size, BOX_TOLERANCE)
+    return {"x": left, "y": top, "width": right - left, "height": bottom - top}
+
+
 def _text_pairs(cents, pents) -> dict:
     """Q2's text pairs as compare_bundles forms them, {prototype key: candidate key}: the left-over elements
     of each chain and role, paired in document order."""
@@ -214,7 +221,8 @@ def _compare(capture, allowed):
     for region in sorted(regions, key=lambda r: -r["width"] * r["height"]):
         if not any(_inside(region, kept) for kept in unique):
             unique.append(region)
-    boxes = {key: _union(named.get(key), pboxes.get(key)) for key in cboxes.keys() | pboxes.keys()}
+    boxes = {key: _explanation(_union(named.get(key), pboxes.get(key)), cimg.size)
+             for key in cboxes.keys() | pboxes.keys()}
     _, undecided = attach_regions(sorted(unique, key=lambda r: (r["y"], r["x"])), comparison.findings, boxes.get)
     explained = [boxes[f.element] for f in comparison.findings if f.kind == "element"]  # missing, extra, text
     return comparison, named, pboxes, [r for r in undecided if not any(_inside(r, box) for box in explained)]
