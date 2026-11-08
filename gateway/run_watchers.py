@@ -236,3 +236,19 @@ class GatewaySessionWatchersMixin:
             except Exception as exc:
                 logger.debug("Session stall watcher error: %s", exc)
             await _interruptible_sleep(self, max(1, int(float(interval))))
+
+    async def _owner_heads_up_watcher(self, interval: float = 30.0):
+        """Send the owner one Telegram heads-up for each card that starts waiting for them.
+
+        Its own supervised task: it only reads boards and never touches the dispatcher, and a
+        failing tick is logged and tried again on the next pass (see ``gateway.owner_heads_up``).
+        """
+        from gateway import owner_heads_up
+
+        await asyncio.sleep(min(30.0, interval))
+        while self._running:
+            try:
+                await owner_heads_up.tick(self)
+            except Exception as exc:
+                logger.debug("Owner heads-up watcher error: %s", exc)
+            await _interruptible_sleep(self, int(interval))
