@@ -21,10 +21,14 @@ WebP, so this tool turns one drawing into a picture the offer accepts. One call 
    neither can hide a reference.
 4. The drawing's own size is read from its svg element as resvg reads it: its width and height,
    or its viewBox where they are missing. A size in em or ex units is measured by the svg
-   element's own font size, from its style attribute or else its font-size attribute, which must
-   be a number or an absolute length; resvg takes 1ex as half of 1em. A drawing with no size, a
-   size in em or ex units without such a font size or with a <style> rule that may change it, or
-   a side above 4,096 px is refused before anything is rendered.
+   element's own font size, found as resvg finds it and read with the rules of resvg's own CSS
+   parsing: its font-size attribute, then the declarations of the drawing's <style> rules whose
+   selectors pick the svg element, from the least to the most specific, then those of its style
+   attribute, the font shorthand included; a later declaration replaces an earlier one unless
+   that one is !important. That font size must be a number or an absolute length; resvg takes
+   1ex as half of 1em. A drawing with no size, a size in em or ex units whose font size is
+   missing, relative, a keyword or unreadable, or a side above 4,096 px is refused before
+   anything is rendered.
 5. resvg renders it at that size, through ``resvg_py``. resvg runs no script, and once the
    checks above pass it opens nothing the drawing names; the only files it reads are the
    system's fonts. The PNG must be exactly that size and at most 4 MiB.
@@ -79,14 +83,21 @@ _PX_PER_UNIT = {"px": 1.0, "in": 96.0, "cm": 96 / 2.54, "mm": 96 / 25.4, "pt": 4
 _CSS_COMMENT = re.compile(r"/\*.*?\*/", re.S)
 _CSS_ESCAPE = re.compile(r"\\([0-9a-fA-F]{1,6})[ \t\r\n\f]?|\\(.)", re.S)
 _CSS_URL = re.compile(r"url\(\s*['\"]?\s*([^'\")\s]*)", re.I)
+# The svg element's font size is read from CSS as resvg reads it, with the rules of its CSS
+# parser (simplecss) and of its parser for the font shorthand and lengths (svgtypes).
 _CSS_SPACE = " \t\r\n\f"
-_CSS_RULE = re.compile(r"([^{}]*)\{([^{}]*)\}")
-_CSS_FONT = re.compile(r"(?:^|[;{\s])font(?:-size)?\s*:", re.I)
-# A selector that picks only elements of a named type other than svg: its last compound starts
-# with that type, and nothing in it but names, classes, ids, pseudo-classes and combinators.
-_OTHER_TYPE = re.compile(r"(?:[\w\s.#:>+~*-]*[\s>+~])?([A-Za-z][\w-]*)(?:[.#:][\w-]+)*")
-_STYLE_TOKEN = re.compile(r"""'[^'\\\n]*'|"[^"\\\n]*"|/\*.*?\*/|[^'"/\\;]+|/(?!\*)|;""", re.S)
-_IMPORTANT = re.compile(r"!\s*important\s*$", re.I)
+_CSS_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+_PSEUDO_CLASSES = frozenset({"first-child", "link", "visited", "hover", "active", "focus"})
+_SVG_SPACE = re.compile(r"[ \t\r\n]*")
+_SVG_WORD = re.compile(r"[0-9A-Za-z_-]*")
+_SVG_NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]*)(?:[eE](?![mx])[+-]?[0-9]*)?")
+_SVG_UNIT = re.compile(r"%|em|ex|px|in|cm|mm|pt|pc")
+_FONT_KEYWORDS = frozenset(
+    "normal small-caps italic oblique bold bolder lighter 100 200 300 400 500 600 700 800 900 "
+    "ultra-condensed extra-condensed condensed semi-condensed semi-expanded expanded extra-expanded "
+    "ultra-expanded".split()
+)
+_FONT_SIZE_KEYWORDS = frozenset("xx-small x-small small medium large x-large xx-large larger smaller".split())
 _NO_FONT_SIZE = (
     "has its size in em or ex units but no plain font size to measure them by "
     "(give its svg element a font-size in px, or its width and height in px)"
@@ -130,17 +141,21 @@ def _check_css(css: str, where: str) -> None:
 
 def _inspect(svg: str) -> tuple:
     """Parse the drawing, refusing anything it may not hold, and return its svg element's
-    attributes and the text of each of its <style> elements.
+    attributes and the style sheets resvg reads from its <style> elements.
 
     The attributes are (name, value) pairs in the order of the start tag, each name as expat
-    gives it with namespaces on: "namespace local-name", or the bare local name.
+    gives it with namespaces on: "namespace local-name", or the bare local name. resvg reads a
+    style sheet from each element named exactly style, in any namespace, whose first type
+    attribute is missing or "text/css": the text of its first child, when that child is text
+    (CDATA and character references included).
     """
     parser = expat.ParserCreate(namespace_separator=" ")
     parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
     parser.ordered_attributes = True
     root = None
-    styles: list = []
-    sheets: list = []
+    styles: list = []  # all the text inside each open <style> element, which is checked
+    sheets: list = []  # the text of each style sheet resvg reads, in document order
+    reading = None  # the sheet whose first child is being read
 
     def doctype(name, system_id, public_id, has_internal_subset):
         if system_id or public_id:
@@ -157,11 +172,18 @@ def _inspect(svg: str) -> tuple:
         )
 
     def instruction(target, data):
+        nonlocal reading
+        reading = None
         if target.lower() == "xml-stylesheet":
             raise _Refused("has an external reference (an xml-stylesheet instruction)")
 
+    def comment(data):
+        nonlocal reading
+        reading = None
+
     def start(name, attributes):
-        nonlocal root
+        nonlocal root, reading
+        reading = None
         pairs = list(zip(attributes[::2], attributes[1::2]))
         if root is None:
             if name != f"{SVG_NS} svg":
@@ -195,20 +217,28 @@ def _inspect(svg: str) -> tuple:
             _check_css(value, f"the {attr} attribute of <{local}>")
         if element == "style":
             styles.append([])
+        style_type = next((value for key, value in pairs if key.rsplit(" ", 1)[-1] == "type"), "text/css")
+        if local == "style" and style_type == "text/css":
+            reading = []
+            sheets.append(reading)
 
     def characters(data):
         if styles:
             styles[-1].append(data)
+        if reading is not None:
+            reading.append(data)
 
     def end(name):
+        nonlocal reading
+        reading = None
         if name.rsplit(" ", 1)[-1].lower() == "style":
-            sheets.append("".join(styles.pop()))
-            _check_css(sheets[-1], "a <style> element")
+            _check_css("".join(styles.pop()), "a <style> element")
 
     parser.StartDoctypeDeclHandler = doctype
     parser.EntityDeclHandler = entity
     parser.AttlistDeclHandler = attlist
     parser.ProcessingInstructionHandler = instruction
+    parser.CommentHandler = comment
     parser.StartElementHandler = start
     parser.CharacterDataHandler = characters
     parser.EndElementHandler = end
@@ -216,7 +246,7 @@ def _inspect(svg: str) -> tuple:
         parser.Parse(svg, True)
     except expat.ExpatError:
         raise _Refused("is not an SVG drawing (it is not well-formed XML)") from None
-    return root, sheets
+    return root, ["".join(sheet) for sheet in sheets]
 
 
 def _root_value(attributes: list, name: str):
@@ -245,90 +275,427 @@ def _view_box(value):
     return width, height
 
 
-def _may_pick_the_svg_element(selector: str) -> bool:
-    found = _OTHER_TYPE.fullmatch(_CSS_COMMENT.sub(" ", selector).strip(_CSS_SPACE))
-    return not found or found.group(1).lower() == "svg"
+class _Css:
+    """CSS text read from ``pos`` on, as simplecss reads it; a reading error raises ValueError."""
+
+    def __init__(self, text: str):
+        self.text, self.pos = text, 0
+
+    def at_end(self) -> bool:
+        return self.pos >= len(self.text)
+
+    def peek(self, ahead: int = 0) -> str:
+        """The character ``ahead`` of the current one, or "" past the end."""
+        return self.text[self.pos + ahead : self.pos + ahead + 1]
+
+    def need(self) -> str:
+        """The current character; the end is an error."""
+        if self.at_end():
+            raise ValueError("unexpected end of CSS")
+        return self.text[self.pos]
+
+    def expect(self, char: str) -> None:
+        if self.peek() != char:
+            raise ValueError(f"expected {char!r}")
+        self.pos += 1
+
+    def skip_over(self, chars: str) -> None:
+        while not self.at_end() and self.text[self.pos] in chars:
+            self.pos += 1
+
+    def skip_to(self, chars: str) -> None:
+        while not self.at_end() and self.text[self.pos] not in chars:
+            self.pos += 1
+
+    def skip_spaces(self) -> None:
+        self.skip_over(_CSS_SPACE)
+
+    def skip_comment(self) -> None:
+        """Skip a comment; an unclosed one is skipped to the end, and is an error."""
+        self.expect("/")
+        self.expect("*")
+        close = self.text.find("*/", self.pos)
+        self.pos = len(self.text) if close < 0 else close + 2
+        if close < 0:
+            raise ValueError("unclosed CSS comment")
+
+    def skip_spaces_and_comments(self) -> None:
+        self.skip_spaces()
+        while self.text.startswith("/*", self.pos):
+            self.skip_comment()
+            self.skip_spaces()
+
+    def ident(self) -> str:
+        """An identifier (ASCII only); a leading "-" stays read when no identifier follows it."""
+        start = self.pos
+        if self.peek() == "-":
+            self.pos += 1
+        name = _CSS_NAME.match(self.text, self.pos)
+        if not name:
+            raise ValueError("expected a CSS identifier")
+        self.pos = name.end()
+        return self.text[start : self.pos]
+
+    def string(self) -> str:
+        """A quoted string's text, where a quote after a backslash does not end it, or an identifier."""
+        quote = self.need()
+        if quote not in "'\"":
+            return self.ident()
+        self.pos += 1
+        start = self.pos
+        while not self.at_end() and not (self.text[self.pos] == quote and self.text[self.pos - 1] != "\\"):
+            self.pos += 1
+        value = self.text[start : self.pos]
+        self.expect(quote)
+        return value
+
+    def block_end(self) -> None:
+        """Skip past the closing brace of the block being read, over any nested blocks."""
+        depth = 0
+        while not self.at_end():
+            char = self.text[self.pos]
+            if char == "}":
+                if not depth:
+                    break
+                depth -= 1
+            elif char == "{":
+                depth += 1
+            self.pos += 1
+        if self.peek() == "}":
+            self.pos += 1
 
 
-def _may_set_root_font(css: str) -> bool:
-    """Whether a rule of this style sheet may set the font size of the svg element.
-
-    Read without and with its comments, its escapes undone: a rule may set it when it declares
-    font or font-size and one of its selectors may pick the svg element. A sheet with nested or
-    unbalanced braces always may.
-    """
-    for view in (_CSS_COMMENT.sub(" ", css), css):
-        view = _unescape_css(view)
-        if not _CSS_FONT.search(view):
-            continue
-        rest = _CSS_RULE.sub(" ", view)
-        if "{" in rest or "}" in rest:
-            return True
-        for selectors, declarations in _CSS_RULE.findall(view):
-            if _CSS_FONT.search(declarations) and any(
-                _may_pick_the_svg_element(selector) for selector in selectors.split(",")
-            ):
-                return True
-    return False
-
-
-def _style_font_size(style: str):
-    """The font size the style attribute declares last, "" when it declares none, or None
-    when it cannot be read plainly.
-
-    Read as CSS reads it: strings are kept whole and comments are spaces. An unclosed string or
-    comment, an escape, a declaration without a colon (resvg stops reading there), or a font
-    shorthand, a differently written font-size or an empty one declared last is not read plainly.
-    """
-    declarations, pieces, position = [], [], 0
-    while position < len(style):
-        token = _STYLE_TOKEN.match(style, position)
-        if not token:
-            return None
-        position = token.end()
-        if token.group() == ";":
-            declarations.append("".join(pieces))
-            pieces = []
+def _css_term(css: _Css) -> bool:
+    """Read one term of a declaration's value; False when none can be read."""
+    try:
+        char = css.need()
+        if char == "#":
+            css.pos += 1
+            try:
+                css.ident()
+            except ValueError:
+                css.skip_over("0123456789abcdefABCDEF")
+        elif char in "+-.0123456789":
+            css.pos += 1
+            css.skip_over("0123456789")
+            if css.peek() == ".":
+                css.pos += 1
+                css.skip_over("0123456789")
+            if css.peek() == "%":
+                css.pos += 1
+            else:
+                try:
+                    css.ident()
+                except ValueError:
+                    pass
+        elif char in "'\"":
+            css.string()
+        elif char == ",":
+            css.pos += 1
         else:
-            pieces.append(" " if token.group().startswith("/*") else token.group())
-    declarations.append("".join(pieces))
-    declared = ""
-    for declaration in declarations:
-        if not declaration.strip(_CSS_SPACE):
+            css.ident()
+            if css.peek() == "(":
+                css.skip_to(")")
+                css.expect(")")
+    except ValueError:
+        return False
+    return True
+
+
+def _css_declaration(css: _Css) -> tuple:
+    """Read one declaration: (name, value, important)."""
+    css.skip_spaces_and_comments()
+    if css.peek() == "*":
+        css.pos += 1
+    name = css.ident()
+    css.skip_spaces_and_comments()
+    css.expect(":")
+    css.skip_spaces_and_comments()
+    start = end = css.pos
+    while _css_term(css):
+        end = css.pos
+        css.skip_spaces_and_comments()
+    css.skip_spaces_and_comments()
+    important = False
+    if css.peek() == "!":
+        css.pos += 1
+        css.skip_spaces_and_comments()
+        if css.text.startswith("important", css.pos):
+            css.pos += len("important")
+            important = True
+    css.skip_spaces_and_comments()
+    while css.peek() == ";":
+        css.pos += 1
+        css.skip_spaces_and_comments()
+    if start == end:
+        raise ValueError("empty CSS value")
+    return name, css.text[start:end], important
+
+
+def _css_declarations(css: _Css) -> list:
+    """Read the declarations of a block, up to its closing brace; an error ends the block."""
+    declarations = []
+    while not css.at_end() and css.peek() != "}":
+        try:
+            declarations.append(_css_declaration(css))
+        except ValueError:
+            css.block_end()
+            break
+    return declarations
+
+
+def _css_selector(css: _Css):
+    """Read one selector of a selector list, up to a comma or brace, as a list of compound
+    selectors, each [type, sub-selectors] with the type None for *, or None when simplecss
+    drops it.
+
+    A sub-selector is (attribute, operator, value), the operator one of "]" (it exists), "=",
+    "~" (one of its words) and "|" (it or a prefix ending in -), or (None, ":", pseudo-class).
+    """
+    compounds, after_combinator, combined = [], True, False
+
+    def sub(selector):
+        nonlocal combined
+        if compounds and not combined:
+            compounds[-1][1].append(selector)
+        else:
+            compounds.append([None, [selector]])
+            combined = False
+
+    try:
+        while True:
+            char = css.peek()
+            if char in ("", ",", "{") or (char == "/" and css.peek(1) != "*"):
+                return None if after_combinator else compounds
+            if char == "/":
+                css.skip_comment()
+            elif char in _CSS_SPACE:
+                css.skip_spaces()
+                if not after_combinator:
+                    while css.peek() == "/":
+                        css.skip_comment()
+                        css.skip_spaces()
+                    if css.peek() not in ("", ">", "+", ",", "{"):
+                        after_combinator = combined = True  # a descendant combinator
+            elif char in ">+":
+                if after_combinator:
+                    return None
+                css.pos += 1
+                after_combinator = combined = True
+            elif char == "*":
+                if not after_combinator:
+                    return None
+                css.pos += 1
+                compounds.append([None, []])
+                after_combinator = combined = False
+            elif char in "#.[:":
+                css.pos += 1
+                after_combinator = False
+                name = css.ident()
+                if char == "#":
+                    sub(("id", "=", name))
+                elif char == ".":
+                    sub(("class", "~", name))
+                elif char == "[":
+                    operator, value = css.need(), None
+                    if operator in "=~|":
+                        css.pos += 1
+                        if operator != "=":
+                            css.expect("=")
+                        value = css.string()
+                    elif operator != "]":
+                        return None
+                    css.expect("]")
+                    sub((name, operator, value))
+                elif name == "lang":
+                    css.expect("(")
+                    start = css.pos
+                    css.skip_to(")")
+                    language = css.text[start : css.pos].strip()
+                    css.expect(")")
+                    if not language:
+                        return None
+                    sub((None, ":", name))
+                elif name in _PSEUDO_CLASSES:
+                    sub((None, ":", name))
+                else:
+                    return None
+            else:
+                name = css.ident()
+                if not after_combinator:
+                    return None
+                compounds.append([name, []])
+                after_combinator = combined = False
+    except ValueError:
+        return None
+
+
+def _css_rules(sheet: str) -> list:
+    """The rules simplecss reads from a style sheet, as (selector, declarations) pairs in
+    source order; rules without declarations are dropped."""
+    css, rules = _Css(sheet), []
+    try:
+        css.skip_spaces_and_comments()
+        while not css.at_end():
+            css.skip_spaces_and_comments()
+            try:
+                if css.peek() == "@":  # an at-rule, which is skipped
+                    css.pos += 1
+                    css.ident()
+                    css.skip_to(";{")
+                    opens_a_block = css.need() == "{"
+                    css.pos += 1
+                    if opens_a_block:
+                        css.block_end()
+                    continue
+                first = len(rules)
+                while css.need() == "," or len(rules) == first:
+                    if css.peek() == ",":
+                        css.pos += 1
+                    selector = _css_selector(css)
+                    css.skip_spaces()
+                    if selector:
+                        rules.append([selector, []])
+                    if css.need() != ",":
+                        css.skip_to("{")
+                        break
+                if css.peek() == "{":
+                    css.pos += 1
+                declarations = _css_declarations(css)
+                for rule in rules[first:]:
+                    rule[1] = declarations
+                if css.peek() == "}":
+                    css.pos += 1
+            except ValueError:
+                pass
+    except ValueError:
+        pass
+    return [(selector, declarations) for selector, declarations in rules if declarations]
+
+
+def _picks_the_svg_element(selector: list, attributes: list) -> bool:
+    """Whether a selector picks the svg element, which has no parent and no element before it."""
+    if len(selector) != 1 or selector[0][0] not in (None, "svg"):
+        return False
+    for name, operator, value in selector[0][1]:
+        if operator == ":":
+            if value != "first-child":
+                return False
             continue
-        name, colon, value = declaration.partition(":")
-        if not colon:
+        actual = next((text for key, text in attributes if key.rpartition(" ")[2] == name), None)
+        if actual is None or not (
+            operator == "]"
+            or (operator == "=" and actual == value)
+            or (operator == "~" and value in actual.split(" "))
+            or (operator == "|" and (actual == value or actual.startswith(f"{value}-")))
+        ):
+            return False
+    return True
+
+
+def _specificity(selector: list) -> tuple:
+    """A selector's specificity as simplecss counts it: ids, other sub-selectors, types."""
+    ids = sum(sub[0] == "id" for _, subs in selector for sub in subs)
+    others = sum(len(subs) for _, subs in selector) - ids
+    types = sum(name is not None for name, _ in selector)
+    return min(ids, 255), min(others, 255), min(types, 255)
+
+
+def _svg_length_end(text: str, position: int):
+    """Where the length that svgtypes reads from ``position`` ends, or None when it reads none."""
+    number = _SVG_NUMBER.match(text, _SVG_SPACE.match(text, position).end())
+    try:
+        if not number or not math.isfinite(float(number.group())):
             return None
-        name = name.strip(_CSS_SPACE)
-        if name.lower() in ("font", "font-size"):
-            value = _IMPORTANT.sub("", value.strip(_CSS_SPACE)).strip(_CSS_SPACE)
-            declared = value if name == "font-size" and value else None
-    return declared
+    except ValueError:
+        return None
+    return (_SVG_UNIT.match(text, number.end()) or number).end()
+
+
+def _font_shorthand_size(value: str):
+    """The font size that a font shorthand sets, as written, or None when resvg ignores it.
+
+    Up to four style, variant, weight or stretch keywords come first, then the size: a length
+    that starts with a digit, or a size keyword. An optional /line-height and the family follow.
+    """
+    position = _SVG_SPACE.match(value).end()
+    for _ in range(4):
+        word = _SVG_WORD.match(value, position)
+        if word.group() not in _FONT_KEYWORDS:
+            break
+        position = _SVG_SPACE.match(value, word.end()).end()
+    start = position
+    if start >= len(value):
+        return None
+    if value[start] in "0123456789":
+        end = _svg_length_end(value, start)
+    else:
+        end = _SVG_WORD.match(value, start).end()
+        if value[start:end] not in _FONT_SIZE_KEYWORDS:
+            return None
+    if end is None:
+        return None
+    rest = _SVG_SPACE.match(value, end).end()
+    if value[rest : rest + 1] == "/":
+        rest = _svg_length_end(value, rest + 1)
+        if rest is None:
+            return None
+        rest = _SVG_SPACE.match(value, rest).end()
+    return value[start:end] if rest < len(value) else None
+
+
+def _root_font_size(attributes: list, sheets: list):
+    """The svg element's font size as resvg finds it, as written, or None when it has none.
+
+    The svg element's font-size attribute comes first, then the declarations of the rules that
+    pick the svg element, from the least to the most specific and in source order, then those
+    of its first style attribute, in any namespace. font-size and the font shorthand set it; a
+    declaration replaces it unless the one that set it is !important, and inherit makes it medium.
+    """
+    value, important = _root_value(attributes, "font-size"), False
+
+    def declare(name, declared, flagged):
+        nonlocal value, important
+        if name == "font":
+            declared = _font_shorthand_size(declared)
+        elif name != "font-size":
+            return
+        if declared is not None and not important:
+            value, important = ("medium", False) if declared == "inherit" else (declared, flagged)
+
+    rules = [rule for sheet in sheets for rule in _css_rules(sheet) if _picks_the_svg_element(rule[0], attributes)]
+    for _, declarations in sorted(rules, key=lambda rule: _specificity(rule[0])):
+        for declaration in declarations:
+            declare(*declaration)
+    style = next((text for key, text in attributes if key.rpartition(" ")[2] == "style"), None)
+    if style is not None:
+        css = _Css(style)
+        while True:
+            try:
+                css.skip_spaces_and_comments()
+            except ValueError:
+                pass
+            if css.at_end():
+                break
+            try:
+                declare(*_css_declaration(css))
+            except ValueError:
+                break
+    return value
 
 
 def _font_size(attributes: list, sheets: list) -> float:
     """The svg element's own font size in px, which its em and ex units are measured by, or a refusal.
 
-    resvg takes it from the first style attribute of the svg element, in any namespace, when that
-    declares one, and otherwise from its font-size attribute. Only a number or an absolute length
-    is used: none, a relative size or a keyword is refused, and so is any <style> rule that may set it.
+    Only a number or an absolute length is used: none, a relative size, a keyword or a value that
+    resvg cannot read is refused.
     """
-    if any(_may_set_root_font(css) for css in sheets):
-        raise _Refused(
-            "has its size in em or ex units, and a <style> element may change the font size they are "
-            "measured by (give its width and height in px)"
-        )
-    value = _root_value(attributes, "font-size")
-    style = next((text for key, text in attributes if key.rpartition(" ")[2] == "style"), None)
-    if style is not None:
-        declared = _style_font_size(style)
-        if declared is None:
-            raise _Refused(_NO_FONT_SIZE)
-        value = declared or value
+    value = _root_font_size(attributes, sheets)
     found = _FONT_SIZE.fullmatch(value) if value is not None else None
-    if not found:
+    pixels = float(found.group(1)) * _PX_PER_UNIT[found.group(2) or "px"] if found else math.nan
+    if not math.isfinite(pixels):
         raise _Refused(_NO_FONT_SIZE)
-    return float(found.group(1)) * _PX_PER_UNIT[found.group(2) or "px"]
+    return pixels
 
 
 def _length(value, side, font_size):
@@ -461,17 +828,18 @@ KANBAN_RENDER_DRAWING_SCHEMA = {
         "Turn an SVG drawing attached to your own task into a PNG picture, for example to offer "
         "it as a design option. The PNG has the drawing's own size: the width and height of its "
         "svg element, or its viewBox where those are missing. Sizes in em or ex units are "
-        "measured by the svg element's own font-size, given as a number or an absolute length "
-        "(1ex is half of 1em). It is stored as a new attachment "
+        "measured by the svg element's own font size, as the drawing's own CSS sets it: its "
+        "font-size attribute, <style> rules that pick the svg element and its style attribute, "
+        "the font shorthand and !important included. That font size must be a number or an "
+        "absolute length (1ex is half of 1em). It is stored as a new attachment "
         "on the same task, and its attachment_id is returned. Only plain, self-contained "
         'drawings whose svg element has xmlns="http://www.w3.org/2000/svg" are rendered. '
         "Nothing is stored, and the reason is returned, when the drawing holds a script, an "
         "event attribute such as onclick, a foreignObject, an image element or a data: "
         "reference; when an href or url() points anywhere but a #fragment of the drawing, or it "
         "uses a CSS @import; when it declares entities, default attributes or an outside DTD; "
-        "when it has no size, a size in em or ex units without such a font-size or with a "
-        "<style> rule that may change it, or a side above 4,096 px; or when the PNG would be "
-        "larger than 4 MiB."
+        "when it has no size, a size in em or ex units without such a font size, or a side "
+        "above 4,096 px; or when the PNG would be larger than 4 MiB."
     ),
     "parameters": {
         "type": "object",
