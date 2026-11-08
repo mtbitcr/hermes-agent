@@ -13,14 +13,19 @@ outlives restarts, so no wait is told twice. A wait is keyed by its Project, its
 ``blocked`` event that started it, so a new wait after an answer gets one new message; the ids stay
 in that local file and never appear in a message. A wait that starts inside an owner channel pause
 window, or is found while paused, is recorded "paused" and never sent, not even after the resume,
-as the kanban notifier drops a card notice.
+as the kanban notifier drops a card notice. A tick tries at most MAX_PER_TICK sends, oldest wait
+first, and leaves the other waits due a send for the next tick. That limit counts sends only, so a
+tick records as "paused" every due wait the pause holds, however many there are.
 
 A tick never raises and writes no kanban store, so a failure here cannot change a card, the
-Decisions list or the dispatcher. A send that raises is recorded "unknown" and never tried again,
-since the message may have arrived; a refused send is recorded "failed" and tried again on later
-ticks, three attempts in all; a "sending" entry found at the start of a tick (a crash between the
-write and the send) counts as told. A record file that exists but cannot be read stops the tick
-rather than counting as empty, which would tell every wait again.
+Decisions list or the dispatcher. A Project whose board fails any read is skipped for the tick:
+nothing is sent for it and its told keys stay, also when the kernel's wait helpers answer the failed
+read as a board with no waits. A send that raises, or that fails with a result that is not retryable
+(as the Telegram adapter answers a timeout), is recorded "unknown" and never tried again, since the
+message may have arrived; only a send that fails with a retryable result is recorded "failed" and
+tried again on later ticks, three attempts in all; a "sending" entry found at the start of a tick (a
+crash between the write and the send) counts as told. A record file that exists but cannot be read
+stops the tick rather than counting as empty, which would tell every wait again.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,9 +49,9 @@ from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
-MAX_PER_TICK = 10  # waits handled per tick, oldest first; the rest wait for the next tick
+MAX_PER_TICK = 10  # sends per tick, oldest first, the rest wait for the next tick; "paused" ones never count
 MAX_MESSAGE = 4000  # last guard under Telegram's 4096-character message limit
-MAX_ATTEMPTS = 3  # a refused send is tried again on later ticks while attempts < 3
+MAX_ATTEMPTS = 3  # a send refused as retryable is tried again on later ticks while attempts < 3
 RECORD_FILE_NAME = "owner_heads_up.json"
 LOCK_FILE_NAME = "owner_heads_up.lock"
 _STATES = ("sent", "paused", "failed", "unknown", "sending")
@@ -131,22 +137,73 @@ def _entry(state: str, attempts: int) -> dict:
     return {"state": state, "attempts": attempts, "at": int(time.time())}
 
 
+class _Reads:
+    """A thin delegating wrapper around the board connection, or a cursor it returned. Each SQLite
+    error raised by execute or while rows are fetched is kept in ``failed``, one list for the
+    connection and its cursors, and then raised on, so a read the kernel's helpers swallow still
+    fails the board."""
+
+    def __init__(self, target: Any, failed: Optional[list] = None):
+        self._target = target
+        self.failed: list = [] if failed is None else failed
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._target, name)
+
+    def _kept(self, read, *args, **kwargs):
+        try:
+            return read(*args, **kwargs)
+        except sqlite3.Error as exc:
+            self.failed.append(exc)
+            raise
+
+    def execute(self, *args, **kwargs) -> "_Reads":
+        return _Reads(self._kept(self._target.execute, *args, **kwargs), self.failed)
+
+    def fetchone(self):
+        return self._kept(self._target.fetchone)
+
+    def fetchmany(self, *args, **kwargs):
+        return self._kept(self._target.fetchmany, *args, **kwargs)
+
+    def fetchall(self):
+        return self._kept(self._target.fetchall)
+
+    def __iter__(self) -> "_Reads":
+        return self
+
+    def __next__(self):
+        return self._kept(next, self._target)
+
+    def check(self) -> None:
+        """Raise the first SQLite error kept, if any read failed."""
+        if self.failed:
+            raise self.failed[0]
+
+
 def _board_waits(project: dict) -> list[_Wait]:
-    """Every card of ``project`` waiting for the owner now, read from its board without writing."""
+    """Every card of ``project`` waiting for the owner now, read from its board without writing.
+
+    Raises when any read of the board fails, also a read the kernel's helpers answer as no waits.
+    """
     board = str(project["board"])
     folder = kanban_db.kanban_home() if board == kanban_db.DEFAULT_BOARD else kanban_db.board_dir(board)
     project_id = str(project["project_id"])
     conn = owner_workspace._open_read_only_sqlite(folder / "kanban.db", label="kanban.db")
     try:
-        # One read transaction, so every query sees the same snapshot of the board and a read that
-        # fails at the start raises here, before task_owner_waits (which answers {} on a failed read)
-        # could make the prune forget waits already told.
+        # One read transaction, so every query sees the same snapshot of the board. task_owner_waits
+        # answers {} when a read fails: here that would pass for a board with no waits and let the prune
+        # forget waits already told, and inside decision_design_options for a design wait without options,
+        # told as a question. So both helpers read through _Reads, and a read error it kept fails the board.
         conn.execute("BEGIN")
         candidates = [str(row[0]) for row in conn.execute(_CANDIDATES, (project_id,))]
-        waits = kanban_db.task_owner_waits(conn, candidates)
+        reads = _Reads(conn)
+        waits = kanban_db.task_owner_waits(reads, candidates)
+        reads.check()
         if not waits:
             return []
-        options = owner_design_choices.decision_design_options(conn, list(waits))
+        options = owner_design_choices.decision_design_options(reads, list(waits))
+        reads.check()
         placeholders = ",".join("?" for _ in waits)
         starts = {
             str(task_id): int(event_id)
@@ -218,8 +275,9 @@ def _due(entry: Optional[dict]) -> bool:
 
 
 async def tick(runner) -> int:
-    """Tell the owner of each wait not told yet, at most MAX_PER_TICK, oldest first; return the
-    number of messages sent. Stops quietly at the first closed gate and never raises."""
+    """Tell the owner of each wait not told yet, oldest first, in at most MAX_PER_TICK sends, and record
+    every one the pause holds as "paused"; return the number of messages sent. Stops quietly at the
+    first closed gate and never raises."""
     sent = 0
     try:
         gates = _gates(runner)
@@ -242,11 +300,15 @@ async def tick(runner) -> int:
                     (wait for wait in waits if _due(told.get(wait.key))),
                     key=lambda wait: (wait.since, wait.blocked_event_id, wait.key),
                 )
-                for wait in due[:MAX_PER_TICK]:
+                calls = 0  # adapter.send calls this tick; a wait recorded "paused" is not one
+                for wait in due:
                     attempts = told[wait.key]["attempts"] if wait.key in told else 0
                     if owner_channel_pause.drops_notice(Platform.TELEGRAM, chat, wait.since):
                         told[wait.key] = _entry("paused", attempts)
+                    elif calls >= MAX_PER_TICK:
+                        continue
                     else:
+                        calls += 1
                         told[wait.key] = _entry("sending", attempts)
                         _write_record(record, told)
                         try:
@@ -257,7 +319,12 @@ async def tick(runner) -> int:
                         else:
                             if getattr(result, "success", True) is False:
                                 logger.warning("Owner heads-up send failed: %s", getattr(result, "error", None))
-                                told[wait.key] = _entry("failed", attempts + 1)
+                                if getattr(result, "retryable", False) is True:
+                                    told[wait.key] = _entry("failed", attempts + 1)
+                                else:
+                                    # Not retryable, such as a Telegram timeout: the message may have
+                                    # arrived, so it counts as told and is never tried again.
+                                    told[wait.key] = _entry("unknown", attempts)
                             else:
                                 told[wait.key] = _entry("sent", attempts)
                                 sent += 1

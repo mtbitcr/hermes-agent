@@ -3,7 +3,8 @@
 Each test builds a real temporary root Hermes home whose config.yaml names HOME_CHAT as the
 Telegram home and turns the owner workspace on, one real owner Project through
 ``owner_workspace.bootstrap``, and real cards on its board through the real kernel calls. A fake
-Telegram adapter keeps every message it is handed; each tick runs through
+Telegram adapter keeps every message it is handed (one test runs the real Telegram adapter over a
+stub bot instead, so nothing contacts Telegram); each tick runs through
 ``asyncio.run(owner_heads_up.tick(runner))``. The module is imported inside each test, so on a tree
 without it each test fails on its own. Chat ids, names and texts are invented placeholders.
 """
@@ -289,6 +290,32 @@ def test_a_wait_that_started_inside_a_pause_window_is_never_told(root, heads_up,
     assert _states(root) == {_key(project, task): "paused"}
 
 
+def test_every_wait_found_while_paused_is_recorded_paused_however_many(
+    root, heads_up, project, telegram, runner, monkeypatch,
+):
+    class _Clock:
+        """The kernel's own clock, an hour behind, so every wait starts before the pause."""
+
+        def time(self):
+            return time.time() - 3_600
+
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(kb, "time", _Clock())
+        tasks = [_waiting(project, f"Card {n}") for n in range(12)]
+    assert len(tasks) > heads_up.MAX_PER_TICK
+    owner_channel_pause.pause()
+
+    assert _tick(heads_up, runner) == 0
+    assert _states(root) == {_key(project, task): "paused" for task in tasks}
+
+    owner_channel_pause.resume()
+    assert _tick(heads_up, runner) == 0
+    assert telegram.sent == []
+
+
 # --- no repeat -------------------------------------------------------------------------------------
 
 def test_no_repeat_across_ticks_or_a_reload_of_the_module(root, heads_up, project, telegram, runner):
@@ -454,6 +481,98 @@ def test_a_board_that_fails_to_read_keeps_its_keys_and_the_other_boards_are_stil
     assert len(telegram.sent) == 2
 
 
+def test_a_failed_event_read_skips_the_board_and_keeps_its_told_keys(
+    root, heads_up, project, telegram, runner, monkeypatch,
+):
+    task = _waiting(project)
+    assert _tick(heads_up, runner) == 1
+    key = _key(project, task)
+    real = ow._open_read_only_sqlite
+    denied = []
+
+    def event_payloads_denied(path, *, label):
+        """The real board connection, with SQLite itself refusing every read of task_events.payload."""
+        conn = real(path, label=label)
+        if Path(path).name == "kanban.db":
+            def authorize(action, table, column, database, trigger):
+                if action == sqlite3.SQLITE_READ and (table, column) == ("task_events", "payload"):
+                    denied.append((table, column))
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            conn.set_authorizer(authorize)
+        return conn
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ow, "_open_read_only_sqlite", event_payloads_denied)
+        assert _tick(heads_up, runner) == 0
+    assert denied
+    assert _states(root) == {key: "sent"}
+
+    assert _tick(heads_up, runner) == 0
+    assert len(telegram.sent) == 1
+    assert _states(root) == {key: "sent"}
+
+
+@pytest.mark.parametrize("fails_in", ["execute", "fetch"])
+def test_a_failed_nested_wait_read_skips_the_board_rather_than_telling_a_design_wait_as_a_question(
+    root, heads_up, project, telegram, runner, monkeypatch, fails_in,
+):
+    task = _designer(project)
+    real = ow._open_read_only_sqlite
+    wait_reads = []
+
+    class _Rows:
+        """The real cursor, except that its rows cannot be fetched."""
+
+        def __init__(self, cursor):
+            self.cursor = cursor
+
+        def __getattr__(self, name):
+            return getattr(self.cursor, name)
+
+        def fetchall(self):
+            raise sqlite3.OperationalError("disk I/O error")
+
+    class _Board:
+        """The real board connection, except that the second read of the wait projection, the one
+        decision_design_options makes inside, fails in ``execute`` or while its rows are fetched."""
+
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __getattr__(self, name):
+            return getattr(self.conn, name)
+
+        def execute(self, sql, *args):
+            if sql.startswith("SELECT task_id, id, kind, created_at, payload FROM task_events"):
+                wait_reads.append(sql)
+                if len(wait_reads) == 2:
+                    if fails_in == "execute":
+                        raise sqlite3.OperationalError("disk I/O error")
+                    return _Rows(self.conn.execute(sql, *args))
+            return self.conn.execute(sql, *args)
+
+    def second_wait_read_fails(path, *, label):
+        conn = real(path, label=label)
+        return _Board(conn) if Path(path).name == "kanban.db" else conn
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ow, "_open_read_only_sqlite", second_wait_read_fails)
+        _tick(heads_up, runner)
+    assert len(wait_reads) == 2
+    assert telegram.sent == []
+    assert not _record(root).exists()
+
+    assert _tick(heads_up, runner) == 1
+    assert telegram.sent == [(HOME_CHAT, (
+        f"Raphael needs you to choose a design in {PROJECT}.\n"
+        f"{QUESTION}\n"
+        "The options are waiting for you on Decisions in the app."
+    ))]
+    assert _states(root) == {_key(project, task): "sent"}
+
+
 def test_a_projects_list_that_fails_stops_the_tick(root, heads_up, project, telegram, runner, monkeypatch):
     _waiting(project)
     real = ow.list_committed_projects
@@ -548,7 +667,7 @@ def test_the_record_says_sending_before_the_message_goes_out(root, heads_up, pro
 
 
 def test_a_refused_send_is_tried_at_most_three_times(root, heads_up, project):
-    telegram = _Telegram(result=SendResult(success=False, error="Bad Request: chat not found"))
+    telegram = _Telegram(result=SendResult(success=False, error="Bad Request: chat not found", retryable=True))
     runner = _runner(telegram)
     task = _waiting(project)
 
@@ -560,7 +679,7 @@ def test_a_refused_send_is_tried_at_most_three_times(root, heads_up, project):
 
 
 def test_a_refused_send_that_then_goes_through_is_sent(root, heads_up, project):
-    telegram = _Telegram(result=SendResult(success=False, error="Too Many Requests"))
+    telegram = _Telegram(result=SendResult(success=False, error="Too Many Requests", retryable=True))
     runner = _runner(telegram)
     task = _waiting(project)
     assert _tick(heads_up, runner) == 0
@@ -571,6 +690,56 @@ def test_a_refused_send_that_then_goes_through_is_sent(root, heads_up, project):
 
     assert len(telegram.sent) == 2
     assert _states(root) == {_key(project, task): "sent"}
+
+
+def test_a_refused_send_that_is_not_retryable_is_never_tried_again(root, heads_up, project):
+    telegram = _Telegram(result=SendResult(success=False, error="Timed out", retryable=False, error_kind="unknown"))
+    runner = _runner(telegram)
+    task = _waiting(project)
+
+    assert [_tick(heads_up, runner) for _ in range(3)] == [0] * 3
+
+    assert len(telegram.sent) == 1
+    assert _states(root) == {_key(project, task): "unknown"}
+
+
+def test_a_telegram_timeout_that_may_have_arrived_is_never_sent_again(root, heads_up, project):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from telegram.error import TimedOut
+
+    from gateway.config import PlatformConfig
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    task = _waiting(project)
+    accepted = []
+
+    async def accepted_then_the_answer_is_lost(**kwargs):
+        accepted.append(kwargs)
+        if len(accepted) == 1:
+            raise TimedOut("timed out")
+        return SimpleNamespace(message_id=42)
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="placeholder-token"))
+    adapter._rich_send_disabled = True
+    adapter._retrigger_typing = AsyncMock()
+    adapter._bot = MagicMock(send_message=AsyncMock(side_effect=accepted_then_the_answer_is_lost))
+    results = []
+    real_send = adapter.send
+
+    async def send(*args, **kwargs):
+        results.append(await real_send(*args, **kwargs))
+        return results[-1]
+
+    adapter.send = send
+    runner = _runner(adapter)
+
+    ticks = [_tick(heads_up, runner) for _ in range(3)]
+
+    assert len(accepted) == 1
+    assert [(result.success, result.retryable) for result in results] == [(False, False)]
+    assert _states(root) == {_key(project, task): "unknown"}
+    assert ticks == [0, 0, 0]
 
 
 # --- gates and the record --------------------------------------------------------------------------
