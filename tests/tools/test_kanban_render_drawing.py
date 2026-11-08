@@ -83,9 +83,21 @@ PLAIN = f"""<svg {NS} {XLINK} width="320" height="200">
   <use xlink:href="#card" x="200" y="120"/>
 </svg>"""
 VIEWBOX_ONLY = f'<svg {NS} viewBox="0 0 640 480"><rect width="640" height="480" fill="#20a040"/></svg>'
+# Sized in em and in ex of the svg element's own font size: 10em of 20 px is 200 px, and
+# resvg takes 1ex as half of 1em, so 10ex is 100 px. The style sheet sets only the font
+# size of text, never the svg element's.
+EM = ('<svg xmlns="http://www.w3.org/2000/svg" width="10em" height="2em" font-size="20">'
+      '<rect width="100%" height="100%" fill="#2050c0"/></svg>')
+EX = (f'<svg {NS} width="10ex" height="4ex" font-size="20"><style>text {{ font-size: 40px; }}</style>'
+      '<rect width="100%" height="100%" fill="#20a040"/></svg>')
 # Fractal noise does not compress: about 5.6 MB of PNG at 1,280 px square.
 NOISE = (
     f'<svg {NS} width="1280" height="1280"><filter id="n" x="0" y="0" width="1" height="1">'
+    '<feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="1" seed="7"/></filter>'
+    '<rect width="1280" height="1280" filter="url(#n)"/></svg>'
+)
+NOISE_IN_EM = (  # the same noise at 64em of 20 px: 1,280 px square again
+    f'<svg {NS} width="64em" height="64em" font-size="20"><filter id="n" x="0" y="0" width="1" height="1">'
     '<feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="1" seed="7"/></filter>'
     '<rect width="1280" height="1280" filter="url(#n)"/></svg>'
 )
@@ -104,7 +116,9 @@ def _fe_image(href: str) -> str:
     )
 
 
-# Width and height, or the viewBox where they are missing, as resvg reads them.
+# Width and height, or the viewBox where they are missing, as resvg reads them. A size in
+# em or ex is measured by the svg element's own font size, its style attribute winning over
+# its font-size attribute.
 OWN_SIZES = [
     pytest.param('width="320" height="200"', (320, 200), id="width-and-height"),
     pytest.param('viewBox="0 0 640 480"', (640, 480), id="viewbox-only"),
@@ -114,6 +128,12 @@ OWN_SIZES = [
     pytest.param('width="50mm" height="1in"', (189, 96), id="absolute-units"),
     pytest.param('width="100.6" height="50.4"', (101, 50), id="fractional"),
     pytest.param('width="4096" height="16"', (4096, 16), id="at-the-limit"),
+    pytest.param('width="10ex" height="4ex" font-size="15pt"', (100, 40), id="ex-of-a-font-size-in-pt"),
+    pytest.param('width="10em" height="2em" font-size="20" style="font-size: 30px"', (300, 60),
+                 id="em-of-the-font-size-in-the-style-attribute"),
+    pytest.param('width="5em" height="40" style="fill: none; font-size: 0.5in"', (240, 40),
+                 id="em-and-px"),
+    pytest.param('width="10em" viewBox="0 0 100 20" font-size="20"', (200, 40), id="em-and-viewbox"),
 ]
 
 # (filename, content, content type, a fragment of the plain reason)
@@ -198,20 +218,38 @@ REFUSED = [
                  "is 100x5,000 px (at most 4,096 px per side", id="viewbox-height-above-the-limit"),
     pytest.param("inches.svg", f'<svg {NS} width="43in" height="1in">{RECT}</svg>', SVG_TYPE,
                  "is 4,128x96 px (at most 4,096 px per side", id="inches-above-the-limit"),
+    pytest.param("em-wide.svg", f'<svg {NS} width="300em" height="1em" font-size="20">{RECT}</svg>', SVG_TYPE,
+                 "is 6,000x20 px (at most 4,096 px per side", id="em-above-the-limit"),
     # No size that can be determined.
     pytest.param("unsized.svg", f"<svg {NS}>{RECT}</svg>", SVG_TYPE, "has no size", id="no-size"),
     pytest.param("width-only.svg", f'<svg {NS} width="40">{RECT}</svg>', SVG_TYPE, "has no size",
                  id="width-without-height-or-viewbox"),
     pytest.param("percent.svg", f'<svg {NS} width="100%" height="100%">{RECT}</svg>', SVG_TYPE, "has no size",
                  id="percent-without-viewbox"),
-    pytest.param("font-units.svg", f'<svg {NS} width="10em" height="10" font-size="20">{RECT}</svg>', SVG_TYPE,
-                 "in em or ex units", id="size-in-font-units"),
+    # A size in em or ex with no plain font size to measure it by: none, one that is
+    # relative or a keyword, or one that a <style> element may change.
+    pytest.param("font-units.svg", f'<svg {NS} width="10em" height="2em">{RECT}</svg>', SVG_TYPE,
+                 "in em or ex units but no plain font size", id="em-without-a-font-size"),
+    pytest.param("percent-font.svg", f'<svg {NS} width="10ex" height="10" font-size="200%">{RECT}</svg>',
+                 SVG_TYPE, "in em or ex units but no plain font size", id="font-size-in-percent"),
+    pytest.param("em-font.svg", f'<svg {NS} width="10em" height="2em" font-size="2em">{RECT}</svg>', SVG_TYPE,
+                 "in em or ex units but no plain font size", id="font-size-in-em"),
+    pytest.param("medium-font.svg", f'<svg {NS} width="10em" height="2em" font-size="medium">{RECT}</svg>',
+                 SVG_TYPE, "in em or ex units but no plain font size", id="font-size-keyword"),
+    pytest.param("larger-font.svg",
+                 f'<svg {NS} width="10em" height="2em" font-size="20" style="font-size: larger">{RECT}</svg>',
+                 SVG_TYPE, "in em or ex units but no plain font size", id="relative-font-size-in-the-style"),
+    pytest.param("sheet-font.svg",
+                 f'<svg {NS} width="10em" height="2em" font-size="20"><style>svg {{ font-size: 40px; }}</style>'
+                 f"{RECT}</svg>",
+                 SVG_TYPE, "a <style> element may change the font size", id="font-size-from-a-style-element"),
     # resvg reads lengths as 32-bit floats: to it 2.4999999 px is 2.5, a 3 px side, so
     # the PNG would not be the 2 px side the drawing gives, and is not stored.
     pytest.param("rounding.svg", f'<svg {NS} width="2.4999999" height="10">{RECT}</svg>', SVG_TYPE,
                  "could not be rendered at its own size of 2x10 px", id="png-not-at-its-own-size"),
     # A resulting PNG larger than 4 MiB.
     pytest.param("noise.svg", NOISE, SVG_TYPE, "(at most 4 MiB is stored)", id="png-above-4-mib"),
+    pytest.param("noise-em.svg", NOISE_IN_EM, SVG_TYPE, "(at most 4 MiB is stored)", id="png-in-em-above-4-mib"),
     # Not an SVG drawing: judged from the stored bytes, never from the name or type.
     pytest.param("drawing.png", PICTURE, "image/png", "is not an SVG drawing", id="png-picture"),
     pytest.param("notes.txt", "Draw the home page with a wide photo at the top.", "text/plain",
@@ -407,6 +445,14 @@ def _stored_picture(worker, attachment_id):
         return picture.convert("RGBA")
 
 
+def _resvg_size(svg):
+    """The size resvg itself gives ``svg``, rendered with no output size asked for."""
+    import resvg_py
+
+    with Image.open(io.BytesIO(resvg_py.svg_to_bytes(svg_string=svg, dpi=96.0))) as picture:
+        return picture.size
+
+
 def _design_vision_schema_names():
     """Tool names of the design_vision toolset this caller actually sees."""
     from tools.registry import invalidate_check_fn_cache, registry
@@ -555,6 +601,56 @@ def test_a_plain_drawing_becomes_a_png_of_its_own_size_that_the_offer_accepts(wo
     assert layout_png.getpixel((250, 150)) == RED  # the shape used through xlink:href
     wide_png = _stored_picture(worker, rendered[1]["attachment_id"])
     assert wide_png.size == (640, 480) and wide_png.getpixel((320, 240)) == GREEN
+    assert not (worker.profile_home / "kanban").exists()
+
+    offered = _dispatch(OFFER, {
+        "question": QUESTION, "options": _options(*(out["attachment_id"] for out in rendered)),
+    })
+
+    assert offered == {
+        "ok": True,
+        "task_id": worker.mine.id,
+        "status": "blocked",
+        "block_kind": "needs_input",
+        "declared": True,
+    }
+
+
+def test_a_drawing_sized_in_em_or_ex_of_its_own_font_size_becomes_a_png_that_the_offer_accepts(worker):
+    # resvg itself gives the two drawings these sizes.
+    assert [_resvg_size(svg) for svg in (EM, EX)] == [(200, 40), (100, 40)]
+    em = _attach("em.svg", EM)
+    ex = _attach("ex.svg", EX)
+    before_rows, before_files = _state(worker)
+
+    rendered = [_dispatch(TOOL, {"attachment_id": drawing}) for drawing in (em, ex)]
+
+    for out in rendered:
+        assert out.get("ok") is True, out
+        assert set(out) == {"ok", "task_id", "attachment_id", "width", "height", "size"}
+        assert out["task_id"] == worker.mine.id
+    assert [(out["width"], out["height"]) for out in rendered] == [(200, 40), (100, 40)]
+    after_rows, after_files = _state(worker)
+    # Only the worker's own board changed: it gained one PNG per drawing, on
+    # the worker's card, and the file of each under that card's directory.
+    assert {slug: after_rows[slug] for slug in (kb.DEFAULT_BOARD, OTHER)} == {
+        slug: before_rows[slug] for slug in (kb.DEFAULT_BOARD, OTHER)
+    }
+    assert after_rows[OWN][:len(before_rows[OWN])] == before_rows[OWN]
+    assert after_rows[OWN][len(before_rows[OWN]):] == [
+        (out["attachment_id"], worker.mine.id, name, "image/png", out["size"], TOOL)
+        for out, name in zip(rendered, ("em.png", "ex.png"))
+    ]
+    card_dir = f"kanban/boards/{OWN}/attachments/{worker.mine.id}"
+    assert set(before_files) <= set(after_files)
+    assert sorted(set(after_files) - set(before_files)) == [
+        (f"{card_dir}/em.png", rendered[0]["size"]),
+        (f"{card_dir}/ex.png", rendered[1]["size"]),
+    ]
+    em_png = _stored_picture(worker, rendered[0]["attachment_id"])
+    assert em_png.size == (200, 40) and em_png.getpixel((100, 20)) == BLUE
+    ex_png = _stored_picture(worker, rendered[1]["attachment_id"])
+    assert ex_png.size == (100, 40) and ex_png.getpixel((50, 20)) == GREEN
     assert not (worker.profile_home / "kanban").exists()
 
     offered = _dispatch(OFFER, {

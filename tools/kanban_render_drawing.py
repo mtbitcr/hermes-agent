@@ -20,8 +20,11 @@ WebP, so this tool turns one drawing into a picture the offer accepts. One call 
    names a style sheet. CSS is read both with and without its comments, its escapes undone, so
    neither can hide a reference.
 4. The drawing's own size is read from its svg element as resvg reads it: its width and height,
-   or its viewBox where they are missing. A drawing with no size, a size in em or ex units (they
-   depend on the font) or a side above 4,096 px is refused before anything is rendered.
+   or its viewBox where they are missing. A size in em or ex units is measured by the svg
+   element's own font size, from its style attribute or else its font-size attribute, which must
+   be a number or an absolute length; resvg takes 1ex as half of 1em. A drawing with no size, a
+   size in em or ex units without such a font size or with a <style> rule that may change it, or
+   a side above 4,096 px is refused before anything is rendered.
 5. resvg renders it at that size, through ``resvg_py``. resvg runs no script, and once the
    checks above pass it opens nothing the drawing names; the only files it reads are the
    system's fonts. The PNG must be exactly that size and at most 4 MiB.
@@ -33,6 +36,7 @@ Every refusal is a plain tool error that says why, and stores nothing.
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import os
@@ -70,10 +74,23 @@ _FRAGMENT = re.compile(r"#\S+")
 _NUMBER = r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
 _LENGTH = re.compile(rf"[ \t\r\n]*({_NUMBER})(px|in|cm|mm|pt|pc|em|ex|%)?")
 _LIST_NUMBER = re.compile(rf"[ \t\r\n]*({_NUMBER})[ \t\r\n]*,?")
+_FONT_SIZE = re.compile(rf"[ \t\r\n]*({_NUMBER})(px|in|cm|mm|pt|pc)?")
 _PX_PER_UNIT = {"px": 1.0, "in": 96.0, "cm": 96 / 2.54, "mm": 96 / 25.4, "pt": 4 / 3, "pc": 16.0}  # at 96 dpi
 _CSS_COMMENT = re.compile(r"/\*.*?\*/", re.S)
 _CSS_ESCAPE = re.compile(r"\\([0-9a-fA-F]{1,6})[ \t\r\n\f]?|\\(.)", re.S)
 _CSS_URL = re.compile(r"url\(\s*['\"]?\s*([^'\")\s]*)", re.I)
+_CSS_SPACE = " \t\r\n\f"
+_CSS_RULE = re.compile(r"([^{}]*)\{([^{}]*)\}")
+_CSS_FONT = re.compile(r"(?:^|[;{\s])font(?:-size)?\s*:", re.I)
+# A selector that picks only elements of a named type other than svg: its last compound starts
+# with that type, and nothing in it but names, classes, ids, pseudo-classes and combinators.
+_OTHER_TYPE = re.compile(r"(?:[\w\s.#:>+~*-]*[\s>+~])?([A-Za-z][\w-]*)(?:[.#:][\w-]+)*")
+_STYLE_TOKEN = re.compile(r"""'[^'\\\n]*'|"[^"\\\n]*"|/\*.*?\*/|[^'"/\\;]+|/(?!\*)|;""", re.S)
+_IMPORTANT = re.compile(r"!\s*important\s*$", re.I)
+_NO_FONT_SIZE = (
+    "has its size in em or ex units but no plain font size to measure them by "
+    "(give its svg element a font-size in px, or its width and height in px)"
+)
 
 
 class _Refused(Exception):
@@ -111,8 +128,9 @@ def _check_css(css: str, where: str) -> None:
                 raise _Refused(f"has an external reference (a url() in {where} is not a #fragment of the drawing)")
 
 
-def _inspect(svg: str) -> list:
-    """Parse the drawing, refusing anything it may not hold, and return its svg element's attributes.
+def _inspect(svg: str) -> tuple:
+    """Parse the drawing, refusing anything it may not hold, and return its svg element's
+    attributes and the text of each of its <style> elements.
 
     The attributes are (name, value) pairs in the order of the start tag, each name as expat
     gives it with namespaces on: "namespace local-name", or the bare local name.
@@ -122,6 +140,7 @@ def _inspect(svg: str) -> list:
     parser.ordered_attributes = True
     root = None
     styles: list = []
+    sheets: list = []
 
     def doctype(name, system_id, public_id, has_internal_subset):
         if system_id or public_id:
@@ -183,7 +202,8 @@ def _inspect(svg: str) -> list:
 
     def end(name):
         if name.rsplit(" ", 1)[-1].lower() == "style":
-            _check_css("".join(styles.pop()), "a <style> element")
+            sheets.append("".join(styles.pop()))
+            _check_css(sheets[-1], "a <style> element")
 
     parser.StartDoctypeDeclHandler = doctype
     parser.EntityDeclHandler = entity
@@ -196,7 +216,7 @@ def _inspect(svg: str) -> list:
         parser.Parse(svg, True)
     except expat.ExpatError:
         raise _Refused("is not an SVG drawing (it is not well-formed XML)") from None
-    return root
+    return root, sheets
 
 
 def _root_value(attributes: list, name: str):
@@ -225,18 +245,105 @@ def _view_box(value):
     return width, height
 
 
-def _length(value, side):
+def _may_pick_the_svg_element(selector: str) -> bool:
+    found = _OTHER_TYPE.fullmatch(_CSS_COMMENT.sub(" ", selector).strip(_CSS_SPACE))
+    return not found or found.group(1).lower() == "svg"
+
+
+def _may_set_root_font(css: str) -> bool:
+    """Whether a rule of this style sheet may set the font size of the svg element.
+
+    Read without and with its comments, its escapes undone: a rule may set it when it declares
+    font or font-size and one of its selectors may pick the svg element. A sheet with nested or
+    unbalanced braces always may.
+    """
+    for view in (_CSS_COMMENT.sub(" ", css), css):
+        view = _unescape_css(view)
+        if not _CSS_FONT.search(view):
+            continue
+        rest = _CSS_RULE.sub(" ", view)
+        if "{" in rest or "}" in rest:
+            return True
+        for selectors, declarations in _CSS_RULE.findall(view):
+            if _CSS_FONT.search(declarations) and any(
+                _may_pick_the_svg_element(selector) for selector in selectors.split(",")
+            ):
+                return True
+    return False
+
+
+def _style_font_size(style: str):
+    """The font size the style attribute declares last, "" when it declares none, or None
+    when it cannot be read plainly.
+
+    Read as CSS reads it: strings are kept whole and comments are spaces. An unclosed string or
+    comment, an escape, a declaration without a colon (resvg stops reading there), or a font
+    shorthand, a differently written font-size or an empty one declared last is not read plainly.
+    """
+    declarations, pieces, position = [], [], 0
+    while position < len(style):
+        token = _STYLE_TOKEN.match(style, position)
+        if not token:
+            return None
+        position = token.end()
+        if token.group() == ";":
+            declarations.append("".join(pieces))
+            pieces = []
+        else:
+            pieces.append(" " if token.group().startswith("/*") else token.group())
+    declarations.append("".join(pieces))
+    declared = ""
+    for declaration in declarations:
+        if not declaration.strip(_CSS_SPACE):
+            continue
+        name, colon, value = declaration.partition(":")
+        if not colon:
+            return None
+        name = name.strip(_CSS_SPACE)
+        if name.lower() in ("font", "font-size"):
+            value = _IMPORTANT.sub("", value.strip(_CSS_SPACE)).strip(_CSS_SPACE)
+            declared = value if name == "font-size" and value else None
+    return declared
+
+
+def _font_size(attributes: list, sheets: list) -> float:
+    """The svg element's own font size in px, which its em and ex units are measured by, or a refusal.
+
+    resvg takes it from the first style attribute of the svg element, in any namespace, when that
+    declares one, and otherwise from its font-size attribute. Only a number or an absolute length
+    is used: none, a relative size or a keyword is refused, and so is any <style> rule that may set it.
+    """
+    if any(_may_set_root_font(css) for css in sheets):
+        raise _Refused(
+            "has its size in em or ex units, and a <style> element may change the font size they are "
+            "measured by (give its width and height in px)"
+        )
+    value = _root_value(attributes, "font-size")
+    style = next((text for key, text in attributes if key.rpartition(" ")[2] == "style"), None)
+    if style is not None:
+        declared = _style_font_size(style)
+        if declared is None:
+            raise _Refused(_NO_FONT_SIZE)
+        value = declared or value
+    found = _FONT_SIZE.fullmatch(value) if value is not None else None
+    if not found:
+        raise _Refused(_NO_FONT_SIZE)
+    return float(found.group(1)) * _PX_PER_UNIT[found.group(2) or "px"]
+
+
+def _length(value, side, font_size):
     """A width or height of the svg element in px as resvg reads it, or None when it reads none.
 
-    ``side`` is the matching side of the viewBox, which a percentage is a share of.
+    ``side`` is the matching side of the viewBox, which a percentage is a share of, and
+    ``font_size`` gives the svg element's own font size, which em and ex are measured by.
     """
     found = _LENGTH.fullmatch(value) if value is not None else None
     if not found:
         return None
     number, unit = float(found.group(1)), found.group(2)
     if unit in ("em", "ex"):
-        raise _Refused("has its size in em or ex units, which depend on the font (give its width and height in px)")
-    if unit == "%":
+        pixels = number * font_size() / (2 if unit == "ex" else 1)  # resvg takes 1ex as half of 1em
+    elif unit == "%":
         if side is None:
             return None
         pixels = side * number / 100
@@ -249,12 +356,13 @@ def _px(value: float) -> str:
     return f"{value:,.2f}".rstrip("0").rstrip(".")
 
 
-def _own_size(attributes: list) -> tuple:
+def _own_size(attributes: list, sheets: list) -> tuple:
     """The drawing's own size in whole pixels, as resvg rounds it, or a refusal."""
     box = _view_box(_root_value(attributes, "viewBox"))
     box_width, box_height = box or (None, None)
-    width = _length(_root_value(attributes, "width"), box_width)
-    height = _length(_root_value(attributes, "height"), box_height)
+    font_size = functools.partial(_font_size, attributes, sheets)
+    width = _length(_root_value(attributes, "width"), box_width, font_size)
+    height = _length(_root_value(attributes, "height"), box_height, font_size)
     if box:
         if width is None and height is None:
             width, height = box
@@ -322,7 +430,7 @@ def _handle_render_drawing(args: dict, **kw) -> str:
                 svg = kb.read_attachment_bytes(drawing, board=board).decode("utf-8-sig")
             except UnicodeDecodeError:
                 raise _Refused("is not an SVG drawing (it is not UTF-8 text)") from None
-            width, height = _own_size(_inspect(svg))
+            width, height = _own_size(*_inspect(svg))
             png = _render(svg, width, height)
             stored = kb.store_attachment_bytes(
                 conn,
@@ -352,15 +460,18 @@ KANBAN_RENDER_DRAWING_SCHEMA = {
     "description": (
         "Turn an SVG drawing attached to your own task into a PNG picture, for example to offer "
         "it as a design option. The PNG has the drawing's own size: the width and height of its "
-        "svg element, or its viewBox where those are missing. It is stored as a new attachment "
+        "svg element, or its viewBox where those are missing. Sizes in em or ex units are "
+        "measured by the svg element's own font-size, given as a number or an absolute length "
+        "(1ex is half of 1em). It is stored as a new attachment "
         "on the same task, and its attachment_id is returned. Only plain, self-contained "
         'drawings whose svg element has xmlns="http://www.w3.org/2000/svg" are rendered. '
         "Nothing is stored, and the reason is returned, when the drawing holds a script, an "
         "event attribute such as onclick, a foreignObject, an image element or a data: "
         "reference; when an href or url() points anywhere but a #fragment of the drawing, or it "
         "uses a CSS @import; when it declares entities, default attributes or an outside DTD; "
-        "when it has no size, a size in em or ex units, or a side above 4,096 px; or when the "
-        "PNG would be larger than 4 MiB."
+        "when it has no size, a size in em or ex units without such a font-size or with a "
+        "<style> rule that may change it, or a side above 4,096 px; or when the PNG would be "
+        "larger than 4 MiB."
     ),
     "parameters": {
         "type": "object",
