@@ -10,8 +10,13 @@ WebP, so this tool turns one drawing into a picture the offer accepts. One call 
    dispatcher-owned worker sees or runs the tool, and only on the card the dispatcher gave it
    (``HERMES_KANBAN_TASK``), on that card's own board.
 2. The attachment must be on that card. What it holds is judged from the stored bytes, never from
-   the declared content type or the file name: UTF-8 XML whose root is an ``svg`` element in the
-   SVG namespace.
+   the declared content type or the file name: XML whose root is an ``svg`` element in the SVG
+   namespace. Its text is read once, in its own encoding, and that text is what is checked and
+   rendered. A byte order mark gives the encoding, or else a first "<" written in two bytes,
+   which is UTF-16 in that byte order, and an encoding its XML declaration names must be that
+   one. Any other drawing is in the encoding its XML declaration names, or else in UTF-8; any
+   other encoding must have one byte per character, such as ISO-8859-1, and is read byte by
+   byte, as expat reads it.
 3. The drawing is parsed with expat, which never loads an external entity or DTD. It is refused
    when it holds a script, an event attribute, a foreignObject, an image element or a ``data:``
    reference; when an href (an animated one too) or a CSS ``url()`` names anything but a
@@ -40,6 +45,7 @@ Every refusal is a plain tool error that says why, and stores nothing.
 
 from __future__ import annotations
 
+import codecs
 import functools
 import logging
 import math
@@ -102,10 +108,83 @@ _NO_FONT_SIZE = (
     "has its size in em or ex units but no plain font size to measure them by "
     "(give its svg element a font-size in px, or its width and height in px)"
 )
+# A drawing that starts with a byte order mark, or with its first "<" written in two bytes, is in
+# the encoding that start gives: (start, Python's codec, the encoding's name, Python's names of the
+# encodings its XML declaration may name, "utf-16" naming either byte order).
+_UNICODE_STARTS = (
+    (codecs.BOM_UTF8, "utf-8-sig", "UTF-8", frozenset({"utf-8"})),
+    (codecs.BOM_UTF16_BE, "utf-16", "UTF-16BE", frozenset({"utf-16", "utf-16-be"})),
+    (codecs.BOM_UTF16_LE, "utf-16", "UTF-16LE", frozenset({"utf-16", "utf-16-le"})),
+    (b"\0<", "utf-16-be", "UTF-16BE", frozenset({"utf-16", "utf-16-be"})),
+    (b"<\0", "utf-16-le", "UTF-16LE", frozenset({"utf-16", "utf-16-le"})),
+)
+_XML_ENCODING = re.compile(  # the encoding an XML declaration names, as XML 1.0 writes it
+    r"<\?xml[ \t\r\n]+version[ \t\r\n]*=[ \t\r\n]*(?:\"[^\"]*\"|'[^']*')[ \t\r\n]+"
+    r"encoding[ \t\r\n]*=[ \t\r\n]*([\"'])([A-Za-z][A-Za-z0-9._-]*)\1"
+)
 
 
 class _Refused(Exception):
     """The drawing is not rendered; the message is the plain reason."""
+
+
+def _codec_name(encoding: str):
+    """Python's own name for ``encoding``, or None when Python knows no such encoding. Python
+    remembers every name it looks up and does not know, so a name longer than any encoding's is
+    not looked up."""
+    if len(encoding) > 64:
+        return None
+    try:
+        return codecs.lookup(encoding).name
+    except LookupError:
+        return None
+
+
+def _one_byte_table(codec, name: str) -> str:
+    """Each byte's character in Python's ``codec`` for the encoding ``name``, read from the 256
+    bytes in turn as expat reads an encoding that is not its own, U+FFFE marking a byte that is no
+    character; a refusal when the encoding does not have one byte per character."""
+    try:
+        table = bytes(range(256)).decode(codec, "replace") if codec else ""
+    except (LookupError, UnicodeError):  # not an encoding of text, or one that cannot be read so
+        table = ""
+    if len(table) != 256:
+        raise _Refused(
+            f"is not an SVG drawing (it cannot be read in {name}, the encoding its XML declaration "
+            "names; write it in UTF-8)"
+        )
+    return table.replace("\ufffd", "\ufffe")
+
+
+def _decode(data: bytes) -> str:
+    """The drawing's text, read once in its own encoding, or a refusal.
+
+    A byte order mark gives the encoding, or else a first "<" written in two bytes, which is
+    UTF-16 in that byte order; an encoding its XML declaration names must be that one. Any other
+    drawing is in the encoding its XML declaration names, or else in UTF-8, and any other encoding
+    is read byte by byte, as expat reads one.
+    """
+    for start, codec, name, declarable in _UNICODE_STARTS:
+        if data.startswith(start):
+            try:
+                text = data.decode(codec)
+            except UnicodeDecodeError:
+                raise _Refused(f"is not an SVG drawing (it is not {name} text)") from None
+            declared = _XML_ENCODING.match(text)
+            if declared and _codec_name(declared[2]) not in declarable:
+                raise _Refused(
+                    f"is not an SVG drawing (it is in {name}, but its XML declaration names {declared[2]})"
+                )
+            return text
+    declared = _XML_ENCODING.match(data.decode("latin-1"))  # a declaration is written in ASCII
+    name = declared[2] if declared else "UTF-8"
+    codec = _codec_name(name)
+    try:
+        if codec == "utf-8":
+            return data.decode("utf-8")
+        return codecs.charmap_decode(data, "strict", _one_byte_table(codec, name))[0]
+    except UnicodeDecodeError:
+        raise _Refused(f"is not an SVG drawing (it is not {name} text)") from None
 
 
 def _check_href(value: str, where: str) -> None:
@@ -793,10 +872,7 @@ def _handle_render_drawing(args: dict, **kw) -> str:
             drawing = kb.get_attachment(conn, attachment_id)
             if drawing is None or drawing.task_id != tid:
                 raise _Refused("is not on your own task")
-            try:
-                svg = kb.read_attachment_bytes(drawing, board=board).decode("utf-8-sig")
-            except UnicodeDecodeError:
-                raise _Refused("is not an SVG drawing (it is not UTF-8 text)") from None
+            svg = _decode(kb.read_attachment_bytes(drawing, board=board))
             width, height = _own_size(*_inspect(svg))
             png = _render(svg, width, height)
             stored = kb.store_attachment_bytes(

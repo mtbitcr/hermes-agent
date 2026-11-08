@@ -19,6 +19,7 @@ files counted on disk.
 from __future__ import annotations
 
 import base64
+import codecs
 import http.client
 import io
 import json
@@ -123,6 +124,11 @@ def _fe_image(href: str) -> str:
     )
 
 
+def _declared(encoding: str, drawing: str) -> str:
+    """``drawing`` after an XML declaration that names ``encoding``."""
+    return f'<?xml version="1.0" encoding="{encoding}"?>{drawing}'
+
+
 # Width and height, or the viewBox where they are missing, as resvg reads them. A size in
 # em or ex is measured by the svg element's own font size, its style attribute winning over
 # its font-size attribute, and an !important declaration over a plain one.
@@ -184,6 +190,21 @@ SHEET_SIZES = [
                  id="rule-for-a-state-a-picture-is-never-in"),
     pytest.param('font-size="20"', "\\73 vg { font-size: 40px; } svg:first-child { font: 30px serif; }", (300, 60),
                  id="rule-whose-selector-resvg-skips"),
+]
+
+# A drawing in each encoding it may be written in: the one its byte order mark gives, or its
+# first "<" written in two bytes, or else the one its XML declaration names. (byte order mark,
+# Python's codec, the encoding the declaration names, a word in the encoding's own characters;
+# windows-1252 writes € as a byte that ISO-8859-1 reads as another character)
+ENCODINGS = [
+    pytest.param(b"", "utf-8", "UTF-8", "café", id="utf-8"),
+    pytest.param(codecs.BOM_UTF8, "utf-8", "UTF-8", "café", id="utf-8-with-a-byte-order-mark"),
+    pytest.param(codecs.BOM_UTF16_BE, "utf-16-be", "UTF-16", "café", id="utf-16-big-endian-with-a-mark"),
+    pytest.param(codecs.BOM_UTF16_LE, "utf-16-le", "UTF-16", "café", id="utf-16-little-endian-with-a-mark"),
+    pytest.param(b"", "utf-16-be", "UTF-16BE", "café", id="utf-16be"),
+    pytest.param(b"", "utf-16-le", "UTF-16LE", "café", id="utf-16le"),
+    pytest.param(b"", "latin-1", "ISO-8859-1", "café", id="iso-8859-1"),
+    pytest.param(b"", "cp1252", "windows-1252", "café€", id="windows-1252"),
 ]
 
 # (filename, content, content type, a fragment of the plain reason)
@@ -808,6 +829,39 @@ def test_the_png_has_the_size_the_drawings_own_style_sheet_gives(worker, attribu
     )
 
 
+@pytest.mark.parametrize(("mark", "codec", "encoding", "word"), ENCODINGS)
+def test_a_drawing_in_its_own_encoding_becomes_a_png_of_its_own_size(worker, mark, codec, encoding, word):
+    # The blue rectangle is drawn only through an href that holds the word, and its id gives
+    # the word in character references, so it is painted only when the drawing that was
+    # checked and rendered was read in its own encoding.
+    shape = "".join(char if char.isascii() else f"&#{ord(char)};" for char in word)
+    drawing = _attach("encoded.svg", mark + _declared(encoding, (
+        f'<svg {NS} width="320" height="200"><defs><rect id="{shape}" width="320" height="200" '
+        f'fill="#2050c0"/></defs><use href="#{word}"/></svg>'
+    )).encode(codec))
+    before_rows, before_files = _state(worker)
+
+    out = _dispatch(TOOL, {"attachment_id": drawing})
+
+    assert out.get("ok") is True, out
+    assert (out["task_id"], out["width"], out["height"]) == (worker.mine.id, 320, 200)
+    after_rows, after_files = _state(worker)
+    # Only the worker's own board changed: it gained the PNG, on the worker's card, and its
+    # file under that card's directory.
+    assert {slug: after_rows[slug] for slug in (kb.DEFAULT_BOARD, OTHER)} == {
+        slug: before_rows[slug] for slug in (kb.DEFAULT_BOARD, OTHER)
+    }
+    assert after_rows[OWN] == before_rows[OWN] + [
+        (out["attachment_id"], worker.mine.id, "encoded.png", "image/png", out["size"], TOOL)
+    ]
+    assert set(before_files) <= set(after_files)
+    assert sorted(set(after_files) - set(before_files)) == [
+        (f"kanban/boards/{OWN}/attachments/{worker.mine.id}/encoded.png", out["size"]),
+    ]
+    picture = _stored_picture(worker, out["attachment_id"])
+    assert picture.size == (320, 200) and picture.getpixel((160, 100)) == BLUE
+
+
 @pytest.mark.parametrize(("filename", "content", "content_type", "reason"), REFUSED)
 def test_a_refused_drawing_leaves_no_attachment_and_gives_a_plain_reason(
     worker, filename, content, content_type, reason,
@@ -820,6 +874,46 @@ def test_a_refused_drawing_leaves_no_attachment_and_gives_a_plain_reason(
     assert "ok" not in out and reason in out["error"], out
     assert out["error"].startswith(f"attachment {drawing} "), out
     assert out["error"].endswith("; nothing is stored"), out
+    assert _state(worker) == before
+
+
+def test_a_drawing_in_another_encoding_is_still_checked_and_one_that_cannot_be_read_is_refused(worker):
+    entity = ('<!DOCTYPE svg [<!ENTITY ext SYSTEM "file:///etc/hostname">]>'
+              + _svg(f'{RECT}<text y="20">&ext;</text>'))
+    drawings = [
+        # Read in its own encoding, a drawing is checked as any other.
+        (codecs.BOM_UTF16_LE + _svg(f"{RECT}<script>alert(1)</script>").encode("utf-16-le"),
+         "holds a script element"),
+        (_declared("UTF-16BE", entity).encode("utf-16-be"), "has an external reference (the external entity ext)"),
+        (_declared("ISO-8859-1", _svg(f'<a href="https://example.com/café">{RECT}</a>')).encode("latin-1"),
+         "has an external reference"),
+        # Its byte order mark and its XML declaration give different encodings.
+        (codecs.BOM_UTF16_LE + _declared("UTF-8", _svg(RECT)).encode("utf-16-le"),
+         "is not an SVG drawing (it is in UTF-16LE, but its XML declaration names UTF-8)"),
+        (codecs.BOM_UTF8 + _declared("ISO-8859-1", _svg(RECT)).encode("utf-8"),
+         "is not an SVG drawing (it is in UTF-8, but its XML declaration names ISO-8859-1)"),
+        # A byte its encoding has no character for, or half of a UTF-16 character.
+        (_declared("US-ASCII", _svg(f"<title>Café</title>{RECT}")).encode("latin-1"),
+         "is not an SVG drawing (it is not US-ASCII text)"),
+        (_declared("UTF-16LE", _svg(RECT)).encode("utf-16-le")[:-1],
+         "is not an SVG drawing (it is not UTF-16LE text)"),
+        # An encoding that is not read: an unknown one, one of more than one byte per character,
+        # or UTF-16 named by a drawing written in single bytes.
+        (_declared("x-unknown", _svg(RECT)).encode("ascii"),
+         "is not an SVG drawing (it cannot be read in x-unknown, the encoding its XML declaration names"),
+        (_declared("Shift_JIS", _svg(f"<title>カフェ</title>{RECT}")).encode("shift_jis"),
+         "is not an SVG drawing (it cannot be read in Shift_JIS,"),
+        (_declared("UTF-16", _svg(RECT)).encode("ascii"), "is not an SVG drawing (it cannot be read in UTF-16,"),
+    ]
+    attached = [_attach(f"encoding-{n}.svg", data) for n, (data, _) in enumerate(drawings)]
+    before = _state(worker)
+
+    for drawing, (_, reason) in zip(attached, drawings):
+        out = _dispatch(TOOL, {"attachment_id": drawing})
+        assert "ok" not in out and reason in out["error"], out
+        assert out["error"].startswith(f"attachment {drawing} "), out
+        assert out["error"].endswith("; nothing is stored"), out
+
     assert _state(worker) == before
 
 
