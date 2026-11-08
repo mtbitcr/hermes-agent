@@ -9,8 +9,10 @@ paused, nothing the platform starts on its own reaches that chat: the kanban not
 visible card notice there the way a wake-only subscription skips it (the cursor advances and no
 failure is counted, so no notice is kept), and ``cron.scheduler._deliver_result`` refuses a
 scheduled report, or its Send again, to that chat ``route_refused`` before the live transport and
-again before any standalone one. Replies inside a chat session are never paused, and every other
-chat is served as before.
+again before any standalone one, and ``gateway.owner_heads_up`` records the heads-up of a wait that
+starts inside a pause window, or is found while paused, as paused and never sends it, not even
+after the resume. Replies inside a chat session are never paused, and every other chat is served
+as before.
 
 The state is one small file in the root Hermes home, read on every send, so every profile sees
 the same pause without a restart. It keeps every pause window of the last 7 days as ``[start,
