@@ -147,6 +147,12 @@ dependencies = [
   # install rather than gating it behind an extra + a mid-session lazy install
   # (which deadlocked the CLI under prompt_toolkit — see #40490).
   "Pillow==13.0.0",
+  # SVG -> PNG for the design_vision tool kanban_render_drawing
+  # (tools/kanban_render_drawing.py): the designer draws its layouts as SVG,
+  # and kanban_offer_design_options accepts only PNG, JPEG or WebP. resvg runs
+  # no script and fetches nothing. No dependencies of its own; abi3 wheels for
+  # CPython 3.10+ on Linux, macOS, Windows and Android, plus an sdist.
+  "resvg-py==0.5.0",
   # Windows log rotation. Stdlib ``RotatingFileHandler.doRollover()`` uses
   # ``os.rename()`` which fails with ``PermissionError [WinError 32]`` on
   # Windows whenever any other process holds an append-mode handle on
@@ -538,6 +544,7 @@ python-telegram-bot = false
 pyyaml = false
 qrcode = false
 requests = false
+resvg-py = false
 rich = false
 ruamel-yaml = false
 ruff = false
