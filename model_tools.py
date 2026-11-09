@@ -59,6 +59,20 @@ def _is_dispatcher_owned_worker() -> bool:
         return True
 
 
+def _task_tool_limit() -> Optional[frozenset]:
+    """Operator rule S1: the only tools a review or portfolio task may see and call, or None.
+
+    kanban_db._default_spawn sets HERMES_KANBAN_ALLOWED_TOOLS for such a worker
+    alone. The worker's own .env can rewrite a value but never widen it past
+    REVIEW_TASK_TOOLS, so an empty or malformed value fails closed.
+    """
+    raw = os.environ.get("HERMES_KANBAN_ALLOWED_TOOLS")
+    if raw is None:
+        return None
+    from hermes_cli.kanban_db import REVIEW_TASK_TOOLS
+    return frozenset(name.strip() for name in raw.split(",")) & frozenset(REVIEW_TASK_TOOLS)
+
+
 # --- Async bridging (single source of truth; registry.dispatch uses it too) ---
 # Loops are persistent (never asyncio.run per call): cached httpx/AsyncOpenAI
 # clients stay bound to a live loop, so their GC cleanup can't hit "Event loop
@@ -258,7 +272,8 @@ def _tool_defs_cache_key(
 
     Covers every argument plus everything that changes the result without one:
     registry generation, config.yaml mtime/size (dynamic schemas), kanban
-    context, profile scope. check_fn results are TTL-cached in the registry.
+    context and its S1 tool limit, profile scope. check_fn results are
+    TTL-cached in the registry.
     """
     profile_scope = check_fn_cache_scope()
     if profile_scope == CHECK_FN_CACHE_BYPASS:
@@ -273,7 +288,7 @@ def _tool_defs_cache_key(
         registry.current_scope_key(), frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
-        _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
+        _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope, _task_tool_limit(),
     )
 
 
@@ -331,7 +346,9 @@ def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets:
     # disabled toolset are strictly stripped out. See issue #17309.
     if disabled_toolsets:
         _apply_toolset_selection(tools, disabled_toolsets, quiet_mode, disable=True)
-    return tools
+    # Operator rule S1: a review or portfolio task gets its limit and nothing else.
+    limit = _task_tool_limit()
+    return tools if limit is None else tools & limit
 
 
 # --- Dynamic schema rewrites -------------------------------------------------
@@ -511,10 +528,11 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
     # tool_search/describe/call bridge when the deferrable surface exceeds the
     # configured share of the context window. Core tools are never deferred.
     # Must be the LAST step (after sanitization); idempotent if called twice.
+    # Never under the S1 limit: the bridge would offer a third tool.
     try:
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
         ts_cfg = _load_ts_config()
-        if not skip_tool_search_assembly and ts_cfg.enabled != "off":
+        if not skip_tool_search_assembly and ts_cfg.enabled != "off" and _task_tool_limit() is None:
             assembly = assemble_tool_defs(filtered_tools, context_length=_resolve_active_context_length(), config=ts_cfg)
             if assembly.activated and not quiet_mode:
                 print(f"🔎 Tool Search (tier {assembly.tier}): {assembly.deferred_count} "
@@ -692,7 +710,15 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
     None when *function_name* is not a bridge tool; ``(result, None)`` for a
     finished catalog read or error; ``(None, (name, args))`` when a validated
     tool_call should be re-dispatched as the real tool.
+
+    As the first seam of every call, it also refuses any tool, bridge or not,
+    outside the S1 limit of a review or portfolio task.
     """
+    limit = _task_tool_limit()
+    if limit is not None and function_name not in limit:
+        from hermes_cli.kanban_db import REVIEW_TASK_TOOLS
+        return tool_error(f"{function_name} refused: a review or portfolio task may call only "
+                          f"{' and '.join(REVIEW_TASK_TOOLS)} (operator rule S1)"), None
     try:
         from tools import tool_search as ts
     except Exception:
@@ -884,7 +910,8 @@ def handle_function_call(
 
     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
     # inline; tool_call is unwrapped so every downstream hook (pre/post, edit
-    # approval, guardrails) sees the real tool name, never the bridge.
+    # approval, guardrails) sees the real tool name, never the bridge. It also
+    # refuses every call outside a review or portfolio task's S1 limit.
     bridged = _dispatch_bridge_tool(function_name, function_args, enabled_toolsets, disabled_toolsets)
     if bridged is not None:
         result, underlying = bridged
