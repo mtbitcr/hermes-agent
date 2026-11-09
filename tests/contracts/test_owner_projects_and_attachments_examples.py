@@ -34,6 +34,7 @@ FAMILY = "owner_projects_and_attachments"
 CAPABILITIES = (
     ow.OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY, ow.OWNER_PROJECT_REMOVAL_STATE_CAPABILITY,
 )
+LAST_CHANGE = ow.OWNER_PROJECT_LAST_CHANGE_CAPABILITY
 HEADERS = ("Content-Type", "Content-Disposition", "Cache-Control")
 FILENAME, CONTENT, MEDIA_TYPE = "plan.md", b"# Plan\n", "text/markdown"
 
@@ -96,6 +97,7 @@ async def test_the_project_and_attachment_examples_carry_each_capability_and_err
         _start_and_join(deleted_id, "contract")
         live["project_list"] = await _projects(client, ",".join(CAPABILITIES))
         live["project_list_without_capabilities"] = await _projects(client)
+        live["project_list_last_change"] = await _projects(client, LAST_CHANGE)
         with patch.object(ow, "list_committed_projects", side_effect=RuntimeError("x")):
             live["project_list_unavailable"] = await _projects(client)
         _write_owner_workspace_config(enabled=False)
@@ -112,6 +114,14 @@ async def test_the_project_and_attachment_examples_carry_each_capability_and_err
         assert [row["project_id"] for row in rows] == [row["project_id"] for row in bare]
         for row, plain in zip(rows, bare):
             assert set(row) - set(plain) == set(CAPABILITIES)
+        changed = answers["project_list_last_change"]["body"]["data"]
+        assert [row["project_id"] for row in changed] == [row["project_id"] for row in bare]
+        for row, plain in zip(changed, bare):
+            assert set(row) - set(plain) == {"last_changed_at"}
+            assert {k: v for k, v in row.items() if k != "last_changed_at"} == plain
+        # The Project with a card reports when its board last changed; one whose board is gone, null.
+        assert sorted(row["last_changed_at"] is None for row in changed) == [False, True]
+        assert all(row["last_changed_at"] is None or type(row["last_changed_at"]) is int for row in changed)
         # The live Project has no removal state; the removed one has its own.
         assert sorted(row["removal_state"] is None for row in rows) == [False, True]
         headers = answers["attachment"]["headers"]
