@@ -185,7 +185,7 @@ def _seed_reviewed(root: Path, project: dict, last_reviewed_date: str, **columns
 
 _STATE = (
     "open_task_id", "open_review_date", "failures", "last_reviewed_date", "last_reviewed_at", "last_news_date",
-    "event_cursor",
+    "event_cursor", "delivery_cursor", "release_cursor", "updated_at",
 )
 
 
@@ -412,9 +412,10 @@ def test_every_task_the_cycle_publishes_is_created_by_project_review(root, owner
 
 
 def test_t2_quiet_day_makes_no_task(root, owner):
-    garden = _project(root, owner, "Garden Plan", _CARDS)
+    with _written_at(_at(2026, 11, 8, 9)):
+        garden = _project(root, owner, "Garden Plan", _CARDS)
     _seed_reviewed(root, garden, "2026-11-08")
-    with _board(root, garden["board"]) as conn:
+    with _board(root, garden["board"]) as conn, _written_at(_at(2026, 11, 9, 6, 30)):
         card = conn.execute("SELECT id FROM tasks WHERE title = ?", (_CARDS[0],)).fetchone()[0]
         kanban_db.add_comment(conn, card, PLANNER, "Checked the room booking again.")
     _switch_on(root, garden["project_id"])
@@ -721,7 +722,8 @@ def test_the_cap_waits_by_urgency_then_news(root):
 
 
 def test_staleness_flips_only_after_fourteen_quiet_days(root, owner):
-    quiet = _project(root, owner, "Quiet Corner")
+    with _written_at(_at(2026, 11, 1, 9)):
+        quiet = _project(root, owner, "Quiet Corner")
     _seed_reviewed(root, quiet, "2026-11-01")
     _switch_on(root, quiet["project_id"])
     ops = _ops()
@@ -740,7 +742,8 @@ def test_staleness_flips_only_after_fourteen_quiet_days(root, owner):
 
 
 def test_news_ends_a_quiet_run(root, owner):
-    quiet = _project(root, owner, "Quiet Corner")
+    with _written_at(_at(2026, 11, 1, 9)):
+        quiet = _project(root, owner, "Quiet Corner")
     _seed_reviewed(root, quiet, "2026-11-01")
     _switch_on(root, quiet["project_id"])
     ops = _ops()
@@ -834,6 +837,136 @@ def test_a_new_event_still_ends_the_quiet_days_while_reviews_wait(root):
     assert (state["last_news_date"], state["event_cursor"]) == ("2026-11-16", 0)
     assert ops.quiet_days(state["last_news_date"], "2026-11-23") == 7
     assert ops.is_stale(state["last_news_date"], "2026-11-23", 14) is False
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The quiet clock sees a new event on every tick: while the review is open, backs off or waits, and after a restart.
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _new_work_at(root: Path, project: dict, instant: int) -> None:
+    """A genuine new work card on the Project's board, stamped ``instant``."""
+    with _written_at(instant):
+        _add_cards(root, project, ["Write the invitations"])
+
+
+def _only_the_clock_moved(ops, root: Path, project: dict, before: dict) -> None:
+    """The card of 07:06 on 2026-11-23 ended the quiet days, and nothing else in the Project's row moved."""
+    after = _state(root, project)
+    assert after["last_news_date"] == "2026-11-23"
+    assert ops.is_stale(after["last_news_date"], "2026-11-23", 14) is False
+    assert {name for name in _STATE if after[name] != before[name]} == {"last_news_date"}
+
+
+def test_a_new_event_moves_the_quiet_clock_while_the_review_is_open(root):
+    late = _news_on_the_ninth(root)
+    _switch_on(root, late["project_id"])
+    ops = _ops()
+    assert ops.review_tick(now=_at(2026, 11, 23, 7)) == 1
+    [task] = _review_tasks(root)
+    before = _state(root, late)
+    assert (before["open_task_id"], before["last_news_date"]) == (task.id, "2026-11-09")
+
+    _new_work_at(root, late, _at(2026, 11, 23, 7, 6))
+    assert ops.review_tick(now=_at(2026, 11, 23, 7, 7)) == 0
+
+    _only_the_clock_moved(ops, root, late, before)
+    assert _budget(root, "2026-11-23") == (1, 0)
+    assert [t.id for t in _review_tasks(root, archived=True)] == [task.id]
+
+
+def test_a_new_event_moves_the_quiet_clock_while_a_failed_review_backs_off(root):
+    late = _news_on_the_ninth(root)
+    _switch_on(root, late["project_id"])
+    ops = _ops()
+    assert ops.review_tick(now=_at(2026, 11, 23, 7)) == 1
+    [task] = _review_tasks(root)
+    _finish(root, task.id, _BAD_RESULT)
+    failed_at = _at(2026, 11, 23, 7, 5)
+    assert ops.review_tick(now=failed_at) == 0
+    before = _state(root, late)
+    assert (before["failures"], before["open_task_id"], before["updated_at"]) == (1, None, failed_at)
+    assert before["last_news_date"] == "2026-11-09"
+
+    _new_work_at(root, late, _at(2026, 11, 23, 7, 6))
+    assert ops.review_tick(now=_at(2026, 11, 23, 7, 7)) == 0
+
+    _only_the_clock_moved(ops, root, late, before)
+    assert _budget(root, "2026-11-23") == (1, 0)
+    assert [t.id for t in _review_tasks(root, archived=True)] == [task.id]
+    # The backoff still runs from the failure, not from the tick that saw the new card.
+    assert ops.review_tick(now=failed_at + HOUR - MINUTE) == 0
+    assert ops.review_tick(now=failed_at + HOUR + MINUTE) == 1
+    [retry] = _review_tasks(root)
+    assert retry.idempotency_key.endswith(":2026-11-23:1")
+
+
+def test_a_new_event_moves_the_quiet_clock_while_the_cap_defers_the_review(root):
+    late = _news_on_the_ninth(root)
+    _switch_on(root, late["project_id"], daily_cap=0)
+    ops = _ops()
+    assert ops.review_tick(now=_at(2026, 11, 23, 7)) == 0
+    before = _state(root, late)
+    assert (before["open_task_id"], before["last_news_date"]) == (None, "2026-11-09")
+
+    _new_work_at(root, late, _at(2026, 11, 23, 7, 6))
+    assert ops.review_tick(now=_at(2026, 11, 23, 7, 7)) == 0
+
+    _only_the_clock_moved(ops, root, late, before)
+    assert _budget(root, "2026-11-23") == (0, 0)
+    assert _review_tasks(root, archived=True) == []
+
+
+def test_a_new_event_after_a_restart_moves_the_quiet_clock(root):
+    late = _news_on_the_ninth(root)
+    _switch_on(root, late["project_id"])
+    assert _ops().review_tick(now=_at(2026, 11, 23, 7)) == 1
+    [task] = _review_tasks(root)
+    before = _state(root, late)
+    assert (before["open_task_id"], before["last_news_date"]) == (task.id, "2026-11-09")
+
+    _restart()
+    _new_work_at(root, late, _at(2026, 11, 23, 7, 6))
+    assert _ops().review_tick(now=_at(2026, 11, 23, 7, 7)) == 0
+
+    _only_the_clock_moved(_ops(), root, late, before)
+    assert _budget(root, "2026-11-23") == (1, 0)
+    assert [t.id for t in _review_tasks(root, archived=True)] == [task.id]
+
+
+def test_without_a_new_event_the_quiet_clock_stays_through_an_open_review_and_its_backoff(root):
+    late = _news_on_the_ninth(root)
+    _switch_on(root, late["project_id"])
+    ops = _ops()
+    assert ops.review_tick(now=_at(2026, 11, 23, 7)) == 1
+    assert ops.review_tick(now=_at(2026, 11, 23, 7, 3)) == 0
+    _quiet_since_the_ninth(ops, _state(root, late))
+
+    [task] = _review_tasks(root)
+    _finish(root, task.id, _BAD_RESULT)
+    assert ops.review_tick(now=_at(2026, 11, 23, 7, 5)) == 0
+    assert ops.review_tick(now=_at(2026, 11, 23, 7, 7)) == 0
+
+    state = _state(root, late)
+    assert (state["failures"], state["open_task_id"]) == (1, None)
+    _quiet_since_the_ninth(ops, state)
+
+
+def test_news_behind_a_full_row_cap_gives_no_date_in_that_tick(root):
+    late = _news_on_the_ninth(root)
+    _switch_on(root, late["project_id"], daily_cap=0)
+    ops = _ops()
+    assert ops.review_tick(now=_at(2026, 11, 23, 7)) == 0
+    assert _state(root, late)["last_news_date"] == "2026-11-09"
+    _new_work_at(root, late, _at(2026, 11, 23, 7, 6))
+    with _board(root, late["board"]) as conn, _written_at(_at(2026, 11, 23, 7, 6)):
+        card = conn.execute("SELECT id FROM tasks WHERE title = ?", ("Write the invitations",)).fetchone()[0]
+        for n in range(ops.NEWS_ROW_CAP):
+            kanban_db.add_comment(conn, card, PLANNER, f"Checked the guest list, pass {n}.")
+
+    assert ops.review_tick(now=_at(2026, 11, 23, 7, 7)) == 0
+
+    assert _state(root, late)["last_news_date"] == "2026-11-09"
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -935,19 +1068,20 @@ def _enter_planning_worker(monkeypatch, root: Path, slug: str, task_id: str) -> 
 
 
 def test_tick_under_the_worker_environment_reaches_every_store(root, owner, monkeypatch):
-    garden = _project(root, owner, "Garden Plan", _CARDS)
-    desk = _project(root, owner, "Planning Desk", _CARDS)
-    spare = _project(root, owner, "Spare Room", _CARDS)
-    # Allowlisted, but not active: the owner paused the porch's board, and the shed's work is complete.
-    porch = _project(root, owner, "Front Porch", _CARDS)
-    kanban_db.write_board_dispatch_state(porch["board"], dispatch_paused_by_owner=True)
-    shed = _project(root, owner, "Garden Shed", ["Paint the shed"])
-    _complete_cards(root, shed, ["Paint the shed"])
-    _switch_on(root, garden["project_id"], desk["project_id"], porch["project_id"], shed["project_id"])
-    with _board(root, desk["board"]) as conn:
-        worker_task = kanban_db.create_task(
-            conn, title="Plan the next milestone", assignee=PLANNER, project_id=desk["project_id"],
-        )
+    with _written_at(_at(2026, 11, 8, 9)):
+        garden = _project(root, owner, "Garden Plan", _CARDS)
+        desk = _project(root, owner, "Planning Desk", _CARDS)
+        spare = _project(root, owner, "Spare Room", _CARDS)
+        # Allowlisted, but not active: the owner paused the porch's board, and the shed's work is complete.
+        porch = _project(root, owner, "Front Porch", _CARDS)
+        kanban_db.write_board_dispatch_state(porch["board"], dispatch_paused_by_owner=True)
+        shed = _project(root, owner, "Garden Shed", ["Paint the shed"])
+        _complete_cards(root, shed, ["Paint the shed"])
+        _switch_on(root, garden["project_id"], desk["project_id"], porch["project_id"], shed["project_id"])
+        with _board(root, desk["board"]) as conn:
+            worker_task = kanban_db.create_task(
+                conn, title="Plan the next milestone", assignee=PLANNER, project_id=desk["project_id"],
+            )
     profile_home = root / "profiles" / PLANNER
     profile_home.mkdir(parents=True)
     with projects_db.connect_closing(profile_home / "projects.db"):
@@ -991,4 +1125,20 @@ def test_tick_under_the_worker_environment_reaches_every_store(root, owner, monk
     assert _rows(profile_home / "projects.db", "SELECT count(*) FROM project_review_state") == [(0,)]
     assert _rows(profile_home / "projects.db", "SELECT count(*) FROM review_budget") == [(0,)]
     assert not _board_db(profile_home, BOARD).exists()
+    assert {name: os.environ[name] for name in pinned} == pinned
+
+    # A new card on the garden's own board, not the pinned one, moves its quiet clock while its review is open.
+    _new_work_at(root, garden, _at(2026, 11, 9, 7, 6))
+    assert _ops().review_tick(now=_at(2026, 11, 9, 7, 7)) == 0
+
+    assert dict(_rows(root / "projects.db", "SELECT project_id, last_news_date FROM project_review_state")) == {
+        garden["project_id"]: "2026-11-09", desk["project_id"]: "2026-11-08",
+    }
+    assert _rows(
+        root / "projects.db",
+        "SELECT project_id FROM project_review_state WHERE open_task_id IS NOT NULL ORDER BY project_id",
+    ) == sorted([(garden["project_id"],), (desk["project_id"],)])
+    assert len(_rows(_board_db(root, BOARD), "SELECT id FROM tasks WHERE created_by = ?", (CREATOR,))) == 2
+    assert _budget(root, "2026-11-09") == (2, 0)
+    assert _rows(profile_home / "projects.db", "SELECT count(*) FROM project_review_state") == [(0,)]
     assert {name: os.environ[name] for name in pinned} == pinned

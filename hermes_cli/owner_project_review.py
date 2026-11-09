@@ -18,6 +18,11 @@ gets one task on the summary board, created by ``CREATED_BY`` under the key
 ``project-review:<project_id>:<review_date>:<failures>``. The date in the key makes one review per Project and day
 structural; a retry changes only the failure count.
 
+The quiet clock, ``last_news_date``, is the Vienna date of the Project's newest material or urgent event, by the
+event's own time. Only ``_observe_news`` sets it: on every tick, for every allowed Project, before the review hour and
+before the skips for an open review, a backoff or the cap. A review day, a deferral, a failure or a retry never sets
+it. ``quiet_days`` and ``is_stale`` count from it.
+
 The rules of the summary tick hold here as they are. The board, not the state row, proves that a task was published,
 so the first thing in each Project's turn is the look for its open task, and a task found there is recorded and
 counted. A task is the tick's own only when ``_made_for`` says so. A failed task is archived first, and only then does
@@ -74,6 +79,10 @@ REVIEW_EVENT_CLASS = {
     "recommendation_created": events.MATERIAL,
     "recommendation_decided": events.MATERIAL,
 }
+
+# The quiet clock reads at most this many rows of each source per tick, newest first; a source that reaches it gives no
+# date in that tick.
+NEWS_ROW_CAP = 100
 
 _SETTLED = ("done", "blocked", "archived")
 _NEVER_REVIEWED = "the start"
@@ -185,7 +194,7 @@ def review_window(body: Optional[str]) -> Optional[tuple[Optional[str], str]]:
 
 
 def quiet_days(last_news_date: Optional[str], today: str) -> int:
-    """The Vienna days from the last day with news to ``today``; 0 before the review has seen the Project."""
+    """The Vienna days from the last day with news to ``today``; 0 while no news of the Project is known."""
     if last_news_date is None:
         return 0
     return max(0, (date.fromisoformat(today) - date.fromisoformat(last_news_date)).days)
@@ -576,35 +585,102 @@ def _settle_quiet(
 ) -> None:
     """The kernel's own review of a Project without news: the review day is today and no task is made.
 
-    The cursors move past the ignored events. A first review without news starts the quiet days. The swap holds
-    only while the row is as the tick read it, so two ticks settle a day once.
+    The cursors move past the ignored events. The quiet clock is left to ``_observe_news``: a review day is no news.
+    The swap holds only while the row is as the tick read it, so two ticks settle a day once.
     """
     with write_txn(registry):
         registry.execute(
-            "UPDATE project_review_state SET last_reviewed_date = ?, last_reviewed_at = ?, "
-            "last_news_date = COALESCE(last_news_date, ?), failures = 0, updated_at = ?, "
-            "event_cursor = ?, delivery_cursor = ?, release_cursor = ? "
+            "UPDATE project_review_state SET last_reviewed_date = ?, last_reviewed_at = ?, failures = 0, "
+            "updated_at = ?, event_cursor = ?, delivery_cursor = ?, release_cursor = ? "
             "WHERE project_id = ? AND open_task_id IS NULL AND failures = ? AND last_reviewed_date IS ? "
             "AND event_cursor = ? AND delivery_cursor = ? AND release_cursor = ?",
             (
-                review_day, now, review_day, now, *batch.cursors,
+                review_day, now, now, *batch.cursors,
                 project_id, state["failures"], state["last_reviewed_date"], *_cursors(state),
             ),
         )
 
 
-def _note_news(registry: sqlite3.Connection, project_id: str, newest: int) -> None:
-    """The last day with news is the Vienna date of the newest news event; the quiet days count from there.
+def _observe_news(registry: sqlite3.Connection, project: projects_db.Project, now: int) -> None:
+    """The quiet clock: ``last_news_date`` becomes the Vienna date of the Project's newest material or urgent event.
 
-    It is the event's own date, not the day of the read: a review that the cap defers, or that fails, leaves its
-    events unread, and the next read finds the same date. The date never moves back.
+    It reads the sources of ``read_review_events``, dated alike, newest first and only back to the day after the
+    stored date, which it never reads at all once that date is today. Each source stops at its first news event; one
+    that reaches ``NEWS_ROW_CAP`` rows first gives no date in this tick. The date is the event's own, never a review
+    day's, a cursor's, a deferral's, a failure's or a retry's, and it never moves back. Nothing else in the row
+    changes, ``updated_at`` included; a row is made only for a date to store. A failed read leaves the clock as it is.
     """
-    news_day = vienna_date(newest)
+    row = registry.execute(
+        "SELECT last_news_date FROM project_review_state WHERE project_id = ?", (project.id,)
+    ).fetchone()
+    after = (row["last_news_date"] if row is not None else None) or ""  # "" sorts before every date
+    slug = project.board_slug
+    if after >= vienna_date(now) or not slug or slug == summary.SUMMARY_BOARD:
+        return
+    path = events._board_path(slug)
+    if not path.exists():
+        return
+    found: list[int] = []
+    try:
+        with events._read_only(path) as board:
+            for event in board.execute(
+                "SELECT id, task_id, kind, payload, created_at FROM task_events ORDER BY id DESC LIMIT ?",
+                (NEWS_ROW_CAP,),
+            ):
+                if vienna_date(event["created_at"]) <= after:
+                    break
+                if review_classify(event["kind"], _detail(board, event)) != events.IGNORED:
+                    found.append(event["created_at"])
+                    break
+            try:
+                # Every merge is urgent, so the newest merged row decides.
+                merged = board.execute(
+                    "SELECT created_at FROM kanban_deliveries WHERE pull_request_state = ? ORDER BY id DESC LIMIT 1",
+                    (events._MERGED,),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                if not events._missing_schema(exc):
+                    raise
+                merged = None
+            if merged is not None and vienna_date(merged["created_at"]) > after:
+                found.append(merged["created_at"])
+            ledger_path = release_ledger.ledger_path()
+            if ledger_path.exists():
+                try:
+                    with events._read_only(ledger_path) as ledger:
+                        for event in ledger.execute(
+                            "SELECT id, batch_id, kind, payload, created_at FROM release_events "
+                            "ORDER BY id DESC LIMIT ?",
+                            (NEWS_ROW_CAP,),
+                        ):
+                            if vienna_date(event["created_at"]) <= after:
+                                break
+                            released = (
+                                event["kind"] == "release_finished"
+                                and events._payload(event["payload"]).get("outcome") == events._RELEASED
+                            )
+                            if released and events._holds_card(ledger, board, slug, event["batch_id"]):
+                                found.append(event["created_at"])
+                                break
+                except sqlite3.OperationalError as exc:
+                    if not events._missing_schema(exc):
+                        raise
+    except (sqlite3.Error, OSError, ValueError, TypeError, OverflowError) as exc:
+        logger.warning(
+            "project review: cannot read the news of Project %s (%s); its quiet clock stays", project.id, exc
+        )
+        return
+    if not found:
+        return
+    news_day = vienna_date(max(found))
     with write_txn(registry):
+        registry.execute(
+            "INSERT OR IGNORE INTO project_review_state (project_id, updated_at) VALUES (?, ?)", (project.id, now)
+        )
         registry.execute(
             "UPDATE project_review_state SET last_news_date = ? "
             "WHERE project_id = ? AND (last_news_date IS NULL OR last_news_date < ?)",
-            (news_day, project_id, news_day),
+            (news_day, project.id, news_day),
         )
 
 
@@ -704,8 +780,12 @@ def _request(registry: sqlite3.Connection, settings: ReviewSettings, now: int) -
             open_task = None if board is None else _find_open_task(board, project.id)
             if open_task is not None:
                 _record_open_task(registry, project.id, open_task, now)
+            if not _allowed(registry, settings, project.id):
                 continue
-            if review_day is None or not _allowed(registry, settings, project.id):
+            # The quiet clock sees the Project's news on every tick: before the review hour, while its review is open,
+            # while a failed one backs off and while the cap makes it wait.
+            _observe_news(registry, project, now)
+            if open_task is not None or review_day is None:
                 continue
             state = _state_row(registry, project.id, now)
             if not _due(state, review_day, now):
@@ -716,7 +796,6 @@ def _request(registry: sqlite3.Connection, settings: ReviewSettings, now: int) -
                 logger.warning("project review: cannot read the events of Project %s (%s)", project.id, exc)
                 continue
             if batch.material or batch.urgent:
-                _note_news(registry, project.id, batch.newest)
                 news.append(_News(project, state, batch))
             else:
                 _settle_quiet(registry, project.id, state, batch, review_day, now)
