@@ -304,7 +304,10 @@ def _waiting(batch: dict[str, Any]) -> dict[str, Any]:
 
 
 def _release(batch: dict[str, Any], busy: Optional[list[tuple[str, str]]]) -> dict[str, Any]:
+    from hermes_cli.owner_workspace import owner_title
+
     running = None if busy is None else any(unit == release_unit.unit_name(batch["batch_id"]) for unit, _ in busy)
+    titles = [owner_title(member["title"]) for member in batch["members"]]
     return {
         "batch_id": batch["batch_id"],
         "state": batch["state"],
@@ -313,6 +316,10 @@ def _release(batch: dict[str, Any], busy: Optional[list[tuple[str, str]]]) -> di
         "unit": _UNIT[running],
         "outcome": batch["outcome"],
         "outcome_text": _OUTCOMES[batch["outcome"]],
+        "titles": titles,
+        "count": len(titles),
+        # A failed release is kept for recovery and has not ended, though the record stamps its stop.
+        "outcome_at": batch["outcome_at"] if batch["state"] in ("released", "folded") else None,
         # Start again: an accepted release that could not start, or one that stopped midway.
         "actions": ["start"] if busy == [] and batch["state"] in _STARTABLE else [],
     }
