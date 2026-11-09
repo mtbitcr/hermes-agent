@@ -1,0 +1,23 @@
+{
+  "body": {
+    "object": "hermes.owner_workspace.release_decision",
+    "release": {
+      "actions": [],
+      "batch_id": 1,
+      "count": 2,
+      "outcome": "released",
+      "outcome_at": 1790000000,
+      "outcome_text": "It was released.",
+      "state": "released",
+      "status": "Released.",
+      "titles": [
+        "Show the release decision",
+        "Keep the owner page fast"
+      ],
+      "unit": "Its release unit is not running.",
+      "unit_running": false
+    },
+    "waiting": null
+  },
+  "status": 200
+}
