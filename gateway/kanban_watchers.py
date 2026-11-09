@@ -1887,6 +1887,14 @@ class GatewayKanbanWatchersMixin:
                             await asyncio.to_thread(_summary.summary_tick)
                     except Exception:
                         logger.exception("kanban dispatcher: project summary tick failed")
+                    try:
+                        # Right after the summary tick, in the same tick; asked again, as a pause can start there.
+                        if _kanban_dispatch_allowed():
+                            from hermes_cli import owner_project_review as _review
+
+                            await asyncio.to_thread(_review.review_tick)
+                    except Exception:
+                        logger.exception("kanban dispatcher: project review tick failed")
                     any_spawned = False
                     # Tasks a full per-profile cap held this tick, by board,
                     # in either lane or left unreached by the ready lane.
