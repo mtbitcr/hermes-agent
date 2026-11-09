@@ -687,3 +687,96 @@ async def test_a_read_leaves_the_database_file_itself_byte_for_byte_unchanged(ro
         assert path.read_bytes() == before
 
     assert waiting["count"] == 2  # the read saw the change in the -wal
+
+
+RELEASE_KEYS = {
+    "batch_id", "state", "status", "unit_running", "unit", "outcome", "outcome_text", "actions",
+}
+NEW_KEYS = {"titles", "count", "outcome_at"}
+
+
+async def _release_after(batch: dict, outcome: str | None, *, begin: bool = True) -> dict:
+    """The release object the view gives once ``batch`` is accepted and, as asked, begun and ended."""
+    batch = _accepted(batch)
+    if begin:
+        _begin(batch)
+    if outcome:
+        _ledger(ledger.finish_release, batch["batch_id"], outcome=outcome)
+    async with _client() as client:
+        return (await (await client.get(VIEW)).json())["release"]
+
+
+@pytest.mark.asyncio
+async def test_a_released_release_carries_its_titles_count_and_end_time(root):
+    _merge("a", "Show the release decision")
+    _merge("b", "Fix the start (https://github.com/mtbitcr/hermes-agent/pull/9) in /srv/hermes/start.py")
+    batch = _merge("c", "Keep the owner page fast")
+    release = await _release_after(batch, "released")
+
+    raw = ["Show the release decision", "Fix the start (https://github.com/mtbitcr/hermes-agent/pull/9) in /srv/hermes/start.py", "Keep the owner page fast"]
+    assert release["titles"] == [owner_title(title) for title in raw]
+    assert release["titles"][1] != raw[1]  # a title the boundary changes is shown as the boundary shows it
+    assert release["count"] == len(release["titles"]) == 3
+    assert type(release["outcome_at"]) is int
+    # Independent read of the stored end time, straight from the one root store.
+    assert _store(root, "SELECT outcome_at FROM release_batches WHERE id = ?", batch["batch_id"]) == [
+        (release["outcome_at"],)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["accepted", "releasing", "failed"])
+async def test_a_release_that_has_not_ended_carries_no_end_time(root, state):
+    batch = _merge("a", "Show the release decision")
+    release = await _release_after(
+        batch, "failed" if state == "failed" else None, begin=state != "accepted"
+    )
+
+    assert release["state"] == state
+    assert release["outcome_at"] is None
+    assert release["titles"] == [owner_title("Show the release decision")]
+    assert release["count"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["restored", "refused"])
+async def test_a_folded_release_has_no_titles_and_a_zero_count(root, outcome):
+    _merge("a", "Show the release decision")
+    batch = _merge("b", "Keep the owner page fast")
+    release = await _release_after(batch, outcome)
+
+    assert release["state"] == "folded"
+    assert (release["titles"], release["count"]) == ([], 0)
+    assert type(release["outcome_at"]) is int  # it ended, though it released nothing
+
+
+@pytest.mark.asyncio
+async def test_the_release_shows_the_titles_the_waiting_batch_shows_for_the_same_changes(root):
+    _merge("a", "Show the release decision")
+    _merge("b", "Fix the start at /srv/hermes/start.py")
+    batch = _merge("c", "Keep the owner page fast")
+    await _release_after(batch, "released")
+    (snapshot,) = _ledger(ledger.list_batches)
+
+    waiting = api_server_release._waiting({**snapshot, "state": "open"})
+    release = api_server_release._release(snapshot, [])
+    assert release["titles"] == waiting["titles"]
+    assert release["count"] == waiting["count"]
+
+
+@pytest.mark.asyncio
+async def test_the_release_object_keeps_every_existing_key_and_value(root):
+    batch = _merge("a", "Show the release decision")
+    release = await _release_after(batch, "released")
+
+    assert set(release) == RELEASE_KEYS | NEW_KEYS
+    assert {key: release[key] for key in RELEASE_KEYS} == {
+        "batch_id": batch["batch_id"],
+        "state": "released",
+        "status": "Released.",
+        "unit_running": False,
+        "unit": "Its release unit is not running.",
+        "outcome": "released",
+        "outcome_text": "It was released.",
+        "actions": [],
+    }
