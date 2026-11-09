@@ -2043,6 +2043,7 @@ def _set_project_dispatch_state(
 OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY = "lifecycle_revision"
 OWNER_PROJECT_REMOVAL_STATE_CAPABILITY = "removal_state"
 OWNER_PROJECT_BOARD_COUNTS_CAPABILITY = "board_counts_v1"
+OWNER_PROJECT_LAST_CHANGE_CAPABILITY = "project_last_change_v1"
 _OWNER_PROJECT_LIFECYCLE_ACTIONS = ("archive", "restore", "pause", "resume")
 _OWNER_PROJECT_REMOVAL_ACTIONS = ("start", "confirm_permanent", "cancel", "restore")
 
@@ -2129,11 +2130,14 @@ def _project_lifecycle_revision(
 def list_committed_projects(
     ctx: OwnerContext, *, lifecycle_revision: bool = False,
     removal_state: bool = False, board_counts: bool = False,
+    project_last_change: bool = False,
 ) -> list[dict]:
     """Read-only projection of projects proven by committed owner receipts.
 
     ``board_counts`` adds each item's snapshot ``board.counts`` and
     ``board.total``, or None for a Project whose board cannot be counted.
+    ``project_last_change`` adds each item's ``last_changed_at``, see
+    ``_listed_last_change``.
 
     Empty means EMPTY. An absent ``projects.db`` is the only state that
     projects as "there are no Projects yet"; a database that exists but cannot
@@ -2247,19 +2251,27 @@ def list_committed_projects(
                 projection["board_counts"] = _listed_board_counts(
                     row["board_slug"], project_id,
                 )
+            if project_last_change:
+                projection["last_changed_at"] = _listed_last_change(
+                    row["board_slug"], project_id,
+                )
             projects.append(projection)
         return projects
     finally:
         conn.close()
 
 
-def _listed_board_counts(board_slug: str, project_id: str) -> Optional[dict]:
-    """The snapshot's ``board.counts`` and ``board.total``, or None when uncountable."""
-    board_path = (
+def _listed_board_path(board_slug: str) -> Path:
+    return (
         kanban_db.kanban_home() / "kanban.db"
         if board_slug == kanban_db.DEFAULT_BOARD
         else kanban_db.board_dir(board_slug) / "kanban.db"
     )
+
+
+def _listed_board_counts(board_slug: str, project_id: str) -> Optional[dict]:
+    """The snapshot's ``board.counts`` and ``board.total``, or None when uncountable."""
+    board_path = _listed_board_path(board_slug)
     try:
         conn = _open_read_only_sqlite(board_path, label="kanban.db")
         try:
@@ -2269,6 +2281,37 @@ def _listed_board_counts(board_slug: str, project_id: str) -> Optional[dict]:
     except (OSError, sqlite3.Error, OwnerWorkspaceError):
         return None
     return {"counts": counts, "total": total}
+
+
+def _listed_last_change(board_slug: str, project_id: str) -> Optional[int]:
+    """When this Project's own board last changed, in whole epoch seconds, or None.
+
+    The newest of the Project's work tasks' ``created_at``, ``started_at`` and
+    ``completed_at`` and of those tasks' ``task_events`` times, taken from the
+    board's own file read-only. The scope is the one ``board_counts`` counts:
+    ``project_id`` and ``task_kind = 'work'``, archived tasks included. A
+    ``heartbeat`` event is worker liveness, not a change of the task, as in
+    ``owner_plan_task_revision``, so it is left out. None when the board cannot
+    be read, and also when it holds no work task of the Project.
+    """
+    try:
+        conn = _open_read_only_sqlite(_listed_board_path(board_slug), label="kanban.db")
+        try:
+            newest = conn.execute(
+                "SELECT MAX(at) FROM ("
+                "SELECT MAX(created_at, COALESCE(started_at, created_at), "
+                "COALESCE(completed_at, created_at)) AS at FROM tasks "
+                "WHERE project_id = ? AND task_kind = 'work' "
+                "UNION ALL SELECT e.created_at FROM task_events e "
+                "JOIN tasks t ON t.id = e.task_id "
+                "WHERE t.project_id = ? AND t.task_kind = 'work' AND e.kind != 'heartbeat')",
+                (project_id, project_id),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error, OwnerWorkspaceError):
+        return None
+    return None if newest is None else int(newest)
 
 
 _OWNER_TASK_RECEIPT_OPERATIONS = (
