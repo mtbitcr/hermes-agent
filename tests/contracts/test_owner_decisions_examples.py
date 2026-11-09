@@ -28,10 +28,20 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     _resolve_owner_workspace_run_context,
 )
-from hermes_cli import kanban_db, owner_named_inputs as oni, owner_workspace as ow
+from hermes_cli import kanban_db, owner_named_inputs as oni, owner_workspace as ow, release_ledger
 from plugins.dashboard_auth.raphael_workspace import model_policy
 from tests.contracts import conftest as contract
 from tests.gateway.test_api_server_owner_choices import _designer_card, _ref
+from tests.gateway.test_api_server_release import (  # noqa: F401  (root and units are fixtures)
+    VIEW as RELEASE_VIEW,
+    _accepted,
+    _begin,
+    _client as _release_client,
+    _ledger,
+    _merge,
+    root,
+    units,
+)
 from tests.gateway.test_api_server_owner_suggestion_decisions import (  # noqa: F401  (owner is a fixture)
     _ROUTES,
     _pending_suggestion,
@@ -260,6 +270,33 @@ async def test_the_design_choice_examples_come_from_the_real_list_and_choose_rou
         (record,) = listed["body"]["recent_design_choices"]
         assert (record["n"], [option["n"] for option in record["options"]]) == (2, [1, 2])
         assert [option["picture"]["attachment_id"] for option in record["options"]] == decided.attachment_ids
+
+
+@pytest.mark.asyncio
+async def test_the_released_release_example_comes_from_the_real_release_route(
+    root, units, owner_payload_example,
+):
+    """The release decision read after a release ended: its change titles, their count and the
+    end time, from the real route over a release record in the per-test home."""
+    _merge("a", "Show the release decision")
+    batch = _accepted(_merge("b", "Keep the owner page fast"))
+    _begin(batch)
+    _ledger(release_ledger.finish_release, batch["batch_id"], outcome="released")
+    async with _release_client() as client:
+        resp = await client.get(RELEASE_VIEW)
+        live = {"status": resp.status, "body": await resp.json()}
+
+    saved = owner_payload_example(FAMILY, "release_decision_released", live)
+
+    for answer in (live, saved):
+        assert answer["status"] == 200
+        release = answer["body"]["release"]
+        assert release["state"] == "released" and release["outcome"] == "released"
+        assert release["titles"] == [ow.owner_title(member["title"]) for member in batch["members"]]
+        assert release["count"] == len(release["titles"]) == len(batch["members"])
+        assert type(release["outcome_at"]) is int
+        assert release["outcome_at"] > 0
+        assert release["batch_id"] == batch["batch_id"]
 
 
 def test_the_decision_examples_keep_to_every_closed_vocabulary():

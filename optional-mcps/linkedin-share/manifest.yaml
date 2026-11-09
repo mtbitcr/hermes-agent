@@ -24,4 +24,5 @@ tools:
 
 post_install: |
   The connector posts only the exact text the owner approved. It makes at
-  most three posts a day. It keeps the LinkedIn sign-in inside the Worker.
+  most three posts a day. It keeps your LinkedIn sign-in inside
+  Raphael's own LinkedIn service, so no other part of Raphael holds it.
