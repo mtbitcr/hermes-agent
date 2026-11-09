@@ -368,6 +368,42 @@ def _resolve_owner_workspace_run_context(value: Any) -> "dict[str, str | None] |
     }
 
 
+def _link_owner_conversation_project(conversation: str, project_id: str) -> "web.Response | None":
+    """Link an owner conversation to the committed Project of this owner its header names.
+
+    The link comes from the X-Raphael-Project-Id header alone, never from
+    conversation text or model output. Called before the turn is reserved or
+    any model runs, so a refusal changes nothing. None means the conversation
+    is linked to exactly this Project.
+    """
+    from hermes_cli import owner_workspace, projects_db
+    from hermes_cli.sqlite_util import InitLockUnavailable
+
+    try:
+        committed = owner_workspace.list_committed_projects(owner_workspace.resolve_owner_context())
+        if project_id not in {project["project_id"] for project in committed}:
+            return web.json_response(
+                _openai_error("Owner workspace Project was not found", code="project_not_found"), status=404,
+            )
+        with projects_db.connect_closing() as conn:
+            linked = projects_db.link_project_conversation(conn, conversation, project_id)
+    except (owner_workspace.OwnerWorkspaceError, InitLockUnavailable, OSError, sqlite3.Error):
+        logger.exception("Owner conversation %s could not be linked to its Project", conversation)
+        return web.json_response(_openai_error(
+            "Owner workspace Project projection is unavailable",
+            err_type="server_error", code="owner_workspace_unavailable",
+        ), status=503)
+    if linked == project_id:
+        return None
+    logger.warning(
+        "Refused to link owner conversation %s to Project %s: it is linked to Project %s",
+        conversation, project_id, linked,
+    )
+    return web.json_response(_openai_error(
+        "This conversation belongs to another Project", code="project_conversation_link_conflict",
+    ), status=409)
+
+
 def _resolve_owner_proposal_run_authority(value: Any) -> "dict[str, Any] | None":
     """Validate hidden proposal authority on one authenticated owner run."""
     if value is None:
@@ -10475,6 +10511,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=409,
                 )
 
+        # The owner turn's Project, linked from its header before any model runs.
+        project_link = request.headers.get("X-Raphael-Project-Id")
+        if is_owner_conversation and project_link is not None:
+            refused = _link_owner_conversation_project(str(conversation), project_link)
+            if refused is not None:
+                return refused
+
         # Normalize input to message list
         input_messages: List[Dict[str, Any]] = []
         if isinstance(raw_input, str):
@@ -11323,11 +11366,16 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation = request.match_info["conversation"]
         view = request.query.get("view")
         if request.query:
-            if len(request.query) != 1 or view != "sessions":
+            if len(request.query) != 1 or view not in ("sessions", "project"):
                 return web.json_response(
                     _openai_error("Invalid owner conversation view"),
                     status=400,
                 )
+            if view == "project":
+                from hermes_cli.projects_db import read_project_conversation_link
+
+                link = read_project_conversation_link(conversation)
+                return web.json_response({"object": "hermes.response.owner_project_link", "project_id": link})
             if re.fullmatch(r"raphael-owner-[a-f0-9]{32}", conversation) is None:
                 return web.json_response(
                     _openai_error("Invalid owner conversation group"),

@@ -181,6 +181,15 @@ CREATE TABLE IF NOT EXISTS review_budget (
     portfolio_reviews INTEGER NOT NULL DEFAULT 0,
     updated_at        INTEGER NOT NULL
 );
+
+-- The Project one owner conversation belongs to, from the owner-authorised
+-- X-Raphael-Project-Id header the gateway checks. Written once and never
+-- overwritten; a conversation without a row is unlinked. Additive.
+CREATE TABLE IF NOT EXISTS project_conversation_links (
+    conversation TEXT PRIMARY KEY,
+    project_id   TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    linked_at    INTEGER NOT NULL
+);
 """
 
 
@@ -847,6 +856,55 @@ def get_project_summary(
         "written_at": written_at,
         "revision": revision,
     }
+
+
+def link_project_conversation(
+    conn: sqlite3.Connection, conversation: str, project_id: str
+) -> str:
+    """Link one owner conversation to a project once; return the linked project id.
+
+    INSERT OR IGNORE keeps the first link for good, so the returned id differs
+    from ``project_id`` exactly when the conversation already belongs to
+    another project: that link is refused, never overwritten. Repeating the
+    same link changes nothing. A ``project_id`` that is not in ``projects``
+    raises the foreign key's :class:`sqlite3.IntegrityError`.
+    """
+    with write_txn(conn):
+        conn.execute(
+            "INSERT OR IGNORE INTO project_conversation_links "
+            "(conversation, project_id, linked_at) VALUES (?, ?, ?)",
+            (conversation, project_id, _now()),
+        )
+        linked = conn.execute(
+            "SELECT project_id FROM project_conversation_links WHERE conversation = ?",
+            (conversation,),
+        ).fetchone()[0]
+    return linked
+
+
+def read_project_conversation_link(conversation: str) -> Optional[str]:
+    """The project one conversation is linked to, or None while it is unlinked.
+
+    Opened read-only because no GET may migrate or mutate the file: an absent
+    ``projects.db``, or one that predates the link table, reads as unlinked.
+    """
+    path = projects_db_path()
+    if not path.is_file():
+        return None
+    with contextlib.closing(
+        sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    ) as conn:
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'project_conversation_links'"
+        ).fetchone()
+        if has_table is None:
+            return None
+        row = conn.execute(
+            "SELECT project_id FROM project_conversation_links WHERE conversation = ?",
+            (conversation,),
+        ).fetchone()
+    return row[0] if row else None
 
 
 # ---------------------------------------------------------------------------
