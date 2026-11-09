@@ -39278,12 +39278,16 @@ def gc_events(
     history. The latest sandbox lifecycle event for each run is retained
     regardless of age: this bounded one-row fold head classifies deletion and
     cleanup authority, including malformed events that must fail closed.
+    Every ``review_followup_recorded`` and ``owner_project_plan_change``
+    event is retained regardless of age: these lineage records hold each
+    work item's key (``kanban_work_items``) for the life of the item.
     """
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
+            "AND kind NOT IN ('review_followup_recorded', 'owner_project_plan_change') "
             "AND NOT (run_id IS NOT NULL AND kind IN ("
             " 'sandbox_reserved', 'sandbox_created', "
             " 'sandbox_provisioned', 'sandbox_released'"
