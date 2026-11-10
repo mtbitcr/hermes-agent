@@ -352,6 +352,50 @@ def test_the_gc_command_keeps_the_keys_and_current_cards_of_an_owner_replacement
                     reviewed: {"review_followup_recorded"}, verdict_item: set()}
 
 
+@pytest.mark.parametrize("purged", [0, 1], ids=["root", "middle"])
+def test_the_purge_command_leaves_each_surviving_card_in_one_item_and_each_item_with_one_current_card(
+        project, tmp_path, monkeypatch, purged):
+    """The real hermes kanban archive --rm on the first or the middle of three cards that real owner plans replaced
+    one by one, the last still active. The owner's purge ends the item's life, so a surviving card may start a new
+    item with a new key; but each surviving card is in exactly one item, each item has exactly one current card,
+    and no read fails, not even one that names the purged card."""
+    cards = [_task(project, "Write the content")[0]]
+    (key, _), = _items(work_item_keys(project.conn, cards)).values()
+    for plan in range(2):
+        target = {"task_id": cards[-1], "expected_status": kb.get_task(project.conn, cards[-1]).status,
+                  "expected_revision": kb.owner_plan_task_revision(project.conn, cards[-1])}
+        result = kb.apply_owner_project_plan(
+            project.conn, project_id=project.id, anchor_task_id=project.anchor_id, changes=[{
+                "action": "replace", "reason": "Rescope the content.", "target": target,
+                "replacement": _spec("Rewrite the content")}],
+            actor="owner", profile="owner", idempotency_key=f"website-plan-{plan}", request_digest="d" * 64,
+            trigger="owner_request", plan_summary="Rework the website content.",
+            current_milestone="Launch the website", later_milestones=[])
+        assert result["applied"] is True
+        cards.extend(result["created_task_ids"])
+    assert [kb.get_task(project.conn, card).status for card in cards] == ["archived", "archived", "scheduled"]
+    assert _items(work_item_keys(project.conn, cards)) == {card: (key, card == cards[-1]) for card in cards}
+    gone = cards[purged]
+    surviving = [card for card in cards if card != gone]
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    purge = subprocess.run([sys.executable, "-m", "hermes_cli.main", "kanban", "archive", "--rm", gone], cwd=ROOT,
+                           env=dict(os.environ), stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=120)
+
+    assert purge.returncode == 0, (purge.stdout, purge.stderr)
+    assert kb.get_task(project.conn, gone) is None
+    found = work_item_keys(project.conn, surviving)
+    grouped = work_items(project.conn, surviving)
+    assert sorted(entry["task_id"] for entries in grouped.values() for entry in entries) == sorted(surviving)
+    assert {entry["task_id"]: {"key": item, "current": entry["current"]}
+            for item, entries in grouped.items() for entry in entries} == found
+    assert {item: [entry["current"] for entry in entries].count(True)
+            for item, entries in grouped.items()} == dict.fromkeys(grouped, 1)
+    assert work_item_keys(project.conn, cards) == {**found, gone: None}
+    assert work_items(project.conn, cards) == grouped
+
+
 def test_a_board_with_no_linking_records_makes_every_card_its_own_item(kanban_home):
     """Cards with ordinary links, runs and every outcome, but no event that names a continuation: each card is
     its own item, alone and current. An id not on the board has no item."""

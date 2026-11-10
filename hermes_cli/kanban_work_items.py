@@ -13,9 +13,16 @@ runs of one card and need no edge.
 An item's root is the card its edges lead back to; in a cycle, the cycle's oldest card. A walk the 32-link guard
 stops goes on to that root, so a lineage of any length has one. The key hashes the root's project and id, so it
 holds for the life of the item and names no card: the owner's runs carry no card id. The current attempt is the
-item's newest active card, else its newest done card, else its newest card; newest by created time, then id. An
-edge to a card no longer on the board is left out, and a deleted card's events, its edges to later cards among
-them, go with it. It reads one board through the caller's connection and never writes.
+item's newest active card, else its newest done card, else its newest card; newest by created time, then id. It
+reads one board through the caller's connection and never writes.
+
+The owner defines the life of an item. No automatic action ends it: the event cleanup, a retry, a review return
+and an update card keep every card's key, and so does an owner replacement. A purge ends it:
+hermes kanban archive --rm is the owner's deliberate act that deletes an archived card for good. A deleted card's
+events go with it, its edges to later cards among them, and an edge to a card no longer on the board is left out,
+so when the owner purges an archived attempt, the life of its item ends for the cards that survive, and each of
+them may start a new item with a new key. After a purge the reading stays consistent: each card belongs to exactly
+one item, each item has exactly one current card, and no read fails.
 """
 
 from __future__ import annotations
