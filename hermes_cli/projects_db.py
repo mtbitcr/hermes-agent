@@ -152,6 +152,35 @@ CREATE TABLE IF NOT EXISTS project_summary_state (
     failures         INTEGER NOT NULL DEFAULT 0,
     updated_at       INTEGER NOT NULL
 );
+
+-- What the daily review tick (hermes_cli/owner_project_review.py) remembers per
+-- Project: its own event cursors (the summary's move hourly, the review's once a
+-- day), the last Vienna review day, the last brief, the last day with news (the
+-- quiet days count from it), the one open review task and the failure count.
+-- Dates are Vienna calendar dates, 'YYYY-MM-DD'. Additive: no existing table changes.
+CREATE TABLE IF NOT EXISTS project_review_state (
+    project_id         TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+    event_cursor       INTEGER NOT NULL DEFAULT 0,
+    delivery_cursor    INTEGER NOT NULL DEFAULT 0,
+    release_cursor     INTEGER NOT NULL DEFAULT 0,
+    last_reviewed_date TEXT,
+    last_reviewed_at   INTEGER,
+    last_brief_date    TEXT,
+    last_news_date     TEXT,
+    open_task_id       TEXT,
+    open_review_date   TEXT,
+    failures           INTEGER NOT NULL DEFAULT 0,
+    updated_at         INTEGER NOT NULL
+);
+
+-- The daily cap of the review: the review tasks started on one Vienna day,
+-- retries included, and the cross-project review's own slot beside them.
+CREATE TABLE IF NOT EXISTS review_budget (
+    review_date       TEXT PRIMARY KEY,
+    project_reviews   INTEGER NOT NULL DEFAULT 0,
+    portfolio_reviews INTEGER NOT NULL DEFAULT 0,
+    updated_at        INTEGER NOT NULL
+);
 """
 
 
