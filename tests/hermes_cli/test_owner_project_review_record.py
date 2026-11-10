@@ -7,8 +7,10 @@ every piece of owner or agent text inside a wrapper that marks it as untrusted d
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
+import itertools
 import json
 import re
 import sqlite3
@@ -504,8 +506,12 @@ def test_comments_follow_f1_and_the_plan_limits(root):
     assert [item["text"][:3] for item in comments] == [f"{n:03d}" for n in range(119, 69, -1)]
     assert len(comments[0]["text"]) == 500
     assert {item["author"] for item in comments} == {OWNER, "raphael-planner"}
-    assert _cut(result, "comments") == {"source": "comments", "shown": 50, "total": 120, "reason": "limit"}
+    assert _cut(result, "comments", "limit") == {"source": "comments", "shown": 50, "total": 120, "reason": "limit"}
     assert "Left out: 70 of 120 comments" in result["text"]
+    # The one shown comment over 500 characters is a partial text (owner rule 2026-11-10, point 4).
+    assert _cut(result, "comments", "partial_text") == {
+        "source": "comments", "shown": 49, "total": 50, "reason": "partial_text",
+    }
 
 
 def test_tasks_events_attachments_and_conversation_follow_the_plan(root):
@@ -567,7 +573,13 @@ def test_tasks_events_attachments_and_conversation_follow_the_plan(root):
     turns = result["sources"]["conversation"]
     assert [item["owner"][:13] for item in turns] == [f"Owner turn {n:02d}" for n in range(5, 25)]
     assert len(turns[-1]["owner"]) + len(turns[-1]["raphael"]) == 1000
-    assert _cut(result, "conversation") == {"source": "conversation", "shown": 20, "total": 25, "reason": "limit"}
+    assert _cut(result, "conversation", "limit") == {
+        "source": "conversation", "shown": 20, "total": 25, "reason": "limit",
+    }
+    # The last turn's owner words are shortened and its reply removed (owner rule 2026-11-10, point 4).
+    assert {cut["reason"] for cut in result["cuts"] if cut["source"] == "conversation"} == {
+        "limit", "partial_text", "removed_text",
+    }
 
     briefs = result["sources"]["earlier_reviews"]
     assert [item["headline"] for item in briefs] == ["Brief 3", "Brief 2", "Brief 1"]
@@ -817,12 +829,14 @@ def test_a_cap_cut_after_a_source_limit_counts_both(root, monkeypatch):
     for cap in range(full["size"] - 1, 4_000, -2_000):
         monkeypatch.setattr(record, "TOTAL_INPUT_CAP_BYTES", cap)
         result = record.build_review_input(project, START, None)
-        cut = _cut(result, "tasks")
-        if cut["reason"] != "total_cap":
+        cut = _cut(result, "tasks", "total_cap")
+        if cut is None:
             continue
         kept = len(result["sources"]["tasks"])
         assert (cut["shown"], cut["total"]) == (kept, 105)
         assert f"Left out: {105 - kept} of 105 tasks." in result["text"]
+        # The cap adds its cut; the source limit's cut stays (owner rule 2026-11-10, point 2).
+        assert _cut(result, "tasks", "limit") == {"source": "tasks", "shown": 100, "total": 102, "reason": "limit"}
         break
     else:
         pytest.fail("no cap cut the tasks")
@@ -906,3 +920,180 @@ def test_a_malformed_design_choice_marks_the_source_not_available(root, declared
     assert result["sources"]["decisions"][0] == {**result["sources"]["decisions"][0], "type": "wait", "task_id": ids["water"]}
     assert gate in {item["id"] for item in result["sources"]["tasks"]}
     assert {item["id"] for item in result["sources"]["suggestions"]} == {ids["pending"], ids["rejected"]}
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# 10. Owner rule of 2026-11-10: one place for every cut
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def test_only_the_reduction_helper_reduces_record_data():
+    """Rule 6a: no line outside ``_reduce`` slices or removes from a list, or writes a cut."""
+    record = _record()
+    tree = ast.parse(Path(record.__file__).read_text(encoding="utf-8"))
+    (helper,) = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_reduce"]
+    inside = {id(node) for node in ast.walk(helper)}
+    found = []
+    for node in ast.walk(tree):
+        if id(node) in inside:
+            continue
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            found.append(("slice", node.lineno))
+        elif isinstance(node, ast.Delete):
+            found.append(("del", node.lineno))
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in {"pop", "popitem", "remove", "clear"}:
+                found.append((node.func.attr, node.lineno))
+            elif isinstance(node.func.value, ast.Name) and node.func.value.id == "cuts":
+                found.append(("cuts." + node.func.attr, node.lineno))
+        elif isinstance(node, (ast.Assign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name) and target.value.id == "cuts":
+                    found.append(("cuts[...] =", node.lineno))
+    assert found == []
+    # The helper is where the reductions are: it slices, and it appends the cuts.
+    assert any(isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice) for node in ast.walk(helper))
+    assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "append"
+               and isinstance(node.func.value, ast.Name) and node.func.value.id == "cuts" for node in ast.walk(helper))
+
+
+_KINDS = ("limit", "partial_text", "removed_text", "total_cap", "not_available")
+# The source and reason each reduction kind leaves in the cut list.
+_KIND_CUTS = {
+    "limit": ("earlier_reviews", "limit"), "partial_text": ("comments", "partial_text"),
+    "removed_text": ("conversation", "removed_text"), "total_cap": ("automations", "total_cap"),
+    "not_available": ("automations", "not_available"),
+}
+_SMALL_CAP = 1_500
+
+
+def _automation_stores(root: Path, project, root_jobs: bytes) -> None:
+    (root / "cron").mkdir(exist_ok=True)
+    (root / "cron" / "jobs.json").write_bytes(root_jobs)
+    helper = root / "profiles" / "helper" / "cron"
+    helper.mkdir(parents=True)
+    (helper / "jobs.json").write_text(json.dumps({"jobs": [
+        {"id": "1", "project": project.id, "name": "Helper note", "enabled": True},
+    ]}))
+
+
+def _unknown_is_never_a_number(result) -> None:
+    record = _record()
+    unknown = {cut["source"] for cut in result["cuts"] if cut["reason"] in ("not_available", "unlinked")}
+    for cut in result["cuts"]:
+        if cut["source"] in unknown and cut["reason"] in ("limit", "total_cap"):
+            assert cut["total"] is None, cut
+        if cut["total"] is None:
+            assert not re.search(r"\bof \d", record.cut_line(cut)), cut
+
+
+@pytest.mark.parametrize("kinds", [
+    frozenset(kind for kind, on in zip(_KINDS, flags) if on) for flags in itertools.product((False, True), repeat=5)
+], ids=lambda kinds: "+".join(sorted(kinds)) or "none")
+def test_every_combination_of_reductions_is_reported(root, monkeypatch, kinds):
+    """Rule 6b: inside the cap, a notice of the right kind per reduced source, none lost, unknown never a number."""
+    record = _record()
+    project = _make(root, "Mixed Plan", description="d" * 5_000)
+    _future_table(root, _LINKS_SQL)
+    _future_table(root, _BRIEFS_SQL)
+    for n in range(4 if "limit" in kinds else 1):
+        _brief(root, project, f"2026-11-0{n + 1}", f"Brief {n}")
+    with _written_at(2_000), _board(root, project.board_slug) as conn:
+        task = _card(conn, project, "Plan the mix")
+        kanban_db.add_comment(conn, task, OWNER, "c" * (501 if "partial_text" in kinds else 20))
+    owner_words = "o" * (1_000 if "removed_text" in kinds else 20)
+    _conversation(root, project, "raphael-owner-" + "f" * 32, [(owner_words, "A nonempty reply.")])
+    root_jobs = json.dumps({"jobs": [{"id": "1", "project": project.id, "name": "Root note", "enabled": True}]})
+    _automation_stores(root, project, b"{" if "not_available" in kinds else root_jobs.encode())
+
+    uncapped = record.build_review_input(project, START, None)
+    if "total_cap" in kinds:
+        monkeypatch.setattr(record, "TOTAL_INPUT_CAP_BYTES", _SMALL_CAP)
+    result = record.build_review_input(project, START, None)
+
+    cap = record.TOTAL_INPUT_CAP_BYTES
+    assert result["size"] == len(result["text"].encode("utf-8")) <= cap
+    found = {(cut["source"], cut["reason"]) for cut in result["cuts"]}
+    for kind, pair in _KIND_CUTS.items():
+        assert (pair in found) == (kind in kinds), (kind, found)
+    assert any(cut["reason"] == "total_cap" for cut in result["cuts"]) == ("total_cap" in kinds)
+    outside = _blocks(result["text"])[1]
+    for cut in result["cuts"]:
+        assert record.cut_line(cut) in outside, cut
+    # No notice of an earlier pass is lost: the cap only adds its own.
+    assert [cut for cut in result["cuts"] if cut["reason"] != "total_cap"] == uncapped["cuts"]
+    _unknown_is_never_a_number(result)
+    _unknown_is_never_a_number(uncapped)
+
+
+def test_review_finding_1_a_clipped_comment_and_an_emptied_reply_are_cuts(root):
+    """A 501-character owner comment, and on the first review a turn of 1,000 owner characters with a reply."""
+    _future_table(root, _LINKS_SQL)
+    clipped, whole, short = _make(root, "Clip Plan"), _make(root, "Whole Plan"), _make(root, "Short Plan")
+    for project, comment, turn, digit in ((clipped, "a" * 501, ("o" * 1_000, "A nonempty reply."), "1"),
+                                          (whole, "a" * 500, ("o" * 20, "A nonempty reply."), "2"),
+                                          (short, "a" * 20, ("o" * 990, "A nonempty reply."), "3")):
+        with _written_at(2_000), _board(root, project.board_slug) as conn:
+            kanban_db.add_comment(conn, _card(conn, project, "Write it down"), OWNER, comment)
+        _conversation(root, project, "raphael-owner-" + digit * 32, [turn])
+
+    result = _record().build_review_input(clipped, START, None)
+
+    assert [item["text"] for item in result["sources"]["comments"]] == ["a" * 500]
+    assert _cut(result, "comments", "partial_text") == {
+        "source": "comments", "shown": 0, "total": 1, "reason": "partial_text",
+    }
+    assert result["sources"]["conversation"] == [{"owner": "o" * 1_000, "raphael": ""}]
+    assert _cut(result, "conversation", "removed_text") == {
+        "source": "conversation", "shown": 1, "total": 2, "reason": "removed_text",
+    }
+    assert _cut(result, "conversation", "partial_text") is None
+    outside = _blocks(result["text"])[1]
+    for cut in result["cuts"]:
+        assert _record().cut_line(cut) in outside
+
+    # A reply shortened, not emptied, by what the owner words leave of the turn is a partial text.
+    partial = _record().build_review_input(short, START, None)
+    ((turn,),) = [partial["sources"]["conversation"]]
+    assert (len(turn["owner"]), len(turn["raphael"])) == (990, 10)
+    assert _cut(partial, "conversation", "partial_text") == {
+        "source": "conversation", "shown": 1, "total": 2, "reason": "partial_text",
+    }
+    assert _cut(partial, "conversation", "removed_text") is None
+
+    # Unclipped controls: a comment at its limit and a short turn are whole and have no cut.
+    control = _record().build_review_input(whole, START, None)
+    assert [item["text"] for item in control["sources"]["comments"]] == ["a" * 500]
+    ((turn,),) = [control["sources"]["conversation"]]
+    assert turn["owner"] == "o" * 20 and "A nonempty reply." in turn["raphael"]
+    assert not [cut for cut in control["cuts"] if cut["source"] in ("comments", "conversation")]
+
+
+@pytest.mark.parametrize("snapshot", ["valid_oversized", "unreadable"])
+def test_review_finding_2_the_total_cap_keeps_the_unavailable_automation_notice(root, monkeypatch, snapshot):
+    """cap=1,500, a 5,000-character description, a root cron snapshot that cannot be read, a readable helper job."""
+    record = _record()
+    project = _make(root, "Cron Plan", description="d" * 5_000)
+    oversized = json.dumps({"jobs": [
+        {"id": "1", "project": project.id, "name": "Root note", "enabled": True, "prompt": "p" * 3_000},
+    ]}).encode()
+    assert len(oversized) > _SMALL_CAP
+    json.loads(oversized)
+    _automation_stores(root, project, oversized if snapshot == "valid_oversized" else b"{")
+    monkeypatch.setattr(record, "TOTAL_INPUT_CAP_BYTES", _SMALL_CAP)
+
+    result = record.build_review_input(project, START, None)
+
+    assert result["size"] == len(result["text"].encode("utf-8")) <= _SMALL_CAP
+    assert result["sources"]["automations"] == []
+    automations = [cut for cut in result["cuts"] if cut["source"] == "automations"]
+    assert sorted(cut["reason"] for cut in automations) == ["not_available", "total_cap"]
+    assert all(cut["total"] is None for cut in automations)
+    assert "Not available: automations." in result["text"]
+    assert "Left out: 1 of 1 automations." not in result["text"]
+    assert not re.search(r"of \d+ automations", result["text"])
+    outside = _blocks(result["text"])[1]
+    for cut in result["cuts"]:
+        assert record.cut_line(cut) in outside
+    _unknown_is_never_a_number(result)
