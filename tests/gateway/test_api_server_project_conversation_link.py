@@ -1,7 +1,9 @@
 """An owner conversation is linked to its Project only through the X-Raphael-Project-Id header.
 
 The header is honoured on an authenticated owner turn under durable owner authority, and only for a
-committed Project of this owner. The link is stored once in projects.db and read back through
+committed Project of this owner. It is part of the turn's idempotency fingerprint, and the link is
+written only once the turn is admitted, before any model runs, so a refused request leaves none.
+The link is stored once in projects.db and read back through
 ``GET /v1/responses/conversations/{conversation}?view=project``; a conversation without a link reads
 as unlinked. Only ``_create_agent`` is stubbed: the real routes, the real response store and the real
 projects.db in the per-test home carry every request.
@@ -9,6 +11,7 @@ projects.db in the per-test home carry every request.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -21,6 +24,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
+from gateway.platforms import api_server
 from gateway.platforms.api_server import APIServerAdapter
 from hermes_cli import owner_workspace as ow, projects_db
 from hermes_constants import get_hermes_home
@@ -105,10 +109,10 @@ def _stored_links() -> list[tuple]:
 
 
 async def _turn(client, *, conversation=CONVERSATION, project=None, expected=None,
-                key=API_KEY, text="Plan the spring launch"):
+                key=API_KEY, text="Plan the spring launch", idempotency=None):
     headers = {
         "Authorization": f"Bearer {key}",
-        "Idempotency-Key": f"response-{uuid.uuid4().hex}",
+        "Idempotency-Key": idempotency or f"response-{uuid.uuid4().hex}",
     }
     if project is not None:
         headers[HEADER] = project
@@ -340,3 +344,215 @@ async def test_conversation_text_and_model_output_never_create_a_link(live):
 
     assert len(created) == 1
     assert _stored_links() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value",
+    [42, {}, [], "", [{"role": "user", "content": [{"type": "input_image", "image_url": "not-a-url"}]}]],
+    ids=["number", "object", "empty_list", "empty_string", "malformed_image"],
+)
+async def test_a_rejected_input_leaves_no_link(live, value):
+    app, created = live
+    first, second = _committed(2)
+
+    async with TestClient(TestServer(app)) as client:
+        status, refused = await _turn(client, project=first, text=value)
+        assert status == 400, refused
+        assert _stored_links() == []
+
+        status, body = await _turn(client, project=second)
+        assert status == 200, body
+        assert await _linked(client) == second
+
+    assert len(created) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_turn_refused_while_another_turn_runs_leaves_no_link(live):
+    app, created = live
+    first, second = _committed(2)
+    adapter = app["api_server_adapter"]
+    started, release = asyncio.Event(), asyncio.Event()
+    run = adapter._run_agent
+
+    async def _held(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return await run(*args, **kwargs)
+
+    adapter._run_agent = _held
+    async with TestClient(TestServer(app)) as client:
+        running = asyncio.create_task(_turn(client))
+        await asyncio.wait_for(started.wait(), timeout=10)
+        try:
+            status, refused = await _turn(client, project=first)
+            links = _stored_links()
+        finally:
+            release.set()
+        running_status, body = await running
+        assert running_status == 200, body
+        assert status == 409, refused
+        assert refused["error"]["code"] == "owner_conversation_locked"
+        assert links == []
+
+        status, body = await _turn(client, project=second, expected=body["id"])
+        assert status == 200, body
+        assert await _linked(client) == second
+
+    assert len(created) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_turn_refused_on_a_closed_conversation_leaves_no_link(live):
+    app, created = live
+    first, second = _committed(2)
+    assert app["api_server_adapter"]._response_store.close_owner_conversation(
+        "default", CONVERSATION, None,
+    ) is True
+    successor = f"{CONVERSATION}-{'b' * 32}"
+
+    async with TestClient(TestServer(app)) as client:
+        status, refused = await _turn(client, project=first)
+        assert status == 409, refused
+        assert refused["error"]["code"] == "owner_conversation_locked"
+        assert _stored_links() == []
+
+        # The group's next session, where the owner goes on after a close.
+        status, body = await _turn(client, conversation=successor, project=second)
+        assert status == 200, body
+        assert await _linked(client, successor) == second
+        assert await _linked(client) is None
+
+    assert len(created) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", ["conflict", "store_failure"])
+async def test_a_link_refused_at_admission_releases_the_turn_and_runs_no_model(live, refusal):
+    app, created = live
+    first, second = _committed(2)
+    store = app["api_server_adapter"]._response_store
+    reserve = store.reserve_owner_conversation
+    key = f"response-{uuid.uuid4().hex}"
+
+    def _linked_meanwhile(*args, **kwargs):
+        # Another turn links the conversation between this turn's check and its write.
+        with projects_db.connect_closing() as conn:
+            projects_db.link_project_conversation(conn, CONVERSATION, second)
+        return reserve(*args, **kwargs)
+
+    if refusal == "conflict":
+        injected = patch.object(store, "reserve_owner_conversation", _linked_meanwhile)
+        expected = (409, "project_conversation_link_conflict", [(CONVERSATION, second)])
+    else:
+        injected = patch.object(
+            projects_db, "link_project_conversation", side_effect=sqlite3.OperationalError("disk I/O error"),
+        )
+        expected = (503, "owner_workspace_unavailable", [])
+
+    async with TestClient(TestServer(app)) as client:
+        with injected:
+            status, refused = await _turn(client, project=first, idempotency=key)
+        assert (status, refused["error"]["code"]) == expected[:2], refused
+        assert [link[:2] for link in _stored_links()] == expected[2]
+        assert created == []
+
+        # Neither reservation is left behind: the same key, naming the other Project, is admitted.
+        status, body = await _turn(client, project=second, idempotency=key)
+        assert status == 200, body
+        assert await _linked(client) == second
+
+    assert len(created) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["standard", "stream", "background"])
+async def test_the_link_is_in_place_before_the_model_runs_on_every_path(live, mode):
+    app, created = live
+    [project] = _committed(1)
+    adapter = app["api_server_adapter"]
+    create = adapter._create_agent
+    links_at_model_start = []
+
+    def _create(**kw):
+        links_at_model_start.append([link[:2] for link in _stored_links()])
+        return create(**kw)
+
+    adapter._create_agent = _create
+    body = {
+        "model": "hermes-agent",
+        "input": "Plan the spring launch",
+        "conversation": CONVERSATION,
+        "store": True,
+        "expected_previous_response_id": None,
+        **({"stream": True} if mode == "stream" else {"background": True} if mode == "background" else {}),
+    }
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Idempotency-Key": f"response-{uuid.uuid4().hex}",
+        HEADER: project,
+    }
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/v1/responses", json=body, headers=headers)
+        assert resp.status == 200, await resp.text()
+        await resp.read()
+        for _ in range(500):
+            if adapter._response_store.get_conversation(CONVERSATION, profile="default"):
+                break
+            await asyncio.sleep(0.01)
+        assert await _linked(client) == project
+
+    assert len(created) == 1
+    assert links_at_model_start == [[(CONVERSATION, project)]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("durable", [False, True], ids=["cache", "durable"])
+@pytest.mark.parametrize("change", ["changed", "added", "removed"])
+async def test_a_retry_that_changes_the_header_is_refused_and_changes_no_link(live, change, durable):
+    app, created = live
+    first, second = _committed(2)
+    before, after = {"changed": (first, second), "added": (None, first), "removed": (first, None)}[change]
+    key = f"response-{uuid.uuid4().hex}"
+
+    async with TestClient(TestServer(app)) as client:
+        status, body = await _turn(client, project=before, idempotency=key)
+        assert status == 200, body
+        links = _stored_links()
+        if durable:
+            api_server._idem_cache._store.clear()
+
+        status, refused = await _turn(client, project=after, idempotency=key)
+        assert status == 409, refused
+        assert refused["error"]["code"] == "idempotency_conflict"
+
+    assert _stored_links() == links
+    assert len(created) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("durable", [False, True], ids=["cache", "durable"])
+async def test_an_identical_retry_replays_without_a_model_run_or_a_link_write(live, durable):
+    app, created = live
+    [project] = _committed(1)
+    key = f"response-{uuid.uuid4().hex}"
+
+    async with TestClient(TestServer(app)) as client:
+        status, body = await _turn(client, project=project, idempotency=key)
+        assert status == 200, body
+        links = _stored_links()
+        if durable:
+            api_server._idem_cache._store.clear()
+
+        with patch.object(
+            projects_db, "link_project_conversation", wraps=projects_db.link_project_conversation,
+        ) as write:
+            status, replay = await _turn(client, project=project, idempotency=key)
+        assert status == 200, replay
+        assert replay == body
+        assert write.call_count == 0
+
+    assert _stored_links() == links
+    assert len(created) == 1
