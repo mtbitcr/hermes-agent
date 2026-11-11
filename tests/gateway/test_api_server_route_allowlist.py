@@ -463,10 +463,10 @@ class TestExactMethodRouteRules:
 
     @pytest.mark.asyncio
     async def test_owner_suggestion_decisions_are_admitted_only_by_their_own_rules(self):
-        """Accept, reject and defer each record an owner decision, and the
-        input upload stores a file, so the read-only Decisions feed rule
-        admits none of them: each is admitted only when its own rule is
-        listed next to the feed."""
+        """Undo, accept, reject and defer change an owner decision. Input upload stores a file.
+
+        The read-only Decisions feed rule admits none of these routes. Each mutation needs its own listed rule.
+        """
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
         feed = "/v1/owner-workspace/decisions"
         rows = [
@@ -474,7 +474,7 @@ class TestExactMethodRouteRules:
             for method, path, _handler in adapter._http_route_table()
             if path.startswith(f"{feed}/")
         ]
-        assert rows == [
+        assert rows == [("POST", f"{feed}/{{decision_ref}}/undo_close")] + [
             ("POST", f"{feed}/{{decision_ref}}/{action}")
             for action in ("accept", "reject", "defer")
         ] + [("POST", f"{feed}/{{ref}}/inputs/{{n}}")] + [("POST", f"{feed}/{{ref}}/choose/{{n}}")]
