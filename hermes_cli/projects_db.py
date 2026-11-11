@@ -24,6 +24,7 @@ The schema is intentionally small and additive: column additions go through
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import secrets
@@ -157,12 +158,16 @@ CREATE TABLE IF NOT EXISTS project_summary_state (
 -- Project: its own event cursors (the summary's move hourly, the review's once a
 -- day), the last Vienna review day, the last brief, the last day with news (the
 -- quiet days count from it), the one open review task and the failure count.
--- Dates are Vienna calendar dates, 'YYYY-MM-DD'. Additive: no existing table changes.
+-- Dates are Vienna calendar dates, 'YYYY-MM-DD'. The optional conversation cursor also upgrades earlier review stores.
+-- input_too_large_date is the day whose required review input did not fit the cap: no review ran that day.
+-- stale_refused_key is the key of the last review refused as stale; it allows one further review of its day. The
+-- claim of that further review stores its own key (ending ':again') here: the day's one further review is used then.
 CREATE TABLE IF NOT EXISTS project_review_state (
     project_id         TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
     event_cursor       INTEGER NOT NULL DEFAULT 0,
     delivery_cursor    INTEGER NOT NULL DEFAULT 0,
     release_cursor     INTEGER NOT NULL DEFAULT 0,
+    conversation_cursor TEXT,
     last_reviewed_date TEXT,
     last_reviewed_at   INTEGER,
     last_brief_date    TEXT,
@@ -170,7 +175,29 @@ CREATE TABLE IF NOT EXISTS project_review_state (
     open_task_id       TEXT,
     open_review_date   TEXT,
     failures           INTEGER NOT NULL DEFAULT 0,
-    updated_at         INTEGER NOT NULL
+    updated_at         INTEGER NOT NULL,
+    input_too_large_date TEXT,
+    stale_refused_key  TEXT
+);
+
+-- Daily briefs have their own history. The five-key project summary keeps its existing shape.
+-- Classification remains internal and is excluded from the owner-facing reader below.
+CREATE TABLE IF NOT EXISTS project_review_briefs (
+    project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    review_date   TEXT NOT NULL,
+    covered_from  TEXT,
+    covered_to    TEXT NOT NULL,
+    headline      TEXT NOT NULL,
+    what_changed  TEXT NOT NULL,
+    next_step     TEXT NOT NULL,
+    needs_you     TEXT,
+    ready_work    TEXT NOT NULL,
+    cut_note      TEXT,
+    quiet         INTEGER NOT NULL,
+    classification TEXT NOT NULL,
+    written_at    INTEGER NOT NULL,
+    revision      INTEGER NOT NULL,
+    PRIMARY KEY (project_id, review_date)
 );
 
 -- The daily cap of the review: the review tasks started on one Vienna day,
@@ -351,6 +378,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "SELECT name FROM sqlite_master WHERE type='table'"
         )
     }
+    if "project_review_state" in tables:
+        _add_column_if_missing(conn, "project_review_state", "conversation_cursor", "conversation_cursor TEXT")
+        _add_column_if_missing(conn, "project_review_state", "input_too_large_date", "input_too_large_date TEXT")
+        _add_column_if_missing(conn, "project_review_state", "stale_refused_key", "stale_refused_key TEXT")
     if "project_removal_operations" in tables:
         rem_cols = {
             row["name"]
@@ -856,6 +887,67 @@ def get_project_summary(
         "written_at": written_at,
         "revision": revision,
     }
+
+
+def write_project_review_brief(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    review_date: str,
+    covered_from: Optional[str],
+    covered_to: str,
+    headline: str,
+    what_changed: str,
+    next_step: str,
+    needs_you: Optional[str] = None,
+    ready_work: Iterable[str] = (),
+    cut_note: Optional[str] = None,
+    quiet: bool = False,
+    classification: Iterable[dict] = (),
+    written_at: Optional[int] = None,
+) -> int:
+    """Store one day's brief. The caller validates model text before this write."""
+    with write_txn(conn):
+        revision = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM project_review_briefs "
+            "WHERE project_id = ? AND review_date = ?", (project_id, review_date),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT OR REPLACE INTO project_review_briefs "
+            "(project_id,review_date,covered_from,covered_to,headline,what_changed,next_step,needs_you,"
+            "ready_work,cut_note,quiet,classification,written_at,revision) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (project_id, review_date, covered_from, covered_to, headline, what_changed, next_step, needs_you,
+             json.dumps(list(ready_work), ensure_ascii=False, allow_nan=False), cut_note, int(quiet),
+             json.dumps(list(classification), ensure_ascii=False, sort_keys=True, allow_nan=False),
+             _now() if written_at is None else written_at, revision),
+        )
+        # The approved daily review plan keeps the latest 90 briefs of each Project.
+        conn.execute(
+            "DELETE FROM project_review_briefs WHERE project_id=? AND review_date NOT IN "
+            "(SELECT review_date FROM project_review_briefs WHERE project_id=? ORDER BY review_date DESC LIMIT 90)",
+            (project_id, project_id),
+        )
+    return revision
+
+
+def get_project_review_brief(conn: sqlite3.Connection, project_id: str) -> Optional[dict]:
+    """Read the latest brief without exposing internal classification or creating an absent table."""
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_review_briefs'"
+    ).fetchone():
+        return None
+    fields = ("review_date", "covered_from", "covered_to", "headline", "what_changed", "next_step",
+              "needs_you", "ready_work", "cut_note", "quiet", "written_at", "revision")
+    row = conn.execute(
+        f"SELECT {','.join(fields)} FROM project_review_briefs WHERE project_id=? ORDER BY review_date DESC LIMIT 1",
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(zip(fields, row))
+    result["ready_work"] = json.loads(result["ready_work"])
+    result["quiet"] = bool(result["quiet"])
+    return result
 
 
 def link_project_conversation(
