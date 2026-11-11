@@ -191,3 +191,40 @@ def test_refusal_writes_nothing(world, monkeypatch, tmp_path, pin_db):
     _assert_refused(_show(board=REVIEW_BOARD))
     _assert_refused(_show(task_id="t_does_not_exist"))
     assert _all_rows(root) == before
+
+
+@PINNED
+@pytest.mark.parametrize("explicit", [False, True], ids=["implicit-id", "explicit-id"])
+def test_review_task_is_refused_for_a_supplied_null_board(world, monkeypatch, pin_db, explicit):
+    kb, ids = world
+    _become_worker(monkeypatch, kb, ids["review"], pin_db=pin_db)
+    args = {"task_id": ids["review"]} if explicit else {}
+    out = _show(board=None, **args)
+    _assert_refused(out, "review of alpha", SECRET)
+
+
+@PINNED
+def test_supplied_null_board_refusal_writes_nothing(world, monkeypatch, tmp_path, pin_db):
+    kb, ids = world
+    _become_worker(monkeypatch, kb, ids["review"], pin_db=pin_db)
+    root = tmp_path / ".hermes"
+    before = _all_rows(root)
+    _assert_refused(_show(board=None))
+    _assert_refused(_show(task_id=ids["review"], board=None))
+    assert _all_rows(root) == before
+
+
+@PINNED
+def test_normal_worker_with_a_null_board_reads_as_before(world, monkeypatch, pin_db):
+    kb, ids = world
+    _become_worker(monkeypatch, kb, ids["plain"], pin_db=pin_db)
+    assert _show(board=None)["task"]["id"] == ids["plain"]
+    assert _show(task_id=ids["plain"], board=None)["task"]["id"] == ids["plain"]
+    assert _show(task_id=ids["review"], board=None)["task"]["title"] == "review of alpha"
+
+
+def test_call_without_a_worker_task_and_a_null_board_behaves_as_before(world, monkeypatch):
+    kb, ids = world
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", REVIEW_BOARD)
+    assert _show(task_id=ids["review"], board=None)["task"]["id"] == ids["review"]
+    assert "task_id is required" in _show(board=None)["error"]
