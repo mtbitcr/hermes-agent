@@ -1908,10 +1908,15 @@ def test_every_open_item_stays_in_every_accepted_classification_until_an_event_s
     for day in range(4):
         now = NOW + day * 86400
         monkeypatch.setattr(time, "time", lambda: now)
+        labels = []
         with kanban_db.connect_closing(path, board=project.board_slug) as board:
             for i in range(70):
-                length = 8 + (i * 37 * seed + day * 11) % 183
-                _decided(board, project, f"past-{day}-{i}", (f"Check room {day}-{i} " + "and confirm the venue date " * 8)[:length])
+                # One creation second each, so the reader's newest 50 decided suggestions are always the same ones.
+                monkeypatch.setattr(time, "time", lambda created=now - 70 + i: created)
+                length = 120 + (i * 37 * seed + day * 11) % 71
+                labels.append((f"Check room {day}-{i} " + "and confirm the venue date " * 8)[:length].rstrip())
+                _decided(board, project, f"past-{day}-{i}", labels[-1])
+            monkeypatch.setattr(time, "time", lambda: now)
             if day == 2:
                 # A delivery and an archive are the recorded events that settle two of the open cards.
                 assert kanban_db.complete_task(board, ready, summary="The room is booked.")
@@ -1923,7 +1928,10 @@ def test_every_open_item_stays_in_every_accepted_classification_until_an_event_s
         sources, _ = review._frozen_sources(body)
         with monkeypatch.context() as patch:
             patch.setattr(records, "TOTAL_INPUT_CAP_BYTES", 10**9)
-            record_sizes.append(records.build_review_input(project, events.Cursors(), None, max_bytes=10**9)["size"])
+            record = records.build_review_input(project, events.Cursors(), None, max_bytes=10**9)
+        record_sizes.append(record["size"])
+        # After the reader's per-source limit the record holds this day's 50 newest decided suggestions.
+        assert [item["label"] for item in record["sources"]["suggestions"] if item["decision"] != "pending"] == labels[:19:-1]
         # Every frozen input of the series was cut by the total cap, with its cut lines.
         assert "Left out: " in body and len(sources["earlier_reviews"]) >= 1, day
         # The brief names a work title of this input, as the brief rule asks.
@@ -1938,6 +1946,8 @@ def test_every_open_item_stays_in_every_accepted_classification_until_an_event_s
         assert not {tid for tid in settled if latest.get(tid) == "still actionable"}
     # The settled records exceeded the frozen input's cap several times over.
     assert max(record_sizes) > 3 * cap
+    # The newest 50 settled labels are long enough that each review after the first saw more than three caps.
+    assert min(record_sizes[1:]) > 3 * cap
 
 
 @pytest.mark.parametrize("long_labels", [False, True])
@@ -2091,6 +2101,16 @@ def _platform_change(project, card, change):
             _suggestion(board, project, subject="new-catering", label="Choose a caterer")
         elif change == "answer_wait":
             assert kanban_db.unblock_task(board, card)
+        elif change == "decided_suggestion":
+            # The owner rejects the Project's first suggestion on the owner screen.
+            suggestion = board.execute(
+                "SELECT id FROM tasks WHERE task_kind='recommendation' AND project_id=? ORDER BY created_at,id LIMIT 1",
+                (project.id,),
+            ).fetchone()[0]
+            kanban_db.decide_recommendation_on_owner_screen(
+                board, suggestion, decision="rejected", reason="Keep the current room.", actor="raphael-owner",
+                owner_screen_ref="owner-workspace:decisions", expected_lifecycle_version=0,
+            )
 
 
 def _board_write_lock_held(project) -> bool:
@@ -2253,3 +2273,611 @@ def test_a_stale_refusal_allows_one_more_review_that_day_and_counts_no_failure(r
     # The next day reviews again.
     monkeypatch.setattr(time, "time", lambda: NOW + 86400)
     assert review.review_tick(NOW + 86400) == 1
+
+
+def _completed_suggestion_review(root, monkeypatch):
+    """A frozen review whose one pending suggestion is classified as waiting for its owner, completed and not harvested."""
+    project = _quiet_project(root)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
+        card = board.execute("SELECT id FROM tasks LIMIT 1").fetchone()[0]
+        suggestion = _suggestion(board, project)
+    assert review.review_tick(NOW) == 1
+    review_task = _open_review(root, project)
+    _complete_review(review_task, [{"item": suggestion, "class": "still actionable", "evidence": [f"suggestions:{suggestion}"]}])
+    return project, card, review_task
+
+
+def _reviewed_day(root, project):
+    """The review day that an independent registry reader sees."""
+    other = sqlite3.connect(root / "projects.db")
+    try:
+        return other.execute(
+            "SELECT last_reviewed_date FROM project_review_state WHERE project_id=?", (project.id,),
+        ).fetchone()[0]
+    finally:
+        other.close()
+
+
+def _at_the_registry_commit(monkeypatch, root, project, card, change, seen, *, before_lock=False):
+    """The boundary where the store's registry COMMIT is issued and has not ended: is the Project board still held?
+
+    A trace on the registry connection fires when SQLite starts that COMMIT. There an independent reader still sees
+    the old review day, and the platform change is tried at once; it can land only if the board is free. The board's
+    release is observed too: it returns whether the section's registry transaction was still open then, and the day.
+    With *before_lock* the change lands just before the board lock, so the section ends in a ROLLBACK instead.
+    """
+    original, lock_board, registries, released = review.write_txn, review._lock_board, [], []
+
+    @contextlib.contextmanager
+    def traced(conn):
+        if seen or not any(frame.function in {"_store_review_result", "_settle_quiet"} for frame in inspect.stack(0)):
+            with original(conn):
+                yield conn
+            return
+        registries.append(conn)
+
+        def at_statement(statement):
+            if seen or statement.strip().upper() != "COMMIT":
+                return
+            held = _board_write_lock_held(project)
+            seen.append({"day": _reviewed_day(root, project), "held": held})
+            if not held:
+                _platform_change(project, card, change)
+
+        conn.set_trace_callback(at_statement)
+        try:
+            with original(conn):
+                yield conn
+        finally:
+            conn.set_trace_callback(None)
+
+    class Held:
+        """The board lock; its release notes whether the registry transaction had ended by then."""
+
+        def __init__(self, path):
+            if before_lock:
+                _platform_change(project, card, change)
+            self.conn = lock_board(path)
+
+        def rollback(self):
+            released.append({"open": registries[-1].in_transaction, "day": _reviewed_day(root, project)})
+            self.conn.rollback()
+
+        def close(self):
+            self.conn.close()
+
+    monkeypatch.setattr(review, "write_txn", traced)
+    monkeypatch.setattr(review, "_lock_board", Held)
+    return released
+
+
+@pytest.mark.parametrize("change", ["none", "new_wait", "new_suggestion", "answer_wait", "decided_suggestion"])
+def test_review_finding_806862cb_owner_decisions_are_kept_out_until_the_registry_commit_ends(root, monkeypatch, change):
+    """Point 5 at the real end of the transaction: the board is held until the registry's COMMIT has finished."""
+    if change == "decided_suggestion":
+        project, card, review_task = _completed_suggestion_review(root, monkeypatch)
+    else:
+        project, card, _other, review_task = _completed_review(root, monkeypatch, wait=change == "answer_wait")
+    seen = []
+    released = _at_the_registry_commit(monkeypatch, root, project, card, change, seen)
+
+    review.review_tick(NOW + 1)
+
+    # The COMMIT was issued and had not ended: an independent reader still saw the old review day.
+    assert [item["day"] for item in seen] == ["2026-11-08"]
+    if change != "none":
+        assert seen[0]["held"], "the board was free before the registry COMMIT ended"
+    # The board was released only once that COMMIT had finished.
+    assert released == [{"open": False, "day": "2026-11-09"}]
+    # Kept out until the commit ended: the stored texts are those of the frozen set, and the change follows them.
+    stored = _review_stores(root, project)
+    assert stored["state"][:3] == (None, "2026-11-09", 0)
+    assert dict(stored["tasks"])[review_task] == "archived"
+    pointer = {"answer_wait": "An answer is waiting on Decisions.", "decided_suggestion": "A suggestion is waiting on Decisions."}
+    assert stored["brief"]["needs_you"] == pointer.get(change)
+    assert stored["summary"]["owner_decision"] == pointer.get(change)
+    # Once the COMMIT has ended, the board is free again.
+    assert not _board_write_lock_held(project)
+    _platform_change(project, card, change)
+
+
+@pytest.mark.parametrize("change", ["new_wait", "new_suggestion", "answer_wait", "decided_suggestion"])
+def test_review_finding_806862cb_a_stale_result_holds_the_board_until_the_registry_rollback_ends(root, monkeypatch, change):
+    """The section's other end: a change just before the board lock makes the result stale inside the section, and
+    the board is released only after the registry's ROLLBACK has finished."""
+    if change == "decided_suggestion":
+        project, card, review_task = _completed_suggestion_review(root, monkeypatch)
+    else:
+        project, card, _other, review_task = _completed_review(root, monkeypatch, wait=change == "answer_wait")
+    before = _review_stores(root, project)
+    seen = []
+    released = _at_the_registry_commit(monkeypatch, root, project, card, change, seen, before_lock=True)
+
+    review.review_tick(NOW + 1)
+
+    # The section issued no COMMIT; its ROLLBACK had finished when the board was released.
+    assert seen == [] and released == [{"open": False, "day": "2026-11-08"}]
+    _stale_outcome(root, project, before, review_task)
+    assert not _board_write_lock_held(project)
+
+
+@pytest.mark.parametrize("change", ["none", "new_wait", "new_suggestion"])
+def test_review_finding_806862cb_a_quiet_day_holds_the_board_until_the_registry_commit_ends(root, monkeypatch, change):
+    """The quiet writer uses the same section: no owner decision can land between its last read and its COMMIT's end."""
+    project = _quiet_project(root)
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
+        card = board.execute("SELECT id FROM tasks LIMIT 1").fetchone()[0]
+    seen = []
+    released = _at_the_registry_commit(monkeypatch, root, project, card, change, seen)
+
+    assert review.review_tick(NOW) == 0
+
+    assert [item["day"] for item in seen] == ["2026-11-08"]
+    if change != "none":
+        assert seen[0]["held"], "the board was free before the quiet day's registry COMMIT ended"
+    assert released == [{"open": False, "day": "2026-11-09"}]
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        brief = projects_db.get_project_review_brief(registry, project.id)
+        day = registry.execute(
+            "SELECT last_reviewed_date FROM project_review_state WHERE project_id=?", (project.id,),
+        ).fetchone()[0]
+    assert brief["quiet"] is True and day == "2026-11-09"
+    # The quiet day was settled while no owner decision was new; the change lands after its COMMIT has ended.
+    assert not _board_write_lock_held(project)
+    _platform_change(project, card, change)
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
+        assert len(review._owner_decisions(board, project.id)["waits" if change == "new_wait" else "suggestions"]) == (
+            change != "none"
+        )
+
+
+def test_review_finding_806862cb_the_protected_section_does_not_join_a_callers_registry_transaction(root):
+    """Joined, the section's end would commit nothing: the caller's COMMIT would come after the board's release."""
+    project = _quiet_project(root)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        with review.write_txn(registry):
+            with pytest.raises(RuntimeError, match="its own registry transaction"):
+                with review._protected_section(registry, project):
+                    pass
+            assert not _board_write_lock_held(project)
+        assert not registry.in_transaction
+
+
+@pytest.mark.parametrize("outcome", ["stale", "malformed", "blocked", "failed", "stored_after_a_storage_fault"])
+def test_review_finding_7ce464ae_the_one_more_review_after_a_stale_result_is_used_whatever_its_outcome(
+    root, monkeypatch, caplog, outcome,
+):
+    """Point 6: the further review of the day is used once it is published, however it ends; no third review runs."""
+    project, card, _other, review_task = _completed_review(root, monkeypatch)
+    _platform_change(project, card, "new_wait")
+    assert review.review_tick(NOW + 1) == 1
+    further = _open_review(root, project)
+    assert further not in {None, review_task}
+    summaries = kanban_db.kanban_db_path(board="project-summaries")
+    if outcome == "stale":
+        _complete_review(further, [{"item": card, "class": "still actionable", "evidence": [f"decisions:wait:{card}"]}])
+        with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
+            _suggestion(board, project, subject="late-catering", label="Choose a late caterer")
+    elif outcome == "stored_after_a_storage_fault":
+        _complete_review(further, [{"item": card, "class": "still actionable", "evidence": [f"decisions:wait:{card}"]}])
+    else:
+        with kanban_db.connect_closing(summaries, board="project-summaries") as board:
+            if outcome == "malformed":
+                assert kanban_db.claim_task(board, further) is not None
+                assert kanban_db.complete_task(board, further, summary="Finished without a typed result.", metadata={})
+            elif outcome == "blocked":
+                assert kanban_db.claim_task(board, further) is not None
+                assert kanban_db.block_task(board, further, reason="The review cannot finish.")
+            else:
+                assert kanban_db.archive_task(board, further)
+    if outcome == "stored_after_a_storage_fault":
+        # A busy store is no verdict: the same completed task is harvested again by a later tick.
+        evidence = review._review_evidence_board
+
+        @contextlib.contextmanager
+        def busy(project_id):
+            raise sqlite3.OperationalError("database is locked")
+            yield
+
+        monkeypatch.setattr(review, "_review_evidence_board", busy)
+        assert review.review_tick(NOW + 2) == 0
+        assert _open_review(root, project) == further
+        monkeypatch.setattr(review, "_review_evidence_board", evidence)
+    review.review_tick(NOW + 3)
+
+    state = dict(_latest_state(root, project))
+    if outcome == "stored_after_a_storage_fault":
+        assert (state["last_reviewed_date"], state["failures"]) == ("2026-11-09", 0)
+    else:
+        assert state["last_reviewed_date"] == "2026-11-08"
+        # The normal failure counter counts a failed attempt as before; a stale one is no failure.
+        assert state["failures"] == (0 if outcome == "stale" else 1)
+    # After the backoff of one failure, no later tick of that Vienna day publishes a third review.
+    assert review.review_tick(NOW + 3 * 3600) == 0
+    assert review.review_tick(NOW + 9 * 3600) == 0
+    assert _open_review(root, project) is None
+    with kanban_db.connect_closing(summaries, board="project-summaries") as board:
+        made = board.execute("SELECT COUNT(*) FROM tasks WHERE created_by=?", (review.CREATED_BY,)).fetchone()[0]
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        spent = review.budget(registry, "2026-11-09")[0]
+    assert (made, spent) == (2, 2)
+    # The next Vienna day is eligible again.
+    monkeypatch.setattr(time, "time", lambda: NOW + 86400)
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
+        kanban_db.add_comment(board, card, "default", "Please book the room today.")
+    assert review.review_tick(NOW + 86400) == 1
+
+
+def _latest_state(root, project):
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        return registry.execute("SELECT * FROM project_review_state WHERE project_id=?", (project.id,)).fetchone()
+
+
+@pytest.mark.parametrize("last_row", ["as_stored", "classification_only"])
+def test_review_finding_35bf089d_open_work_that_fits_starts_its_review_under_long_last_review_texts(
+    root, monkeypatch, caplog, last_row
+):
+    """Point 2: only the open items of the last review are required; its texts and ready work are expendable.
+
+    The reviewer's state: open cards whose classification, in the empty record's envelope, fits the live input cap,
+    under a last review with long permitted texts. The control gives the record that classification alone.
+    """
+    from tools.budget_config import DEFAULT_BUDGET
+
+    project = _quiet_project(root)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    # The cap the review tick freezes with.
+    cap = int(DEFAULT_BUDGET.resolve_threshold("kanban_show")) // 4
+    classification = []
+    path = kanban_db.kanban_db_path(board=project.board_slug)
+    with kanban_db.connect_closing(path, board=project.board_slug) as board:
+        for n in range(400):
+            title = f"Prepare room {n}" + (" with the agreed furniture and catering arrangements" if n < 5 else "")
+            tid = kanban_db.create_task(board, title=title, project_id=project.id)
+            classification.append({"item": tid, "class": "still actionable", "evidence": [f"tasks:{tid}"],
+                                   "event_revision": kanban_db.task_event_revision(board, tid), "actor": "worker"})
+            sources = {name: [] for name in records._SOURCES}
+            sources["earlier_reviews"] = [{"classification": classification}]
+            required = records._freeze(sources, [], max_bytes=10**9)["size"]
+            if required >= cap - 1000:
+                break
+        kanban_db.add_comment(board, classification[0]["item"], "default", "The room arrangement changed.")
+    # The required part alone fits, with a small cushion for the cut lines.
+    assert cap - 1000 <= required < cap
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        projects_db.write_project_review_brief(
+            registry, project.id, review_date="2026-11-08", covered_from=None, covered_to="2026-11-08",
+            headline=("The room plan now has confirmed work and dates. " * 3)[:120],
+            what_changed=("Book the room remains open and the venue work is scheduled. " * 7)[:400],
+            next_step=("Prepare the rooms in the agreed order and confirm the dates. " * 5)[:240],
+            ready_work=review._ready_work(project), classification=classification, written_at=NOW - 86400,
+        )
+    if last_row == "classification_only":
+        registry_record = records._registry_record
+
+        def classification_only(root_arg, project_arg, last_review, sources, cuts):
+            cursor = registry_record(root_arg, project_arg, last_review, sources, cuts)
+            sources["earlier_reviews"][0] = {"classification": sources["earlier_reviews"][0]["classification"]}
+            return cursor
+
+        monkeypatch.setattr(records, "_registry_record", classification_only)
+
+    assert review.review_tick(NOW) == 1
+
+    state = _latest_state(root, project)
+    assert (state["input_too_large_date"], state["failures"]) == (None, 0)
+    assert "review_input_too_large" not in caplog.text
+    body = _frozen_body(state["open_task_id"])
+    assert len(body.encode("utf-8")) < 2 * cap
+    sources, _ = review._frozen_sources(body)
+    # No required item is left out: the last review's classification is frozen whole and in its order.
+    assert [item["item"] for item in sources["earlier_reviews"][0]["classification"]] == [
+        item["item"] for item in classification
+    ]
+    assert set(sources["earlier_reviews"][0]) == {"classification"}
+    if last_row == "as_stored":
+        # The cap removed the other fields of that row in their fixed order, and said so.
+        assert "Left out: 10 of 10 fields of the last review besides its open items." in body
+    # The acceptance boundary still holds every open item.
+    _complete_review(state["open_task_id"], _worker_claims(sources))
+    assert review.review_tick(NOW + 1) == 0
+    latest, state = _latest_classification(root, project)
+    assert (state["failures"], state["last_reviewed_date"]) == (0, "2026-11-09")
+    assert all(latest[item["item"]] == "still actionable" for item in classification)
+
+
+# Owner rule 2, point 5: the review's round-3 regressions (test_b5_round3_independent.py, test_b5_round3_siblings.py,
+# test_b5_round3_required_control.py), case by case. test_round3_acceptance_<name> holds the probe's test_<name>.
+
+
+@pytest.fixture
+def round3_root(root):
+    """The probes' root: this file's root with its default board."""
+    kanban_db.create_board(slug=kanban_db.DEFAULT_BOARD, name="Default")
+    return root
+
+
+def _round3_drive(monkeypatch, instant):
+    """One tick of the gateway's dispatcher loop, whose review tick runs at ``instant``, as the probes drive it.
+
+    A copy of ``_Loop`` and ``_drive`` of tests/gateway/test_kanban_watchers_review_tick.py for one clock: a stubbed
+    sleep, a stand-in for the worker spawn, and the real summary and review tick inside the loop's threads.
+    """
+    import asyncio
+
+    import hermes_cli.config as cfg_mod
+    from gateway.run import GatewayRunner
+
+    jobs = []
+    # No PID: the card stays running, and no worker process starts.
+    monkeypatch.setattr(kanban_db, "_default_spawn", lambda task, workspace, board=None: None)
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    config = {"dispatch_in_gateway": True, "dispatch_interval_seconds": 1, "auto_decompose": False}
+    monkeypatch.setattr(cfg_mod, "load_config", lambda: {"kanban": dict(config)})
+    review_tick = review.review_tick
+
+    def at_instant(*args, **kwargs):
+        with pytest.MonkeyPatch.context() as clock:
+            clock.setattr(time, "time", lambda: instant)
+            return review_tick(*args, **kwargs)
+
+    async def to_thread(fn, *args, **kwargs):
+        if getattr(fn, "__name__", "") == "reap_worker_zombies":
+            jobs.append(fn)
+            runner._running = False  # the rest of this tick still runs; the next one never starts
+        return fn(*args, **kwargs)
+
+    async def sleep(_delay):
+        return None
+
+    monkeypatch.setattr("gateway.run.asyncio.to_thread", to_thread)
+    monkeypatch.setattr("gateway.run.asyncio.sleep", sleep)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(review, "review_tick", at_instant)
+        asyncio.run(asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=120.0))
+    assert len(jobs) == 1
+
+
+def _round3_setup_result(root, monkeypatch, *, wait=False):
+    """The probes' completed review: news on the card (and its owner wait), the review published by the dispatcher
+    at NOW and completed with a typed result, not yet harvested."""
+    project = _quiet_project(root)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
+        card = board.execute("SELECT id FROM tasks LIMIT 1").fetchone()[0]
+        kanban_db.add_comment(board, card, "default", "The room is chosen.")
+        if wait:
+            assert kanban_db.block_task(board, card, reason="Which room?", kind="needs_input")
+    _round3_drive(monkeypatch, NOW)
+    task = _open_review(root, project)
+    assert task
+    payload = {
+        "summary": {"outcome": "The meeting has a room.", "next_action": "Book the chosen room.", "owner_decision": None},
+        "brief": {"headline": "The room is chosen.", "what_changed": "Book the room now has a chosen room.",
+                  "next_step": "Book the chosen room.", "needs_you": None},
+        "classification": (
+            [{"item": card, "class": "still actionable", "evidence": [f"decisions:wait:{card}"]}] if wait else []
+        ),
+        "proposed_closures": [],
+    }
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board="project-summaries"), board="project-summaries") as board:
+        assert kanban_db.claim_task(board, task)
+        assert kanban_db.complete_task(board, task, summary="Reviewed the meeting.", metadata={"project_review": payload})
+    return project, card, task
+
+
+def _round3_snapshot(root, project, task):
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        state = dict(registry.execute("SELECT * FROM project_review_state WHERE project_id=?", (project.id,)).fetchone())
+        brief = projects_db.get_project_review_brief(registry, project.id)
+        summary = projects_db.get_project_summary(registry, project.id)
+        budget = tuple(registry.execute("SELECT project_reviews,portfolio_reviews FROM review_budget").fetchone())
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board="project-summaries"), board="project-summaries") as board:
+        task_status = kanban_db.get_task(board, task).status
+    return {"state": state, "brief": brief, "summary": summary, "budget": budget, "task_status": task_status}
+
+
+def _round3_mutate(project, card, change):
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
+        if change == "new_wait":
+            assert kanban_db.block_task(board, card, reason="Which room should be booked?", kind="needs_input")
+        elif change == "new_suggestion":
+            _suggestion(board, project, subject="late-catering", label="Choose a caterer")
+        elif change == "answer_wait":
+            assert kanban_db.unblock_task(board, card)
+
+
+def _round3_install_commit_probe(monkeypatch, root, project, card, change, observations):
+    """The probes' hook: after the whole protected body has unwound, before its registry transaction COMMITs.
+
+    There an independent registry reader gives the published day, and a second board connection tries the write lock;
+    if it gets it, the platform change commits right there.
+    """
+    original = review.write_txn
+
+    @contextlib.contextmanager
+    def at_actual_commit(conn):
+        target = any(frame.function in {"_store_review_result", "_settle_quiet"} for frame in inspect.stack(0))
+        with original(conn):
+            yield conn
+            if target and not observations:
+                published_day = _reviewed_day(root, project)
+                board_locked = _board_write_lock_held(project)
+                observations.append({"registry_in_transaction": conn.in_transaction, "published_day": published_day,
+                                     "board_locked": board_locked})
+                if not board_locked:
+                    _round3_mutate(project, card, change)
+                    observations[-1]["mutation_committed_before_review_commit"] = change != "none"
+
+    monkeypatch.setattr(review, "write_txn", at_actual_commit)
+
+
+@pytest.mark.parametrize("change", ["none", "new_wait", "new_suggestion", "answer_wait"])
+def test_round3_acceptance_owner_decisions_are_fenced_until_the_actual_registry_commit(round3_root, monkeypatch, change):
+    root = round3_root
+    project, card, task = _round3_setup_result(root, monkeypatch, wait=change == "answer_wait")
+    observations = []
+    _round3_install_commit_probe(monkeypatch, root, project, card, change, observations)
+    _round3_drive(monkeypatch, NOW + 1)
+    out = _round3_snapshot(root, project, task)
+    assert observations and observations[0]["registry_in_transaction"]
+    assert observations[0]["published_day"] == "2026-11-08"
+    if change == "none":
+        assert out["brief"] and out["state"]["last_reviewed_date"] == "2026-11-09"
+    else:
+        assert observations[0]["board_locked"] or out["brief"] is None, (
+            "the platform committed an owner decision before the review COMMIT, but the kernel accepted stale texts "
+            "and marked the day reviewed"
+        )
+
+
+@pytest.mark.parametrize("change", ["none", "new_wait", "new_suggestion"])
+def test_round3_acceptance_quiet_brief_is_fenced_until_the_actual_registry_commit(round3_root, monkeypatch, change):
+    root = round3_root
+    project = _quiet_project(root)
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
+        card = board.execute("SELECT id FROM tasks LIMIT 1").fetchone()[0]
+    observations = []
+    _round3_install_commit_probe(monkeypatch, root, project, card, change, observations)
+    _round3_drive(monkeypatch, NOW)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        brief = projects_db.get_project_review_brief(registry, project.id)
+        state = dict(registry.execute("SELECT * FROM project_review_state WHERE project_id=?", (project.id,)).fetchone())
+    assert observations and observations[0]["registry_in_transaction"]
+    if change == "none":
+        assert brief["quiet"] and state["last_reviewed_date"] == "2026-11-09"
+    else:
+        assert observations[0]["board_locked"] or brief is None, (
+            "a quiet-day brief committed over a newly committed owner decision before the actual review COMMIT"
+        )
+
+
+def test_round3_acceptance_only_one_additional_review_runs_after_stale_even_if_its_result_is_malformed(
+    round3_root, monkeypatch,
+):
+    root = round3_root
+    project, card, task = _round3_setup_result(root, monkeypatch)
+    _round3_mutate(project, card, "new_wait")
+    _round3_drive(monkeypatch, NOW + 1)
+    after_stale = _round3_snapshot(root, project, task)
+    further = after_stale["state"]["open_task_id"]
+    assert further and further != task and after_stale["state"]["failures"] == 0
+    summaries = kanban_db.kanban_db_path(board="project-summaries")
+    with kanban_db.connect_closing(summaries, board="project-summaries") as board:
+        assert kanban_db.claim_task(board, further)
+        assert kanban_db.complete_task(board, further, summary="Review attempt finished without a typed result.", metadata={})
+    _round3_drive(monkeypatch, NOW + 2)
+    _round3_drive(monkeypatch, NOW + 3 * 3600)
+    out = _round3_snapshot(root, project, task)
+    with kanban_db.connect_closing(summaries, board="project-summaries") as board:
+        made = [dict(row) for row in board.execute(
+            "SELECT id,status,idempotency_key FROM tasks WHERE created_by=?", (review.CREATED_BY,),
+        )]
+    assert out["state"]["open_task_id"] is None and len(made) == 2, (
+        "the second attempt failed validation, then a third budgeted review ran on the same Vienna day"
+    )
+
+
+def test_round3_acceptance_a_decided_suggestion_cannot_land_before_the_review_commit(round3_root, monkeypatch):
+    root = round3_root
+    project = _quiet_project(root)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
+        suggestion = _suggestion(board, project)
+    _round3_drive(monkeypatch, NOW)
+    task = _open_review(root, project)
+    _complete_review(task, [{"item": suggestion, "class": "still actionable", "evidence": [f"suggestions:{suggestion}"]}])
+    original, seen = review.write_txn, []
+
+    @contextlib.contextmanager
+    def at_commit(conn):
+        target = any(frame.function == "_store_review_result" for frame in inspect.stack(0))
+        with original(conn):
+            yield conn
+            if target and not seen:
+                locked = _board_write_lock_held(project)
+                seen.append({"registry_in_transaction": conn.in_transaction, "board_locked": locked})
+                if not locked:
+                    path = kanban_db.kanban_db_path(board=project.board_slug)
+                    with kanban_db.connect_closing(path, board=project.board_slug) as board:
+                        kanban_db.decide_recommendation_on_owner_screen(
+                            board, suggestion, decision="rejected", reason="Keep the current room.",
+                            actor="raphael-owner", owner_screen_ref="owner-workspace:decisions",
+                            expected_lifecycle_version=0,
+                        )
+
+    monkeypatch.setattr(review, "write_txn", at_commit)
+    _round3_drive(monkeypatch, NOW + 1)
+    out = _round3_snapshot(root, project, task)
+    assert seen and (seen[0]["board_locked"] or out["brief"] is None), (
+        "the owner rejected the suggestion before the registry COMMIT, but the accepted brief still says a decision "
+        "is pending"
+    )
+
+
+def _round3_fitting_required_items(root, monkeypatch):
+    """The siblings probe's state: open cards whose classification, in the empty record's envelope, fits the live
+    25,000-byte cap, under a last review with long permitted texts; one dispatcher tick must open their review."""
+    project = _quiet_project(root)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    cap = 25000
+    classification = []
+    path = kanban_db.kanban_db_path(board=project.board_slug)
+    with kanban_db.connect_closing(path, board=project.board_slug) as board:
+        for i in range(250):
+            title = (f"Prepare room {i} with the agreed furniture and catering arrangements for the meeting" if i < 5
+                     else f"Prepare room {i}")
+            tid = kanban_db.create_task(board, title=title, project_id=project.id)
+            classification.append({"item": tid, "class": "still actionable", "evidence": [f"tasks:{tid}"],
+                                   "event_revision": kanban_db.task_event_revision(board, tid), "actor": "worker"})
+            # This exact required classification, plus the real empty-record envelope, fits the live dispatcher cap,
+            # with a small cushion for omission notices.
+            sources = {name: [] for name in records._SOURCES}
+            sources["earlier_reviews"] = [{"classification": classification}]
+            minimal = records._freeze(sources, [], max_bytes=10**9)["size"]
+            if minimal >= 24000:
+                break
+        kanban_db.add_comment(board, classification[0]["item"], "default", "The room arrangement changed.")
+    assert minimal < cap
+    # Legal accepted text and ready-work fields are expendable under owner rule point 2.
+    headline = ("The room plan now has confirmed work and dates. " * 3)[:120]
+    changed = ("Book the room remains open and the venue work is scheduled. " * 7)[:400]
+    next_step = ("Prepare the rooms in the agreed order and confirm the dates. " * 5)[:240]
+    ready = review._ready_work(project)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        projects_db.write_project_review_brief(
+            registry, project.id, review_date="2026-11-08", covered_from=None, covered_to="2026-11-08",
+            headline=headline, what_changed=changed, next_step=next_step, needs_you=None, ready_work=ready,
+            classification=classification, written_at=NOW - 86400,
+        )
+    _round3_drive(monkeypatch, NOW)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        state = dict(registry.execute("SELECT * FROM project_review_state WHERE project_id=?", (project.id,)).fetchone())
+    assert state["input_too_large_date"] is None and state["open_task_id"] is not None, (
+        "expendable last-review fields caused input too large although all required classification fits the live cap"
+    )
+
+
+def test_round3_acceptance_expendable_last_review_texts_do_not_turn_fitting_required_items_into_input_too_large(
+    round3_root, monkeypatch,
+):
+    _round3_fitting_required_items(round3_root, monkeypatch)
+
+
+def test_round3_acceptance_the_same_required_classification_fits_with_only_expendable_last_row_fields_removed(
+    round3_root, monkeypatch,
+):
+    """Control: the reader drops only the old row's expendable fields, never its classification."""
+    original = records._registry_record
+
+    def without_old_text(root_arg, project, last_review, sources, cuts):
+        cursor = original(root_arg, project, last_review, sources, cuts)
+        if sources["earlier_reviews"]:
+            row = sources["earlier_reviews"][0]
+            sources["earlier_reviews"][0] = {"classification": row["classification"]}
+        return cursor
+
+    monkeypatch.setattr(records, "_registry_record", without_old_text)
+    _round3_fitting_required_items(round3_root, monkeypatch)

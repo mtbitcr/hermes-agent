@@ -587,17 +587,22 @@ def _protected_section(registry: sqlite3.Connection, project: projects_db.Projec
 
     The order is the plan commit's (``commit_project_plan``), so the two never wait on each other. While the section
     holds, no owner wait, answer or suggestion can start, so a read made inside it stays true until its commit ends.
+    The board is released only after the registry's COMMIT or ROLLBACK has finished, outside the transaction.
     """
+    if registry.in_transaction:
+        # A caller's open transaction would commit after the board's release.
+        raise RuntimeError("the protected section needs its own registry transaction")
     path = events._board_path(project.board_slug) if project.board_slug else None
-    with write_txn(registry):
-        # A Project without a board has no owner decision to hold.
-        board = _lock_board(path) if path is not None and path.exists() else None
-        try:
+    board = None
+    try:
+        with write_txn(registry):
+            # A Project without a board has no owner decision to hold.
+            board = _lock_board(path) if path is not None and path.exists() else None
             yield
-        finally:
-            if board is not None:
-                board.rollback()
-                board.close()
+    finally:
+        if board is not None:
+            board.rollback()
+            board.close()
 
 
 def _open_work_missing(registry: sqlite3.Connection, board: sqlite3.Connection, project_id: str,
@@ -1033,10 +1038,11 @@ def _record_open_task(registry: sqlite3.Connection, project_id: str, task: sqlit
         registry.execute(
             "INSERT OR IGNORE INTO project_review_state (project_id, updated_at) VALUES (?, ?)", (project_id, now)
         )
+        # A published further review is used, as when its claim records it (owner rule of 2026-11-11, point 6).
         recorded = registry.execute(
-            "UPDATE project_review_state SET open_task_id = ?, open_review_date = ?, updated_at = ? "
-            "WHERE project_id = ? AND open_task_id IS NULL",
-            (task["id"], review_day, now, project_id),
+            "UPDATE project_review_state SET open_task_id = ?, open_review_date = ?, updated_at = ?, "
+            "stale_refused_key = COALESCE(?, stale_refused_key) WHERE project_id = ? AND open_task_id IS NULL",
+            (task["id"], review_day, now, _further_key(task["idempotency_key"]), project_id),
         ).rowcount
         if recorded == 1:
             _spend(registry, review_day, "project_reviews", None, now)
@@ -1119,6 +1125,7 @@ def _record_stale(
     """Owner rule of 2026-11-11, point 6: a stale result replaces no text and counts no failure.
 
     The refused key names its review day; it allows one further review of that day, whose key ends in ``:again``.
+    The claim of that further review records its own key here, so it is used however it ends.
     """
     if not _archive(board, task.id):
         return
@@ -1238,17 +1245,23 @@ def _due(state: Mapping[str, Any], review_day: str, now: int) -> bool:
         return False
     if state["last_reviewed_date"] is not None and state["last_reviewed_date"] >= review_day:
         return False
-    # The required input did not fit on this day, or its one further review after a stale result was refused too.
+    # The required input did not fit on this day, or the day's one further review after a stale result was published:
+    # whether that one ended stale, malformed, blocked or failed, no other review of the day runs.
     if state["input_too_large_date"] == review_day:
         return False
-    if _again(state, review_day) and str(state["stale_refused_key"]).endswith(":again"):
+    if _again(state, review_day) and _further_key(state["stale_refused_key"]) is not None:
         return False
     return not state["failures"] or now - state["updated_at"] >= summary.backoff_seconds(state["failures"])
 
 
 def _again(state: Mapping[str, Any], review_day: str) -> bool:
-    """Whether a review of this Project's review day was refused as stale, so the next one is its further review."""
+    """Whether a review of this Project's review day was refused as stale (or its further review was published)."""
     return _key_date(state["stale_refused_key"], state["project_id"]) == review_day
+
+
+def _further_key(key: Optional[str]) -> Optional[str]:
+    """The key of a further review after a stale result (it ends in ``:again``), else None."""
+    return key if isinstance(key, str) and key.endswith(":again") else None
 
 
 def _settle_quiet(
@@ -1478,14 +1491,17 @@ def _open_review_task(
     # The claim holds only while the row is the one the key was made from, and only while the day's cap has room;
     # the task is counted in the same transaction. The cursors do not move here: a review moves them when its result
     # is stored, so a failed one leaves its events for the retry. A loser archives its task only if the row does not
-    # record that very task.
+    # record that very task. The claim of the day's further review after a stale result records its key: that review is
+    # used from here on, independently of how it ends and of the failure count (owner rule of 2026-11-11, point 6).
     with write_txn(registry):
         claimed = 0
         if budget(registry, review_day)[0] < cap:
             claimed = registry.execute(
-                "UPDATE project_review_state SET open_task_id = ?, open_review_date = ?, updated_at = ? "
+                "UPDATE project_review_state SET open_task_id = ?, open_review_date = ?, updated_at = ?, "
+                "stale_refused_key = COALESCE(?, stale_refused_key) "
                 "WHERE project_id = ? AND open_task_id IS NULL AND failures = ? AND last_reviewed_date IS ?",
-                (task_id, review_day, now, project.id, state["failures"], state["last_reviewed_date"]),
+                (task_id, review_day, now, _further_key(made.idempotency_key), project.id, state["failures"],
+                 state["last_reviewed_date"]),
             ).rowcount
             if claimed == 1:
                 _spend(registry, review_day, "project_reviews", None, now)

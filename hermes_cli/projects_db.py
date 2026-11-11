@@ -160,7 +160,8 @@ CREATE TABLE IF NOT EXISTS project_summary_state (
 -- quiet days count from it), the one open review task and the failure count.
 -- Dates are Vienna calendar dates, 'YYYY-MM-DD'. The optional conversation cursor also upgrades earlier review stores.
 -- input_too_large_date is the day whose required review input did not fit the cap: no review ran that day.
--- stale_refused_key is the key of the last review refused as stale; it allows one further review of its day.
+-- stale_refused_key is the key of the last review refused as stale; it allows one further review of its day. The
+-- claim of that further review stores its own key (ending ':again') here: the day's one further review is used then.
 CREATE TABLE IF NOT EXISTS project_review_state (
     project_id         TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
     event_cursor       INTEGER NOT NULL DEFAULT 0,
