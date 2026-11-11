@@ -13163,6 +13163,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 OWNER_PROJECT_SUMMARY_CAPABILITY,
                 OWNER_WAITING_CAPABILITY,
                 PROVIDER_WAIT_CAPABILITY,
+                WORK_ITEM_CAPABILITY,
                 read_project_snapshot,
                 resolve_owner_context,
             )
@@ -13176,7 +13177,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 else {}
             )
-            # The same for provider_wait_v1, delivery_state_v1 and delivery_outcome_v1.
+            # The same for provider_wait_v1, delivery_state_v1,
+            # delivery_outcome_v1 and work_item_v1.
             if _owner_workspace_capability_requested(
                 request, PROVIDER_WAIT_CAPABILITY
             ):
@@ -13189,6 +13191,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, DELIVERY_OUTCOME_CAPABILITY
             ):
                 waiting["delivery_outcome"] = True
+            if _owner_workspace_capability_requested(
+                request, WORK_ITEM_CAPABILITY
+            ):
+                waiting["work_item"] = True
             if _owner_workspace_capability_requested(
                 request, OWNER_PROJECT_SUMMARY_CAPABILITY
             ):

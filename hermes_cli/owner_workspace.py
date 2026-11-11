@@ -2738,6 +2738,11 @@ DELIVERY_STATE_CAPABILITY = "delivery_state_v1"
 # gets each card's ``delivery_outcome``: what happened to its latest delivered
 # change, with the repository, pull request and link, or None.
 DELIVERY_OUTCOME_CAPABILITY = "delivery_outcome_v1"
+# A separately negotiated contour for repeated attempts at the same work.
+# Without it every card and run keeps today's shape exactly; only a reader
+# naming it gets each card's and each run's ``work_item``: the key of the work
+# it is an attempt at, and whether it is that work's current attempt.
+WORK_ITEM_CAPABILITY = "work_item_v1"
 # A separately negotiated contour for Raphael's own summary of a Project. The
 # oldest owner reader validates a closed snapshot schema, so a new key may not
 # appear unasked: without it the snapshot keeps today's shape exactly, and only
@@ -3514,6 +3519,7 @@ def read_project_snapshot(
     delivery_state: bool = False,
     delivery_outcome: bool = False,
     project_summary: bool = False,
+    work_item: bool = False,
 ) -> dict:
     """Return one bounded read-only surface for an exact receipt-owned Project.
 
@@ -3556,6 +3562,13 @@ def read_project_snapshot(
     off so the card shape stays exactly today's; see
     ``DELIVERY_OUTCOME_CAPABILITY``. Each run then carries the same value for
     its own task, found by the run's native task id and never by title.
+
+    ``work_item`` gives each card ``work_item``: its work item's key and
+    whether it is the item's current attempt, as
+    ``kanban_work_items.work_item_keys`` gives them; it defaults off so the
+    card shape stays exactly today's; see ``WORK_ITEM_CAPABILITY``. Each run
+    then carries its own task's key, found by the run's native task id and
+    never by title, and is current only as the newest run of the current card.
 
     ``project_summary`` adds ``raphael_summary``: Raphael's summary of the
     Project (the outcome now, the next action and, only when one waits, the
@@ -3790,6 +3803,18 @@ def read_project_snapshot(
             run_outcomes.update(delivery_outcomes(conn, {
                 str(run.task_id) for run in bounded_run_objects
             } - outcomes.keys()))
+        # One batched read for the visible cards and the listed runs' tasks
+        # together, so a card and its runs never come from two reads.
+        items = {}
+        if work_item:
+            from hermes_cli.kanban_work_items import work_item_keys
+
+            items = work_item_keys(conn, [
+                *task_ids, *(str(run.task_id) for run in bounded_run_objects),
+            ])
+            for column in columns.values():
+                for card in column:
+                    card["work_item"] = items[card["id"]]
         runs: list[dict] = []
         task_ids_with_newer_run: set[str] = set()
         for row, run in zip(run_rows[:_OWNER_PROJECT_MAX_RUNS], bounded_run_objects):
@@ -3812,6 +3837,14 @@ def read_project_snapshot(
             )
             if delivery_outcome:
                 runs[-1]["delivery_outcome"] = run_outcomes.get(run_task_id)
+            if work_item:
+                # Current only as the newest run of the item's current card,
+                # decided in the same walk as has_newer_run.
+                runs[-1]["work_item"] = {
+                    "key": items[run_task_id]["key"],
+                    "current": items[run_task_id]["current"]
+                    and run_task_id not in task_ids_with_newer_run,
+                }
             task_ids_with_newer_run.add(run_task_id)
     except OwnerWorkspaceError:
         raise
