@@ -15,7 +15,7 @@ from tests.gateway.test_api_server_owner_review_advice import accepted_advice, a
 from tests.hermes_cli.test_owner_project_review_record import root  # noqa: F401
 from tests.hermes_cli.test_owner_workspace import ctx  # noqa: F401
 
-HINT = "Ask Raphael in the Project chat: Wait for the venue confirmation"
+HINT = "Ask Raphael in the Project chat to postpone Book the room."
 SOURCE_FIELDS = ("source_task_id", "source_run_id", "source_digest")
 
 
