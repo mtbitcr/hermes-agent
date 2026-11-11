@@ -1,0 +1,10 @@
+{
+  "body": {
+    "data": {
+      "decision_ref": "decision_2c8ef98ab278c0648b9477152e4e9376",
+      "undone": true
+    },
+    "object": "hermes.owner_workspace.closure_undo"
+  },
+  "status": 200
+}

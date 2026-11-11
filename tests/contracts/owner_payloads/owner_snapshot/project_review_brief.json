@@ -1,0 +1,138 @@
+{
+  "body": {
+    "data": {
+      "attachments": [],
+      "board": {
+        "counts": {
+          "archived": 0,
+          "blocked": 0,
+          "done": 0,
+          "ready": 0,
+          "review": 0,
+          "running": 0,
+          "scheduled": 0,
+          "todo": 0,
+          "triage": 0
+        },
+        "name": "Meeting Plan",
+        "project_id": "p_d4bbc0be1245ecab177b6ec4",
+        "slug": "meeting-plan",
+        "total": 0
+      },
+      "columns": [
+        {
+          "name": "triage",
+          "tasks": []
+        },
+        {
+          "name": "todo",
+          "tasks": []
+        },
+        {
+          "name": "scheduled",
+          "tasks": []
+        },
+        {
+          "name": "ready",
+          "tasks": []
+        },
+        {
+          "name": "running",
+          "tasks": []
+        },
+        {
+          "name": "blocked",
+          "tasks": []
+        },
+        {
+          "name": "review",
+          "tasks": []
+        },
+        {
+          "name": "done",
+          "tasks": []
+        }
+      ],
+      "project": {
+        "archived": false,
+        "board": "meeting-plan",
+        "description": null,
+        "id": "p_d4bbc0be1245ecab177b6ec4",
+        "name": "Meeting Plan",
+        "slug": "meeting-plan"
+      },
+      "raphael_review": {
+        "history": [
+          {
+            "headline": "The room is booked.",
+            "review_date": "2026-11-10"
+          }
+        ],
+        "latest": {
+          "covered_from": "2026-11-09",
+          "covered_to": "2026-11-10",
+          "cut_note": null,
+          "headline": "The room is booked.",
+          "needs_you": null,
+          "next_step": "Send the invitations.",
+          "quiet": false,
+          "ready_work": [
+            "Send the invitations"
+          ],
+          "review_date": "2026-11-10",
+          "revision": 1,
+          "what_changed": "The room booking is complete.",
+          "written_at": 1794294000
+        }
+      },
+      "raphael_summary": {
+        "next_action": "Send the invitations.",
+        "outcome": "The room is booked.",
+        "owner_decision": null,
+        "revision": 1,
+        "written_at": 1794294000
+      },
+      "runs": [],
+      "steward": {
+        "active_work": [],
+        "counts": {
+          "awaiting_review": 0,
+          "completed_in_window": 0,
+          "needs_attention": 0,
+          "open": 0
+        },
+        "decisions_needed": [],
+        "execution": {
+          "paused": false,
+          "state": "waiting_for_approval",
+          "summary": "Raphael is waiting for an approved milestone before starting work."
+        },
+        "generated_at": "2026-11-10T07:00:00Z",
+        "lookback_days": 7,
+        "needs_attention": [],
+        "progress": [],
+        "project": {
+          "name": "Meeting Plan"
+        },
+        "schema_version": 2,
+        "stale_candidates": [],
+        "truncated": {
+          "active_work": false,
+          "decisions_needed": false,
+          "needs_attention": false,
+          "progress": false,
+          "stale_candidates": false
+        }
+      },
+      "truncated": {
+        "attachments": false,
+        "runs": false,
+        "tasks": false,
+        "workers": false
+      },
+      "workers": []
+    },
+    "object": "hermes.owner_workspace.project_snapshot"
+  },
+  "status": 200
+}

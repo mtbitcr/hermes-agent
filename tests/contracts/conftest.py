@@ -279,6 +279,8 @@ CLOSED_VOCABULARIES = (
         "hermes.owner_workspace.decision_list", "hermes.owner_workspace.decision",
         "hermes.owner_workspace.design_options", "hermes.owner_workspace.design_choice",
         "hermes.owner_workspace.release_decision",
+        # api_server_owner_closures.py returns this object after a fenced Undo.
+        "hermes.owner_workspace.closure_undo",
     })),
     # owner_workspace.py:3906, :3914, :3919; api_server.py:13240
     ("owner_decisions", (_DECISION_LIST, "data", "kind"),
