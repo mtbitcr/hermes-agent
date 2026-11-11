@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1126,3 +1128,315 @@ def test_a_legacy_board_without_the_closure_table_lists_its_pending_suggestions(
 
     state = kb.recommendation_lifecycle_snapshot(board.execute("SELECT * FROM tasks WHERE id=?", (suggestion,)).fetchone())
     assert review._owner_decisions(board, pid)["suggestions"] == [[suggestion, state["effective_state"], version]]
+
+
+# Owner rule of 2026-11-11, round 3: only the finish archives the done task of an accepted review.
+
+
+def _accepted_review(root, monkeypatch, publications):
+    """A stored review whose closures wait for a busy board; ``publications`` records each publication's arguments."""
+    publish = review._open_review_task
+
+    def recorded(*args):
+        publications.append(args)
+        return publish(*args)
+
+    monkeypatch.setattr(review, "_open_review_task", recorded)
+    project, task_id, made = _completed_review(root, monkeypatch)
+    with monkeypatch.context() as busy:
+        busy.setattr(review, "_apply_review_closures", lambda *args: False)
+        review.review_tick(NOW + 1)
+    assert _stored(root, project)[0] == (None, "2026-11-10", 0)
+    assert _review_task_status(task_id) == "done" and _closures(project) == []
+    return project, task_id, made
+
+
+def _losing_publication(root, publication, now, **changes):
+    """A publication from the state read before the acceptance: its claim loses."""
+    _, _, (project, state, batch), review_day, cap, _ = publication
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        with kb.connect_closing(kb.kanban_db_path(board="project-summaries"), board="project-summaries") as reviews:
+            return review._open_review_task(registry, reviews, (project, dict(state, **changes), batch), review_day,
+                                            cap, now)
+
+
+@pytest.mark.parametrize("place", ["stale", "failure", "retirement", "losing publication"])
+def test_no_place_but_the_finish_archives_an_accepted_review_and_the_finish_closes_once(root, monkeypatch, place):
+    publications = []
+    project, task_id, made = _accepted_review(root, monkeypatch, publications)
+    stored = _registry_rows(root, project)
+
+    if place == "losing publication":
+        assert _losing_publication(root, publications[0], NOW + 2) is False
+    else:
+        with projects_db.connect_closing(root / "projects.db") as registry:
+            with kb.connect_closing(kb.kanban_db_path(board="project-summaries"), board="project-summaries") as reviews:
+                task = kb.get_task(reviews, task_id)
+                if place == "stale":
+                    review._record_stale(registry, reviews, project.id, task, NOW + 2)
+                elif place == "failure":
+                    review._record_failure(registry, reviews, project.id, task_id, NOW + 2)
+                else:
+                    review._retire(registry, reviews, project.id, task_id, NOW + 2)
+
+    # Not archived, and nothing written for the Project: no failure, no stale key, no state change.
+    assert _review_task_status(task_id) == "done" and _closures(project) == []
+    assert _registry_rows(root, project) == stored
+    review.review_tick(NOW + 3)
+
+    assert [row[:2] for row in _closures(project)] == [made[0][:2]]
+    assert _closed_events(project) == ["recommendation_closed"]
+    assert _review_task_status(task_id) == "archived"
+    assert _registry_rows(root, project) == stored
+
+
+def test_a_review_task_that_is_not_accepted_is_archived_also_when_another_task_of_its_day_is(root, monkeypatch):
+    publications = []
+    project, task_id, made = _accepted_review(root, monkeypatch, publications)
+    stored = _registry_rows(root, project)
+
+    # Another failure count gives a new task of the same review day, whose claim loses.
+    assert _losing_publication(root, publications[0], NOW + 2, failures=1) is False
+
+    with kb.connect_closing(kb.kanban_db_path(board="project-summaries"), board="project-summaries") as reviews:
+        tasks = dict(reviews.execute("SELECT id, status FROM tasks WHERE created_by=?", (review.CREATED_BY,)).fetchall())
+        (other,) = set(tasks) - {task_id}
+        assert review._key_date(kb.get_task(reviews, other).idempotency_key, project.id) == "2026-11-10"
+    assert tasks == {task_id: "done", other: "archived"}
+    assert _registry_rows(root, project) == stored
+    review.review_tick(NOW + 3)
+
+    assert [row[:2] for row in _closures(project)] == [made[0][:2]]
+    assert _review_task_status(task_id) == "archived"
+
+
+REPO = Path(__file__).resolve().parents[2]
+
+# A gateway in its own process: the real dispatcher watcher, its asyncio.to_thread tick and its OS singleton lock.
+# The old gateway's watcher is cancelled, as a shutdown does, while its review thread runs on; each other gateway
+# starts its watcher on its go file, so the imports of all of them overlap.
+_GATEWAY_HEAD = """
+import asyncio
+import sys
+import time
+from pathlib import Path
+repo, home, gate, role, now, old, paused = sys.argv[1:]
+sys.path.insert(0, repo)
+gate, now = Path(gate), int(now)
+Path.home = lambda: Path(home)
+time.time = lambda: now
+from plugins.dashboard_auth.raphael_workspace import model_policy
+model_policy.configured_assignment_for = lambda profile: model_policy.assignment_for(profile, "anthropic")
+from hermes_cli import kanban_db as kb, owner_project_review as review
+import hermes_cli.config as cfg
+from gateway.run import GatewayRunner
+cfg.load_config = lambda: {"kanban": {"dispatch_in_gateway": True, "dispatch_interval_seconds": 1,
+                                      "auto_decompose": False}}
+kb._default_spawn = lambda *args, **kwargs: None
+runner = object.__new__(GatewayRunner)
+runner._running = True
+
+def wait(name):
+    deadline = time.monotonic() + 180
+    while not (gate / name).exists():
+        if time.monotonic() > deadline:
+            raise TimeoutError(name)
+        time.sleep(0.02)
+
+def paused_closures(*args, **kwargs):
+    (gate / (role + "-text-committed")).touch()
+    wait(role + "-go-closures")
+    return apply(*args, **kwargs)
+apply = review._apply_review_closures
+"""
+
+_GATEWAY_TAIL = """
+tick = review.review_tick
+def one_tick():
+    try:
+        return tick(now)
+    finally:
+        runner._running = False
+        (gate / (role + "-thread-finished")).touch()
+review.review_tick = one_tick
+
+async def main():
+    if role == old:
+        watcher = asyncio.create_task(runner._kanban_dispatcher_watcher())
+        deadline = time.monotonic() + 180
+        while not (gate / paused).exists():
+            if watcher.done():
+                await watcher
+                raise AssertionError("the old watcher ended before its pause")
+            if time.monotonic() > deadline:
+                raise TimeoutError(paused)
+            await asyncio.sleep(0.02)
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+        assert runner._kanban_dispatcher_lock_handle is None
+        (gate / "old-lock-released").touch()
+        while True:
+            await asyncio.sleep(1)
+    else:
+        wait(role + "-go")
+        await runner._kanban_dispatcher_watcher()
+        (gate / (role + "-finished")).touch()
+asyncio.run(main())
+"""
+
+# Case 1: the old gateway pauses after publishing its review, before its claim; C pauses after the text commit.
+_PUBLISHER_HOOKS = """
+if role == "P":
+    create = kb.create_task
+    def paused_create(*args, **kwargs):
+        result = create(*args, **kwargs)
+        if kwargs.get("created_by") == review.CREATED_BY:
+            (gate / "P-published").write_text(result)
+            wait("P-go-claim")
+        return result
+    kb.create_task = paused_create
+if role == "C":
+    review._apply_review_closures = paused_closures
+"""
+
+# Case 2: both gateways pause before the store; the old one also pauses after its text commit.
+_HARVESTER_HOOKS = """
+store = review._store_review_result
+def paused_store(*args, **kwargs):
+    (gate / (role + "-before-store")).touch()
+    wait(role + "-go-store")
+    return store(*args, **kwargs)
+review._store_review_result = paused_store
+if role == "A":
+    review._apply_review_closures = paused_closures
+"""
+
+
+@pytest.fixture
+def native_work_routes(root, monkeypatch):
+    """Project work on the native approved route: the real dispatcher's route fence stays in force."""
+    from hermes_cli import owner_workspace
+
+    route = owner_workspace._resolved_route_pin("raphael-planner", "routine", "execution_tier")
+    create = kb.create_task
+
+    def approved_work(*args, **kwargs):
+        if kwargs.get("project_id") and kwargs.get("assignee") is None:
+            kwargs.update(route)
+            kwargs["assignee"] = "raphael-planner"
+            kwargs.setdefault("owned_paths", [])
+            kwargs.setdefault("risk_tier", 0)
+        return create(*args, **kwargs)
+
+    monkeypatch.setattr(kb, "create_task", approved_work)
+    kb.create_board("default", name="Default")
+
+
+def _wait_file(path, processes):
+    deadline = time.monotonic() + 180
+    while not path.exists():
+        assert all(p.poll() is None for p in processes), [(p.pid, p.poll()) for p in processes]
+        assert time.monotonic() < deadline, str(path)
+        time.sleep(0.02)
+
+
+@contextlib.contextmanager
+def _gateways(tmp_path, hooks, old, paused, roles):
+    child = tmp_path / "gateway_child.py"
+    child.write_text(_GATEWAY_HEAD + hooks + _GATEWAY_TAIL)
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    processes, logs = {}, []
+    try:
+        for role, now in roles.items():
+            logs.append((gate / f"{role}.log").open("w"))
+            processes[role] = subprocess.Popen(
+                [sys.executable, str(child), str(REPO), str(tmp_path), str(gate), role, str(now), old, paused],
+                stdin=subprocess.DEVNULL, stdout=logs[-1], stderr=subprocess.STDOUT, cwd=tmp_path,
+                env={**os.environ, "HOME": str(tmp_path)},
+            )
+        yield gate, processes
+    finally:
+        for process in processes.values():
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=30)
+        for log in logs:
+            log.close()
+        for log in sorted(gate.glob("*.log")):
+            print(log.name, log.read_text(), flush=True)
+
+
+@pytest.mark.parametrize("crashes", [False, True], ids=["control-closure-finished", "accepted-closure-pending"])
+def test_a_losing_publisher_after_a_shutdown_keeps_the_accepted_closure_for_the_next_dispatcher(
+    root, native_work_routes, monkeypatch, tmp_path, crashes,
+):
+    project = _project(root)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    with _board(project) as board:
+        pair = _delivered_pair(board, project.id)
+    _config(root, project, closure=True)
+    roles = {"P": NOW, "B": NOW + 1, "C": NOW + 2, "D": NOW + 3}
+    with _gateways(tmp_path, _PUBLISHER_HOOKS, "P", "P-published", roles) as (gate, gateways):
+        _wait_file(gate / "old-lock-released", [gateways["P"]])
+        task_id = (gate / "P-published").read_text()
+        # B passes the native singleton gate that P's cancelled watcher released, and claims P's published task.
+        (gate / "B-go").touch()
+        assert gateways["B"].wait(timeout=180) == 0, (gate / "B.log").read_text()
+        assert _open_review(root, project) == task_id
+        _finish_review(task_id, _payload([pair]))
+        (gate / "C-go").touch()
+        _wait_file(gate / "C-text-committed", [gateways["P"], gateways["C"]])
+        assert _stored(root, project)[0] == (None, "2026-11-10", 0)
+        assert _review_task_status(task_id) == "done" and _closures(project) == []
+        if not crashes:
+            (gate / "C-go-closures").touch()
+            assert gateways["C"].wait(timeout=180) == 0, (gate / "C.log").read_text()
+        # P's thread resumes and its claim loses to the accepted review.
+        (gate / "P-go-claim").touch()
+        _wait_file(gate / "P-thread-finished", [gateways["P"]])
+        if crashes:
+            gateways["C"].kill()
+            assert gateways["C"].wait(timeout=30) == -signal.SIGKILL
+        gateways["P"].kill()
+        assert gateways["P"].wait(timeout=30) == -signal.SIGKILL
+        (gate / "D-go").touch()
+        assert gateways["D"].wait(timeout=180) == 0, (gate / "D.log").read_text()
+
+    assert [row[:2] for row in _closures(project)] == [pair[:2]]
+    assert _closed_events(project) == ["recommendation_closed"]
+    assert _review_task_status(task_id) == "archived"
+
+
+@pytest.mark.parametrize("owner_changes", [False, True], ids=["control-no-drift", "new-owner-wait"])
+def test_a_stale_harvest_after_a_shutdown_keeps_the_accepted_closure_for_the_next_tick(
+    root, native_work_routes, monkeypatch, tmp_path, owner_changes,
+):
+    project, task_id, made = _completed_review(root, monkeypatch)
+    with _gateways(tmp_path, _HARVESTER_HOOKS, "A", "A-before-store", {"A": NOW + 1, "B": NOW + 1}) as (gate, gateways):
+        _wait_file(gate / "old-lock-released", [gateways["A"]])
+        # B passes the native singleton gate that A's cancelled watcher released; A's old thread is still alive.
+        (gate / "B-go").touch()
+        _wait_file(gate / "B-before-store", list(gateways.values()))
+        (gate / "A-go-store").touch()
+        _wait_file(gate / "A-text-committed", list(gateways.values()))
+        assert _stored(root, project)[0] == (None, "2026-11-10", 0)
+        assert _review_task_status(task_id) == "done" and _closures(project) == []
+        if owner_changes:
+            # A normal owner wait makes B's parse of the same result stale.
+            with _board(project) as board:
+                question = kb.create_task(board, title="Choose refreshments", project_id=project.id)
+                assert kb.block_task(board, question, reason="Which drinks should be ordered?", kind="needs_input")
+        (gate / "B-go-store").touch()
+        assert gateways["B"].wait(timeout=180) == 0, (gate / "B.log").read_text()
+        gateways["A"].kill()
+        assert gateways["A"].wait(timeout=30) == -signal.SIGKILL
+    review.review_tick(NOW + 2)
+    review.review_tick(NOW + 3)
+
+    assert [row[:2] for row in _closures(project)] == [made[0][:2]]
+    assert _closed_events(project) == ["recommendation_closed"]
+    assert _review_task_status(task_id) == "archived"

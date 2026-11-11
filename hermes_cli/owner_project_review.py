@@ -92,6 +92,9 @@ REVIEW_EVENT_CLASS = {
 NEWS_ROW_CAP = 100
 
 _SETTLED = ("done", "blocked", "archived")
+# With the closure setting on, the acceptance of a review result marks its exact task in the registry's project_meta
+# table, keyed by this prefix and the task id, valued with the Project id; the finish removes the mark after its archive.
+_ACCEPTED_KEY = "project_review_accepted:"
 _NEVER_REVIEWED = "the start"
 _WINDOW = re.compile(r"^Review days: from ([0-9]{4}-[0-9]{2}-[0-9]{2}|the start) to ([0-9]{4}-[0-9]{2}-[0-9]{2})$", re.MULTILINE)
 
@@ -725,7 +728,7 @@ def _check_review_decisions(
         yield
 
 
-def _store_review_result(registry, project_id, task, result, now) -> bool:
+def _store_review_result(registry, project_id, task, result, now, closure=False) -> bool:
     covered = events.covered_cursors(task.body)
     window = _WINDOW.search(task.body or "")
     if covered is None or window is None or window[2] != _key_date(task.idempotency_key, project_id):
@@ -752,6 +755,10 @@ def _store_review_result(registry, project_id, task, result, now) -> bool:
         ).rowcount
         if changed != 1:
             return False
+        if closure:
+            # Owner rule of 2026-11-11, round 3: this exact task is accepted, in the acceptance's own transaction.
+            registry.execute("INSERT OR REPLACE INTO project_meta (key, value) VALUES (?, ?)",
+                             (_ACCEPTED_KEY + task.id, project_id))
         # A retry cannot expose only one text or count an unrecorded day.
         projects_db.write_project_summary(registry, project_id, **result.summary)
         projects_db.write_project_review_brief(
@@ -1111,23 +1118,37 @@ def _active(project_id: str, board_slug: Optional[str]) -> bool:
     return state not in ("deleted", "complete")
 
 
-def _archive(board: sqlite3.Connection, task_id: str) -> bool:
-    """Archive the task and say whether it is archived now. An error is not caught: the caller then writes nothing."""
-    kanban_db.archive_task(board, task_id)
-    task = kanban_db.get_task(board, task_id)
-    if task is None or task.status == "archived":
-        return True
+def _archive_review(registry: sqlite3.Connection, board: sqlite3.Connection, project_id: str, task_id: str) -> str:
+    """Owner rule of 2026-11-11, round 3: the one archive of a review task here, apart from the finish of a stored review.
+
+    The registry's write transaction comes first and the board second, the module's lock order; a caller's open
+    transaction is joined, so its compare-and-set reads the same state. The acceptance of a result holds that
+    transaction too and writes the mark of its exact task there, so it cannot come between this check and the archive.
+    An accepted task is not archived and the answer is "accepted": the caller writes nothing for the Project, and the
+    finish applies its closures and archives it. The other answers are "archived" and "kept", an archive that did not
+    take. An error is not caught: the caller then writes nothing.
+    """
+    with write_txn(registry):
+        if registry.execute(
+            "SELECT 1 FROM project_meta WHERE key = ? AND value = ?", (_ACCEPTED_KEY + task_id, project_id),
+        ).fetchone() is not None:
+            logger.info("project review: task %s of Project %s is accepted; only its finish archives it", task_id, project_id)
+            return "accepted"
+        kanban_db.archive_task(board, task_id)
+        task = kanban_db.get_task(board, task_id)
+        if task is None or task.status == "archived":
+            return "archived"
     logger.warning("project review: review task %s could not be archived; nothing is changed for its Project", task_id)
-    return False
+    return "kept"
 
 
 def _retire(
     registry: sqlite3.Connection, board: Optional[sqlite3.Connection], project_id: str, task_id: str, now: int
 ) -> None:
     """Close the review of a Project the owner no longer allows: no failure, and the review day stays."""
-    if board is not None and not _archive(board, task_id):
-        return
     with write_txn(registry):
+        if board is not None and _archive_review(registry, board, project_id, task_id) != "archived":
+            return
         registry.execute(
             "UPDATE project_review_state SET open_task_id = NULL, open_review_date = NULL, updated_at = ? "
             "WHERE project_id = ? AND open_task_id = ?",
@@ -1139,10 +1160,10 @@ def _retire(
 def _record_failure(
     registry: sqlite3.Connection, board: Optional[sqlite3.Connection], project_id: str, task_id: str, now: int
 ) -> None:
-    """One more failure in a row: archive first, then clear the task and count, by compare-and-set on the task."""
-    if board is not None and not _archive(board, task_id):
-        return
+    """One more failure in a row: the archive, then the compare-and-set on the task that clears it and counts."""
     with write_txn(registry):
+        if board is not None and _archive_review(registry, board, project_id, task_id) != "archived":
+            return
         registry.execute(
             "UPDATE project_review_state SET open_task_id = NULL, open_review_date = NULL, "
             "failures = failures + 1, updated_at = ? WHERE project_id = ? AND open_task_id = ?",
@@ -1158,9 +1179,9 @@ def _record_stale(
     The refused key names its review day; it allows one further review of that day, whose key ends in ``:again``.
     The claim of that further review records its own key here, so it is used however it ends.
     """
-    if not _archive(board, task.id):
-        return
     with write_txn(registry):
+        if _archive_review(registry, board, project_id, task.id) != "archived":
+            return
         registry.execute(
             "UPDATE project_review_state SET open_task_id = NULL, open_review_date = NULL, stale_refused_key = ?, "
             "updated_at = ? WHERE project_id = ? AND open_task_id = ?",
@@ -1262,6 +1283,8 @@ def _finish_review(registry: sqlite3.Connection, board: sqlite3.Connection, sett
 
     The done task is the durable mark of closures still to finish. It is archived only once each closure is applied
     or refused for good, so a later tick resumes the work and never writes the stored texts, day or cursors again.
+    With the closure setting on, its acceptance mark keeps every other path from archiving it (``_archive_review``);
+    this is the only path that archives an accepted task, and it removes the mark after the archive.
     """
     try:
         # The owner_review.closure setting, off by default, gates every closure. Off, no Project board is opened to write.
@@ -1274,6 +1297,9 @@ def _finish_review(registry: sqlite3.Connection, board: sqlite3.Connection, sett
             if proposals and not _apply_review_closures(registry, project_id, task, sources, proposals):
                 return
         kanban_db.archive_task(board, task.id)
+        if settings.closure:
+            with write_txn(registry):
+                registry.execute("DELETE FROM project_meta WHERE key = ?", (_ACCEPTED_KEY + task.id,))
     except (sqlite3.OperationalError, OSError) as exc:
         logger.warning("review_closure_pending: Project %s task %s (%s)", project_id, task.id, type(exc).__name__)
 
@@ -1321,7 +1347,7 @@ def _harvest_one(
         # Another gateway stored this result already: only its finish is left, never a second judgement.
         if task is None or task.status != "done" or not _review_result_stored(registry, project_id, task):
             result = parse_review_result(board, task_id, project_id=project_id, now=now, stale_days=settings.stale_days)
-            if (not _store_review_result(registry, project_id, task, result, now)
+            if (not _store_review_result(registry, project_id, task, result, now, closure=settings.closure)
                     and not _review_result_stored(registry, project_id, task)):
                 _retire(registry, board, project_id, task_id, now)
                 return
@@ -1640,8 +1666,9 @@ def _open_review_task(
     # The claim holds only while the row is the one the key was made from, and only while the day's cap has room;
     # the task is counted in the same transaction. The cursors do not move here: a review moves them when its result
     # is stored, so a failed one leaves its events for the retry. A loser archives its task only if the row does not
-    # record that very task. The claim of the day's further review after a stale result records its key: that review is
-    # used from here on, independently of how it ends and of the failure count (owner rule of 2026-11-11, point 6).
+    # record that very task, read in the archive's transaction, and never once that task is accepted. The claim of the
+    # day's further review after a stale result records its key: that review is used from here on, independently of
+    # how it ends and of the failure count (owner rule of 2026-11-11, point 6).
     with write_txn(registry):
         claimed = 0
         if budget(registry, review_day)[0] < cap:
@@ -1659,7 +1686,7 @@ def _open_review_task(
                 "SELECT open_task_id FROM project_review_state WHERE project_id = ?", (project.id,)
             ).fetchone()
             if recorded is None or recorded["open_task_id"] != task_id:
-                kanban_db.archive_task(board, task_id)
+                _archive_review(registry, board, project.id, task_id)
             return False
     logger.info("project review: asked for the %s review of Project %s (task %s)", review_day, project.id, task_id)
     return True
