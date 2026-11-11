@@ -34,7 +34,6 @@
   "hermes_cli/kanban_transfer.py": "047547ba44b256fdd7ef2db23a7a727f8f39a52159220ae57868bb08b21846b3",
   "hermes_cli/local_runtime/hf_browse.py": "7fded4fa026f5049ee55105cfe94d516c232ca2d8456b205f3750e47a248f9be",
   "hermes_cli/observability/relay_runtime.py": "c8e741e5fd37a2fbd43b23ffacad72d13283248d9c589bde41fa5cd80a8f416e",
-  "hermes_cli/owner_project_review.py": "663dc3fe41f743dbfa97f7974f6f9f47c887a79e2ca892715ab45465af9918c4",
   "hermes_cli/owner_write_watch.py": "824e505f7c5d93aac880f7c1f5b5fd6002de6b004642f741ba33732ae38e1725",
   "hermes_cli/plugins_discovery.py": "dcbacf997838b67ba06933672ce16985a43403e9f266ba76e9731e781a01973f",
   "hermes_cli/plugins_dispatch.py": "32dbefe228ed2de37c6d0b0d52c3438c81cd98a87344a321f9334748e08e19b7",

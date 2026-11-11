@@ -1,6 +1,6 @@
 """The daily project review tick: once per Vienna day, one review of each allowlisted Project that has news.
 
-The gateway's dispatcher is to run ``review_tick`` right after ``summary_tick`` (card B2 wires the call). Nothing
+The gateway's dispatcher runs ``review_tick`` once per tick, right after ``summary_tick``. Nothing
 runs until the owner switches it on: ``read_settings`` reads the ``owner_review`` section of the root config, and in
 code every flag is off and the allowlist is empty (operator rule L3). Only a Project named in the allowlist, by id or
 slug, that is active as the plan defines it, is reviewed: the summary's ``_eligible`` still counts it as live, the owner
