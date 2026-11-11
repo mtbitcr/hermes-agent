@@ -14,13 +14,26 @@ from hermes_cli import kanban_db, owner_project_review as review, owner_workspac
 from hermes_cli import owner_project_review_record as records, owner_project_summary_events as events
 from tests.hermes_cli.test_owner_project_review_plans import _approved_plan, _logical_state
 from tests.hermes_cli.test_owner_project_review_record import _written_at, root  # noqa: F401
-from tests.hermes_cli.test_owner_workspace import _bootstrap_board, _commit_project_plan, _with_approver, ctx  # noqa: F401
+from tests.hermes_cli.test_owner_workspace import _bootstrap_board, _commit_project_plan, _owner_move, _with_approver, ctx  # noqa: F401
 from tests.gateway.test_api_server_owner_review_advice import app as snapshot_app
 from tests.gateway.test_kanban_watchers_review_tick import _Loop, _drive
 
 NOW = int(datetime(2026, 11, 10, 7, tzinfo=timezone.utc).timestamp())
 _ADD = {"reason": "Prepare the visit.", "body": "Prepare the visit before the guests arrive.", "assignee": "default",
         "execution_tier": "routine", "risk_tier": 0, "existing_parents": [], "new_parents": []}
+_SPEC = {"body": "Prepare the visit before the guests arrive.", "assignee": "default", "execution_tier": "routine",
+         "risk_tier": 0}
+_LONG_TITLES = ("Arrange comfortable seating for the guests in the main reception room",
+                "Prepare fresh refreshments for the visitors before the evening reception",
+                "Organize suitable transport for the visitors after the evening reception")
+# Event kinds without meaning for a settled decision: bookkeeping of the board, of a run, or of an approval's own
+# application. They are neither the owner's decision nor evidence about the work.
+_WITHOUT_MEANING = {
+    "owner_work_parked", "owner_work_activated", "promoted", "linked", "unlinked", "decomposed", "model_route_repinned",
+    "owner_project_plan_applied", "recommendation_created", "unblocked", "claimed", "spawned", "heartbeat", "reclaimed",
+    "spawn_failed", "rate_limited", "stale", "timed_out", "crashed", "run_handover_completed", "assigned", "edited",
+    "status", "scheduled", "attached",
+}
 
 
 def _reference(board, task_id):
@@ -335,6 +348,9 @@ def test_every_native_plan_action_stays_advice_until_owner_approval(root, ctx, a
             ])
     with kanban_db.connect_closing(path, board=project.board_slug) as board:
         kanban_db.add_comment(board, first_id, "default", "The venue decision changed the visit plan.")
+        if action == "merge":
+            # A merge changes both works: each needs evidence newer than its approved creation.
+            kanban_db.add_comment(board, second_id, "default", "The venue decision changed the menu as well.")
         target, sibling = reference(board, first_id), reference(board, second_id)
     change = {"action": action, "reason": "Adapt the visit plan to the venue decision."}
     titles = []
@@ -598,3 +614,260 @@ def test_a_daily_plan_hint_changes_no_work_until_the_owner_confirms_the_native_p
         replayed = _commit_project_plan(ctx, **commit_args)
         assert replayed["applied"] is True and _logical_state(path) == before_replay
         assert records.build_review_input(project, events.Cursors(), None)["sources"]["proposals"][0]["trigger"] == expected_trigger
+
+
+def _round_two_review(root, ctx, monkeypatch, case):
+    """The second independent review's cases: the dispatcher harvests the advice while ordinary work waits at its cap."""
+    kanban_db.init_db()
+    kanban_db.create_board(slug=kanban_db.DEFAULT_BOARD, name="Default")
+    # Ordinary work keeps waiting through the real cross-board profile cap, so no claim changes a frozen revision.
+    with kanban_db.connect_closing(board=kanban_db.DEFAULT_BOARD) as holding:
+        holder = kanban_db.create_task(holding, title="Ongoing unrelated work", assignee="default", owned_paths=[],
+                                       board=kanban_db.DEFAULT_BOARD)
+        assert kanban_db.claim_task(holding, holder) is not None
+    titles = _LONG_TITLES if case == "long_merge" else ("Book the room", "Prepare the menu")
+    with _written_at(NOW - 86400):
+        setup = _bootstrap_board(ctx)
+        initial = _approved_plan(ctx, setup, changes=[{"action": "add", **_ADD, "title": title} for title in titles])
+    ids = initial["created_task_ids"]
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        project = projects_db.get_project(registry, setup["project_id"])
+    path = kanban_db.kanban_db_path(board=project.board_slug)
+    with kanban_db.connect_closing(path, board=project.board_slug) as board:
+        first = _reference(board, ids[0])
+    if case == "owner_move_back_then_postpone":
+        with _written_at(NOW - 7200):
+            _approved_plan(ctx, setup, key="owner-postpones-via-plan", changes=[
+                {"action": "postpone", "reason": "Wait for the venue.", "target": first}])
+        with kanban_db.connect_closing(path, board=project.board_slug) as board:
+            first = _reference(board, ids[0])
+    if case.startswith("owner_move"):
+        with _written_at(NOW - 3600):
+            _owner_move(ctx, setup, ids[0], key="owner-postpones-directly", expected_status=first["expected_status"],
+                        to_status="ready" if case == "owner_move_back_then_postpone" else "scheduled",
+                        revision=first["expected_revision"])
+    if case in ("long_merge", "long_split", "initial_add_with_evidence"):
+        with kanban_db.connect_closing(path, board=project.board_slug) as board:
+            for task_id in ids:
+                with _written_at(NOW - 60):
+                    kanban_db.add_comment(board, task_id, "default", "The venue decision requires a different arrangement now.")
+    with kanban_db.connect_closing(path, board=project.board_slug) as board:
+        refs = [_reference(board, task_id) for task_id in ids]
+        kinds = [row[0] for row in board.execute("SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (ids[0],))]
+    change = {"action": "cancel", "reason": "Adapt the room work.", "target": refs[0]}
+    if case == "owner_move_back_then_postpone":
+        change["action"] = "postpone"
+    elif case == "owner_move_undo":
+        change.update(action="move", to_status="ready")
+    elif case == "long_merge":
+        change = {"action": "merge", "reason": "Combine the visit arrangements.", "targets": refs,
+                  "replacement": {**_SPEC, "title": "Prepare the complete visit reception"}}
+    elif case == "long_split":
+        change = {"action": "split", "reason": "Separate the visit arrangements.", "target": refs[0],
+                  "replacements": [{**_SPEC, "title": title, "parents": []} for title in _LONG_TITLES]}
+    proposal = {"request_title": "Revise the visit plan", "summary": "Adapt the visit work.",
+                "specification": "Adjust the visit work to the current arrangements.", "current_milestone": "Prepare the visit.",
+                "owner_visible_result": "The visit plan is ready.", "later_milestones": [], "changes": [change]}
+    (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {"enabled": True, "allowlist": [project.id]},
+                                                      "gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}))
+    monkeypatch.setattr("gateway.run._hermes_home", root)
+    payload = {"summary": {"outcome": "The visit work is planned.", "next_action": "Keep the visit plan.",
+                           "owner_decision": None},
+               "brief": {"headline": "The visit work is planned.", "what_changed": titles[0] + " is in the visit plan.",
+                         "next_step": "Keep the visit plan.", "needs_you": None},
+               "classification": [], "proposed_closures": [], "plan_proposal": proposal}
+    before = _logical_state(path)
+    finished = []
+
+    def finish():
+        if finished:
+            return
+        with projects_db.connect_closing(root / "projects.db") as registry:
+            [task_id] = registry.execute("SELECT open_task_id FROM project_review_state WHERE project_id=?",
+                                         (project.id,)).fetchone()
+        with kanban_db.connect_closing(kanban_db.kanban_db_path(board="project-summaries"), board="project-summaries") as board:
+            assert kanban_db.claim_task(board, task_id) is not None
+            assert kanban_db.complete_task(board, task_id, summary="Reviewed the visit.", metadata={"project_review": payload})
+        finished.append(task_id)
+
+    loop = _Loop()
+    with pytest.MonkeyPatch.context() as patch:
+        loop.record_spawns(patch)
+        _drive(patch, loop, [NOW, NOW + 60], kanban={"max_in_progress_by_profile": {"default": 1}},
+               after={"review_tick": finish})
+    assert finished
+    assert not any(spawn[2] in ids for spawn in loop.spawned)
+    # The review applies no advice.
+    assert _logical_state(path) == before
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        brief = projects_db.get_project_review_brief(registry, project.id)
+        summary = projects_db.get_project_summary(registry, project.id)
+
+    async def read_advice():
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async with TestClient(TestServer(snapshot_app())) as client:
+            response = await client.get(f"/v1/owner-workspace/projects/{project.slug}/snapshot"
+                                        "?capabilities=project_review_advice_v1")
+            assert response.status == 200, await response.text()
+            return (await response.json())["data"].get("raphael_review_advice")
+
+    return {"brief": brief, "summary": summary, "advice": asyncio.run(read_advice()), "kinds": kinds,
+            "setup": setup, "project": project, "ids": ids}
+
+
+@pytest.mark.parametrize("case, kinds", [
+    ("initial_add_cancel", ["created", "owner_work_activated", "promoted"]),
+    ("owner_move_cancel", ["created", "owner_work_activated", "promoted", "owner_move"]),
+    ("owner_move_undo", ["created", "owner_work_activated", "promoted", "owner_move"]),
+    ("owner_move_back_then_postpone", ["created", "owner_work_activated", "promoted", "owner_project_plan_change",
+                                       "owner_move"]),
+])
+def test_the_latest_owner_decision_reopens_only_with_newer_evidence(root, ctx, monkeypatch, case, kinds):
+    observed = _round_two_review(root, ctx, monkeypatch, case)
+    # The approved creation, a direct move, or a direct move after a plan change: nothing after the latest decision.
+    assert [kind for kind in observed["kinds"] if kind != "linked"] == kinds
+    assert observed["advice"] is None, observed
+    assert observed["brief"]["next_step"] == observed["summary"]["next_action"] == "Keep the visit plan."
+
+
+def test_genuinely_newer_evidence_after_the_approved_creation_keeps_ordinary_advice(root, ctx, monkeypatch):
+    observed = _round_two_review(root, ctx, monkeypatch, "initial_add_with_evidence")
+    assert observed["kinds"][-1] == "commented"
+    assert observed["advice"] is not None, observed
+    hint = "Ask Raphael in the Project chat to cancel Book the room."
+    assert observed["brief"]["next_step"] == observed["summary"]["next_action"] == hint
+
+
+def test_only_the_plans_own_comment_after_its_move_is_not_evidence(root, ctx):
+    from hermes_cli.owner_project_review_proposals import _settled
+
+    with _written_at(NOW - 86400):
+        setup = _bootstrap_board(ctx)
+        [task_id] = _approved_plan(ctx, setup, changes=[{"action": "add", **_ADD, "title": "Book the room"}])["created_task_ids"]
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        project = projects_db.get_project(registry, setup["project_id"])
+    path = kanban_db.kanban_db_path(board=project.board_slug)
+    for index, action in enumerate(("postpone", "move")):
+        with kanban_db.connect_closing(path, board=project.board_slug) as board:
+            change = {"action": action, "reason": "The venue is confirmed.", "target": _reference(board, task_id)}
+        if action == "move":
+            change["to_status"] = "ready"
+        with _written_at(NOW - 7200 + 3600 * index):
+            assert _approved_plan(ctx, setup, key=f"owner-{action}s", changes=[change])["applied"] is True
+    with kanban_db.connect_closing(path, board=project.board_slug) as board:
+        with _written_at(NOW - 60):
+            kanban_db.add_comment(board, task_id, "default", "The guests arrive a day later.")
+        rows = [dict(row) for row in board.execute("SELECT id,kind FROM task_events WHERE task_id=? ORDER BY id", (task_id,))]
+        decision = max(row["id"] for row in rows if row["kind"] == "owner_project_plan_change")
+        own, genuine = [row for row in rows if row["kind"] == "commented" and row["id"] > decision]
+        # The move's own comment reopens nothing. A later comment does, also when an earlier review read the plan's.
+        assert _settled(board, task_id, [own], ended=False)
+        assert not _settled(board, task_id, [own, genuine], ended=False)
+        assert not _settled(board, task_id, [genuine], ended=False)
+
+
+@pytest.mark.parametrize("case, hint", [
+    ("long_merge", "Ask Raphael in the Project chat to merge Arrange comfortable seating for the guests in the main "
+                   "rece…, Prepare fresh refreshments for the visitors before the even… and 1 more into Prepare the "
+                   "complete visit reception."),
+    ("long_split", "Ask Raphael in the Project chat to split Book the room into Arrange comfortable seating for the "
+                   "guests in the main rece…, Prepare fresh refreshments for the visitors before the even… and 1 more."),
+])
+def test_a_large_change_names_its_action_and_work_within_the_limit(root, ctx, monkeypatch, case, hint):
+    observed = _round_two_review(root, ctx, monkeypatch, case)
+    assert observed["advice"] is not None, observed
+    assert observed["brief"]["next_step"] == observed["summary"]["next_action"] == hint
+    assert len(hint) <= 240
+
+
+_ACTIONS = ("add", "replace", "split", "merge", "move", "postpone", "cancel")
+
+
+def _changes(action, count, titles, *, works):
+    """``count`` changes of one action; ``works`` is how many works a merge or a split names."""
+    ref = lambda index: {"task_id": f"t_{index % 3}"}  # noqa: E731
+    spec = lambda index: {"title": titles[index % 3]}  # noqa: E731
+    change = {"add": lambda n: {"title": titles[n % 3]},
+              "replace": lambda n: {"target": ref(n), "replacement": spec(n + 1)},
+              "split": lambda n: {"target": ref(n), "replacements": [spec(n + step) for step in range(works)]},
+              "merge": lambda n: {"targets": [ref(n + step) for step in range(works)], "replacement": spec(n + 1)},
+              "move": lambda n: {"target": ref(n), "to_status": "ready"},
+              "postpone": lambda n: {"target": ref(n)}, "cancel": lambda n: {"target": ref(n)}}[action]
+    return [{"action": action, **change(n)} for n in range(count)]
+
+
+@pytest.mark.parametrize("action", _ACTIONS)
+def test_every_action_keeps_its_name_and_a_work_title_in_the_brief(action):
+    from hermes_cli.owner_project_review_proposals import _render
+    from hermes_cli.owner_text import check_owner_text
+
+    short = ("Book the room", "Prepare the menu", "Send the invitations")
+    for titles in (short, _LONG_TITLES):
+        sources = {"tasks": [{"id": f"t_{index}", "title": title} for index, title in enumerate(titles)]}
+        shown = [title if len(title) <= 60 else title[:59].rstrip() + "…" for title in titles]
+        for count in (1, 2, 3):
+            # Proposals with one, two and three changes, and changes that name one, two and three works.
+            for changes in (_changes(action, count, titles, works=2), _changes(action, 1, titles, works=count)):
+                hint = _render(changes, sources, limit=240)
+                assert hint.startswith(f"Ask Raphael in the Project chat to {action} "), hint
+                assert any(title in hint for title in shown), hint
+                assert len(hint) <= 240 and check_owner_text(hint, "planner_prose") == hint
+    # More changes than fit: the first change in its short form and the count of the others.
+    many = _changes("merge", 3, _LONG_TITLES, works=3) * 2
+    sources = {"tasks": [{"id": f"t_{index}", "title": title} for index, title in enumerate(_LONG_TITLES)]}
+    hint = _render(many, sources, limit=240)
+    assert hint.startswith("Ask Raphael in the Project chat to merge Arrange comfortable seating") and len(hint) <= 240
+    assert hint.endswith("; and 5 more changes.")
+    # A smaller limit cuts the title itself and keeps the action.
+    cut = _render(_changes("split", 1, _LONG_TITLES, works=3), sources, limit=90)
+    assert cut.startswith("Ask Raphael in the Project chat to split ") and "…" in cut and len(cut) <= 90
+
+
+def test_each_event_kind_on_work_is_a_decision_evidence_or_without_meaning(root, ctx, monkeypatch):
+    from hermes_cli import owner_project_review_proposals as proposals
+
+    decisions, evidence = set(proposals._DECISION_EVENTS), set(proposals._EVIDENCE_EVENTS)
+    # A decision is never evidence, and no kind is in two places.
+    assert not decisions & evidence and not (decisions | evidence) & _WITHOUT_MEANING
+    # This card's fixtures: an approved plan of each action, a direct owner move, comments and a dispatched review.
+    observed = _round_two_review(root, ctx, monkeypatch, "owner_move_back_then_postpone")
+    setup, project, ids = observed["setup"], observed["project"], observed["ids"]
+    path = kanban_db.kanban_db_path(board=project.board_slug)
+    with _written_at(NOW + 120):
+        more = _approved_plan(ctx, setup, key="more-visit-work", changes=[
+            {"action": "add", **_ADD, "title": title} for title in ("Send the invitations", "Order the flowers",
+                                                                    "Print the menu", "Hire the band")])["created_task_ids"]
+    for index, action in enumerate(("replace", "split", "merge", "cancel", "postpone", "move")):
+        with kanban_db.connect_closing(path, board=project.board_slug) as board:
+            work = {"cancel": ids[1], "postpone": ids[0], "move": ids[0]}.get(action, more[index % 4])
+            kanban_db.add_comment(board, work, "default", "The venue changed.")
+            live = [task_id for task_id in more + ids if kanban_db.get_task(board, task_id).status != "archived"]
+            refs = {task_id: _reference(board, task_id) for task_id in live}
+        change = {"action": action, "reason": "The venue changed."}
+        if action == "replace":
+            change.update(target=refs[more[0]], replacement={**_SPEC, "title": "Send the printed invitations"})
+        elif action == "split":
+            change.update(target=refs[more[1]], replacements=[{**_SPEC, "title": "Order the roses", "parents": []},
+                                                              {**_SPEC, "title": "Order the tulips", "parents": [0]}])
+        elif action == "merge":
+            change.update(targets=[refs[more[2]], refs[more[3]]], replacement={**_SPEC, "title": "Prepare the evening"})
+        elif action in ("cancel", "postpone"):
+            change["target"] = refs[work]
+        else:
+            change.update(target=refs[work], to_status="ready")
+        with _written_at(NOW + 180 + index):
+            assert _approved_plan(ctx, setup, key=f"each-action-{action}", changes=[change])["applied"] is True
+    with kanban_db.connect_closing(path, board=project.board_slug) as board:
+        task = kanban_db.get_task(board, ids[0])
+        _owner_move(ctx, setup, ids[0], key="owner-moves-back", expected_status=task.status, to_status="scheduled",
+                    revision=kanban_db.task_event_revision(board, ids[0]))
+    written = set()
+    for database in root.rglob("kanban.db"):
+        with kanban_db.connect_closing(database) as board:
+            written |= {row[0] for row in board.execute(
+                "SELECT DISTINCT e.kind FROM task_events e JOIN tasks t ON t.id=e.task_id WHERE t.task_kind='work'")}
+    # The kernel's own lists of event kinds: the daily review's classes and the kinds that close a run.
+    written |= {key.split(":")[0] for key in review.REVIEW_EVENT_CLASS} | set(kanban_db._RUN_CLOSING_EVENT_KINDS)
+    assert {"created", "owner_project_plan_change", "owner_move", "commented"} <= written
+    assert written - decisions - evidence - _WITHOUT_MEANING == set()

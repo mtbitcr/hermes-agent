@@ -9,11 +9,13 @@ _TEXT_LIMITS = {
     "current_milestone": 1000, "owner_visible_result": 1000,
 }
 _CHAT_PREFIX = "Ask Raphael in the Project chat: "
-# Events an approved plan writes on its own work: they record that decision and are never new evidence against it.
-_PLAN_EVENTS = {"owner_project_plan_change", "model_route_repinned", "owner_work_activated", "owner_work_parked",
-                "promoted", "linked"}
-# The owner's decision on work that has ended: a plan change, a direct move, an archive or a suggestion decision.
-_ENDED_DECISIONS = ("owner_project_plan_change", "owner_move", "archived", "recommendation_decided")
+# Two closed lists decide whether advice may reopen the owner's decision on work. A kind on neither is not evidence.
+# The owner's decisions on a work item: an applied plan change, its creation (create_task writes it for an approved
+# add and for the created work of replace, split and merge alike), a direct move, an archive and a suggestion decision.
+_DECISION_EVENTS = ("owner_project_plan_change", "created", "owner_move", "archived", "recommendation_decided")
+# Evidence about the work: a result of work or of a review, a delivery outcome, and a comment that is not the plan's own.
+_EVIDENCE_EVENTS = ("completed", "blocked", "gave_up", "review_requested", "changes_requested", "review_reopened",
+                    "delivery_merged", "merged", "released", "commented")
 _PHRASES = {"add": "add {new}", "replace": "replace {old} with {new}", "split": "split {old} into {new}",
             "merge": "merge {old} into {new}", "move": "move {old} to {status}", "postpone": "postpone {old}",
             "cancel": "cancel {old}"}
@@ -34,28 +36,31 @@ def proposal_schema(*, limit):
 
 
 def _settled(board, task_id, events, *, ended):
-    """Whether the owner's latest decision on this work has no newer event of the same work in the frozen input.
+    """Whether the frozen input holds no evidence of this work newer than the owner's latest decision on it.
 
-    On live work the decision is an applied plan change, of any action and age. Ended work without a recorded
+    The latest decision is the newest event of a decision kind, of any action and age. Ended work without a recorded
     decision is settled as a whole.
     """
-    kinds = _ENDED_DECISIONS if ended else _ENDED_DECISIONS[:1]
     decision = board.execute(
-        "SELECT id,CASE WHEN json_valid(payload) THEN json_extract(payload,'$.idempotency_key') END AS plan "
-        f"FROM task_events WHERE task_id=? AND kind IN ({','.join('?' * len(kinds))}) ORDER BY id DESC LIMIT 1",
-        (task_id, *kinds),
+        "SELECT id,kind,CASE WHEN json_valid(payload) THEN json_extract(payload,'$.idempotency_key') END AS plan "
+        f"FROM task_events WHERE task_id=? AND kind IN ({','.join('?' * len(_DECISION_EVENTS))}) ORDER BY id DESC LIMIT 1",
+        (task_id, *_DECISION_EVENTS),
     ).fetchone()
-    if decision is None:
-        return ended
-    newer = [event["kind"] for event in events if event["id"] > decision["id"] and event["kind"] not in _PLAN_EVENTS]
-    # A move back to ready also writes the approved reason as that plan's own comment, the first one after the change.
-    prefix = f"owner-plan:{decision['plan']}:change:"
-    if "commented" in newer and isinstance(decision["plan"], str) and board.execute(
-        "SELECT 1 FROM task_comments WHERE task_id=? AND substr(operation_key,1,?)=? AND operation_key LIKE '%:resume'",
-        (task_id, len(prefix), prefix),
-    ).fetchone():
-        newer.remove("commented")
-    return not newer
+    if decision is None and ended:
+        return True
+    latest = decision["id"] if decision is not None else 0
+    own = None
+    if decision is not None and decision["kind"] == "owner_project_plan_change" and isinstance(decision["plan"], str):
+        # A move back to ready also writes the approved reason as that plan's own comment, in the change's transaction:
+        # the first comment event after the change. Only that event is not evidence; any later comment is.
+        prefix = f"owner-plan:{decision['plan']}:change:"
+        if board.execute(
+            "SELECT 1 FROM task_comments WHERE task_id=? AND substr(operation_key,1,?)=? AND operation_key LIKE '%:resume'",
+            (task_id, len(prefix), prefix),
+        ).fetchone():
+            own = board.execute("SELECT MIN(id) FROM task_events WHERE task_id=? AND kind='commented' AND id>?",
+                                (task_id, latest)).fetchone()[0]
+    return not any(event["id"] > latest and event["kind"] in _EVIDENCE_EVENTS and event["id"] != own for event in events)
 
 
 def _equivalent_created_work(changes, sources, board, project):
@@ -63,9 +68,10 @@ def _equivalent_created_work(changes, sources, board, project):
     from hermes_cli.owner_project_review import _same_work
 
     frozen = {item["id"]: item.get("events", []) for item in sources["tasks"]}
-    # The input holds the latest event of each suggestion, enough to show an event after its decision.
-    frozen.update((item["id"], [{"id": item.get("event_revision", 0), "kind": "suggestion"}])
-                  for item in sources.get("suggestions", []))
+    # The input holds the latest event of each suggestion, enough to show an event after its decision. Its kind decides.
+    for item in sources.get("suggestions", []):
+        frozen[item["id"]] = [dict(row) for row in board.execute(
+            "SELECT id,kind FROM task_events WHERE id=? AND task_id=?", (item.get("event_revision", 0), item["id"]))]
     proposed_titles = []
     for change in changes:
         action = change["action"]
@@ -95,26 +101,38 @@ def _render(changes, sources, *, limit):
     """Name each checked change and its work: the owner title of the frozen input, or the proposed title."""
     titles = {item["id"]: item["title"] for item in sources["tasks"]}
 
-    def names(values):
-        shown = [title if len(title) <= 60 else title[:59].rstrip() + "…" for title in values]
-        return ", ".join(shown[:-1]) + " and " + shown[-1] if len(shown) > 1 else "".join(shown)
-
-    phrases = []
-    for change in changes:
+    def works(change):
         refs = change["targets"] if "targets" in change else [change["target"]] if "target" in change else []
         specs = [change] if change["action"] == "add" else change.get("replacements", [change.get("replacement")])
-        phrases.append(_PHRASES[change["action"]].format(
-            old=names([titles[ref["task_id"]] for ref in refs]),
-            new=names([spec["title"] for spec in specs if spec]), status=change.get("to_status")))
-    # The longest run of whole changes that fits, then a count of the rest.
-    for shown in range(len(phrases), 0, -1):
-        rest = len(phrases) - shown
+        return [titles[ref["task_id"]] for ref in refs], [spec["title"] for spec in specs if spec]
+
+    def names(values, keep, width):
+        shown = [title if len(title) <= width else title[:width - 1].rstrip() + "…" for title in values[:keep]]
+        shown += [f"{len(values) - keep} more"] if len(values) > keep else []
+        return ", ".join(shown[:-1]) + " and " + shown[-1] if len(shown) > 1 else "".join(shown)
+
+    def phrase(change, keep=None, width=60):
+        old, new = works(change)
+        return _PHRASES[change["action"]].format(old=names(old, keep or len(old), width),
+                                                 new=names(new, keep or len(new), width), status=change.get("to_status"))
+
+    def hint(phrases, rest):
         more = f"; and {rest} more change{'s' if rest > 1 else ''}" if rest else ""
-        hint = "Ask Raphael in the Project chat to " + "; ".join(phrases[:shown]) + more + "."
-        if len(hint) <= limit:
-            return hint
-    count = f"the {len(phrases)} suggested plan changes" if len(phrases) > 1 else "the suggested plan change"
-    return f"Ask Raphael in the Project chat to make {count}."
+        return "Ask Raphael in the Project chat to " + "; ".join(phrases) + more + "."
+
+    # The longest run of whole changes that fits, then a count of the rest.
+    for shown in range(len(changes), 0, -1):
+        text = hint([phrase(change) for change in changes[:shown]], len(changes) - shown)
+        if len(text) <= limit:
+            return text
+    # The first change alone keeps its action: first its list of titles is cut to a count, then the title itself.
+    first, rest = changes[0], len(changes) - 1
+    size = max(map(len, works(first)))
+    for keep, width in [(keep, 60) for keep in range(size - 1, 0, -1)] + [(1, width) for width in range(59, 1, -1)]:
+        text = hint([phrase(first, keep, width)], rest)
+        if len(text) <= limit:
+            return text
+    return text
 
 
 def proposal_hint(value, sources, board, registry, project, *, now, limit, max_bytes):
