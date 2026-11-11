@@ -46,6 +46,7 @@ pins the dispatcher gives a worker (``HERMES_KANBAN_DB``, ``HERMES_KANBAN_BOARD`
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import re
@@ -116,6 +117,11 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
 _BRIEF_LIMITS = {"headline": 120, "what_changed": 400, "next_step": 240, "needs_you": 160}
 _GENERIC_HEADLINES = {"work is progressing", "no updates", "all good", "things are moving"}
 _REVIEW_CLASSES = {"answered", "superseded", "stale", "still actionable", "current"}
+
+
+def _settled_class(item: Any) -> bool:
+    """A stored item of a settled class, which no later review reads. A damaged item stays, so the review refuses it."""
+    return isinstance(item, dict) and item.get("class") in ("answered", "superseded", "stale", "current")
 
 
 class ReviewRefused(ValueError):
@@ -189,18 +195,19 @@ def _frozen_sources(body: Optional[str]) -> tuple[dict[str, list[dict]], Optiona
 def _review_evidence_board(project_id: str):
     from hermes_constants import get_default_hermes_root, reset_hermes_home_override, set_hermes_home_override
 
-    root = get_default_hermes_root()
-    token = set_hermes_home_override(str(root))
+    token = set_hermes_home_override(str(get_default_hermes_root()))
     try:
-        with events._read_only(root / "projects.db") as registry:
+        # The registry ``review_tick`` writes, by the rule of every board path: the kanban home.
+        with events._read_only(kanban_db.kanban_home() / "projects.db") as registry:
             project = projects_db.get_project(registry, project_id)
-            if project is None or not project.board_slug:
+            if project is None or not project.board_slug or not events._board_path(project.board_slug).exists():
                 raise ReviewRefused("review_evidence_project_missing")
             with events._read_only(events._board_path(project.board_slug)) as board:
                 yield board, registry, project
-    except ReviewRefused:
+    except (ReviewRefused, sqlite3.OperationalError, OSError):
+        # A busy or unreadable store is no verdict on the result: the harvest keeps it for a later tick.
         raise
-    except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
+    except (sqlite3.Error, ValueError, TypeError) as exc:
         raise ReviewRefused("review_evidence_unavailable") from exc
     finally:
         reset_hermes_home_override(token)
@@ -292,7 +299,8 @@ def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, s
         by_item[claim["item"]] = claim
     if set(by_item) != expected:
         raise ReviewRefused("review_class_coverage_invalid")
-    classified = [item for item in previous if item["item"] not in expected]
+    # Only unresolved items carry forward. A settled item stays in the brief row of its own review day.
+    classified = []
     tasks = {item["id"]: item for item in sources["tasks"]}
     for tid in sorted(expected):
         card = tasks.get(tid, {})
@@ -449,6 +457,9 @@ def parse_review_result(
     with _review_evidence_board(project_id) as (project_board, registry, project):
         from hermes_cli.owner_project_review_plans import verified_supersessions
 
+        decisions = _owner_decisions(project_board, project_id)
+        if _decision_cursor(decisions) != _frozen_decision_cursor(task.body):
+            raise ReviewRefused("review_decision_state_changed")
         plan_changes = verified_supersessions(
             registry, project, events._board_path(project.board_slug), sources.get("proposals", []),
             max_bytes=TOTAL_INPUT_CAP_BYTES,
@@ -458,12 +469,13 @@ def parse_review_result(
             plan_changes=plan_changes,
         )
         closures = _review_closures(project_board, project_id, sources, classification, value["proposed_closures"])
-    waiting = len({item["task_id"] for item in sources["decisions"] if item.get("type") == "wait"})
+    # The live set is the frozen one, checked above. Count from it the waits and suggestions the total cap left out.
+    waiting = len(decisions["waits"])
     suggestion_ids = {item["id"] for item in sources["suggestions"]}
     pending = sum(
         item["item"] in suggestion_ids and item["class"] == "still actionable" and item.get("actor") == "owner"
         for item in classification
-    )
+    ) + sum(suggestion[0] not in suggestion_ids for suggestion in decisions["suggestions"])
     if waiting and pending:
         pointer = f"{waiting + pending} items are waiting on Decisions."
     elif pending:
@@ -506,14 +518,47 @@ def _ready_work(project: projects_db.Project) -> list[str]:
     return titles
 
 
-def _check_review_decisions(project: projects_db.Project, sources: dict[str, list[dict]]) -> None:
+def _owner_decisions(board: sqlite3.Connection, project_id: str) -> dict[str, list]:
+    """The Project's live owner decisions: each owner wait on its unfinished work, and each pending suggestion."""
+    # This query raises on a busy or unreadable board; task_owner_waits would return no waits instead.
+    work = [row["id"] for row in board.execute(
+        "SELECT id FROM tasks WHERE task_kind='work' AND (project_id=? OR project_id IS NULL) "
+        "AND status NOT IN ('done','archived') ORDER BY id", (project_id,),
+    )]
+    waits = kanban_db.task_owner_waits(board, work)
+    suggestions = [kanban_db.recommendation_lifecycle_snapshot(row) for row in board.execute(
+        "SELECT * FROM tasks WHERE task_kind='recommendation' AND project_id=? ORDER BY id", (project_id,),
+    )]
+    return {
+        # The revision tells an answer and a new question in the same second from the first question.
+        "waits": [[tid, waits[tid]["kind"], waits[tid]["since"], kanban_db.task_event_revision(board, tid)]
+                  for tid in sorted(waits)],
+        "suggestions": [[item["recommendation_id"], item["effective_state"], item["lifecycle_version"]]
+                        for item in suggestions if item["decision"] == "pending"],
+    }
+
+
+def _decision_cursor(decisions: Mapping[str, list]) -> str:
+    """The digest the task body carries outside the record, where the total input cap cannot shorten it."""
+    return hashlib.sha256(json.dumps(decisions, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _frozen_decision_cursor(body: Optional[str]) -> str:
+    found = re.search(r"^Owner decision cursor: ([a-f0-9]{64}|none)$", body or "", re.M)
+    if found is None:
+        raise ReviewRefused("review_decision_cursor_invalid")
+    return found[1]
+
+
+def _check_review_decisions(project: projects_db.Project, sources: dict[str, list[dict]], frozen_cursor: str) -> None:
     frozen = {item["task_id"]: item for item in sources["decisions"] if item.get("type") == "wait"}
     decision_ids = {item["task_id"] for item in sources["decisions"] if item.get("task_id")}
-    if not decision_ids and not sources["suggestions"]:
-        return
     cards = {item["id"]: item for item in sources["tasks"]}
     try:
         with events._read_only(events._board_path(project.board_slug)) as board:
+            # A new wait or suggestion anywhere in the Project makes the frozen pointer stale, also one the cap cut.
+            if _decision_cursor(_owner_decisions(board, project.id)) != frozen_cursor:
+                raise ReviewRefused("review_decision_state_changed")
             current = kanban_db.task_owner_waits(board, decision_ids)
             if set(current) != set(frozen) or any(
                 any(current[tid].get(key) != frozen[tid].get(key) for key in ("kind", "since"))
@@ -534,7 +579,10 @@ def _check_review_decisions(project: projects_db.Project, sources: dict[str, lis
                 lifecycle = kanban_db.recommendation_lifecycle_snapshot(row)
                 if any(lifecycle[key] != item.get(key) for key in lifecycle):
                     raise ReviewRefused("review_recommendation_state_changed")
-    except (sqlite3.Error, OSError) as exc:
+    except (sqlite3.OperationalError, OSError):
+        # A busy or unreadable board is no verdict on the result: the harvest keeps it for a later tick.
+        raise
+    except sqlite3.Error as exc:
         raise ReviewRefused("review_decision_state_unavailable") from exc
 
 
@@ -546,10 +594,11 @@ def _store_review_result(registry, project_id, task, result, now) -> bool:
     conversation = re.search(r"^Linked conversation cursor: ([a-f0-9]{64}|none)$", task.body or "", re.M)
     if conversation is None:
         raise ReviewRefused("review_conversation_cursor_invalid")
+    decision_cursor = _frozen_decision_cursor(task.body)
     project = projects_db.get_project(registry, project_id)
     if project is None or not summary._eligible(registry, project_id):
         return False
-    _check_review_decisions(project, result.sources)
+    _check_review_decisions(project, result.sources, decision_cursor)
     ready_work = _ready_work(project)
     with write_txn(registry):
         changed = registry.execute(
@@ -1008,6 +1057,10 @@ def _harvest_one(
         logger.warning("project review: refused Project %s task %s (%s)", project_id, task_id, exc)
         _record_failure(registry, board, project_id, task_id, now)
         return
+    except (sqlite3.OperationalError, OSError) as exc:
+        # No verdict: the completed task and its open marker wait for a later tick, with no failure and no new run.
+        logger.warning("review_storage_unavailable: Project %s task %s (%s)", project_id, task_id, type(exc).__name__)
+        return
     kanban_db.archive_task(board, task_id)
 
 
@@ -1091,6 +1144,8 @@ def _settle_quiet(
             classification = [] if previous is None else json.loads(previous[0])
             if not isinstance(classification, list):
                 raise ValueError("the previous review classification is not a list")
+            # Only unresolved items carry forward; a settled item stays in the row of its own review day.
+            classification = [item for item in classification if not _settled_class(item)]
             covered_from = (
                 None if state["last_reviewed_date"] is None
                 else (date.fromisoformat(state["last_reviewed_date"]) + timedelta(days=1)).isoformat()
@@ -1099,7 +1154,7 @@ def _settle_quiet(
             projects_db.write_project_review_brief(
                 registry, project_id, review_date=review_day, covered_from=covered_from, covered_to=review_day,
                 headline="Nothing changed since the last review.", what_changed="Nothing changed since the last review.",
-                # Keep answered items settled through quiet days, without asking a model to classify them again.
+                # Keep the unresolved items through quiet days, without asking a model to classify them again.
                 next_step="Follow the current plan.", quiet=True, classification=classification, written_at=now,
             )
 
@@ -1200,13 +1255,14 @@ def _wait_order(news: _News, review_day: str) -> tuple:
 
 
 def _task_body(last_reviewed_date: Optional[str], review_day: str, covered: events.Cursors, frozen: str,
-               conversation_cursor: Optional[str] = None) -> str:
+               conversation_cursor: Optional[str] = None, decision_cursor: Optional[str] = None) -> str:
     """The instruction, the days the review covers, and last the line that names the events it covers."""
     return (
         INSTRUCTION
         + f"\nReview date: {review_day}\n"
         + _window_line(last_reviewed_date, review_day)
         + f"\nLinked conversation cursor: {conversation_cursor or 'none'}"
+        + f"\nOwner decision cursor: {decision_cursor or 'none'}"
         + "\n"
         + frozen
         + "\n"
@@ -1245,7 +1301,8 @@ def _open_review_task(
     task_id = kanban_db.create_task(
         board,
         title=TITLE_PREFIX + project.name,
-        body=_task_body(state["last_reviewed_date"], review_day, batch.cursors, frozen["text"], frozen["conversation_cursor"]),
+        body=_task_body(state["last_reviewed_date"], review_day, batch.cursors, frozen["text"], frozen["conversation_cursor"],
+                        frozen["decision_cursor"]),
         assignee=summary.PLANNING_ROLE,
         created_by=CREATED_BY,
         workspace_kind="scratch",

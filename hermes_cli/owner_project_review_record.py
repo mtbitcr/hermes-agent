@@ -37,6 +37,7 @@ class ReviewInput(TypedDict):
     sources: dict[str, list[dict]]
     cuts: list[Cut]
     conversation_cursor: str | None
+    decision_cursor: str | None
 
 
 def cut_line(cut: Cut) -> str:
@@ -107,6 +108,9 @@ def card_delivery_state(board: sqlite3.Connection, task_id: str, status: str) ->
     """Read done or merged work from the kernel records without changing the board."""
     if status == "done":
         return "done"
+    if status != "archived":
+        # A card that is open again: an earlier merge proves nothing about the work it does now.
+        return None
     try:
         merged = board.execute(
             "SELECT 1 FROM kanban_deliveries WHERE source_task_id=? AND pull_request_state='merged' LIMIT 1",
@@ -335,7 +339,8 @@ def _conversation(root, registry, project, last_review, sources, cuts):
 
 
 def _registry_record(root, project, last_review, sources, cuts):
-    path = root / "projects.db"
+    # The registry ``review_tick`` writes, by the rule of every board path: the kanban home.
+    path = kanban_db.kanban_home() / "projects.db"
     if not path.exists():
         _reduce(cuts, "project", "not_available")
         _reduce(cuts, "conversation", "unlinked")
@@ -442,7 +447,7 @@ def _freeze(sources, cuts, max_bytes: int | None = None) -> ReviewInput:
     if size > cap:
         raise ValueError("the review input cap cannot hold its omission notices")
     return {"text": text, "size": size, "sources": {source: [row[0] for row in rows[source]] for source in sources},
-            "cuts": ordered, "conversation_cursor": None}
+            "cuts": ordered, "conversation_cursor": None, "decision_cursor": None}
 
 
 def _automations(project, sources, cuts) -> None:
@@ -494,6 +499,7 @@ def build_review_input(
     sources: dict[str, list[dict]] = {source: [] for source in _SOURCES if source != "proposals"}
     sources["project"] = [{"id": project.id, "name": project.name}, {"field": "description", "text": project.description}]
     cuts: list[Cut] = []
+    decision_cursor = None
     token = set_hermes_home_override(str(root))
     try:
         conversation_cursor = _registry_record(root, project, last_review, sources, cuts)
@@ -509,6 +515,8 @@ def build_review_input(
             if path.exists():
                 with events._read_only(path) as board:
                     _board_record(board, project, cursors, last_review, sources, cuts)
+                    # The whole live set from the same snapshot; the total cap may shorten only its rows in the record.
+                    decision_cursor = review._decision_cursor(review._owner_decisions(board, project.id))
             else:
                 for source in ("tasks", "comments", "decisions", "suggestions", "attachments", "runs"):
                     _reduce(cuts, source, "not_available")
@@ -527,4 +535,5 @@ def build_review_input(
         reset_hermes_home_override(token)
     result = _freeze(sources, cuts, max_bytes)
     result["conversation_cursor"] = conversation_cursor
+    result["decision_cursor"] = decision_cursor
     return result
