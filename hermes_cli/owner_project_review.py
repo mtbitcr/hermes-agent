@@ -60,6 +60,7 @@ from zoneinfo import ZoneInfo
 from hermes_cli import kanban_db, projects_db, release_ledger
 from hermes_cli import owner_project_summary as summary
 from hermes_cli import owner_project_summary_events as events
+from hermes_cli.kanban_recommendation_closure import delivery_after_undo, same_review_work
 from hermes_cli.sqlite_util import write_txn
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,8 @@ REVIEW_EVENT_CLASS = {
     # An approved plan can cancel or move work without creating another card.
     "owner_project_plan_change": events.MATERIAL,
     "owner_project_plan_applied": events.MATERIAL,
+    # An owner's Undo changes pending work. The review's own close is not fresh news.
+    "recommendation_closure_undone": events.MATERIAL,
 }
 
 # The quiet clock reads at most this many rows of each source per tick, newest first; a source that reaches it gives no
@@ -109,6 +112,7 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
    The kernel settles a delivered or archived item and keeps every other earlier item open.
    Evidence references use tasks:<id>, suggestions:<id>, decisions:event:<event_id>, or decisions:wait:<task_id>.
    The kernel also resolves approved plan replacements. Their evidence uses proposals:<id> from this input.
+   A live closure makes its suggestion superseded. Use suggestions:<id> as its evidence.
 6. Return null for owner_decision and needs_you. The kernel names the existing owner waits.
 7. Propose at most three closures. Each has exactly recommendation_id, card_id, reason, and evidence.
    The reason has at most 300 characters. Evidence must name suggestions:<id> and tasks:<id> from this input.
@@ -218,17 +222,6 @@ def _review_evidence_board(project_id: str):
         reset_hermes_home_override(token)
 
 
-def _same_work(left: Optional[str], right: Optional[str]) -> bool:
-    # Earlier stores can hold a recommendation without a display label.
-    if not isinstance(left, str) or not isinstance(right, str):
-        return False
-    ignored = {"a", "an", "the", "to", "of", "for", "and"}
-    left_words = set(re.findall(r"\w+", left.casefold())) - ignored
-    right_words = set(re.findall(r"\w+", right.casefold())) - ignored
-    # The approved content-link threshold is token-set Jaccard >= 0.8.
-    return bool(left_words and right_words and len(left_words & right_words) * 5 >= len(left_words | right_words) * 4)
-
-
 def _delivered_match(board, project_id, suggestion_id, frozen_card) -> Optional[str]:
     from hermes_cli.owner_project_review_record import card_delivery_state
 
@@ -247,8 +240,13 @@ def _delivered_match(board, project_id, suggestion_id, frozen_card) -> Optional[
     state = card_delivery_state(board, frozen_card["id"], card["status"])
     if state is None or state != frozen_card.get("delivery_state"):
         return None
+    # After the owner's Undo only a delivery recorded later proves the work again, as the closure kernel requires.
+    if board.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND kind='recommendation_closure_undone' LIMIT 1", (suggestion_id,),
+    ).fetchone() is not None and not delivery_after_undo(board, suggestion_id, frozen_card["id"]):
+        return None
     # The reader redacts display text. The content link must use the stored labels.
-    return state if _same_work(suggestion["recommendation_label"], card["title"]) else None
+    return state if same_review_work(suggestion["recommendation_label"], card["title"]) else None
 
 
 def _newer_equivalent(board, project_id, original, candidate) -> bool:
@@ -266,9 +264,17 @@ def _newer_equivalent(board, project_id, original, candidate) -> bool:
     # Creation events order same-second items without using random task ids.
     if new["status"] == "archived" or old["opened_event"] is None or new["opened_event"] is None:
         return False
+    closure = original.get("closure")
+    if closure and closure.get("undone_at") is not None:
+        undo_event = board.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id=? AND kind='recommendation_closure_undone'", (old["id"],),
+        ).fetchone()[0]
+        # Older equivalent work cannot hide a suggestion that the owner has made pending again.
+        if undo_event is None or new["opened_event"] <= undo_event:
+            return False
     old_title = old["recommendation_label"] if old["task_kind"] == "recommendation" else old["title"]
     new_title = new["recommendation_label"] if new["task_kind"] == "recommendation" else new["title"]
-    return new["opened_event"] > old["opened_event"] and _same_work(old_title, new_title)
+    return new["opened_event"] > old["opened_event"] and same_review_work(old_title, new_title)
 
 
 def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, stale_days: int,
@@ -321,6 +327,10 @@ def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, s
         elif tid in suggestions and suggestions[tid]["decision"] != "pending":
             actual = "answered"
             evidence = [f"suggestions:{tid}"]
+        elif (tid in suggestions and suggestions[tid].get("closure")
+              and suggestions[tid]["closure"].get("undone_at") is None and kanban_db.has_live_recommendation_closure(board, tid)):
+            # A checked closure settles its suggestion until the owner's Undo; the kernel reads it from its own record.
+            actual, evidence = "superseded", [f"suggestions:{tid}"]
         elif tid in plan_changes and card.get("status") == "archived":
             live = board.execute(
                 "SELECT status FROM tasks WHERE id=? AND project_id=? AND task_kind='work'", (tid, project_id),
@@ -681,7 +691,9 @@ def _check_review_decisions(
                     if row is None:
                         raise ReviewStale("review_recommendation_state_changed")
                     lifecycle = kanban_db.recommendation_lifecycle_snapshot(row)
-                    if any(lifecycle[key] != item.get(key) for key in lifecycle):
+                    # A close or an Undo keeps the owner's lifecycle fields; its audit revision still moves.
+                    if (any(lifecycle[key] != item.get(key) for key in lifecycle)
+                            or kanban_db.task_event_revision(board, item["id"]) != item.get("event_revision")):
                         raise ReviewStale("review_recommendation_state_changed")
                 # Owner rule of 2026-11-11, point 1: input trimming alone never settles work.
                 if _open_work_missing(registry, board, project.id, classification):
@@ -1152,6 +1164,41 @@ def _record_failure_before_publishing(registry: sqlite3.Connection, project_id: 
 # ---------------------------------------------------------------------------------------------------------------
 
 
+def _apply_review_closures(registry: sqlite3.Connection, project_id: str, task: kanban_db.Task,
+                           result: ReviewResult) -> None:
+    """The stored review's checked closures, each through the closure kernel, after its texts committed.
+
+    Only the Project board's write lock is held, never the registry's, so the plan commit's lock order stays. A
+    closure the kernel refuses leaves its suggestion pending, and a later review can propose it again.
+    """
+    project = projects_db.get_project(registry, project_id)
+    if project is None or not project.board_slug:
+        return
+    suggestions = {item["id"]: item for item in result.sources["suggestions"]}
+    cards = {item["id"]: item for item in result.sources["tasks"]}
+    review_date = _key_date(task.idempotency_key, project_id)
+    try:
+        with kanban_db.connect_closing(events._board_path(project.board_slug), board=project.board_slug) as board:
+            with kanban_db.write_txn(board):
+                for proposal in result.proposed_closures:
+                    tid, card_id = proposal["recommendation_id"], proposal["card_id"]
+                    # An owner action or a reopened card since the frozen input wins over the review's closure.
+                    if (kanban_db.task_event_revision(board, tid) != suggestions[tid]["event_revision"]
+                            or _delivered_match(board, project.id, tid, cards[card_id]) is None):
+                        logger.warning("review_closure_state_changed: Project %s suggestion %s", project_id, tid)
+                        continue
+                    try:
+                        kanban_db.close_recommendation_delivered(
+                            board, tid, card_id, reason=proposal["reason"], review_date=review_date,
+                            expected_lifecycle_version=proposal["expected_lifecycle_version"],
+                        )
+                    except ValueError as exc:
+                        # The kernel's refusal, the daily cap among them, rolls back only this closure.
+                        logger.warning("%s: Project %s suggestion %s", exc, project_id, tid)
+    except (sqlite3.Error, OSError, ValueError, kanban_db.BoardFenceClosedError) as exc:
+        logger.warning("review_closure_unavailable: Project %s task %s (%s)", project_id, task.id, type(exc).__name__)
+
+
 def _harvest_one(
     registry: sqlite3.Connection,
     board: Optional[sqlite3.Connection],
@@ -1193,6 +1240,9 @@ def _harvest_one(
         # No verdict: the completed task and its open marker wait for a later tick, with no failure and no new run.
         logger.warning("review_storage_unavailable: Project %s task %s (%s)", project_id, task_id, type(exc).__name__)
         return
+    # The owner_review.closure setting, off by default, gates every closure. Off, no Project board is opened to write.
+    if settings.closure and result.proposed_closures:
+        _apply_review_closures(registry, project_id, task, result)
     kanban_db.archive_task(board, task_id)
 
 
