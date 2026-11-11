@@ -1846,6 +1846,29 @@ class GatewayKanbanWatchersMixin:
                         os.environ["HERMES_KANBAN_BOARD"] = prev_env
             return successes
 
+        def _owner_project_ticks() -> None:
+            """Run the project summary tick, then the project review tick.
+
+            Both run in this one background job, so a tick hands
+            ``asyncio.to_thread`` the same jobs as before the review tick was
+            added. Each tick has its own error guard: a failing review tick
+            never stops the summary tick, and neither stops dispatch.
+            """
+            try:
+                from hermes_cli import owner_project_summary as _summary
+
+                _summary.summary_tick()
+            except Exception:
+                logger.exception("kanban dispatcher: project summary tick failed")
+            try:
+                # Asked again: a pause can start while the summary tick runs.
+                if _kanban_dispatch_allowed():
+                    from hermes_cli import owner_project_review as _review
+
+                    _review.review_tick()
+            except Exception:
+                logger.exception("kanban dispatcher: project review tick failed")
+
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
@@ -1882,9 +1905,7 @@ class GatewayKanbanWatchersMixin:
                     try:
                         # Asked again: a pause can start while the dispatch above runs.
                         if _kanban_dispatch_allowed():
-                            from hermes_cli import owner_project_summary as _summary
-
-                            await asyncio.to_thread(_summary.summary_tick)
+                            await asyncio.to_thread(_owner_project_ticks)
                     except Exception:
                         logger.exception("kanban dispatcher: project summary tick failed")
                     any_spawned = False
