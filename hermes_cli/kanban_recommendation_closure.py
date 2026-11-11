@@ -27,6 +27,11 @@ CREATE TABLE IF NOT EXISTS recommendation_closures (
 );
 CREATE INDEX IF NOT EXISTS idx_recommendation_closures_project
     ON recommendation_closures(project_id,closed_at DESC);
+CREATE TABLE IF NOT EXISTS recommendation_made_from (
+    card_id TEXT PRIMARY KEY,
+    recommendation_id TEXT NOT NULL,
+    recorded_at INTEGER NOT NULL
+);
 """
 
 _VIENNA = ZoneInfo("Europe/Vienna")
@@ -43,6 +48,34 @@ def same_review_work(left: Optional[str], right: Optional[str]) -> bool:
     right_words = set(re.findall(r"\w+", right.casefold())) - ignored
     # The approved content-link threshold is token-set Jaccard >= 0.8.
     return bool(left_words and right_words and len(left_words & right_words) * 5 >= len(left_words | right_words) * 4)
+
+
+def record_made_from(conn: sqlite3.Connection, card_id: str, recommendation_id: str) -> None:
+    """The kernel's lineage of a card it creates from a suggestion, in the transaction that inserts the card."""
+    card = conn.execute("SELECT project_id,task_kind FROM tasks WHERE id=?", (card_id,)).fetchone()
+    source = conn.execute(
+        "SELECT project_id FROM tasks WHERE id=? AND task_kind='recommendation'", (recommendation_id,),
+    ).fetchone() if isinstance(recommendation_id, str) else None
+    if (card is None or card["task_kind"] != "work" or not card["project_id"] or source is None
+            or source["project_id"] != card["project_id"]):
+        raise ValueError("made_from_recommendation must name a suggestion of the card's Project")
+    conn.execute(
+        "INSERT INTO recommendation_made_from (card_id,recommendation_id,recorded_at) VALUES (?,?,?)",
+        (card_id, recommendation_id, int(time.time())),
+    )
+
+
+def content_link(conn: sqlite3.Connection, recommendation_id: str, label: Optional[str], card_id: str,
+                 title: Optional[str]) -> bool:
+    """L1: a title similarity of at least 0.8, or the card was made from the suggestion by the kernel."""
+    if same_review_work(label, title):
+        return True
+    # Older boards have no lineage table: no card there was made from a suggestion.
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recommendation_made_from'"
+    ).fetchone() is not None and conn.execute(
+        "SELECT 1 FROM recommendation_made_from WHERE card_id=? AND recommendation_id=?", (card_id, recommendation_id),
+    ).fetchone() is not None
 
 
 def has_live_recommendation_closure(conn: sqlite3.Connection, recommendation_id: str) -> bool:
@@ -120,7 +153,7 @@ def close_recommendation_delivered(
             raise ValueError("review_closure_card_project_invalid")
         # A merge proves delivery only for a card that is done or archived, not for one that is open again.
         state = card_delivery_state(conn, card_id, card["status"])
-        if state is None or not same_review_work(row["recommendation_label"], card["title"]):
+        if state is None or not content_link(conn, recommendation_id, row["recommendation_label"], card_id, card["title"]):
             raise ValueError("review_closure_delivery_required")
         previous = conn.execute(
             "SELECT * FROM recommendation_closures WHERE recommendation_id=?", (recommendation_id,),

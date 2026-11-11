@@ -102,6 +102,7 @@ from hermes_cli.kanban_recommendation_closure import (
     SCHEMA_SQL as _RECOMMENDATION_CLOSURE_SCHEMA_SQL,
     close_recommendation_delivered,
     has_live_recommendation_closure,
+    record_made_from,
     undo_recommendation_closure,
 )
 from hermes_cli.kanban_replaced_cards import replaced_task_ids
@@ -19390,6 +19391,7 @@ def create_task(
     receipt_owned: bool = False,
     requires_review: bool = False,
     risk_tier: Optional[int] = None,
+    made_from_recommendation: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -19884,6 +19886,8 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if made_from_recommendation is not None:
+                    record_made_from(conn, task_id, made_from_recommendation)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

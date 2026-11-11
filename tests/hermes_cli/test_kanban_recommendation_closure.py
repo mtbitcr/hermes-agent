@@ -16,6 +16,7 @@ import yaml
 
 from hermes_cli import kanban_db as kb, owner_project_review as review, projects_db
 from hermes_cli import owner_project_review_record as records, owner_project_summary_events as events
+from hermes_cli.kanban_recommendation_closure import content_link, same_review_work
 from plugins.dashboard_auth.raphael_workspace import model_policy
 
 NOW = int(datetime(2026, 11, 10, 7, tzinfo=timezone.utc).timestamp())
@@ -87,9 +88,10 @@ def _version(board, suggestion):
     return board.execute("SELECT recommendation_lifecycle_version FROM tasks WHERE id=?", (suggestion,)).fetchone()[0]
 
 
-def _delivered_pair(board, pid, *, subject="meeting-room", label="Book the room", title="Book a room"):
+def _delivered_pair(board, pid, *, subject="meeting-room", label="Book the room", title="Book a room", made_from=False):
     suggestion = _suggestion(board, pid, subject=subject, label=label)
-    delivered = kb.create_task(board, title=title, project_id=pid)
+    lineage = {"made_from_recommendation": suggestion} if made_from else {}
+    delivered = kb.create_task(board, title=title, project_id=pid, **lineage)
     assert kb.complete_task(board, delivered, summary="The work is delivered.")
     return suggestion, delivered, _version(board, suggestion)
 
@@ -167,17 +169,49 @@ def test_a_title_similarity_at_or_above_the_threshold_is_a_content_link(project_
     assert _close(board, suggestion, delivered, version)["status"] == "closed"
 
 
-@pytest.mark.xfail(strict=True, raises=TypeError, reason=(
-    "open: this tree records no link from a card to the suggestion it was made from (create_task has no source "
-    "field and task_links refuses recommendation parents); B6 owns neither producer, see /tmp/b6-handover.md"
-))
 def test_a_card_made_from_the_suggestion_is_accepted(project_board):
     board, pid = project_board
     suggestion = _suggestion(board, pid)
     made = kb.create_task(board, title="Reserve a venue", project_id=pid, made_from_recommendation=suggestion)
     assert kb.complete_task(board, made, summary="The venue is reserved.")
+    assert not same_review_work("Book the room", "Reserve a venue")
 
     assert _close(board, suggestion, made, _version(board, suggestion))["status"] == "closed"
+    assert [tuple(row) for row in board.execute(
+        "SELECT card_id,recommendation_id FROM recommendation_made_from",
+    )] == [(made, suggestion)]
+
+
+@pytest.mark.parametrize("source", ["other_project", "work_card", "unknown", "no_project"])
+def test_a_made_from_link_to_anything_but_a_suggestion_of_the_cards_project_creates_nothing(root, project_board, source):
+    board, pid = project_board
+    card_project = {"other_project": _project(root, name="Office Move").id, "no_project": None}.get(source, pid)
+    if source == "work_card":
+        made_from = kb.create_task(board, title="Book the room", project_id=pid)
+    else:
+        made_from = "t_unknown" if source == "unknown" else _suggestion(board, pid)
+    before = board.execute("SELECT COUNT(*), MAX(id) FROM task_events").fetchone()[:] + (
+        board.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+    )
+
+    with pytest.raises(ValueError, match="made_from_recommendation"):
+        kb.create_task(board, title="Reserve a venue", project_id=card_project, made_from_recommendation=made_from)
+
+    assert board.execute("SELECT COUNT(*), MAX(id) FROM task_events").fetchone()[:] + (
+        board.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+    ) == before
+    assert board.execute("SELECT COUNT(*) FROM recommendation_made_from").fetchone()[0] == 0
+
+
+def test_a_legacy_board_without_the_lineage_table_reads_as_no_made_from_link(project_board):
+    board, pid = project_board
+    suggestion, delivered, version = _delivered_pair(board, pid, title="Reserve a venue")
+    with kb.write_txn(board):
+        board.execute("DROP TABLE recommendation_made_from")
+
+    assert not content_link(board, suggestion, "Book the room", delivered, "Reserve a venue")
+    with pytest.raises(ValueError, match="review_closure_delivery_required"):
+        _close(board, suggestion, delivered, version)
 
 
 @pytest.mark.parametrize(("first_time", "last_time", "review_day", "next_day"), [
@@ -515,12 +549,14 @@ _PAIRS = (("meeting-room", "Book the room", "Book a room"), ("meeting-speaker", 
           ("meeting-agenda", "Print the agenda", "Print the agenda"))
 
 
-def _completed_review(root, monkeypatch, *, closure=True, pairs=1, closed_before=0, edit=None):
+def _completed_review(root, monkeypatch, *, closure=True, pairs=1, closed_before=0, edit=None, first_title=None,
+                      made_from=False):
     """A Project with delivered suggestions, its frozen review task, and the worker's completed result."""
     project = _project(root)
     monkeypatch.setattr(time, "time", lambda: NOW)
     with _board(project) as board:
-        made = [_delivered_pair(board, project.id, subject=s, label=label, title=title) for s, label, title in _PAIRS[:pairs]]
+        made = [_delivered_pair(board, project.id, subject=s, label=label, title=(first_title or title) if n == 0 else title,
+                                made_from=made_from and n == 0) for n, (s, label, title) in enumerate(_PAIRS[:pairs])]
         closed = [_delivered_pair(board, project.id, subject=f"done-{n}", label=f"Print badge set {n}",
                                   title=f"Print badge set {n}") for n in range(closed_before)]
         for pair in closed:
@@ -859,3 +895,234 @@ def test_inside_a_worker_close_and_undo_refuse_and_no_board_changes(root, monkey
     after = count()
     assert after == before
     assert after[project_path][1] == (1, 0)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# L1 made-from through the harvest, the resumed finish after a crash or a busy board, and the closure-aware fence
+# ---------------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("made_from", [True, False])
+def test_the_harvest_closes_a_card_made_from_the_suggestion_and_refuses_a_claimed_link_without_lineage(
+    root, monkeypatch, caplog, made_from,
+):
+    def claim_made_from(payload, made):
+        payload["proposed_closures"][0]["reason"] = "The card was made from this suggestion."
+
+    project, task_id, made = _completed_review(root, monkeypatch, first_title="Reserve a venue", made_from=made_from,
+                                               edit=claim_made_from)
+
+    assert review.review_tick(NOW + 1) == 0
+
+    if made_from:
+        assert [row[:2] for row in _closures(project)] == [made[0][:2]]
+        assert _stored(root, project)[0] == (None, "2026-11-10", 0)
+    else:
+        # Only the kernel's lineage record makes the link. A result's own claim is no evidence.
+        assert _closures(project) == []
+        assert _stored(root, project) == ((None, "2026-11-09", 1), None)
+        assert "review_class_evidence_required" in caplog.text
+    assert _review_task_status(task_id) == "archived"
+
+
+def _child_tick(tmp_path, now, *, kill_in=None):
+    """One scheduled tick in a fresh process; ``kill_in`` names the step where the process is SIGKILLed."""
+    return f"""
+import os, signal, time
+from pathlib import Path
+Path.home = lambda: Path({str(tmp_path)!r})
+time.time = lambda: {now}
+from plugins.dashboard_auth.raphael_workspace import model_policy
+model_policy.configured_assignment_for = lambda profile: model_policy.assignment_for(profile, "anthropic")
+from hermes_cli import kanban_db, owner_project_review as review
+def crash(*args, **kwargs):
+    os.kill(os.getpid(), signal.SIGKILL)
+if {kill_in!r} == "closures":
+    review._apply_review_closures = crash
+elif {kill_in!r} == "archive":
+    kanban_db.archive_task = crash
+review.review_tick({now})
+"""
+
+
+def _run_child(tmp_path, now, *, kill_in=None):
+    return subprocess.run([sys.executable, "-c", _child_tick(tmp_path, now, kill_in=kill_in)], capture_output=True,
+                          timeout=120, stdin=subprocess.DEVNULL, env={**os.environ, "HOME": str(tmp_path)})
+
+
+def _registry_rows(root, project):
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        state = dict(registry.execute("SELECT * FROM project_review_state WHERE project_id=?", (project.id,)).fetchone())
+        state.pop("updated_at")
+        return (state, projects_db.get_project_summary(registry, project.id),
+                projects_db.get_project_review_brief(registry, project.id), review.budget(registry, "2026-11-10"))
+
+
+def _closed_events(project):
+    with _board(project) as board:
+        return [row[0] for row in board.execute(
+            "SELECT kind FROM task_events WHERE kind LIKE 'recommendation_clos%' ORDER BY id",
+        )]
+
+
+def test_a_crash_after_the_text_commit_resumes_the_accepted_closures_without_writing_the_texts_again(
+    root, monkeypatch, tmp_path,
+):
+    project, task_id, made = _completed_review(root, monkeypatch)
+
+    crashed = _run_child(tmp_path, NOW + 1, kill_in="closures")
+
+    assert crashed.returncode == -9, crashed.stderr.decode(errors="replace")
+    # The texts and the day are stored; the done review task is the durable mark of the accepted closure work.
+    assert _stored(root, project)[0] == (None, "2026-11-10", 0)
+    assert _review_task_status(task_id) == "done" and _closures(project) == []
+    stored = _registry_rows(root, project)
+
+    restarted = _run_child(tmp_path, NOW + 1)
+    assert restarted.returncode == 0, restarted.stderr.decode(errors="replace")
+    review.review_tick(NOW + 2)
+    review.review_tick(NOW + 3)
+
+    assert [row[:2] for row in _closures(project)] == [made[0][:2]]
+    assert _closed_events(project) == ["recommendation_closed"]
+    assert _review_task_status(task_id) == "archived"
+    # The resumed finish wrote no text, day, cursor or budget slot.
+    assert _registry_rows(root, project) == stored
+
+
+def test_a_busy_board_keeps_the_accepted_closures_for_the_next_tick(root, monkeypatch, caplog):
+    project, task_id, made = _completed_review(root, monkeypatch)
+    original, target, faults = kb.connect_closing, events._board_path(project.board_slug), []
+
+    def busy_once(path, *args, **kwargs):
+        if Path(path) == target and not faults:
+            faults.append(path)
+            raise sqlite3.OperationalError("database is locked")
+        return original(path, *args, **kwargs)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(kb, "connect_closing", busy_once)
+        review.review_tick(NOW + 1)
+
+    assert len(faults) == 1 and "review_closure_pending" in caplog.text
+    assert _review_task_status(task_id) == "done" and _closures(project) == []
+    assert _stored(root, project)[0] == (None, "2026-11-10", 0)
+    review.review_tick(NOW + 2)
+    review.review_tick(NOW + 3)
+
+    assert [row[:2] for row in _closures(project)] == [made[0][:2]]
+    assert _closed_events(project) == ["recommendation_closed"]
+    assert _review_task_status(task_id) == "archived"
+
+
+@pytest.mark.parametrize("owner_undoes", [False, True])
+def test_a_crash_after_the_closure_commit_replays_once_from_two_gateways_and_keeps_the_owners_undo(
+    root, monkeypatch, tmp_path, owner_undoes,
+):
+    project, task_id, made = _completed_review(root, monkeypatch)
+
+    crashed = _run_child(tmp_path, NOW + 1, kill_in="archive")
+
+    assert crashed.returncode == -9, crashed.stderr.decode(errors="replace")
+    assert _review_task_status(task_id) == "done"
+    ((suggestion, delivered, _, closed_at, _),) = _closures(project)
+    monkeypatch.setattr(time, "time", lambda: NOW + 5)
+    if owner_undoes:
+        with _board(project) as board:
+            assert kb.undo_recommendation_closure(board, suggestion, actor="default", reason="The room needs a check.",
+                                                  expected_closed_at=closed_at)["status"] == "undone"
+    settings = review.read_settings()
+    with kb.connect_closing(kb.kanban_db_path(board="project-summaries"), board="project-summaries") as reviews:
+        task = kb.get_task(reviews, task_id)
+    # Two gateways found the same stored review before either finished it; each replays it with its own connections.
+    for now in (NOW + 5, NOW + 6):
+        with projects_db.connect_closing(root / "projects.db") as registry:
+            with kb.connect_closing(kb.kanban_db_path(board="project-summaries"), board="project-summaries") as reviews:
+                review._finish_review(registry, reviews, settings, project.id, task, now)
+    review.review_tick(NOW + 7)
+
+    assert _closures(project) == [(suggestion, delivered, "2026-11-10", closed_at, NOW + 5 if owner_undoes else None)]
+    assert _closed_events(project) == ["recommendation_closed"] + ["recommendation_closure_undone"] * owner_undoes
+    assert _review_task_status(task_id) == "archived"
+    assert _stored(root, project)[0] == (None, "2026-11-10", 0)
+
+
+def _capped_project(root, monkeypatch, *, closed=True, clipped=True):
+    """A Project whose one suggestion the total input cap leaves out among 120 open cards."""
+    project = _project(root)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    with _board(project) as board:
+        pair = _delivered_pair(board, project.id)
+        closure = _close(board, *pair) if closed else None
+        if clipped:
+            with kb.write_txn(board):
+                for index in range(120):
+                    kb.create_task(board, title=f"Prepare the detailed meeting followup section number {index}",
+                                   project_id=project.id)
+    _config(root, project, closure=True)
+    assert review.review_tick(NOW) == 1
+    task_id = _open_review(root, project)
+    with kb.connect_closing(kb.kanban_db_path(board="project-summaries"), board="project-summaries") as reviews:
+        sources, _ = review._frozen_sources(kb.get_task(reviews, task_id).body)
+    assert bool(sources["suggestions"]) is not clipped
+    return project, task_id, pair, closure
+
+
+def _capped_payload(pair, *, clipped, closed):
+    payload = _payload([])
+    payload["brief"]["what_changed"] = "Book the room has been completed and the followup work is ready."
+    if not clipped:
+        payload["classification"] = [{"item": pair[0], "class": "superseded" if closed else "still actionable",
+                                      "evidence": [f"suggestions:{pair[0]}"]}]
+    return payload
+
+
+@pytest.mark.parametrize(("closed", "clipped"), [(True, True), (True, False), (False, True)])
+def test_a_live_closed_suggestion_is_no_owner_decision_also_when_the_input_cap_leaves_it_out(
+    root, monkeypatch, closed, clipped,
+):
+    project, task_id, pair, _ = _capped_project(root, monkeypatch, closed=closed, clipped=clipped)
+    _finish_review(task_id, _capped_payload(pair, clipped=clipped, closed=closed))
+
+    review.review_tick(NOW + 1)
+
+    state, brief = _stored(root, project)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        summary = projects_db.get_project_summary(registry, project.id)
+    assert state == (None, "2026-11-10", 0)
+    pointer = None if closed else "A suggestion is waiting on Decisions."
+    assert (brief["needs_you"], summary["owner_decision"]) == (pointer, pointer)
+
+
+@pytest.mark.parametrize("action", ["undo", "close"])
+def test_an_undo_or_a_close_of_a_suggestion_the_cap_left_out_makes_the_frozen_review_stale(root, monkeypatch, action):
+    project, task_id, pair, closure = _capped_project(root, monkeypatch, closed=action == "undo")
+    with kb.connect_closing(kb.kanban_db_path(board="project-summaries"), board="project-summaries") as reviews:
+        frozen = review._frozen_decision_cursor(kb.get_task(reviews, task_id).body)
+    with _board(project) as board:
+        if action == "undo":
+            assert kb.undo_recommendation_closure(board, pair[0], actor="default", reason="The room needs a check.",
+                                                  expected_closed_at=closure["closed_at"])["status"] == "undone"
+        else:
+            assert _close(board, *pair)["status"] == "closed"
+        # The stored owner decision stays pending; only the live closure moves the suggestion in or out of the set.
+        assert kb.recommendation_lifecycle_snapshot(
+            board.execute("SELECT * FROM tasks WHERE id=?", (pair[0],)).fetchone(),
+        )["decision"] == "pending"
+        assert review._decision_cursor(review._owner_decisions(board, project.id)) != frozen
+    _finish_review(task_id, _capped_payload(pair, clipped=True, closed=action == "undo"))
+
+    review.review_tick(NOW + 1)
+
+    state, brief = _stored(root, project)
+    assert brief is None and state[1] == "2026-11-09"
+
+
+def test_a_legacy_board_without_the_closure_table_lists_its_pending_suggestions(project_board):
+    board, pid = project_board
+    suggestion, _, version = _delivered_pair(board, pid)
+    with kb.write_txn(board):
+        board.execute("DROP TABLE recommendation_closures")
+
+    state = kb.recommendation_lifecycle_snapshot(board.execute("SELECT * FROM tasks WHERE id=?", (suggestion,)).fetchone())
+    assert review._owner_decisions(board, pid)["suggestions"] == [[suggestion, state["effective_state"], version]]
