@@ -36,6 +36,7 @@ import re
 import sqlite3
 import time
 from collections import Counter
+from contextlib import closing
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -141,6 +142,19 @@ def _is_delegated_child_process_context() -> bool:
         return True
 
 
+def _review_task_refusal(tool_name: str) -> Optional[str]:
+    """Operator rule S1 refusal. Reads the worker's own task read-only: a refusal never writes."""
+    from hermes_cli import kanban_db as kb
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    if tid and tool_name not in kb.REVIEW_TASK_TOOLS and (path := kb.kanban_db_path()).exists():
+        with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+            row = conn.execute("SELECT created_by FROM tasks WHERE id = ?", (tid,)).fetchone()
+        if row and row[0] == kb.REVIEW_TASK_CREATOR:
+            return tool_error(f"{tool_name} refused: a review or portfolio task may call only "
+                              f"{' and '.join(kb.REVIEW_TASK_TOOLS)} (operator rule S1)")
+    return None
+
+
 def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
     """Deny Kanban mutations from delegate_task children.
 
@@ -150,7 +164,7 @@ def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
     block, heartbeat, comment, create, link, or unblock board tasks directly.
     """
     if not _is_delegated_child_context():
-        return None
+        return _review_task_refusal(tool_name)
     return tool_error(
         f"{tool_name} refused: delegate_task child agents are not Kanban "
         "run owners. Return findings to the parent agent; the dispatcher "
@@ -1108,7 +1122,7 @@ def _handle_show(args: dict, **kw) -> str:
 
 def _handle_list(args: dict, **kw) -> str:
     """List task summaries with the same core filters as the CLI."""
-    guard = _require_orchestrator_tool("kanban_list")
+    guard = _review_task_refusal("kanban_list") or _require_orchestrator_tool("kanban_list")
     if guard:
         return guard
     assignee = args.get("assignee")
@@ -1366,7 +1380,7 @@ def _handle_status_report(args: dict, **kw) -> str:
     deliberately NOT done here. Whatever the bounds exclude is disclosed in
     the response; nothing is dropped silently.
     """
-    guard = _require_status_report_profile("kanban_status_report")
+    guard = _review_task_refusal("kanban_status_report") or _require_status_report_profile("kanban_status_report")
     if guard:
         return guard
 
@@ -1870,7 +1884,7 @@ def _handle_receipts_summary(args: dict, **kw) -> str:
     ended in the last ``days`` days; what either bound leaves out is
     disclosed as counts.
     """
-    guard = _require_status_report_profile("kanban_receipts_summary")
+    guard = _review_task_refusal("kanban_receipts_summary") or _require_status_report_profile("kanban_receipts_summary")
     if guard:
         return guard
 
@@ -2932,6 +2946,8 @@ def _handle_attach_url(args: dict, **kw) -> str:
 
 def _handle_attachments(args: dict, **kw) -> str:
     """List a task's attachments (read-only; no ownership restriction)."""
+    if refusal := _review_task_refusal("kanban_attachments"):
+        return refusal
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -3001,8 +3017,9 @@ def _handle_read(args: dict, **kw) -> str:
     are enforced by the same ``read_attachment_bytes`` the download path
     already uses, so this can never read outside the attachments directory.
     """
+    if refusal := _review_task_refusal("kanban_read"):
+        return refusal
     from hermes_cli import kanban_db as kb
-
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -3511,7 +3528,7 @@ def _handle_recommend(args: dict, **kw) -> str:
     The model supplies only the opaque advice payload (kind/subject/label/
     rationale), and the response echoes back scope, never the display text.
     """
-    guard_err = _require_recommendation_worker("kanban_recommend")
+    guard_err = _review_task_refusal("kanban_recommend") or _require_recommendation_worker("kanban_recommend")
     if guard_err:
         return guard_err
     tid = os.environ.get("HERMES_KANBAN_TASK")
