@@ -25,6 +25,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -547,73 +548,133 @@ def _design_vision_schema_names():
     return names
 
 
+_PROCESS_VARS = (
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_HOME",
+    "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_ATTACHMENTS_ROOT",
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_PROFILE",
+    "HERMES_SESSION_ID",
+)
+
+
+def _fresh_process(home: Path, monkeypatch) -> None:
+    """This process names no card, run, profile or session of its own, and its Hermes root
+    is ``home``; the kanban modules remember no board."""
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for var in _PROCESS_VARS:
+        monkeypatch.delenv(var, raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    kb._REGISTER_INITIALIZED = False
+    kb._REGISTER_INITIALIZED_PATHS.clear()
+    kb._ARCHIVE_INITIALIZED_PATHS.clear()
+
+
+@pytest.fixture(scope="module")
+def _world(tmp_path_factory):
+    """The Hermes root every test starts from, built and launched once for the module.
+
+    A Hermes root with three live boards (the default one, the worker's own and another one):
+    the worker's own card, a sibling card with a drawing, and on each other board a card with a
+    picture and a drawing, so each of their drawings has the id the worker's next attachment
+    gets on its own board. The worker's card is prepared as the dispatcher does and launched
+    through ``_default_spawn`` (only the process launch stubbed), and the positive controls
+    run. Building a root takes seconds of disk syncs, so it is kept as a pristine copy that
+    each test gets back byte for byte at the same paths (the drawings' stored paths and the
+    card's workspace are in the boards).
+    """
+    from tools.registry import discover_builtin_tools
+
+    base = tmp_path_factory.mktemp("world")
+    home = base / "hermes_home"
+    home.mkdir()
+    with pytest.MonkeyPatch.context() as patch:
+        hermes_state = sys.modules.get("hermes_state")
+        if hermes_state is not None and hasattr(hermes_state, "DEFAULT_DB_PATH"):
+            patch.setattr(hermes_state, "DEFAULT_DB_PATH", base / "state.db")
+        _fresh_process(home, patch)
+
+        kb.init_db()
+        for slug in (OWN, OTHER):
+            kb.create_board(slug)
+            entry = kb.get_register_entry(slug)
+            assert entry is not None and entry.lifecycle is kb.BoardLifecycle.LIVE
+
+        mine = _claimed_card(OWN, "home page design")
+        sibling = _claimed_card(OWN, "menu page design")
+        foreign = _claimed_card(OTHER, "shop page design")
+        default_card = _claimed_card(kb.DEFAULT_BOARD, "about page design")
+        stores = {slug: _store_path(slug) for slug in (kb.DEFAULT_BOARD, OWN, OTHER)}
+        drawings = {"sibling": _store(OWN, sibling, "menu.svg", PLAIN)}
+        for name, slug, card in (("foreign", OTHER, foreign), ("default_card", kb.DEFAULT_BOARD, default_card)):
+            _store(slug, card, "photo.png", PICTURE, "image/png")
+            drawings[name] = _store(slug, card, "shop.svg", PLAIN)
+
+        (home / "profiles" / mine.assignee).mkdir(parents=True)
+        conn = kb.connect(board=OWN)
+        try:
+            workspace = kb.resolve_workspace(mine, board=OWN)
+            kb.set_workspace_path(conn, mine.id, str(workspace))
+        finally:
+            conn.close()
+        inherited = dict(os.environ)
+        env = _spawned_worker_env(mine, Path(workspace), patch)
+        # What the launch sets, and what it takes out, of the environment it inherits.
+        launch_sets = {name: value for name, value in env.items() if inherited.get(name) != value}
+        launch_drops = [name for name in inherited if name not in env]
+
+        # The positive controls, which also leave the tool discovery cache warm in the copy.
+        _become(env, patch)
+        assert kb.kanban_db_path(board=OTHER).resolve() == stores[OWN].resolve()
+        assert "tools.kanban_render_drawing" in discover_builtin_tools()
+        assert TOOL in _design_vision_schema_names()
+
+    pristine = base / "pristine"
+    shutil.copytree(home, pristine, symlinks=True)
+    return SimpleNamespace(
+        base=base, home=home, pristine=pristine, stores=stores, mine=mine, sibling=sibling,
+        foreign=foreign, default_card=default_card, drawings=drawings,
+        launch_sets=launch_sets, launch_drops=launch_drops,
+    )
+
+
 @pytest.fixture
-def root(tmp_path, monkeypatch):
+def root(_world, monkeypatch):
     """A Hermes root with three live boards: the default one, the worker's own
     and another one.
 
     The test process plays the dispatcher: it names no card, run, profile or
     session of its own.
     """
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    for var in (
-        "HERMES_KANBAN_DB",
-        "HERMES_KANBAN_WORKSPACES_ROOT",
-        "HERMES_KANBAN_HOME",
-        "HERMES_KANBAN_BOARD",
-        "HERMES_KANBAN_ATTACHMENTS_ROOT",
-        "HERMES_KANBAN_TASK",
-        "HERMES_KANBAN_RUN_ID",
-        "HERMES_PROFILE",
-        "HERMES_SESSION_ID",
-    ):
-        monkeypatch.delenv(var, raising=False)
-
-    kb._INITIALIZED_PATHS.clear()
-    kb._REGISTER_INITIALIZED = False
-    kb._REGISTER_INITIALIZED_PATHS.clear()
-    kb._ARCHIVE_INITIALIZED_PATHS.clear()
-
-    kb.init_db()
+    shutil.rmtree(_world.home)
+    shutil.copytree(_world.pristine, _world.home, symlinks=True)
+    _fresh_process(_world.home, monkeypatch)
     for slug in (OWN, OTHER):
-        kb.create_board(slug)
         entry = kb.get_register_entry(slug)
         assert entry is not None and entry.lifecycle is kb.BoardLifecycle.LIVE
-    return home
+    return _world.home
 
 
 @pytest.fixture
-def worker(root, tmp_path, monkeypatch):
+def worker(_world, root, monkeypatch):
     """This process becomes the designer's worker for its card on ``own-board``.
 
     The worker's own board also holds a sibling card with a drawing. The other
     board and the default board each hold a card with a picture and a drawing,
     so each of their drawings has the id the worker's next attachment gets on
-    its own board. The card is then prepared as the dispatcher does, and this
+    its own board. The card is prepared as the dispatcher does, and this
     process takes the environment ``_default_spawn`` gives its worker.
     """
     from tools.registry import discover_builtin_tools
 
-    mine = _claimed_card(OWN, "home page design")
-    sibling = _claimed_card(OWN, "menu page design")
-    foreign = _claimed_card(OTHER, "shop page design")
-    default_card = _claimed_card(kb.DEFAULT_BOARD, "about page design")
-    stores = {slug: _store_path(slug) for slug in (kb.DEFAULT_BOARD, OWN, OTHER)}
-    drawings = {"sibling": _store(OWN, sibling, "menu.svg", PLAIN)}
-    for name, slug, card in (("foreign", OTHER, foreign), ("default_card", kb.DEFAULT_BOARD, default_card)):
-        _store(slug, card, "photo.png", PICTURE, "image/png")
-        drawings[name] = _store(slug, card, "shop.svg", PLAIN)
-
-    (root / "profiles" / mine.assignee).mkdir(parents=True)
-    conn = kb.connect(board=OWN)
-    try:
-        workspace = kb.resolve_workspace(mine, board=OWN)
-        kb.set_workspace_path(conn, mine.id, str(workspace))
-    finally:
-        conn.close()
-    env = _spawned_worker_env(mine, Path(workspace), monkeypatch)
+    mine, stores = _world.mine, _world.stores
+    env = dict(os.environ)
+    env.update(_world.launch_sets)
+    for name in _world.launch_drops:
+        env.pop(name, None)
 
     # Pinned to its own card, run and board, under its profile home below the
     # root; the session id is the worker's own to publish once it starts.
@@ -630,7 +691,7 @@ def worker(root, tmp_path, monkeypatch):
         "HERMES_KANBAN_WORKSPACES_ROOT",
         "HERMES_KANBAN_WORKSPACE",
     ):
-        assert Path(env[name]).resolve().is_relative_to(tmp_path.resolve()), name
+        assert Path(env[name]).resolve().is_relative_to(_world.base.resolve()), name
 
     _become(env, monkeypatch)
     _assert_root_in_reach(root)
@@ -643,7 +704,8 @@ def worker(root, tmp_path, monkeypatch):
     assert TOOL in _design_vision_schema_names()
     return SimpleNamespace(
         root=root, profile_home=Path(env["HERMES_HOME"]), stores=stores, mine=mine,
-        sibling=sibling, foreign=foreign, default_card=default_card, drawings=drawings,
+        sibling=_world.sibling, foreign=_world.foreign, default_card=_world.default_card,
+        drawings=_world.drawings,
     )
 
 
