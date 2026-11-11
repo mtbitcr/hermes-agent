@@ -33,6 +33,7 @@ from tests.gateway.test_api_server_owner_suggestion_decisions import (  # noqa: 
 )
 from tests.gateway.test_api_server_runs import _capability_stopped_task
 from tests.hermes_cli.test_kanban_delivery_outcome import _delivery, _red_check_returned
+from tests.hermes_cli.test_kanban_work_items import _continued_by
 from tests.hermes_cli.test_owner_project_removal import (
     _call,
     _n,
@@ -320,6 +321,53 @@ async def test_the_delivery_outcome_example_carries_every_outcome_state(
                 "task_title", "has_newer_run", "retry_origin", "started_at", "finished_at", "receipt",
                 "delivery_outcome"}
         assert not any(task_id in json.dumps(runs) for task_id in cards.values())
+
+
+@pytest.mark.asyncio
+async def test_the_work_item_example_carries_current_and_earlier_attempts(
+    owner, owner_payload_example,
+):
+    project = _project(owner, "Signup Pilot")
+    board, slug = project["board"], _slug(owner, project)
+    source = _task(board, project, "Build the signup form")
+    rework = _task(board, project, "Rework the signup form")
+    alone = _task(board, project, "Book the photographer")
+    # The source's run finished and the source recorded its rework, as
+    # _continuation does; the rework was tried again and its newest run goes on.
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        assert kanban_db.claim_task(conn, source) is not None
+        assert kanban_db.complete_task(conn, source, result="Returned for rework.")
+        _continued_by(conn, source, rework)
+        assert kanban_db.claim_task(conn, rework) is not None
+        assert kanban_db.reclaim_task(conn, rework, reason="try again")
+        assert kanban_db.claim_task(conn, rework) is not None
+
+    async with TestClient(TestServer(_app())) as client:
+        live = await _snapshot(client, slug, f"{V1},{ow.WORK_ITEM_CAPABILITY}")
+
+    def items(answer):
+        """Each work item as its rows' kind, title and current flag; the keys themselves left out."""
+        found = {}
+        for kind, rows in (("card", _tasks(answer)), ("run", answer["body"]["data"]["runs"])):
+            for row in rows:
+                found.setdefault(row["work_item"]["key"], []).append(
+                    (kind, row.get("title", row.get("task_title")), row["work_item"]["current"]))
+        return sorted(sorted(rows) for rows in found.values())
+
+    saved = owner_payload_example(FAMILY, "work_item", live)
+    assert items(live) == [[("card", "Book the photographer", True)], [
+        ("card", "Build the signup form", False), ("card", "Rework the signup form", True),
+        ("run", "Build the signup form", False), ("run", "Rework the signup form", False),
+        ("run", "Rework the signup form", True)]]
+    assert items(saved) == items(live)
+    for answer in (live, saved):
+        cards, runs = _tasks(answer), answer["body"]["data"]["runs"]
+        for row in (*cards, *runs):
+            assert set(row["work_item"]) == {"key", "current"}
+        assert {card["work_item"]["current"] for card in cards} == {True, False}
+        assert {run["work_item"]["current"] for run in runs} == {True, False}
+        ids = {source, rework, alone} | {card["id"] for card in cards}
+        assert not any(task_id in json.dumps(runs) for task_id in ids)
 
 
 def test_the_run_receipt_examples_carry_every_outcome_and_summary(owner_payload_example):
