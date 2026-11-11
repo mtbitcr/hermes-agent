@@ -105,7 +105,8 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
 5. Classify every suggestion, every task in decisions, and every earlier still actionable item exactly once.
    Each classification has exactly item (task id), class, and evidence (a list of input references).
    Classes are answered, superseded, stale, still actionable, and current. The kernel computes answered, stale, and current.
-   An item that is finished, parked, waiting on other work, or not in this input takes one of those three; the kernel settles it.
+   An item that is finished, parked, waiting on other work, or not in this input takes one of those three.
+   The kernel settles a delivered or archived item and keeps every other earlier item open.
    Evidence references use tasks:<id>, suggestions:<id>, decisions:event:<event_id>, or decisions:wait:<task_id>.
    The kernel also resolves approved plan replacements. Their evidence uses proposals:<id> from this input.
 6. Return null for owner_decision and needs_you. The kernel names the existing owner waits.
@@ -126,6 +127,10 @@ def _settled_class(item: Any) -> bool:
 
 class ReviewRefused(ValueError):
     """A stable refusal code, without text from the worker or the Project record."""
+
+
+class ReviewStale(ReviewRefused):
+    """The live owner decisions are not those the review was frozen with: no text is replaced and no failure counted."""
 
 
 @dataclass(frozen=True)
@@ -355,13 +360,23 @@ def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, s
               and kanban_db.task_event_revision(board, tid) == card.get("event_revision")
               and next(_ready_work_rows(board, project_id, tid), None) is not None):
             actual, evidence, actor = "still actionable", [f"tasks:{tid}"], "worker"
-        elif not waiting and not (tid in suggestions and suggestions[tid]["decision"] == "pending") and next(
-            _ready_work_rows(board, project_id, tid), None,
-        ) is None:
-            # No owner wait, pending suggestion or dependency-ready card keeps the item open: its card is finished,
-            # parked, waiting on other work, or not in the record. No class fits it, so the kernel settles it here:
-            # the item is not saved, and no later review expects it.
-            actual, evidence = None, []
+        elif not waiting and not (tid in suggestions and suggestions[tid]["decision"] == "pending"):
+            live = board.execute(
+                "SELECT status FROM tasks WHERE id=? AND (project_id=? OR project_id IS NULL)", (tid, project_id),
+            ).fetchone()
+            if live is not None and live["status"] in {"done", "archived"}:
+                # A delivery or an archive settles the item: it is not saved, and no later review expects it.
+                actual, evidence = None, []
+            else:
+                # Owner rule of 2026-11-11: nothing else settles open work, and input trimming never does. A parked
+                # card, a card waiting on other work, and a card the input does not hold stay open.
+                actual, evidence = "still actionable", [f"tasks:{tid}"] if tid in tasks else []
+                # The worker's own claim is checked against the frozen card, as on the ready-card branch above.
+                if by_item[tid]["class"] == "still actionable" and (
+                    not set(evidence) <= set(by_item[tid]["evidence"])
+                    or (tid in tasks and kanban_db.task_event_revision(board, tid) != card.get("event_revision"))
+                ):
+                    raise ReviewRefused("review_class_evidence_required")
         else:
             raise ReviewRefused("review_class_evidence_required")
         if by_item[tid]["class"] not in {"answered", "stale", "current", actual}:
@@ -459,7 +474,7 @@ def parse_review_result(
 
         decisions = _owner_decisions(project_board, project_id)
         if _decision_cursor(decisions) != _frozen_decision_cursor(task.body):
-            raise ReviewRefused("review_decision_state_changed")
+            raise ReviewStale("review_decision_state_changed")
         plan_changes = verified_supersessions(
             registry, project, events._board_path(project.board_slug), sources.get("proposals", []),
             max_bytes=TOTAL_INPUT_CAP_BYTES,
@@ -550,40 +565,128 @@ def _frozen_decision_cursor(body: Optional[str]) -> str:
     return found[1]
 
 
-def _check_review_decisions(project: projects_db.Project, sources: dict[str, list[dict]], frozen_cursor: str) -> None:
+# The board's write lock waits this long; a Project board held longer delays the harvest to a later tick.
+_BOARD_LOCK_SECONDS = 30
+
+
+def _lock_board(path) -> sqlite3.Connection:
+    """The Project board's write lock, taken as the plan commit takes it: after the registry's. Nothing is written."""
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=rw", uri=True, timeout=_BOARD_LOCK_SECONDS,
+                           isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+@contextlib.contextmanager
+def _protected_section(registry: sqlite3.Connection, project: projects_db.Project):
+    """Owner rule of 2026-11-11, point 5: the registry's write transaction, then the Project board's write lock.
+
+    The order is the plan commit's (``commit_project_plan``), so the two never wait on each other. While the section
+    holds, no owner wait, answer or suggestion can start, so a read made inside it stays true until its commit ends.
+    """
+    path = events._board_path(project.board_slug) if project.board_slug else None
+    with write_txn(registry):
+        # A Project without a board has no owner decision to hold.
+        board = _lock_board(path) if path is not None and path.exists() else None
+        try:
+            yield
+        finally:
+            if board is not None:
+                board.rollback()
+                board.close()
+
+
+def _open_work_missing(registry: sqlite3.Connection, board: sqlite3.Connection, project_id: str,
+                       classification: list[dict]) -> list[str]:
+    """Each open item of the last accepted classification that the new one leaves out and no recorded event settled.
+
+    A delivery or an archive of its card, or the owner's decision on its suggestion, settles an item. An owner answer
+    and an approved plan change keep it in the new classification, as answered and superseded.
+    """
+    previous = registry.execute(
+        "SELECT classification FROM project_review_briefs WHERE project_id=? ORDER BY review_date DESC LIMIT 1",
+        (project_id,),
+    ).fetchone()
+    try:
+        held = [] if previous is None else json.loads(previous[0])
+    except ValueError:
+        held = None
+    if not isinstance(held, list):
+        raise ReviewRefused("review_previous_classification_invalid")
+    kept = {item["item"] for item in classification}
+    missing = []
+    for item in held:
+        if _settled_class(item):
+            continue
+        tid = item.get("item") if isinstance(item, dict) else None
+        if not isinstance(tid, str):
+            raise ReviewRefused("review_previous_classification_invalid")
+        if tid in kept:
+            continue
+        row = board.execute(
+            "SELECT status, task_kind, recommendation_decision FROM tasks WHERE id=? AND (project_id=? OR project_id IS NULL)",
+            (tid, project_id),
+        ).fetchone()
+        if row is not None and (row["status"] in {"done", "archived"} or (
+            row["task_kind"] == "recommendation" and row["recommendation_decision"] not in (None, "pending")
+        )):
+            continue
+        missing.append(tid)
+    return missing
+
+
+@contextlib.contextmanager
+def _check_review_decisions(
+    registry: sqlite3.Connection, project: projects_db.Project, sources: dict[str, list[dict]], frozen_cursor: str,
+    classification: list[dict],
+):
+    """The protected section of a review's commit: the final read of the live owner decisions, then the commit.
+
+    A live set that differs from the frozen one makes the result stale. A result that leaves out an open item of the
+    last accepted review, which no recorded event settled, is refused. Either way nothing is written.
+    """
     frozen = {item["task_id"]: item for item in sources["decisions"] if item.get("type") == "wait"}
     decision_ids = {item["task_id"] for item in sources["decisions"] if item.get("task_id")}
     cards = {item["id"]: item for item in sources["tasks"]}
-    try:
-        with events._read_only(events._board_path(project.board_slug)) as board:
-            # A new wait or suggestion anywhere in the Project makes the frozen pointer stale, also one the cap cut.
-            if _decision_cursor(_owner_decisions(board, project.id)) != frozen_cursor:
-                raise ReviewRefused("review_decision_state_changed")
-            current = kanban_db.task_owner_waits(board, decision_ids)
-            if set(current) != set(frozen) or any(
-                any(current[tid].get(key) != frozen[tid].get(key) for key in ("kind", "since"))
-                for tid in frozen
-            ) or any(
-                kanban_db.task_event_revision(board, tid) != cards.get(tid, {}).get("event_revision")
-                for tid in decision_ids
-            ):
-                # Revisions also detect an answer and a new question within the same timestamp second.
-                raise ReviewRefused("review_decision_state_changed")
-            for item in sources["suggestions"]:
-                row = board.execute(
-                    "SELECT * FROM tasks WHERE id=? AND project_id=? AND task_kind='recommendation'",
-                    (item["id"], project.id),
-                ).fetchone()
-                if row is None:
-                    raise ReviewRefused("review_recommendation_state_changed")
-                lifecycle = kanban_db.recommendation_lifecycle_snapshot(row)
-                if any(lifecycle[key] != item.get(key) for key in lifecycle):
-                    raise ReviewRefused("review_recommendation_state_changed")
-    except (sqlite3.OperationalError, OSError):
-        # A busy or unreadable board is no verdict on the result: the harvest keeps it for a later tick.
-        raise
-    except sqlite3.Error as exc:
-        raise ReviewRefused("review_decision_state_unavailable") from exc
+    with _protected_section(registry, project):
+        try:
+            with events._read_only(events._board_path(project.board_slug)) as board:
+                # A new wait or suggestion anywhere in the Project makes the frozen pointer stale, also one the cap cut.
+                if _decision_cursor(_owner_decisions(board, project.id)) != frozen_cursor:
+                    raise ReviewStale("review_decision_state_changed")
+                current = kanban_db.task_owner_waits(board, decision_ids)
+                if set(current) != set(frozen) or any(
+                    any(current[tid].get(key) != frozen[tid].get(key) for key in ("kind", "since"))
+                    for tid in frozen
+                ) or any(
+                    kanban_db.task_event_revision(board, tid) != cards.get(tid, {}).get("event_revision")
+                    for tid in decision_ids
+                ):
+                    # Revisions also detect an answer and a new question within the same timestamp second.
+                    raise ReviewStale("review_decision_state_changed")
+                for item in sources["suggestions"]:
+                    row = board.execute(
+                        "SELECT * FROM tasks WHERE id=? AND project_id=? AND task_kind='recommendation'",
+                        (item["id"], project.id),
+                    ).fetchone()
+                    if row is None:
+                        raise ReviewStale("review_recommendation_state_changed")
+                    lifecycle = kanban_db.recommendation_lifecycle_snapshot(row)
+                    if any(lifecycle[key] != item.get(key) for key in lifecycle):
+                        raise ReviewStale("review_recommendation_state_changed")
+                # Owner rule of 2026-11-11, point 1: input trimming alone never settles work.
+                if _open_work_missing(registry, board, project.id, classification):
+                    raise ReviewRefused("review_open_work_missing")
+        except (sqlite3.OperationalError, OSError):
+            # A busy or unreadable board is no verdict on the result: the harvest keeps it for a later tick.
+            raise
+        except sqlite3.Error as exc:
+            raise ReviewRefused("review_decision_state_unavailable") from exc
+        yield
 
 
 def _store_review_result(registry, project_id, task, result, now) -> bool:
@@ -598,9 +701,10 @@ def _store_review_result(registry, project_id, task, result, now) -> bool:
     project = projects_db.get_project(registry, project_id)
     if project is None or not summary._eligible(registry, project_id):
         return False
-    _check_review_decisions(project, result.sources, decision_cursor)
     ready_work = _ready_work(project)
-    with write_txn(registry):
+    # Owner rule of 2026-11-11, points 5 to 7: the final read and the commit hold one protected section. This is the
+    # one writer of a review's texts and day; the quiet day uses the same section.
+    with _check_review_decisions(registry, project, result.sources, decision_cursor, result.classification):
         changed = registry.execute(
             "UPDATE project_review_state SET open_task_id=NULL,open_review_date=NULL,failures=0,"
             "last_reviewed_date=?,last_reviewed_at=?,last_brief_date=?,updated_at=?,"
@@ -1009,6 +1113,23 @@ def _record_failure(
         )
 
 
+def _record_stale(
+    registry: sqlite3.Connection, board: sqlite3.Connection, project_id: str, task: kanban_db.Task, now: int
+) -> None:
+    """Owner rule of 2026-11-11, point 6: a stale result replaces no text and counts no failure.
+
+    The refused key names its review day; it allows one further review of that day, whose key ends in ``:again``.
+    """
+    if not _archive(board, task.id):
+        return
+    with write_txn(registry):
+        registry.execute(
+            "UPDATE project_review_state SET open_task_id = NULL, open_review_date = NULL, stale_refused_key = ?, "
+            "updated_at = ? WHERE project_id = ? AND open_task_id = ?",
+            (task.idempotency_key, now, project_id, task.id),
+        )
+
+
 def _record_failure_before_publishing(registry: sqlite3.Connection, project_id: str, now: int) -> None:
     """One more failure in a row where no task was made: only the count and the clock move."""
     with write_txn(registry):
@@ -1053,6 +1174,10 @@ def _harvest_one(
         if not _store_review_result(registry, project_id, task, result, now):
             _retire(registry, board, project_id, task_id, now)
             return
+    except ReviewStale as exc:
+        logger.warning("project review: stale result of Project %s task %s (%s)", project_id, task_id, exc)
+        _record_stale(registry, board, project_id, task, now)
+        return
     except ReviewRefused as exc:
         logger.warning("project review: refused Project %s task %s (%s)", project_id, task_id, exc)
         _record_failure(registry, board, project_id, task_id, now)
@@ -1113,19 +1238,35 @@ def _due(state: Mapping[str, Any], review_day: str, now: int) -> bool:
         return False
     if state["last_reviewed_date"] is not None and state["last_reviewed_date"] >= review_day:
         return False
+    # The required input did not fit on this day, or its one further review after a stale result was refused too.
+    if state["input_too_large_date"] == review_day:
+        return False
+    if _again(state, review_day) and str(state["stale_refused_key"]).endswith(":again"):
+        return False
     return not state["failures"] or now - state["updated_at"] >= summary.backoff_seconds(state["failures"])
 
 
+def _again(state: Mapping[str, Any], review_day: str) -> bool:
+    """Whether a review of this Project's review day was refused as stale, so the next one is its further review."""
+    return _key_date(state["stale_refused_key"], state["project_id"]) == review_day
+
+
 def _settle_quiet(
-    registry: sqlite3.Connection, project_id: str, state: Mapping[str, Any], batch: events.Batch, review_day: str,
-    now: int,
+    registry: sqlite3.Connection, project: projects_db.Project, state: Mapping[str, Any], batch: events.Batch,
+    review_day: str, now: int,
 ) -> None:
     """The kernel's own review of a Project without news: the review day is today and no task is made.
 
     The cursors move past the ignored events. The quiet clock is left to ``_observe_news``: a review day is no news.
     The swap holds only while the row is as the tick read it, so two ticks settle a day once.
     """
-    with write_txn(registry):
+    project_id = project.id
+    # The protected section of a review's commit (owner rule of 2026-11-11, points 5 and 7). Inside it, news since the
+    # tick's read leaves the day to the next tick, which reviews it.
+    with _protected_section(registry, project):
+        later = read_review_events(project, batch.cursors)
+        if later.material or later.urgent:
+            return
         changed = registry.execute(
             "UPDATE project_review_state SET last_reviewed_date = ?, last_reviewed_at = ?, last_brief_date = ?, failures = 0, "
             "updated_at = ?, event_cursor = ?, delivery_cursor = ?, release_cursor = ?, conversation_cursor = ? "
@@ -1285,13 +1426,24 @@ def _open_review_task(
         _record_failure_before_publishing(registry, project.id, now)
         return False
 
-    from hermes_cli.owner_project_review_record import build_review_input
+    from hermes_cli.owner_project_review_record import ReviewInputTooLarge, build_review_input
     from tools.budget_config import DEFAULT_BUDGET
 
     try:
         # kanban_show quotes the body and repeats it in worker_context. Both copies must fit without file tools.
         input_cap = int(DEFAULT_BUDGET.resolve_threshold("kanban_show")) // 4
         frozen = build_review_input(project, _cursors(state), state["last_reviewed_at"], max_bytes=input_cap)
+    except ReviewInputTooLarge:
+        # Owner rule of 2026-11-11, point 3: no review starts, the earlier texts and classification stay, no failure
+        # counts, and the day records its plain outcome.
+        logger.warning("review_input_too_large: Project %s", project.id)
+        with write_txn(registry):
+            registry.execute(
+                "UPDATE project_review_state SET input_too_large_date = ?, updated_at = ? "
+                "WHERE project_id = ? AND open_task_id IS NULL",
+                (review_day, now, project.id),
+            )
+        return False
     except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
         logger.warning("review_input_invalid: Project %s (%s)", project.id, type(exc).__name__)
         _record_failure_before_publishing(registry, project.id, now)
@@ -1310,7 +1462,9 @@ def _open_review_task(
         project_id=None,
         owned_paths=[],
         risk_tier=summary.RISK_TIER,
-        idempotency_key=_request_key(project.id, review_day, state["failures"]),
+        idempotency_key=_request_key(project.id, review_day, state["failures"]) + (
+            ":again" if _again(state, review_day) else ""
+        ),
         **route,
     )
     # create_task returns the task that already holds the key, whoever made it and whatever its status.
@@ -1385,7 +1539,10 @@ def _request(registry: sqlite3.Connection, settings: ReviewSettings, now: int) -
                 news.append(_News(project, state, batch))
             else:
                 try:
-                    _settle_quiet(registry, project.id, state, batch, review_day, now)
+                    _settle_quiet(registry, project, state, batch, review_day, now)
+                except (sqlite3.OperationalError, OSError) as exc:
+                    # A held or unreadable board is no verdict: the day stays open for a later tick.
+                    logger.warning("review_storage_unavailable: Project %s (%s)", project.id, type(exc).__name__)
                 except (ValueError, TypeError) as exc:
                     # A damaged history must leave this day unreviewed and let the other Projects continue.
                     logger.warning("quiet_review_state_invalid: Project %s (%s)", project.id, type(exc).__name__)

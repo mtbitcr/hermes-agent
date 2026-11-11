@@ -179,3 +179,66 @@ def test_the_review_keeps_its_project_plan_when_a_worker_is_pinned_to_another_bo
     assert review == expected
     assert [plan["created_task_ids"] for plan in review["sources"]["proposals"]] == [committed["created_task_ids"]]
     assert "A different project owns this plan." not in review["text"]
+
+
+def test_a_plan_commit_on_a_second_connection_during_the_review_commit_does_not_deadlock(root, ctx, monkeypatch):
+    """Owner rule of 2026-11-11, point 8: both commits take the registry first, then the board; both finish."""
+    import threading
+    from datetime import datetime, timezone
+
+    import yaml
+
+    from hermes_cli import kanban_db, owner_project_review as review
+
+    now = int(datetime(2026, 11, 10, 7, tzinfo=timezone.utc).timestamp())
+    with _written_at(now - 86400):
+        setup = _bootstrap_board(ctx)
+        _approved_plan(ctx, setup)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        project = projects_db.get_project(registry, setup["project_id"])
+    (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {"enabled": True, "allowlist": [project.id]}}))
+    monkeypatch.setattr(time, "time", lambda: now)
+    assert review.review_tick(now) == 1
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        task = registry.execute(
+            "SELECT open_task_id FROM project_review_state WHERE project_id=?", (project.id,),
+        ).fetchone()[0]
+    payload = {
+        "summary": {"outcome": "The room work is planned.", "next_action": "Book the room.", "owner_decision": None},
+        "brief": {"headline": "The room work is planned.", "what_changed": "Book the room was added.",
+                  "next_step": "Book the room.", "needs_you": None},
+        "classification": [], "proposed_closures": [],
+    }
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board="project-summaries"), board="project-summaries") as board:
+        assert kanban_db.claim_task(board, task) is not None
+        assert kanban_db.complete_task(board, task, summary="Reviewed the plan.", metadata={"project_review": payload})
+
+    lock, threads, commits, errors = review._lock_board, [], [], []
+
+    def second_plan_commit():
+        try:
+            commits.append(_approved_plan(ctx, setup, key="concurrent-plan"))
+        except Exception as exc:  # the assertion below names it
+            errors.append(exc)
+
+    def contended(*args, **kwargs):
+        # The review holds the registry: the plan commit starts now and must wait for it, not hold the board against it.
+        if not threads:
+            threads.append(threading.Thread(target=second_plan_commit))
+            threads[0].start()
+            threads[0].join(timeout=0.5)
+        return lock(*args, **kwargs)
+
+    monkeypatch.setattr(review, "_lock_board", contended)
+    started = time.monotonic()
+    review.review_tick(now + 1)
+    threads[0].join(timeout=60)
+    assert not threads[0].is_alive() and not errors, errors
+    assert time.monotonic() - started < 60
+    assert commits and commits[0]["created_task_ids"]
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        state = registry.execute(
+            "SELECT open_task_id,last_reviewed_date,failures FROM project_review_state WHERE project_id=?", (project.id,),
+        ).fetchone()
+        assert tuple(state) == (None, "2026-11-10", 0)
+        assert projects_db.get_project_review_brief(registry, project.id)["headline"] == "The room work is planned."

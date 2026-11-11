@@ -159,6 +159,8 @@ CREATE TABLE IF NOT EXISTS project_summary_state (
 -- day), the last Vienna review day, the last brief, the last day with news (the
 -- quiet days count from it), the one open review task and the failure count.
 -- Dates are Vienna calendar dates, 'YYYY-MM-DD'. The optional conversation cursor also upgrades earlier review stores.
+-- input_too_large_date is the day whose required review input did not fit the cap: no review ran that day.
+-- stale_refused_key is the key of the last review refused as stale; it allows one further review of its day.
 CREATE TABLE IF NOT EXISTS project_review_state (
     project_id         TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
     event_cursor       INTEGER NOT NULL DEFAULT 0,
@@ -172,7 +174,9 @@ CREATE TABLE IF NOT EXISTS project_review_state (
     open_task_id       TEXT,
     open_review_date   TEXT,
     failures           INTEGER NOT NULL DEFAULT 0,
-    updated_at         INTEGER NOT NULL
+    updated_at         INTEGER NOT NULL,
+    input_too_large_date TEXT,
+    stale_refused_key  TEXT
 );
 
 -- Daily briefs have their own history. The five-key project summary keeps its existing shape.
@@ -375,6 +379,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     }
     if "project_review_state" in tables:
         _add_column_if_missing(conn, "project_review_state", "conversation_cursor", "conversation_cursor TEXT")
+        _add_column_if_missing(conn, "project_review_state", "input_too_large_date", "input_too_large_date TEXT")
+        _add_column_if_missing(conn, "project_review_state", "stale_refused_key", "stale_refused_key TEXT")
     if "project_removal_operations" in tables:
         rem_cols = {
             row["name"]

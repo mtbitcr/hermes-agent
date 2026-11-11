@@ -23,6 +23,10 @@ _SOURCES = ("project", "tasks", "comments", "conversation", "decisions", "sugges
             "runs", "activity", "earlier_reviews", "connections", "automations")
 
 
+class ReviewInputTooLarge(ValueError):
+    """The required part of the review input, the open items of the last accepted review, does not fit the cap."""
+
+
 class Cut(TypedDict):
     source: str
     shown: int
@@ -42,7 +46,9 @@ class ReviewInput(TypedDict):
 
 def cut_line(cut: Cut) -> str:
     """Render an omission independently of the model's response."""
-    label = {"proposals": "plan proposals"}.get(cut["source"], cut["source"].replace("_", " "))
+    label = {"proposals": "plan proposals", "last_review_settled": "settled items of the last review"}.get(
+        cut["source"], cut["source"].replace("_", " "),
+    )
     if cut["reason"] == "not_available":
         return f"Not available: {label}."
     if cut["reason"] == "unlinked":
@@ -398,6 +404,45 @@ def _data_line(item: dict) -> str:
     return "| " + text.replace("<", "\\u003c").replace(">", "\\u003e")
 
 
+def _settled_item(entry) -> bool:
+    """A classification item of a settled class. Anything else, a damaged item too, is open and required."""
+    return isinstance(entry, dict) and entry.get("class") in ("answered", "superseded", "stale", "current")
+
+
+def _open_items(review: dict) -> bool:
+    classification = review.get("classification")
+    return not isinstance(classification, list) or any(not _settled_item(entry) for entry in classification)
+
+
+def _cut_settled_items(reviews: list, cuts: list[Cut], size: int, cap: int) -> int:
+    """Remove the settled items of the last review, the last first, until the input fits; return the new size.
+
+    The open items stay in their order. One cut line counts the settled items left out.
+    """
+    review, line, length = reviews[0]
+    settled = [entry for entry in review["classification"] if _settled_item(entry)]
+    keep, after, kept_line = len(settled), size, line
+    while keep and after > cap:
+        keep -= 1
+        # Only measured here; ``_reduce`` below is what removes them.
+        left = {id(entry) for n, entry in enumerate(settled) if n >= keep}
+        kept_line = _data_line({**review, "classification": [
+            entry for entry in review["classification"] if id(entry) not in left
+        ]})
+        notice = cut_line(_cut_record(cuts, "last_review_settled", "total_cap", keep, len(settled)))
+        after = size - length + len(kept_line.encode("utf-8")) + len(notice.encode("utf-8")) + 1
+    if keep == len(settled):
+        return size
+    (kept,) = _reduce(cuts, "last_review_settled", "total_cap", [settled], keep)
+    kept_ids = {id(entry) for entry in kept}
+    review = {**review, "classification": [
+        entry for entry in review["classification"] if not _settled_item(entry) or id(entry) in kept_ids
+    ]}
+    line = _data_line(review)
+    reviews[0] = (review, line, len(line.encode("utf-8")))
+    return after
+
+
 def _freeze(sources, cuts, max_bytes: int | None = None) -> ReviewInput:
     cap = TOTAL_INPUT_CAP_BYTES if max_bytes is None else max_bytes
     if isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0:
@@ -419,13 +464,17 @@ def _freeze(sources, cuts, max_bytes: int | None = None) -> ReviewInput:
     # The joined text has one newline fewer than lines. The cut notices count, and the cap never removes one.
     size = sum(len(line.encode("utf-8")) + 1 for line in (header, *(cut_line(cut) for cut in cuts))) - 1
     size += sum(section(source, len(rows[source]), sum(row[2] for row in rows[source])) for source in _SOURCES)
+    # Owner rule of 2026-11-11: the open items of the last accepted review are the required part. Everything else
+    # is expendable, and the cap removes it in CUT_ORDER: the older reviews, then the settled items of the last one.
+    required = bool(rows["earlier_reviews"]) and _open_items(rows["earlier_reviews"][0][0])
     for source in CUT_ORDER:
         if size <= cap:
             break
         tail = source == "conversation"  # the oldest turns go first; elsewhere the last rows are the oldest
         count, data = len(rows[source]), sum(row[2] for row in rows[source])
         rest, keep, after = size - section(source, count, data), count, size
-        while keep and after > cap:
+        floor = 1 if source == "earlier_reviews" and required else 0
+        while keep > floor and after > cap:
             keep -= 1
             data -= rows[source][count - 1 - keep if tail else keep][2]
             notice = cut_line(_cut_record(cuts, source, "total_cap", keep, count))
@@ -433,6 +482,8 @@ def _freeze(sources, cuts, max_bytes: int | None = None) -> ReviewInput:
         if keep < count:
             (rows[source],) = _reduce(cuts, source, "total_cap", [rows[source]], keep, tail=tail)
             size = after
+        if floor and size > cap:
+            size = _cut_settled_items(rows["earlier_reviews"], cuts, size, cap)
     ordered = sorted(cuts, key=lambda cut: (
         cut["reason"] != "total_cap", CUT_ORDER.index(cut["source"]) if cut["source"] in CUT_ORDER else len(CUT_ORDER),
         cut["source"],
@@ -444,6 +495,8 @@ def _freeze(sources, cuts, max_bytes: int | None = None) -> ReviewInput:
             text.extend([begin, *(row[1] for row in rows[source]), end])
     text = "\n".join(text)
     size = len(text.encode("utf-8"))
+    if size > cap and required:
+        raise ReviewInputTooLarge("the open items of the last accepted review do not fit the review input cap")
     if size > cap:
         raise ValueError("the review input cap cannot hold its omission notices")
     return {"text": text, "size": size, "sources": {source: [row[0] for row in rows[source]] for source in sources},
