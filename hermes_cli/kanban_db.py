@@ -37745,7 +37745,9 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
-def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
+def _resolve_worker_cli_toolsets(
+    hermes_home: Optional[str], task: Optional[Task] = None
+) -> Optional[list[str]]:
     """Return the assigned profile's effective CLI toolsets for a worker.
 
     Dispatcher-spawned workers are launched from a long-lived gateway process,
@@ -37755,7 +37757,10 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
     root/active-profile config or a profile whose top-level ``toolsets`` entry
     is only the kanban orchestrator surface. ``model_tools`` still appends the
     task-scoped kanban lifecycle tools when ``HERMES_KANBAN_TASK`` is set.
+    A review or portfolio ``task`` gets only the kanban toolset (operator rule S1).
     """
+    if getattr(task, "created_by", None) == REVIEW_TASK_CREATOR:
+        return ["kanban"]
     if not hermes_home:
         return None
     try:
@@ -37809,6 +37814,9 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 #: turns, which a deep run over a large source tree exhausts before it can
 #: finish; the value rides in the spawned event so the receipt shows it.
 _DEEP_TIER_MAX_TURNS = 160
+#: Operator rule S1: review and portfolio tasks may call only these two tools.
+REVIEW_TASK_CREATOR = "project-review"
+REVIEW_TASK_TOOLS = ("kanban_show", "kanban_complete")
 
 
 def _worker_max_turns(task: Task) -> Optional[int]:
@@ -37969,6 +37977,10 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    # Operator rule S1: model_tools limits a review or portfolio task to these tools; no other task inherits it.
+    env.pop("HERMES_KANBAN_ALLOWED_TOOLS", None)
+    if getattr(task, "created_by", None) == REVIEW_TASK_CREATOR:
+        env["HERMES_KANBAN_ALLOWED_TOOLS"] = ",".join(REVIEW_TASK_TOOLS)
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
@@ -38017,7 +38029,7 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"), task)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
@@ -39278,12 +39290,16 @@ def gc_events(
     history. The latest sandbox lifecycle event for each run is retained
     regardless of age: this bounded one-row fold head classifies deletion and
     cleanup authority, including malformed events that must fail closed.
+    Every ``review_followup_recorded`` and ``owner_project_plan_change``
+    event is retained regardless of age: these lineage records hold each
+    work item's key (``kanban_work_items``) for the life of the item.
     """
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
             "(SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
+            "AND kind NOT IN ('review_followup_recorded', 'owner_project_plan_change') "
             "AND NOT (run_id IS NOT NULL AND kind IN ("
             " 'sandbox_reserved', 'sandbox_created', "
             " 'sandbox_provisioned', 'sandbox_released'"
