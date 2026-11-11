@@ -1,0 +1,320 @@
+{
+  "body": {
+    "data": {
+      "attachments": [],
+      "board": {
+        "counts": {
+          "archived": 0,
+          "blocked": 0,
+          "done": 1,
+          "ready": 1,
+          "review": 0,
+          "running": 1,
+          "scheduled": 0,
+          "todo": 0,
+          "triage": 0
+        },
+        "name": "Signup Pilot",
+        "project_id": "p_d2153ddff5fec82eb72c9d1e",
+        "slug": "signup-pilot",
+        "total": 3
+      },
+      "columns": [
+        {
+          "name": "triage",
+          "tasks": []
+        },
+        {
+          "name": "todo",
+          "tasks": []
+        },
+        {
+          "name": "scheduled",
+          "tasks": []
+        },
+        {
+          "name": "ready",
+          "tasks": [
+            {
+              "assignee_name": "default",
+              "child_ids": [],
+              "event_revision": 4,
+              "id": "t_112a104b",
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "none",
+              "risk_tier": null,
+              "risk_tier_raised": false,
+              "stopped_work": "none",
+              "title": "Book the photographer",
+              "updated_at": "2026-09-21T14:13:20Z",
+              "work_item": {
+                "current": true,
+                "key": "wi_5105757964056c1b"
+              }
+            }
+          ]
+        },
+        {
+          "name": "running",
+          "tasks": [
+            {
+              "assignee_name": "default",
+              "child_ids": [],
+              "event_revision": 10,
+              "id": "t_cc2dc8d8",
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "none",
+              "risk_tier": null,
+              "risk_tier_raised": false,
+              "stopped_work": "none",
+              "title": "Rework the signup form",
+              "updated_at": "2026-09-21T14:13:20Z",
+              "work_item": {
+                "current": true,
+                "key": "wi_2484bbd9b1042627"
+              }
+            }
+          ]
+        },
+        {
+          "name": "blocked",
+          "tasks": []
+        },
+        {
+          "name": "review",
+          "tasks": []
+        },
+        {
+          "name": "done",
+          "tasks": [
+            {
+              "assignee_name": "default",
+              "child_ids": [],
+              "event_revision": 7,
+              "id": "t_172f84a6",
+              "parent_ids": [],
+              "responsibility": null,
+              "review_state": "none",
+              "risk_tier": null,
+              "risk_tier_raised": false,
+              "stopped_work": "none",
+              "title": "Build the signup form",
+              "updated_at": "2026-09-21T14:13:20Z",
+              "work_item": {
+                "current": false,
+                "key": "wi_2484bbd9b1042627"
+              }
+            }
+          ]
+        }
+      ],
+      "planning_context": {
+        "actionable_count": 2,
+        "actionable_truncated": false,
+        "omitted_terminal_count": 0,
+        "relations_truncated": false,
+        "schema_version": 1,
+        "tasks": [
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 4,
+            "id": "t_112a104b",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "ready",
+            "title": "Book the photographer",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 10,
+            "id": "t_cc2dc8d8",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "running",
+            "title": "Rework the signup form",
+            "updated_at": "2026-09-21T14:13:20Z"
+          },
+          {
+            "assignee_name": "default",
+            "child_ids": [],
+            "event_revision": 7,
+            "id": "t_172f84a6",
+            "omitted_child_count": 0,
+            "omitted_parent_count": 0,
+            "parent_ids": [],
+            "responsibility": null,
+            "status": "done",
+            "title": "Build the signup form",
+            "updated_at": "2026-09-21T14:13:20Z"
+          }
+        ]
+      },
+      "project": {
+        "archived": false,
+        "board": "signup-pilot",
+        "description": null,
+        "id": "p_d2153ddff5fec82eb72c9d1e",
+        "name": "Signup Pilot",
+        "slug": "signup-pilot"
+      },
+      "runs": [
+        {
+          "finished_at": null,
+          "has_newer_run": false,
+          "receipt": {
+            "cost": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative cost."
+            },
+            "evidence": {
+              "kind": "project_activity",
+              "state": "available"
+            },
+            "external_effect": {
+              "state": "unknown",
+              "summary": "This record does not confirm whether an external service changed."
+            },
+            "outcome": "running",
+            "runtime": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative model route."
+            },
+            "summary": "Work is still in progress."
+          },
+          "retry_origin": "none",
+          "started_at": "2026-09-21T14:13:20Z",
+          "task_title": "Rework the signup form",
+          "work_item": {
+            "current": true,
+            "key": "wi_2484bbd9b1042627"
+          }
+        },
+        {
+          "finished_at": "2026-09-21T14:13:20Z",
+          "has_newer_run": true,
+          "receipt": {
+            "cost": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative cost."
+            },
+            "evidence": {
+              "kind": "project_activity",
+              "state": "available"
+            },
+            "external_effect": {
+              "state": "unknown",
+              "summary": "This record does not confirm whether an external service changed."
+            },
+            "outcome": "attention",
+            "runtime": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative model route."
+            },
+            "summary": "Work stopped and needs attention."
+          },
+          "retry_origin": "owner",
+          "started_at": "2026-09-21T14:13:20Z",
+          "task_title": "Rework the signup form",
+          "work_item": {
+            "current": false,
+            "key": "wi_2484bbd9b1042627"
+          }
+        },
+        {
+          "finished_at": "2026-09-21T14:13:20Z",
+          "has_newer_run": false,
+          "receipt": {
+            "cost": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative cost."
+            },
+            "evidence": {
+              "kind": "project_activity",
+              "state": "available"
+            },
+            "external_effect": {
+              "state": "unknown",
+              "summary": "This record does not confirm whether an external service changed."
+            },
+            "outcome": "completed",
+            "runtime": {
+              "state": "unknown",
+              "summary": "This record does not contain an authoritative model route."
+            },
+            "summary": "Work finished."
+          },
+          "retry_origin": "none",
+          "started_at": "2026-09-21T14:13:20Z",
+          "task_title": "Build the signup form",
+          "work_item": {
+            "current": false,
+            "key": "wi_2484bbd9b1042627"
+          }
+        }
+      ],
+      "steward": {
+        "active_work": [
+          {
+            "state": "In progress",
+            "title": "Rework the signup form"
+          },
+          {
+            "state": "Ready",
+            "title": "Book the photographer"
+          }
+        ],
+        "counts": {
+          "awaiting_review": 0,
+          "completed_in_window": 1,
+          "needs_attention": 0,
+          "open": 2
+        },
+        "decisions_needed": [],
+        "execution": {
+          "paused": false,
+          "state": "waiting_for_approval",
+          "summary": "Raphael is waiting for an approved milestone before starting work."
+        },
+        "generated_at": "2026-09-21T14:13:20Z",
+        "lookback_days": 7,
+        "needs_attention": [],
+        "progress": [
+          {
+            "completed_at": "2026-09-21T14:13:20Z",
+            "title": "Build the signup form"
+          }
+        ],
+        "project": {
+          "name": "Signup Pilot"
+        },
+        "schema_version": 2,
+        "stale_candidates": [],
+        "truncated": {
+          "active_work": false,
+          "decisions_needed": false,
+          "needs_attention": false,
+          "progress": false,
+          "stale_candidates": false
+        }
+      },
+      "truncated": {
+        "attachments": false,
+        "runs": false,
+        "tasks": false,
+        "workers": false
+      },
+      "workers": []
+    },
+    "object": "hermes.owner_workspace.project_snapshot"
+  },
+  "status": 200
+}
