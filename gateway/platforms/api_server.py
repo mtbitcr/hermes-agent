@@ -13161,6 +13161,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 OWNER_PROJECT_PLANNING_CONTEXT_V2_CAPABILITY,
                 OWNER_PROJECT_RUN_CONTEXT_CAPABILITY,
                 OWNER_PROJECT_SUMMARY_CAPABILITY,
+                OWNER_PROJECT_REVIEW_ADVICE_CAPABILITY,
                 OWNER_WAITING_CAPABILITY,
                 PROVIDER_WAIT_CAPABILITY,
                 WORK_ITEM_CAPABILITY,
@@ -13199,6 +13200,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, OWNER_PROJECT_SUMMARY_CAPABILITY
             ):
                 waiting["project_summary"] = True
+            if _owner_workspace_capability_requested(
+                request, OWNER_PROJECT_REVIEW_ADVICE_CAPABILITY
+            ):
+                waiting["project_review_advice"] = True
             # And for planning_context_v2, which the kernel serves in place of
             # planning_context_v1 when a reader names both.
             planning_v2 = (

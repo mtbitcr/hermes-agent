@@ -197,6 +197,9 @@ CREATE TABLE IF NOT EXISTS project_review_briefs (
     classification TEXT NOT NULL,
     written_at    INTEGER NOT NULL,
     revision      INTEGER NOT NULL,
+    source_task_id TEXT,
+    source_run_id INTEGER,
+    source_digest TEXT,
     PRIMARY KEY (project_id, review_date)
 );
 
@@ -382,6 +385,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "project_review_state", "conversation_cursor", "conversation_cursor TEXT")
         _add_column_if_missing(conn, "project_review_state", "input_too_large_date", "input_too_large_date TEXT")
         _add_column_if_missing(conn, "project_review_state", "stale_refused_key", "stale_refused_key TEXT")
+    if "project_review_briefs" in tables:
+        for name, kind in (("source_task_id", "TEXT"), ("source_run_id", "INTEGER"), ("source_digest", "TEXT")):
+            _add_column_if_missing(conn, "project_review_briefs", name, f"{name} {kind}")
     if "project_removal_operations" in tables:
         rem_cols = {
             row["name"]
@@ -905,8 +911,21 @@ def write_project_review_brief(
     quiet: bool = False,
     classification: Iterable[dict] = (),
     written_at: Optional[int] = None,
+    source_task_id: Optional[str] = None,
+    source_run_id: Optional[int] = None,
+    source_digest: Optional[str] = None,
 ) -> int:
-    """Store one day's brief. The caller validates model text before this write."""
+    """Store one day's brief. The caller validates model text before this write.
+
+    The ``source_*`` values name the accepted review run whose plan advice the brief points to. They are
+    references only: the advice itself stays in that run's metadata.
+    """
+    if any(value is not None for value in (source_task_id, source_run_id, source_digest)) and not (
+        isinstance(source_task_id, str) and 1 <= len(source_task_id) <= 100
+        and type(source_run_id) is int and 1 <= source_run_id <= 2**63 - 1
+        and isinstance(source_digest, str) and re.fullmatch(r"[a-f0-9]{64}", source_digest)
+    ):
+        raise ValueError("review_source_invalid")
     with write_txn(conn):
         revision = conn.execute(
             "SELECT COALESCE(MAX(revision), 0) + 1 FROM project_review_briefs "
@@ -915,11 +934,12 @@ def write_project_review_brief(
         conn.execute(
             "INSERT OR REPLACE INTO project_review_briefs "
             "(project_id,review_date,covered_from,covered_to,headline,what_changed,next_step,needs_you,"
-            "ready_work,cut_note,quiet,classification,written_at,revision) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "ready_work,cut_note,quiet,classification,written_at,revision,source_task_id,source_run_id,source_digest) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (project_id, review_date, covered_from, covered_to, headline, what_changed, next_step, needs_you,
              json.dumps(list(ready_work), ensure_ascii=False, allow_nan=False), cut_note, int(quiet),
              json.dumps(list(classification), ensure_ascii=False, sort_keys=True, allow_nan=False),
-             _now() if written_at is None else written_at, revision),
+             _now() if written_at is None else written_at, revision, source_task_id, source_run_id, source_digest),
         )
         # The approved daily review plan keeps the latest 90 briefs of each Project.
         conn.execute(
@@ -928,6 +948,20 @@ def write_project_review_brief(
             (project_id, project_id),
         )
     return revision
+
+
+def get_project_review_source(conn: sqlite3.Connection, project_id: str) -> Optional[dict]:
+    """Read private source references without migrating an older store or extending the public brief."""
+    fields = {row[1] for row in conn.execute("PRAGMA table_info(project_review_briefs)")}
+    if not {"source_task_id", "source_run_id", "source_digest"}.issubset(fields):
+        return None
+    row = conn.execute(
+        "SELECT review_date,quiet,source_task_id,source_run_id,source_digest FROM project_review_briefs "
+        "WHERE project_id=? ORDER BY review_date DESC LIMIT 1", (project_id,),
+    ).fetchone()
+    if row is None or row["quiet"] or row["source_task_id"] is None:
+        return None
+    return dict(row)
 
 
 def get_project_review_brief(conn: sqlite3.Connection, project_id: str) -> Optional[dict]:
