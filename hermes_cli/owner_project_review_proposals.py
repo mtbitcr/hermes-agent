@@ -10,8 +10,8 @@ _TEXT_LIMITS = {
 }
 _CHAT_PREFIX = "Ask Raphael in the Project chat: "
 # Two closed lists decide whether advice may reopen the owner's decision on work. A kind on neither is not evidence.
-# The owner's decisions on a work item: an applied plan change, its creation (create_task writes it for an approved
-# add and for the created work of replace, split and merge alike), a direct move, an archive and a suggestion decision.
+# The owner's decisions on a work item: an applied plan change, its creation by an approved plan (a creation counts only
+# when that plan's applied record names the item, see _settled), a direct move, an archive and a suggestion decision.
 _DECISION_EVENTS = ("owner_project_plan_change", "created", "owner_move", "archived", "recommendation_decided")
 # Evidence about the work: a result of work or of a review, a delivery outcome, and a comment that is not the plan's own.
 _EVIDENCE_EVENTS = ("completed", "blocked", "gave_up", "review_requested", "changes_requested", "review_reopened",
@@ -43,8 +43,16 @@ def _settled(board, task_id, events, *, ended):
     """
     decision = board.execute(
         "SELECT id,kind,CASE WHEN json_valid(payload) THEN json_extract(payload,'$.idempotency_key') END AS plan "
-        f"FROM task_events WHERE task_id=? AND kind IN ({','.join('?' * len(_DECISION_EVENTS))}) ORDER BY id DESC LIMIT 1",
-        (task_id, *_DECISION_EVENTS),
+        f"FROM task_events WHERE task_id=? AND kind IN ({','.join('?' * len(_DECISION_EVENTS))}) "
+        # A creation is a decision only when an approved plan made the item: the plan's applied record on the Project's
+        # control row names it among the work it created, alike for add and for replace, split and merge. A kernel's
+        # rework item and earlier work have no such record. An activation is no proof: it also releases resumed work.
+        "AND (kind<>'created' OR EXISTS (SELECT 1 FROM tasks work JOIN tasks anchor ON anchor.project_id=work.project_id "
+        "AND anchor.task_kind='control' JOIN task_events applied ON applied.task_id=anchor.id "
+        "AND applied.kind='owner_project_plan_applied' JOIN json_each(CASE WHEN json_valid(applied.payload) "
+        "THEN applied.payload END,'$.result.created_task_ids') named ON named.value=work.id WHERE work.id=?)) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, *_DECISION_EVENTS, task_id),
     ).fetchone()
     if decision is None and ended:
         return True

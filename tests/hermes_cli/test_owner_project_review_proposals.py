@@ -871,3 +871,193 @@ def test_each_event_kind_on_work_is_a_decision_evidence_or_without_meaning(root,
     written |= {key.split(":")[0] for key in review.REVIEW_EVENT_CLASS} | set(kanban_db._RUN_CLOSING_EVENT_KINDS)
     assert {"created", "owner_project_plan_change", "owner_move", "commented"} <= written
     assert written - decisions - evidence - _WITHOUT_MEANING == set()
+
+
+def _round_three_work(root, ctx, action):
+    """The third independent review's work: the outputs of an approved add, replace, split or merge, or work moved back."""
+    kanban_db.init_db()
+    kanban_db.create_board(slug=kanban_db.DEFAULT_BOARD, name="Default")
+    # Ordinary work keeps waiting through the real cross-board profile cap, so no claim changes a frozen revision.
+    with kanban_db.connect_closing(board=kanban_db.DEFAULT_BOARD) as holding:
+        holder = kanban_db.create_task(holding, title="Ongoing unrelated work", assignee="default", owned_paths=[],
+                                       board=kanban_db.DEFAULT_BOARD)
+        assert kanban_db.claim_task(holding, holder) is not None
+    with _written_at(NOW - 86400):
+        setup = _bootstrap_board(ctx)
+        ids = _approved_plan(ctx, setup, changes=[{"action": "add", **_ADD, "title": title}
+                                                  for title in ("Book the room", "Prepare the menu")])["created_task_ids"]
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        project = projects_db.get_project(registry, setup["project_id"])
+    path = kanban_db.kanban_db_path(board=project.board_slug)
+    with kanban_db.connect_closing(path, board=project.board_slug) as board:
+        refs = [_reference(board, task_id) for task_id in ids]
+    change = {"action": action, "reason": "The owner approved the arrangements."}
+    if action == "split":
+        change.update(target=refs[0], replacements=[{**_SPEC, "title": title, "parents": []}
+                                                    for title in ("Arrange the seating", "Prepare the invitations")])
+    elif action == "merge":
+        change.update(targets=refs, replacement={**_SPEC, "title": "Arrange the guest reception"})
+    elif action == "replace":
+        change.update(target=refs[0], replacement={**_SPEC, "title": "Arrange the guest transport"})
+    if action in ("replace", "split", "merge"):
+        with _written_at(NOW - 7200):
+            ids = _approved_plan(ctx, setup, key="make-" + action, changes=[change])["created_task_ids"]
+    elif action == "resume":
+        for index, verb in enumerate(("postpone", "move")):
+            with kanban_db.connect_closing(path, board=project.board_slug) as board:
+                change = {"action": verb, "reason": "The venue is confirmed.", "target": _reference(board, ids[0])}
+            if verb == "move":
+                change["to_status"] = "ready"
+            with _written_at(NOW - 7200 + index * 3600):
+                _approved_plan(ctx, setup, key="owner-" + verb, changes=[change])
+    (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {"enabled": True, "allowlist": [project.id]},
+                                                      "gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}))
+    return project, path, ids[0]
+
+
+def _daily_pass(root, project, path, monkeypatch, instant, proposal, *, headline, what_changed, work):
+    """One real daily pass: the dispatcher's review tick, the native completion and harvest, the HTTP readback."""
+    monkeypatch.setattr("gateway.run._hermes_home", root)
+    payload = {"summary": {"outcome": headline, "next_action": "Keep the visit plan.", "owner_decision": None},
+               "brief": {"headline": headline, "what_changed": what_changed, "next_step": "Keep the visit plan.",
+                         "needs_you": None},
+               "classification": [], "proposed_closures": [], "plan_proposal": proposal}
+    before = _logical_state(path)
+    finished, frozen = [], []
+
+    def finish():
+        if finished:
+            return
+        with projects_db.connect_closing(root / "projects.db") as registry:
+            [task_id] = registry.execute("SELECT open_task_id FROM project_review_state WHERE project_id=?",
+                                         (project.id,)).fetchone()
+        with kanban_db.connect_closing(kanban_db.kanban_db_path(board="project-summaries"), board="project-summaries") as board:
+            sources, _cut = review._frozen_sources(kanban_db.get_task(board, task_id).body)
+            frozen.extend(item for item in sources["tasks"] if item["id"] == work)
+            assert kanban_db.claim_task(board, task_id) is not None
+            assert kanban_db.complete_task(board, task_id, summary="Reviewed the visit.", metadata={"project_review": payload})
+        finished.append(task_id)
+
+    loop = _Loop()
+    with pytest.MonkeyPatch.context() as patch:
+        loop.record_spawns(patch)
+        _drive(patch, loop, [instant, instant + 60], kanban={"max_in_progress_by_profile": {"default": 1}},
+               after={"review_tick": finish})
+    assert finished
+    assert not any(spawn[2] == work for spawn in loop.spawned)
+    # The review applies no advice.
+    assert _logical_state(path) == before
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        brief = projects_db.get_project_review_brief(registry, project.id)
+        summary = projects_db.get_project_summary(registry, project.id)
+    assert brief is not None and summary is not None
+
+    async def read_advice():
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async with TestClient(TestServer(snapshot_app())) as client:
+            response = await client.get(f"/v1/owner-workspace/projects/{project.slug}/snapshot"
+                                        "?capabilities=project_review_advice_v1")
+            assert response.status == 200, await response.text()
+            return (await response.json())["data"].get("raphael_review_advice")
+
+    assert len(frozen) <= 1
+    return {"brief": brief, "summary": summary, "advice": asyncio.run(read_advice()), "frozen": (frozen or [None])[0]}
+
+
+def _cancel_pass(root, project, path, task_id, monkeypatch, instant):
+    with kanban_db.connect_closing(path, board=project.board_slug) as board:
+        target, title = _reference(board, task_id), kanban_db.get_task(board, task_id).title
+    proposal = {"request_title": "Revise the guest arrangements", "summary": "Adapt the visit work.",
+                "specification": "Adjust the work in the visit plan.", "current_milestone": "Prepare the visit.",
+                "owner_visible_result": "The visit plan is ready.", "later_milestones": [],
+                "changes": [{"action": "cancel", "reason": "The venue arrangements changed.", "target": target}]}
+    observed = _daily_pass(root, project, path, monkeypatch, instant, proposal, headline="The visit work is planned.",
+                           what_changed=title + " is in the visit plan.", work=task_id)
+    return observed, title
+
+
+@pytest.mark.parametrize("creation", ["add", "replace", "split", "merge"])
+@pytest.mark.parametrize("new_evidence", [False, True])
+def test_every_native_creation_output_uses_the_same_evidence_boundary(root, ctx, monkeypatch, creation, new_evidence):
+    from hermes_cli.owner_project_review_proposals import _settled
+
+    project, path, task_id = _round_three_work(root, ctx, creation)
+    if new_evidence:
+        with _written_at(NOW - 60), kanban_db.connect_closing(path, board=project.board_slug) as board:
+            kanban_db.add_comment(board, task_id, "default", "The venue has changed and this arrangement is no longer needed.")
+    observed, title = _cancel_pass(root, project, path, task_id, monkeypatch, NOW)
+    assert (observed["advice"] is not None) == new_evidence, observed
+    expected = f"Ask Raphael in the Project chat to cancel {title}." if new_evidence else "Keep the visit plan."
+    assert observed["brief"]["next_step"] == observed["summary"]["next_action"] == expected, observed
+    # The applied plan names this work among what it created: its creation is the owner's decision, also were it ended.
+    with kanban_db.connect_closing(path, board=project.board_slug) as board:
+        assert _settled(board, task_id, observed["frozen"]["events"], ended=True) is not new_evidence
+
+
+@pytest.mark.parametrize("new_evidence", [False, True])
+def test_two_daily_passes_ignore_only_the_plans_own_comment(root, ctx, monkeypatch, new_evidence):
+    project, path, task_id = _round_three_work(root, ctx, "resume")
+    first, _title = _cancel_pass(root, project, path, task_id, monkeypatch, NOW)
+    assert first["advice"] is None and first["brief"]["next_step"] == "Keep the visit plan.", first
+    with _written_at(NOW + 86400 - 60), kanban_db.connect_closing(path, board=project.board_slug) as board:
+        if new_evidence:
+            kanban_db.add_comment(board, task_id, "default", "The guests now arrive a day later. The original booking is not needed.")
+        else:
+            # A second material day without evidence on the settled work: a comment on other work only.
+            sibling = board.execute("SELECT id FROM tasks WHERE project_id=? AND task_kind='work' AND id<>? "
+                                    "AND status<>'archived' ORDER BY id LIMIT 1", (project.id, task_id)).fetchone()[0]
+            kanban_db.add_comment(board, sibling, "default", "The menu for the visit is now confirmed.")
+    second, title = _cancel_pass(root, project, path, task_id, monkeypatch, NOW + 86400)
+    assert (second["advice"] is not None) == new_evidence, second
+    expected = f"Ask Raphael in the Project chat to cancel {title}." if new_evidence else "Keep the visit plan."
+    assert second["brief"]["next_step"] == second["summary"]["next_action"] == expected, second
+    assert second["brief"]["review_date"] != first["brief"]["review_date"]
+
+
+@pytest.mark.parametrize("case", ["qualified_with_older_comment", "qualified_without_comment", "original_title_control"])
+def test_archived_rework_is_not_recreated_from_a_comment_before_the_archive(root, ctx, monkeypatch, case):
+    from tests.hermes_cli.test_kanban_review_followup_resolution import _park_for_review, _vouched_followups
+
+    project, path, _first = _round_three_work(root, ctx, "add")
+    title = "Prepare the guest arrival seating plan"
+    with kanban_db.connect_closing(path, board=project.board_slug) as board:
+        with _written_at(NOW - 7200):
+            # Existing Project work without a route lock is a supported native lifecycle, also for earlier work.
+            parent = kanban_db.create_task(board, title=title, body=_SPEC["body"], assignee="default",
+                                           project_id=project.id, owned_paths=[], board=project.board_slug)
+            assert kanban_db.get_task(board, parent).model_policy_lock is None
+        with _written_at(NOW - 3600):
+            assert kanban_db.claim_task(board, parent) is not None
+            review_run = _park_for_review(board, parent, reviewer="raphael-verifier")
+            assert kanban_db.request_changes(board, parent, reason="Clarify the seating arrangement.",
+                                             expected_run_id=review_run) == (True, "default")
+            # The kernel's own rework record of that verdict: no plan made it.
+            [rework] = _vouched_followups(board, parent)
+        if case != "qualified_without_comment":
+            with _written_at(NOW - 120):
+                kanban_db.add_comment(board, rework, "default", "The seating arrangement needs to be checked for the arriving guests.")
+        with _written_at(NOW - 60):
+            # The owner archives the reviewed work. The kernel closes its rework with it, on the parent's events only.
+            assert kanban_db.archive_task(board, parent)
+        item = kanban_db.get_task(board, rework)
+        assert item.status == "archived" and item.project_id == project.id
+        kinds = [row[0] for row in board.execute("SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (rework,))]
+        assert kinds == ["created"] + (["commented"] if case != "qualified_without_comment" else [])
+        closed = board.execute("SELECT MAX(id) FROM task_events WHERE task_id=? AND kind='review_followup_archived'",
+                               (parent,)).fetchone()[0]
+        assert closed > board.execute("SELECT MAX(id) FROM task_events WHERE task_id=?", (rework,)).fetchone()[0]
+    new_title = owner_workspace.owner_title(item.title) + (" carefully" if case != "original_title_control" else "")
+    # The qualified title is the same work as the archived rework only; the original title is also the parent's.
+    assert review._same_work(new_title, item.title)
+    assert review._same_work(new_title, title) == (case == "original_title_control")
+    proposal = {"request_title": "Revise the seating work", "summary": "Add the seating work.",
+                "specification": "Arrange the seating work in the visit plan.", "current_milestone": "Prepare the visit.",
+                "owner_visible_result": "The seating plan is ready.", "later_milestones": [],
+                "changes": [{"action": "add", **_ADD, "reason": "Prepare the seating arrangement.", "title": new_title}]}
+    observed = _daily_pass(root, project, path, monkeypatch, NOW, proposal, headline="The seating work has ended.",
+                           what_changed=title + " is no longer planned.", work=rework)
+    assert observed["frozen"]["status"] == "archived"
+    # Ended work with no recorded owner decision stays settled as a whole: the older comment reopens nothing.
+    assert observed["advice"] is None, observed
+    assert observed["brief"]["next_step"] == observed["summary"]["next_action"] == "Keep the visit plan.", observed
