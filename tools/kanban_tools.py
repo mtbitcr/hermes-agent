@@ -1103,6 +1103,10 @@ def _handle_show(args: dict, **kw) -> str:
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
     board = args.get("board")
+    if ("board" in args or tid != os.environ.get("HERMES_KANBAN_TASK")) and (
+        refusal := _review_task_refusal("kanban_show of another task or board")
+    ):
+        return refusal
     try:
         kb, conn = _connect(board=board)
         try:
