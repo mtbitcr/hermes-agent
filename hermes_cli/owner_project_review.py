@@ -1084,13 +1084,27 @@ def _made_for(task: kanban_db.Task, project_id: str) -> bool:
     return task.created_by == CREATED_BY and (task.idempotency_key or "").startswith(_key_prefix(project_id))
 
 
-def _find_open_task(board: sqlite3.Connection, project_id: str) -> Optional[sqlite3.Row]:
-    """The oldest review task the tick made for the Project that is neither done nor archived, as in the summary."""
+def _find_open_task(
+    board: sqlite3.Connection, project_id: str, review_day: Optional[str] = None
+) -> Optional[sqlite3.Row]:
+    """The oldest review task the tick made for the Project that is neither done nor archived, as in the summary.
+
+    Failing that, on a review day: the oldest archived further review of that day (its key ends in ``:again``). An
+    archived task no longer holds its key, so a further review archived before its claim would be published again.
+    """
     prefix = _key_prefix(project_id)
-    return board.execute(
-        "SELECT id, idempotency_key FROM tasks WHERE created_by = ? AND substr(idempotency_key, 1, ?) = ? "
+    found = board.execute(
+        "SELECT id, idempotency_key, status FROM tasks WHERE created_by = ? AND substr(idempotency_key, 1, ?) = ? "
         "AND status NOT IN ('done', 'archived') ORDER BY created_at, id LIMIT 1",
         (CREATED_BY, len(prefix), prefix),
+    ).fetchone()
+    if found is not None or review_day is None:
+        return found
+    day_prefix = f"{prefix}{review_day}:"
+    return board.execute(
+        "SELECT id, idempotency_key, status FROM tasks WHERE created_by = ? AND substr(idempotency_key, 1, ?) = ? "
+        "AND substr(idempotency_key, -6) = ':again' AND status = 'archived' ORDER BY created_at, id LIMIT 1",
+        (CREATED_BY, len(day_prefix), day_prefix),
     ).fetchone()
 
 
@@ -1098,12 +1112,16 @@ def _record_open_task(registry: sqlite3.Connection, project_id: str, task: sqlit
     """Record a task found on the board as the Project's open review, and count it on its review day.
 
     A row that records a task already is left alone, so a task is counted once: by its claim, or here when the
-    publisher stopped before its claim. A key without a date counts on today.
+    publisher stopped before its claim. A key without a date counts on today. An archived task stays on the board
+    after its record is cleared, so it is recorded only while the row does not hold its key.
     """
     row = registry.execute(
-        "SELECT open_task_id FROM project_review_state WHERE project_id = ?", (project_id,)
+        "SELECT open_task_id, stale_refused_key FROM project_review_state WHERE project_id = ?", (project_id,)
     ).fetchone()
     if row is not None and row["open_task_id"] is not None:
+        return
+    archived = task["status"] == "archived"
+    if archived and row is not None and row["stale_refused_key"] == task["idempotency_key"]:
         return
     review_day = _key_date(task["idempotency_key"], project_id) or vienna_date(now)
     with write_txn(registry):
@@ -1113,8 +1131,10 @@ def _record_open_task(registry: sqlite3.Connection, project_id: str, task: sqlit
         # A published further review is used, as when its claim records it (owner rule of 2026-11-11, point 6).
         recorded = registry.execute(
             "UPDATE project_review_state SET open_task_id = ?, open_review_date = ?, updated_at = ?, "
-            "stale_refused_key = COALESCE(?, stale_refused_key) WHERE project_id = ? AND open_task_id IS NULL",
-            (task["id"], review_day, now, _further_key(task["idempotency_key"]), project_id),
+            "stale_refused_key = COALESCE(?, stale_refused_key) WHERE project_id = ? AND open_task_id IS NULL "
+            "AND (? = 0 OR stale_refused_key IS NOT ?)",
+            (task["id"], review_day, now, _further_key(task["idempotency_key"]), project_id, archived,
+             task["idempotency_key"]),
         ).rowcount
         if recorded == 1:
             _spend(registry, review_day, "project_reviews", None, now)
@@ -1742,7 +1762,7 @@ def _request(registry: sqlite3.Connection, settings: ReviewSettings, now: int) -
             # comes before every other read of the turn. The check never makes the board; a failing query ends the tick.
             if board is None and path.exists():
                 board = stack.enter_context(kanban_db.connect_closing(path, board=summary.SUMMARY_BOARD))
-            open_task = None if board is None else _find_open_task(board, project.id)
+            open_task = None if board is None else _find_open_task(board, project.id, review_day)
             if open_task is not None:
                 _record_open_task(registry, project.id, open_task, now)
             if not _allowed(registry, settings, project.id):
