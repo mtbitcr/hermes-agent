@@ -377,22 +377,24 @@ def _link_owner_conversation_project(
     conversation text or model output. Without ``write`` it only checks, so a
     request refused before its turn is admitted leaves no link; with ``write``,
     called once the turn is admitted and before any model runs, it links. None
-    means no other Project holds the conversation.
+    means no other Project holds the conversation. A profile route reaches the
+    owner's Project store for this check and this one link only.
     """
     from hermes_cli import owner_workspace, projects_db
     from hermes_cli.sqlite_util import InitLockUnavailable
 
     try:
-        committed = owner_workspace.list_committed_projects(owner_workspace.resolve_owner_context())
-        if project_id not in {project["project_id"] for project in committed}:
-            return web.json_response(
-                _openai_error("Owner workspace Project was not found", code="project_not_found"), status=404,
-            )
-        if not write:
-            linked = projects_db.read_project_conversation_link(conversation) or project_id
-        else:
-            with projects_db.connect_closing() as conn:
-                linked = projects_db.link_project_conversation(conn, conversation, project_id)
+        with owner_workspace.owner_project_store():
+            committed = owner_workspace.list_committed_projects(owner_workspace.resolve_owner_context())
+            if project_id not in {project["project_id"] for project in committed}:
+                return web.json_response(
+                    _openai_error("Owner workspace Project was not found", code="project_not_found"), status=404,
+                )
+            if not write:
+                linked = projects_db.read_project_conversation_link(conversation) or project_id
+            else:
+                with projects_db.connect_closing() as conn:
+                    linked = projects_db.link_project_conversation(conn, conversation, project_id)
     except (owner_workspace.OwnerWorkspaceError, InitLockUnavailable, OSError, sqlite3.Error):
         logger.exception("Owner conversation %s could not be linked to its Project", conversation)
         return web.json_response(_openai_error(
@@ -11396,9 +11398,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             if view == "project":
+                from hermes_cli.owner_workspace import owner_project_store
                 from hermes_cli.projects_db import read_project_conversation_link
 
-                link = read_project_conversation_link(conversation)
+                with owner_project_store():
+                    link = read_project_conversation_link(conversation)
                 return web.json_response({"object": "hermes.response.owner_project_link", "project_id": link})
             if re.fullmatch(r"raphael-owner-[a-f0-9]{32}", conversation) is None:
                 return web.json_response(

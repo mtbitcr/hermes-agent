@@ -2372,6 +2372,24 @@ def _owner_executor_scope():
         reset_hermes_home_override(token)
 
 
+@contextlib.contextmanager
+def owner_project_store():
+    """Scope this block to the store of the owner's committed Projects, the one the native route reads.
+
+    A ``/p/<profile>/`` request runs under that profile's home, whose own
+    ``projects.db`` holds none of the owner's committed Projects. The native
+    route runs under the process home, so inside this block the owner and the
+    Project store resolve as they do there.
+    """
+    from hermes_constants import get_process_hermes_home, reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(get_process_hermes_home()))
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _receipt_unreadable(detail: str) -> OwnerWorkspaceError:
     return OwnerWorkspaceError("execution_state_busy", detail)
 
