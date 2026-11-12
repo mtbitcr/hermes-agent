@@ -1,0 +1,19 @@
+{
+  "body": {
+    "closed": [
+      {
+        "card_title": "Book a room",
+        "closed_at": 1794294000,
+        "decision_ref": "decision_2c8ef98ab278c0648b9477152e4e9376",
+        "project_name": "Meeting Plan",
+        "project_slug": "meeting-plan",
+        "reason": "The room is booked.",
+        "title": "Book the room"
+      }
+    ],
+    "data": [],
+    "object": "hermes.owner_workspace.decision_list",
+    "truncated": false
+  },
+  "status": 200
+}

@@ -2748,8 +2748,15 @@ WORK_ITEM_CAPABILITY = "work_item_v1"
 # appear unasked: without it the snapshot keeps today's shape exactly, and only
 # a reader naming it gets ``raphael_summary``, or None while none is stored.
 OWNER_PROJECT_SUMMARY_CAPABILITY = "project_summary"
+<<<<<<< b0632132ce9057b8bb427a85c023dc6497e7274b
+# The separate brief is absent unless the reader asks for it.
+OWNER_PROJECT_REVIEW_BRIEF_CAPABILITY = "project_review_brief"
+# Closed suggestions have their own optional Decisions list.
+OWNER_CLOSED_SUGGESTIONS_CAPABILITY = "closed_suggestions_v1"
+=======
 # Planning clients request accepted advice separately from the visible brief.
 OWNER_PROJECT_REVIEW_ADVICE_CAPABILITY = "project_review_advice_v1"
+>>>>>>> ba8db44f84bce07e889c63117718e2ff9f0b79c8
 # A separately negotiated contour for the files a held card still needs from
 # the owner (card C2 of the named inputs plan). Without it every Decision keeps
 # today's keys exactly; only a reader naming it gets ``missing_inputs``.
@@ -3522,7 +3529,11 @@ def read_project_snapshot(
     delivery_outcome: bool = False,
     project_summary: bool = False,
     work_item: bool = False,
+<<<<<<< b0632132ce9057b8bb427a85c023dc6497e7274b
+    project_review_brief: bool = False,
+=======
     project_review_advice: bool = False,
+>>>>>>> ba8db44f84bce07e889c63117718e2ff9f0b79c8
 ) -> dict:
     """Return one bounded read-only surface for an exact receipt-owned Project.
 
@@ -3579,8 +3590,14 @@ def read_project_snapshot(
     None while none is stored; it defaults off so the snapshot stays exactly
     today's; see ``OWNER_PROJECT_SUMMARY_CAPABILITY``.
 
+<<<<<<< b0632132ce9057b8bb427a85c023dc6497e7274b
+    ``project_review_brief`` adds ``raphael_review``: the latest daily brief
+    and the last fourteen review days, or None while none is stored; see
+    ``OWNER_PROJECT_REVIEW_BRIEF_CAPABILITY``.
+=======
     ``project_review_advice`` adds the checked plan advice from an accepted review.
     It grants no approval and leaves the stored data unchanged.
+>>>>>>> ba8db44f84bce07e889c63117718e2ff9f0b79c8
     """
     try:
         project_slug = projects_db.normalize_slug(project_slug) or ""
@@ -3920,9 +3937,16 @@ def read_project_snapshot(
             planning_conn.close()
     if project_summary:
         result["raphael_summary"] = _owner_project_summary(project_id)
+<<<<<<< b0632132ce9057b8bb427a85c023dc6497e7274b
+    if project_review_brief:
+        from hermes_cli.owner_project_review_view import project_review_view
+
+        result["raphael_review"] = project_review_view(project_id)
+=======
     if project_review_advice:
         from hermes_cli.owner_project_review_view import project_review_advice_view
         result["raphael_review_advice"] = project_review_advice_view(project_id)
+>>>>>>> ba8db44f84bce07e889c63117718e2ff9f0b79c8
     return result
 
 
@@ -4081,6 +4105,7 @@ _SUGGESTION_FALLBACK_TITLE = "A suggested capability change"
 
 def list_owner_decisions(
     ctx: OwnerContext, *, owner_waiting: bool = False, owner_input_upload: bool = False, design_options: bool = False,
+    closed_suggestions: bool = False,
 ) -> dict:
     """Project pending native gates into one owner-safe read-only inbox.
 
@@ -4109,9 +4134,17 @@ def list_owner_decisions(
     ``OWNER_INPUT_UPLOAD_CAPABILITY``. Each owner-input item of a card that
     declares named inputs then carries ``missing_inputs``, the inputs the owner
     has not given yet (see :func:`decision_missing_inputs`).
+
+    ``closed_suggestions`` is set only for a reader that named
+    ``OWNER_CLOSED_SUGGESTIONS_CAPABILITY``. A suggestion with a live checked
+    closure then leaves the pending window and the list carries ``closed``,
+    the newest 20 closures the owner can undo.
     """
+    from hermes_cli.owner_recommendation_closures import live_closure_filter, recent_closed_suggestions
+
     decisions: list[dict] = []
     recent: list[dict] = []
+    closed: list[dict] = []
     truncated = False
     projects = list_committed_projects(ctx)
     for project in projects:
@@ -4160,7 +4193,8 @@ def list_owner_decisions(
                 "AND block_kind = 'needs_input') OR "
                 "(task_kind = 'recommendation' AND status = 'review' "
                 "AND review_policy = 'owner' "
-                "AND COALESCE(recommendation_decision, 'pending') = 'pending')) "
+                "AND COALESCE(recommendation_decision, 'pending') = 'pending'"
+                f"{live_closure_filter(conn, closed_suggestions)})) "
                 "ORDER BY created_at DESC, id ASC LIMIT ?",
                 (project_id, _OWNER_DECISIONS_LIMIT + 1),
             ).fetchall()
@@ -4197,6 +4231,8 @@ def list_owner_decisions(
                     str(row["id"]) for row in rows[:_OWNER_DECISIONS_LIMIT]
                 ])
                 recent = recent_design_choices(conn, project, recent)
+            if closed_suggestions:
+                closed = recent_closed_suggestions(conn, ctx, project, closed)
         except sqlite3.Error as exc:
             raise OwnerWorkspaceError(
                 "snapshot_unavailable", "the Project decisions could not be read"
@@ -4291,6 +4327,7 @@ def list_owner_decisions(
         "data": decisions[:_OWNER_DECISIONS_LIMIT],
         "truncated": truncated or len(decisions) > _OWNER_DECISIONS_LIMIT,
         **({"recent_design_choices": recent} if design_options else {}),
+        **({"closed": closed} if closed_suggestions else {}),
     }
 
 
@@ -4413,6 +4450,12 @@ def decide_owner_suggestion(
                 "decision_not_found", "no pending suggestion has this decision key"
             ) from exc
     return {"decision_ref": decision_ref, "decision": decision}
+
+
+def undo_owner_suggestion_closure(ctx: OwnerContext, *, decision_ref: Any, reason: Any, expected_closed_at: Any) -> dict:
+    from hermes_cli.owner_recommendation_closures import undo_closed_suggestion
+
+    return undo_closed_suggestion(ctx, decision_ref=decision_ref, reason=reason, expected_closed_at=expected_closed_at)
 
 
 def set_project_archived(
