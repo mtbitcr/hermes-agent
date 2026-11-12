@@ -252,3 +252,15 @@ class GatewaySessionWatchersMixin:
             except Exception as exc:
                 logger.debug("Owner heads-up watcher error: %s", exc)
             await _interruptible_sleep(self, int(interval))
+
+    async def _owner_review_digest_watcher(self, interval: float = 30.0):
+        """Deliver the optional daily digest independently of board dispatch."""
+        from gateway import owner_review_digest
+
+        await asyncio.sleep(min(30.0, interval))
+        while self._running:
+            try:
+                await owner_review_digest.tick(self)
+            except Exception:
+                logger.debug("Daily digest watcher could not finish a tick")
+            await _interruptible_sleep(self, int(interval))

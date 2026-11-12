@@ -6946,6 +6946,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._handle_owner_workspace_project_attachment,
             ),
             ("GET", "/v1/owner-workspace/decisions", self._handle_owner_workspace_decisions),
+            ("POST", "/v1/owner-workspace/decisions/{decision_ref}/undo_close", __import__("gateway.platforms.api_server_owner_closures", fromlist=["route"]).route(self)),
             (
                 "POST",
                 "/v1/owner-workspace/decisions/{decision_ref}/accept",
@@ -13081,59 +13082,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self, request: "web.Request",
     ) -> "web.Response":
         """GET receipt-backed owner Projects without opening a mutation path."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
+        from gateway.platforms.api_server_owner_projects import list_owner_projects
 
-        try:
-            from gateway.run import _load_gateway_config
-
-            if not _owner_workspace_toolset_enabled(_load_gateway_config()):
-                return web.json_response(
-                    _openai_error(
-                        "Owner workspace is not enabled for this profile",
-                        code="owner_workspace_not_enabled",
-                    ),
-                    status=404,
-                )
-            from hermes_cli.owner_workspace import (
-                OWNER_PROJECT_BOARD_COUNTS_CAPABILITY,
-                OWNER_PROJECT_LAST_CHANGE_CAPABILITY,
-                OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY,
-                OWNER_PROJECT_REMOVAL_STATE_CAPABILITY,
-                list_committed_projects,
-                resolve_owner_context,
-            )
-
-            projects = list_committed_projects(
-                resolve_owner_context(),
-                lifecycle_revision=_owner_workspace_capability_requested(
-                    request, OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY,
-                ),
-                removal_state=_owner_workspace_capability_requested(
-                    request, OWNER_PROJECT_REMOVAL_STATE_CAPABILITY,
-                ),
-                board_counts=_owner_workspace_capability_requested(
-                    request, OWNER_PROJECT_BOARD_COUNTS_CAPABILITY,
-                ),
-                project_last_change=_owner_workspace_capability_requested(
-                    request, OWNER_PROJECT_LAST_CHANGE_CAPABILITY,
-                ),
-            )
-        except Exception:
-            logger.exception("[api_server] owner-workspace Project projection failed")
-            return web.json_response(
-                _openai_error(
-                    "Owner workspace Project projection is unavailable",
-                    code="owner_workspace_unavailable",
-                ),
-                status=500,
-            )
-
-        return web.json_response({
-            "object": "hermes.owner_workspace.project_list",
-            "data": projects,
-        })
+        return await list_owner_projects(self, request)
     async def _handle_owner_workspace_project_snapshot(
         self, request: "web.Request",
     ) -> "web.Response":
@@ -13161,6 +13112,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 OWNER_PROJECT_PLANNING_CONTEXT_V2_CAPABILITY,
                 OWNER_PROJECT_RUN_CONTEXT_CAPABILITY,
                 OWNER_PROJECT_SUMMARY_CAPABILITY,
+                OWNER_PROJECT_REVIEW_BRIEF_CAPABILITY,
+                OWNER_PROJECT_REVIEW_ADVICE_CAPABILITY,
                 OWNER_WAITING_CAPABILITY,
                 PROVIDER_WAIT_CAPABILITY,
                 WORK_ITEM_CAPABILITY,
@@ -13199,6 +13152,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, OWNER_PROJECT_SUMMARY_CAPABILITY
             ):
                 waiting["project_summary"] = True
+            if _owner_workspace_capability_requested(request, OWNER_PROJECT_REVIEW_BRIEF_CAPABILITY):
+                waiting["project_review_brief"] = True
+            if _owner_workspace_capability_requested(
+                request, OWNER_PROJECT_REVIEW_ADVICE_CAPABILITY
+            ):
+                waiting["project_review_advice"] = True
             # And for planning_context_v2, which the kernel serves in place of
             # planning_context_v1 when a reader names both.
             planning_v2 = (
@@ -13342,6 +13301,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             from hermes_cli.owner_workspace import (
                 DESIGN_OPTIONS_CAPABILITY,
+                OWNER_CLOSED_SUGGESTIONS_CAPABILITY,
                 OWNER_INPUT_UPLOAD_CAPABILITY,
                 OWNER_WAITING_CAPABILITY,
                 list_owner_decisions,
@@ -13365,6 +13325,8 @@ class APIServerAdapter(BasePlatformAdapter):
             # The same for design_options_v1 and its keyword (design options card 2).
             if _owner_workspace_capability_requested(request, DESIGN_OPTIONS_CAPABILITY):
                 waiting["design_options"] = True
+            if _owner_workspace_capability_requested(request, OWNER_CLOSED_SUGGESTIONS_CAPABILITY):
+                waiting["closed_suggestions"] = True
             owner = resolve_owner_context()
             projected = list_owner_decisions(owner, **waiting)
             decisions = list(projected["data"])
@@ -13433,6 +13395,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # everything Raphael is waiting on.
             "truncated": truncated or len(decisions) > 100,
             "data": decisions[:100],
+            **({"closed": projected["closed"]} if "closed" in projected else {}),
             **({"recent_design_choices": projected["recent_design_choices"]} if "recent_design_choices" in projected else {}),
         })
 

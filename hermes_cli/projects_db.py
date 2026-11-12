@@ -24,6 +24,7 @@ The schema is intentionally small and additive: column additions go through
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import secrets
@@ -157,12 +158,16 @@ CREATE TABLE IF NOT EXISTS project_summary_state (
 -- Project: its own event cursors (the summary's move hourly, the review's once a
 -- day), the last Vienna review day, the last brief, the last day with news (the
 -- quiet days count from it), the one open review task and the failure count.
--- Dates are Vienna calendar dates, 'YYYY-MM-DD'. Additive: no existing table changes.
+-- Dates are Vienna calendar dates, 'YYYY-MM-DD'. The optional conversation cursor also upgrades earlier review stores.
+-- input_too_large_date is the day whose required review input did not fit the cap: no review ran that day.
+-- stale_refused_key is the key of the last review refused as stale; it allows one further review of its day. The
+-- claim of that further review stores its own key (ending ':again') here: the day's one further review is used then.
 CREATE TABLE IF NOT EXISTS project_review_state (
     project_id         TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
     event_cursor       INTEGER NOT NULL DEFAULT 0,
     delivery_cursor    INTEGER NOT NULL DEFAULT 0,
     release_cursor     INTEGER NOT NULL DEFAULT 0,
+    conversation_cursor TEXT,
     last_reviewed_date TEXT,
     last_reviewed_at   INTEGER,
     last_brief_date    TEXT,
@@ -170,7 +175,32 @@ CREATE TABLE IF NOT EXISTS project_review_state (
     open_task_id       TEXT,
     open_review_date   TEXT,
     failures           INTEGER NOT NULL DEFAULT 0,
-    updated_at         INTEGER NOT NULL
+    updated_at         INTEGER NOT NULL,
+    input_too_large_date TEXT,
+    stale_refused_key  TEXT
+);
+
+-- Daily briefs have their own history. The five-key project summary keeps its existing shape.
+-- Classification remains internal and is excluded from the owner-facing reader below.
+CREATE TABLE IF NOT EXISTS project_review_briefs (
+    project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    review_date   TEXT NOT NULL,
+    covered_from  TEXT,
+    covered_to    TEXT NOT NULL,
+    headline      TEXT NOT NULL,
+    what_changed  TEXT NOT NULL,
+    next_step     TEXT NOT NULL,
+    needs_you     TEXT,
+    ready_work    TEXT NOT NULL,
+    cut_note      TEXT,
+    quiet         INTEGER NOT NULL,
+    classification TEXT NOT NULL,
+    written_at    INTEGER NOT NULL,
+    revision      INTEGER NOT NULL,
+    source_task_id TEXT,
+    source_run_id INTEGER,
+    source_digest TEXT,
+    PRIMARY KEY (project_id, review_date)
 );
 
 -- The daily cap of the review: the review tasks started on one Vienna day,
@@ -180,6 +210,17 @@ CREATE TABLE IF NOT EXISTS review_budget (
     project_reviews   INTEGER NOT NULL DEFAULT 0,
     portfolio_reviews INTEGER NOT NULL DEFAULT 0,
     updated_at        INTEGER NOT NULL
+);
+
+-- The portfolio stores advice only. Existing Project summaries and briefs keep their formats.
+CREATE TABLE IF NOT EXISTS portfolio_review_briefs (
+    review_date     TEXT PRIMARY KEY,
+    conflicts       TEXT NOT NULL,
+    priorities      TEXT NOT NULL,
+    shared_blockers TEXT NOT NULL,
+    project_scope   TEXT NOT NULL DEFAULT '[]',
+    written_at      INTEGER NOT NULL,
+    revision        INTEGER NOT NULL
 );
 
 -- The Project one owner conversation belongs to, from the owner-authorised
@@ -351,6 +392,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "SELECT name FROM sqlite_master WHERE type='table'"
         )
     }
+    if "project_review_state" in tables:
+        _add_column_if_missing(conn, "project_review_state", "conversation_cursor", "conversation_cursor TEXT")
+        _add_column_if_missing(conn, "project_review_state", "input_too_large_date", "input_too_large_date TEXT")
+        _add_column_if_missing(conn, "project_review_state", "stale_refused_key", "stale_refused_key TEXT")
+    if "project_review_briefs" in tables:
+        for name, kind in (("source_task_id", "TEXT"), ("source_run_id", "INTEGER"), ("source_digest", "TEXT")):
+            _add_column_if_missing(conn, "project_review_briefs", name, f"{name} {kind}")
+    if "portfolio_review_briefs" in tables:
+        _add_column_if_missing(conn, "portfolio_review_briefs", "project_scope", "project_scope TEXT NOT NULL DEFAULT '[]'")
     if "project_removal_operations" in tables:
         rem_cols = {
             row["name"]
@@ -856,6 +906,128 @@ def get_project_summary(
         "written_at": written_at,
         "revision": revision,
     }
+
+
+def write_project_review_brief(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    review_date: str,
+    covered_from: Optional[str],
+    covered_to: str,
+    headline: str,
+    what_changed: str,
+    next_step: str,
+    needs_you: Optional[str] = None,
+    ready_work: Iterable[str] = (),
+    cut_note: Optional[str] = None,
+    quiet: bool = False,
+    classification: Iterable[dict] = (),
+    written_at: Optional[int] = None,
+    source_task_id: Optional[str] = None,
+    source_run_id: Optional[int] = None,
+    source_digest: Optional[str] = None,
+) -> int:
+    """Store one day's brief. The caller validates model text before this write.
+
+    The ``source_*`` values name the accepted review run whose plan advice the brief points to. They are
+    references only: the advice itself stays in that run's metadata.
+    """
+    if any(value is not None for value in (source_task_id, source_run_id, source_digest)) and not (
+        isinstance(source_task_id, str) and 1 <= len(source_task_id) <= 100
+        and type(source_run_id) is int and 1 <= source_run_id <= 2**63 - 1
+        and isinstance(source_digest, str) and re.fullmatch(r"[a-f0-9]{64}", source_digest)
+    ):
+        raise ValueError("review_source_invalid")
+    with write_txn(conn):
+        revision = conn.execute(
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM project_review_briefs "
+            "WHERE project_id = ? AND review_date = ?", (project_id, review_date),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT OR REPLACE INTO project_review_briefs "
+            "(project_id,review_date,covered_from,covered_to,headline,what_changed,next_step,needs_you,"
+            "ready_work,cut_note,quiet,classification,written_at,revision,source_task_id,source_run_id,source_digest) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (project_id, review_date, covered_from, covered_to, headline, what_changed, next_step, needs_you,
+             json.dumps(list(ready_work), ensure_ascii=False, allow_nan=False), cut_note, int(quiet),
+             json.dumps(list(classification), ensure_ascii=False, sort_keys=True, allow_nan=False),
+             _now() if written_at is None else written_at, revision, source_task_id, source_run_id, source_digest),
+        )
+        # The approved daily review plan keeps the latest 90 briefs of each Project.
+        conn.execute(
+            "DELETE FROM project_review_briefs WHERE project_id=? AND review_date NOT IN "
+            "(SELECT review_date FROM project_review_briefs WHERE project_id=? ORDER BY review_date DESC LIMIT 90)",
+            (project_id, project_id),
+        )
+    return revision
+
+
+def get_project_review_source(conn: sqlite3.Connection, project_id: str) -> Optional[dict]:
+    """Read private source references without migrating an older store or extending the public brief."""
+    fields = {row[1] for row in conn.execute("PRAGMA table_info(project_review_briefs)")}
+    if not {"source_task_id", "source_run_id", "source_digest"}.issubset(fields):
+        return None
+    row = conn.execute(
+        "SELECT review_date,quiet,source_task_id,source_run_id,source_digest FROM project_review_briefs "
+        "WHERE project_id=? ORDER BY review_date DESC LIMIT 1", (project_id,),
+    ).fetchone()
+    if row is None or row["quiet"] or row["source_task_id"] is None:
+        return None
+    return dict(row)
+
+
+def get_project_review_brief(conn: sqlite3.Connection, project_id: str) -> Optional[dict]:
+    """Read the latest brief without exposing internal classification or creating an absent table."""
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_review_briefs'"
+    ).fetchone():
+        return None
+    fields = ("review_date", "covered_from", "covered_to", "headline", "what_changed", "next_step",
+              "needs_you", "ready_work", "cut_note", "quiet", "written_at", "revision")
+    row = conn.execute(
+        f"SELECT {','.join(fields)} FROM project_review_briefs WHERE project_id=? ORDER BY review_date DESC LIMIT 1",
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(zip(fields, row))
+    result["ready_work"] = json.loads(result["ready_work"])
+    result["quiet"] = bool(result["quiet"])
+    return result
+
+
+def write_portfolio_review_brief(conn: sqlite3.Connection, review_date: str, *, conflicts: list,
+                                priorities: list, shared_blockers: list, written_at: int,
+                                project_scope: Iterable[str] = ()) -> None:
+    """Store validated advice once. A repeated harvest preserves the accepted daily result."""
+    with write_txn(conn):
+        conn.execute(
+            "INSERT OR IGNORE INTO portfolio_review_briefs "
+            "(review_date,conflicts,priorities,shared_blockers,project_scope,written_at,revision) VALUES (?,?,?,?,?,?,1)",
+            (review_date, *(json.dumps(items, ensure_ascii=False, allow_nan=False)
+                            for items in (conflicts, priorities, shared_blockers)),
+             json.dumps(list(project_scope), allow_nan=False), written_at),
+        )
+
+
+def get_portfolio_review_brief(conn: sqlite3.Connection, review_date: Optional[str] = None) -> Optional[dict]:
+    """Read daily advice without creating the additive table on an older store."""
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='portfolio_review_briefs'").fetchone():
+        return None
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(portfolio_review_briefs)")}
+    # Older advice has no recorded scope. It cannot authorize the optional owner projection.
+    scope = "project_scope" if "project_scope" in columns else "'[]'"
+    row = conn.execute(
+        f"SELECT review_date,conflicts,priorities,shared_blockers,written_at,revision,{scope} AS project_scope FROM portfolio_review_briefs "
+        "WHERE (? IS NULL OR review_date=?) ORDER BY review_date DESC LIMIT 1", (review_date, review_date),
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    for key in ("conflicts", "priorities", "shared_blockers", "project_scope"):
+        result[key] = json.loads(result[key])
+    return result
 
 
 def link_project_conversation(

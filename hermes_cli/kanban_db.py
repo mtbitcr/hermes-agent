@@ -98,6 +98,13 @@ from hermes_cli.gitlock import clear_stale_index_lock
 from hermes_cli.kanban_archived_followups import archive_recorded_review_followups
 from hermes_cli.kanban_handover_guard import refuse_early, rollback_task_branch
 from hermes_cli.kanban_merge_gate import named_carrier, parent_satisfies
+from hermes_cli.kanban_recommendation_closure import (
+    SCHEMA_SQL as _RECOMMENDATION_CLOSURE_SCHEMA_SQL,
+    close_recommendation_delivered,
+    has_live_recommendation_closure,
+    record_made_from,
+    undo_recommendation_closure,
+)
 from hermes_cli.kanban_replaced_cards import replaced_task_ids
 from hermes_cli.kanban_risk_tier import (
     active_run_box_seconds,
@@ -16298,6 +16305,7 @@ CREATE INDEX IF NOT EXISTS idx_sandbox_cleanup_due   ON run_sandbox_cleanup_inte
 CREATE INDEX IF NOT EXISTS idx_sandbox_orphan_cleanup_due ON run_sandbox_orphan_cleanup_intents(next_attempt_at, created_event_id) WHERE exhausted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
+SCHEMA_SQL += _RECOMMENDATION_CLOSURE_SCHEMA_SQL
 
 
 # ---------------------------------------------------------------------------
@@ -19383,6 +19391,7 @@ def create_task(
     receipt_owned: bool = False,
     requires_review: bool = False,
     risk_tier: Optional[int] = None,
+    made_from_recommendation: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -19877,6 +19886,8 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if made_from_recommendation is not None:
+                    record_made_from(conn, task_id, made_from_recommendation)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -20629,6 +20640,8 @@ def decide_recommendation(
 
     with write_txn(conn):
         row = _recommendation_row(conn, task_id)
+        if has_live_recommendation_closure(conn, task_id):
+            raise ValueError("not_waiting")
         snapshot = recommendation_lifecycle_snapshot(row)
         if snapshot["lifecycle_version"] != expected_lifecycle_version:
             raise ValueError(
@@ -20738,6 +20751,8 @@ def decide_recommendation_on_owner_screen(
 
     with write_txn(conn):
         row = _recommendation_row(conn, task_id)
+        if has_live_recommendation_closure(conn, task_id):
+            raise ValueError("not_waiting")
         snapshot = recommendation_lifecycle_snapshot(row)
         if snapshot["lifecycle_version"] != expected_lifecycle_version:
             raise ValueError(
