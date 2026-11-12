@@ -407,6 +407,32 @@ def test_a_published_portfolio_recovers_its_missing_budget_record_once(root):
         assert board.execute("SELECT COUNT(*) FROM tasks WHERE created_by='project-review'").fetchone()[0] == 1
 
 
+def test_an_uncounted_portfolio_retry_archived_before_recovery_still_holds_its_slot(root, monkeypatch):
+    project = _quiet_project(root)
+    (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
+        "enabled": True, "allowlist": [project.id], "portfolio": True, "portfolio_cap": 2,
+    }}))
+    assert review.review_tick(NOW) == 1
+    _finish_portfolio({**RESULT, "changes": []})
+    assert review.review_tick(NOW + 1) == 0
+
+    def busy(*_args):
+        raise OSError("The registry is busy.")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(review, "take_portfolio_slot", busy)
+        with pytest.raises(OSError):
+            review.review_tick(NOW + 2)
+    # The owner archives the published retry before any tick could recover its count.
+    with _summaries() as board:
+        [retry] = [row[0] for row in board.execute("SELECT id FROM tasks WHERE status!='archived'")]
+        assert kanban_db.archive_task(board, retry)
+    assert review.review_tick(NOW + 3) == 0
+    assert _portfolio_keys() == ["project-review:portfolio:2026-11-09:0"] * 2
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        assert review.budget(registry, "2026-11-09") == (0, 2)
+
+
 @pytest.mark.parametrize("cap", [1, 2])
 def test_a_saved_portfolio_survives_an_archive_failure_without_another_revision(root, cap):
     project = _quiet_project(root)

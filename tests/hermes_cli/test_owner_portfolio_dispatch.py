@@ -2,6 +2,8 @@
 
 from pathlib import Path
 from types import SimpleNamespace
+import multiprocessing
+import os
 import subprocess
 import yaml
 
@@ -18,6 +20,7 @@ from tests.hermes_cli.test_owner_project_review_result import NOW, _quiet_projec
 SUMMARIES = "project-summaries"
 KEY = "project-review:portfolio:2026-11-09:0"
 RESULT = {"conflicts": [], "priorities": ["Meeting Plan: Book the room."], "shared_blockers": []}
+REFUSED = {**RESULT, "changes": [{"action": "cancel"}]}
 
 
 @pytest.mark.parametrize("paused", [False, True], ids=["active", "owner-paused"])
@@ -201,9 +204,8 @@ def test_the_next_review_day_still_gets_its_own_portfolio_with_a_spare_slot(watc
 def test_a_refused_portfolio_still_gets_its_retry_from_a_spare_slot(watcher_root, watcher_loop, monkeypatch):
     project = _quiet_project(watcher_root)
     _switch_on(watcher_root, project.id, portfolio=True, portfolio_cap=2)
-    refused = {**RESULT, "changes": [{"action": "cancel"}]}
 
-    _drive(monkeypatch, watcher_loop, [NOW + n * 60 for n in range(5)], between=_worker_completes(refused))
+    _drive(monkeypatch, watcher_loop, [NOW + n * 60 for n in range(5)], between=_worker_completes(REFUSED))
 
     # Tick 2 refuses and archives the result, so nothing is stored. Tick 3 publishes the day's retry from the spare
     # slot, and tick 4 launches its worker.
@@ -213,3 +215,80 @@ def test_a_refused_portfolio_still_gets_its_retry_from_a_spare_slot(watcher_root
     assert first_key == retry_key == KEY
     assert _launched(watcher_loop) == [(1, first), (4, retry)]
     assert _stored(watcher_root) == ((0, 2), None)
+
+
+def _attempts(cap):
+    """Clocks for ``cap`` refused attempts, three ticks each (publication, launch, refusal), and two ticks after."""
+    return [NOW + n * 60 for n in range(3 * cap + 2)]
+
+
+def _each_attempt_holds_one_slot(loop, home, cap):
+    published = _portfolios()
+    assert [(status, key) for _id, status, key in published] == [("archived", KEY)] * cap
+    assert [task_id for _tick, task_id in _launched(loop)] == [task_id for task_id, _status, _key in published]
+    assert _stored(home) == ((0, cap), None)
+
+
+@pytest.mark.parametrize("cap,failed", [(1, None), (2, None), (2, 2), (3, 2), (3, 3)])
+def test_a_published_portfolio_attempt_whose_count_fails_once_still_holds_one_slot(
+    watcher_root, watcher_loop, monkeypatch, cap, failed
+):
+    project = _quiet_project(watcher_root)
+    _switch_on(watcher_root, project.id, portfolio=True, portfolio_cap=cap)
+    count, calls = review.take_portfolio_slot, []
+
+    def flaky(registry, day, limit, now):
+        # Only a publication, or the recovery of a count it lost, counts a slot: call n counts attempt n.
+        calls.append(day)
+        if len(calls) == failed:
+            raise OSError("The registry is busy.")
+        return count(registry, day, limit, now)
+
+    monkeypatch.setattr(review, "take_portfolio_slot", flaky)
+
+    _drive(monkeypatch, watcher_loop, _attempts(cap), between=_worker_completes(REFUSED))
+
+    _each_attempt_holds_one_slot(watcher_loop, watcher_root, cap)
+
+
+def _gateway_stops_before_counting(clock):
+    """One dispatcher tick of a gateway process that ends right after it publishes a portfolio attempt."""
+
+    def stop(*_args):
+        os._exit(91)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(review, "take_portfolio_slot", stop)
+        loop = _Loop()
+        loop.record_spawns(patch)
+        _drive(patch, loop, [clock])
+
+
+@pytest.mark.parametrize("cap,stopped", [(2, 2), (3, 2), (3, 3)])
+def test_a_portfolio_attempt_published_by_a_stopped_gateway_holds_one_slot_after_the_restart(
+    watcher_root, watcher_loop, monkeypatch, cap, stopped
+):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("The gateway process stop needs fork.")
+    project = _quiet_project(watcher_root)
+    _switch_on(watcher_root, project.id, portfolio=True, portfolio_cap=cap)
+    clocks, finish = _attempts(cap), _worker_completes(REFUSED)
+    before = 3 * (stopped - 1)
+    _drive(monkeypatch, watcher_loop, clocks[:before], between=finish)
+
+    gateway = multiprocessing.get_context("fork").Process(target=_gateway_stops_before_counting, args=(clocks[before],))
+    gateway.start()
+    gateway.join(timeout=120)
+    if gateway.is_alive():
+        gateway.terminate()
+        gateway.join(timeout=10)
+    assert gateway.exitcode == 91
+    # The stopped process published the attempt, launched nothing and counted no slot for it.
+    assert [status for _id, status, _key in _portfolios()] == ["archived"] * (stopped - 1) + ["ready"]
+    assert _stored(watcher_root) == ((0, stopped - 1), None)
+
+    # A new gateway process resumes from the stores.
+    projects_db._INITIALIZED_PATHS.clear()
+    _drive(monkeypatch, watcher_loop, clocks[before + 1:], between=finish)
+
+    _each_attempt_holds_one_slot(watcher_loop, watcher_root, cap)

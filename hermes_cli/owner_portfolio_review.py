@@ -122,6 +122,20 @@ def _ready(registry, projects, day, settings, now):
     return True
 
 
+def _count_published(registry, board, day, now):
+    """Count each attempt published for ``day`` once, also one whose count a stopped gateway or a failure lost.
+
+    The summary board keeps every published attempt, archived ones included. The count only rises to match them.
+    """
+    published = board.execute(
+        "SELECT COUNT(*) FROM tasks WHERE created_by=? AND idempotency_key=?",
+        (review.CREATED_BY, f"project-review:portfolio:{day}:0"),
+    ).fetchone()[0]
+    # Each slot is its own transaction; the bound of ``published`` keeps a repeat from counting an attempt twice.
+    for _ in range(published - review.budget(registry, day)[1]):
+        review.take_portfolio_slot(registry, day, published, now)
+
+
 def portfolio_tick(registry, settings, now, *, room):
     """Handle one daily portfolio after settlement, failure, the cap, or the approved wait."""
     if settings.portfolio_cap < 1:
@@ -155,6 +169,8 @@ def _portfolio_tick(registry, settings, now, *, room):
                     return 0
                 if task_day != parts[2]:
                     return 0
+                # The published task proves its attempt if the gateway stopped, or the count failed, after publication.
+                _count_published(registry, board, task_day, now)
                 today = review.review_date(now, settings.review_hour)
                 # A task left unsettled, or given to another assignee, gives way once the next review day began.
                 over = today is not None and task_day < today
@@ -164,10 +180,6 @@ def _portfolio_tick(registry, settings, now, *, room):
                     review.logger.warning("portfolio_task_unsettled")
                     kanban_db.archive_task(board, task.id)
                 else:
-                    # The published task proves the attempt if the gateway stopped before counting its slot.
-                    with write_txn(registry):
-                        if review.budget(registry, task_day)[1] == 0:
-                            review.take_portfolio_slot(registry, task_day, settings.portfolio_cap, now)
                     try:
                         _harvest(registry, board, task, task_day, now)
                     except PortfolioRefused:
@@ -190,6 +202,10 @@ def _portfolio_tick(registry, settings, now, *, room):
     # A stored brief settles its day: spare slots of the cap retry only a day without an accepted result.
     if projects_db.get_portfolio_review_brief(registry, day) is not None:
         return 0
+    if path.exists():
+        # An attempt archived before any tick adopted it still holds its slot when the cap is read.
+        with kanban_db.connect_closing(path, board=summary.SUMMARY_BOARD) as board:
+            _count_published(registry, board, day, now)
     key = f"project-review:portfolio:{day}:0"
     if room < 1 or review.budget(registry, day)[1] >= settings.portfolio_cap:
         return 0
