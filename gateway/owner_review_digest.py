@@ -65,15 +65,24 @@ def _due(entry, now):
     return entry is None or now - entry["at"] >= RETRY_WAITS[min(entry["attempts"], len(RETRY_WAITS)) - 1]
 
 
-def _words(text):
+def _compared(text):
+    # The one form in which model lines meet live questions. A quote may keep or drop the punctuation inside a word
+    # ("follow-up", "followup"), so the first list splits at it and the second removes it.
     folded = unicodedata.normalize("NFKC", text).casefold().translate(_LOOK_ALIKES)
-    return "".join(char if char.isalnum() else " " for char in folded).split()
+    pieces = ("".join(char for char in piece if char.isalnum()) for piece in folded.split())
+    return "".join(char if char.isalnum() else " " for char in folded).split(), [piece for piece in pieces if piece]
 
 
-def _quotes(words, question):
-    size = min(QUOTE_WORDS, len(question))
-    runs = {tuple(question[start:start + size]) for start in range(len(question) - size + 1)}
-    return any(tuple(words[start:start + size]) in runs for start in range(len(words) - size + 1))
+def _quotes(line, question):
+    # Either text may be the one that kept the punctuation, so each word list of the line meets each of the question.
+    for asked in question:
+        if not asked:
+            continue  # An empty run would be found in every line.
+        size = min(QUOTE_WORDS, len(asked))
+        runs = {tuple(asked[start:start + size]) for start in range(len(asked) - size + 1)}
+        if any(tuple(words[start:start + size]) in runs for words in line for start in range(len(words) - size + 1)):
+            return True
+    return False
 
 
 def _ready(settings, day, now):
@@ -121,8 +130,8 @@ def _ready(settings, day, now):
     notes.extend(text for key in ("conflicts", "priorities", "shared_blockers") for text in portfolio[key])
     # Valid prose can still quote a live question of any Project, also in part or in another spelling.
     # Keep that quote out even when its heads-up was already told.
-    questions = [words for words in (_words(wait.question) for wait in waits) if words]
-    lines.extend(line for line in notes if not any(_quotes(_words(line), question) for question in questions))
+    questions = [_compared(wait.question) for wait in waits]
+    lines.extend(line for line in notes if not any(_quotes(_compared(line), question) for question in questions))
     if not lines:
         return None
     text = "\n".join([f"Your daily project review ({day})", NOTES_LINE, *lines])

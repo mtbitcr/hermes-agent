@@ -92,6 +92,31 @@ def _clock(monkeypatch):
     return clock
 
 
+def _registered_watcher(monkeypatch, adapter):
+    """The digest watcher that gateway start-up registers; each call of it runs one pass."""
+    from gateway import run_watchers
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    spawned = {}
+    runner._spawn_supervised = lambda factory, name, **_kwargs: spawned.setdefault(name, factory)
+    runner._failed_platforms = {}
+    runner._spawn_reconnect_watcher = lambda: None
+    runner._scale_to_zero_should_arm = lambda: False
+    runner._log_scale_to_zero_not_armed_reason = lambda: None
+    runner._active_profile_name = lambda: "default"
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._running = True
+    runner._start_spawn_background_watchers()
+
+    async def one_pass(passed, _seconds):
+        passed._running = False
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(run_watchers, "_interruptible_sleep", one_pass)
+    return runner, spawned["owner_review_digest_watcher"]
+
+
 @pytest.fixture
 def ready(root, monkeypatch):
     now = _at(2026, 11, 10, 6, 30)
@@ -144,6 +169,82 @@ async def test_review_prose_cannot_repeat_a_live_wait_question(root, ready, anno
         assert adapter.sent[0][1].splitlines()[1:] == [NOTES_LINE, "Meeting Plan: 1 answer waiting on Decisions"]
     else:
         assert adapter.sent == []
+
+
+def test_the_compared_form_splits_words_at_punctuation_and_also_drops_punctuation_inside_a_word():
+    digest = importlib.import_module("gateway.owner_review_digest")
+    expected = {
+        "What's next?": (["what", "s", "next"], ["whats", "next"]),
+        "Whats next?": (["whats", "next"], ["whats", "next"]),
+        "Do we re-book the room?": (["do", "we", "re", "book", "the", "room"], ["do", "we", "rebook", "the", "room"]),
+        "Do we rebook the room?": (["do", "we", "rebook", "the", "room"], ["do", "we", "rebook", "the", "room"]),
+        "Is the follow-up booked?": (["is", "the", "follow", "up", "booked"], ["is", "the", "followup", "booked"]),
+        "Is the followup booked?": (["is", "the", "followup", "booked"], ["is", "the", "followup", "booked"]),
+        "\uff37hat's next\uff1f": (["what", "s", "next"], ["whats", "next"]),  # NFKC: full-width W and question mark
+        "Wh\u0430t's n\u0435xt?": (["what", "s", "next"], ["whats", "next"]),  # Cyrillic look-alike a and e
+        "WHAT'S NEXT?": (["what", "s", "next"], ["whats", "next"]),  # case fold
+    }
+    assert {text: digest._compared(text) for text in expected} == expected
+
+
+def test_a_line_quotes_a_question_when_one_of_its_word_lists_holds_a_run_of_one_of_the_questions_word_lists():
+    digest = importlib.import_module("gateway.owner_review_digest")
+
+    def quotes(line, question):
+        return digest._quotes(digest._compared(line), digest._compared(question))
+
+    # Each text joins the word that the other splits, so one pair of word lists meets and no other. Here line list 2
+    # [we, rebook, the, follow, up] holds four consecutive words of question list 1 [do, we, rebook, the, follow, up].
+    assert quotes("We re-book the follow up.", "Do we rebook the follow-up?")
+    # Here the same two lists are line list 1 and question list 2.
+    assert quotes("We rebook the follow-up.", "Do we re-book the follow up?")
+    # A question list shorter than QUOTE_WORDS words is quoted only whole: [whats, next], not [next] alone.
+    assert digest.QUOTE_WORDS == 4
+    assert quotes("Meeting Plan: Whats next?", "What's next?")
+    assert not quotes("Meeting Plan: next week", "What's next?")
+    # An empty question list would hold a run of every line.
+    assert not quotes("Meeting Plan: The room is booked.", "") and not quotes("Meeting Plan: The room is booked.", "?")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("question,quote", [
+    ("What's next?", "Whats next?"),
+    ("Do we re-book the room?", "Do we rebook the room?"),
+    ("Is the follow-up booked?", "Is the followup booked?"),
+], ids=["apostrophe", "hyphen-rebook", "hyphen-followup"])
+@pytest.mark.parametrize("announced", [False, True], ids=["untold", "already-told"])
+@pytest.mark.parametrize("source", ["headline", "portfolio"])
+async def test_the_registered_watcher_never_sends_a_live_question_quoted_without_its_inner_punctuation(
+    root, ready, monkeypatch, question, quote, announced, source,
+):
+    from gateway import owner_heads_up
+
+    # The policy admits the question and the quote, so only the digest's own guard can keep the quote out.
+    assert check_owner_text(question, "planner_prose") == question
+    assert check_owner_text(quote, "planner_prose") == quote
+    _waiting(ready, title="Choose the next step", reason=question)
+    adapter = Adapter()
+    runner, watcher = _registered_watcher(monkeypatch, adapter)
+    if announced:
+        assert await owner_heads_up.tick(runner) == 1
+        adapter.sent.clear()
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        if source == "headline":
+            registry.execute("UPDATE project_review_briefs SET headline=?", (quote,))
+            registry.execute("UPDATE portfolio_review_briefs SET priorities='[]'")
+        else:
+            registry.execute("UPDATE project_review_briefs SET quiet=1")
+            registry.execute("UPDATE portfolio_review_briefs SET priorities=?",
+                             (json.dumps(["Meeting Plan: " + quote]),))
+        registry.commit()
+    await asyncio.wait_for(watcher(interval=0), 15)
+    assert all(quote not in text for _chat, text in adapter.sent)
+    if announced:
+        # The quote was the only news, and a digest with nothing to report is not sent.
+        assert adapter.sent == []
+    else:
+        assert adapter.sent == [(HOME_CHAT, "\n".join(
+            ["Your daily project review (2026-11-10)", NOTES_LINE, "Meeting Plan: 1 answer waiting on Decisions"]))]
 
 
 @pytest.mark.asyncio
@@ -334,6 +435,70 @@ async def test_gateway_start_registers_the_digest_and_its_real_loop_retries_a_re
     await asyncio.wait_for(spawned["owner_review_digest_watcher"](interval=0), 15)
     assert len(adapter.sent) == 2 and all(chat == HOME_CHAT for chat, _text in adapter.sent)
     assert sends == [0, 300]  # the retry waits five minutes of one-minute passes
+
+
+@pytest.mark.asyncio
+async def test_the_registered_watcher_sends_one_digest_and_no_second_one_after_a_reload(root, ready, monkeypatch):
+    adapter = Adapter()
+    runner, watcher = _registered_watcher(monkeypatch, adapter)
+    await asyncio.wait_for(watcher(interval=0), 15)
+    assert len(adapter.sent) == 1 and "The room is booked." in adapter.sent[0][1]
+    importlib.reload(importlib.import_module("gateway.owner_review_digest"))
+    runner._running = True
+    await asyncio.wait_for(watcher(interval=0), 15)
+    assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_send_cancelled_in_the_registered_watcher_stays_sending_and_is_never_replayed(root, ready, monkeypatch):
+    entered = asyncio.Event()
+
+    class Held(Adapter):
+        async def send(self, chat, text):
+            self.sent.append((chat, text))
+            entered.set()
+            await asyncio.Future()  # the transport never answers
+
+    adapter = Held()
+    runner, watcher = _registered_watcher(monkeypatch, adapter)
+    task = asyncio.create_task(watcher(interval=0))
+    await asyncio.wait_for(entered.wait(), 15)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    record = json.loads((root / "owner_review_digest.json").read_text())
+    assert record["told"]["2026-11-10"]["state"] == "sending"
+    importlib.reload(importlib.import_module("gateway.owner_review_digest"))
+    runner._running = True
+    await asyncio.wait_for(watcher(interval=0), 15)
+    assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_two_registered_watchers_in_one_process_share_the_delivery_lock(root, ready, monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Held(Adapter):
+        async def send(self, chat, text):
+            self.sent.append((chat, text))
+            entered.set()
+            await release.wait()
+            return SimpleNamespace(success=True)
+
+    digest = importlib.import_module("gateway.owner_review_digest")
+    acquire, acquired = digest._try_acquire_file_lock, []
+    monkeypatch.setattr(digest, "_try_acquire_file_lock",
+                        lambda handle: acquired.append(acquire(handle)) or acquired[-1])
+    adapter = Held()
+    _first, watcher1 = _registered_watcher(monkeypatch, adapter)
+    _second, watcher2 = _registered_watcher(monkeypatch, adapter)
+    task = asyncio.create_task(watcher1(interval=0))
+    await asyncio.wait_for(entered.wait(), 15)
+    await asyncio.wait_for(watcher2(interval=0), 15)
+    release.set()
+    await asyncio.wait_for(task, 15)
+    # The second watcher stopped at the lock, before it could read the first one's "sending" record.
+    assert len(adapter.sent) == 1 and acquired == [True, False]
 
 
 @pytest.mark.asyncio
