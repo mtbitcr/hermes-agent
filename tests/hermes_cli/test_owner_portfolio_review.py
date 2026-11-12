@@ -407,10 +407,11 @@ def test_a_published_portfolio_recovers_its_missing_budget_record_once(root):
         assert board.execute("SELECT COUNT(*) FROM tasks WHERE created_by='project-review'").fetchone()[0] == 1
 
 
-def test_a_saved_portfolio_survives_an_archive_failure_without_another_revision(root):
+@pytest.mark.parametrize("cap", [1, 2])
+def test_a_saved_portfolio_survives_an_archive_failure_without_another_revision(root, cap):
     project = _quiet_project(root)
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
-        "enabled": True, "allowlist": [project.id], "portfolio": True,
+        "enabled": True, "allowlist": [project.id], "portfolio": True, "portfolio_cap": cap,
     }}))
     assert review.review_tick(NOW) == 1
     path = kanban_db.kanban_db_path(board="project-summaries")
@@ -432,6 +433,7 @@ def test_a_saved_portfolio_survives_an_archive_failure_without_another_revision(
         assert kanban_db.get_task(board, task_id).status == "done"
         with kanban_db.write_txn(board):
             board.execute("DROP TRIGGER hold_portfolio_archive")
+    # The next tick archives the stored task; a spare slot (cap 2) starts no other task for the stored day.
     assert review.review_tick(NOW + 2) == 0
     with projects_db.connect_closing(root / "projects.db") as registry:
         assert projects_db.get_portfolio_review_brief(registry, "2026-11-09")["revision"] == 1

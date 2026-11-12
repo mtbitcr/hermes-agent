@@ -187,6 +187,9 @@ def _portfolio_tick(registry, settings, now, *, room):
     day = review.review_date(now, settings.review_hour)
     if day is None:
         return 0
+    # A stored brief settles its day: spare slots of the cap retry only a day without an accepted result.
+    if projects_db.get_portfolio_review_brief(registry, day) is not None:
+        return 0
     key = f"project-review:portfolio:{day}:0"
     if room < 1 or review.budget(registry, day)[1] >= settings.portfolio_cap:
         return 0
