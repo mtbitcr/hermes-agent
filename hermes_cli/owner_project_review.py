@@ -806,6 +806,7 @@ class ReviewSettings:
     allowlist: tuple[str, ...] = ()
     closure: bool = False
     digest: bool = False
+    portfolio: bool = False
     review_hour: int = 6
     daily_cap: int = 20
     portfolio_cap: int = 1
@@ -854,6 +855,7 @@ def read_settings() -> ReviewSettings:
         allowlist=_names(section.get("allowlist")),
         closure=_flag(section.get("closure")),
         digest=_flag(section.get("digest")),
+        portfolio=_flag(section.get("portfolio")),
         review_hour=_whole(section.get("review_hour"), defaults.review_hour, 0, 23),
         daily_cap=_whole(section.get("daily_cap"), defaults.daily_cap, 0),
         portfolio_cap=_whole(section.get("portfolio_cap"), defaults.portfolio_cap, 0),
@@ -1032,15 +1034,18 @@ def budget(registry: sqlite3.Connection, review_day: str) -> tuple[int, int]:
 
 
 def _spend(registry: sqlite3.Connection, review_day: str, column: str, cap: Optional[int], now: int) -> bool:
-    """Count one task of ``column`` on ``review_day`` unless ``cap`` are counted. Joins the caller's transaction."""
+    """Count one task of ``column`` on ``review_day`` unless ``cap`` are counted. Joins the caller's transaction.
+
+    The row keeps the time of the day's first counted task: the portfolio's two-hour wait runs from it.
+    """
     with write_txn(registry):
         registry.execute(
             "INSERT OR IGNORE INTO review_budget (review_date, updated_at) VALUES (?, ?)", (review_day, now)
         )
         return registry.execute(
-            f"UPDATE review_budget SET {column} = {column} + 1, updated_at = ? "
+            f"UPDATE review_budget SET {column} = {column} + 1 "
             f"WHERE review_date = ? AND (? IS NULL OR {column} < ?)",
-            (now, review_day, cap, cap),
+            (review_day, cap, cap),
         ).rowcount == 1
 
 
@@ -1809,4 +1814,9 @@ def review_tick(now: Optional[int] = None) -> int:
         return 0
     with projects_db.connect_closing(registry_path) as registry:
         _harvest(registry, settings, now)
-        return _request(registry, settings, now)
+        created = _request(registry, settings, now)
+        if settings.portfolio:
+            from hermes_cli.owner_portfolio_review import portfolio_tick
+
+            created += portfolio_tick(registry, settings, now, room=summary.MAX_NEW_PER_TICK - created)
+        return created

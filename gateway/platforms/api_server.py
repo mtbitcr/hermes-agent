@@ -13082,59 +13082,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self, request: "web.Request",
     ) -> "web.Response":
         """GET receipt-backed owner Projects without opening a mutation path."""
-        auth_err = self._check_auth(request)
-        if auth_err:
-            return auth_err
+        from gateway.platforms.api_server_owner_projects import list_owner_projects
 
-        try:
-            from gateway.run import _load_gateway_config
-
-            if not _owner_workspace_toolset_enabled(_load_gateway_config()):
-                return web.json_response(
-                    _openai_error(
-                        "Owner workspace is not enabled for this profile",
-                        code="owner_workspace_not_enabled",
-                    ),
-                    status=404,
-                )
-            from hermes_cli.owner_workspace import (
-                OWNER_PROJECT_BOARD_COUNTS_CAPABILITY,
-                OWNER_PROJECT_LAST_CHANGE_CAPABILITY,
-                OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY,
-                OWNER_PROJECT_REMOVAL_STATE_CAPABILITY,
-                list_committed_projects,
-                resolve_owner_context,
-            )
-
-            projects = list_committed_projects(
-                resolve_owner_context(),
-                lifecycle_revision=_owner_workspace_capability_requested(
-                    request, OWNER_PROJECT_LIFECYCLE_REVISION_CAPABILITY,
-                ),
-                removal_state=_owner_workspace_capability_requested(
-                    request, OWNER_PROJECT_REMOVAL_STATE_CAPABILITY,
-                ),
-                board_counts=_owner_workspace_capability_requested(
-                    request, OWNER_PROJECT_BOARD_COUNTS_CAPABILITY,
-                ),
-                project_last_change=_owner_workspace_capability_requested(
-                    request, OWNER_PROJECT_LAST_CHANGE_CAPABILITY,
-                ),
-            )
-        except Exception:
-            logger.exception("[api_server] owner-workspace Project projection failed")
-            return web.json_response(
-                _openai_error(
-                    "Owner workspace Project projection is unavailable",
-                    code="owner_workspace_unavailable",
-                ),
-                status=500,
-            )
-
-        return web.json_response({
-            "object": "hermes.owner_workspace.project_list",
-            "data": projects,
-        })
+        return await list_owner_projects(self, request)
     async def _handle_owner_workspace_project_snapshot(
         self, request: "web.Request",
     ) -> "web.Response":

@@ -212,6 +212,17 @@ CREATE TABLE IF NOT EXISTS review_budget (
     updated_at        INTEGER NOT NULL
 );
 
+-- The portfolio stores advice only. Existing Project summaries and briefs keep their formats.
+CREATE TABLE IF NOT EXISTS portfolio_review_briefs (
+    review_date     TEXT PRIMARY KEY,
+    conflicts       TEXT NOT NULL,
+    priorities      TEXT NOT NULL,
+    shared_blockers TEXT NOT NULL,
+    project_scope   TEXT NOT NULL DEFAULT '[]',
+    written_at      INTEGER NOT NULL,
+    revision        INTEGER NOT NULL
+);
+
 -- The Project one owner conversation belongs to, from the owner-authorised
 -- X-Raphael-Project-Id header the gateway checks. Written once and never
 -- overwritten; a conversation without a row is unlinked. Additive.
@@ -388,6 +399,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "project_review_briefs" in tables:
         for name, kind in (("source_task_id", "TEXT"), ("source_run_id", "INTEGER"), ("source_digest", "TEXT")):
             _add_column_if_missing(conn, "project_review_briefs", name, f"{name} {kind}")
+    if "portfolio_review_briefs" in tables:
+        _add_column_if_missing(conn, "portfolio_review_briefs", "project_scope", "project_scope TEXT NOT NULL DEFAULT '[]'")
     if "project_removal_operations" in tables:
         rem_cols = {
             row["name"]
@@ -981,6 +994,39 @@ def get_project_review_brief(conn: sqlite3.Connection, project_id: str) -> Optio
     result = dict(zip(fields, row))
     result["ready_work"] = json.loads(result["ready_work"])
     result["quiet"] = bool(result["quiet"])
+    return result
+
+
+def write_portfolio_review_brief(conn: sqlite3.Connection, review_date: str, *, conflicts: list,
+                                priorities: list, shared_blockers: list, written_at: int,
+                                project_scope: Iterable[str] = ()) -> None:
+    """Store validated advice once. A repeated harvest preserves the accepted daily result."""
+    with write_txn(conn):
+        conn.execute(
+            "INSERT OR IGNORE INTO portfolio_review_briefs "
+            "(review_date,conflicts,priorities,shared_blockers,project_scope,written_at,revision) VALUES (?,?,?,?,?,?,1)",
+            (review_date, *(json.dumps(items, ensure_ascii=False, allow_nan=False)
+                            for items in (conflicts, priorities, shared_blockers)),
+             json.dumps(list(project_scope), allow_nan=False), written_at),
+        )
+
+
+def get_portfolio_review_brief(conn: sqlite3.Connection, review_date: Optional[str] = None) -> Optional[dict]:
+    """Read daily advice without creating the additive table on an older store."""
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='portfolio_review_briefs'").fetchone():
+        return None
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(portfolio_review_briefs)")}
+    # Older advice has no recorded scope. It cannot authorize the optional owner projection.
+    scope = "project_scope" if "project_scope" in columns else "'[]'"
+    row = conn.execute(
+        f"SELECT review_date,conflicts,priorities,shared_blockers,written_at,revision,{scope} AS project_scope FROM portfolio_review_briefs "
+        "WHERE (? IS NULL OR review_date=?) ORDER BY review_date DESC LIMIT 1", (review_date, review_date),
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    for key in ("conflicts", "priorities", "shared_blockers", "project_scope"):
+        result[key] = json.loads(result[key])
     return result
 
 
