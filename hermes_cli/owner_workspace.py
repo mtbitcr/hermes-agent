@@ -2752,6 +2752,8 @@ OWNER_PROJECT_SUMMARY_CAPABILITY = "project_summary"
 OWNER_PROJECT_REVIEW_BRIEF_CAPABILITY = "project_review_brief"
 # Closed suggestions have their own optional Decisions list.
 OWNER_CLOSED_SUGGESTIONS_CAPABILITY = "closed_suggestions_v1"
+# Planning clients request accepted advice separately from the visible brief.
+OWNER_PROJECT_REVIEW_ADVICE_CAPABILITY = "project_review_advice_v1"
 # A separately negotiated contour for the files a held card still needs from
 # the owner (card C2 of the named inputs plan). Without it every Decision keeps
 # today's keys exactly; only a reader naming it gets ``missing_inputs``.
@@ -3525,6 +3527,7 @@ def read_project_snapshot(
     project_summary: bool = False,
     work_item: bool = False,
     project_review_brief: bool = False,
+    project_review_advice: bool = False,
 ) -> dict:
     """Return one bounded read-only surface for an exact receipt-owned Project.
 
@@ -3584,6 +3587,9 @@ def read_project_snapshot(
     ``project_review_brief`` adds ``raphael_review``: the latest daily brief
     and the last fourteen review days, or None while none is stored; see
     ``OWNER_PROJECT_REVIEW_BRIEF_CAPABILITY``.
+
+    ``project_review_advice`` adds the checked plan advice from an accepted review.
+    It grants no approval and leaves the stored data unchanged.
     """
     try:
         project_slug = projects_db.normalize_slug(project_slug) or ""
@@ -3927,6 +3933,9 @@ def read_project_snapshot(
         from hermes_cli.owner_project_review_view import project_review_view
 
         result["raphael_review"] = project_review_view(project_id)
+    if project_review_advice:
+        from hermes_cli.owner_project_review_view import project_review_advice_view
+        result["raphael_review_advice"] = project_review_advice_view(project_id)
     return result
 
 
@@ -6716,6 +6725,12 @@ def commit_project_plan(
             _activate_committed_owner_work(committed)
             return committed
         project, board_slug = _resolve_existing_project_board(pconn, project_id)
+        # Preserve the approved payload and its replay identity. A proven review changes only the audit origin.
+        recorded_trigger = trigger
+        if trigger == "owner_request":
+            from hermes_cli.owner_project_review_origin import confirmed_plan_trigger
+
+            recorded_trigger = confirmed_plan_trigger(project_id, digest)
         kconn = kanban_db.connect(board=board_slug)
         try:
             # Before the scope check, so a boundary inherited from a superseded
@@ -6854,7 +6869,7 @@ def commit_project_plan(
                             profile=ctx.profile,
                             idempotency_key=idempotency_key,
                             request_digest=digest,
-                            trigger=trigger,
+                            trigger=recorded_trigger,
                             plan_summary=plan_record,
                             current_milestone=current_milestone,
                             later_milestones=normalized_later,

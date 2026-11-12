@@ -120,6 +120,10 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
 7. Propose at most three closures. Each has exactly recommendation_id, card_id, reason, and evidence.
    The reason has at most 300 characters. Evidence must name suggestions:<id> and tasks:<id> from this input.
    The card must deliver the suggestion in this Project. A proposal cannot decide or close the suggestion.
+8. You may add plan_proposal, or leave it out. It is null or an object with exactly request_title, summary,
+   specification, current_milestone, owner_visible_result, later_milestones, and changes.
+   Use the native plan change schema. Each existing task reference must use its input status and event revision.
+   This is advice for the Project chat. It grants no approval and changes no work.
 """
 
 _BRIEF_LIMITS = {"headline": 120, "what_changed": 400, "next_step": 240, "needs_you": 160}
@@ -148,6 +152,8 @@ class ReviewResult:
     proposed_closures: list[dict]
     sources: dict[str, list[dict]]
     cut_note: Optional[str]
+    source_run_id: Optional[int] = None
+    source_digest: Optional[str] = None
 
 
 def _review_texts(value: Any, limits: Mapping[str, int], nullable: str) -> dict[str, Optional[str]]:
@@ -463,7 +469,9 @@ def _review_payload(board: sqlite3.Connection, task_id: str, project_id: str):
     if run is None or run.outcome != "completed" or not isinstance(run.metadata, dict):
         raise ReviewRefused("review_run_invalid")
     value = run.metadata.get("project_review")
-    if not isinstance(value, dict) or set(value) != {"summary", "brief", "classification", "proposed_closures"}:
+    required = {"summary", "brief", "classification", "proposed_closures"}
+    # Plan advice is the one optional key. Every other extra key stays invalid.
+    if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(required | {"plan_proposal"}):
         raise ReviewRefused("review_result_keys_invalid")
     try:
         if len(json.dumps(value, allow_nan=False).encode("utf-8")) > TOTAL_INPUT_CAP_BYTES:
@@ -511,6 +519,21 @@ def parse_review_result(
             plan_changes=plan_changes,
         )
         closures = _review_closures(project_board, project_id, sources, classification, value["proposed_closures"])
+        from hermes_cli.owner_project_review_proposals import proposal_hint
+
+        try:
+            hint = proposal_hint(
+                value.get("plan_proposal"), sources, project_board, registry, project, now=now,
+                limit=_BRIEF_LIMITS["next_step"], max_bytes=TOTAL_INPUT_CAP_BYTES,
+            )
+        except ReviewRefused:
+            raise
+        except ValueError as exc:
+            # The advice's own stable code, not the evidence board's generic one.
+            raise ReviewRefused(str(exc)) from exc
+    # Plan advice reaches the owner only as this plain text. Approval stays with the Project chat.
+    if hint is not None:
+        refreshed["next_action"] = brief["next_step"] = hint
     # The live set is the frozen one, checked above. Count from it the waits and suggestions the total cap left out.
     waiting = len(decisions["waits"])
     suggestion_ids = {item["id"] for item in sources["suggestions"]}
@@ -528,7 +551,11 @@ def parse_review_result(
         pointer = None
     # Only recorded waits and pending suggestions supply a pointer. Worker prose supplies no question authority.
     refreshed["owner_decision"] = brief["needs_you"] = pointer
-    return ReviewResult(refreshed, brief, classification, closures, sources, cut_note)
+    from hermes_cli.owner_project_review_origin import source_digest
+
+    return ReviewResult(refreshed, brief, classification, closures, sources, cut_note,
+                        kanban_db.latest_run(board, task_id).id if hint is not None else None,
+                        source_digest(task.body, value) if hint is not None else None)
 
 
 def _ready_work_rows(board: sqlite3.Connection, project_id: str, task_id: Optional[str] = None):
@@ -765,6 +792,8 @@ def _store_review_result(registry, project_id, task, result, now, closure=False)
             registry, project_id, review_date=window[2], covered_from=None if window[1] == _NEVER_REVIEWED else window[1],
             covered_to=window[2], **result.brief, ready_work=ready_work, cut_note=result.cut_note,
             quiet=False, classification=result.classification, written_at=now,
+            source_task_id=task.id if result.source_run_id is not None else None,
+            source_run_id=result.source_run_id, source_digest=result.source_digest,
         )
     return True
 
@@ -1586,8 +1615,12 @@ def _wait_order(news: _News, review_day: str) -> tuple:
 def _task_body(last_reviewed_date: Optional[str], review_day: str, covered: events.Cursors, frozen: str,
                conversation_cursor: Optional[str] = None, decision_cursor: Optional[str] = None) -> str:
     """The instruction, the days the review covers, and last the line that names the events it covers."""
+    from hermes_cli.owner_project_review_proposals import proposal_schema
+
     return (
         INSTRUCTION
+        + "\nPlan proposal schema: "
+        + json.dumps(proposal_schema(limit=_BRIEF_LIMITS["next_step"]), ensure_ascii=True, separators=(",", ":"))
         + f"\nReview date: {review_day}\n"
         + _window_line(last_reviewed_date, review_day)
         + f"\nLinked conversation cursor: {conversation_cursor or 'none'}"
