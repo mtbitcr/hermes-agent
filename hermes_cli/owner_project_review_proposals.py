@@ -11,8 +11,10 @@ _TEXT_LIMITS = {
 _CHAT_PREFIX = "Ask Raphael in the Project chat: "
 # Two closed lists decide whether advice may reopen the owner's decision on work. A kind on neither is not evidence.
 # The owner's decisions on a work item: an applied plan change, its creation by an approved plan (a creation counts only
-# when that plan's applied record names the item, see _settled), a direct move, an archive and a suggestion decision.
-_DECISION_EVENTS = ("owner_project_plan_change", "created", "owner_move", "archived", "recommendation_decided")
+# when that plan's applied record names the item, see _settled), a direct move, an archive, a suggestion decision and
+# the owner's Undo of a suggestion's closure (an Undo is the owner's decision on a suggestion).
+_DECISION_EVENTS = ("owner_project_plan_change", "created", "owner_move", "archived", "recommendation_decided",
+                    "recommendation_closure_undone")
 # Evidence about the work: a result of work or of a review, a delivery outcome, and a comment that is not the plan's own.
 _EVIDENCE_EVENTS = ("completed", "blocked", "gave_up", "review_requested", "changes_requested", "review_reopened",
                     "delivery_merged", "merged", "released", "commented")
@@ -73,7 +75,7 @@ def _settled(board, task_id, events, *, ended):
 
 def _equivalent_created_work(changes, sources, board, project):
     # The content-link rule of the closures: token-set similarity of at least 0.8.
-    from hermes_cli.owner_project_review import _same_work
+    from hermes_cli.kanban_recommendation_closure import same_review_work
 
     frozen = {item["id"]: item.get("events", []) for item in sources["tasks"]}
     # The input holds the latest event of each suggestion, enough to show an event after its decision. Its kind decides.
@@ -89,7 +91,7 @@ def _equivalent_created_work(changes, sources, board, project):
         if "target" in change:
             excluded.add(change["target"]["task_id"])
         for spec in specs:
-            if any(_same_work(spec["title"], title) for title in proposed_titles):
+            if any(same_review_work(spec["title"], title) for title in proposed_titles):
                 return True
             proposed_titles.append(spec["title"])
             for row in board.execute(
@@ -97,7 +99,7 @@ def _equivalent_created_work(changes, sources, board, project):
                 "AND task_kind IN ('work','recommendation')", (project.id,),
             ):
                 label = row["recommendation_label"] if row["task_kind"] == "recommendation" else row["title"]
-                if row["id"] in excluded or not _same_work(spec["title"], label):
+                if row["id"] in excluded or not same_review_work(spec["title"], label):
                     continue
                 # Live work is a plain duplicate; archived work stays the owner's settled decision.
                 if row["status"] != "archived" or _settled(board, row["id"], frozen.get(row["id"], []), ended=True):

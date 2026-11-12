@@ -554,7 +554,7 @@ def parse_review_result(
     from hermes_cli.owner_project_review_origin import source_digest
 
     return ReviewResult(refreshed, brief, classification, closures, sources, cut_note,
-                        run.id if hint is not None else None,
+                        kanban_db.latest_run(board, task_id).id if hint is not None else None,
                         source_digest(task.body, value) if hint is not None else None)
 
 

@@ -12,6 +12,7 @@ import yaml
 
 from hermes_cli import kanban_db, owner_project_review as review, owner_workspace, projects_db
 from hermes_cli import owner_project_review_record as records, owner_project_summary_events as events
+from hermes_cli.kanban_recommendation_closure import same_review_work
 from tests.hermes_cli.test_owner_project_review_plans import _approved_plan, _logical_state
 from tests.hermes_cli.test_owner_project_review_record import _written_at, root  # noqa: F401
 from tests.hermes_cli.test_owner_workspace import _bootstrap_board, _commit_project_plan, _owner_move, _with_approver, ctx  # noqa: F401
@@ -1049,8 +1050,8 @@ def test_archived_rework_is_not_recreated_from_a_comment_before_the_archive(root
         assert closed > board.execute("SELECT MAX(id) FROM task_events WHERE task_id=?", (rework,)).fetchone()[0]
     new_title = owner_workspace.owner_title(item.title) + (" carefully" if case != "original_title_control" else "")
     # The qualified title is the same work as the archived rework only; the original title is also the parent's.
-    assert review._same_work(new_title, item.title)
-    assert review._same_work(new_title, title) == (case == "original_title_control")
+    assert same_review_work(new_title, item.title)
+    assert same_review_work(new_title, title) == (case == "original_title_control")
     proposal = {"request_title": "Revise the seating work", "summary": "Add the seating work.",
                 "specification": "Arrange the seating work in the visit plan.", "current_milestone": "Prepare the visit.",
                 "owner_visible_result": "The seating plan is ready.", "later_milestones": [],

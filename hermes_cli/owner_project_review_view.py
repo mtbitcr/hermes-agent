@@ -1,10 +1,10 @@
-<<<<<<< b0632132ce9057b8bb427a85c023dc6497e7274b
-"""Read the owner-safe brief after the caller checks Project ownership."""
+"""Read the owner-safe brief and the accepted daily plan advice after the caller checks Project ownership."""
 
 from __future__ import annotations
 
 import contextlib
 import sqlite3
+import time
 
 from hermes_cli import kanban_db, projects_db
 from hermes_cli.owner_text import check_owner_text
@@ -41,15 +41,6 @@ def project_review_view(project_id: str):
         {"review_date": row["review_date"], "headline": check_owner_text(row["headline"], "planner_prose")}
         for row in history
     ]}
-=======
-"""Read the accepted daily plan advice of an owned Project for its snapshot."""
-
-from __future__ import annotations
-
-import sqlite3
-import time
-
-from hermes_cli.owner_text import check_owner_text
 
 
 def _readable(proposal: dict) -> bool:
@@ -89,4 +80,3 @@ def project_review_advice_view(project_id: str):
         return {"review_date": day, "proposal": records._redacted(proposal)}
     except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, OwnerWorkspaceError):
         return None
->>>>>>> ba8db44f84bce07e889c63117718e2ff9f0b79c8
