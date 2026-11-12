@@ -38325,16 +38325,16 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
          shown; older attempts collapsed into a one-line summary).
          Each attempt's ``summary`` / ``error`` / ``metadata`` capped at
          ``_CTX_MAX_FIELD_BYTES`` each.
-      4. Structured handoff results of every done parent task. Prefers
-         ``run.summary`` / ``run.metadata`` when the parent was executed
-         via a run; falls back to ``task.result`` for older data. Same
-         per-field cap. Each parent's attachments are listed; text ones
-         (``text/*``, ``application/json``) are inlined up to
-         ``_CTX_MAX_ATTACHMENT_BYTES`` each and
+      4. Structured handoff results of every done parent task, none for a
+         daily-review task. Prefers ``run.summary`` / ``run.metadata`` when
+         the parent was executed via a run; falls back to ``task.result``
+         for older data. Same per-field cap. Each parent's attachments are
+         listed; text ones (``text/*``, ``application/json``) are inlined
+         up to ``_CTX_MAX_ATTACHMENT_BYTES`` each and
          ``_CTX_MAX_PARENT_ATTACHMENTS_BYTES`` in total, so a worker
          without file tools still reads the parent's deliverables.
       5. Cross-task role history for the assignee (most recent 5
-         completed runs on other tasks).
+         completed runs on other tasks); none for a daily-review task.
       6. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
          collapsed).
 
@@ -38498,8 +38498,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         (task_id,),
     ).fetchall()
     parent_ids = [r["parent_id"] for r in parent_rows]
+    # One Project's review must not read another task's text: own card only.
+    review_task = task.created_by == REVIEW_TASK_CREATOR
 
-    if parent_ids:
+    if parent_ids and not review_task:
         # Resolve finished parents first (in the ``ORDER BY parent_id`` order
         # the SQL above returns) so the cap can pick the most recently
         # completed ones without changing the section's order.
@@ -38623,7 +38625,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # the user to wire anything into SOUL.md / MEMORY.md. Bounded to the
     # most recent 5 completed runs, excluding this task so the retry
     # section above isn't duplicated. Safe on assignee=None (skipped).
-    if task.assignee:
+    if task.assignee and not review_task:
         role_rows = conn.execute(
             "SELECT t.id, t.title, r.summary, r.ended_at "
             "FROM task_runs r JOIN tasks t ON r.task_id = t.id "

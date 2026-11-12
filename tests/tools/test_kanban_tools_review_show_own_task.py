@@ -2,6 +2,8 @@
 
 The summary board holds every project's review tasks and frozen records, so a
 review worker must not read another card, on its board or on another board.
+Its own card's reply must not carry another task's text either: not the title,
+summary or metadata of another Project's finished review in its worker context.
 Real board DB files under ``tmp_path``, ``HERMES_HOME`` isolated, calls through
 the registered handler under the env the dispatcher injects.
 """
@@ -19,6 +21,10 @@ import pytest
 REVIEW_BOARD = "daily-project-review"
 OTHER_BOARD = "alpha-board"
 SECRET = "alpha confidential frozen record"
+# What another Project's finished review leaves in the store: its run summary and run metadata, besides its title and comment.
+PEER_SUMMARY = "Beta only private planning result"
+PEER_HEADLINE = "Beta work is ready."
+PEER_TEXT = ("review of beta", "note on review of beta", PEER_SUMMARY, PEER_HEADLINE)
 
 
 @pytest.fixture
@@ -88,6 +94,31 @@ def _all_rows(root: Path) -> dict:
                 rows[(str(db), t)] = sorted(repr(r) for r in conn.execute(f'SELECT * FROM "{t}"'))
     assert rows
     return rows
+
+
+def _count_rows(root: Path, table: str, needle: str) -> int:
+    """Rows of ``table``, over every board file under the root, that hold ``needle``: counted straight from the sqlite files."""
+    return sum(needle in row for (_db, t), rows in _all_rows(root).items() if t == table for row in rows)
+
+
+def _complete_peer(kb, ids) -> None:
+    """The review of another Project is finished by the same assignee: its run holds the text a leak would carry."""
+    with kb.connect_closing(board=REVIEW_BOARD) as conn:
+        assert kb.claim_task(conn, ids["review_peer"])
+        assert kb.complete_task(
+            conn, ids["review_peer"], summary=PEER_SUMMARY,
+            metadata={"project_review": {"brief": {"headline": PEER_HEADLINE}}},
+        )
+
+
+def _assert_own_card_only(shown: dict, ids: dict, own: str, title: str, body: str) -> None:
+    assert shown["task"]["id"] == own and shown["task"]["title"] == title, shown
+    assert shown["task"]["status"] == "running" and shown["task"]["body"] == body, shown
+    assert shown["worker_context"].startswith(f"# Kanban task {own}: {title}\n"), shown
+    assert f"## Body\n{body}\n" in shown["worker_context"], shown
+    reply = json.dumps(shown)
+    for hidden in (*PEER_TEXT, *(tid for tid in ids.values() if tid != own)):
+        assert hidden not in reply, shown
 
 
 PINNED = pytest.mark.parametrize("pin_db", [True, False], ids=["db-pinned", "db-unpinned"])
@@ -228,3 +259,66 @@ def test_call_without_a_worker_task_and_a_null_board_behaves_as_before(world, mo
     monkeypatch.setenv("HERMES_KANBAN_BOARD", REVIEW_BOARD)
     assert _show(task_id=ids["review"], board=None)["task"]["id"] == ids["review"]
     assert "task_id is required" in _show(board=None)["error"]
+
+
+@PINNED
+@pytest.mark.parametrize("portfolio", [False, True], ids=["project-review", "portfolio-review"])
+def test_review_task_show_holds_its_own_card_and_no_other_task_text(world, monkeypatch, pin_db, portfolio):
+    kb, ids = world
+    _complete_peer(kb, ids)
+    own, title, body = ids["review"], "review of alpha", SECRET
+    with kb.connect_closing(board=REVIEW_BOARD) as conn:
+        if portfolio:
+            title, body = "portfolio of alpha", "the portfolio input"
+            own = kb.create_task(
+                conn, title=title, body=body, assignee="raphael", created_by=kb.REVIEW_TASK_CREATOR,
+                idempotency_key="project-review:portfolio:2026-11-09:0", board=REVIEW_BOARD,
+            )
+        assert kb.claim_task(conn, own)
+    _become_worker(monkeypatch, kb, own, pin_db=pin_db)
+    _assert_own_card_only(_show(), ids, own, title, body)
+
+
+def test_dispatcher_env_in_a_profile_home_keeps_the_review_context_on_its_own_card(world, monkeypatch, tmp_path):
+    """The env the dispatcher injects: the board's DB path and name pinned, the worker homed in its profile under the root."""
+    kb, ids = world
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "raphael"
+    profile.mkdir(parents=True)
+    _complete_peer(kb, ids)
+    with kb.connect_closing(board=REVIEW_BOARD) as conn:
+        assert kb.claim_task(conn, ids["review"])
+    # What a leak would carry is really in the stores: the peer's row and its finished run, counted from the sqlite files.
+    assert _count_rows(root, "tasks", ids["review_peer"]) == 1
+    assert _count_rows(root, "task_runs", PEER_SUMMARY) == 1
+    assert _count_rows(root, "task_runs", PEER_HEADLINE) == 1
+
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    assert kb.kanban_home().resolve() == root.resolve()
+
+    # An ordinary worker: its context keeps the recent-work block (the other Project's review among it) and it reads
+    # another card as before. With the path pinned, kb.connect ignores the board argument, as it always did, so a
+    # card of another board (counted in its own file) is not in the store this worker is pinned to.
+    _become_worker(monkeypatch, kb, ids["plain"])
+    ordinary = _show()
+    assert ordinary["task"]["id"] == ids["plain"], ordinary
+    assert f"- {ids['review_peer']} — review of beta (" in ordinary["worker_context"], ordinary
+    assert PEER_SUMMARY in ordinary["worker_context"], ordinary
+    peer = _show(task_id=ids["review_peer"])
+    assert peer["task"]["title"] == "review of beta" and PEER_SUMMARY in json.dumps(peer), peer
+    assert _count_rows(root, "tasks", ids["other_board"]) == 1
+    assert _show(task_id=ids["other_board"], board=OTHER_BOARD)["error"] == f"task {ids['other_board']} not found"
+
+    # Without the path pin the same profile home still reaches every other board under the root; the review worker
+    # is refused it.
+    monkeypatch.delenv("HERMES_KANBAN_DB")
+    assert _show(task_id=ids["other_board"], board=OTHER_BOARD)["task"]["title"] == "alpha work card"
+    _become_worker(monkeypatch, kb, ids["review"], pin_db=False)
+    _assert_refused(_show(task_id=ids["other_board"], board=OTHER_BOARD), ids["other_board"], "alpha work card")
+
+    # The review worker under the dispatcher's env: still refused every other card, and its own card holds no
+    # other task's text.
+    _become_worker(monkeypatch, kb, ids["review"])
+    _assert_refused(_show(task_id=ids["review_peer"]), ids["review_peer"], *PEER_TEXT)
+    _assert_refused(_show(task_id=ids["other_board"], board=OTHER_BOARD), ids["other_board"], "alpha work card")
+    _assert_own_card_only(_show(), ids, ids["review"], "review of alpha", SECRET)
