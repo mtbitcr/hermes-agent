@@ -577,6 +577,79 @@ def committed_owner_receipt_for_proposal(
     return applied
 
 
+def committed_owner_receipts_for_proposals(
+    items: list[tuple[str, str | None, str | None]],
+) -> set[int]:
+    """Which of several proposals' changes are applied, in ONE read.
+
+    Each item is ``(operation, idempotency_key, authority_digest)`` and is
+    answered exactly as :func:`committed_owner_receipt_for_proposal` answers
+    it: the same store opened ``mode=ro``, the same matching receipts, the
+    same rule for refusals and successes. Returns the indexes of the applied
+    items. One connection and one query serve every item, so a history with
+    many earlier proposals costs one read, not one per proposal. A store or a
+    matching receipt that cannot be read raises
+    :class:`OwnerReceiptUnreadable` for the whole read, as its sibling does.
+    """
+    operations = sorted({item[0] for item in items if item[0] is not None})
+    keys = sorted({item[1] for item in items if item[1] is not None})
+    digests = sorted({item[2] for item in items if item[2] is not None})
+    try:
+        with _owner_executor_scope():
+            path = projects_db.projects_db_path()
+        path.stat()
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    except FileNotFoundError:
+        return set()
+    except (OSError, sqlite3.Error) as exc:
+        raise OwnerReceiptUnreadable(
+            "the owner receipts store could not be read"
+        ) from exc
+    try:
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'owner_workspace_receipts'"
+        ).fetchone() is None:
+            return set()
+        rows = conn.execute(
+            "SELECT operation, idempotency_key, authority_digest, result_json "
+            "FROM owner_workspace_receipts WHERE status = 'committed' "
+            f"AND operation IN ({', '.join('?' * len(operations))}) "
+            f"AND (idempotency_key IN ({', '.join('?' * len(keys))}) "
+            f"OR authority_digest IN ({', '.join('?' * len(digests))}))",
+            (*operations, *keys, *digests),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise OwnerReceiptUnreadable(
+            "the owner receipts store could not be read"
+        ) from exc
+    finally:
+        conn.close()
+    applied: set[int] = set()
+    for operation, key, digest, result_json in rows:
+        # Only the receipts the single check would read for an item count.
+        matched = {
+            index
+            for index, (item_operation, item_key, item_digest) in enumerate(items)
+            if item_operation == operation
+            and (
+                (item_key is not None and item_key == key)
+                or (item_digest is not None and item_digest == digest)
+            )
+        }
+        if not matched:
+            continue
+        try:
+            result = json.loads(result_json)
+        except (TypeError, ValueError):
+            result = None
+        if isinstance(result, dict) and result.get("ok") is False:
+            continue
+        decode_committed_owner_receipt(result_json, operation)
+        applied |= matched
+    return applied
+
+
 def _is_retryable_confirmation_timeout(row: sqlite3.Row) -> bool:
     """Return whether a terminal receipt records silence, not an owner denial."""
     if row["status"] != "denied" or not row["result_json"]:
