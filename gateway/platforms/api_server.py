@@ -2855,8 +2855,8 @@ class ResponseStore:
             and _OWNER_RUN_RE.fullmatch(row[4]) is not None
         ):
             released_run_id = row[4]
-        # A released claim whose change the native receipts store holds as
-        # committed was applied: a restart fell between that commit and the
+        # A released claim whose change the native receipts store records as a
+        # success was applied: a restart fell between that commit and the
         # completion recorded here. Read only; nothing repairs the row.
         if (
             proposal_response_id is not None
@@ -4160,10 +4160,12 @@ class ResponseStore:
         older proposal behind the standing record, which no acknowledgement can
         undo. The refusal is decided before either branch writes anything.
 
-        Both are refused too when the native receipts store already holds the
-        proposal's change as committed; that ``"authority_conflict"`` carries
-        the stable refusal code ``owner_proposal_already_applied`` in place of
-        a run id. A store that cannot be read raises ``OwnerReceiptUnreadable``.
+        An owner request is refused too when the native receipts store already
+        holds the proposal's change as applied: on a kept row before its
+        fingerprint or retry is compared, on a fresh claim before it is bound.
+        That ``"authority_conflict"`` carries the stable refusal code
+        ``owner_proposal_already_applied`` in place of a run id. A store that
+        cannot be read raises ``OwnerReceiptUnreadable``.
         """
         from hermes_cli.owner_workspace import committed_owner_receipt_for_proposal
 
@@ -4181,6 +4183,13 @@ class ResponseStore:
                     if owner is not None else profile
                 )
                 if existing is not None:
+                    if owner is not None and committed_owner_receipt_for_proposal(
+                        operation=owner["operation"],
+                        idempotency_key=owner.get("idempotency_key"),
+                        authority_digest=None,
+                    ):
+                        self._conn.rollback()
+                        return "authority_conflict", "owner_proposal_already_applied"
                     if existing[0] != fingerprint:
                         self._conn.rollback()
                         return "conflict", None
@@ -4214,13 +4223,6 @@ class ResponseStore:
                             ):
                                 self._conn.rollback()
                                 return "authority_conflict", None
-                            if committed_owner_receipt_for_proposal(
-                                operation=owner["operation"],
-                                idempotency_key=owner.get("idempotency_key"),
-                                authority_digest=None,
-                            ):
-                                self._conn.rollback()
-                                return "authority_conflict", "owner_proposal_already_applied"
                             created_at = time.time()
                             queued_json = self._queued_run_status_json(
                                 run_id, created_at,
@@ -14467,33 +14469,46 @@ class APIServerAdapter(BasePlatformAdapter):
                         retry_status.get("status") == "completed"
                         and retry_status.get("owner_mutation_committed") is True
                     )
-                    # A released claim can no longer record a completion; the
-                    # reservation below decides whether its change committed.
-                    and not self._response_store.owner_claim_is_released(
-                        owner_proposal_authority["proposal_profile"],
-                        owner_proposal_authority["conversation"],
-                        owner_proposal_authority["response_id"],
-                        owner_proposal_authority["claim_id"],
-                        retry_run_id,
-                    )
                 ):
+                    from hermes_cli.owner_workspace import (
+                        OwnerReceiptUnreadable,
+                        committed_owner_receipt_for_proposal,
+                    )
+
                     try:
-                        retry_status = self._recover_native_owner_completion(
-                            profile=request_owner_profile,
-                            session_scope=retry_scope,
-                            run_id=retry_run_id,
-                            authority=owner_proposal_authority,
-                            owner={
-                                "proposal_profile": owner_proposal_authority[
-                                    "proposal_profile"
-                                ],
-                                "conversation": owner_proposal_authority["conversation"],
-                                "response_id": owner_proposal_authority["response_id"],
-                                "claim_id": owner_proposal_authority["claim_id"],
-                                "operation": owner_proposal_authority["operation"],
-                            },
-                        ) or retry_status
-                    except _OwnerNativeReceiptUnreadable:
+                        # A released claim can no longer record a completion, so
+                        # one whose change was applied is refused below. Any other
+                        # outcome, a committed refusal too, is read here.
+                        if not (
+                            self._response_store.owner_claim_is_released(
+                                owner_proposal_authority["proposal_profile"],
+                                owner_proposal_authority["conversation"],
+                                owner_proposal_authority["response_id"],
+                                owner_proposal_authority["claim_id"],
+                                retry_run_id,
+                            )
+                            and committed_owner_receipt_for_proposal(
+                                operation=owner_proposal_authority["operation"],
+                                idempotency_key=owner_proposal_authority["idempotency_key"],
+                                authority_digest=None,
+                            )
+                        ):
+                            retry_status = self._recover_native_owner_completion(
+                                profile=request_owner_profile,
+                                session_scope=retry_scope,
+                                run_id=retry_run_id,
+                                authority=owner_proposal_authority,
+                                owner={
+                                    "proposal_profile": owner_proposal_authority[
+                                        "proposal_profile"
+                                    ],
+                                    "conversation": owner_proposal_authority["conversation"],
+                                    "response_id": owner_proposal_authority["response_id"],
+                                    "claim_id": owner_proposal_authority["claim_id"],
+                                    "operation": owner_proposal_authority["operation"],
+                                },
+                            ) or retry_status
+                    except (_OwnerNativeReceiptUnreadable, OwnerReceiptUnreadable):
                         # Whether the first attempt's change committed cannot be
                         # decided, so this retry may neither replay it as
                         # completed nor start a second one.
@@ -14728,6 +14743,38 @@ class APIServerAdapter(BasePlatformAdapter):
                 idempotency_fingerprint,
             )
             if state != "missing":
+                if owner_proposal_authority is not None:
+                    from hermes_cli.owner_workspace import (
+                        OwnerReceiptUnreadable,
+                        committed_owner_receipt_for_proposal,
+                    )
+
+                    # Before this kept row's own exits: a proposal whose change
+                    # the receipts store holds as applied gets the stable refusal
+                    # whatever this request's fingerprint, and nothing is written.
+                    try:
+                        applied = committed_owner_receipt_for_proposal(
+                            operation=owner_proposal_authority["operation"],
+                            idempotency_key=owner_proposal_authority["idempotency_key"],
+                            authority_digest=None,
+                        )
+                    except OwnerReceiptUnreadable:
+                        return web.json_response(
+                            _openai_error(
+                                "The earlier attempt's outcome could not be confirmed",
+                                err_type="server_error",
+                                code="owner_run_outcome_unconfirmed",
+                            ),
+                            status=503,
+                        )
+                    if applied:
+                        return web.json_response(
+                            _openai_error(
+                                "Owner proposal authority is not current",
+                                code="owner_proposal_already_applied",
+                            ),
+                            status=409,
+                        )
                 if state == "conflict":
                     return web.json_response(
                         _openai_error(
