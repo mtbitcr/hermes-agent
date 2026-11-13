@@ -5,9 +5,41 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 import time
+from datetime import date, timedelta
 
 from hermes_cli import kanban_db, projects_db
 from hermes_cli.owner_text import check_owner_text
+
+# The fixed explanation of a daily cap delay (owner rule of 2026-11-12, point 5).
+_CAP_HEADLINE = "The review waits for the next day: the daily limit is reached."
+_CAP_WHAT_CHANGED = (
+    "The daily limit of reviews is reached, so this Project's review waits for the next day. "
+    "Its news is kept for that review."
+)
+_CAP_NEXT_STEP = "The review runs on the next day."
+
+
+def _cap_wait(registry: sqlite3.Connection, project_id: str):
+    """The Project's cap mark with its last reviewed day, or None. A store from before the mark has no mark."""
+    columns = {row[1] for row in registry.execute("PRAGMA table_info(project_review_state)")}
+    if not {"cap_wait_date", "cap_wait_at"} <= columns:
+        return None
+    row = registry.execute(
+        "SELECT cap_wait_date, cap_wait_at, last_reviewed_date FROM project_review_state WHERE project_id=?",
+        (project_id,),
+    ).fetchone()
+    return None if row is None or row["cap_wait_date"] is None else row
+
+
+def _cap_explanation(mark) -> dict:
+    """The fixed explanation in the shape of a stored brief, for the day of the mark."""
+    day, reviewed = mark["cap_wait_date"], mark["last_reviewed_date"]
+    covered_from = None if reviewed is None else (date.fromisoformat(reviewed) + timedelta(days=1)).isoformat()
+    return {
+        "review_date": day, "covered_from": covered_from, "covered_to": day, "headline": _CAP_HEADLINE,
+        "what_changed": _CAP_WHAT_CHANGED, "next_step": _CAP_NEXT_STEP, "needs_you": None, "ready_work": [],
+        "cut_note": None, "quiet": False, "written_at": mark["cap_wait_at"], "revision": 1,
+    }
 
 
 def project_review_view(project_id: str):
@@ -20,15 +52,19 @@ def project_review_view(project_id: str):
     try:
         with contextlib.closing(_open_read_only_sqlite(path, label="projects.db")) as registry:
             stored = projects_db.get_project_review_brief(registry, project_id)
-            if stored is None:
+            mark = _cap_wait(registry, project_id)
+            if stored is None and mark is None:
                 return None
             # The plan limits the visible history to fourteen daily briefs.
-            history = registry.execute(
+            history = [] if stored is None else registry.execute(
                 "SELECT review_date,headline FROM project_review_briefs WHERE project_id=? "
                 "ORDER BY review_date DESC LIMIT 14", (project_id,),
             ).fetchall()
     except sqlite3.Error as exc:
         raise OwnerWorkspaceError("snapshot_unavailable", "the Project review could not be read") from exc
+    # The cap mark is shown only while no stored brief has its day or a later one; the history stays the stored one.
+    if mark is not None and (stored is None or stored["review_date"] < mark["cap_wait_date"]):
+        stored = _cap_explanation(mark)
     latest = {name: stored[name] for name in (
         "review_date", "covered_from", "covered_to", "headline", "what_changed", "next_step", "needs_you",
         "ready_work", "cut_note", "quiet", "written_at", "revision",

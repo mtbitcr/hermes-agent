@@ -716,6 +716,42 @@ def test_the_cap_waits_by_urgency_then_news(root):
     assert _state(root, calm)["open_task_id"] is None
 
 
+def test_the_project_the_cap_makes_wait_gets_the_day_s_mark_and_its_review_the_next_day(root):
+    calm = _quick_project(root, "Calm Notes", 1)
+    busy = _quick_project(root, "Busy Notes", 3)
+    urgent = _quick_project(root, "Urgent Notes", 1)
+    with _board(root, urgent["board"]) as conn:
+        card = conn.execute("SELECT id FROM tasks LIMIT 1").fetchone()[0]
+        kanban_db.block_task(conn, card, reason="Which room?", kind="needs_input")
+    _switch_on(root, calm["project_id"], busy["project_id"], urgent["project_id"], daily_cap=2)
+    ops = _ops()
+    position = (
+        "SELECT event_cursor, delivery_cursor, release_cursor, conversation_cursor, last_reviewed_date, open_task_id, "
+        "failures, updated_at FROM project_review_state WHERE project_id = ?"
+    )
+    marks = "SELECT project_id, cap_wait_date, cap_wait_at FROM project_review_state WHERE cap_wait_date IS NOT NULL"
+
+    assert ops.review_tick(now=_at(2026, 11, 9, 7)) == 2
+    waiting = _rows(root / "projects.db", position, (calm["project_id"],))
+    assert ops.review_tick(now=_at(2026, 11, 9, 7, 30)) == 0
+
+    # Owner rule of 2026-11-12: the cap delay is the day's mark in the review state, set once; no brief row.
+    assert _rows(root / "projects.db", marks) == [(calm["project_id"], "2026-11-09", _at(2026, 11, 9, 7))]
+    assert _rows(root / "projects.db", "SELECT count(*) FROM project_review_briefs") == [(0,)]
+    assert _rows(root / "projects.db", position, (calm["project_id"],)) == waiting
+    assert _budget(root, "2026-11-09") == (2, 0)
+    assert sorted(task.title for task in _review_tasks(root)) == [TITLE + "Busy Notes", TITLE + "Urgent Notes"]
+
+    # The next day reviews it as usual; the two reviews of the day before still hold their own Projects.
+    assert ops.review_tick(now=_at(2026, 11, 10, 7)) == 1
+    assert _state(root, calm)["open_task_id"] is not None
+    assert sorted(task.title for task in _review_tasks(root)) == [
+        TITLE + "Busy Notes", TITLE + "Calm Notes", TITLE + "Urgent Notes",
+    ]
+    assert _budget(root, "2026-11-10") == (1, 0)
+    assert _rows(root / "projects.db", marks) == [(calm["project_id"], "2026-11-09", _at(2026, 11, 9, 7))]
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # Quiet-day tracking: a Project is stale only after the stored number of quiet days.
 # ---------------------------------------------------------------------------------------------------------------
