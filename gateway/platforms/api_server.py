@@ -1739,6 +1739,14 @@ def _owner_proposal_digest(candidate: Any) -> "str | None":
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _owner_turn_ordinal(history: List[Any]) -> int:
+    """The 1-based number of a transcript's last owner turn."""
+    return sum(
+        1 for message in history
+        if isinstance(message, dict) and message.get("role") == "user"
+    )
+
+
 def _owner_history_has_actionable_final_proposal(
     history: List[Dict[str, Any]],
 ) -> bool:
@@ -2030,6 +2038,36 @@ class ResponseStore:
             self._conn.execute(
                 "ALTER TABLE owner_executor_jobs ADD COLUMN lease_expires_at REAL"
             )
+        # What became of each proposal, recorded in the transaction that
+        # consumes or releases it, and the turn from which a conversation's
+        # outcomes are recorded at all. The claim fields of ``conversations``
+        # are overwritten when the head moves, so an earlier proposal has no
+        # other durable outcome. A store from before these tables reads every
+        # earlier proposal as unknown.
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS owner_proposal_outcomes (
+                profile TEXT NOT NULL,
+                name TEXT NOT NULL,
+                turn_ordinal INTEGER NOT NULL,
+                response_id TEXT NOT NULL,
+                proposal_digest TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK (outcome IN ('applied', 'released')),
+                operation TEXT,
+                idempotency_key TEXT,
+                authority_digest TEXT,
+                run_id TEXT,
+                recorded_at REAL NOT NULL,
+                PRIMARY KEY (profile, name, turn_ordinal)
+            )"""
+        )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS owner_outcome_tracking (
+                profile TEXT NOT NULL,
+                name TEXT NOT NULL,
+                from_ordinal INTEGER NOT NULL,
+                PRIMARY KEY (profile, name)
+            )"""
+        )
         self._backfill_owner_proposals()
 
     def _ensure_response_schema(self) -> None:
@@ -2643,11 +2681,18 @@ class ResponseStore:
         # never answered. Reset and read with ``unreadable_reply`` too.
         provider_failure_reply = False
         substituted_failure_turn = False
+        # Per projected turn: its owner-message ordinal and, when its final
+        # reply is a proposal, that proposal's digest. Together they name the
+        # exact proposal an outcome mark was recorded for.
+        turn_keys: List[tuple] = []
+        ordinal = 0
+        reply_digest: Optional[str] = None
 
         def _flush() -> None:
-            nonlocal owner_text, raphael_text, incomplete
+            nonlocal owner_text, raphael_text, incomplete, reply_digest
             if owner_text is not None and raphael_text is not None:
                 turns.append({"owner": owner_text, "raphael": raphael_text})
+                turn_keys.append((ordinal, reply_digest))
             elif owner_text is not None:
                 # An owner turn with no projectable reply before the next turn
                 # boundary — consecutive owner messages, or a trailing one. The
@@ -2657,6 +2702,7 @@ class ResponseStore:
                 incomplete = True
             owner_text = None
             raphael_text = None
+            reply_digest = None
 
         # An OWNER message is a turn BOUNDARY, so it is authoritative in a way
         # an assistant message is not: dropping one silently merges two owner
@@ -2684,6 +2730,7 @@ class ResponseStore:
                     )
                 text = content.strip()
                 _flush()
+                ordinal += 1
                 unreadable_reply = False
                 refusal_notice_reply = False
                 provider_failure_reply = False
@@ -2766,6 +2813,11 @@ class ResponseStore:
                     "projected"
                 )
             raphael_text = projected_text
+            reply_digest = (
+                _owner_proposal_digest(candidate)
+                if candidate["kind"] in {"proposal", "project_change_proposal"}
+                else None
+            )
 
         # The conversation ENDS on assistant output that carries no outcome. The
         # turn was real, so dropping it hid the owner's own latest message and
@@ -2884,6 +2936,66 @@ class ResponseStore:
             if applied:
                 proposal_consumed = True
                 released_run_id = None
+        # What became of each EARLIER proposal turn; the newest one is told by
+        # the flags above. Read only: the marks, the tracking row and, for
+        # marks left released, at most one batched read of the receipts store.
+        earlier = [
+            (index, turn_ordinal, digest)
+            for index, (turn_ordinal, digest) in enumerate(
+                turn_keys[-_OWNER_HISTORY_TURN_LIMIT:][:-1]
+            )
+            if digest is not None
+        ]
+        if earlier:
+            marks = {
+                mark[0]: mark[1:]
+                for mark in self._conn.execute(
+                    "SELECT turn_ordinal, proposal_digest, outcome, operation, "
+                    "idempotency_key, authority_digest FROM owner_proposal_outcomes "
+                    "WHERE profile = ? AND name = ?",
+                    (profile, name),
+                ).fetchall()
+            }
+            tracked = self._conn.execute(
+                "SELECT from_ordinal FROM owner_outcome_tracking "
+                "WHERE profile = ? AND name = ?",
+                (profile, name),
+            ).fetchone()
+            released = []
+            for index, turn_ordinal, digest in earlier:
+                mark = marks.get(turn_ordinal)
+                if mark is not None and mark[0] == digest:
+                    if mark[1] == "applied":
+                        data[index]["proposal_outcome"] = "applied"
+                    else:
+                        released.append((index, mark[2:]))
+                elif tracked is not None and turn_ordinal >= tracked[0]:
+                    data[index]["proposal_outcome"] = "replaced"
+                else:
+                    data[index]["proposal_outcome"] = "unknown"
+            if released:
+                from hermes_cli.owner_workspace import (
+                    committed_owner_receipts_for_proposals,
+                )
+
+                try:
+                    applied_items = committed_owner_receipts_for_proposals(
+                        [item for _index, item in released]
+                    )
+                except Exception as exc:
+                    # Uncertainty never reads as applied or as not applied, and
+                    # an earlier turn never fails the whole history.
+                    logger.warning(
+                        "Owner conversation %s: earlier outcomes are unreadable: %s",
+                        name, exc,
+                    )
+                    applied_items = None
+                for position, (index, _item) in enumerate(released):
+                    data[index]["proposal_outcome"] = (
+                        "unknown" if applied_items is None
+                        else "applied" if position in applied_items
+                        else "not_applied"
+                    )
         return {
             # The exact turn this conversation currently ends at, whatever it
             # was. Distinct from ``latest_response_id``, which names the
@@ -2951,7 +3063,16 @@ class ResponseStore:
             ")",
             (response_id, profile, name, response_id),
         )
-        self._conn.commit()
+        try:
+            if cursor.rowcount == 1:
+                self._record_owner_proposal_outcome_locked(
+                    profile, name, response_id, "applied",
+                    *self._owner_claim_binding_locked(profile, name),
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
         return cursor.rowcount == 1
 
     @staticmethod
@@ -3653,7 +3774,16 @@ class ResponseStore:
                 "AND claim_state IN ('claimed', 'completed')",
                 (response_id, profile, name, response_id, response_id, claim_id, run_id),
             )
-            self._conn.commit()
+            try:
+                if cursor.rowcount == 1:
+                    self._record_owner_proposal_outcome_locked(
+                        profile, name, response_id, "applied",
+                        *self._owner_claim_binding_locked(profile, name),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
             return cursor.rowcount == 1
 
     @_owner_authority
@@ -3675,7 +3805,16 @@ class ResponseStore:
                 "AND claim_state IN ('claimed', 'released')",
                 (profile, name, response_id, response_id, response_id, claim_id, run_id),
             )
-            self._conn.commit()
+            try:
+                if cursor.rowcount == 1:
+                    self._record_owner_proposal_outcome_locked(
+                        profile, name, response_id, "released",
+                        *self._owner_claim_binding_locked(profile, name),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
             return cursor.rowcount == 1
 
     @_owner_authority
@@ -4845,6 +4984,11 @@ class ResponseStore:
                     if proposal_cursor.rowcount != 1:
                         self._conn.rollback()
                         raise RuntimeError("owner proposal completion is unavailable")
+                    self._record_owner_proposal_outcome_locked(
+                        owner_profile, owner["conversation"], owner["response_id"],
+                        "applied", owner["operation"], idempotency_key,
+                        owner["payload_digest"], run_id,
+                    )
                 cur = self._conn.execute(
                     "UPDATE run_idempotency SET terminal_json = ?, status_json = NULL "
                     "WHERE profile = ? AND session_scope = ? "
@@ -4990,6 +5134,70 @@ class ResponseStore:
             "DELETE FROM owner_executor_jobs WHERE kind = ? AND job_key = ?",
             (kind, job_key),
         )
+
+    def _record_owner_proposal_outcome_locked(
+        self,
+        profile: str,
+        name: str,
+        response_id: str,
+        outcome: str,
+        operation: Optional[str],
+        idempotency_key: Optional[str],
+        authority_digest: Optional[str],
+        run_id: Optional[str],
+    ) -> None:
+        """Record what became of one proposal, WITHOUT committing.
+
+        Only ever called inside the transaction that consumes or releases the
+        proposal, so the mark and that fact appear (or fail to appear)
+        together. A claimed proposal fences new turns, so its response is the
+        head and its owner-message count is its exact turn. ``applied`` is
+        final: a later ``released`` for the same turn leaves the row as it is.
+        """
+        stored = self._conn.execute(
+            "SELECT data FROM responses WHERE response_id = ? AND profile = ?",
+            (response_id, profile),
+        ).fetchone()
+        try:
+            history = json.loads(stored[0]).get("conversation_history")
+        except (TypeError, ValueError, AttributeError):
+            # No readable proposal, no turn to mark; the consumption or
+            # release itself must not fail on a display record.
+            return
+        digest = _owner_proposal_digest(_owner_final_proposal(history))
+        if digest is None:
+            return
+        self._conn.execute(
+            "INSERT INTO owner_proposal_outcomes (profile, name, turn_ordinal, "
+            "response_id, proposal_digest, outcome, operation, idempotency_key, "
+            "authority_digest, run_id, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(profile, name, turn_ordinal) DO UPDATE SET "
+            "response_id = excluded.response_id, "
+            "proposal_digest = excluded.proposal_digest, "
+            "outcome = excluded.outcome, operation = excluded.operation, "
+            "idempotency_key = excluded.idempotency_key, "
+            "authority_digest = excluded.authority_digest, "
+            "run_id = excluded.run_id, recorded_at = excluded.recorded_at "
+            "WHERE owner_proposal_outcomes.outcome != 'applied' "
+            "OR excluded.outcome = 'applied'",
+            (
+                profile, name, _owner_turn_ordinal(history), response_id, digest,
+                outcome, operation, idempotency_key, authority_digest, run_id,
+                time.time(),
+            ),
+        )
+
+    def _owner_claim_binding_locked(self, profile: str, name: str) -> tuple:
+        """The claim's operation, run key, bound digest and run, as the history's
+        released-claim check reads them to find the receipt."""
+        row = self._conn.execute(
+            "SELECT c.bound_operation, (SELECT r.idempotency_key FROM run_idempotency r "
+            "WHERE r.run_id = c.owner_run_id LIMIT 1), c.bound_payload_digest, "
+            "c.owner_run_id FROM conversations c WHERE c.profile = ? AND c.name = ?",
+            (profile, name),
+        ).fetchone()
+        return tuple(row) if row is not None else (None, None, None, None)
 
     @_response_store_locked
     def renew_owner_job_leases(self, kind: str, job_keys: "Iterable[str]") -> None:
@@ -5256,7 +5464,7 @@ class ResponseStore:
                     ),
                 )
             if owner:
-                self._conn.execute(
+                released = self._conn.execute(
                     "UPDATE conversations SET claim_state = 'released', "
                     "claim_expires_at = NULL WHERE profile = ? AND name = ? "
                     "AND proposal_response_id = ? AND consumed_response_id IS NOT ? "
@@ -5269,6 +5477,15 @@ class ResponseStore:
                         owner.get("response_id"), owner.get("claim_id"), run_id,
                     ),
                 )
+                if released.rowcount == 1:
+                    owner_profile = self._profile(owner.get("proposal_profile"))
+                    self._record_owner_proposal_outcome_locked(
+                        owner_profile, owner["conversation"], owner["response_id"],
+                        "released",
+                        *self._owner_claim_binding_locked(
+                            owner_profile, owner["conversation"],
+                        ),
+                    )
             self._release_owner_job_locked("run", run_id)
             self._conn.commit()
             return True
@@ -5464,6 +5681,19 @@ class ResponseStore:
                 ):
                     self._conn.rollback()
                     return False
+                history = data.get("conversation_history")
+                if (
+                    isinstance(conversation, str)
+                    and _OWNER_CONVERSATION_RE.fullmatch(conversation) is not None
+                    and isinstance(history, list)
+                ):
+                    # Outcomes are recorded from the first turn published
+                    # here on; an earlier proposal with no mark is unknown.
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO owner_outcome_tracking "
+                        "(profile, name, from_ordinal) VALUES (?, ?, ?)",
+                        (profile, conversation, _owner_turn_ordinal(history)),
+                    )
                 if (
                     replay is not None
                     and session_scope is not None

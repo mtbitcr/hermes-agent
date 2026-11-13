@@ -37,6 +37,11 @@ from tests.gateway.test_owner_turn_provider_unavailable import (
 
 FAMILY = "owner_conversation"
 QUESTION = {"schema_version": 1, "kind": "question", "message": "Which outcome first?"}
+# The closed values of an earlier proposal turn's ``proposal_outcome``. Not a
+# row of the conftest table, which needs every value in some saved example: the
+# one example with earlier proposals is seeded without outcome tracking, so its
+# turns read "unknown" only.
+PROPOSAL_OUTCOMES = frozenset({"applied", "not_applied", "replaced", "unknown"})
 
 
 def _name(digit: str) -> str:
@@ -175,8 +180,12 @@ async def test_the_history_examples_carry_every_reply_kind_and_handle(owner_payl
             live["owner_history_unavailable"] = await history(_name("1"))
 
     saved = {kind: owner_payload_example(FAMILY, kind, body) for kind, body in live.items()}
+    assert contract.closed_values(live["history"], ("proposal_outcome",)) == (
+        contract.closed_values(saved["history"], ("proposal_outcome",)))
 
     for answers in (live, saved):
+        assert contract.closed_values(answers["history"], ("proposal_outcome",)) <= (
+            PROPOSAL_OUTCOMES)
         assert answers["history_empty"]["body"]["data"] == []
         assert answers["history_pending"]["body"]["pending"] is not None
         assert answers["history_recovery"]["body"]["recovery"] is not None
