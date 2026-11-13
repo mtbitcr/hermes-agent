@@ -53,6 +53,10 @@ from tests.gateway.test_api_server_runs import (  # noqa: F401  (an autouse fixt
 
 _QUESTION = {"schema_version": 1, "kind": "question", "message": "Which milestone comes next?"}
 _FIFTH = "resp_earlier_outcome_turn_5"
+# The catch-up's marker: the name of its row in ``owner_outcome_tracking`` and
+# the ``run_id`` of every mark it writes. Stored, so it never changes.
+_CATCH_UP = "owner-outcome-catch-up"
+_NEW_TABLES = ("owner_proposal_outcomes", "owner_outcome_tracking")
 
 
 def _key(response_id: str) -> str:
@@ -197,6 +201,28 @@ def _marks(store) -> list[tuple]:
     ).fetchall()
 
 
+def _before_the_catch_up(store, *, drop: bool = False) -> None:
+    """The store as production holds it before the catch-up ran: both new
+    tables empty or, with ``drop``, a store from before either table."""
+    for table in _NEW_TABLES:
+        store._conn.execute(f"DROP TABLE {table}" if drop else f"DELETE FROM {table}")
+    store._conn.commit()
+
+
+def _marker(store) -> list[tuple]:
+    return store._conn.execute(
+        "SELECT profile, name, from_ordinal FROM owner_outcome_tracking WHERE name = ?",
+        (_CATCH_UP,),
+    ).fetchall()
+
+
+def _rows(store, *tables: str) -> dict:
+    return {
+        table: sorted(store._conn.execute(f"SELECT * FROM {table}").fetchall(), key=repr)
+        for table in tables
+    }
+
+
 class _FailsAfterTheMark:
     """The store connection, failing the first step after the outcome mark."""
 
@@ -295,9 +321,13 @@ async def test_earlier_unapproved_proposal_reads_replaced():
 async def test_proposal_before_tracking_reads_unknown():
     adapter, _runs = await _five_turns()
     store = adapter._response_store
-    # A store from before this change: neither new table exists.
-    store._conn.execute("DROP TABLE IF EXISTS owner_proposal_outcomes")
-    store._conn.execute("DROP TABLE IF EXISTS owner_outcome_tracking")
+    # A conversation from before this change that the catch-up, already run,
+    # could not prove: neither its marks nor its tracking row exist.
+    for table in _NEW_TABLES:
+        store._conn.execute(
+            f"DELETE FROM {table} WHERE profile = ? AND name = ?",
+            (_PLANNER, _CONVERSATION),
+        )
     store._conn.commit()
     row = _conversation_row(store)
     restarted = _restarted_twice()
@@ -309,8 +339,11 @@ async def test_proposal_before_tracking_reads_unknown():
     assert history["proposal_consumed"] is True
     reloaded = restarted._response_store
     assert _conversation_row(reloaded) == row
-    for table in ("owner_proposal_outcomes", "owner_outcome_tracking"):
-        assert reloaded._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
+    for table in _NEW_TABLES:
+        assert reloaded._conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE profile = ? AND name = ?",
+            (_PLANNER, _CONVERSATION),
+        ).fetchone() == (0,)
 
 
 @pytest.mark.asyncio
@@ -483,3 +516,130 @@ async def test_records_written_in_the_same_transaction(writer, outcome):
     assert write() is True
     assert _conversation_row(store) != row
     assert [mark[:2] for mark in _marks(store)] == [(1, outcome)]
+
+
+@pytest.mark.asyncio
+async def test_catch_up_marks_a_surviving_applied_proposal():
+    adapter, _runs = await _five_turns()
+    store = adapter._response_store
+    recorded = store._conn.execute(
+        "SELECT turn_ordinal, response_id, proposal_digest FROM owner_proposal_outcomes "
+        "WHERE outcome = 'applied' ORDER BY turn_ordinal",
+    ).fetchall()
+    _before_the_catch_up(store)
+
+    adapter = _restarted_twice()
+    store = adapter._response_store
+    status, history = await _history(adapter)
+
+    assert status == 200, history
+    # Turn 1 by its committed success receipt, turn 5 as the consumed proposal:
+    # the same turns and proposals step 1 recorded. The refusal of turn 4 and
+    # the never approved turn 3 prove nothing here, so both stay unknown.
+    assert _outcomes(history) == ["applied", None, "unknown", "unknown", None]
+    assert history["proposal_consumed"] is True
+    assert _marks(store) == [(1, "applied", _CATCH_UP), (5, "applied", _CATCH_UP)]
+    assert store._conn.execute(
+        "SELECT turn_ordinal, response_id, proposal_digest FROM owner_proposal_outcomes "
+        "ORDER BY turn_ordinal",
+    ).fetchall() == recorded
+    assert store._conn.execute(
+        "SELECT operation, idempotency_key, authority_digest FROM owner_proposal_outcomes "
+        "WHERE turn_ordinal = 1",
+    ).fetchone() == (_OPERATION, _KEY, None)
+    # Tracking is left as it was: no conversation row, only the marker.
+    assert store._conn.execute(
+        "SELECT profile, name, from_ordinal FROM owner_outcome_tracking",
+    ).fetchall() == [("", _CATCH_UP, 0)]
+
+
+@pytest.mark.asyncio
+async def test_catch_up_leaves_an_evicted_proposal_unknown():
+    adapter, _runs = await _five_turns()
+    store = adapter._response_store
+    # A store from before step 1 whose turn 1 response the stored-response cap
+    # evicted. Its committed success receipt remains, under a key that no
+    # stored row names any more.
+    _before_the_catch_up(store, drop=True)
+    store._conn.execute(
+        "DELETE FROM responses WHERE profile = ? AND response_id = ?",
+        (_PLANNER, _RESPONSE_ID),
+    )
+    store._conn.commit()
+    with _receipts_db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM owner_workspace_receipts "
+            "WHERE idempotency_key = ? AND status = 'committed'",
+            (_KEY,),
+        ).fetchone() == (1,)
+
+    adapter = _restarted_twice()
+    status, history = await _history(adapter)
+
+    assert status == 200, history
+    assert _outcomes(history) == ["unknown", None, "unknown", "unknown", None]
+    # Only the consumed fifth proposal is proven; nothing is guessed.
+    assert _marks(adapter._response_store) == [(5, "applied", _CATCH_UP)]
+
+
+@pytest.mark.asyncio
+async def test_catch_up_runs_once_and_is_idempotent():
+    adapter, _runs = await _five_turns()
+    _before_the_catch_up(adapter._response_store)
+
+    store = _restarted_twice()._response_store
+    once = _rows(store, *_NEW_TABLES)
+
+    assert _marks(store) == [(1, "applied", _CATCH_UP), (5, "applied", _CATCH_UP)]
+    assert _marker(store) == [("", _CATCH_UP, 0)]
+    # Run again without its marker, it writes the same rows and changes none.
+    store._conn.execute("DELETE FROM owner_outcome_tracking WHERE name = ?", (_CATCH_UP,))
+    store._conn.commit()
+    store = _restarted_twice()._response_store
+    assert _rows(store, *_NEW_TABLES) == once
+    # Once its marker is set it never runs again, also not after a restart.
+    store._conn.execute("DELETE FROM owner_proposal_outcomes WHERE turn_ordinal = 1")
+    store._conn.commit()
+    adapter = _restarted_twice()
+    assert _marks(adapter._response_store) == [(5, "applied", _CATCH_UP)]
+    status, history = await _history(adapter)
+    assert status == 200, history
+    assert _outcomes(history)[0] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_catch_up_never_writes_conversations_or_receipts():
+    adapter, _runs = await _five_turns()
+    store = adapter._response_store
+    _before_the_catch_up(store)
+    tables = [
+        name for (name,) in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+        if name not in _NEW_TABLES
+    ]
+    assert {"conversations", "responses", "run_idempotency"} <= set(tables)
+    before = _rows(store, *tables)
+    receipts = (ow.owner_executor_home() / "projects.db").read_bytes()
+    opened, statements = [], []
+    connect = ow.sqlite3.connect
+
+    def _traced(*args, **kw):
+        conn = connect(*args, **kw)
+        if "projects.db" in str(args[0]):
+            opened.append(str(args[0]))
+            conn.set_trace_callback(statements.append)
+        return conn
+
+    with patch.object(ow.sqlite3, "connect", side_effect=_traced):
+        store = _restarted_twice()._response_store
+
+    # Its marks and its marker are all it wrote, in either store.
+    assert _marks(store) == [(1, "applied", _CATCH_UP), (5, "applied", _CATCH_UP)]
+    assert _rows(store, *tables) == before
+    assert (ow.owner_executor_home() / "projects.db").read_bytes() == receipts
+    # One read-only open of the receipts store, which it only read.
+    assert len(opened) == 1 and opened[0].endswith("?mode=ro")
+    assert statements and all(
+        sql.lstrip().upper().startswith("SELECT") for sql in statements
+    )

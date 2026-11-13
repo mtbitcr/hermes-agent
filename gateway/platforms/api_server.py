@@ -1407,6 +1407,11 @@ _UNSTATED: Any = object()
 _OWNER_CLAIM_RE = re.compile(r"claim_[A-Za-z0-9_-]{8,128}")
 _OWNER_RUN_RE = re.compile(r"run_[a-f0-9]{32}")
 _OWNER_PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+# The one-time catch-up of earlier proposal outcomes: the name of its marker
+# row in ``owner_outcome_tracking`` and the ``run_id`` of every mark it wrote.
+# Neither a conversation name nor a run id, so no history reads the marker and
+# its marks stay apart from recorded ones. Stored, so it never changes.
+_OWNER_OUTCOME_CATCH_UP = "owner-outcome-catch-up"
 _OWNER_SESSION_INDEX_LIMIT = 100
 # This process's identity as the executor of durably queued owner work. A
 # queued response or run lives in the store, but its only executor is an
@@ -2069,6 +2074,7 @@ class ResponseStore:
             )"""
         )
         self._backfill_owner_proposals()
+        self._backfill_owner_proposal_outcomes()
 
     def _ensure_response_schema(self) -> None:
         """Migrate stored responses to an exact profile-scoped identity."""
@@ -2318,6 +2324,114 @@ class ResponseStore:
                 "AND proposal_response_id IS NULL",
                 (response_id, digest, profile, name, response_id),
             )
+
+    def _backfill_owner_proposal_outcomes(self) -> None:
+        """Once, mark applied each earlier proposal stored records prove applied.
+
+        A proposal of an owner conversation is a surviving response row whose
+        transcript is the conversation's own up to the end of one owner turn,
+        ending on that proposal. It is proven applied when it is the
+        conversation's ``consumed_response_id``, or when one batched read of
+        the receipts store finds a committed success receipt under its approval
+        key. Nothing else is proven: an evicted, refused or never approved
+        proposal gets no mark and keeps reading unknown, and tracking stays as
+        it is. Writes only the two outcome tables, never over a recorded mark;
+        the marker row commits with the marks, so the catch-up never runs
+        again. A receipts store that cannot be read writes nothing, marker
+        included, and the next start tries again.
+        """
+        if self._conn.execute(
+            "SELECT 1 FROM owner_outcome_tracking WHERE profile = '' AND name = ?",
+            (_OWNER_OUTCOME_CATCH_UP,),
+        ).fetchone() is not None:
+            return
+
+        def _history(data: Any) -> Any:
+            try:
+                return json.loads(data).get("conversation_history")
+            except (TypeError, ValueError, AttributeError, RecursionError):
+                return None
+
+        heads: Dict[str, List[tuple]] = {}
+        for profile, name, consumed, data in self._conn.execute(
+            "SELECT c.profile, c.name, c.consumed_response_id, r.data "
+            "FROM conversations c JOIN responses r "
+            "ON r.profile = c.profile AND r.response_id = c.response_id"
+        ).fetchall():
+            head = _history(data)
+            if (
+                isinstance(name, str)
+                and _OWNER_CONVERSATION_RE.fullmatch(name) is not None
+                and isinstance(head, list)
+            ):
+                heads.setdefault(profile, []).append((name, consumed, head))
+        proposals: Dict[tuple, List[tuple]] = {}
+        for profile, conversations in heads.items():
+            for response_id, data in self._conn.execute(
+                "SELECT response_id, data FROM responses WHERE profile = ?", (profile,),
+            ):
+                history = _history(data)
+                proposal = _owner_final_proposal(history)
+                if proposal is None:
+                    continue
+                end = len(history)
+                for name, consumed, head in conversations:
+                    if head[:end] != history or (
+                        end < len(head)
+                        and (not isinstance(head[end], dict) or head[end].get("role") != "user")
+                    ):
+                        continue
+                    proposals.setdefault((profile, name), []).append((
+                        _owner_turn_ordinal(history), response_id,
+                        _owner_proposal_digest(proposal),
+                        "owner_task_graph_commit" if proposal["kind"] == "proposal"
+                        else "owner_project_plan_commit",
+                        "conversation-"
+                        + hashlib.sha256(response_id.encode("utf-8")).hexdigest(),
+                        response_id == consumed,
+                    ))
+        marks = []
+        for (profile, name), found in proposals.items():
+            rest = [proposal for proposal in found if not proposal[5]]
+            applied: "set[int]" = set()
+            if rest:
+                try:
+                    from hermes_cli.owner_workspace import (
+                        committed_owner_receipts_for_proposals,
+                    )
+
+                    applied = committed_owner_receipts_for_proposals(
+                        [(proposal[3], proposal[4], None) for proposal in rest]
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Earlier owner proposal outcomes were not caught up; the "
+                        "receipts store could not be read: %s", exc,
+                    )
+                    return
+            marks.extend(
+                (profile, name, *proposal[:5], _OWNER_OUTCOME_CATCH_UP, time.time())
+                for proposal in [
+                    *(proposal for proposal in found if proposal[5]),
+                    *(rest[index] for index in sorted(applied)),
+                ]
+            )
+        self._conn.executemany(
+            "INSERT INTO owner_proposal_outcomes (profile, name, turn_ordinal, "
+            "response_id, proposal_digest, outcome, operation, idempotency_key, "
+            "authority_digest, run_id, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, 'applied', ?, ?, NULL, ?, ?) "
+            "ON CONFLICT(profile, name, turn_ordinal) DO NOTHING",
+            marks,
+        )
+        self._conn.execute(
+            "INSERT INTO owner_outcome_tracking (profile, name, from_ordinal) "
+            "VALUES ('', ?, 0)",
+            (_OWNER_OUTCOME_CATCH_UP,),
+        )
+        logger.info(
+            "Earlier owner proposal outcomes caught up: %d proven applied", len(marks),
+        )
 
     def _tighten_file_permissions(self) -> None:
         """Force owner-only permissions on the DB and SQLite sidecars."""
