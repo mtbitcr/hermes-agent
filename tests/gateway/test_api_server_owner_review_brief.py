@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import sqlite3
 import time
@@ -190,6 +191,117 @@ def test_a_root_without_a_registry_yet_reads_as_no_brief_and_the_read_creates_no
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(empty_root))
     assert project_review_view(project_review["project_id"]) is None
     assert list(empty_root.iterdir()) == []
+
+
+# Owner rule of 2026-11-12: the daily cap's mark in the review state, explained only by this view of the brief.
+STORED = {
+    "latest": {
+        "review_date": "2026-11-10", "covered_from": "2026-11-09", "covered_to": "2026-11-10",
+        "headline": "The room is booked.", "what_changed": "The room booking is complete.",
+        "next_step": "Send the invitations.", "needs_you": None, "ready_work": ["Send the invitations"],
+        "cut_note": None, "quiet": False, "written_at": NOW, "revision": 1,
+    },
+    "history": [{"review_date": "2026-11-10", "headline": "The room is booked."}],
+}
+SAVED_EXAMPLE = Path(__file__).resolve().parents[1] / "contracts/owner_payloads/owner_snapshot/project_review_brief.json"
+
+
+def _explanation(day, covered_from, written_at):
+    return {
+        "review_date": day, "covered_from": covered_from, "covered_to": day,
+        "headline": "The review waits for the next day: the daily limit is reached.",
+        "what_changed": (
+            "The daily limit of reviews is reached, so this Project's review waits for the next day. "
+            "Its news is kept for that review."
+        ),
+        "next_step": "The review runs on the next day.", "needs_you": None, "ready_work": [], "cut_note": None,
+        "quiet": False, "written_at": written_at, "revision": 1,
+    }
+
+
+def _cap_mark(project_id, day, at, last_reviewed_date="2026-11-10"):
+    with projects_db.connect_closing() as registry:
+        registry.execute(
+            "INSERT OR REPLACE INTO project_review_state (project_id, last_reviewed_date, updated_at, cap_wait_date, "
+            "cap_wait_at) VALUES (?, ?, ?, ?, ?)", (project_id, last_reviewed_date, NOW, day, at),
+        )
+        registry.commit()
+
+
+async def _snapshots(project_review):
+    path = f"/v1/owner-workspace/projects/{project_review['slug']}/snapshot"
+    async with TestClient(TestServer(app())) as client:
+        plain_response = await client.get(path + "?capabilities=project_summary")
+        asked_response = await client.get(path + "?capabilities=project_summary,project_review_brief")
+        assert plain_response.status == asked_response.status == 200
+        return (await plain_response.json())["data"], (await asked_response.json())["data"]
+
+
+@pytest.mark.asyncio
+async def test_a_cap_mark_later_than_the_newest_brief_shows_the_fixed_explanation_in_the_same_payload_shape(
+    project_review,
+):
+    _cap_mark(project_review["project_id"], "2026-11-11", NOW + 86400)
+    with projects_db.connect_closing() as registry:
+        before = list(registry.iterdump())
+    plain, asked = await _snapshots(project_review)
+
+    assert set(asked) - set(plain) == {"raphael_review"}
+    assert {key: value for key, value in asked.items() if key != "raphael_review"} == plain
+    # The explanation is ``latest``; the history holds the stored briefs only, which stay as they are.
+    assert asked["raphael_review"] == {
+        "latest": _explanation("2026-11-11", "2026-11-11", NOW + 86400), "history": STORED["history"],
+    }
+    with projects_db.connect_closing() as registry:
+        assert list(registry.iterdump()) == before
+    # The saved brief payload example has the same keys and value types, record by record; it is not changed.
+    saved = json.loads(SAVED_EXAMPLE.read_text(encoding="utf-8"))["body"]["data"]["raphael_review"]
+    served = asked["raphael_review"]
+    assert sorted(served) == sorted(saved) and sorted(served["latest"]) == sorted(saved["latest"])
+    assert {key: type(value) for key, value in served["latest"].items()} == {
+        key: type(value) for key, value in saved["latest"].items()
+    }
+    assert [sorted(entry) for entry in served["history"]] == [sorted(entry) for entry in saved["history"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("day", ["2026-11-10", "2026-11-09"])
+async def test_a_cap_mark_on_or_before_the_day_of_the_newest_brief_leaves_the_brief_unchanged(project_review, day):
+    _cap_mark(project_review["project_id"], day, NOW - 60)
+    plain, asked = await _snapshots(project_review)
+
+    assert asked["raphael_review"] == STORED
+    assert {key: value for key, value in asked.items() if key != "raphael_review"} == plain
+
+
+@pytest.mark.asyncio
+async def test_a_project_with_a_cap_mark_and_no_stored_brief_gets_the_explanation(project_review):
+    with projects_db.connect_closing() as registry:
+        registry.execute("DELETE FROM project_review_briefs WHERE project_id=?", (project_review["project_id"],))
+        registry.commit()
+    _cap_mark(project_review["project_id"], "2026-11-10", NOW, last_reviewed_date=None)
+    plain, asked = await _snapshots(project_review)
+
+    assert asked["raphael_review"] == {"latest": _explanation("2026-11-10", None, NOW), "history": []}
+    assert asked["raphael_summary"] == plain["raphael_summary"]
+
+
+@pytest.mark.asyncio
+async def test_a_store_without_the_cap_mark_columns_reads_as_before_and_the_read_adds_nothing(project_review):
+    with projects_db.connect_closing() as registry:
+        registry.execute(
+            "INSERT INTO project_review_state (project_id, last_reviewed_date, updated_at) VALUES (?, ?, ?)",
+            (project_review["project_id"], "2026-11-10", NOW),
+        )
+        registry.execute("ALTER TABLE project_review_state DROP COLUMN cap_wait_at")
+        registry.execute("ALTER TABLE project_review_state DROP COLUMN cap_wait_date")
+        registry.commit()
+        before = list(registry.iterdump())
+    plain, asked = await _snapshots(project_review)
+
+    assert asked["raphael_review"] == STORED
+    assert asked["raphael_summary"] == plain["raphael_summary"]
+    assert _dump(kb.kanban_home() / "projects.db") == before
 
 
 @pytest.fixture

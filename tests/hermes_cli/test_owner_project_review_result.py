@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from hermes_cli import kanban_db, owner_project_review as review, projects_db
+from hermes_cli import kanban_db, owner_project_review as review, owner_workspace, projects_db
 from hermes_cli import owner_project_review_record as records, owner_project_summary_events as events
 from plugins.dashboard_auth.raphael_workspace import model_policy
 
@@ -2881,3 +2881,145 @@ def test_round3_acceptance_the_same_required_classification_fits_with_only_expen
 
     monkeypatch.setattr(records, "_registry_record", without_old_text)
     _round3_fitting_required_items(round3_root, monkeypatch)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Every cut notice the reader writes survives the frozen input into the stored brief
+# ---------------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("long_comment", [False, True])
+def test_partial_text_cut_survives_harvest(root, monkeypatch, long_comment):
+    from gateway.platforms.api_server import ResponseStore
+
+    project = _quiet_project(root)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    name = "raphael-owner-" + "c" * 32
+    store = ResponseStore(db_path=str(root / "response_store.db"), default_profile="default")
+    store._conn.close()
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        owner_workspace._ensure_schema(registry)
+        projects_db.link_project_conversation(registry, name, project.id)
+        with kanban_db.write_txn(registry):
+            registry.execute("DELETE FROM project_review_state WHERE project_id=?", (project.id,))
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
+        tid = board.execute("SELECT id FROM tasks LIMIT 1").fetchone()[0]
+        kanban_db.add_comment(board, tid, "default", "The room is chosen. " + ("a" * 600 if long_comment else "Ready."))
+    assert review.review_tick(NOW) == 1
+    task = _open_review(root, project)
+    body = _frozen_body(task)
+    assert ("Shortened to the character limit:" in body) == long_comment
+    assert "Not available:" not in body and "Left out:" not in body and "not linked" not in body
+    _complete_review(task, [])
+    assert review.review_tick(NOW + 1) == 0
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        brief = projects_db.get_project_review_brief(registry, project.id)
+    # A truncated source must stay visibly partial in the owner brief.
+    assert bool(brief["cut_note"]) == long_comment
+    if long_comment:
+        assert records.NOTICE_KINDS["partial_text"] in brief["cut_note"]
+
+
+@pytest.mark.parametrize("long_turn", [False, True])
+def test_conversation_text_cut_survives_harvest(root, monkeypatch, long_turn):
+    project = _quiet_project(root)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    name = "raphael-owner-" + "d" * 32
+    _owner_turn(root, name, "resp_b12_turn", "Choose the room. " + ("b" * 1100 if long_turn else "Ready."), NOW)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        owner_workspace._ensure_schema(registry)
+        projects_db.link_project_conversation(registry, name, project.id)
+        with kanban_db.write_txn(registry):
+            registry.execute("DELETE FROM project_review_state WHERE project_id=?", (project.id,))
+    assert review.review_tick(NOW) == 1
+    task = _open_review(root, project)
+    body = _frozen_body(task)
+    assert "Not available:" not in body and "Left out:" not in body and "not linked" not in body
+    assert ("Shortened to the character limit:" in body) == long_turn
+    assert ("Removed by the character limit:" in body) == long_turn
+    _complete_review(task, [])
+    assert review.review_tick(NOW + 1) == 0
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        brief = projects_db.get_project_review_brief(registry, project.id)
+    assert bool(brief["cut_note"]) == long_turn
+    for kind in ("partial_text", "removed_text") if long_turn else ():
+        assert records.NOTICE_KINDS[kind] in brief["cut_note"], kind
+
+
+def test_yesterdays_open_review_harvests_under_its_own_day(root, monkeypatch):
+    project = _quiet_project(root)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
+        tid = board.execute("SELECT id FROM tasks LIMIT 1").fetchone()[0]
+        kanban_db.add_comment(board, tid, "default", "The room is ready to book.")
+    assert review.review_tick(NOW) == 1
+    task = _open_review(root, project)
+    assert review.review_tick(NOW + 86400) == 0
+    assert _open_review(root, project) == task
+    _complete_review(task, [])
+    assert review.review_tick(NOW + 86401) == 0
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        rows = [dict(r) for r in registry.execute(
+            "SELECT review_date,quiet,covered_from,covered_to FROM project_review_briefs WHERE project_id=? ORDER BY review_date",
+            (project.id,),
+        )]
+        spent_yesterday = review.budget(registry, "2026-11-09")
+        spent_today = review.budget(registry, "2026-11-10")
+    assert [r["review_date"] for r in rows] == ["2026-11-09", "2026-11-10"]
+    assert [r["quiet"] for r in rows] == [0, 1]
+    assert spent_yesterday == (1, 0) and spent_today == (0, 0)
+
+
+def test_the_result_check_knows_every_notice_kind_the_reader_can_write():
+    """Built from the one shared list: a kind the check did not know would lose its notice between input and brief."""
+    kinds = list(records.NOTICE_KINDS)
+    # One cut per kind, each on its own source, so no other kind's line can stand in for a missing one.
+    cuts = [{"source": records._SOURCES[n], "shown": 1, "total": 3, "reason": kind} for n, kind in enumerate(kinds)]
+    frozen = records._freeze({"project": [{"name": "Plan"}]}, cuts)
+    _sources, note = review._frozen_sources(frozen["text"])
+    assert kinds and len(frozen["cuts"]) == len(kinds)
+    for cut in frozen["cuts"]:
+        assert records.cut_line(cut) in note, cut["reason"]
+
+
+def test_several_kinds_of_cut_notice_reach_the_stored_brief_within_the_owner_text_policy(root, monkeypatch):
+    """A long comment, more comments than the window, a long first turn and an unreadable automation store at once."""
+    from hermes_cli.owner_text import check_owner_text
+
+    project = _quiet_project(root)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    name = "raphael-owner-" + "e" * 32
+    _owner_turn(root, name, "resp_cut_kinds", "Choose the room. " + "b" * 1100, NOW)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        owner_workspace._ensure_schema(registry)
+        projects_db.link_project_conversation(registry, name, project.id)
+        with kanban_db.write_txn(registry):
+            registry.execute("DELETE FROM project_review_state WHERE project_id=?", (project.id,))
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
+        tid = board.execute("SELECT id FROM tasks LIMIT 1").fetchone()[0]
+        for n in range(60):
+            kanban_db.add_comment(board, tid, "default", "The room is chosen. " + ("a" * 600 if n == 30 else f"Note {n}."))
+    (root / "cron").mkdir(exist_ok=True)
+    (root / "cron" / "jobs.json").write_text("{")
+    built = []
+    real = records.build_review_input
+
+    def reading(*args, **kwargs):
+        built.append(real(*args, **kwargs))
+        return built[-1]
+
+    monkeypatch.setattr(records, "build_review_input", reading)
+    assert review.review_tick(NOW) == 1
+    cuts = built[-1]["cuts"]
+    written = [records.cut_line(cut) for cut in cuts]
+    assert {"limit", "partial_text", "removed_text", "not_available"} <= {cut["reason"] for cut in cuts}
+    task = _open_review(root, project)
+    assert all(line in _frozen_body(task) for line in written)
+    _complete_review(task, [])
+    assert review.review_tick(NOW + 1) == 0
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        note = projects_db.get_project_review_brief(registry, project.id)["cut_note"]
+    assert all(line in note for line in written)
+    # The note is only notice lines, which the input cap counts; the owner reads it unchanged.
+    assert len(note.encode("utf-8")) <= records.TOTAL_INPUT_CAP_BYTES
+    assert check_owner_text(note, "planner_prose") == note

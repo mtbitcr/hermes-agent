@@ -33,7 +33,8 @@ The daily cap counts every review task started on a review day, retries included
 counted in the transaction that claims it, or that records it when a crash came between the two. When the cap is
 reached, the Projects with news wait in this order: urgent first, then more material events, then more days since
 the last review, then the older Project. The cross-project review has a slot of its own (``take_portfolio_slot``).
-At most ``MAX_NEW_PER_TICK`` new tasks are asked for per tick.
+At most ``MAX_NEW_PER_TICK`` new tasks are asked for per tick. Once the day's cap is reached, each waiting Project
+with news gets the day's cap mark (``cap_wait_date``): no brief, and only the project page's brief view explains it.
 
 The harvest accepts only a typed result from the completed planning run and its frozen Project record. The summary,
 the separate brief and their completed review day commit together. Card B-S1 holds review tasks to kanban_show and
@@ -175,11 +176,12 @@ def _review_texts(value: Any, limits: Mapping[str, int], nullable: str) -> dict[
 
 
 def _frozen_sources(body: Optional[str]) -> tuple[dict[str, list[dict]], Optional[str]]:
-    from hermes_cli.owner_project_review_record import _SOURCES
+    from hermes_cli.owner_project_review_record import _SOURCES, NOTICE_KINDS
 
     if not isinstance(body, str):
         raise ReviewRefused("review_input_missing")
     sources = {name: [] for name in _SOURCES}
+    notice_starts = tuple(NOTICE_KINDS.values())
     current = None
     seen = set()
     notices = []
@@ -200,7 +202,7 @@ def _frozen_sources(body: Optional[str]) -> tuple[dict[str, list[dict]], Optiona
                 if not isinstance(item, dict):
                     raise ReviewRefused("review_input_data_invalid")
                 sources[current].append(item)
-            elif line.startswith(("Left out: ", "Not available: ", "Earlier conversation about this project is not linked")):
+            elif line.startswith(notice_starts):
                 notices.append(line)
     except (TypeError, json.JSONDecodeError) as exc:
         raise ReviewRefused("review_input_data_invalid") from exc
@@ -1760,6 +1762,31 @@ def _open_review_task(
     return True
 
 
+def _mark_cap_waits(registry: sqlite3.Connection, news: list[_News], review_day: str, cap: int, now: int) -> None:
+    """The one writer of the cap mark (owner rule of 2026-11-12, point 3), run once after the start loop.
+
+    When the day's started reviews reach the daily cap, each Project with news that holds no review task and is not
+    reviewed on this day gets this day as its mark. The mark is no review: no slot, cursor, reviewed day, brief,
+    classification or backoff clock moves, and a repeated tick of the day leaves the mark as the first one set it.
+    """
+    if not news:
+        return
+    try:
+        if budget(registry, review_day)[0] < cap:
+            return
+        with write_txn(registry):
+            for item in news:
+                registry.execute(
+                    "UPDATE project_review_state SET cap_wait_date = ?, cap_wait_at = ? WHERE project_id = ? "
+                    "AND open_task_id IS NULL AND (last_reviewed_date IS NULL OR last_reviewed_date < ?) "
+                    "AND cap_wait_date IS NOT ?",
+                    (review_day, now, item.project.id, review_day, review_day),
+                )
+    except (sqlite3.Error, OSError) as exc:
+        # No review failure: nothing is marked, and a later tick of the day marks the Projects that still wait.
+        logger.warning("cap_mark_unavailable (%s)", type(exc).__name__)
+
+
 def _request(registry: sqlite3.Connection, settings: ReviewSettings, now: int) -> int:
     review_day = review_date(now, settings.review_hour)
     path = summary._summary_board_path()
@@ -1835,6 +1862,8 @@ def _request(registry: sqlite3.Connection, settings: ReviewSettings, now: int) -
                 board = stack.enter_context(kanban_db.connect_closing(path, board=summary.SUMMARY_BOARD))
             asked += 1
             created += _open_review_task(registry, board, item, review_day, settings.daily_cap, now)
+    # However the loop ended, also on the limit of starts in one tick, the waiting Projects get the day's cap mark.
+    _mark_cap_waits(registry, news, review_day, settings.daily_cap, now)
     return created
 
 

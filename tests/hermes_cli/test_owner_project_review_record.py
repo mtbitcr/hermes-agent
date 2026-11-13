@@ -1025,6 +1025,21 @@ def test_every_combination_of_reductions_is_reported(root, monkeypatch, kinds):
     assert [cut for cut in result["cuts"] if cut["reason"] != "total_cap"] == uncapped["cuts"]
     _unknown_is_never_a_number(result)
     _unknown_is_never_a_number(uncapped)
+    # The result check reads the stored brief's cut note out of this text: it must keep the notice of every kind.
+    from hermes_cli import owner_project_review as review
+
+    noted = review._frozen_sources(result["text"])[1] or ""
+    for cut in result["cuts"]:
+        assert cut["reason"] in record.NOTICE_KINDS, cut
+        assert record.cut_line(cut) in noted, cut
+
+
+def test_each_notice_kind_starts_its_line_with_the_words_the_shared_list_names():
+    """The result check reads a notice by the words of its kind in the one shared list; the writer must use them."""
+    record = _record()
+    for kind, words in record.NOTICE_KINDS.items():
+        cut = {"source": "earlier_reviews", "shown": 1, "total": 3, "reason": kind}
+        assert record.cut_line(cut).startswith(words), kind
 
 
 def test_review_finding_1_a_clipped_comment_and_an_emptied_reply_are_cuts(root):

@@ -303,3 +303,50 @@ def test_per_profile_isolation(tmp_path):
         a.close()
         b.close()
 
+
+
+def _review_state_row(conn, project_id):
+    return dict(conn.execute("SELECT * FROM project_review_state WHERE project_id = ?", (project_id,)).fetchone())
+
+
+def test_the_cap_mark_of_the_review_state_is_stored_and_read_back(conn):
+    pid = pdb.create_project(conn, name="Meeting Plan", folders=["/m"])
+    with sqlite_util.write_txn(conn):
+        conn.execute("INSERT INTO project_review_state (project_id, updated_at) VALUES (?, ?)", (pid, 5))
+    assert (_review_state_row(conn, pid)["cap_wait_date"], _review_state_row(conn, pid)["cap_wait_at"]) == (None, None)
+    with sqlite_util.write_txn(conn):
+        conn.execute(
+            "UPDATE project_review_state SET cap_wait_date = ?, cap_wait_at = ? WHERE project_id = ?",
+            ("2026-11-09", 1794207600, pid),
+        )
+    row = _review_state_row(conn, pid)
+    assert (row["cap_wait_date"], row["cap_wait_at"], row["updated_at"]) == ("2026-11-09", 1794207600, 5)
+
+
+def test_an_older_review_state_without_the_cap_mark_still_loads(tmp_path):
+    path = tmp_path / "projects.db"
+    old = pdb.connect(db_path=path)
+    try:
+        pid = pdb.create_project(old, name="Meeting Plan", folders=["/m"])
+        with sqlite_util.write_txn(old):
+            old.execute(
+                "INSERT INTO project_review_state (project_id, event_cursor, last_reviewed_date, input_too_large_date, "
+                "updated_at) VALUES (?, ?, ?, ?, ?)", (pid, 7, "2026-11-08", "2026-11-07", 5),
+            )
+        # The store as it was before the mark: the state table without its two columns.
+        old.execute("ALTER TABLE project_review_state DROP COLUMN cap_wait_at")
+        old.execute("ALTER TABLE project_review_state DROP COLUMN cap_wait_date")
+        old.commit()
+        before = _review_state_row(old, pid)
+        assert "cap_wait_date" not in before and "cap_wait_at" not in before
+    finally:
+        old.close()
+    pdb._INITIALIZED_PATHS.clear()
+    upgraded = pdb.connect(db_path=path)
+    try:
+        row = _review_state_row(upgraded, pid)
+        assert {name: row[name] for name in before} == before
+        assert (row["cap_wait_date"], row["cap_wait_at"]) == (None, None)
+        assert [project.id for project in pdb.list_projects(upgraded)] == [pid]
+    finally:
+        upgraded.close()

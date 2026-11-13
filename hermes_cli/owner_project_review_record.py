@@ -47,23 +47,31 @@ class ReviewInput(TypedDict):
     decision_cursor: str | None
 
 
+# Every kind of cut notice, by cut reason, with the words its line starts with. ``cut_line`` writes the lines from
+# this list and the result check recognises them by it, so a kind added here reaches the stored brief.
+NOTICE_KINDS = {
+    "limit": "Left out: ", "total_cap": "Left out: ", "not_available": "Not available: ",
+    "unlinked": "Earlier conversation about this project is not linked",
+    "partial_text": "Shortened to the character limit: ", "removed_text": "Removed by the character limit: ",
+}
+
+
 def cut_line(cut: Cut) -> str:
     """Render an omission independently of the model's response."""
     label = {
         "proposals": "plan proposals", "last_review_settled": "settled items of the last review",
         "last_review_fields": "fields of the last review besides its open items",
     }.get(cut["source"], cut["source"].replace("_", " "))
+    start = NOTICE_KINDS[cut["reason"]]
     if cut["reason"] == "not_available":
-        return f"Not available: {label}."
+        return f"{start}{label}."
     if cut["reason"] == "unlinked":
-        return "Earlier conversation about this project is not linked and was not read."
-    if cut["reason"] == "partial_text":
-        return f"Shortened to the character limit: {cut['total'] - cut['shown']} of the {cut['total']} texts read in {label}."
-    if cut["reason"] == "removed_text":
-        return f"Removed by the character limit: {cut['total'] - cut['shown']} of the {cut['total']} texts read in {label}."
+        return f"{start} and was not read."
+    if cut["reason"] in ("partial_text", "removed_text"):
+        return f"{start}{cut['total'] - cut['shown']} of the {cut['total']} texts read in {label}."
     if cut["total"] is None:
-        return f"Left out: {label} beyond the {cut['shown']} shown; part was not read, so the total is not known."
-    return f"Left out: {cut['total'] - cut['shown']} of {cut['total']} {label}."
+        return f"{start}{label} beyond the {cut['shown']} shown; part was not read, so the total is not known."
+    return f"{start}{cut['total'] - cut['shown']} of {cut['total']} {label}."
 
 
 def _cut_record(cuts: list[Cut], source: str, reason: str, shown: int, given: int, total: int | None = None) -> Cut:
