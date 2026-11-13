@@ -508,6 +508,75 @@ def read_committed_owner_run_receipt(
         conn.close()
 
 
+def committed_owner_receipt_for_proposal(
+    *, operation: str, idempotency_key: str | None, authority_digest: str | None,
+) -> bool:
+    """Whether one proposal's change is applied in the native receipts store.
+
+    True when a ``committed`` receipt for ``operation`` carries that
+    ``idempotency_key`` or that ``authority_digest`` and its stored result
+    records success. The native commit lands before the conversation store
+    records the run's completion, so a restart between the two leaves a
+    released claim whose change was applied; this is the read that tells the
+    two apart.
+
+    The result decides, not the status: the native plan path commits its
+    refusals too, and a result recording ``ok`` exactly false (the zero-change
+    ``conflict``) applied nothing. Every matching receipt is read. One whose
+    result is neither a refusal nor a success as
+    :func:`decode_committed_owner_receipt` reads it raises
+    :class:`OwnerReceiptUnreadable`, whatever the others record; otherwise one
+    success is enough, since a refusal of one attempt never undoes a change
+    another attempt committed.
+
+    Read-only: the canonical owner-executor store (see
+    :func:`owner_executor_home`) is opened ``mode=ro``; no store is created and
+    no schema or row is written. No store at all provably holds no receipt. A
+    store that cannot be read raises :class:`OwnerReceiptUnreadable`:
+    uncertainty never reads as "applied" or as "not applied".
+    """
+    try:
+        with _owner_executor_scope():
+            path = projects_db.projects_db_path()
+        path.stat()
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    except FileNotFoundError:
+        return False
+    except (OSError, sqlite3.Error) as exc:
+        raise OwnerReceiptUnreadable(
+            "the owner receipts store could not be read"
+        ) from exc
+    try:
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'owner_workspace_receipts'"
+        ).fetchone() is None:
+            return False
+        rows = conn.execute(
+            "SELECT result_json FROM owner_workspace_receipts "
+            "WHERE status = 'committed' AND operation = ? "
+            "AND (idempotency_key = ? OR authority_digest = ?)",
+            (operation, idempotency_key, authority_digest),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise OwnerReceiptUnreadable(
+            "the owner receipts store could not be read"
+        ) from exc
+    finally:
+        conn.close()
+    applied = False
+    for (result_json,) in rows:
+        try:
+            result = json.loads(result_json)
+        except (TypeError, ValueError):
+            result = None
+        if isinstance(result, dict) and result.get("ok") is False:
+            continue
+        decode_committed_owner_receipt(result_json, operation)
+        applied = True
+    return applied
+
+
 def _is_retryable_confirmation_timeout(row: sqlite3.Row) -> bool:
     """Return whether a terminal receipt records silence, not an owner denial."""
     if row["status"] != "denied" or not row["result_json"]:
