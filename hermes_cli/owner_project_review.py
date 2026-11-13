@@ -1480,6 +1480,23 @@ def _state_row(registry: sqlite3.Connection, project_id: str, now: int) -> sqlit
     return registry.execute("SELECT * FROM project_review_state WHERE project_id = ?", (project_id,)).fetchone()
 
 
+def _read_news(
+    registry: sqlite3.Connection, project: projects_db.Project, state: Mapping[str, Any]
+) -> tuple[ReviewBatch, bool]:
+    """What a review of the Project would read since ``state``, and whether that is news. It reads, read-only.
+
+    News is a material or urgent review event past the stored cursors, or a moved head of the linked conversation.
+    The start loop and the cap mark both ask here, so the two never differ on it.
+    """
+    from hermes_cli.owner_project_review_record import read_conversation_news
+
+    batch = read_review_events(project, _cursors(state))
+    conversation_cursor, _ = read_conversation_news(registry, project.id)
+    batch = ReviewBatch(batch.cursors, batch.material + (conversation_cursor != state["conversation_cursor"]),
+                        batch.urgent, batch.newest, conversation_cursor)
+    return batch, bool(batch.material or batch.urgent)
+
+
 def _due(state: Mapping[str, Any], review_day: str, now: int) -> bool:
     """No open task, the review day not yet reviewed, and after a failure the backoff passed (from ``updated_at``)."""
     if state["open_task_id"] is not None:
@@ -1762,25 +1779,47 @@ def _open_review_task(
     return True
 
 
-def _mark_cap_waits(registry: sqlite3.Connection, news: list[_News], review_day: str, cap: int, now: int) -> None:
+def _mark_cap_waits(
+    registry: sqlite3.Connection, news: list[_News], held: list[tuple[projects_db.Project, Mapping[str, Any]]],
+    review_day: str, cap: int, now: int,
+) -> None:
     """The one writer of the cap mark (owner rule of 2026-11-12, point 3), run once after the start loop.
 
     When the day's started reviews reach the daily cap, each Project with news that holds no review task and is not
-    reviewed on this day gets this day as its mark. The mark is no review: no slot, cursor, reviewed day, brief,
-    classification or backoff clock moves, and a repeated tick of the day leaves the mark as the first one set it.
+    reviewed on this day gets this day as its mark: those the start loop read with news, and those ``_due`` held back
+    from a start (the input did not fit on this day, a failed review backs off, the day's further review is used).
+    Only then is a held-back Project's news read, read-only and as the start loop reads it, and not once it has the
+    day's mark. The mark is no review: no slot, cursor, reviewed day, brief, classification or backoff clock moves,
+    and a repeated tick of the day leaves the mark as the first one set it.
     """
-    if not news:
+    if not news and not held:
         return
     try:
         if budget(registry, review_day)[0] < cap:
             return
+        waiting = [item.project.id for item in news]
+        for project, state in held:
+            if (
+                state["open_task_id"] is not None
+                or (state["last_reviewed_date"] is not None and state["last_reviewed_date"] >= review_day)
+                or state["cap_wait_date"] == review_day
+            ):
+                continue
+            try:
+                if _read_news(registry, project, state)[1]:
+                    waiting.append(project.id)
+            except (sqlite3.Error, OSError, ValueError) as exc:
+                # No review failure: this Project stays unmarked in this tick, and the others get their mark.
+                logger.warning("cap_mark_news_unavailable: Project %s (%s)", project.id, type(exc).__name__)
+        if not waiting:
+            return
         with write_txn(registry):
-            for item in news:
+            for project_id in waiting:
                 registry.execute(
                     "UPDATE project_review_state SET cap_wait_date = ?, cap_wait_at = ? WHERE project_id = ? "
                     "AND open_task_id IS NULL AND (last_reviewed_date IS NULL OR last_reviewed_date < ?) "
                     "AND cap_wait_date IS NOT ?",
-                    (review_day, now, item.project.id, review_day, review_day),
+                    (review_day, now, project_id, review_day, review_day),
                 )
     except (sqlite3.Error, OSError) as exc:
         # No review failure: nothing is marked, and a later tick of the day marks the Projects that still wait.
@@ -1791,6 +1830,7 @@ def _request(registry: sqlite3.Connection, settings: ReviewSettings, now: int) -
     review_day = review_date(now, settings.review_hour)
     path = summary._summary_board_path()
     news: list[_News] = []
+    held: list[tuple[projects_db.Project, Mapping[str, Any]]] = []
     created = asked = 0
     with contextlib.ExitStack() as stack:
         board: Optional[sqlite3.Connection] = None
@@ -1819,18 +1859,15 @@ def _request(registry: sqlite3.Connection, settings: ReviewSettings, now: int) -
                 continue
             state = _state_row(registry, project.id, now)
             if not _due(state, review_day, now):
+                # No start today, but the day's cap mark may still be due to it.
+                held.append((project, state))
                 continue
             try:
-                batch = read_review_events(project, _cursors(state))
-                from hermes_cli.owner_project_review_record import read_conversation_news
-
-                conversation_cursor, _ = read_conversation_news(registry, project.id)
-                batch = ReviewBatch(batch.cursors, batch.material + (conversation_cursor != state["conversation_cursor"]),
-                                    batch.urgent, batch.newest, conversation_cursor)
+                batch, has_news = _read_news(registry, project, state)
             except (sqlite3.Error, OSError, ValueError) as exc:
                 logger.warning("project review: cannot read the events of Project %s (%s)", project.id, exc)
                 continue
-            if batch.material or batch.urgent:
+            if has_news:
                 news.append(_News(project, state, batch))
             else:
                 try:
@@ -1863,7 +1900,7 @@ def _request(registry: sqlite3.Connection, settings: ReviewSettings, now: int) -
             asked += 1
             created += _open_review_task(registry, board, item, review_day, settings.daily_cap, now)
     # However the loop ended, also on the limit of starts in one tick, the waiting Projects get the day's cap mark.
-    _mark_cap_waits(registry, news, review_day, settings.daily_cap, now)
+    _mark_cap_waits(registry, news, held, review_day, settings.daily_cap, now)
     return created
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -18,6 +19,8 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from hermes_cli import kanban_db as kb, owner_workspace as ow, projects_db
+from plugins.dashboard_auth.raphael_workspace import model_policy
+from tests.hermes_cli.test_owner_project_review_result import _quiet_project, _round3_drive
 from tools import approval
 
 NOW = int(datetime(2026, 11, 10, 7, tzinfo=timezone.utc).timestamp())
@@ -302,6 +305,84 @@ async def test_a_store_without_the_cap_mark_columns_reads_as_before_and_the_read
     assert asked["raphael_review"] == STORED
     assert asked["raphael_summary"] == plain["raphael_summary"]
     assert _dump(kb.kanban_home() / "projects.db") == before
+
+
+@pytest.mark.asyncio
+async def test_a_project_whose_input_an_earlier_tick_refused_shows_the_explanation_once_the_cap_is_full(
+    project_review, monkeypatch,
+):
+    root = kb.kanban_home()
+    registry = root / "projects.db"
+    project_id = project_review["project_id"]
+    day, instant = "2026-11-11", NOW + 86400
+    monkeypatch.setattr(time, "time", lambda: instant)
+    monkeypatch.setattr(
+        model_policy, "configured_assignment_for", lambda profile: model_policy.assignment_for(profile, "anthropic"),
+    )
+    if not kb.kanban_db_path(board=kb.DEFAULT_BOARD).exists():
+        kb.create_board(slug=kb.DEFAULT_BOARD, name="Default")
+    # The newest brief holds more open items than a review input fits, so each review of the Project is refused.
+    open_items = [
+        {"item": f"t_open_{index:04d}_" + "x" * 80, "class": "still actionable", "evidence": [], "event_revision": 0}
+        for index in range(400)
+    ]
+    with projects_db.connect_closing() as registry_conn:
+        projects_db.write_project_review_brief(
+            registry_conn, project_id, review_date="2026-11-10", covered_from=None, covered_to="2026-11-10",
+            headline="The room needs work.", what_changed="Much work is open.", next_step="Book the room.",
+            classification=open_items, written_at=NOW,
+        )
+        registry_conn.execute(
+            "INSERT INTO project_review_state (project_id, last_reviewed_date, last_reviewed_at, updated_at) "
+            "VALUES (?, ?, ?, ?)", (project_id, "2026-11-10", NOW, NOW),
+        )
+        registry_conn.commit()
+    with kb.connect_closing(board=project_review["board"]) as board:
+        card = kb.create_task(board, title="Book the room", project_id=project_id)
+        for index in range(4):
+            kb.add_comment(board, card, "default", f"The room has news {index}.")
+
+    def configure(*allowed):
+        (root / "config.yaml").write_text(yaml.safe_dump({
+            "gateway": {"api_server": {"owner_workspace": {"enabled": True}}},
+            "owner_review": {"enabled": True, "allowlist": list(allowed), "daily_cap": 1},
+        }))
+
+    async def drive(at):
+        # One tick of the dispatcher loop in a worker thread; its patches are undone before the client runs here.
+        with pytest.MonkeyPatch.context() as dispatch:
+            await asyncio.get_running_loop().run_in_executor(None, _round3_drive, dispatch, at)
+
+    configure(project_id)
+    await drive(instant)
+    state = (
+        "SELECT input_too_large_date, open_task_id, cap_wait_date, cap_wait_at FROM project_review_state "
+        "WHERE project_id = ?"
+    )
+    assert _rows(registry, state, project_id) == [(day, None, None, None)]
+    # A later tick of the day: another Project takes the day's one slot.
+    small = _quiet_project(root, "Small Plan", created_at=NOW)
+    with kb.connect_closing(board=small.board_slug) as board:
+        kb.add_comment(board, board.execute("SELECT id FROM tasks LIMIT 1").fetchone()[0], "default", "The room is free.")
+    configure(project_id, small.id)
+    await drive(instant + 60)
+    assert _rows(registry, "SELECT project_reviews, portfolio_reviews FROM review_budget WHERE review_date = ?", day) == [
+        (1, 0),
+    ]
+    assert _rows(registry, state, project_id) == [(day, None, day, instant + 60)]
+    plain, asked = await _snapshots(project_review)
+
+    assert set(asked) - set(plain) == {"raphael_review"}
+    assert {key: value for key, value in asked.items() if key != "raphael_review"} == plain
+    assert asked["raphael_review"] == {
+        "latest": _explanation(day, day, instant + 60),
+        "history": [{"review_date": "2026-11-10", "headline": "The room needs work."}],
+    }
+    saved = json.loads(SAVED_EXAMPLE.read_text(encoding="utf-8"))["body"]["data"]["raphael_review"]
+    assert sorted(asked["raphael_review"]["latest"]) == sorted(saved["latest"])
+    assert {key: type(value) for key, value in asked["raphael_review"]["latest"].items()} == {
+        key: type(value) for key, value in saved["latest"].items()
+    }
 
 
 @pytest.fixture
