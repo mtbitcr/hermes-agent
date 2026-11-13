@@ -2,8 +2,11 @@
 
 ``review_tick`` runs once per dispatcher tick. Once per Vienna day, from the stored review hour on, it looks at each
 allowlisted active Project: a Project with no news since its last review is settled by the kernel alone, and a Project
-with news gets one review task on the summary board. A daily cap counts every review task, retries included, and keeps
-one more slot for the cross-project review. Everything is off until the owner switches it on.
+with news gets one review task on the summary board. A Project whose work is complete (owner rule of 2026-11-13) gets
+that one review only when it was reviewed before and has news since its last review. Without news it gets no task and
+no quiet brief, and its last brief stays; never reviewed, it gets none. Its open review task, and a stored review whose
+closures are not finished, are finished as an active Project's. A daily cap counts every review task, retries included,
+and keeps one more slot for the cross-project review. Everything is off until the owner switches it on.
 
 Card B1 has no result reader yet (card B5), so its harvest refuses every finished review and counts a failure.
 """
@@ -1178,3 +1181,203 @@ def test_tick_under_the_worker_environment_reaches_every_store(root, owner, monk
     assert _budget(root, "2026-11-09") == (2, 0)
     assert _rows(profile_home / "projects.db", "SELECT count(*) FROM project_review_state") == [(0,)]
     assert {name: os.environ[name] for name in pinned} == pinned
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# A Project whose work completes (owner rule of 2026-11-13): one more review for its news, and its reviews finished.
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _result(what_changed: str) -> dict:
+    """A result the harvest accepts: plain texts that name a work title of the input, and nothing to classify."""
+    return {"project_review": {
+        "summary": {"outcome": "The work is done.", "next_action": "Check the finished work.", "owner_decision": None},
+        "brief": {"headline": "The work is done.", "what_changed": what_changed,
+                  "next_step": "Check the finished work.", "needs_you": None},
+        "classification": [], "proposed_closures": [],
+    }}
+
+
+_BRIEFS = "SELECT review_date, quiet FROM project_review_briefs WHERE project_id = ? ORDER BY review_date"
+
+
+def test_a_reviewed_project_that_completes_with_news_is_reviewed_once_the_next_morning(root, owner):
+    cards = [*_CARDS, "Print the name tags"]
+    with _written_at(_at(2026, 11, 12, 9)):
+        garden = _project(root, owner, "Garden Plan", cards)
+    _switch_on(root, garden["project_id"])
+    ops = _ops()
+    # The morning brief of 2026-11-13, while the work is still open.
+    assert ops.review_tick(now=_at(2026, 11, 13, 7)) == 1
+    [morning] = _review_tasks(root)
+    _finish(root, morning.id, _result("Book the meeting room is planned for today."))
+    assert ops.review_tick(now=_at(2026, 11, 13, 7, 5)) == 0
+    assert _state(root, garden)["last_reviewed_date"] == "2026-11-13"
+    # Then four changes go out and all work completes; the day itself is reviewed already.
+    for hour, title in zip((10, 11, 12, 13), cards):
+        with _written_at(_at(2026, 11, 13, hour)):
+            _complete_cards(root, garden, [title])
+    assert _steward_state(garden) == "complete"
+    assert ops.review_tick(now=_at(2026, 11, 13, 18)) == 0
+
+    assert ops.review_tick(now=_at(2026, 11, 14, 7)) == 1
+
+    [task] = _review_tasks(root)
+    assert task.idempotency_key == f"{CREATOR}:{garden['project_id']}:2026-11-14:0"
+    assert ops.review_window(task.body) == ("2026-11-14", "2026-11-14")
+    assert _budget(root, "2026-11-14") == (1, 0)
+    _finish(root, task.id, _result("Print the name tags is done, and so is the other work."))
+    assert ops.review_tick(now=_at(2026, 11, 14, 7, 5)) == 0
+    # No news since that review: the day after has no review and no quiet brief.
+    assert ops.review_tick(now=_at(2026, 11, 15, 7)) == 0
+
+    assert _review_tasks(root) == []
+    state = _state(root, garden)
+    assert (state["open_task_id"], state["last_reviewed_date"]) == (None, "2026-11-14")
+    assert _rows(root / "projects.db", _BRIEFS, (garden["project_id"],)) == [("2026-11-13", 0), ("2026-11-14", 0)]
+    assert _budget(root, "2026-11-15") == (0, 0)
+
+
+def test_a_reviewed_complete_project_without_news_gets_no_task_and_no_brief_row(root, owner, monkeypatch):
+    with _written_at(_at(2026, 11, 12, 9)):
+        shed = _project(root, owner, "Garden Shed", ["Paint the shed"])
+        _complete_cards(root, shed, ["Paint the shed"])
+        porch = _project(root, owner, "Front Porch", ["Fix the steps"])
+        desk = _project(root, owner, "Planning Desk", _CARDS)
+        with _board(root, desk["board"]) as conn:
+            worker_task = kanban_db.create_task(
+                conn, title="Plan the next milestone", assignee=PLANNER, project_id=desk["project_id"],
+            )
+    # Both were reviewed on 2026-11-13 with every event up to then read; the shed's last brief is of that day.
+    _seed_reviewed(root, shed, "2026-11-13")
+    _seed_reviewed(root, porch, "2026-11-13")
+    with projects_db.connect_closing(root / "projects.db") as conn:
+        projects_db.write_project_review_brief(
+            conn, shed["project_id"], review_date="2026-11-13", covered_from=None, covered_to="2026-11-13",
+            headline="The shed is painted.", what_changed="Paint the shed is done.", next_step="Enjoy the shed.",
+            written_at=_at(2026, 11, 13, 7, 5),
+        )
+    # The porch's work completes after its review, which is news since then; the shed has none.
+    with _written_at(_at(2026, 11, 13, 15)):
+        _complete_cards(root, porch, ["Fix the steps"])
+    assert (_steward_state(shed), _steward_state(porch)) == ("complete", "complete")
+    _switch_on(root, shed["project_id"], porch["project_id"])
+    shed_briefs = "SELECT * FROM project_review_briefs WHERE project_id = ?"
+    before = (_state(root, shed), _rows(root / "projects.db", shed_briefs, (shed["project_id"],)))
+    profile_home = root / "profiles" / PLANNER
+    profile_home.mkdir(parents=True)
+    with projects_db.connect_closing(profile_home / "projects.db"):
+        pass
+    _configure(profile_home, enabled=False, allowlist=[])
+    _enter_planning_worker(monkeypatch, root, desk["board"], worker_task)
+    pinned = {name: os.environ[name] for name in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD")}
+    own_board = _board_db(root, desk["board"])
+    assert Path(pinned["HERMES_KANBAN_DB"]).resolve() == own_board.resolve()
+    own_cards = _rows(own_board, "SELECT id, title, status FROM tasks ORDER BY id")
+
+    made = _ops().review_tick(now=_at(2026, 11, 14, 7))
+
+    # The independent count: the rows on the root summary board, read on a raw read-only connection.
+    on_board = _rows(
+        _board_db(root, BOARD), "SELECT title, idempotency_key FROM tasks WHERE created_by = ?", (CREATOR,),
+    ) if _board_db(root, BOARD).exists() else []
+    assert made == len(on_board) == 1
+    assert on_board == [(TITLE + "Front Porch", f"{CREATOR}:{porch['project_id']}:2026-11-14:0")]
+    # The shed's review row and its last brief stay as they were: no task, no quiet brief row.
+    assert (_state(root, shed), _rows(root / "projects.db", shed_briefs, (shed["project_id"],))) == before
+    assert _state(root, porch)["open_task_id"] is not None
+    assert _state(root, desk) is None
+    assert _budget(root, "2026-11-14") == (1, 0)
+    assert _rows(own_board, "SELECT id, title, status FROM tasks ORDER BY id") == own_cards
+    assert _rows(profile_home / "projects.db", "SELECT count(*) FROM project_review_state") == [(0,)]
+    assert _rows(profile_home / "projects.db", "SELECT count(*) FROM review_budget") == [(0,)]
+    assert not _board_db(profile_home, BOARD).exists()
+    assert {name: os.environ[name] for name in pinned} == pinned
+
+
+def test_an_open_review_of_a_project_that_completes_is_harvested_and_its_brief_stored(root, owner):
+    with _written_at(_at(2026, 11, 12, 9)):
+        garden = _project(root, owner, "Garden Plan", _CARDS)
+    _switch_on(root, garden["project_id"])
+    ops = _ops()
+    assert ops.review_tick(now=_at(2026, 11, 13, 7)) == 1
+    [task] = _review_tasks(root)
+    # The work completes while the review task is still open.
+    with _written_at(_at(2026, 11, 13, 7, 1)):
+        _complete_cards(root, garden, _CARDS)
+    assert _steward_state(garden) == "complete"
+
+    assert ops.review_tick(now=_at(2026, 11, 13, 7, 2)) == 0
+
+    assert [(t.id, t.status) for t in _review_tasks(root, archived=True)] == [(task.id, "ready")]
+    assert _state(root, garden)["open_task_id"] == task.id
+    _finish(root, task.id, _result("Book the meeting room is done."))
+    assert ops.review_tick(now=_at(2026, 11, 13, 7, 5)) == 0
+
+    state = _state(root, garden)
+    assert (state["open_task_id"], state["last_reviewed_date"], state["failures"]) == (None, "2026-11-13", 0)
+    assert _rows(root / "projects.db", _BRIEFS, (garden["project_id"],)) == [("2026-11-13", 0)]
+    assert [t.status for t in _review_tasks(root, archived=True)] == ["archived"]
+    assert _budget(root, "2026-11-13") == (1, 0)
+
+
+def test_a_stored_review_with_an_unfinished_closure_is_finished_after_the_project_completes(root, owner, caplog):
+    with _written_at(_at(2026, 11, 12, 9)):
+        garden = _project(root, owner, "Garden Plan", ["Send the invitations"])
+        evidence = dict(
+            schema_version=1, need="Repeated capability gap", expected_benefit="Complete work safely",
+            requested_scope={flag: False for flag in kanban_db.RECOMMENDATION_SCOPE_FLAGS},
+            risks="Low", cost="No added cost", rollback="Remove the staged configuration",
+        )
+        with _board(root, garden["board"]) as conn:
+            suggestion = kanban_db.create_recommendation(
+                conn, project_id=garden["project_id"], target_profile="worker", recommendation_kind="skill",
+                recommendation_subject_id="meeting-room", recommendation_label="Book the room",
+                recommendation_evidence=evidence, provenance_authority="static-analyzer",
+                provenance_ref="finding-123", provenance_observed_at=1_700_000_000,
+            )
+            card = kanban_db.create_task(conn, title="Book a room", project_id=garden["project_id"])
+            assert kanban_db.complete_task(conn, card, summary="The work is delivered.")
+    _switch_on(root, garden["project_id"])
+    ops = _ops()
+    assert ops.review_tick(now=_at(2026, 11, 13, 7)) == 1
+    [task] = _review_tasks(root)
+    _finish(root, task.id, {"project_review": {
+        "summary": {"outcome": "The meeting has a room.", "next_action": "Send the invitations.", "owner_decision": None},
+        "brief": {"headline": "The room is booked.", "what_changed": "Book the room is complete.",
+                  "next_step": "Send the invitations.", "needs_you": None},
+        "classification": [{"item": suggestion, "class": "superseded", "evidence": [f"tasks:{card}"]}],
+        "proposed_closures": [{"recommendation_id": suggestion, "card_id": card, "reason": "The work is delivered.",
+                               "evidence": [f"suggestions:{suggestion}", f"tasks:{card}"]}],
+    }})
+    # A busy Project board leaves the accepted closure of the stored review unfinished.
+    original, target, faults = kanban_db.connect_closing, events._board_path(garden["board"]), []
+
+    def busy_once(path, *args, **kwargs):
+        if Path(path) == target and not faults:
+            faults.append(path)
+            raise sqlite3.OperationalError("database is locked")
+        return original(path, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(kanban_db, "connect_closing", busy_once)
+        assert ops.review_tick(now=_at(2026, 11, 13, 7, 5)) == 0
+    closures = "SELECT recommendation_id, card_id, review_date FROM recommendation_closures"
+    accepted = "SELECT key FROM project_meta WHERE key LIKE 'project_review_accepted:%'"
+    assert len(faults) == 1 and "review_closure_pending" in caplog.text
+    assert [t.status for t in _review_tasks(root, archived=True)] == ["done"]
+    assert _rows(_board_db(root, garden["board"]), closures) == []
+    assert _rows(root / "projects.db", accepted) == [(f"project_review_accepted:{task.id}",)]
+    assert _state(root, garden)["last_reviewed_date"] == "2026-11-13"
+    # Then the last open work completes.
+    with _written_at(_at(2026, 11, 13, 7, 10)):
+        _complete_cards(root, garden, ["Send the invitations"])
+    assert _steward_state(garden) == "complete"
+
+    with _written_at(_at(2026, 11, 13, 7, 15)):
+        assert ops.review_tick(now=_at(2026, 11, 13, 7, 15)) == 0
+
+    assert _rows(_board_db(root, garden["board"]), closures) == [(suggestion, card, "2026-11-13")]
+    assert [t.status for t in _review_tasks(root, archived=True)] == ["archived"]
+    assert _rows(root / "projects.db", accepted) == []
+    assert _rows(root / "projects.db", _BRIEFS, (garden["project_id"],)) == [("2026-11-13", 0)]
