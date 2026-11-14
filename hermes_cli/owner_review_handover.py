@@ -1,7 +1,12 @@
 """The hand-over check of a daily review or portfolio result, inside kanban_complete and before anything is written.
 
 It runs the harvest's own result rules against the task's frozen input, so the reviewer corrects a broken result in the
-same run. It is an early copy of the harvest's verdict, never the authority: it never writes, a broken input or any
+same run. It is an early copy of the harvest's verdict, never the authority. Neither it nor any function it calls
+changes the owner's data or the state of the Hermes home (owner rule 4 of 2026-11-14): the configuration, the stores,
+the secret files, the profile folders and the attachments, with the mode and the change time of each of these files and
+folders. Two effects are not its writes: a bytecode cache file in a __pycache__ folder, which the Python interpreter
+writes when a process first imports a module of the code checkout and which holds no owner data, and the one line of a
+refusal or of a fault that the logger of the process adds to the log file of the process. A broken input or any
 fault of its own lets the completion through to the harvest, and its message and log carry only codes, field paths,
 numbers and kernel ids. It loads no configuration and does not read the daily review switch (owner rule 3 of
 2026-11-14): the tick makes a review task only while the switch is on, and a configuration load prepares a home folder.
