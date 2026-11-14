@@ -119,6 +119,7 @@ def _ready(settings, day, now):
     if heads is None:
         return None
     notes = []
+    written = []  # The written_at of each stored Project brief of the day in scope, quiet ones too.
     with contextlib.closing(owner_workspace._open_read_only_sqlite(
         get_default_hermes_root() / "projects.db", label="projects.db",
     )) as registry:
@@ -134,12 +135,18 @@ def _ready(settings, day, now):
             return None
         for project in visible:
             brief = projects_db.get_project_review_brief(registry, project["project_id"])
-            if brief is None or brief["review_date"] != day or brief["quiet"]:
+            if brief is None or brief["review_date"] != day:
+                continue
+            written.append(brief["written_at"])
+            if brief["quiet"]:
                 continue
             headline = brief["headline"]
             if (isinstance(headline, str) and 1 <= len(headline) <= review._BRIEF_LIMITS["headline"]
                     and check_owner_text(headline, "planner_prose") == headline):
                 notes.append(f'{project["name"]}: {headline}')
+    # Without a stored Project brief of the day there is no notice time and no Project headline to send.
+    if not advised and not written:
+        return None
     waits, read = owner_heads_up._waiting()
     scope = {project["project_id"] for project in visible}
     # An unread board gives neither its wait count nor its questions. Leave the day due for a later tick.
@@ -165,7 +172,8 @@ def _ready(settings, day, now):
     text = "\n".join([f"Your daily project review ({day})", NOTES_LINE if advised else NO_ADVICE_LINE, *lines])
     if len(text) > MAX_MESSAGE:
         text = text[:MAX_MESSAGE - 1] + "…"
-    return (portfolio["written_at"] if advised else now), text
+    # A message without advice is as old as its newest Project brief, never as new as the tick that sends it.
+    return (portfolio["written_at"] if advised else max(written)), text
 
 
 async def tick(runner) -> int:
