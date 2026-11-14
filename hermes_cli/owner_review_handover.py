@@ -23,6 +23,10 @@ def handover_refusal(task: Any, metadata: Any) -> Optional[dict]:
     try:
         if task is None or task.created_by != kanban_db.REVIEW_TASK_CREATOR:
             return None
+        # Only a running attempt can still correct its result. In any other state the completion path answers with
+        # its own lifecycle refusal, as it did before this check.
+        if task.status != "running" or task.current_run_id is None:
+            return None
         from hermes_cli.owner_project_review import read_settings
 
         # Nothing changes while the daily review switch is off; the root config is read, not the worker's profile.

@@ -353,3 +353,81 @@ def test_nothing_changes_while_the_daily_review_switch_is_off(root, monkeypatch,
     assert json.loads(metadata)["project_review"] == bad["project_review"]
     assert review.review_tick(NOW + 1) == 0
     assert _review_state(root, project) == [(task_id, "2026-11-08", 0)]
+
+
+def _stored_rows(root, task_id, stored, *args):
+    """The independent read of the task's row and runs on the summary board and of one stored state in projects.db."""
+    return (
+        _read(_summary_db(root), "SELECT * FROM tasks WHERE id=?", task_id),
+        _read(_summary_db(root), "SELECT * FROM task_runs WHERE task_id=? ORDER BY id", task_id),
+        _read(root / "projects.db", stored, *args),
+    )
+
+
+def _assert_a_second_completion_is_unchanged(root, monkeypatch, caplog, task_id, valid, broken, stored, *args):
+    """Complete the task with ``valid``, then call kanban_complete again with ``broken`` in the same worker.
+
+    The run has ended, so the second call gets the answer of the completion path as it was before the card: the answer
+    the same second call gives with ``valid``, which no refusal of the hand-over check can reach. It asks for no
+    correction, the hand-over check logs nothing for it, and the task's row, its runs and the stored state stay as
+    they were.
+    """
+    with _worker(root, monkeypatch, task_id) as task:
+        done = json.loads(_complete(valid))
+        assert done.get("ok") is True, done
+        assert _read(_summary_db(root), "SELECT status, current_run_id FROM tasks WHERE id=?", task.id) == [
+            ("done", None),
+        ]
+        before = _stored_rows(root, task.id, stored, *args)
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger=LOGGER):
+            raw = _complete(broken)
+        log = caplog.text
+        after = _stored_rows(root, task.id, stored, *args)
+        unchanged = _complete(valid)
+    assert raw == unchanged
+    answer = json.loads(raw)
+    assert "still_running" not in answer and "refusal" not in answer, answer
+    assert "still running" not in raw.lower() and "correct" not in raw.lower(), answer
+    handover = ("review_handover_refused", "portfolio_handover_refused", "review_handover_check_failed")
+    assert not [line for line in log.splitlines() if any(name in line for name in handover)], log
+    assert after == before
+    # Read against an independent count: the first completion is still the task's one run.
+    assert _read(_summary_db(root), "SELECT id, status FROM task_runs WHERE task_id=?", task.id) == [
+        (task.current_run_id, "done"),
+    ]
+
+
+def _advice(line):
+    return {"summary": "Advised.", "metadata": {"portfolio_review": {
+        "conflicts": [], "priorities": [line], "shared_blockers": [],
+    }}}
+
+
+def test_a_second_completion_of_a_finished_review_task_gets_the_unchanged_answer(root, monkeypatch, caplog):
+    project, task_id, _ = _news_project(root, monkeypatch)
+    _assert_a_second_completion_is_unchanged(
+        root, monkeypatch, caplog, task_id,
+        {"summary": "Reviewed.", "metadata": _payload()},
+        {"summary": "Reviewed.", "metadata": _payload(_text(412))},
+        "SELECT * FROM project_review_state WHERE project_id=?", project.id,
+    )
+    # No harvest ran: the registry still holds the review task open, with no failure counted.
+    assert _review_state(root, project) == [(task_id, "2026-11-08", 0)]
+
+
+def test_a_second_completion_of_a_finished_portfolio_task_gets_the_unchanged_answer(root, monkeypatch, caplog):
+    project = _quiet_project(root)
+    (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
+        "enabled": True, "allowlist": [project.id], "portfolio": True,
+    }}))
+    assert review.review_tick(NOW) == 1
+    task_id = _task_with_key(root, f"project-review:portfolio:{DAY}:0")
+    long_line = f"{project.name}: " + _text(201)
+    assert len(long_line) == 215
+    _assert_a_second_completion_is_unchanged(
+        root, monkeypatch, caplog, task_id, _advice(f"{project.name}: Book the room."), _advice(long_line),
+        "SELECT * FROM portfolio_review_briefs",
+    )
+    # No harvest ran: no advice is stored.
+    assert _read(root / "projects.db", "SELECT COUNT(*) FROM portfolio_review_briefs") == [(0,)]
