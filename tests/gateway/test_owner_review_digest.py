@@ -16,6 +16,7 @@ import yaml
 
 from gateway import owner_channel_pause
 from gateway.config import Platform
+from hermes_cli import kanban_db, owner_project_review as review, owner_project_summary as summary
 from hermes_cli import owner_workspace as ow, projects_db
 from hermes_cli.owner_text import check_owner_text
 from tests.gateway.test_owner_heads_up import HOME_CHAT, root  # noqa: F401
@@ -817,3 +818,289 @@ async def test_t8_a_paused_daily_digest_stays_unsent_after_resume_but_the_next_d
     assert len(adapter.sent[0][1]) <= 1500
     assert await digest.tick(runner) == 0
     assert len(adapter.sent) == 1
+
+
+def _two_briefs_and_a_used_attempt(root, ready):
+    """A second Project with its brief of the day, both in the scope of the portfolio brief, and the day's attempt used."""
+    other = _project(root, "Garden Party")
+    _headline(root, other, "2026-11-10", int(time.time()), "The garden is ready.")
+    _scope(root, ready, other)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        assert review.take_portfolio_slot(registry, "2026-11-10", 1, int(time.time()))
+    return other
+
+
+def _no_portfolio_brief(root):
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        registry.execute("DELETE FROM portfolio_review_briefs")
+        registry.commit()
+
+
+def _portfolio_task(day):
+    path = summary._ensure_summary_board()
+    with kanban_db.connect_closing(path, board=summary.SUMMARY_BOARD) as board:
+        return kanban_db.create_task(
+            board, title="Review the Projects together", assignee=summary.PLANNING_ROLE, created_by=review.CREATED_BY,
+            board=summary.SUMMARY_BOARD, idempotency_key=f"project-review:portfolio:{day}:0",
+        )
+
+
+def _task_status(task_id, status):
+    with kanban_db.connect_closing(summary._summary_board_path(), board=summary.SUMMARY_BOARD) as board:
+        if status == "archived":
+            kanban_db.archive_task(board, task_id)
+        else:
+            board.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
+            board.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_day_without_a_portfolio_brief_and_with_its_attempt_used_sends_the_headlines_without_advice(root, ready):
+    _two_briefs_and_a_used_attempt(root, ready)
+    _no_portfolio_brief(root)
+    adapter = Adapter()
+    runner = _runner(adapter)
+    digest = importlib.import_module("gateway.owner_review_digest")
+    assert await digest.tick(runner) == 1
+    lines = adapter.sent[0][1].splitlines()
+    assert lines[:2] == ["Your daily project review (2026-11-10)", "Raphael has no advice across your projects today."]
+    assert sorted(lines[2:]) == ["Garden Party: The garden is ready.", "Meeting Plan: The room is booked."]
+    assert NOTES_LINE not in lines
+    # One digest a day: the told day is not sent again.
+    assert await digest.tick(runner) == 0
+    assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_day_with_a_portfolio_brief_sends_todays_message_without_the_fixed_sentence(root, ready):
+    _two_briefs_and_a_used_attempt(root, ready)
+    adapter = Adapter()
+    digest = importlib.import_module("gateway.owner_review_digest")
+    assert await digest.tick(_runner(adapter)) == 1
+    lines = adapter.sent[0][1].splitlines()
+    assert lines[:2] == ["Your daily project review (2026-11-10)", NOTES_LINE]
+    assert sorted(lines[2:-1]) == ["Garden Party: The garden is ready.", "Meeting Plan: The room is booked."]
+    assert lines[-1] == "Meeting Plan: Prepare the guest list."
+    assert digest.NO_ADVICE_LINE not in lines
+
+
+@pytest.mark.asyncio
+async def test_an_open_portfolio_task_of_the_day_holds_the_message_without_advice_back_until_it_is_archived(root, ready):
+    _two_briefs_and_a_used_attempt(root, ready)
+    _no_portfolio_brief(root)
+    task = _portfolio_task("2026-11-10")
+    adapter = Adapter()
+    runner = _runner(adapter)
+    digest = importlib.import_module("gateway.owner_review_digest")
+    # A done task still waits for its harvest, and a blocked one is archived only by the next portfolio tick.
+    for status in ("ready", "done", "blocked"):
+        _task_status(task, status)
+        assert await digest.tick(runner) == 0
+        assert adapter.sent == [] and not (root / "owner_review_digest.json").exists()
+    _task_status(task, "archived")
+    assert await digest.tick(runner) == 1
+    assert adapter.sent[0][1].splitlines()[1] == "Raphael has no advice across your projects today."
+
+
+@pytest.mark.asyncio
+async def test_a_paused_channel_records_the_day_without_advice_as_paused_and_sends_nothing(root, ready):
+    _two_briefs_and_a_used_attempt(root, ready)
+    _no_portfolio_brief(root)
+    owner_channel_pause.pause()
+    adapter = Adapter()
+    digest = importlib.import_module("gateway.owner_review_digest")
+    assert await digest.tick(_runner(adapter)) == 0
+    assert adapter.sent == []
+    assert json.loads((root / "owner_review_digest.json").read_text(encoding="utf-8"))["told"]["2026-11-10"]["state"] == "paused"
+
+
+def _pause_clock(monkeypatch):
+    """The test clock, with a sleep that moves it, so that ``owner_channel_pause.resume()`` does not really wait."""
+    clock = _clock(monkeypatch)
+    monkeypatch.setattr(time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    return clock
+
+
+def _settle_the_day_inside_a_pause(root, ready, clock, case):
+    """Open a pause, settle 2026-11-10 inside it without a portfolio brief, then resume.
+
+    The two Projects of the scope get their brief of the day strictly inside the window. The day's one portfolio
+    attempt is used up either by a real task that the production review tick counts, refuses and archives, or with
+    no task at all. Returns the second Project.
+    """
+    day = "2026-11-10"
+    owner_channel_pause.pause()
+    clock[0] += 10
+    other = _project(root, "Garden Party")
+    _scope(root, ready, other)
+    _no_portfolio_brief(root)
+    _headline(root, ready, day, clock[0], "The room is booked.")
+    clock[0] += 10
+    _headline(root, other, day, clock[0], "The garden is ready.")
+    clock[0] += 10
+    if case == "used-cap-no-task":
+        with projects_db.connect_closing(root / "projects.db") as registry:
+            assert review.take_portfolio_slot(registry, day, 1, clock[0])
+    else:
+        config = yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8"))
+        config["owner_review"]["daily_cap"] = 0
+        (root / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+        task = _portfolio_task(day)
+        with kanban_db.connect_closing(summary._summary_board_path(), board=summary.SUMMARY_BOARD) as board:
+            assert kanban_db.claim_task(board, task) is not None
+            assert kanban_db.complete_task(board, task, summary="The attempt returned no usable advice.",
+                                           metadata={"portfolio_review": {}})
+        assert review.review_tick(clock[0]) == 0
+        with projects_db.connect_closing(root / "projects.db") as registry:
+            assert review.budget(registry, day)[1] == 1
+            assert projects_db.get_portfolio_review_brief(registry, day) is None
+        with kanban_db.connect_closing(summary._summary_board_path(), board=summary.SUMMARY_BOARD) as board:
+            assert kanban_db.get_task(board, task).status == "archived"
+    clock[0] += 10
+    owner_channel_pause.resume()
+    return other
+
+
+async def _one_watcher_pass(runner, watcher):
+    runner._running = True
+    await asyncio.wait_for(watcher(interval=0), 15)
+
+
+def _digest_state(root, day="2026-11-10"):
+    return json.loads((root / "owner_review_digest.json").read_text(encoding="utf-8"))["told"][day]["state"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["archived-refused-task", "used-cap-no-task"])
+async def test_t1_a_day_without_advice_settled_inside_a_pause_is_recorded_paused_when_first_seen_after_the_resume(
+    root, ready, monkeypatch, case,
+):
+    clock = _pause_clock(monkeypatch)
+    _settle_the_day_inside_a_pause(root, ready, clock, case)
+    adapter = Adapter()
+    runner, watcher = _registered_watcher(monkeypatch, adapter)
+    await _one_watcher_pass(runner, watcher)
+    assert adapter.sent == [], "A day settled inside a closed pause window was sent after the resume"
+    assert _digest_state(root) == "paused"
+    # A day that is recorded stays as recorded: a later brief of the day does not make it new.
+    clock[0] += 30
+    _headline(root, ready, "2026-11-10", clock[0], "The room is booked and the guests are invited.")
+    await _one_watcher_pass(runner, watcher)
+    assert adapter.sent == []
+    assert _digest_state(root) == "paused"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("newest", ["Meeting Plan", "Garden Party"])
+@pytest.mark.parametrize("case", ["archived-refused-task", "used-cap-no-task"])
+async def test_t2_a_day_without_advice_whose_newest_brief_was_written_after_the_resume_is_sent_once(
+    root, ready, monkeypatch, case, newest,
+):
+    clock = _pause_clock(monkeypatch)
+    other = _settle_the_day_inside_a_pause(root, ready, clock, case)
+    clock[0] += 30
+    _headline(root, ready if newest == "Meeting Plan" else other, "2026-11-10", clock[0], "The guests are invited.")
+    adapter = Adapter()
+    runner, watcher = _registered_watcher(monkeypatch, adapter)
+    await _one_watcher_pass(runner, watcher)
+    assert len(adapter.sent) == 1
+    lines = adapter.sent[0][1].splitlines()
+    assert lines[:2] == ["Your daily project review (2026-11-10)", "Raphael has no advice across your projects today."]
+    assert sorted(lines[2:]) == sorted([
+        "Garden Party: " + ("The guests are invited." if newest == "Garden Party" else "The garden is ready."),
+        "Meeting Plan: " + ("The guests are invited." if newest == "Meeting Plan" else "The room is booked."),
+    ])
+    assert _digest_state(root) == "sent"
+    await _one_watcher_pass(runner, watcher)
+    assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("portfolio_written", ["inside-the-pause", "before-the-pause"])
+async def test_t3_a_day_with_a_portfolio_brief_keeps_the_written_at_of_that_brief_as_its_notice_time(
+    root, ready, monkeypatch, portfolio_written,
+):
+    clock = _pause_clock(monkeypatch)
+    if portfolio_written == "before-the-pause":
+        clock[0] += 20  # the portfolio brief of the fixture (written at the first second) is strictly before the pause
+    owner_channel_pause.pause()
+    clock[0] += 10
+    if portfolio_written == "inside-the-pause":
+        _no_portfolio_brief(root)
+        _ready(root, ready, "2026-11-10", clock[0])
+    else:
+        # The Project brief of the day is newer than the portfolio brief and written inside the pause.
+        _headline(root, ready, "2026-11-10", clock[0], "The room is booked.")
+    clock[0] += 30
+    owner_channel_pause.resume()
+    adapter = Adapter()
+    runner, watcher = _registered_watcher(monkeypatch, adapter)
+    await _one_watcher_pass(runner, watcher)
+    if portfolio_written == "inside-the-pause":
+        assert adapter.sent == []
+        assert _digest_state(root) == "paused"
+    else:
+        assert len(adapter.sent) == 1
+        lines = adapter.sent[0][1].splitlines()
+        assert lines[:2] == ["Your daily project review (2026-11-10)", NOTES_LINE]
+        assert "Raphael has no advice across your projects today." not in lines
+        assert _digest_state(root) == "sent"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored", ["no-brief", "older-day-only", "outside-the-scope"])
+async def test_t4_a_day_without_advice_and_without_a_stored_project_brief_of_the_day_in_scope_sends_nothing(
+    root, ready, stored,
+):
+    _no_portfolio_brief(root)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        assert review.take_portfolio_slot(registry, "2026-11-10", 1, int(time.time()))
+        if stored == "older-day-only":
+            registry.execute("UPDATE project_review_briefs SET review_date='2026-11-09'")
+        else:
+            registry.execute("DELETE FROM project_review_briefs")
+        registry.commit()
+    if stored == "outside-the-scope":
+        # Not on the allowlist, so its brief of the day is not in the scope of the message.
+        _headline(root, _project(root, "Garden Party"), "2026-11-10", int(time.time()), "The garden is ready.")
+    _waiting(ready, title="Choose a room", reason=QUESTION)
+    adapter = Adapter()
+    digest = importlib.import_module("gateway.owner_review_digest")
+    assert await digest.tick(_runner(adapter)) == 0
+    assert adapter.sent == [] and not (root / "owner_review_digest.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_brief_of_a_project_outside_the_scope_does_not_move_the_notice_time_of_a_day_without_advice(
+    root, ready, monkeypatch,
+):
+    clock = _pause_clock(monkeypatch)
+    _settle_the_day_inside_a_pause(root, ready, clock, "used-cap-no-task")
+    clock[0] += 30
+    # A third Project that is not on the allowlist writes the newest brief of the day, after the resume.
+    _headline(root, _project(root, "Tea Garden"), "2026-11-10", clock[0], "The tea is ready.")
+    adapter = Adapter()
+    runner, watcher = _registered_watcher(monkeypatch, adapter)
+    await _one_watcher_pass(runner, watcher)
+    assert adapter.sent == []
+    assert _digest_state(root) == "paused"
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_brief_written_after_the_resume_moves_the_notice_time_but_adds_no_line(root, ready, monkeypatch):
+    clock = _pause_clock(monkeypatch)
+    other = _settle_the_day_inside_a_pause(root, ready, clock, "used-cap-no-task")
+    clock[0] += 30
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        registry.execute("UPDATE project_review_briefs SET quiet=1, written_at=? WHERE project_id=?",
+                         (clock[0], other["project_id"]))
+        registry.commit()
+    adapter = Adapter()
+    runner, watcher = _registered_watcher(monkeypatch, adapter)
+    await _one_watcher_pass(runner, watcher)
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0][1].splitlines() == [
+        "Your daily project review (2026-11-10)", "Raphael has no advice across your projects today.",
+        "Meeting Plan: The room is booked.",
+    ]
+    assert _digest_state(root) == "sent"

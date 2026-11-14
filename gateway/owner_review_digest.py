@@ -18,7 +18,7 @@ from gateway import owner_channel_pause, owner_heads_up
 from gateway.config import Platform
 from gateway.platforms.api_server_owner_projects import _portfolio_view
 from gateway.status import _release_file_lock, _try_acquire_file_lock
-from hermes_cli import owner_project_review as review, owner_workspace, projects_db
+from hermes_cli import owner_project_review as review, owner_project_summary as summary, owner_workspace, projects_db
 from hermes_cli.owner_text import check_owner_text
 from hermes_constants import get_default_hermes_root, reset_hermes_home_override, set_hermes_home_override
 
@@ -32,6 +32,7 @@ LOCK_FILE_NAME = "owner_review_digest.lock"
 RETRY_WAITS = (5 * 60, 15 * 60)
 # Model prose reaches the owner as notes, never as a request: every action stays in the app.
 NOTES_LINE = "These are Raphael's notes from today's review. To act on any of them, open the app."
+NO_ADVICE_LINE = "Raphael has no advice across your projects today."
 QUOTE_WORDS = 4  # A model line sharing this many consecutive words with a live question (all of a shorter one) quotes it.
 # Cyrillic and Greek letters drawn like Latin ones, so a look-alike spelling still matches the question.
 _LOOK_ALIKES = str.maketrans(
@@ -85,34 +86,67 @@ def _quotes(line, question):
     return False
 
 
+def _no_portfolio_result(registry, settings, day):
+    """No portfolio brief of the day, its attempts used up by the cap and no portfolio task of the day open.
+
+    A task that is done waits for its harvest, and a blocked one is archived by the next portfolio tick: both are open.
+    A brief is stored before its task is archived, so it is read last.
+    """
+    if review.budget(registry, day)[1] < settings.portfolio_cap:
+        return False
+    board = summary._summary_board_path()
+    if board.exists():
+        with contextlib.closing(owner_workspace._open_read_only_sqlite(board, label="kanban.db")) as tasks:
+            if tasks.execute(
+                "SELECT 1 FROM tasks WHERE created_by=? AND idempotency_key=? AND status!='archived'",
+                (review.CREATED_BY, f"project-review:portfolio:{day}:0"),
+            ).fetchone() is not None:
+                return False
+    return projects_db.get_portfolio_review_brief(registry, day) is None
+
+
 def _ready(settings, day, now):
     ctx = owner_workspace.OwnerContext(actor="default", profile="default", session="")
     projects = [project for project in owner_workspace.list_committed_projects(ctx)
                 if not project["archived"] and (project["project_id"] in settings.allowlist
                                                 or project["slug"] in settings.allowlist)]
     portfolio = _portfolio_view(projects)
-    if portfolio is None or portfolio["review_date"] != day or portfolio["written_at"] > now:
+    # Only a day without a portfolio brief can go out without advice; a brief of the day, proven or not, keeps the rules.
+    advised = portfolio is not None and portfolio["review_date"] == day
+    if advised and portfolio["written_at"] > now:
         return None
     heads = owner_heads_up._read_record(get_default_hermes_root() / owner_heads_up.RECORD_FILE_NAME)
     if heads is None:
         return None
     notes = []
+    written = []  # The written_at of each stored Project brief of the day in scope, quiet ones too.
     with contextlib.closing(owner_workspace._open_read_only_sqlite(
         get_default_hermes_root() / "projects.db", label="projects.db",
     )) as registry:
-        stored = projects_db.get_portfolio_review_brief(registry, day)
-        # The optional API view validates receipt scope and prose. Refuse a result changed between these reads.
-        if stored is None or any(stored[key] != value for key, value in portfolio.items()):
+        if advised:
+            stored = projects_db.get_portfolio_review_brief(registry, day)
+            # The optional API view validates receipt scope and prose. Refuse a result changed between these reads.
+            if stored is None or any(stored[key] != value for key, value in portfolio.items()):
+                return None
+            visible = [project for project in projects if project["project_id"] in stored["project_scope"]]
+        elif _no_portfolio_result(registry, settings, day):
+            visible = projects
+        else:
             return None
-        visible = [project for project in projects if project["project_id"] in stored["project_scope"]]
         for project in visible:
             brief = projects_db.get_project_review_brief(registry, project["project_id"])
-            if brief is None or brief["review_date"] != day or brief["quiet"]:
+            if brief is None or brief["review_date"] != day:
+                continue
+            written.append(brief["written_at"])
+            if brief["quiet"]:
                 continue
             headline = brief["headline"]
             if (isinstance(headline, str) and 1 <= len(headline) <= review._BRIEF_LIMITS["headline"]
                     and check_owner_text(headline, "planner_prose") == headline):
                 notes.append(f'{project["name"]}: {headline}')
+    # Without a stored Project brief of the day there is no notice time and no Project headline to send.
+    if not advised and not written:
+        return None
     waits, read = owner_heads_up._waiting()
     scope = {project["project_id"] for project in visible}
     # An unread board gives neither its wait count nor its questions. Leave the day due for a later tick.
@@ -127,17 +161,19 @@ def _ready(settings, day, now):
         if count:
             noun = "answer" if count == 1 else "answers"
             lines.append(f'{project["name"]}: {count} {noun} waiting on Decisions')
-    notes.extend(text for key in ("conflicts", "priorities", "shared_blockers") for text in portfolio[key])
+    if advised:
+        notes.extend(text for key in ("conflicts", "priorities", "shared_blockers") for text in portfolio[key])
     # Valid prose can still quote a live question of any Project, also in part or in another spelling.
     # Keep that quote out even when its heads-up was already told.
     questions = [_compared(wait.question) for wait in waits]
     lines.extend(line for line in notes if not any(_quotes(_compared(line), question) for question in questions))
     if not lines:
         return None
-    text = "\n".join([f"Your daily project review ({day})", NOTES_LINE, *lines])
+    text = "\n".join([f"Your daily project review ({day})", NOTES_LINE if advised else NO_ADVICE_LINE, *lines])
     if len(text) > MAX_MESSAGE:
         text = text[:MAX_MESSAGE - 1] + "…"
-    return portfolio["written_at"], text
+    # A message without advice is as old as its newest Project brief, never as new as the tick that sends it.
+    return (portfolio["written_at"] if advised else max(written)), text
 
 
 async def tick(runner) -> int:
