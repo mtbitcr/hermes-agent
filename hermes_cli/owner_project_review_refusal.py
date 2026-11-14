@@ -1,12 +1,14 @@
 """Shared refusal detail of the daily reviews: the log tokens and the sentences of a refusal, built only from kernel-made
-fields, and the claim rule that the harvest and the hand-over both run against the frozen input.
+fields, the record of a harvest refusal that the next review of its date is told (``refusal_record``, ``refusal_line``),
+and the claim rule that the harvest and the hand-over both run against the frozen input.
 
 Pure functions. They import nothing from the review modules, and they print only field paths, numbers and kernel ids.
 """
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+import json
+from typing import Any, Mapping, Optional
 
 _TEXT_CODES = ("review_text_length_invalid", "review_text_policy_invalid")
 _COVERAGE_CODE = "review_class_coverage_invalid"
@@ -15,6 +17,8 @@ _PORTFOLIO_LIST_CODE = "portfolio_result_list_invalid"
 _MAX_IDS = 10
 _MAX_SENTENCES = 12
 _STILL_RUNNING = "Your task is still running. Correct the result and call kanban_complete again."
+_LAST_REFUSAL_LEAD_IN = "Your last result for this date was refused: "
+_LAST_REFUSAL_KEYS = {"date", "code", "detail"}
 _SENTENCES = {
     "review_result_keys_invalid": "project_review must hold exactly the keys of the shape in the task instructions.",
     "review_result_too_large": "The result is larger than the kernel accepts. Shorten it.",
@@ -136,6 +140,37 @@ def refusal_sentences(code: str, detail: Mapping[str, Any]) -> str:
     if not sentences:
         sentences = [_SENTENCES.get(str(code), "The result breaks a rule of the task instructions.")]
     return " ".join([f"The result was refused ({code}).", *sentences, _STILL_RUNNING])
+
+
+def refusal_record(day: Optional[str], code: str, detail: Mapping[str, Any]) -> Optional[str]:
+    """The ``last_refusal`` text of a harvest refusal: JSON of its review date, code and detail; None without a date."""
+    if not day:
+        return None
+    try:
+        return json.dumps({"date": day, "code": code, "detail": dict(detail)}, ensure_ascii=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
+
+
+def refusal_line(state: Mapping[str, Any], review_day: str) -> str:
+    """The one line that tells a review task of ``review_day`` why the last review of that day was refused.
+
+    Empty for a stored refusal that is missing, dated for another day, or not exactly the record above rendered as one
+    line of printable ASCII: it is read as data and never raises.
+    """
+    try:
+        stored = state["last_refusal"]
+    except (KeyError, IndexError):
+        return ""
+    try:
+        record = json.loads(stored) if isinstance(stored, str) else None
+        if (not isinstance(record, dict) or set(record) != _LAST_REFUSAL_KEYS or record["date"] != review_day
+                or not isinstance(record["code"], str) or not isinstance(record["detail"], dict)):
+            return ""
+        line = _LAST_REFUSAL_LEAD_IN + refusal_sentences(record["code"], record["detail"])
+    except Exception:  # refusal_sentences lets OverflowError through, and a stored value is no reason to stop a review
+        return ""
+    return line if line.isascii() and line.isprintable() else ""
 
 
 def class_history(sources: Mapping[str, Any], classes: Any, refused: type) -> list:

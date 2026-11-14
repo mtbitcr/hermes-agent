@@ -164,6 +164,7 @@ CREATE TABLE IF NOT EXISTS project_summary_state (
 -- claim of that further review stores its own key (ending ':again') here: the day's one further review is used then.
 -- cap_wait_date is the review day on which the daily cap deferred the Project with news, cap_wait_at the time of
 -- that mark. Only the snapshot view of the brief reads them; they are no review.
+-- last_refusal: JSON {"date": <review date>, "code": <code>, "detail": <detail>} of the last harvest refusal; read only by that date's next review.
 CREATE TABLE IF NOT EXISTS project_review_state (
     project_id         TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
     event_cursor       INTEGER NOT NULL DEFAULT 0,
@@ -181,7 +182,8 @@ CREATE TABLE IF NOT EXISTS project_review_state (
     input_too_large_date TEXT,
     stale_refused_key  TEXT,
     cap_wait_date      TEXT,
-    cap_wait_at        INTEGER
+    cap_wait_at        INTEGER,
+    last_refusal       TEXT
 );
 
 -- Daily briefs have their own history. The five-key project summary keeps its existing shape.
@@ -402,6 +404,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "project_review_state", "stale_refused_key", "stale_refused_key TEXT")
         _add_column_if_missing(conn, "project_review_state", "cap_wait_date", "cap_wait_date TEXT")
         _add_column_if_missing(conn, "project_review_state", "cap_wait_at", "cap_wait_at INTEGER")
+        _add_column_if_missing(conn, "project_review_state", "last_refusal", "last_refusal TEXT")
     if "project_review_briefs" in tables:
         for name, kind in (("source_task_id", "TEXT"), ("source_run_id", "INTEGER"), ("source_digest", "TEXT")):
             _add_column_if_missing(conn, "project_review_briefs", name, f"{name} {kind}")
