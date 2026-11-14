@@ -7,8 +7,8 @@ and calls kanban_complete again. The harvest runs the same checks and stays the 
 Every worker call runs under the exact environment the dispatcher injects: the real spawn
 (``kanban_db._default_spawn``, with only ``Popen`` captured) pins ``HERMES_KANBAN_DB`` and ``HERMES_KANBAN_BOARD`` to
 the summary board, sets ``HERMES_KANBAN_TASK`` and points ``HERMES_HOME`` at a profile home under the root. The tool
-runs through ``model_tools.handle_function_call``. The stores are read back with plain sqlite3, without the code under
-test.
+runs through ``model_tools.handle_function_call``, in this process or, for the cold-process controls, in a fresh worker
+process. The stores are read back with plain sqlite3, without the code under test.
 """
 
 from __future__ import annotations
@@ -19,12 +19,14 @@ import logging
 import os
 import sqlite3
 import subprocess
+import sys
 import time
 from pathlib import Path
 
+import pytest
 import yaml
 
-from hermes_cli import kanban_db, owner_project_review as review, projects_db
+from hermes_cli import config, kanban_db, owner_project_review as review, projects_db
 from tests.hermes_cli.test_owner_project_review_result import NOW, _quiet_project, _suggestion, root  # noqa: F401
 
 SUMMARIES = "project-summaries"
@@ -338,19 +340,25 @@ def test_an_ordinary_task_completes_unchanged(root, monkeypatch):
     assert json.loads(metadata)["project_review"] == bad["project_review"]
 
 
-def test_nothing_changes_while_the_daily_review_switch_is_off(root, monkeypatch, caplog):
+def test_a_broken_result_is_handed_back_as_well_while_the_daily_review_switch_is_off(root, monkeypatch, caplog):
     project, task_id, _ = _news_project(root, monkeypatch)
-    # The owner turns the daily review off while its task still runs: the completion stays as it was before the card.
+    # The owner turns the daily review off while its task still runs. Owner rule 3 of 2026-11-14: the hand-over reads
+    # no switch, since the task exists only because the switch was on, so the broken result is refused as with it on.
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {"enabled": False, "allowlist": [project.id]}}))
-    bad = _payload(_text(412))
     with _worker(root, monkeypatch, task_id) as task:
         with caplog.at_level(logging.DEBUG, logger=LOGGER):
-            done = json.loads(_complete({"summary": "Reviewed.", "metadata": bad}))
-    assert done.get("ok") is True, done
-    assert "refusal" not in done and "handover" not in caplog.text
-    assert _read(_summary_db(root), "SELECT status FROM tasks WHERE id=?", task.id) == [("done",)]
-    [(metadata,)] = _read(_summary_db(root), "SELECT metadata FROM task_runs WHERE task_id=? AND status='done'", task.id)
-    assert json.loads(metadata)["project_review"] == bad["project_review"]
+            refused = json.loads(_complete({"summary": "Reviewed.", "metadata": _payload(_text(412))}))
+        assert refused.get("refusal") == {"code": "review_text_length_invalid", "detail": {"fields": [
+            {"field": "summary.outcome", "rule": "length", "length": 412, "limit": 400},
+        ]}}, refused
+        assert refused["still_running"] is True and refused.get("ok") is not True
+        assert "summary.outcome has 412 characters; at most 400." in refused["error"]
+        assert refused["error"].endswith(STILL_RUNNING)
+        _assert_running(root, task)
+    [line] = [text for text in caplog.text.splitlines() if "handover" in text]
+    assert (f"review_handover_refused: Project {project.id} task {task.id} run {task.current_run_id} "
+            "(review_text_length_invalid) fields=summary.outcome:length:412/400") in line
+    # The switch still stops the harvest: the registry holds the review task open, with no failure counted.
     assert review.review_tick(NOW + 1) == 0
     assert _review_state(root, project) == [(task_id, "2026-11-08", 0)]
 
@@ -431,3 +439,118 @@ def test_a_second_completion_of_a_finished_portfolio_task_gets_the_unchanged_ans
     )
     # No harvest ran: no advice is stored.
     assert _read(root / "projects.db", "SELECT COUNT(*) FROM portfolio_review_briefs") == [(0,)]
+
+
+_REPOSITORY = Path(__file__).resolve().parents[2]
+
+# The fresh worker of the cold-process controls. Its audit hook only observes: it records each writing event for a path
+# in the owner's root home, which holds the profile home and the boards too, made while a frame of the hand-over check
+# is on the call stack. A file descriptor is read back through /proc. Logging stays unconfigured, as in the review.
+_COLD_WORKER = r"""
+import json, os, sys
+
+HOME = os.path.join(os.environ["HOME"], ".hermes")
+ROOTS = {os.path.abspath(HOME), os.path.realpath(HOME)}
+CHECK = os.sep + os.path.join("hermes_cli", "owner_review_handover.py")
+PATHS = {"open": 1, "os.mkdir": 1, "os.chmod": 1, "os.chown": 1, "os.remove": 1, "os.rmdir": 1, "os.utime": 1,
+         "os.truncate": 1, "os.rename": 2, "os.symlink": 2, "os.link": 2}
+WRITING = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC
+writes = []
+
+
+def in_root(target):
+    try:
+        path = os.readlink(f"/proc/self/fd/{target}") if isinstance(target, int) else os.fsdecode(target)
+    except (OSError, TypeError):
+        return None
+    for name in (os.path.abspath(path), os.path.realpath(path)):
+        if any(name == root or name.startswith(root + os.sep) for root in ROOTS):
+            return name
+    return None
+
+
+def audit(event, args):
+    if event == "open" and not (args[1] and any(c in args[1] for c in "wax+")) and not (args[2] or 0) & WRITING:
+        return
+    if event.startswith("shutil."):
+        targets = [arg for arg in args if isinstance(arg, (str, bytes, os.PathLike))]
+    elif event in PATHS:
+        targets = args[:PATHS[event]]
+    else:
+        return
+    frame = sys._getframe(1)
+    while frame is not None and not frame.f_code.co_filename.endswith(CHECK):
+        frame = frame.f_back
+    if frame is not None:
+        writes.extend([event, path] for path in map(in_root, targets) if path)
+
+
+sys.addaudithook(audit)
+import model_tools
+import tools.kanban_tools
+
+answer = json.loads(model_tools.handle_function_call("kanban_complete", json.loads(sys.argv[1])))
+print("COLD_WORKER=" + json.dumps({"writes": writes, "answer": answer}))
+"""
+
+
+def _cold_task(root, monkeypatch, kind):
+    """The review tick's task of ``kind``, the arguments of a broken and a valid result, and the broken one's code."""
+    if kind == "project":
+        _project, task_id, _ = _news_project(root, monkeypatch)
+        broken = {"summary": "Reviewed.", "metadata": _payload(_text(412))}
+        return task_id, broken, {"summary": "Reviewed.", "metadata": _payload()}, "review_text_length_invalid"
+    project = _quiet_project(root)
+    (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
+        "enabled": True, "allowlist": [project.id], "portfolio": True,
+    }}))
+    assert review.review_tick(NOW) == 1
+    long_line = f"{project.name}: " + _text(201)
+    assert len(long_line) == 215
+    return (_task_with_key(root, f"project-review:portfolio:{DAY}:0"), _advice(long_line),
+            _advice(f"{project.name}: Book the room."), "portfolio_result_text_invalid")
+
+
+def _modes_and_change_times(paths):
+    return {str(path): (path.stat().st_mode, path.stat().st_ctime_ns) for path in paths}
+
+
+@pytest.mark.parametrize("result", ["broken", "valid"])
+@pytest.mark.parametrize("switch", ["on", "off"])
+@pytest.mark.parametrize("kind", ["project", "portfolio"])
+def test_a_cold_worker_completion_writes_nothing_in_the_owner_home(root, monkeypatch, kind, switch, result):
+    """Owner rule 3 of 2026-11-14, points 5 and 6: the cold-process controls of the delivery review.
+
+    A fresh worker process makes its first kanban_complete through the real entry point, under the environment the
+    dispatcher injects and with HOME at this test's home. It has prepared no folder of the root home, so a config load
+    in the hand-over check would make folders and set their mode there.
+    """
+    task_id, broken, valid, code = _cold_task(root, monkeypatch, kind)
+    if switch == "off":
+        # The owner turns the daily review off after the tick made the task.
+        (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {"enabled": False}}))
+    real_popen = subprocess.Popen
+    skeleton = [root, *(root / name for name in config._HERMES_HOME_SUBDIRS)]
+    with _worker(root, monkeypatch, task_id) as task:
+        assert all(path.is_dir() for path in skeleton)
+        before = _modes_and_change_times(skeleton)
+        with monkeypatch.context() as launcher:
+            launcher.setattr(subprocess, "Popen", real_popen)
+            run = subprocess.run(
+                [sys.executable, "-c", _COLD_WORKER, json.dumps(broken if result == "broken" else valid)],
+                cwd=_REPOSITORY, env={**os.environ, "HOME": str(root.parent), "PYTHONPATH": str(_REPOSITORY)},
+                capture_output=True, text=True, timeout=120,
+            )
+        assert run.returncode == 0, run.stderr[-4000:]
+        after = _modes_and_change_times(skeleton)
+        [line] = [text for text in run.stdout.splitlines() if text.startswith("COLD_WORKER=")]
+        observed = json.loads(line.partition("=")[2])
+        assert observed["writes"] == []
+        assert after == before
+        answer = observed["answer"]
+        if result == "valid":
+            assert answer.get("ok") is True, answer
+            assert _read(_summary_db(root), "SELECT status FROM tasks WHERE id=?", task.id) == [("done",)]
+        else:
+            assert answer.get("refusal", {}).get("code") == code and answer.get("still_running") is True, answer
+            _assert_running(root, task)

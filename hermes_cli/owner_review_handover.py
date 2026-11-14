@@ -3,7 +3,8 @@
 It runs the harvest's own result rules against the task's frozen input, so the reviewer corrects a broken result in the
 same run. It is an early copy of the harvest's verdict, never the authority: it never writes, a broken input or any
 fault of its own lets the completion through to the harvest, and its message and log carry only codes, field paths,
-numbers and kernel ids.
+numbers and kernel ids. It loads no configuration and does not read the daily review switch (owner rule 3 of
+2026-11-14): the tick makes a review task only while the switch is on, and a configuration load prepares a home folder.
 """
 
 from __future__ import annotations
@@ -26,11 +27,6 @@ def handover_refusal(task: Any, metadata: Any) -> Optional[dict]:
         # Only a running attempt can still correct its result. In any other state the completion path answers with
         # its own lifecycle refusal, as it did before this check.
         if task.status != "running" or task.current_run_id is None:
-            return None
-        from hermes_cli.owner_project_review import read_settings
-
-        # Nothing changes while the daily review switch is off; the root config is read, not the worker's profile.
-        if not read_settings().enabled:
             return None
         if (task.idempotency_key or "").startswith(_PORTFOLIO_KEY):
             return _portfolio_refusal(task, metadata)
