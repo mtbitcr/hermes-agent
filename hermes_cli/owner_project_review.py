@@ -4,7 +4,10 @@ The gateway's dispatcher runs ``review_tick`` once per tick, right after ``summa
 runs until the owner switches it on: ``read_settings`` reads the ``owner_review`` section of the root config, and in
 code every flag is off and the allowlist is empty (operator rule L3). Only a Project named in the allowlist, by id or
 slug, that is active as the plan defines it, is reviewed: the summary's ``_eligible`` still counts it as live, the owner
-has neither paused nor archived its board, and its steward state is neither "deleted" nor "complete".
+has neither paused nor archived its board, and its steward state is not "deleted". A Project whose steward state is
+"complete" (owner rule of 2026-11-13) is reviewed as an active one only when it was reviewed before and has news since
+its last review. Without news it gets no task and no quiet brief, and its last brief stays; never reviewed, it gets
+none. Its open review task, and a stored review whose closures are not finished, are finished as an active Project's.
 
 The review day is the Vienna calendar date. A Project is due once the Vienna clock has reached the review hour of a
 date later than its ``last_reviewed_date``. A calendar date rather than a 24-hour window keeps one review per date on
@@ -1154,19 +1157,30 @@ def _record_open_task(registry: sqlite3.Connection, project_id: str, task: sqlit
         logger.info("project review: Project %s already has review task %s; recorded it", project_id, task["id"])
 
 
-def _allowed(registry: sqlite3.Connection, settings: ReviewSettings, project_id: str) -> bool:
-    """Whether the owner allows a review of the Project now: allowlisted by id or slug, and active."""
+def _allowed(
+    registry: sqlite3.Connection, settings: ReviewSettings, project_id: str, *, step: Optional[str] = None
+) -> bool:
+    """Whether the owner allows a review of the Project now: allowlisted by id or slug, and active.
+
+    ``step`` is what the caller does with the answer, "start" a review or "finish" one (``_active``). The
+    cross-project review names none.
+    """
     row = registry.execute("SELECT slug, board_slug FROM projects WHERE id = ?", (project_id,)).fetchone()
     if row is None or (project_id not in settings.allowlist and row["slug"] not in settings.allowlist):
         return False
-    return summary._eligible(registry, project_id) and _active(project_id, row["board_slug"])
+    return summary._eligible(registry, project_id) and _active(registry, project_id, row["board_slug"], step)
 
 
-def _active(project_id: str, board_slug: Optional[str]) -> bool:
+def _active(
+    registry: sqlite3.Connection, project_id: str, board_slug: Optional[str], step: Optional[str] = None
+) -> bool:
     """Whether the Project is active as the plan defines it, past the summary's ``_eligible``.
 
-    The owner has neither paused nor archived its board, and its steward state is neither "deleted" nor "complete".
-    A Project whose state cannot be read is not active.
+    The owner has neither paused nor archived its board, and its steward state is not "deleted". A Project whose
+    steward state is "complete" (owner rule of 2026-11-13) is active to "finish" a review, its open task or a stored
+    review's closures. It is active to "start" one only when it was reviewed before and has news since its last
+    review (``_read_news``). Without a step it is not active. A Project whose state or news cannot be read is not
+    active.
     """
     if not board_slug:
         return False
@@ -1181,7 +1195,19 @@ def _active(project_id: str, board_slug: Optional[str]) -> bool:
     except owner_workspace.OwnerWorkspaceError as exc:
         logger.warning("project review: the state of Project %s cannot be read (%s)", project_id, exc.code)
         return False
-    return state not in ("deleted", "complete")
+    if state != "complete":
+        return state != "deleted"
+    if step != "start":
+        return step == "finish"
+    # Read only: a complete Project never reviewed gets no review row here.
+    reviewed = registry.execute("SELECT * FROM project_review_state WHERE project_id = ?", (project_id,)).fetchone()
+    if reviewed is None or reviewed["last_reviewed_date"] is None:
+        return False
+    try:
+        return _read_news(registry, projects_db.get_project(registry, project_id), reviewed)[1]
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        logger.warning("project review: cannot read the news of complete Project %s (%s)", project_id, exc)
+        return False
 
 
 def _archive_review(registry: sqlite3.Connection, board: sqlite3.Connection, project_id: str, task_id: str) -> str:
@@ -1396,7 +1422,7 @@ def _harvest_one(
     task = None if board is None else kanban_db.get_task(board, task_id)
     # A task the tick did not make for this Project is not its review, and not the tick's to archive or change.
     foreign = task is not None and not _made_for(task, project_id)
-    if not _allowed(registry, settings, project_id):
+    if not _allowed(registry, settings, project_id, step="finish"):
         _retire(registry, None if foreign else board, project_id, task_id, now)
         return
     if board is None:
@@ -1446,7 +1472,7 @@ def _harvest(registry: sqlite3.Connection, settings: ReviewSettings, now: int) -
         )
         for project_id, task in [] if board is None or not settings.closure else _stored_reviews(registry, board):
             # A Project the owner no longer allows keeps its closures pending and unapplied.
-            if _allowed(registry, settings, project_id):
+            if _allowed(registry, settings, project_id, step="finish"):
                 _finish_review(registry, board, settings, project_id, task, now)
         for row in open_tasks:
             _harvest_one(registry, board, settings, row["project_id"], row["open_task_id"], now)
@@ -1850,7 +1876,7 @@ def _request(registry: sqlite3.Connection, settings: ReviewSettings, now: int) -
                 )
             if open_task is not None:
                 _record_open_task(registry, project.id, open_task, now)
-            if not _allowed(registry, settings, project.id):
+            if not _allowed(registry, settings, project.id, step="start"):
                 continue
             # The quiet clock sees the Project's news on every tick: before the review hour, while its review is open,
             # while a failed one backs off and while the cap makes it wait.

@@ -551,6 +551,15 @@ def _f4_world(base: Path, monkeypatch, *, review: bool, kanban=None) -> dict:
     if review:
         _switch_on(home, garden["project_id"], desk["project_id"])
     names = {garden["board"]: "Garden Plan", desk["board"]: "Planning Desk"}
+    # The result the desk's review worker returns: a valid typed project review that names a work title of its input
+    # and has nothing to classify. The garden's review worker returns none, and the harvest refuses that.
+    desk_review = {"project_review": {
+        "summary": {"outcome": "The work is done.", "next_action": "Check the finished work.", "owner_decision": None},
+        "brief": {"headline": "The work is done.",
+                  "what_changed": "Plan the next milestone is done, and so is the other work.",
+                  "next_step": "Check the finished work.", "needs_you": None},
+        "classification": [], "proposed_closures": [],
+    }}
     loop = _Loop()
     loop.record_spawns(monkeypatch)
     ready: list[dict] = []
@@ -565,15 +574,17 @@ def _f4_world(base: Path, monkeypatch, *, review: bool, kanban=None) -> dict:
 
     def _between(tick: int) -> None:
         ready.append(_ready_set())
-        for spawn_tick, board, task_id, _title, _who, by in loop.spawned:
+        for spawn_tick, board, task_id, title, _who, by in loop.spawned:
             if spawn_tick != tick:
                 continue
             with _board(home, board) as conn:
                 if board in names:
                     assert kanban_db.complete_task(conn, task_id, summary="Done.")
                 elif by == CREATOR and kanban_db.get_task(conn, task_id).status == "running":
-                    # A review the harvest has not closed in its own tick (its Project is still active) finishes too.
-                    assert kanban_db.complete_task(conn, task_id, summary="Done.")
+                    # A review the harvest has not closed finishes too, also when its Project completed meanwhile: such
+                    # a review is finished, not retired, so the harvest reads its result.
+                    metadata = desk_review if title == "Review the project: Planning Desk" else None
+                    assert kanban_db.complete_task(conn, task_id, summary="Done.", metadata=metadata)
 
     _drive(monkeypatch, loop, [_at(2026, 11, 9, 7) + n * MINUTE for n in range(4)], kanban=kanban, between=_between)
     ready.append(_ready_set())
@@ -619,8 +630,9 @@ def test_f4_spare_capacity_claim_order_assignees_ready_set_and_project_tasks_are
     without = _f4_world(tmp_path / "without", monkeypatch, review=False, kanban=caps)
     with_review = _f4_world(tmp_path / "with", monkeypatch, review=True, kanban=caps)
 
-    # The review ran: two tasks made in the first tick and archived by the B1 harvest, the desk's when its cards were
-    # all done (the Project is complete), the garden's when its result was refused.
+    # The review ran: two tasks made in the first tick and archived by the B1 harvest after their workers finished,
+    # the desk's when its typed result was accepted (its Project completed meanwhile, and an open review of a complete
+    # Project is finished, not retired), the garden's when its result was refused.
     assert without["made"] == [0, 0, 0, 0]
     assert with_review["made"] == [2, 0, 0, 0]
     assert [status for _title, status, _who, _by in with_review["review_board"]] == ["archived", "archived"]
