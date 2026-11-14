@@ -2048,6 +2048,10 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"or (2) create continuation tasks with parents=[{tid}] "
                     f"and keep this task alive."
                 )
+            from hermes_cli.owner_review_handover import handover_refusal
+            if (refusal := handover_refusal(task, metadata)) is not None:
+                return tool_error(refusal["message"], refusal={"code": refusal["code"], "detail": refusal["detail"]},
+                                  still_running=True)
             saved_patches = []
             if patch_attachment_id is None:
                 # No patch named: the run's newest saved patch goes to review
