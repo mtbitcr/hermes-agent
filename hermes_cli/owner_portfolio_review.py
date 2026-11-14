@@ -92,9 +92,13 @@ def _harvest(registry, board, task, day, now):
     if run is None or run.outcome != "completed" or not isinstance(run.metadata, dict):
         raise PortfolioRefused("portfolio_run_invalid")
     value = run.metadata.get("portfolio_review")
-    if not isinstance(value, dict) or set(value) != {"conflicts", "priorities", "shared_blockers"}:
-        raise PortfolioRefused("portfolio_result_keys_invalid")
-    lines = [line[len(_INPUT):] for line in task.body.splitlines() if line.startswith(_INPUT)]
+    scope, _names = check_portfolio_result(value, task.body)
+    projects_db.write_portfolio_review_brief(registry, day, **value, written_at=now, project_scope=scope)
+
+
+def _portfolio_input(body):
+    """The scope and Project names of the one frozen input line. The hand-over lets a broken input pass to the harvest."""
+    lines = [line[len(_INPUT):] for line in body.splitlines() if line.startswith(_INPUT)]
     if len(lines) != 1:
         raise PortfolioRefused("portfolio_input_invalid")
     frozen = json.loads(lines[0])
@@ -103,6 +107,14 @@ def _harvest(registry, board, task, day, now):
     if (not isinstance(scope, list) or any(not isinstance(item, str) or not 1 <= len(item) <= 100 for item in scope)
             or len(scope) != len(set(scope))):
         raise PortfolioRefused("portfolio_input_scope_invalid")
+    return scope, names
+
+
+def check_portfolio_result(value, body):
+    """The result's keys, its frozen input, every list size and every line: one rule, which the hand-over runs too."""
+    if not isinstance(value, dict) or set(value) != {"conflicts", "priorities", "shared_blockers"}:
+        raise PortfolioRefused("portfolio_result_keys_invalid")
+    scope, names = _portfolio_input(body)
     lists, lines_found = [], []
     for key, items in value.items():
         if not isinstance(items, list):
@@ -124,7 +136,7 @@ def _harvest(registry, board, task, day, now):
         raise PortfolioRefused("portfolio_result_list_invalid", {"lists": lists, "lines": lines_found})
     if lines_found:
         raise PortfolioRefused("portfolio_result_text_invalid", {"lines": lines_found})
-    projects_db.write_portfolio_review_brief(registry, day, **value, written_at=now, project_scope=scope)
+    return scope, names
 
 
 def _ready(registry, projects, day, settings, now):

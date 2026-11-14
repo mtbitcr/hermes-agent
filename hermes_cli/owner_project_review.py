@@ -319,45 +319,19 @@ def _newer_equivalent(board, project_id, original, candidate) -> bool:
     return new["opened_event"] > old["opened_event"] and content_link(board, old["id"], old_title, new["id"], new_title)
 
 
+def check_claims(sources: dict[str, list[dict]], claims: Any) -> tuple[set, dict, set]:
+    """The history check, the claim structure and the coverage against the frozen input alone: one rule, which the
+    hand-over runs too. Its body lives in the refusal module, which keeps this facade under its line limit."""
+    from hermes_cli.owner_project_review_refusal import claim_coverage
+
+    return claim_coverage(sources, claims, _REVIEW_CLASSES, ReviewRefused)
+
+
 def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, stale_days: int,
                      board: sqlite3.Connection, project_id: str, plan_changes: dict[str, str]) -> list[dict]:
+    expected, by_item, _references = check_claims(sources, claims)
     suggestions = {item["id"]: item for item in sources["suggestions"]}
     decisions = sources["decisions"]
-    previous = sources["earlier_reviews"][0].get("classification", []) if sources["earlier_reviews"] else []
-    if not isinstance(previous, list) or any(
-        not isinstance(item, dict) or not isinstance(item.get("item"), str)
-        or not isinstance(item.get("class"), str) or item["class"] not in _REVIEW_CLASSES
-        for item in previous
-    ):
-        raise ReviewRefused("review_class_history_invalid")
-    expected = set(suggestions) | {item["task_id"] for item in decisions if item.get("task_id")}
-    expected.update(item["item"] for item in previous if item["class"] == "still actionable")
-    references = {f"tasks:{item['id']}" for item in sources["tasks"]}
-    references.update(f"suggestions:{tid}" for tid in suggestions)
-    references.update(f"proposals:{item['id']}" for item in sources.get("proposals", []))
-    references.update(
-        f"decisions:event:{item['event_id']}" if "event_id" in item else f"decisions:wait:{item['task_id']}"
-        for item in decisions if "event_id" in item or item.get("task_id")
-    )
-    if not isinstance(claims, list):
-        raise ReviewRefused("review_class_list_invalid")
-    by_item = {}
-    for claim in claims:
-        if (not isinstance(claim, dict) or set(claim) != {"item", "class", "evidence"}
-                or not isinstance(claim["item"], str) or claim["item"] in by_item
-                or not isinstance(claim["class"], str) or claim["class"] not in _REVIEW_CLASSES
-                or not isinstance(claim["evidence"], list)
-                or not all(isinstance(ref, str) and ref in references for ref in claim["evidence"])):
-            raise ReviewRefused("review_class_evidence_invalid")
-        by_item[claim["item"]] = claim
-    if set(by_item) != expected:
-        known = {item["id"] for item in sources["tasks"]} | set(suggestions)
-        extra = set(by_item) - expected
-        raise ReviewRefused("review_class_coverage_invalid", {
-            "missing": sorted(expected - set(by_item)),
-            "extra": sorted(item for item in extra if item in known),
-            "extra_other": sum(item not in known for item in extra),
-        })
     # Only unresolved items carry forward. A settled item stays in the brief row of its own review day.
     classified = []
     tasks = {item["id"]: item for item in sources["tasks"]}
@@ -450,22 +424,29 @@ def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, s
     return classified
 
 
-def _review_closures(board, project_id, sources, classification, proposals) -> list[dict]:
-    """The result's closures its classification proves. Without a board, a stored review's closures are read again:
-    the closure step then checks the live state in its own board transaction."""
+def check_closure_shapes(proposals: Any) -> None:
+    """The closure list size, each proposal's keys and its reason text, without the evidence only the harvest checks."""
     if not isinstance(proposals, list) or len(proposals) > 3:
         raise ReviewRefused("review_closure_list_invalid")
-    suggestions = {item["id"]: item for item in sources["suggestions"]}
-    cards = {item["id"]: item for item in sources["tasks"]}
-    classes = {item["item"]: item for item in classification}
-    checked = []
-    seen = set()
     for index, proposal in enumerate(proposals):
         if (not isinstance(proposal, dict)
                 or set(proposal) != {"recommendation_id", "card_id", "reason", "evidence"}
                 or not isinstance(proposal["recommendation_id"], str)
                 or not isinstance(proposal["card_id"], str)):
             raise ReviewRefused("review_closure_keys_invalid")
+        _review_texts({"reason": proposal["reason"]}, {"reason": _CLOSURE_REASON_LIMIT}, "", f"proposed_closures[{index}]")
+
+
+def _review_closures(board, project_id, sources, classification, proposals) -> list[dict]:
+    """The result's closures its classification proves. Without a board, a stored review's closures are read again:
+    the closure step then checks the live state in its own board transaction."""
+    check_closure_shapes(proposals)
+    suggestions = {item["id"]: item for item in sources["suggestions"]}
+    cards = {item["id"]: item for item in sources["tasks"]}
+    classes = {item["item"]: item for item in classification}
+    checked = []
+    seen = set()
+    for proposal in proposals:
         tid, card_id = proposal["recommendation_id"], proposal["card_id"]
         evidence = [f"suggestions:{tid}", f"tasks:{card_id}"]
         if (tid in seen or tid not in suggestions or card_id not in cards
@@ -488,26 +469,19 @@ def _review_closures(board, project_id, sources, classification, proposals) -> l
             lifecycle = kanban_db.recommendation_lifecycle_snapshot(row)
             if any(lifecycle[key] != suggestions[tid].get(key) for key in lifecycle):
                 raise ReviewRefused("review_recommendation_state_changed")
-        reason = _review_texts(
-            {"reason": proposal["reason"]}, {"reason": _CLOSURE_REASON_LIMIT}, "", f"proposed_closures[{index}]",
-        )["reason"]
+        # check_closure_shapes passed this reason through _review_texts, which returns it stripped.
+        reason = proposal["reason"].strip()
         seen.add(tid)
         checked.append({"recommendation_id": tid, "card_id": card_id, "reason": reason,
                         "evidence": evidence, "card_state": delivery_state, "expected_lifecycle_version": lifecycle["lifecycle_version"]})
     return checked
 
 
-def _review_payload(board: sqlite3.Connection, task_id: str, project_id: str):
-    """The review task, its latest completed run's result and its frozen input, each checked for shape."""
+def check_result_texts(value: Any, sources: Optional[dict[str, list[dict]]] = None):
+    """The result's keys and size, then with its frozen input the summary, the brief and the work-title rule: one rule,
+    which the hand-over runs too. Without sources only the keys and size are checked, ahead of the frozen input."""
     from hermes_cli.owner_project_review_record import TOTAL_INPUT_CAP_BYTES
 
-    task = kanban_db.get_task(board, task_id)
-    if task is None or not _made_for(task, project_id) or task.assignee != summary.PLANNING_ROLE or task.status != "done":
-        raise ReviewRefused("review_task_invalid")
-    run = kanban_db.latest_run(board, task_id)
-    if run is None or run.outcome != "completed" or not isinstance(run.metadata, dict):
-        raise ReviewRefused("review_run_invalid")
-    value = run.metadata.get("project_review")
     required = {"summary", "brief", "classification", "proposed_closures"}
     # Plan advice is the one optional key. Every other extra key stays invalid.
     if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(required | {"plan_proposal"}):
@@ -519,6 +493,32 @@ def _review_payload(board: sqlite3.Connection, task_id: str, project_id: str):
         if isinstance(exc, ReviewRefused):
             raise
         raise ReviewRefused("review_result_data_invalid") from exc
+    if sources is None:
+        return None
+    refreshed = _review_texts(value["summary"], summary._TEXT_LIMITS, "owner_decision", "summary")
+    brief = _review_texts(value["brief"], _BRIEF_LIMITS, "needs_you", "brief")
+    titles = [
+        title for title in [item.get("title") for item in sources["tasks"]] + [item.get("label") for item in sources["suggestions"]]
+        if isinstance(title, str) and title
+    ]
+    # A record with no work title (only its creation, or only a linked owner turn) keeps the headline rule alone.
+    if brief["headline"].rstrip(".! ").casefold() in _GENERIC_HEADLINES or (
+        titles and not any(title.casefold() in brief["what_changed"].casefold() for title in titles)
+    ):
+        raise ReviewRefused("review_brief_generic")
+    return refreshed, brief
+
+
+def _review_payload(board: sqlite3.Connection, task_id: str, project_id: str):
+    """The review task, its latest completed run's result and its frozen input, each checked for shape."""
+    task = kanban_db.get_task(board, task_id)
+    if task is None or not _made_for(task, project_id) or task.assignee != summary.PLANNING_ROLE or task.status != "done":
+        raise ReviewRefused("review_task_invalid")
+    run = kanban_db.latest_run(board, task_id)
+    if run is None or run.outcome != "completed" or not isinstance(run.metadata, dict):
+        raise ReviewRefused("review_run_invalid")
+    value = run.metadata.get("project_review")
+    check_result_texts(value)
     sources, cut_note = _frozen_sources(task.body)
     if sources["project"][0].get("id") != project_id:
         raise ReviewRefused("review_input_project_invalid")
@@ -532,17 +532,7 @@ def parse_review_result(
     from hermes_cli.owner_project_review_record import TOTAL_INPUT_CAP_BYTES
 
     task, value, sources, cut_note = _review_payload(board, task_id, project_id)
-    refreshed = _review_texts(value["summary"], summary._TEXT_LIMITS, "owner_decision", "summary")
-    brief = _review_texts(value["brief"], _BRIEF_LIMITS, "needs_you", "brief")
-    titles = [
-        title for title in [item.get("title") for item in sources["tasks"]] + [item.get("label") for item in sources["suggestions"]]
-        if isinstance(title, str) and title
-    ]
-    # A record with no work title (only its creation, or only a linked owner turn) keeps the headline rule alone.
-    if brief["headline"].rstrip(".! ").casefold() in _GENERIC_HEADLINES or (
-        titles and not any(title.casefold() in brief["what_changed"].casefold() for title in titles)
-    ):
-        raise ReviewRefused("review_brief_generic")
+    refreshed, brief = check_result_texts(value, sources)
     with _review_evidence_board(project_id) as (project_board, registry, project):
         from hermes_cli.owner_project_review_plans import verified_supersessions
 
