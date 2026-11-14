@@ -110,7 +110,7 @@ def _ready(settings, day, now):
             if brief is None or brief["review_date"] != day or brief["quiet"]:
                 continue
             headline = brief["headline"]
-            if (isinstance(headline, str) and 1 <= len(headline) <= 120
+            if (isinstance(headline, str) and 1 <= len(headline) <= review._BRIEF_LIMITS["headline"]
                     and check_owner_text(headline, "planner_prose") == headline):
                 notes.append(f'{project["name"]}: {headline}')
     waits, read = owner_heads_up._waiting()

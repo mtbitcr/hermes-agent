@@ -102,6 +102,9 @@ _ACCEPTED_KEY = "project_review_accepted:"
 _NEVER_REVIEWED = "the start"
 _WINDOW = re.compile(r"^Review days: from ([0-9]{4}-[0-9]{2}-[0-9]{2}|the start) to ([0-9]{4}-[0-9]{2}-[0-9]{2})$", re.MULTILINE)
 
+_BRIEF_LIMITS = {"headline": 120, "what_changed": 400, "next_step": 240, "needs_you": 160}
+_CLOSURE_REASON_LIMIT = 300
+
 INSTRUCTION = """\
 Review one Project for its owner. Use no tool except kanban_show and kanban_complete.
 
@@ -110,7 +113,12 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
    {"project_review": {"summary": {"outcome": "...", "next_action": "...", "owner_decision": null},
    "brief": {"headline": "...", "what_changed": "...", "next_step": "...", "needs_you": null},
    "classification": [], "proposed_closures": []}}
-3. Write plain owner text. The brief headline has at most 120 characters, what_changed 400, next_step 240, needs_you 160.
+""" + (
+    f"3. Write plain owner text. In summary, outcome has at most {summary._TEXT_LIMITS['outcome']} characters and "
+    f"next_action at most {summary._TEXT_LIMITS['next_action']}. In brief, headline has at most "
+    f"{_BRIEF_LIMITS['headline']}, what_changed {_BRIEF_LIMITS['what_changed']}, next_step "
+    f"{_BRIEF_LIMITS['next_step']}, needs_you {_BRIEF_LIMITS['needs_you']}.\n"
+) + """\
 4. Include an input work title in what_changed when the input has one. Do not write a generic headline or invent evidence.
 5. Classify every suggestion, every task in decisions, and every earlier still actionable item exactly once.
    Each classification has exactly item (task id), class, and evidence (a list of input references).
@@ -122,7 +130,7 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
    A live closure makes its suggestion superseded. Use suggestions:<id> as its evidence.
 6. Return null for owner_decision and needs_you. The kernel names the existing owner waits.
 7. Propose at most three closures. Each has exactly recommendation_id, card_id, reason, and evidence.
-   The reason has at most 300 characters. Evidence must name suggestions:<id> and tasks:<id> from this input.
+""" + f"   The reason has at most {_CLOSURE_REASON_LIMIT} characters." + """ Evidence must name suggestions:<id> and tasks:<id> from this input.
    The card must deliver the suggestion in this Project. A proposal cannot decide or close the suggestion.
 8. You may add plan_proposal, or leave it out. It is null or an object with exactly request_title, summary,
    specification, current_milestone, owner_visible_result, later_milestones, and changes.
@@ -130,7 +138,6 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
    This is advice for the Project chat. It grants no approval and changes no work.
 """
 
-_BRIEF_LIMITS = {"headline": 120, "what_changed": 400, "next_step": 240, "needs_you": 160}
 _GENERIC_HEADLINES = {"work is progressing", "no updates", "all good", "things are moving"}
 _REVIEW_CLASSES = {"answered", "superseded", "stale", "still actionable", "current"}
 
@@ -141,7 +148,15 @@ def _settled_class(item: Any) -> bool:
 
 
 class ReviewRefused(ValueError):
-    """A stable refusal code, without text from the worker or the Project record."""
+    """A stable refusal code, without text from the worker or the Project record.
+
+    ``detail`` holds only kernel-made fields: field paths, numbers and ids from the frozen input.
+    """
+
+    def __init__(self, code: str, detail: Optional[Mapping[str, Any]] = None):
+        super().__init__(code)
+        self.code = code
+        self.detail = dict(detail or {})
 
 
 class ReviewStale(ReviewRefused):
@@ -160,21 +175,32 @@ class ReviewResult:
     source_digest: Optional[str] = None
 
 
-def _review_texts(value: Any, limits: Mapping[str, int], nullable: str) -> dict[str, Optional[str]]:
+def _review_texts(value: Any, limits: Mapping[str, int], nullable: str, part: str) -> dict[str, Optional[str]]:
+    """The checked texts. The code is that of the first failing key; the detail lists every breach, none of its text."""
     if not isinstance(value, dict) or value.keys() != limits.keys():
         raise ReviewRefused("review_text_keys_invalid")
     texts = {}
+    code = None
+    breaches = []
     for key, limit in limits.items():
         text = value[key]
         if key == nullable and (text is None or isinstance(text, str) and not text.strip()):
             texts[key] = None
             continue
-        if not isinstance(text, str) or not 1 <= len(text.strip()) <= limit:
-            raise ReviewRefused("review_text_length_invalid")
-        text = text.strip()
-        if summary.check_owner_text(text, "planner_prose") != text:
-            raise ReviewRefused("review_text_policy_invalid")
-        texts[key] = text
+        field = f"{part}.{key}"
+        if not isinstance(text, str):
+            code = code or "review_text_length_invalid"
+            breaches.append({"field": field, "rule": "type"})
+        elif not 1 <= len(text.strip()) <= limit:
+            code = code or "review_text_length_invalid"
+            breaches.append({"field": field, "rule": "length", "length": len(text.strip()), "limit": limit})
+        elif summary.check_owner_text(text.strip(), "planner_prose") != text.strip():
+            code = code or "review_text_policy_invalid"
+            breaches.append({"field": field, "rule": "owner_text"})
+        else:
+            texts[key] = text.strip()
+    if breaches:
+        raise ReviewRefused(code, {"fields": breaches})
     return texts
 
 
@@ -325,7 +351,13 @@ def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, s
             raise ReviewRefused("review_class_evidence_invalid")
         by_item[claim["item"]] = claim
     if set(by_item) != expected:
-        raise ReviewRefused("review_class_coverage_invalid")
+        known = {item["id"] for item in sources["tasks"]} | set(suggestions)
+        extra = set(by_item) - expected
+        raise ReviewRefused("review_class_coverage_invalid", {
+            "missing": sorted(expected - set(by_item)),
+            "extra": sorted(item for item in extra if item in known),
+            "extra_other": sum(item not in known for item in extra),
+        })
     # Only unresolved items carry forward. A settled item stays in the brief row of its own review day.
     classified = []
     tasks = {item["id"]: item for item in sources["tasks"]}
@@ -428,7 +460,7 @@ def _review_closures(board, project_id, sources, classification, proposals) -> l
     classes = {item["item"]: item for item in classification}
     checked = []
     seen = set()
-    for proposal in proposals:
+    for index, proposal in enumerate(proposals):
         if (not isinstance(proposal, dict)
                 or set(proposal) != {"recommendation_id", "card_id", "reason", "evidence"}
                 or not isinstance(proposal["recommendation_id"], str)
@@ -456,7 +488,9 @@ def _review_closures(board, project_id, sources, classification, proposals) -> l
             lifecycle = kanban_db.recommendation_lifecycle_snapshot(row)
             if any(lifecycle[key] != suggestions[tid].get(key) for key in lifecycle):
                 raise ReviewRefused("review_recommendation_state_changed")
-        reason = _review_texts({"reason": proposal["reason"]}, {"reason": 300}, "")["reason"]
+        reason = _review_texts(
+            {"reason": proposal["reason"]}, {"reason": _CLOSURE_REASON_LIMIT}, "", f"proposed_closures[{index}]",
+        )["reason"]
         seen.add(tid)
         checked.append({"recommendation_id": tid, "card_id": card_id, "reason": reason,
                         "evidence": evidence, "card_state": delivery_state, "expected_lifecycle_version": lifecycle["lifecycle_version"]})
@@ -498,8 +532,8 @@ def parse_review_result(
     from hermes_cli.owner_project_review_record import TOTAL_INPUT_CAP_BYTES
 
     task, value, sources, cut_note = _review_payload(board, task_id, project_id)
-    refreshed = _review_texts(value["summary"], summary._TEXT_LIMITS, "owner_decision")
-    brief = _review_texts(value["brief"], _BRIEF_LIMITS, "needs_you")
+    refreshed = _review_texts(value["summary"], summary._TEXT_LIMITS, "owner_decision", "summary")
+    brief = _review_texts(value["brief"], _BRIEF_LIMITS, "needs_you", "brief")
     titles = [
         title for title in [item.get("title") for item in sources["tasks"]] + [item.get("label") for item in sources["suggestions"]]
         if isinstance(title, str) and title
@@ -1448,7 +1482,15 @@ def _harvest_one(
         _record_stale(registry, board, project_id, task, now)
         return
     except ReviewRefused as exc:
-        logger.warning("project review: refused Project %s task %s (%s)", project_id, task_id, exc)
+        from hermes_cli.owner_project_review_refusal import refusal_tokens
+
+        state = registry.execute("SELECT failures FROM project_review_state WHERE project_id = ?", (project_id,)).fetchone()
+        tokens = refusal_tokens(exc.code, exc.detail)
+        logger.warning(
+            "project review: refused Project %s task %s (%s) day=%s failures=%d%s", project_id, task_id, exc,
+            (task is not None and _key_date(task.idempotency_key, project_id)) or "unknown",
+            (state[0] if state else 0) + 1, f" {tokens}" if tokens else "",
+        )
         _record_failure(registry, board, project_id, task_id, now)
         return
     except (sqlite3.OperationalError, OSError) as exc:

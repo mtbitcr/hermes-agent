@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 def _portfolio_view(projects):
+    from hermes_cli.owner_portfolio_review import _ITEM_LIMIT, _LIST_LIMIT
     from hermes_cli.owner_project_review import read_settings
     from hermes_cli.owner_workspace import OwnerWorkspaceError, _open_read_only_sqlite
 
@@ -45,10 +46,10 @@ def _portfolio_view(projects):
             return None
         for key in ("conflicts", "priorities", "shared_blockers"):
             items = result[key]
-            if not isinstance(items, list) or len(items) > 5:
+            if not isinstance(items, list) or len(items) > _LIST_LIMIT:
                 return None
             for text in items:
-                if (not isinstance(text, str) or not 1 <= len(text) <= 200
+                if (not isinstance(text, str) or not 1 <= len(text) <= _ITEM_LIMIT
                         or check_owner_text(text, "planner_prose") != text
                         or not any(text.startswith(name + ": ") for name in names)):
                     return None
