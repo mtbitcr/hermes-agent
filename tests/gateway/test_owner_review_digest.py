@@ -16,6 +16,7 @@ import yaml
 
 from gateway import owner_channel_pause
 from gateway.config import Platform
+from hermes_cli import kanban_db, owner_project_review as review, owner_project_summary as summary
 from hermes_cli import owner_workspace as ow, projects_db
 from hermes_cli.owner_text import check_owner_text
 from tests.gateway.test_owner_heads_up import HOME_CHAT, root  # noqa: F401
@@ -817,3 +818,97 @@ async def test_t8_a_paused_daily_digest_stays_unsent_after_resume_but_the_next_d
     assert len(adapter.sent[0][1]) <= 1500
     assert await digest.tick(runner) == 0
     assert len(adapter.sent) == 1
+
+
+def _two_briefs_and_a_used_attempt(root, ready):
+    """A second Project with its brief of the day, both in the scope of the portfolio brief, and the day's attempt used."""
+    other = _project(root, "Garden Party")
+    _headline(root, other, "2026-11-10", int(time.time()), "The garden is ready.")
+    _scope(root, ready, other)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        assert review.take_portfolio_slot(registry, "2026-11-10", 1, int(time.time()))
+    return other
+
+
+def _no_portfolio_brief(root):
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        registry.execute("DELETE FROM portfolio_review_briefs")
+        registry.commit()
+
+
+def _portfolio_task(day):
+    path = summary._ensure_summary_board()
+    with kanban_db.connect_closing(path, board=summary.SUMMARY_BOARD) as board:
+        return kanban_db.create_task(
+            board, title="Review the Projects together", assignee=summary.PLANNING_ROLE, created_by=review.CREATED_BY,
+            board=summary.SUMMARY_BOARD, idempotency_key=f"project-review:portfolio:{day}:0",
+        )
+
+
+def _task_status(task_id, status):
+    with kanban_db.connect_closing(summary._summary_board_path(), board=summary.SUMMARY_BOARD) as board:
+        if status == "archived":
+            kanban_db.archive_task(board, task_id)
+        else:
+            board.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
+            board.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_day_without_a_portfolio_brief_and_with_its_attempt_used_sends_the_headlines_without_advice(root, ready):
+    _two_briefs_and_a_used_attempt(root, ready)
+    _no_portfolio_brief(root)
+    adapter = Adapter()
+    runner = _runner(adapter)
+    digest = importlib.import_module("gateway.owner_review_digest")
+    assert await digest.tick(runner) == 1
+    lines = adapter.sent[0][1].splitlines()
+    assert lines[:2] == ["Your daily project review (2026-11-10)", "Raphael has no advice across your projects today."]
+    assert sorted(lines[2:]) == ["Garden Party: The garden is ready.", "Meeting Plan: The room is booked."]
+    assert NOTES_LINE not in lines
+    # One digest a day: the told day is not sent again.
+    assert await digest.tick(runner) == 0
+    assert len(adapter.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_day_with_a_portfolio_brief_sends_todays_message_without_the_fixed_sentence(root, ready):
+    _two_briefs_and_a_used_attempt(root, ready)
+    adapter = Adapter()
+    digest = importlib.import_module("gateway.owner_review_digest")
+    assert await digest.tick(_runner(adapter)) == 1
+    lines = adapter.sent[0][1].splitlines()
+    assert lines[:2] == ["Your daily project review (2026-11-10)", NOTES_LINE]
+    assert sorted(lines[2:-1]) == ["Garden Party: The garden is ready.", "Meeting Plan: The room is booked."]
+    assert lines[-1] == "Meeting Plan: Prepare the guest list."
+    assert digest.NO_ADVICE_LINE not in lines
+
+
+@pytest.mark.asyncio
+async def test_an_open_portfolio_task_of_the_day_holds_the_message_without_advice_back_until_it_is_archived(root, ready):
+    _two_briefs_and_a_used_attempt(root, ready)
+    _no_portfolio_brief(root)
+    task = _portfolio_task("2026-11-10")
+    adapter = Adapter()
+    runner = _runner(adapter)
+    digest = importlib.import_module("gateway.owner_review_digest")
+    # A done task still waits for its harvest, and a blocked one is archived only by the next portfolio tick.
+    for status in ("ready", "done", "blocked"):
+        _task_status(task, status)
+        assert await digest.tick(runner) == 0
+        assert adapter.sent == [] and not (root / "owner_review_digest.json").exists()
+    _task_status(task, "archived")
+    assert await digest.tick(runner) == 1
+    assert adapter.sent[0][1].splitlines()[1] == "Raphael has no advice across your projects today."
+
+
+@pytest.mark.asyncio
+async def test_a_paused_channel_records_the_day_without_advice_as_paused_and_sends_nothing(root, ready):
+    _two_briefs_and_a_used_attempt(root, ready)
+    _no_portfolio_brief(root)
+    owner_channel_pause.pause()
+    adapter = Adapter()
+    digest = importlib.import_module("gateway.owner_review_digest")
+    assert await digest.tick(_runner(adapter)) == 0
+    assert adapter.sent == []
+    assert json.loads((root / "owner_review_digest.json").read_text(encoding="utf-8"))["told"]["2026-11-10"]["state"] == "paused"
