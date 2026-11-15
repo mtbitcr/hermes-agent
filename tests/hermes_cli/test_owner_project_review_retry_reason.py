@@ -322,3 +322,51 @@ def test_an_unreadable_refusal_gives_no_line_and_no_error(root, monkeypatch, cap
         else:
             assert _refusal_lines(body) == [] and LEAD_IN not in body, name
         assert _stored(root, project) == stored[name], name
+
+
+def test_a_further_review_after_a_stale_retry_carries_no_refusal(root, monkeypatch):
+    project = _quiet_project(root)
+    _clock(monkeypatch, NOW)
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
+        card = board.execute("SELECT id FROM tasks LIMIT 1").fetchone()[0]
+        assert kanban_db.block_task(board, card, reason="Which room?", kind="needs_input")
+    assert review.review_tick(NOW) == 1
+    first = _body(root, _key(project))
+    assert _refusal_lines(first) == []
+
+    # The first result is refused at the harvest, as a bypass of the hand-over would have it.
+    _finish(root, _key(project), _payload(_text(412, f"{MARKER} notes on the room. ")))
+    assert review.review_tick(NOW + 1) == 0
+    refusal = _stored(root, project)
+    assert json.loads(refusal) == {"date": DAY, "code": LENGTH, "detail": LONG_DETAIL}
+
+    # After the backoff the retry names that refusal.
+    assert review.review_tick(NOW + HOUR) == 0
+    retry_at = NOW + 1 + HOUR
+    _clock(monkeypatch, retry_at)
+    assert review.review_tick(retry_at) == 1
+    line = LEAD_IN + refusal_sentences(LENGTH, LONG_DETAIL)
+    assert _refusal_lines(_body(root, _key(project, failures=1))) == [line]
+
+    # The owner answers after the retry's input was frozen. Its valid result is stale, which counts no failure and
+    # stores no new refusal: the earlier one stays in the store, and the stale marker names the retry's key.
+    _clock(monkeypatch, retry_at + 10)
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
+        assert kanban_db.unblock_task(board, card)
+    claim = {"item": card, "class": "still actionable", "evidence": [f"decisions:wait:{card}"]}
+    _finish(root, _key(project, failures=1), _payload(classification=[claim]))
+    stale_at = retry_at + 11
+    assert review.review_tick(stale_at) == 0
+    assert _read(root / "projects.db", "SELECT failures, last_reviewed_date, stale_refused_key, last_refusal "
+                 "FROM project_review_state WHERE project_id=?", project.id) == [
+        (1, YESTERDAY, _key(project, failures=1), refusal)]
+
+    # After the unchanged backoff the day's further review opens. It follows a valid result, so it carries no line.
+    assert review.review_tick(stale_at + HOUR - 1) == 0
+    _clock(monkeypatch, stale_at + HOUR)
+    assert review.review_tick(stale_at + HOUR) == 1
+    again = _body(root, _key(project, failures=1, again=True))
+    assert _refusal_lines(again) == []
+    assert LEAD_IN not in again and "was refused" not in again and MARKER not in again
+    assert again.split("\nReview date: ", 1)[0] == first.split("\nReview date: ", 1)[0]
+    assert _stored(root, project) == refusal

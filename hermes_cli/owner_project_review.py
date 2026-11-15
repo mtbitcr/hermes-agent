@@ -1795,7 +1795,7 @@ def _open_review_task(
         board,
         title=TITLE_PREFIX + project.name,
         body=_task_body(state["last_reviewed_date"], review_day, batch.cursors, frozen["text"], frozen["conversation_cursor"],
-                        frozen["decision_cursor"], refusal_line(state, review_day)),
+                        frozen["decision_cursor"], "" if _again(state, review_day) else refusal_line(state, review_day)),
         assignee=summary.PLANNING_ROLE,
         created_by=CREATED_BY,
         workspace_kind="scratch",
