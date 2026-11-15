@@ -12,7 +12,7 @@ import sqlite3
 from typing import TypedDict
 
 from hermes_cli import kanban_db, owner_project_summary_events as events, projects_db
-from hermes_cli.owner_project_review_owner_line import owner_projection, plan_approvals_waiting
+from hermes_cli.owner_project_review_owner_line import linked_chats, waiting_approvals
 from hermes_constants import get_default_hermes_root, reset_hermes_home_override, set_hermes_home_override
 
 # This budget covers the normal source windows. Larger records retain explicit cut notices, including their bytes.
@@ -45,7 +45,8 @@ class ReviewInput(TypedDict):
     cuts: list[Cut]
     conversation_cursor: str | None
     decision_cursor: str | None
-    plan_approvals: int
+    # None while the linked chats are not available: a count that is not known is never 0.
+    plan_approvals: int | None
 
 
 # Every kind of cut notice, by cut reason, with the words its line starts with. ``cut_line`` writes the lines from
@@ -312,35 +313,17 @@ def read_conversation_news(registry, project_id: str) -> tuple[str | None, int |
 
 
 def _conversation(root, registry, project, last_review, sources, cuts):
-    if not _table(registry, "project_conversation_links"):
-        _reduce(cuts, "conversation", "unlinked")
-        return
-    links = list(registry.execute(
-        "SELECT conversation FROM project_conversation_links WHERE project_id=? ORDER BY linked_at,conversation",
-        (project.id,),
-    ))
-    if not links:
-        _reduce(cuts, "conversation", "unlinked")
-        return
-    path = root / "response_store.db"
-    if not path.exists():
-        _reduce(cuts, "conversation", "not_available")
-        return
-    from gateway.platforms.api_server import OwnerAuthorityBroken
-
-    with events._read_only(path) as conn:
-        # The constructor migrates the schema and changes file permissions. Reuse only its read-only projection.
-        store = owner_projection(conn, path)
-        turns, unread, heads = [], False, []
-        for (name,) in links:
-            try:
-                snapshot = store.owner_history_snapshot(name, profile="default")
-            except OwnerAuthorityBroken:
-                # A broken project must defer its review, not abort the shared tick.
-                raise ValueError("linked_conversation_unavailable") from None
-            heads.append((name, snapshot["head_response_id"]))
-            unread = unread or snapshot["truncated"] or snapshot["incomplete"]
-            turns.extend(snapshot["data"])
+    # The plan approval count's own rule and read, so the record and the count never differ.
+    chats = linked_chats(registry, project.id, root)
+    if not chats:
+        # A link with no response store: the chat is not available, and its plan approvals are not known.
+        _reduce(cuts, "conversation", "not_available" if chats is None else "unlinked")
+        return None, waiting_approvals(chats)
+    turns, unread, heads = [], False, []
+    for name, snapshot in chats:
+        heads.append((name, snapshot["head_response_id"]))
+        unread = unread or snapshot["truncated"] or snapshot["incomplete"]
+        turns.extend(snapshot["data"])
     if unread:
         # Part of the conversation was not read, so its total is not known.
         _reduce(cuts, "conversation", "not_available")
@@ -352,7 +335,7 @@ def _conversation(root, registry, project, last_review, sources, cuts):
     texts = _reduce(cuts, "conversation", "text", [turn["owner"] for turn in turns] + [turn["raphael"] for turn in turns],
                     [1000] * len(turns) + [1000 - min(len(turn["owner"]), 1000) for turn in turns])
     sources["conversation"] = [{"owner": texts[i], "raphael": texts[len(turns) + i]} for i in range(len(turns))]
-    return _conversation_cursor(heads)
+    return _conversation_cursor(heads), waiting_approvals(chats)
 
 
 def _registry_record(root, project, last_review, sources, cuts):
@@ -379,9 +362,8 @@ def _registry_record(root, project, last_review, sources, cuts):
         summary = projects_db.get_project_summary(conn, project.id)
         if summary:
             sources["project"].append(summary)
-        conversation_cursor = _conversation(root, conn, project, last_review, sources, cuts)
-        # The plan approvals that wait in the linked chats, from the same registry snapshot as the record.
-        chat = conversation_cursor, plan_approvals_waiting(conn, project.id)
+        # The chat cursor and the plan approvals that wait in the linked chats, from the same snapshots as the record.
+        chat = _conversation(root, conn, project, last_review, sources, cuts)
         if not _table(conn, "project_review_briefs"):
             _reduce(cuts, "earlier_reviews", "not_available")
             return chat
@@ -525,7 +507,7 @@ def _freeze(sources, cuts, max_bytes: int | None = None) -> ReviewInput:
     if size > cap:
         raise ValueError("the review input cap cannot hold its omission notices")
     return {"text": text, "size": size, "sources": {source: [row[0] for row in rows[source]] for source in sources},
-            "cuts": ordered, "conversation_cursor": None, "decision_cursor": None, "plan_approvals": 0}
+            "cuts": ordered, "conversation_cursor": None, "decision_cursor": None, "plan_approvals": None}
 
 
 def _automations(project, sources, cuts) -> None:

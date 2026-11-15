@@ -574,8 +574,8 @@ def parse_review_result(
         item["item"] in suggestion_ids and item["class"] == "still actionable" and item.get("actor") == "owner"
         for item in classification
     ) + sum(suggestion[0] not in suggestion_ids for suggestion in decisions["suggestions"])
-    # Only recorded waits and suggestions, and the plan approvals frozen with the task, supply the owner line.
-    approvals = owner_steps.frozen_plan_approvals(task.body) or 0
+    # Only recorded waits and suggestions, and the plan approvals frozen with the task (none named if not known), count.
+    approvals = owner_steps.frozen_plan_approvals(task.body)
     refreshed["owner_decision"] = brief["needs_you"] = owner_steps.owner_line(waiting, pending, approvals)
     from hermes_cli.owner_project_review_origin import source_digest
 
@@ -1728,7 +1728,7 @@ def _wait_order(news: _News, review_day: str) -> tuple:
 
 def _task_body(last_reviewed_date: Optional[str], review_day: str, covered: events.Cursors, frozen: str,
                conversation_cursor: Optional[str] = None, decision_cursor: Optional[str] = None,
-               refusal_line: str = "", plan_approvals: int = 0) -> str:
+               refusal_line: str = "", plan_approvals: Optional[int] = None) -> str:
     """The instruction, the line that tells why the day's last review was refused, the days the review covers, and last
     the line that names the events it covers."""
     from hermes_cli.owner_project_review_proposals import proposal_schema
@@ -1742,7 +1742,7 @@ def _task_body(last_reviewed_date: Optional[str], review_day: str, covered: even
         + _window_line(last_reviewed_date, review_day)
         + f"\nLinked conversation cursor: {conversation_cursor or 'none'}"
         + f"\nOwner decision cursor: {decision_cursor or 'none'}"
-        + f"\nPlan approvals waiting: {plan_approvals}"
+        + ("" if plan_approvals is None else f"\nPlan approvals waiting: {plan_approvals}")
         + "\n"
         + frozen
         + "\n"

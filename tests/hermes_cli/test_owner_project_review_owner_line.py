@@ -377,3 +377,41 @@ def test_t10_a_worker_pinned_count_reads_the_root_registry_and_the_root_response
     assert "Book the room" in [item["title"] for item in frozen["sources"]["tasks"]]
     assert "Plan approvals waiting: 2" in _frozen_body(task_id).splitlines()
     assert not (profile / "projects.db").exists()
+
+
+def test_a_linked_chat_without_a_response_store_freezes_no_approval_count_and_names_no_approval(root, monkeypatch):
+    """Owner decision of 2026-11-15, point 7: the chat is not available, so its approvals are not known, never 0."""
+    project = _quiet_project(root)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
+        card = board.execute("SELECT id FROM tasks LIMIT 1").fetchone()[0]
+        assert kanban_db.block_task(board, card, reason="Which room?", kind="needs_input")
+    # A proposal waits in the linked chat when the tick reads its news. The response store is gone before the freeze.
+    _chat(root, NAME, RID)
+    _link(root, NAME, project.id)
+    freeze = records.build_review_input
+
+    def without_store(*args, **kwargs):
+        for item in root.iterdir():
+            if item.name.startswith("response_store.db"):
+                item.unlink()
+        return freeze(*args, **kwargs)
+
+    monkeypatch.setattr(records, "build_review_input", without_store)
+
+    assert review.review_tick(NOW) == 1
+
+    task_id = _open_review(root, project)
+    lines = _frozen_body(task_id).splitlines()
+    assert "Not available: conversation." in lines
+    assert [line for line in lines if line.startswith("Plan approvals waiting")] == []
+    assert freeze(project, events.Cursors(), None)["plan_approvals"] is None
+    _complete_review(task_id, [{"item": card, "class": "still actionable", "evidence": [f"decisions:wait:{card}"]}])
+
+    assert review.review_tick(NOW + 1) == 0
+
+    # Harvested with no approval check: the owner line names the recorded answer and no plan approval.
+    brief, stored = _brief(root, project)
+    assert (brief["needs_you"], stored["owner_decision"]) == (ANSWER, ANSWER), brief
+    assert (brief["review_date"], brief["quiet"]) == (DAY, False)
+    assert not (root / "response_store.db").exists()

@@ -23,6 +23,7 @@ FIRST = "Nothing has happened in this Project yet."
 FOLLOW = "Follow the current plan."
 WAITS = "The work waits for you: see what needs you."
 # The count frozen into a review task's body next to its two cursors, outside the record, so the total cap cannot cut it.
+# A count that is not known is the absence of the line, never 0.
 _APPROVALS = re.compile(r"^Plan approvals waiting: ([0-9]+)$", re.MULTILINE)
 _EARLIER_REVIEW = re.compile(r"(?i)\b(?:last|previous|earlier|prior)\s+review")
 
@@ -38,42 +39,62 @@ def owner_projection(conn: sqlite3.Connection, path: Path) -> Any:
     return store
 
 
-def plan_approvals_waiting(registry: sqlite3.Connection, project_id: str) -> int:
-    """The Project's linked chats whose plan change proposal waits for the owner's approval: outstanding, not applied,
-    not claimed and in an open conversation. A chat that cannot be read raises ValueError, so no review says that
-    nothing needs the owner by mistake."""
+def linked_chats(registry: sqlite3.Connection, project_id: str, root: Path) -> Optional[list[tuple[str, dict]]]:
+    """The owner snapshot of each chat linked to the Project, from the response store under ``root``.
+
+    The one rule of the review record's conversation and of the plan approval count, so the two never differ (owner
+    decision of 2026-11-15, point 2): no link table or no link gives []; a link with no response store gives None, a
+    chat that is not available and whose approvals are not known; a chat that cannot be read raises ValueError, so its
+    Project's review is deferred.
+    """
     if registry.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_conversation_links'",
     ).fetchone() is None:
-        return 0
+        return []
     links = [row[0] for row in registry.execute(
         "SELECT conversation FROM project_conversation_links WHERE project_id=? ORDER BY linked_at,conversation",
         (project_id,),
     )]
     if not links:
-        return 0
-    path = get_default_hermes_root() / "response_store.db"
+        return []
+    path = root / "response_store.db"
     if not path.exists():
-        raise ValueError("linked_conversation_unavailable")
+        return None
     from gateway.platforms.api_server import OwnerAuthorityBroken
 
-    waiting = 0
+    chats = []
     with events._read_only(path) as conn:
         store = owner_projection(conn, path)
         for name in links:
             try:
-                snapshot = store.owner_history_snapshot(name, profile="default")
+                chats.append((name, store.owner_history_snapshot(name, profile="default")))
             except OwnerAuthorityBroken:
+                # A broken project must defer its review, not abort the shared tick.
                 raise ValueError("linked_conversation_unavailable") from None
-            # A released claim waits again; one whose change was applied reads as consumed.
-            waiting += snapshot["latest_response_id"] is not None and not (
-                snapshot["proposal_consumed"] or snapshot["proposal_claimed"] or snapshot["conversation_closed"]
-            )
-    return waiting
+    return chats
 
 
-def owner_line(waiting: int, pending: int, approvals: int) -> Optional[str]:
-    """needs_you and the summary's owner_decision: the Decisions part, then the approval part; None with no owner step."""
+def waiting_approvals(chats: Optional[list[tuple[str, dict]]]) -> Optional[int]:
+    """The chats whose plan change proposal waits for the owner's approval: outstanding, not applied, not claimed and in
+    an open conversation. None for chats that are not available: a count that is not known is never 0."""
+    if chats is None:
+        return None
+    # A released claim waits again; one whose change was applied reads as consumed.
+    return sum(snapshot["latest_response_id"] is not None and not (
+        snapshot["proposal_consumed"] or snapshot["proposal_claimed"] or snapshot["conversation_closed"]
+    ) for _name, snapshot in chats)
+
+
+def plan_approvals_waiting(registry: sqlite3.Connection, project_id: str) -> Optional[int]:
+    """The Project's plan approvals in its linked chats, read live from the root response store by ``linked_chats``:
+    None while the chats are not available. A chat that cannot be read raises ValueError, so no review says that nothing
+    needs the owner by mistake."""
+    return waiting_approvals(linked_chats(registry, project_id, get_default_hermes_root()))
+
+
+def owner_line(waiting: int, pending: int, approvals: Optional[int]) -> Optional[str]:
+    """needs_you and the summary's owner_decision: the Decisions part, then the approval part; None with no owner step.
+    Approvals that are not known (None) give no approval part."""
     if waiting and pending:
         decisions = f"{waiting + pending} items are waiting on Decisions."
     elif pending:
@@ -97,7 +118,8 @@ def quiet_texts(first: bool, line: Optional[str]) -> dict[str, Optional[str]]:
 
 
 def frozen_plan_approvals(body: Optional[str]) -> Optional[int]:
-    """The plan approvals frozen into a review task's body; None for a task made before the count was frozen."""
+    """The plan approvals frozen into a review task's body; None for a task made before the count was frozen, or while
+    the linked chats were not available."""
     found = _APPROVALS.search(body or "")
     return None if found is None else int(found[1])
 
@@ -122,8 +144,9 @@ def refuse_earlier_review(refreshed: Mapping[str, Any], brief: Mapping[str, Any]
 
 
 def fence_plan_approvals(registry: sqlite3.Connection, project_id: str, frozen: Optional[int]) -> None:
-    """The harvest's live read inside its protected section: approvals that differ from the frozen count make the
-    result stale. A task made before the count was frozen skips the check."""
+    """The harvest's live read inside its protected section: approvals that differ from the frozen count, or that are
+    now not known, make the result stale. A body without the count, made before it was frozen or while the chats were
+    not available, skips the check."""
     from hermes_cli.owner_project_review import ReviewRefused, ReviewStale
 
     if frozen is None:
@@ -139,7 +162,8 @@ def fence_plan_approvals(registry: sqlite3.Connection, project_id: str, frozen: 
 
 def quiet_brief(registry: sqlite3.Connection, project: Any, first: bool) -> dict[str, Optional[str]]:
     """The quiet brief's texts, read inside the caller's protected section: the waits and the pending suggestions of
-    the Project board, read-only, less each suggestion the latest real review settled, and the plan approvals."""
+    the Project board, read-only, less each suggestion the latest real review settled, and the plan approvals, of which
+    none is named while they are not known."""
     from hermes_cli import owner_project_review as review
 
     waiting = pending = 0
