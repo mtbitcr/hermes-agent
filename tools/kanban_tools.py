@@ -40,6 +40,7 @@ from contextlib import closing
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
+from agent.tool_dispatch_helpers import _maybe_wrap_untrusted, _neutralize_delimiters
 from hermes_cli.goals import judge_goal
 from tools.kanban_record_window import build_record_text
 from tools.kanban_run_ending import ends_run
@@ -3012,6 +3013,19 @@ def _read_window_int(args: dict, name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer")
 
 
+_PAGE_FILE_SUFFIXES = (".html", ".htm")
+_PAGE_FILE_WRAP_SOURCE = "browser_page_file"
+# The shared wrapper leaves a string under 32 chars bare, so take its frame around a 32-char slot.
+_PAGE_FILE_SLOT = "\x00" * 32
+
+
+def _wrap_page_file(text: str) -> str:
+    """Put ``text`` inside the untrusted-data block the design browser uses."""
+    frame = _maybe_wrap_untrusted(_PAGE_FILE_WRAP_SOURCE, _PAGE_FILE_SLOT)
+    head, tail = frame.split(_PAGE_FILE_SLOT)
+    return head + _neutralize_delimiters(text) + tail
+
+
 def _handle_read(args: dict, **kw) -> str:
     """Return a bounded character window of this task's attachment, body or record.
 
@@ -3114,6 +3128,7 @@ def _handle_read(args: dict, **kw) -> str:
             f"(total {total})"
         )
     window = text[offset:offset + limit]
+    page_file = source == "attachment" and filename.lower().endswith(_PAGE_FILE_SUFFIXES)
     return _ok(
         task_id=tid,
         source=source,
@@ -3124,7 +3139,7 @@ def _handle_read(args: dict, **kw) -> str:
         returned=len(window),
         total=total,
         has_more=(offset + len(window)) < total,
-        content=window,
+        content=_wrap_page_file(window) if page_file else window,
     )
 
 
