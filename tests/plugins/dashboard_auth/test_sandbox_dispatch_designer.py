@@ -9,9 +9,15 @@ test_raphael_sandbox_dispatch: the seat is admitted only on its own card and
 run, the kernel still refuses a designer patch, the artifact tool is no wider
 for it than for the other read-only roles, and every role admitted before keeps
 exactly the authority it had.
+
+The seat is admitted only on a card that owns no repository path. The kernel's
+read-only run policy does not name the designer yet, so a designer card that
+owns paths gets no machine at all (``designer_card_has_owned_paths``): no
+machine means no export, and no export means no patch to commit.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -43,6 +49,15 @@ ROLE_CARDS = [
 ROLES = [profile for profile, _card, _scope in ROLE_CARDS]
 CARDS = [(profile, card) for profile, card, _scope in ROLE_CARDS]
 PATCH = b"--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-print('hi')\n+print('designed')\n"
+#: The one code, and the one sentence, for a designer card that owns repository paths.
+DESIGNER_OWNED_PATHS = "designer_card_has_owned_paths"
+DESIGNER_OWNED_PATHS_REPLY = (
+    "a designer card that owns repository paths gets no build machine, "
+    "because a designer has no patch authority."
+)
+#: Card scopes that own a repository path: one file, and the whole tree.
+OWNING_SCOPES = [["app.py"], ["."]]
+OWNING_IDS = ["file", "whole-tree"]
 
 
 def _seat(host, monkeypatch, profile, owned_paths):
@@ -55,6 +70,13 @@ def _seat(host, monkeypatch, profile, owned_paths):
         )
         conn.execute("UPDATE task_runs SET profile=? WHERE id=?", (profile, host.run_id))
     monkeypatch.setenv("HERMES_PROFILE", profile)
+
+
+def _set_owned_paths(host, owned_paths):
+    """Change only the host card's owned paths; the session and its environment stay as they are."""
+    scope = None if owned_paths is None else json.dumps(owned_paths)
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET owned_paths=? WHERE id=?", (scope, host.task_id))
 
 
 @pytest.fixture
@@ -73,11 +95,21 @@ def credential_calls(host, monkeypatch):
     return calls
 
 
-def _provision_code(caplog, args=None):
-    """Run the tool; return its JSON and the refusal code it logged, if any."""
-    caplog.clear()
-    with caplog.at_level(logging.INFO, logger=sd.logger.name):
-        out = _provision(args)
+@pytest.fixture
+def board_writes(monkeypatch):
+    """The two calls a provision writes for a machine through: its creation intent and its reservation."""
+    calls = []
+    for owner, name in ((kb, "record_kernel_creation"), (sd, "_advance_reservation")):
+        def spy(*args, _real=getattr(owner, name), _name=name, **kwargs):
+            calls.append(_name)
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, spy)
+    return calls
+
+
+def _refusal_code(caplog):
+    """The code the tool logged for a refused call, if it logged one."""
     code = None
     for record in caplog.records:
         message = record.getMessage()
@@ -88,7 +120,15 @@ def _provision_code(caplog, args=None):
         elif message.startswith("raphael sandbox dispatch: {"):
             entry = json.loads(message.split(": ", 1)[1])
             code = entry.get("reason") if entry.get("outcome") == "failed" else code
-    return out, code
+    return code
+
+
+def _provision_code(caplog, args=None):
+    """Run the tool; return its JSON and the refusal code it logged, if any."""
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=sd.logger.name):
+        out = _provision(args)
+    return out, _refusal_code(caplog)
 
 
 def _assert_refused(host, caplog, credential_calls, code):
@@ -97,6 +137,25 @@ def _assert_refused(host, caplog, credential_calls, code):
     assert FakeSandbox.created == []
     assert _reservation(host)["state"] == "absent"
     assert credential_calls == []
+    return out
+
+
+def _board_state(host):
+    """What the board and the creation ledger hold for the host card, to compare around a refusal."""
+    with kb.connect_closing() as conn:
+        events = [
+            tuple(row) for row in conn.execute(
+                "SELECT id, run_id, kind, payload FROM task_events "
+                "WHERE task_id = ? ORDER BY id", (host.task_id,),
+            )
+        ]
+        attachments = [item.id for item in kb.list_attachments(conn, host.task_id)]
+    return {
+        "events": events,
+        "attachments": attachments,
+        "intents": kb.kernel_resource_intents(kind=sd.KERNEL_SANDBOX_KIND, task_id=host.task_id),
+        "reservation": _reservation(host),
+    }
 
 
 def _designer_machine():
@@ -139,9 +198,7 @@ def test_designer_is_admitted_read_only_beside_verifier_and_planner():
     assert {DESIGNER, "raphael-verifier", "raphael-planner"} <= sd.READ_ONLY_SOURCE_PROFILES
 
 
-@pytest.mark.parametrize(
-    "owned_paths", [None, [], ["."]], ids=["unscoped", "empty", "whole-tree"],
-)
+@pytest.mark.parametrize("owned_paths", [None, []], ids=["unscoped", "empty"])
 def test_designer_gets_a_machine_with_no_coding_authority(
     host, sdk, monkeypatch, credential_calls, owned_paths,
 ):
@@ -246,13 +303,13 @@ def _spawned_env(host, monkeypatch):
     return spawned
 
 
-@pytest.mark.parametrize("name_from", ["HERMES_PROFILE", "profile home"])
-def test_designer_is_admitted_in_the_env_the_dispatcher_injects(
-    host, sdk, monkeypatch, name_from,
-):
-    _seat(host, monkeypatch, DESIGNER, [])
+def _worker_env(host, monkeypatch, name_from):
+    """Run this session in the exact environment the dispatcher hands the worker it starts."""
+    board_db, board = kb.kanban_db_path(), kb.get_current_board()
     env = _spawned_env(host, monkeypatch)
     assert {"HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_WORKSPACE"} <= set(env)
+    assert Path(env["HERMES_KANBAN_DB"]) == board_db
+    assert env["HERMES_KANBAN_BOARD"] == board
     assert env["HERMES_KANBAN_TASK"] == host.task_id
     assert env["HERMES_KANBAN_RUN_ID"] == str(host.run_id)
     if name_from == "profile home":
@@ -264,6 +321,28 @@ def test_designer_is_admitted_in_the_env_the_dispatcher_injects(
             monkeypatch.setenv(key, env[key])
     assert Path(os.environ["HERMES_HOME"]) == host.home / "profiles" / DESIGNER
     assert ("HERMES_PROFILE" in os.environ) is (name_from == "HERMES_PROFILE")
+
+
+@pytest.mark.parametrize("name_from", ["HERMES_PROFILE", "profile home"])
+def test_designer_is_admitted_in_the_env_the_dispatcher_injects(
+    host, sdk, monkeypatch, name_from,
+):
+    _seat(host, monkeypatch, DESIGNER, [])
+    _worker_env(host, monkeypatch, name_from)
+    _out, box = _designer_machine()
+    assert box.reported_metadata["hermes_profile"] == DESIGNER
+
+
+@pytest.mark.parametrize("name_from", ["HERMES_PROFILE", "profile home"])
+def test_designer_card_with_owned_paths_is_refused_in_the_env_the_dispatcher_injects(
+    host, sdk, monkeypatch, caplog, credential_calls, name_from,
+):
+    _seat(host, monkeypatch, DESIGNER, ["app.py"])
+    _worker_env(host, monkeypatch, name_from)
+    out = _assert_refused(host, caplog, credential_calls, DESIGNER_OWNED_PATHS)
+    assert out["error"] == DESIGNER_OWNED_PATHS_REPLY
+    # Same environment, same card: with its owned paths gone it is granted its machine.
+    _set_owned_paths(host, [])
     _out, box = _designer_machine()
     assert box.reported_metadata["hermes_profile"] == DESIGNER
 
@@ -301,6 +380,76 @@ def test_another_role_cannot_provision_for_the_designers_card(
     _assert_refused(host, caplog, credential_calls, "task_not_assigned")
     monkeypatch.setenv("HERMES_PROFILE", DESIGNER)
     _designer_machine()
+
+
+@pytest.mark.parametrize(
+    ("how", "code"),
+    [
+        ("delegated child", "not_dispatcher_owned"),
+        ("another role's session", "task_not_assigned"),
+        ("stale run", "run_not_active"),
+    ],
+)
+def test_older_refusals_keep_their_codes_on_a_designer_card_that_owns_paths(
+    host, sdk, monkeypatch, caplog, credential_calls, how, code,
+):
+    _seat(host, monkeypatch, DESIGNER, ["app.py"])
+    if how == "another role's session":
+        monkeypatch.setenv("HERMES_PROFILE", sd.WORKER_PROFILE)
+    elif how == "stale run":
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(host.run_id + 90))
+    child = (
+        delegated_child_context("designer-child")
+        if how == "delegated child" else contextlib.nullcontext()
+    )
+    with child:
+        _assert_refused(host, caplog, credential_calls, code)
+
+
+# --- 2b. A designer card that owns repository paths gets no machine at all ---
+
+
+@pytest.mark.parametrize("owned_paths", OWNING_SCOPES, ids=OWNING_IDS)
+def test_designer_card_with_owned_paths_gets_no_machine_and_nothing_is_written(
+    host, sdk, monkeypatch, caplog, credential_calls, board_writes, owned_paths,
+):
+    _seat(host, monkeypatch, DESIGNER, owned_paths)
+    before = _board_state(host)
+    out = _assert_refused(host, caplog, credential_calls, DESIGNER_OWNED_PATHS)
+    assert out["error"] == DESIGNER_OWNED_PATHS_REPLY
+    assert "sandbox_id" not in out
+    assert FakeSandbox.connect_calls == []
+    assert board_writes == []
+    assert _board_state(host) == before
+    # Not vacuous: the same card owning nothing is granted its machine, and that does write.
+    _set_owned_paths(host, [])
+    _designer_machine()
+    assert {"record_kernel_creation", "_advance_reservation"} <= set(board_writes)
+    after = _board_state(host)
+    assert after["events"] != before["events"]
+    assert before["intents"] == [] and len(after["intents"]) == 1
+
+
+@pytest.mark.parametrize("owned_paths", OWNING_SCOPES, ids=OWNING_IDS)
+def test_designer_card_with_owned_paths_has_nothing_to_export(
+    host, sdk, monkeypatch, caplog, credential_calls, owned_paths,
+):
+    _seat(host, monkeypatch, DESIGNER, owned_paths)
+    _assert_refused(host, caplog, credential_calls, DESIGNER_OWNED_PATHS)
+    before = _board_state(host)["attachments"]
+    request = {
+        "direction": "export", "path": "/workspace/task/designer.patch",
+        "expected_sha256": hashlib.sha256(PATCH).hexdigest(),
+    }
+    exported = _artifact(request)
+    assert "error" in exported and "attachment_id" not in exported, exported
+    assert FakeSandbox.created == [] and FakeSandbox.connect_calls == []
+    assert _board_state(host)["attachments"] == before
+    # Not vacuous: the same request is served once the card owns nothing and so gets its machine.
+    _set_owned_paths(host, [])
+    _out, box = _designer_machine()
+    box.files.write_file(request["path"], PATCH)
+    assert "attachment_id" in _artifact(request)
 
 
 # --- 3. No patch authority: the kernel refuses a designer patch, the tree stays ---
@@ -341,6 +490,113 @@ def test_kernel_refuses_a_designer_patch_and_leaves_the_worktree_alone(
         assert kb.complete_task(conn, host.task_id, summary="Applied.", **handoff)
         task = kb.get_task(conn, host.task_id)
         assert task.head_commit != task.base_commit
+
+
+def _tool(name, args):
+    """Call one model tool the way the agent loop does: through the registry, with its middleware."""
+    import model_tools
+
+    return json.loads(model_tools.handle_function_call(name, args))
+
+
+def _claimed_designer_card(host, monkeypatch, owned_paths):
+    """A designer card as the dispatcher makes it: created with a pinned route, claimed, on the host worktree."""
+    route = task_assignment_for(DESIGNER, "anthropic", "deep")
+    for profile, provider in ((DESIGNER, "anthropic"), ("raphael-verifier", "openai-codex")):
+        configured = task_assignment_for(profile, provider, "deep")
+        home = host.home / "profiles" / profile
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text(json.dumps({
+            "model": {"provider": configured.provider, "default": configured.model},
+            "agent": {"reasoning_effort": configured.reasoning_effort},
+            "fallback_providers": [], "fallback_model": None,
+        }), encoding="utf-8")
+    branch = _git(host.worktree, "branch", "--show-current")
+    with kb.connect_closing() as conn:
+        assert kb.block_task(conn, host.task_id, reason="replaced by a claimed designer card")
+        task_id = kb.create_task(
+            conn, title="Designer owns this option rendering card", assignee=DESIGNER,
+            workspace_kind="worktree", workspace_path=str(host.worktree),
+            branch_name=branch, owned_paths=owned_paths,
+            provider_override=route.provider, model_override=route.model,
+            reasoning_effort=route.reasoning_effort, execution_tier="deep",
+            model_policy_lock=kb.mint_policy_lock(
+                DESIGNER, route.provider, route.model, route.reasoning_effort, "deep",
+            ),
+            risk_tier=2,
+        )
+        kb.recompute_ready(conn)
+        claimed = kb.claim_task(conn, task_id, expected_assignee=DESIGNER)
+        assert claimed is not None
+        kb.record_worktree_base(conn, task_id, host.worktree)
+        assert kb.get_task(conn, task_id).owned_paths == owned_paths
+    monkeypatch.setenv("HERMES_PROFILE", DESIGNER)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    return task_id, branch
+
+
+def _source_state(host, branch):
+    """The source the host holds: every commit, plus the card's branch and worktree while they exist.
+
+    Finishing a clean card removes its worktree and ``wt/`` branch, so their absence is not a change.
+    """
+    state = {"commits": set(_git(host.repo, "rev-list", "--all").split())}
+    if _git(host.repo, "branch", "--list", branch):
+        state["branch_head"] = _git(host.repo, "rev-parse", branch)
+        state["branch_source"] = _git(host.repo, "show", f"{branch}:app.py")
+    if host.worktree.exists():
+        state["worktree_head"] = _git(host.worktree, "rev-parse", "HEAD")
+        state["worktree_source"] = (host.worktree / "app.py").read_text(encoding="utf-8")
+        state["worktree_status"] = _git(host.worktree, "status", "--porcelain")
+    return state
+
+
+@pytest.mark.parametrize("handoff", ["explicit-complete", "saved-complete", "request-review"])
+@pytest.mark.parametrize(
+    "owned_paths", [[], None, *OWNING_SCOPES], ids=["empty", "unscoped", *OWNING_IDS],
+)
+def test_no_designer_patch_is_committed_through_any_handoff_tool(
+    host, sdk, monkeypatch, caplog, owned_paths, handoff,
+):
+    task_id, branch = _claimed_designer_card(host, monkeypatch, owned_paths)
+    before = _source_state(host, branch)
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=sd.logger.name):
+        receipt = _tool("raphael_sandbox_provision", {})
+    refusal = _refusal_code(caplog)
+    patch_id = 999_999  # a refused card has no machine to export from, so nothing real to cite
+    if "sandbox_id" in receipt:
+        FakeSandbox.created[-1].files.write_file("/workspace/task/designer.patch", PATCH)
+        exported = _tool("raphael_sandbox_artifact", {
+            "direction": "export", "path": "/workspace/task/designer.patch",
+            "expected_sha256": hashlib.sha256(PATCH).hexdigest(),
+        })
+        assert "attachment_id" in exported, exported
+        patch_id = exported["attachment_id"]
+
+    args = {"task_id": task_id, "summary": "Rendered the options."}
+    if handoff == "explicit-complete":
+        args["patch_attachment_id"] = patch_id
+    tool = "kanban_request_review" if handoff == "request-review" else "kanban_complete"
+    reply = _tool(tool, args)
+
+    after = _source_state(host, branch)
+    assert after == {key: before[key] for key in after}, (receipt, reply)
+    if handoff == "explicit-complete":
+        assert "error" in reply, reply
+    if owned_paths:
+        assert "error" in receipt and "sandbox_id" not in receipt, receipt
+        assert refusal == DESIGNER_OWNED_PATHS
+        assert FakeSandbox.created == []
+        with kb.connect_closing() as conn:
+            uploads = kb.list_attachments(conn, task_id)
+        assert [item.id for item in uploads if item.uploaded_by == "agent"] == []
+    else:
+        assert "sandbox_id" in receipt, receipt
+        assert receipt["ownership_scope"] == []
+        assert receipt["policy"]["host_patch_import_authorized"] is False
 
 
 # --- 3c. The artifact tool is no wider for the designer than for any read-only role ---
@@ -447,6 +703,18 @@ def test_each_earlier_role_keeps_exactly_its_authority(
     assert (sd.PLACEHOLDER_TOKEN in repr(box.create_kwargs["env"])) is has_credential
     assert bool(credential_calls) is has_credential
     assert policy["automatic_run_cleanup"] is True
+
+
+@pytest.mark.parametrize("owned_paths", OWNING_SCOPES, ids=OWNING_IDS)
+@pytest.mark.parametrize("profile", ROLES)
+def test_a_card_that_owns_paths_is_refused_for_the_designer_alone(
+    host, sdk, monkeypatch, caplog, profile, owned_paths,
+):
+    _seat(host, monkeypatch, profile, owned_paths)
+    out, code = _provision_code(caplog)
+    assert "sandbox_id" in out and code != DESIGNER_OWNED_PATHS, (out, code)
+    writes = profile in (sd.WORKER_PROFILE, "raphael-builder")
+    assert out["ownership_scope"] == (owned_paths if writes else [])
 
 
 def test_admission_sets_keep_their_relations():

@@ -81,11 +81,12 @@ Fail-closed everywhere
 Wrong profile, missing/foreign Kanban run, scratch or ambiguous or unscoped
 source, a dirty tree, a mutable image tag, an unconfigured connection, a
 missing host credential, a Claude account token that would expire mid-task and
-cannot be refreshed, or a missing SDK all refuse before anything is created. A
-failure after creation records the remote ID before later setup, then either
-confirms cleanup or retains durable cleanup authority. Host temporary material
-is removed and the caller receives one actionable sanitized error. Exception
-bodies are never logged or returned — they can carry protected data.
+cannot be refreshed, a missing SDK, or a designer card that owns paths all
+refuse before anything is created. A failure after creation records the remote
+ID before later setup, then either confirms cleanup or retains durable cleanup
+authority. Host temporary material is removed and the caller receives one
+actionable sanitized error. Exception bodies are never logged or returned —
+they can carry protected data.
 """
 from __future__ import annotations
 
@@ -118,16 +119,20 @@ logger = logging.getLogger(__name__)
 TOOL_NAME = "raphael_sandbox_provision"
 TOOLSET = "raphael_sandbox"
 WORKER_PROFILE = "raphael-claude-worker"
+DESIGNER_PROFILE = "raphael-designer"
 SANDBOX_PROFILES = frozenset({
     WORKER_PROFILE, "raphael-builder", "raphael-verifier", "raphael-planner",
-    "raphael-designer",
+    DESIGNER_PROFILE,
 })
 #: Profiles whose runs only ever read the exact source: no patch authority,
 #: no coding credential. The planner joins the verifier here so code
 #: evidence for planning work is gathered on Server 2, never on the host; the
 #: designer renders its own option pages into pictures in its own machine.
+#: The designer is admitted only on a card that owns no repository path: the
+#: kernel's read-only run policy in hermes_cli/kanban_db.py does not name it
+#: yet. A follow-up card adds it there, and the refusal can then be dropped.
 READ_ONLY_SOURCE_PROFILES = frozenset({
-    "raphael-verifier", "raphael-planner", "raphael-designer",
+    "raphael-verifier", "raphael-planner", DESIGNER_PROFILE,
 })
 
 #: Where the task source is extracted inside the sandbox. Fixed so no caller
@@ -638,6 +643,12 @@ def _run_requires_read_only_source(ctx: _WorkerContext) -> bool:
 
 
 def _resolve_source(task: Any, ctx: _WorkerContext) -> _Source:
+    if ctx.profile == DESIGNER_PROFILE and task.owned_paths:
+        raise SandboxDispatchError(
+            "a designer card that owns repository paths gets no build machine, "
+            "because a designer has no patch authority.",
+            code="designer_card_has_owned_paths",
+        )
     if task.workspace_kind != "worktree" or not task.workspace_path:
         raise SandboxDispatchError(
             "this task has no git-backed source workspace (its workspace is "
