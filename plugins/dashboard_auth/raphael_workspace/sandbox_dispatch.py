@@ -120,11 +120,15 @@ TOOLSET = "raphael_sandbox"
 WORKER_PROFILE = "raphael-claude-worker"
 SANDBOX_PROFILES = frozenset({
     WORKER_PROFILE, "raphael-builder", "raphael-verifier", "raphael-planner",
+    "raphael-designer",
 })
 #: Profiles whose runs only ever read the exact source: no patch authority,
 #: no coding credential. The planner joins the verifier here so code
-#: evidence for planning work is gathered on Server 2, never on the host.
-READ_ONLY_SOURCE_PROFILES = frozenset({"raphael-verifier", "raphael-planner"})
+#: evidence for planning work is gathered on Server 2, never on the host; the
+#: designer renders its own option pages into pictures in its own machine.
+READ_ONLY_SOURCE_PROFILES = frozenset({
+    "raphael-verifier", "raphael-planner", "raphael-designer",
+})
 
 #: Where the task source is extracted inside the sandbox. Fixed so no caller
 #: — model or operator — picks a path on Server 2.
