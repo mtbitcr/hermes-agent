@@ -731,3 +731,103 @@ def test_profiles_never_admitted_are_still_refused(host, sdk, monkeypatch, caplo
     out, code = _provision_code(caplog)
     assert "error" in out and code == "wrong_profile", (out, code)
     assert FakeSandbox.created == []
+
+
+# --- 5. One gate: a designer card that owns paths gets no build machine tool operation ---
+
+
+@pytest.mark.parametrize("operation", ["provision", "inspect", "copy", "import", "export"])
+@pytest.mark.parametrize("owned_paths", OWNING_SCOPES, ids=OWNING_IDS)
+def test_designer_card_with_owned_paths_is_refused_each_build_machine_operation(
+    host, sdk, monkeypatch, credential_calls, board_writes, owned_paths, operation,
+):
+    _seat(host, monkeypatch, DESIGNER, owned_paths)
+    brief = b"Option A is calm. Option B is bold.\n"
+    digest = hashlib.sha256(brief).hexdigest()
+    with kb.connect_closing() as conn:
+        brief_id = kb.store_attachment_bytes(
+            conn, host.task_id, "brief.txt", brief,
+            content_type="text/plain", uploaded_by="operator",
+        )
+    requests = {
+        "inspect": {"direction": "inspect", "attachment_id": brief_id},
+        "copy": {"direction": "copy", "attachment_id": brief_id, "expected_sha256": digest},
+        "import": {"direction": "import", "attachment_id": brief_id, "expected_sha256": digest},
+        "export": {
+            "direction": "export", "path": "/workspace/task/option-a.png",
+            "expected_sha256": digest,
+        },
+    }
+    # The artifact tool reports only the sentence, so the code is read where the gate raises it.
+    gate_refusals, real_gate = [], sd._resolve_task
+
+    def watch_gate(*args, **kwargs):
+        try:
+            return real_gate(*args, **kwargs)
+        except sd.SandboxDispatchError as exc:
+            gate_refusals.append(exc.code)
+            raise
+
+    monkeypatch.setattr(sd, "_resolve_task", watch_gate)
+    before = _board_state(host)
+    assert brief_id in before["attachments"]
+    out = _provision() if operation == "provision" else _artifact(requests[operation])
+    assert out.get("error") == DESIGNER_OWNED_PATHS_REPLY, out
+    assert gate_refusals == [DESIGNER_OWNED_PATHS]
+    assert "sandbox_id" not in out and "attachment_id" not in out
+    assert FakeSandbox.created == [] and FakeSandbox.connect_calls == []
+    assert credential_calls == [] and board_writes == []
+    assert _board_state(host) == before
+
+
+@pytest.mark.parametrize("owned_paths", OWNING_SCOPES, ids=OWNING_IDS)
+def test_lease_hook_blocks_no_tool_of_a_designer_card_that_owns_paths(
+    host, sdk, monkeypatch, owned_paths,
+):
+    # The hook resolves its task through the same gate the build machine tools use.
+    _seat(host, monkeypatch, DESIGNER, owned_paths)
+    result = sd.maintain_sandbox_lease(
+        tool_name="kanban_heartbeat", args={"note": "still rendering the options"},
+    )
+    assert result is None, result
+
+
+@pytest.mark.parametrize("owned_paths", OWNING_SCOPES, ids=OWNING_IDS)
+def test_codex_runtime_is_still_blocked_and_recorded_on_a_designer_card_that_owns_paths(
+    host, monkeypatch, owned_paths,
+):
+    # The runtime hook resolves its task through the same gate and must record its blocker as before.
+    _seat(host, monkeypatch, DESIGNER, owned_paths)
+    result = sd.enforce_sandbox_runtime(api_mode="codex_app_server")
+    assert result and result["action"] == "block", result
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, host.task_id)
+    assert (task.status, task.block_kind) == ("blocked", "capability")
+
+
+@pytest.mark.parametrize("owned_paths", [None, []], ids=["unscoped", "empty"])
+def test_designer_card_with_no_owned_path_keeps_inspect_copy_and_provision(
+    host, sdk, monkeypatch, credential_calls, owned_paths,
+):
+    _seat(host, monkeypatch, DESIGNER, owned_paths)
+    brief = b"Option A is calm. Option B is bold.\n"
+    digest = hashlib.sha256(brief).hexdigest()
+    with kb.connect_closing() as conn:
+        brief_id = kb.store_attachment_bytes(
+            conn, host.task_id, "brief.txt", brief,
+            content_type="text/plain", uploaded_by="operator",
+        )
+    seen = _artifact({"direction": "inspect", "attachment_id": brief_id})
+    assert seen["sha256"] == digest
+    assert seen["content_text"] == brief.decode("utf-8")
+
+    before = _board_state(host)["attachments"]
+    copied = _artifact({"direction": "copy", "attachment_id": brief_id, "expected_sha256": digest})
+    assert "error" not in copied, copied
+    with kb.connect_closing() as conn:
+        added = [item for item in kb.list_attachments(conn, host.task_id) if item.id not in before]
+        assert len(added) == 1
+        assert kb.read_attachment_bytes(added[0]) == brief
+
+    out, box = _designer_machine()
+    _assert_no_coding_authority(out, box, credential_calls)

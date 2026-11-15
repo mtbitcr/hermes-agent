@@ -643,12 +643,6 @@ def _run_requires_read_only_source(ctx: _WorkerContext) -> bool:
 
 
 def _resolve_source(task: Any, ctx: _WorkerContext) -> _Source:
-    if ctx.profile == DESIGNER_PROFILE and task.owned_paths:
-        raise SandboxDispatchError(
-            "a designer card that owns repository paths gets no build machine, "
-            "because a designer has no patch authority.",
-            code="designer_card_has_owned_paths",
-        )
     if task.workspace_kind != "worktree" or not task.workspace_path:
         raise SandboxDispatchError(
             "this task has no git-backed source workspace (its workspace is "
@@ -1233,7 +1227,7 @@ def _release_reservation(ctx: _WorkerContext, generation: int, reason: str) -> N
 # ---------------------------------------------------------------------------
 
 
-def _resolve_task(ctx: _WorkerContext):
+def _resolve_task(ctx: _WorkerContext, *, build_machine_tool: bool = True):
     kb = _kanban()
     try:
         with kb.connect_closing(board=ctx.board) as conn:
@@ -1261,6 +1255,12 @@ def _resolve_task(ctx: _WorkerContext):
             "this session is not the board's active run for the task, so it "
             "may not provision a build machine.",
             code="run_not_active",
+        )
+    if build_machine_tool and ctx.profile == DESIGNER_PROFILE and task.owned_paths:
+        raise SandboxDispatchError(
+            "a designer card that owns repository paths gets no build machine, "
+            "because a designer has no patch authority.",
+            code="designer_card_has_owned_paths",
         )
     return task
 
@@ -2466,7 +2466,7 @@ def enforce_sandbox_runtime(api_mode: str = "", **_kwargs):
     )
     try:
         ctx = _worker_context()
-        _resolve_task(ctx)
+        _resolve_task(ctx, build_machine_tool=False)
         kb = _kanban()
         with kb.connect_closing(board=ctx.board) as conn:
             kb.block_task(
@@ -2508,7 +2508,7 @@ def maintain_sandbox_lease(tool_name: str = "", args: Optional[dict] = None, **_
     with _lease_lock:
         try:
             ctx = _worker_context()
-            _resolve_task(ctx)
+            _resolve_task(ctx, build_machine_tool=False)
             if opensandbox_operation in {
                 "sandbox_create", "sandbox_list", "sandbox_kill", "sandbox_renew",
             }:
@@ -2561,7 +2561,7 @@ def maintain_sandbox_lease(tool_name: str = "", args: Optional[dict] = None, **_
                     expiry = expiry.replace(tzinfo=timezone.utc)
                 remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
                 if remaining < 2 * SANDBOX_MIN_REMAINING_SECONDS:
-                    _resolve_task(ctx)
+                    _resolve_task(ctx, build_machine_tool=False)
                     if ctx.profile == WORKER_PROFILE:
                         secret = _prepare_host_credential()
                         credentials, _bindings = _vault_payload(sdk, secret)
