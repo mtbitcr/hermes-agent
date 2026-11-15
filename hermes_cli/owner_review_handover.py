@@ -50,6 +50,7 @@ def _answer(exc: Any) -> dict:
 
 def _review_refusal(task: Any, metadata: Any) -> Optional[dict]:
     from hermes_cli import owner_portfolio_review as portfolio, owner_project_review as review
+    from hermes_cli.owner_project_review_owner_line import first_review
     from hermes_cli.owner_project_review_refusal import class_history, refusal_tokens
 
     fields = (task.idempotency_key or "").split(":")
@@ -64,7 +65,7 @@ def _review_refusal(task: Any, metadata: Any) -> Optional[dict]:
         return None
     value = metadata.get("project_review") if isinstance(metadata, dict) else None
     try:
-        review.check_result_texts(value, sources)
+        review.check_result_texts(value, sources, first=first_review(task.body))
         review.check_claims(sources, value["classification"])
         review.check_closure_shapes(value["proposed_closures"])
     except review.ReviewRefused as exc:

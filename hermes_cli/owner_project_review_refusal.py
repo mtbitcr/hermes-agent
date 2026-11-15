@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping, Optional
 
-_TEXT_CODES = ("review_text_length_invalid", "review_text_policy_invalid")
+_TEXT_CODES = ("review_text_length_invalid", "review_text_policy_invalid", "review_first_review_wording")
 _COVERAGE_CODE = "review_class_coverage_invalid"
 _PORTFOLIO_TEXT_CODE = "portfolio_result_text_invalid"
 _PORTFOLIO_LIST_CODE = "portfolio_result_list_invalid"
@@ -26,6 +26,9 @@ _SENTENCES = {
     "review_text_keys_invalid": "summary and brief must hold exactly the keys of the shape in the task instructions.",
     "review_text_length_invalid": "A text of the result is empty, too long or not text.",
     "review_text_policy_invalid": "A text of the result breaks the owner text rule. Write it again in plain words.",
+    "review_first_review_wording": (
+        "A text of the result refers to an earlier review, but this is the first review. Write so far instead."
+    ),
     "review_brief_generic": "The brief headline is too general, or what_changed names no work title from the input.",
     "review_class_list_invalid": "classification must be a list.",
     "review_class_evidence_invalid": (
@@ -101,6 +104,8 @@ def _breach_sentence(name: str, breach: Mapping[str, Any]) -> str:
         return f"{name} breaks the owner text rule. Write it again in plain words."
     if rule == "project_prefix":
         return f"{name} must start with one of the input Project names, a colon and a space."
+    if rule == "earlier_review":
+        return f"{name} refers to an earlier review, but this is the first review. Write so far instead."
     raise ValueError(rule)
 
 

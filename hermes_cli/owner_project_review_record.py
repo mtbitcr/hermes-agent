@@ -9,10 +9,10 @@ import hashlib
 import json
 import math
 import sqlite3
-import threading
 from typing import TypedDict
 
 from hermes_cli import kanban_db, owner_project_summary_events as events, projects_db
+from hermes_cli.owner_project_review_owner_line import linked_chats, waiting_approvals
 from hermes_constants import get_default_hermes_root, reset_hermes_home_override, set_hermes_home_override
 
 # This budget covers the normal source windows. Larger records retain explicit cut notices, including their bytes.
@@ -45,6 +45,8 @@ class ReviewInput(TypedDict):
     cuts: list[Cut]
     conversation_cursor: str | None
     decision_cursor: str | None
+    # None while the linked chats are not available: a count that is not known is never 0.
+    plan_approvals: int | None
 
 
 # Every kind of cut notice, by cut reason, with the words its line starts with. ``cut_line`` writes the lines from
@@ -311,37 +313,17 @@ def read_conversation_news(registry, project_id: str) -> tuple[str | None, int |
 
 
 def _conversation(root, registry, project, last_review, sources, cuts):
-    if not _table(registry, "project_conversation_links"):
-        _reduce(cuts, "conversation", "unlinked")
-        return
-    links = list(registry.execute(
-        "SELECT conversation FROM project_conversation_links WHERE project_id=? ORDER BY linked_at,conversation",
-        (project.id,),
-    ))
-    if not links:
-        _reduce(cuts, "conversation", "unlinked")
-        return
-    path = root / "response_store.db"
-    if not path.exists():
-        _reduce(cuts, "conversation", "not_available")
-        return
-    from gateway.platforms.api_server import OwnerAuthorityBroken, ResponseStore
-
-    with events._read_only(path) as conn:
-        # The constructor migrates the schema and changes file permissions. Reuse only its read-only projection.
-        store = ResponseStore.__new__(ResponseStore)
-        store._conn, store._default_profile, store._db_path = conn, "default", str(path)
-        store._conversation_lock = threading.RLock()
-        turns, unread, heads = [], False, []
-        for (name,) in links:
-            try:
-                snapshot = store.owner_history_snapshot(name, profile="default")
-            except OwnerAuthorityBroken:
-                # A broken project must defer its review, not abort the shared tick.
-                raise ValueError("linked_conversation_unavailable") from None
-            heads.append((name, snapshot["head_response_id"]))
-            unread = unread or snapshot["truncated"] or snapshot["incomplete"]
-            turns.extend(snapshot["data"])
+    # The plan approval count's own rule and read, so the record and the count never differ.
+    chats = linked_chats(registry, project.id, root)
+    if not chats:
+        # A link with no response store: the chat is not available, and its plan approvals are not known.
+        _reduce(cuts, "conversation", "not_available" if chats is None else "unlinked")
+        return None, waiting_approvals(chats)
+    turns, unread, heads = [], False, []
+    for name, snapshot in chats:
+        heads.append((name, snapshot["head_response_id"]))
+        unread = unread or snapshot["truncated"] or snapshot["incomplete"]
+        turns.extend(snapshot["data"])
     if unread:
         # Part of the conversation was not read, so its total is not known.
         _reduce(cuts, "conversation", "not_available")
@@ -353,7 +335,7 @@ def _conversation(root, registry, project, last_review, sources, cuts):
     texts = _reduce(cuts, "conversation", "text", [turn["owner"] for turn in turns] + [turn["raphael"] for turn in turns],
                     [1000] * len(turns) + [1000 - min(len(turn["owner"]), 1000) for turn in turns])
     sources["conversation"] = [{"owner": texts[i], "raphael": texts[len(turns) + i]} for i in range(len(turns))]
-    return _conversation_cursor(heads)
+    return _conversation_cursor(heads), waiting_approvals(chats)
 
 
 def _registry_record(root, project, last_review, sources, cuts):
@@ -364,7 +346,7 @@ def _registry_record(root, project, last_review, sources, cuts):
         _reduce(cuts, "conversation", "unlinked")
         _reduce(cuts, "earlier_reviews", "not_available")
         _reduce(cuts, "proposals", "not_available")
-        return
+        return None, 0
     with events._read_only(path) as conn:
         if _table(conn, "owner_workspace_receipts"):
             from hermes_cli.owner_project_review_plans import read_plan_receipts
@@ -380,10 +362,11 @@ def _registry_record(root, project, last_review, sources, cuts):
         summary = projects_db.get_project_summary(conn, project.id)
         if summary:
             sources["project"].append(summary)
-        conversation_cursor = _conversation(root, conn, project, last_review, sources, cuts)
+        # The chat cursor and the plan approvals that wait in the linked chats, from the same snapshots as the record.
+        chat = _conversation(root, conn, project, last_review, sources, cuts)
         if not _table(conn, "project_review_briefs"):
             _reduce(cuts, "earlier_reviews", "not_available")
-            return conversation_cursor
+            return chat
         rows = list(conn.execute(
             "SELECT * FROM project_review_briefs WHERE project_id=? ORDER BY review_date DESC", (project.id,),
         ))
@@ -395,7 +378,7 @@ def _registry_record(root, project, last_review, sources, cuts):
             if i == 0:
                 item["classification"] = _json(row["classification"])
             sources["earlier_reviews"].append(item)
-        return conversation_cursor
+        return chat
 
 
 def _redacted(value):
@@ -524,7 +507,7 @@ def _freeze(sources, cuts, max_bytes: int | None = None) -> ReviewInput:
     if size > cap:
         raise ValueError("the review input cap cannot hold its omission notices")
     return {"text": text, "size": size, "sources": {source: [row[0] for row in rows[source]] for source in sources},
-            "cuts": ordered, "conversation_cursor": None, "decision_cursor": None}
+            "cuts": ordered, "conversation_cursor": None, "decision_cursor": None, "plan_approvals": None}
 
 
 def _automations(project, sources, cuts) -> None:
@@ -579,7 +562,7 @@ def build_review_input(
     decision_cursor = None
     token = set_hermes_home_override(str(root))
     try:
-        conversation_cursor = _registry_record(root, project, last_review, sources, cuts)
+        conversation_cursor, approvals = _registry_record(root, project, last_review, sources, cuts)
         _automations(project, sources, cuts)
         if project.primary_path:
             from gateway.platforms.api_server_repository import _held
@@ -613,4 +596,5 @@ def build_review_input(
     result = _freeze(sources, cuts, max_bytes)
     result["conversation_cursor"] = conversation_cursor
     result["decision_cursor"] = decision_cursor
+    result["plan_approvals"] = approvals
     return result
