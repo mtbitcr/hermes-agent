@@ -804,7 +804,7 @@ def _store_review_result(registry, project_id, task, result, now, closure=False)
             "UPDATE project_review_state SET open_task_id=NULL,open_review_date=NULL,failures=0,"
             "last_reviewed_date=?,last_reviewed_at=?,last_brief_date=?,updated_at=?,"
             "event_cursor=MAX(event_cursor,?),delivery_cursor=MAX(delivery_cursor,?),release_cursor=MAX(release_cursor,?),"
-            "conversation_cursor=? "
+            "conversation_cursor=?,last_refusal=NULL "
             "WHERE project_id=? AND open_task_id=?",
             (window[2], now, window[2], now, *covered,
              None if conversation[1] == "none" else conversation[1], project_id, task.id),
@@ -1274,16 +1274,19 @@ def _retire(
 
 
 def _record_failure(
-    registry: sqlite3.Connection, board: Optional[sqlite3.Connection], project_id: str, task_id: str, now: int
+    registry: sqlite3.Connection, board: Optional[sqlite3.Connection], project_id: str, task_id: str, now: int,
+    refusal: Optional[str] = None,
 ) -> None:
-    """One more failure in a row: the archive, then the compare-and-set on the task that clears it and counts."""
+    """One more failure in a row: the archive, then the compare-and-set on the task that clears it and counts.
+
+    ``refusal`` is the record of the harvest's refusal, told to the retry of its day; with none, no reason is kept."""
     with write_txn(registry):
         if board is not None and _archive_review(registry, board, project_id, task_id) != "archived":
             return
         registry.execute(
             "UPDATE project_review_state SET open_task_id = NULL, open_review_date = NULL, "
-            "failures = failures + 1, updated_at = ? WHERE project_id = ? AND open_task_id = ?",
-            (now, project_id, task_id),
+            "failures = failures + 1, updated_at = ?, last_refusal = ? WHERE project_id = ? AND open_task_id = ?",
+            (now, refusal, project_id, task_id),
         )
 
 
@@ -1472,16 +1475,16 @@ def _harvest_one(
         _record_stale(registry, board, project_id, task, now)
         return
     except ReviewRefused as exc:
-        from hermes_cli.owner_project_review_refusal import refusal_tokens
+        from hermes_cli.owner_project_review_refusal import refusal_record, refusal_tokens
 
         state = registry.execute("SELECT failures FROM project_review_state WHERE project_id = ?", (project_id,)).fetchone()
         tokens = refusal_tokens(exc.code, exc.detail)
+        day = _key_date(task.idempotency_key, project_id) if task is not None else None
         logger.warning(
             "project review: refused Project %s task %s (%s) day=%s failures=%d%s", project_id, task_id, exc,
-            (task is not None and _key_date(task.idempotency_key, project_id)) or "unknown",
-            (state[0] if state else 0) + 1, f" {tokens}" if tokens else "",
+            day or "unknown", (state[0] if state else 0) + 1, f" {tokens}" if tokens else "",
         )
-        _record_failure(registry, board, project_id, task_id, now)
+        _record_failure(registry, board, project_id, task_id, now, refusal_record(day, exc.code, exc.detail))
         return
     except (sqlite3.OperationalError, OSError) as exc:
         # No verdict: the completed task and its open marker wait for a later tick, with no failure and no new run.
@@ -1598,7 +1601,8 @@ def _settle_quiet(
             return
         changed = registry.execute(
             "UPDATE project_review_state SET last_reviewed_date = ?, last_reviewed_at = ?, last_brief_date = ?, failures = 0, "
-            "updated_at = ?, event_cursor = ?, delivery_cursor = ?, release_cursor = ?, conversation_cursor = ? "
+            "updated_at = ?, event_cursor = ?, delivery_cursor = ?, release_cursor = ?, conversation_cursor = ?, "
+            "last_refusal = NULL "
             "WHERE project_id = ? AND open_task_id IS NULL AND failures = ? AND last_reviewed_date IS ? "
             "AND event_cursor = ? AND delivery_cursor = ? AND release_cursor = ?",
             (
@@ -1725,14 +1729,17 @@ def _wait_order(news: _News, review_day: str) -> tuple:
 
 
 def _task_body(last_reviewed_date: Optional[str], review_day: str, covered: events.Cursors, frozen: str,
-               conversation_cursor: Optional[str] = None, decision_cursor: Optional[str] = None) -> str:
-    """The instruction, the days the review covers, and last the line that names the events it covers."""
+               conversation_cursor: Optional[str] = None, decision_cursor: Optional[str] = None,
+               refusal_line: str = "") -> str:
+    """The instruction, the line that tells why the day's last review was refused, the days the review covers, and last
+    the line that names the events it covers."""
     from hermes_cli.owner_project_review_proposals import proposal_schema
 
     return (
         INSTRUCTION
         + "\nPlan proposal schema: "
         + json.dumps(proposal_schema(limit=_BRIEF_LIMITS["next_step"]), ensure_ascii=True, separators=(",", ":"))
+        + (f"\n{refusal_line}" if refusal_line else "")
         + f"\nReview date: {review_day}\n"
         + _window_line(last_reviewed_date, review_day)
         + f"\nLinked conversation cursor: {conversation_cursor or 'none'}"
@@ -1760,6 +1767,7 @@ def _open_review_task(
         return False
 
     from hermes_cli.owner_project_review_record import ReviewInputTooLarge, build_review_input
+    from hermes_cli.owner_project_review_refusal import refusal_line
     from tools.budget_config import DEFAULT_BUDGET
 
     try:
@@ -1787,7 +1795,7 @@ def _open_review_task(
         board,
         title=TITLE_PREFIX + project.name,
         body=_task_body(state["last_reviewed_date"], review_day, batch.cursors, frozen["text"], frozen["conversation_cursor"],
-                        frozen["decision_cursor"]),
+                        frozen["decision_cursor"], "" if _again(state, review_day) else refusal_line(state, review_day)),
         assignee=summary.PLANNING_ROLE,
         created_by=CREATED_BY,
         workspace_kind="scratch",
