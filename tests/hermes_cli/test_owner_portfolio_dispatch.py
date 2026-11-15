@@ -14,8 +14,9 @@ from tests.gateway.test_kanban_watchers_review_tick import _Loop, _drive, _switc
 # Renamed: the watcher tests' root makes every assignee a profile, and the first test keeps the real profile check.
 from tests.gateway.test_kanban_watchers_review_tick import root as watcher_root  # noqa: F401
 from tests.hermes_cli.test_kanban_review_task_tool_allowlist import _profile
+from tests.hermes_cli.test_owner_portfolio_review import _waiting_pair
 from tests.hermes_cli.test_owner_project_review_plans import _logical_state
-from tests.hermes_cli.test_owner_project_review_result import NOW, _quiet_project, root  # noqa: F401
+from tests.hermes_cli.test_owner_project_review_result import NOW, root  # noqa: F401
 
 SUMMARIES = "project-summaries"
 KEY = "project-review:portfolio:2026-11-09:0"
@@ -25,13 +26,13 @@ REFUSED = {**RESULT, "changes": [{"action": "cancel"}]}
 
 @pytest.mark.parametrize("paused", [False, True], ids=["active", "owner-paused"])
 def test_a_generated_portfolio_keeps_native_dispatch_admission_and_tool_limits(root, tmp_path, monkeypatch, paused):
-    project = _quiet_project(root)
+    first, second = _waiting_pair(root)
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
-        "enabled": True, "allowlist": [project.id], "portfolio": True,
+        "enabled": True, "allowlist": [first.id, second.id], "portfolio": True,
     }}))
     _profile(root, "raphael-planner")
-    project_path = kanban_db.kanban_db_path(board=project.board_slug)
-    before = _logical_state(project_path)
+    project_paths = [kanban_db.kanban_db_path(board=item.board_slug) for item in (first, second)]
+    before = [_logical_state(path) for path in project_paths]
     assert review.review_tick(NOW) == 1
     board_name = "project-summaries"
     if paused:
@@ -93,7 +94,7 @@ def test_a_generated_portfolio_keeps_native_dispatch_admission_and_tool_limits(r
             assert len(captured) == 2 and captured[1][0] == ordinary
     with projects_db.connect_closing(root / "projects.db") as registry:
         assert review.budget(registry, "2026-11-09") == (0, 1)
-    assert _logical_state(project_path) == before
+    assert [_logical_state(path) for path in project_paths] == before
 
 
 @pytest.fixture
@@ -145,8 +146,8 @@ def _stored(home, day="2026-11-09"):
 
 
 def test_an_accepted_portfolio_day_starts_no_second_task_with_a_spare_slot(watcher_root, watcher_loop, monkeypatch):
-    project = _quiet_project(watcher_root)
-    _switch_on(watcher_root, project.id, portfolio=True, portfolio_cap=2)
+    first, second = _waiting_pair(watcher_root)
+    _switch_on(watcher_root, first.id, second.id, portfolio=True, portfolio_cap=2)
 
     _drive(monkeypatch, watcher_loop, [NOW + n * 60 for n in range(5)], between=_worker_completes(RESULT))
 
@@ -164,15 +165,15 @@ def test_an_accepted_portfolio_day_starts_no_second_task_with_a_spare_slot(watch
 def test_a_cap_raised_after_an_accepted_portfolio_starts_no_second_task_that_day(
     watcher_root, watcher_loop, monkeypatch
 ):
-    project = _quiet_project(watcher_root)
-    _switch_on(watcher_root, project.id, portfolio=True, portfolio_cap=1)
+    first, second = _waiting_pair(watcher_root)
+    _switch_on(watcher_root, first.id, second.id, portfolio=True, portfolio_cap=1)
     finish = _worker_completes(RESULT)
     _drive(monkeypatch, watcher_loop, [NOW, NOW + 60, NOW + 120], between=finish)
     [(task_id, status, _key)] = _portfolios()
     assert (watcher_loop.made, status) == ([1, 0, 0], "archived")
 
     # The owner raises the cap on the same review day.
-    _switch_on(watcher_root, project.id, portfolio=True, portfolio_cap=2)
+    _switch_on(watcher_root, first.id, second.id, portfolio=True, portfolio_cap=2)
     assert review.read_settings().portfolio_cap == 2
     _drive(monkeypatch, watcher_loop, [NOW + 180, NOW + 240, NOW + 300], between=finish)
 
@@ -184,8 +185,8 @@ def test_a_cap_raised_after_an_accepted_portfolio_starts_no_second_task_that_day
 
 
 def test_the_next_review_day_still_gets_its_own_portfolio_with_a_spare_slot(watcher_root, watcher_loop, monkeypatch):
-    project = _quiet_project(watcher_root)
-    _switch_on(watcher_root, project.id, portfolio=True, portfolio_cap=2)
+    first, second = _waiting_pair(watcher_root)
+    _switch_on(watcher_root, first.id, second.id, portfolio=True, portfolio_cap=2)
     finish = _worker_completes(RESULT)
     _drive(monkeypatch, watcher_loop, [NOW, NOW + 60, NOW + 120], between=finish)
     assert _stored(watcher_root)[1]["revision"] == 1
@@ -202,8 +203,8 @@ def test_the_next_review_day_still_gets_its_own_portfolio_with_a_spare_slot(watc
 
 
 def test_a_refused_portfolio_still_gets_its_retry_from_a_spare_slot(watcher_root, watcher_loop, monkeypatch):
-    project = _quiet_project(watcher_root)
-    _switch_on(watcher_root, project.id, portfolio=True, portfolio_cap=2)
+    meeting, guest = _waiting_pair(watcher_root)
+    _switch_on(watcher_root, meeting.id, guest.id, portfolio=True, portfolio_cap=2)
 
     _drive(monkeypatch, watcher_loop, [NOW + n * 60 for n in range(5)], between=_worker_completes(REFUSED))
 
@@ -233,8 +234,8 @@ def _each_attempt_holds_one_slot(loop, home, cap):
 def test_a_published_portfolio_attempt_whose_count_fails_once_still_holds_one_slot(
     watcher_root, watcher_loop, monkeypatch, cap, failed
 ):
-    project = _quiet_project(watcher_root)
-    _switch_on(watcher_root, project.id, portfolio=True, portfolio_cap=cap)
+    first, second = _waiting_pair(watcher_root)
+    _switch_on(watcher_root, first.id, second.id, portfolio=True, portfolio_cap=cap)
     count, calls = review.take_portfolio_slot, []
 
     def flaky(registry, day, limit, now):
@@ -270,8 +271,8 @@ def test_a_portfolio_attempt_published_by_a_stopped_gateway_holds_one_slot_after
 ):
     if "fork" not in multiprocessing.get_all_start_methods():
         pytest.skip("The gateway process stop needs fork.")
-    project = _quiet_project(watcher_root)
-    _switch_on(watcher_root, project.id, portfolio=True, portfolio_cap=cap)
+    first, second = _waiting_pair(watcher_root)
+    _switch_on(watcher_root, first.id, second.id, portfolio=True, portfolio_cap=cap)
     clocks, finish = _attempts(cap), _worker_completes(REFUSED)
     before = 3 * (stopped - 1)
     _drive(monkeypatch, watcher_loop, clocks[:before], between=finish)

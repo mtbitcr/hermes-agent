@@ -5,6 +5,7 @@ import json
 import multiprocessing
 import os
 import sqlite3
+import time
 
 import pytest
 import yaml
@@ -104,6 +105,27 @@ class _Budget:
         return self.threshold
 
 
+def _owner_waits(root, *projects):
+    """Each Project's work card waits for the owner's answer. The review cursor moves past that news."""
+    for project in projects:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(time, "time", lambda: NOW - 86400)
+            with _project_board(project) as board:
+                card = board.execute("SELECT id FROM tasks WHERE task_kind='work' ORDER BY created_at,id").fetchone()[0]
+                assert kanban_db.block_task(board, card, reason="Which room?", kind="needs_input")
+                cursor = board.execute("SELECT MAX(id) FROM task_events").fetchone()[0]
+        with projects_db.connect_closing(root / "projects.db") as registry:
+            with kanban_db.write_txn(registry):
+                registry.execute("UPDATE project_review_state SET event_cursor=? WHERE project_id=?", (cursor, project.id))
+
+
+def _waiting_pair(root):
+    """Two quiet Projects whose work waits for the owner: the least a portfolio review needs."""
+    pair = _quiet_project(root, "Meeting Plan"), _quiet_project(root, "Guest Visit")
+    _owner_waits(root, *pair)
+    return pair
+
+
 def _parallel_portfolio_tick(barrier, results):
     try:
         barrier.wait(timeout=15)
@@ -116,8 +138,7 @@ def _parallel_portfolio_tick(barrier, results):
 
 @pytest.mark.parametrize("fault", [None, "changes", "unknown_project", "too_many", "long"])
 def test_quiet_projects_get_one_portfolio_review_and_one_text_result(root, fault):
-    first = _quiet_project(root, "Meeting Plan")
-    second = _quiet_project(root, "Guest Visit")
+    first, second = _waiting_pair(root)
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
         "enabled": True, "allowlist": [first.id, second.id], "portfolio": True,
     }}))
@@ -134,9 +155,9 @@ def test_quiet_projects_get_one_portfolio_review_and_one_text_result(root, fault
         frozen = json.loads(line.removeprefix("Portfolio input: "))
         assert {item["name"] for item in frozen["projects"]} == {"Meeting Plan", "Guest Visit"}
         for item in frozen["projects"]:
-            assert set(item) == {"name", "review_state", "brief", "classification_counts", "open_owner_waits", "assignee_load"}
+            assert set(item) == {"name", "review_state", "brief", "owner_steps", "oldest_answer_days"}
             assert item["review_state"] == "reviewed"
-            assert set(item["brief"]) == {"headline", "needs_you", "ready_work"}
+            assert set(item["brief"]) == {"headline", "needs_you"}
         task_id = task["id"]
     assert review.review_tick(NOW + 1) == 0
     result = {"conflicts": [], "priorities": ["Meeting Plan: Book the room."], "shared_blockers": []}
@@ -168,9 +189,9 @@ def test_quiet_projects_get_one_portfolio_review_and_one_text_result(root, fault
 
 @pytest.mark.parametrize("when", ["open", "before_timeout", "timeout", "capped", "failed"])
 def test_portfolio_waits_for_project_reviews_or_the_two_hour_limit(root, when):
-    project = _quiet_project(root)
+    project, other = _waiting_pair(root)
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
-        "enabled": True, "allowlist": [project.id], "portfolio": True,
+        "enabled": True, "allowlist": [project.id, other.id], "portfolio": True,
         "daily_cap": 0 if when == "capped" else 20,
     }}))
     with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
@@ -199,9 +220,9 @@ def test_portfolio_waits_for_project_reviews_or_the_two_hour_limit(root, when):
 
 
 def test_a_late_portfolio_result_keeps_its_original_day_before_the_next_review_hour(root):
-    project = _quiet_project(root)
+    project, other = _waiting_pair(root)
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
-        "enabled": True, "allowlist": [project.id], "portfolio": True,
+        "enabled": True, "allowlist": [project.id, other.id], "portfolio": True,
     }}))
     assert review.review_tick(NOW) == 1
     path = kanban_db.kanban_db_path(board="project-summaries")
@@ -237,8 +258,8 @@ def test_portfolio_input_counts_shared_work_and_waits_from_root_boards(root, mon
             with kanban_db.connect_closing(path, board=project.board_slug) as board:
                 assigned = kanban_db.create_task(board, title="Prepare the meeting", assignee="default", project_id=project.id)
                 assigned_by_project[project.id] = assigned
-                if project == first:
-                    assert kanban_db.block_task(board, assigned, kind="needs_input", reason="Which table should the guests use?")
+                question = "Which table should the guests use?" if project == first else "Which day should the guests arrive?"
+                assert kanban_db.block_task(board, assigned, kind="needs_input", reason=question)
     before = [_logical_state(path) for path in paths]
     profile = root / "profiles/raphael-planner"
     if worker:
@@ -257,23 +278,18 @@ def test_portfolio_input_counts_shared_work_and_waits_from_root_boards(root, mon
     [line] = [line for line in body.splitlines() if line.startswith("Portfolio input: ")]
     frozen = json.loads(line.removeprefix("Portfolio input: "))
     by_name = {item["name"]: item for item in frozen["projects"]}
-    assert frozen["shared_assignees"] == ["default"]
-    assert by_name["Meeting Plan"]["assignee_load"] == {"default": 1}
-    assert by_name["Guest Visit"]["assignee_load"] == {"default": 1}
-    assert by_name["Meeting Plan"]["open_owner_waits"] == 1
-    assert by_name["Guest Visit"]["open_owner_waits"] == 0
+    assert set(frozen) == {"projects", "project_scope"}
+    assert by_name["Meeting Plan"]["owner_steps"] == {"answers": 1, "suggestions": 0, "plan_approvals": 0}
+    assert by_name["Guest Visit"]["owner_steps"] == {"answers": 1, "suggestions": 0, "plan_approvals": 0}
+    assert [by_name[name]["oldest_answer_days"] for name in ("Meeting Plan", "Guest Visit")] == [0, 0]
     # The same counts read with plain sqlite3 from each root board file and the root registry, apart from the kernel.
     for project, board_path in zip((first, second), paths):
         with contextlib.closing(sqlite3.connect(board_path.resolve().as_uri() + "?mode=ro", uri=True)) as plain:
-            load = dict(plain.execute(
-                "SELECT assignee, COUNT(*) FROM tasks WHERE project_id=? AND task_kind='work' "
-                "AND status NOT IN ('done','archived') AND assignee IS NOT NULL GROUP BY assignee", (project.id,),
-            ).fetchall())
             blocked = plain.execute(
                 "SELECT COUNT(*) FROM tasks WHERE project_id=? AND task_kind='work' AND status='blocked'", (project.id,),
             ).fetchone()[0]
-        assert by_name[project.name]["assignee_load"] == load
-        assert by_name[project.name]["open_owner_waits"] == blocked
+        assert by_name[project.name]["owner_steps"]["answers"] == blocked
+    assert "Which day should the guests arrive?" not in line
     with contextlib.closing(sqlite3.connect((root / "projects.db").resolve().as_uri() + "?mode=ro", uri=True)) as plain:
         assert sorted(frozen["project_scope"]) == sorted(row[0] for row in plain.execute("SELECT id FROM projects"))
         assert plain.execute(
@@ -294,9 +310,9 @@ def test_portfolio_input_counts_shared_work_and_waits_from_root_boards(root, mon
 
 @pytest.mark.parametrize("fault", ["fields", "missing_metadata", "blocked"])
 def test_a_refused_portfolio_result_does_not_block_the_next_day(root, fault):
-    project = _quiet_project(root)
+    project, other = _waiting_pair(root)
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
-        "enabled": True, "allowlist": [project.id], "portfolio": True,
+        "enabled": True, "allowlist": [project.id, other.id], "portfolio": True,
     }}))
     work_path = kanban_db.kanban_db_path(board=project.board_slug)
     before = _logical_state(work_path)
@@ -323,9 +339,9 @@ def test_a_refused_portfolio_result_does_not_block_the_next_day(root, fault):
 
 
 def test_a_portfolio_store_failure_keeps_the_finished_attempt_recoverable(root):
-    project = _quiet_project(root)
+    project, other = _waiting_pair(root)
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
-        "enabled": True, "allowlist": [project.id], "portfolio": True,
+        "enabled": True, "allowlist": [project.id, other.id], "portfolio": True,
     }}))
     assert review.review_tick(NOW) == 1
     path = kanban_db.kanban_db_path(board="project-summaries")
@@ -356,10 +372,10 @@ def test_a_portfolio_store_failure_keeps_the_finished_attempt_recoverable(root):
 def test_two_processes_share_one_portfolio_task_and_one_daily_slot(root):
     if "fork" not in multiprocessing.get_all_start_methods():
         pytest.skip("The native Linux process proof needs fork.")
-    project = _quiet_project(root)
+    project, other = _waiting_pair(root)
     assert review.review_tick(NOW) == 0
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
-        "enabled": True, "allowlist": [project.id], "portfolio": True,
+        "enabled": True, "allowlist": [project.id, other.id], "portfolio": True,
     }}))
     kanban_db.create_board("project-summaries")
     context = multiprocessing.get_context("fork")
@@ -389,9 +405,9 @@ def test_two_processes_share_one_portfolio_task_and_one_daily_slot(root):
 
 
 def test_a_published_portfolio_recovers_its_missing_budget_record_once(root):
-    project = _quiet_project(root)
+    project, other = _waiting_pair(root)
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
-        "enabled": True, "allowlist": [project.id], "portfolio": True,
+        "enabled": True, "allowlist": [project.id, other.id], "portfolio": True,
     }}))
     assert review.review_tick(NOW) == 1
     with projects_db.connect_closing(root / "projects.db") as registry:
@@ -408,9 +424,9 @@ def test_a_published_portfolio_recovers_its_missing_budget_record_once(root):
 
 
 def test_an_uncounted_portfolio_retry_archived_before_recovery_still_holds_its_slot(root, monkeypatch):
-    project = _quiet_project(root)
+    project, other = _waiting_pair(root)
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
-        "enabled": True, "allowlist": [project.id], "portfolio": True, "portfolio_cap": 2,
+        "enabled": True, "allowlist": [project.id, other.id], "portfolio": True, "portfolio_cap": 2,
     }}))
     assert review.review_tick(NOW) == 1
     _finish_portfolio({**RESULT, "changes": []})
@@ -435,9 +451,9 @@ def test_an_uncounted_portfolio_retry_archived_before_recovery_still_holds_its_s
 
 @pytest.mark.parametrize("cap", [1, 2])
 def test_a_saved_portfolio_survives_an_archive_failure_without_another_revision(root, cap):
-    project = _quiet_project(root)
+    project, other = _waiting_pair(root)
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
-        "enabled": True, "allowlist": [project.id], "portfolio": True, "portfolio_cap": cap,
+        "enabled": True, "allowlist": [project.id, other.id], "portfolio": True, "portfolio_cap": cap,
     }}))
     assert review.review_tick(NOW) == 1
     path = kanban_db.kanban_db_path(board="project-summaries")
@@ -473,6 +489,7 @@ def test_two_projects_in_conflict_name_both_and_the_shared_assignee_and_store_th
     first = _quiet_project(root, "Meeting Plan")
     second = _quiet_project(root, "Guest Visit")
     _portfolio_on(root, first, second)
+    _owner_waits(root, first, second)
     with _written_at(NOW):
         for project in (first, second):
             with _project_board(project) as board:
@@ -481,8 +498,9 @@ def test_two_projects_in_conflict_name_both_and_the_shared_assignee_and_store_th
     assert review.review_tick(NOW + 7200) == 1
     frozen = _frozen(_portfolio_body())
     assert {item["name"] for item in frozen["projects"]} == {"Meeting Plan", "Guest Visit"}
-    assert frozen["shared_assignees"] == ["default"]
-    assert [item["assignee_load"] for item in frozen["projects"]] == [{"default": 1}, {"default": 1}]
+    assert "shared_assignees" not in frozen
+    assert all("assignee_load" not in item for item in frozen["projects"])
+    assert [item["owner_steps"] for item in frozen["projects"]] == [{"answers": 1, "suggestions": 0, "plan_approvals": 0}] * 2
     conflict = "Meeting Plan: Guest Visit needs the same default worker today."
     _finish_portfolio({"conflicts": [conflict], "priorities": [], "shared_blockers": []})
     assert review.review_tick(NOW + 7201) == 0
@@ -493,8 +511,8 @@ def test_two_projects_in_conflict_name_both_and_the_shared_assignee_and_store_th
 
 
 def test_no_conflicts_are_stored_and_read_back_as_empty(root):
-    project = _quiet_project(root)
-    _portfolio_on(root, project)
+    project, other = _waiting_pair(root)
+    _portfolio_on(root, project, other)
     assert review.review_tick(NOW) == 1
     empty = {"conflicts": [], "priorities": [], "shared_blockers": []}
     _finish_portfolio(empty)
@@ -502,7 +520,7 @@ def test_no_conflicts_are_stored_and_read_back_as_empty(root):
     with projects_db.connect_closing(root / "projects.db") as registry:
         brief = _brief(registry, "2026-11-09")
     assert {key: brief[key] for key in empty} == empty
-    assert brief["project_scope"] == [project.id]
+    assert sorted(brief["project_scope"]) == sorted([project.id, other.id])
 
 
 @pytest.mark.parametrize("unknown", [False, True])
@@ -510,6 +528,7 @@ def test_priorities_keep_the_result_order_and_refuse_an_item_without_an_input_pr
     later = _quiet_project(root, "Meeting Plan")
     earlier = _quiet_project(root, "Guest Visit", created_at=NOW - 2 * 86400)
     _portfolio_on(root, later, earlier)
+    _owner_waits(root, later, earlier)
     assert review.review_tick(NOW) == 1
     frozen = _frozen(_portfolio_body())
     # The input lists the Projects in the order they were created, not by name or by the order of the allowlist.
@@ -531,8 +550,8 @@ def test_priorities_keep_the_result_order_and_refuse_an_item_without_an_input_pr
 
 
 def test_at_most_one_portfolio_runs_per_day_and_the_next_day_gets_its_own(root):
-    project = _quiet_project(root)
-    _portfolio_on(root, project)
+    project, other = _waiting_pair(root)
+    _portfolio_on(root, project, other)
     assert review.review_tick(NOW) == 1
     assert review.review_tick(NOW + 60) == 0
     _finish_portfolio(RESULT)
@@ -560,6 +579,7 @@ def test_the_portfolio_runs_once_after_every_project_review(root):
     assert review.review_tick(NOW + 1) == 0
     assert _portfolio_keys() == []
     _finish_project_review(second, VALID_REVIEW)
+    _owner_waits(root, first, second)
     assert review.review_tick(NOW + 2) == 1
     assert review.review_tick(NOW + 3) == 0
     assert _portfolio_keys() == ["project-review:portfolio:2026-11-09:0"]
@@ -574,8 +594,8 @@ def test_the_portfolio_runs_once_after_every_project_review(root):
     {"priorities": [{"project": "Meeting Plan", "create_task": "Book the room"}]},
 ])
 def test_the_portfolio_result_schema_refuses_task_change_and_closure_fields(root, extra):
-    project = _quiet_project(root)
-    _portfolio_on(root, project)
+    project, other = _waiting_pair(root)
+    _portfolio_on(root, project, other)
     work_path = kanban_db.kanban_db_path(board=project.board_slug)
     before = _logical_state(work_path)
     assert review.review_tick(NOW) == 1
@@ -589,8 +609,8 @@ def test_the_portfolio_result_schema_refuses_task_change_and_closure_fields(root
 
 
 def test_the_portfolio_makes_no_task_plan_or_closure_call_beyond_its_own_task(root, monkeypatch):
-    project = _quiet_project(root)
-    _portfolio_on(root, project)
+    project, other = _waiting_pair(root)
+    _portfolio_on(root, project, other)
     calls = []
 
     def spy(module, name):
@@ -657,6 +677,7 @@ def test_the_two_hour_wait_runs_from_the_first_counted_review_not_from_a_later_r
     first = _quiet_project(root, "Meeting Plan")
     second = _quiet_project(root, "Guest Visit")
     _portfolio_on(root, first, second)
+    _owner_waits(root, first, second)
     _news(first, second)
     assert review.review_tick(NOW) == 2
     _finish_project_review(second, {"project_review": {}})
@@ -673,8 +694,8 @@ def test_the_two_hour_wait_runs_from_the_first_counted_review_not_from_a_later_r
 
 @pytest.mark.parametrize("left", ["waiting", "running", "reassigned"])
 def test_an_unsettled_portfolio_task_is_archived_once_its_day_is_over(root, left):
-    project = _quiet_project(root)
-    _portfolio_on(root, project)
+    project, other = _waiting_pair(root)
+    _portfolio_on(root, project, other)
     assert review.review_tick(NOW) == 1
     with _summaries() as board:
         task_id = board.execute("SELECT id FROM tasks WHERE created_by='project-review'").fetchone()[0]
@@ -700,10 +721,11 @@ def test_an_unsettled_portfolio_task_is_archived_once_its_day_is_over(root, left
         assert review.budget(registry, "2026-11-10") == (0, 1)
 
 
-def test_a_large_portfolio_input_leaves_out_ready_work_and_assignee_load_with_one_cut_line(root, monkeypatch):
+def test_a_large_portfolio_input_goes_whole_with_no_ready_work_assignee_load_or_cut_line(root, monkeypatch):
     first = _quiet_project(root, "Meeting Plan")
     second = _quiet_project(root, "Guest Visit")
     _portfolio_on(root, first, second)
+    _owner_waits(root, first, second)
     with _written_at(NOW):
         with _project_board(first) as board:
             for number in range(4):
@@ -713,27 +735,23 @@ def test_a_large_portfolio_input_leaves_out_ready_work_and_assignee_load_with_on
             kanban_db.create_task(board, title="Invite the guests", assignee="default", project_id=second.id)
     assert review.review_tick(NOW) == 2
     with projects_db.connect_closing(root / "projects.db") as registry:
-        full = json.dumps(portfolio._input(registry, projects_db.list_projects(registry), "2026-11-09"),
+        full = json.dumps(portfolio._input(registry, projects_db.list_projects(registry), "2026-11-09", NOW + 7200),
                           ensure_ascii=True, separators=(",", ":"), allow_nan=False)
-    cap = len(full.encode()) - 1
+    cap = len(full.encode())
     monkeypatch.setattr(budget_config, "DEFAULT_BUDGET", _Budget(4 * cap))
     assert review.review_tick(NOW + 7200) == 1
     body = _portfolio_body()
     frozen = _frozen(body)
-    by_name = {item["name"]: item for item in frozen["projects"]}
-    assert "assignee_load" not in by_name["Meeting Plan"]
-    assert "ready_work" not in by_name["Meeting Plan"]["brief"]
-    assert by_name["Guest Visit"]["assignee_load"] == {"default": 1}
-    assert "ready_work" in by_name["Guest Visit"]["brief"]
-    cuts = [line for line in body.splitlines() if line.startswith("Left out: ")]
-    assert cuts == ["Left out: the ready work and assignee load of 1 of 2 Projects."]
+    assert all("assignee_load" not in item and "ready_work" not in item["brief"] for item in frozen["projects"])
+    assert "Prepare part" not in body and "meeting-room-planner-number" not in body
+    assert not [line for line in body.splitlines() if line.startswith("Left out: ")]
     line = next(line for line in body.splitlines() if line.startswith("Portfolio input: "))
-    assert len(line.removeprefix("Portfolio input: ").encode()) + len(cuts[0].encode()) + 1 <= cap
+    assert len(line.removeprefix("Portfolio input: ").encode()) == cap
 
 
 def test_a_portfolio_input_that_cannot_fit_stops_for_its_day(root, monkeypatch):
-    project = _quiet_project(root)
-    _portfolio_on(root, project)
+    project, other = _waiting_pair(root)
+    _portfolio_on(root, project, other)
     real_budget, real_input = budget_config.DEFAULT_BUDGET, portfolio._input
     reads = []
 

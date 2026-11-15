@@ -169,7 +169,8 @@ def _ready(settings, day, now):
     lines.extend(line for line in notes if not any(_quotes(_compared(line), question) for question in questions))
     if not lines:
         return None
-    text = "\n".join([f"Your daily project review ({day})", NOTES_LINE if advised else NO_ADVICE_LINE, *lines])
+    advice = advised and any(portfolio[key] for key in ("conflicts", "priorities", "shared_blockers"))
+    text = "\n".join([f"Your daily project review ({day})", NOTES_LINE if advice else NO_ADVICE_LINE, *lines])
     if len(text) > MAX_MESSAGE:
         text = text[:MAX_MESSAGE - 1] + "…"
     # A message without advice is as old as its newest Project brief, never as new as the tick that sends it.

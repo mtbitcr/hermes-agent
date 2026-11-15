@@ -10,6 +10,7 @@ import yaml
 
 from hermes_cli import kanban_db, owner_portfolio_review as portfolio, owner_project_review as review
 from hermes_cli import owner_project_summary as summary, projects_db
+from tests.hermes_cli.test_owner_portfolio_review import _waiting_pair
 from tests.hermes_cli.test_owner_project_review_result import NOW, _quiet_project, _suggestion, root  # noqa: F401
 
 SUMMARIES = "project-summaries"
@@ -123,9 +124,9 @@ def test_a_coverage_refusal_logs_the_missing_and_extra_items(root, monkeypatch, 
     assert invented not in caplog.text
 
 
-def _portfolio_on(root, project):
+def _portfolio_on(root, *projects):
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
-        "enabled": True, "allowlist": [project.id], "portfolio": True,
+        "enabled": True, "allowlist": [project.id for project in projects], "portfolio": True,
     }}))
 
 
@@ -138,8 +139,8 @@ def _finish_portfolio(result):
 
 
 def test_a_refused_portfolio_line_is_logged_with_its_code_and_position(root, monkeypatch, caplog):
-    project = _quiet_project(root)
-    _portfolio_on(root, project)
+    first, second = _waiting_pair(root)
+    _portfolio_on(root, first, second)
     assert review.review_tick(NOW) == 1
     long_line = "Meeting Plan: " + _marked(199)
     assert len(long_line) == 213
@@ -158,8 +159,8 @@ def test_a_refused_portfolio_line_is_logged_with_its_code_and_position(root, mon
 def test_the_gateway_readers_follow_the_portfolio_limits(root, monkeypatch):
     from gateway.platforms.api_server_owner_projects import _portfolio_view
 
-    project = _quiet_project(root)
-    _portfolio_on(root, project)
+    first, second = _waiting_pair(root)
+    _portfolio_on(root, first, second)
     monkeypatch.setattr(portfolio, "_ITEM_LIMIT", 250, raising=False)
     assert review.review_tick(NOW) == 1
     line = "Meeting Plan: " + _marked(216)
@@ -168,6 +169,8 @@ def test_the_gateway_readers_follow_the_portfolio_limits(root, monkeypatch):
     assert review.review_tick(NOW + 1) == 0
     with projects_db.connect_closing(root / "projects.db") as registry:
         assert projects_db.get_portfolio_review_brief(registry, DAY)["priorities"] == [line]
-    view = _portfolio_view([{"project_id": project.id, "slug": project.slug, "name": project.name}])
+    view = _portfolio_view(
+        [{"project_id": item.id, "slug": item.slug, "name": item.name} for item in (first, second)]
+    )
     assert view is not None
     assert view["priorities"] == [line]
