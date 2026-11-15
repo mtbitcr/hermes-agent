@@ -81,11 +81,12 @@ Fail-closed everywhere
 Wrong profile, missing/foreign Kanban run, scratch or ambiguous or unscoped
 source, a dirty tree, a mutable image tag, an unconfigured connection, a
 missing host credential, a Claude account token that would expire mid-task and
-cannot be refreshed, or a missing SDK all refuse before anything is created. A
-failure after creation records the remote ID before later setup, then either
-confirms cleanup or retains durable cleanup authority. Host temporary material
-is removed and the caller receives one actionable sanitized error. Exception
-bodies are never logged or returned — they can carry protected data.
+cannot be refreshed, a missing SDK, or a designer card that owns paths all
+refuse before anything is created. A failure after creation records the remote
+ID before later setup, then either confirms cleanup or retains durable cleanup
+authority. Host temporary material is removed and the caller receives one
+actionable sanitized error. Exception bodies are never logged or returned —
+they can carry protected data.
 """
 from __future__ import annotations
 
@@ -118,13 +119,21 @@ logger = logging.getLogger(__name__)
 TOOL_NAME = "raphael_sandbox_provision"
 TOOLSET = "raphael_sandbox"
 WORKER_PROFILE = "raphael-claude-worker"
+DESIGNER_PROFILE = "raphael-designer"
 SANDBOX_PROFILES = frozenset({
     WORKER_PROFILE, "raphael-builder", "raphael-verifier", "raphael-planner",
+    DESIGNER_PROFILE,
 })
 #: Profiles whose runs only ever read the exact source: no patch authority,
 #: no coding credential. The planner joins the verifier here so code
-#: evidence for planning work is gathered on Server 2, never on the host.
-READ_ONLY_SOURCE_PROFILES = frozenset({"raphael-verifier", "raphael-planner"})
+#: evidence for planning work is gathered on Server 2, never on the host; the
+#: designer renders its own option pages into pictures in its own machine.
+#: The designer is admitted only on a card that owns no repository path: the
+#: kernel's read-only run policy in hermes_cli/kanban_db.py does not name it
+#: yet. A follow-up card adds it there, and the refusal can then be dropped.
+READ_ONLY_SOURCE_PROFILES = frozenset({
+    "raphael-verifier", "raphael-planner", DESIGNER_PROFILE,
+})
 
 #: Where the task source is extracted inside the sandbox. Fixed so no caller
 #: — model or operator — picks a path on Server 2.
@@ -1218,7 +1227,7 @@ def _release_reservation(ctx: _WorkerContext, generation: int, reason: str) -> N
 # ---------------------------------------------------------------------------
 
 
-def _resolve_task(ctx: _WorkerContext):
+def _resolve_task(ctx: _WorkerContext, *, build_machine_tool: bool = True):
     kb = _kanban()
     try:
         with kb.connect_closing(board=ctx.board) as conn:
@@ -1246,6 +1255,12 @@ def _resolve_task(ctx: _WorkerContext):
             "this session is not the board's active run for the task, so it "
             "may not provision a build machine.",
             code="run_not_active",
+        )
+    if build_machine_tool and ctx.profile == DESIGNER_PROFILE and task.owned_paths:
+        raise SandboxDispatchError(
+            "a designer card that owns repository paths gets no build machine, "
+            "because a designer has no patch authority.",
+            code="designer_card_has_owned_paths",
         )
     return task
 
@@ -2451,7 +2466,7 @@ def enforce_sandbox_runtime(api_mode: str = "", **_kwargs):
     )
     try:
         ctx = _worker_context()
-        _resolve_task(ctx)
+        _resolve_task(ctx, build_machine_tool=False)
         kb = _kanban()
         with kb.connect_closing(board=ctx.board) as conn:
             kb.block_task(
@@ -2493,7 +2508,7 @@ def maintain_sandbox_lease(tool_name: str = "", args: Optional[dict] = None, **_
     with _lease_lock:
         try:
             ctx = _worker_context()
-            _resolve_task(ctx)
+            _resolve_task(ctx, build_machine_tool=False)
             if opensandbox_operation in {
                 "sandbox_create", "sandbox_list", "sandbox_kill", "sandbox_renew",
             }:
@@ -2546,7 +2561,7 @@ def maintain_sandbox_lease(tool_name: str = "", args: Optional[dict] = None, **_
                     expiry = expiry.replace(tzinfo=timezone.utc)
                 remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
                 if remaining < 2 * SANDBOX_MIN_REMAINING_SECONDS:
-                    _resolve_task(ctx)
+                    _resolve_task(ctx, build_machine_tool=False)
                     if ctx.profile == WORKER_PROFILE:
                         secret = _prepare_host_credential()
                         credentials, _bindings = _vault_payload(sdk, secret)
