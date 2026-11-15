@@ -10,6 +10,7 @@ import importlib.util
 import json
 import random
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -395,8 +396,19 @@ def test_rules_forbid_foreign_pages_readbacks_and_outside_services():
     assert "outside design service" in text
 
 
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
 def test_skill_names_the_real_capture_kit_pin_field():
-    assert re.search(r"CHROMIUM_PIN\s*=\s*\{\s*package:", CAPTURE_MJS.read_text())
+    # Import the real module in one Node process (no browser is launched) and
+    # read the exported pin, instead of matching the kit's source text.
+    done = subprocess.run(
+        ["node", "--input-type=module", "-e",
+         "const m = await import(process.argv[1]);"
+         "console.log(JSON.stringify(m.CHROMIUM_PIN));",
+         CAPTURE_MJS.as_uri()],
+        capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    pin = json.loads(done.stdout)
+    assert isinstance(pin.get("package"), str) and pin["package"]
     assert "CHROMIUM_PIN.package" in _skill_text()
 
 
