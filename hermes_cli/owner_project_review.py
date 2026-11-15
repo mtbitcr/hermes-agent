@@ -61,7 +61,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Mapping, NamedTuple, Optional
 from zoneinfo import ZoneInfo
 
-from hermes_cli import kanban_db, projects_db, release_ledger
+from hermes_cli import kanban_db, owner_project_review_owner_line as owner_steps, projects_db, release_ledger
 from hermes_cli import owner_project_summary as summary
 from hermes_cli import owner_project_summary_events as events
 from hermes_cli.kanban_recommendation_closure import content_link, delivery_after_undo
@@ -136,6 +136,8 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
    specification, current_milestone, owner_visible_result, later_milestones, and changes.
    Use the native plan change schema. Each existing task reference must use its input status and event revision.
    This is advice for the Project chat. It grants no approval and changes no work.
+9. When Review days start from the start, this is the Project's first review and no review came before it.
+   Do not write last review, previous review, earlier review or prior review. Write so far instead.
 """
 
 _GENERIC_HEADLINES = {"work is progressing", "no updates", "all good", "things are moving"}
@@ -477,7 +479,7 @@ def _review_closures(board, project_id, sources, classification, proposals) -> l
     return checked
 
 
-def check_result_texts(value: Any, sources: Optional[dict[str, list[dict]]] = None):
+def check_result_texts(value: Any, sources: Optional[dict[str, list[dict]]] = None, *, first: bool = False):
     """The result's keys and size, then with its frozen input the summary, the brief and the work-title rule: one rule,
     which the hand-over runs too. Without sources only the keys and size are checked, ahead of the frozen input."""
     from hermes_cli.owner_project_review_record import TOTAL_INPUT_CAP_BYTES
@@ -506,6 +508,8 @@ def check_result_texts(value: Any, sources: Optional[dict[str, list[dict]]] = No
         titles and not any(title.casefold() in brief["what_changed"].casefold() for title in titles)
     ):
         raise ReviewRefused("review_brief_generic")
+    if first:
+        owner_steps.refuse_earlier_review(refreshed, brief, ReviewRefused)
     return refreshed, brief
 
 
@@ -532,7 +536,7 @@ def parse_review_result(
     from hermes_cli.owner_project_review_record import TOTAL_INPUT_CAP_BYTES
 
     task, value, sources, cut_note = _review_payload(board, task_id, project_id)
-    refreshed, brief = check_result_texts(value, sources)
+    refreshed, brief = check_result_texts(value, sources, first=owner_steps.first_review(task.body))
     with _review_evidence_board(project_id) as (project_board, registry, project):
         from hermes_cli.owner_project_review_plans import verified_supersessions
 
@@ -570,16 +574,9 @@ def parse_review_result(
         item["item"] in suggestion_ids and item["class"] == "still actionable" and item.get("actor") == "owner"
         for item in classification
     ) + sum(suggestion[0] not in suggestion_ids for suggestion in decisions["suggestions"])
-    if waiting and pending:
-        pointer = f"{waiting + pending} items are waiting on Decisions."
-    elif pending:
-        pointer = "A suggestion is waiting on Decisions." if pending == 1 else f"{pending} suggestions are waiting on Decisions."
-    elif waiting:
-        pointer = "An answer is waiting on Decisions." if waiting == 1 else f"{waiting} answers are waiting on Decisions."
-    else:
-        pointer = None
-    # Only recorded waits and pending suggestions supply a pointer. Worker prose supplies no question authority.
-    refreshed["owner_decision"] = brief["needs_you"] = pointer
+    # Only recorded waits and suggestions, and the plan approvals frozen with the task (none named if not known), count.
+    approvals = owner_steps.frozen_plan_approvals(task.body)
+    refreshed["owner_decision"] = brief["needs_you"] = owner_steps.owner_line(waiting, pending, approvals)
     from hermes_cli.owner_project_review_origin import source_digest
 
     return ReviewResult(refreshed, brief, classification, closures, sources, cut_note,
@@ -735,7 +732,7 @@ def _open_work_missing(registry: sqlite3.Connection, board: sqlite3.Connection, 
 @contextlib.contextmanager
 def _check_review_decisions(
     registry: sqlite3.Connection, project: projects_db.Project, sources: dict[str, list[dict]], frozen_cursor: str,
-    classification: list[dict],
+    classification: list[dict], frozen_approvals: Optional[int] = None,
 ):
     """The protected section of a review's commit: the final read of the live owner decisions, then the commit.
 
@@ -751,6 +748,7 @@ def _check_review_decisions(
                 # A new wait or suggestion anywhere in the Project makes the frozen pointer stale, also one the cap cut.
                 if _decision_cursor(_owner_decisions(board, project.id)) != frozen_cursor:
                     raise ReviewStale("review_decision_state_changed")
+                owner_steps.fence_plan_approvals(registry, project.id, frozen_approvals)
                 current = kanban_db.task_owner_waits(board, decision_ids)
                 if set(current) != set(frozen) or any(
                     any(current[tid].get(key) != frozen[tid].get(key) for key in ("kind", "since"))
@@ -792,14 +790,14 @@ def _store_review_result(registry, project_id, task, result, now, closure=False)
     conversation = re.search(r"^Linked conversation cursor: ([a-f0-9]{64}|none)$", task.body or "", re.M)
     if conversation is None:
         raise ReviewRefused("review_conversation_cursor_invalid")
-    decision_cursor = _frozen_decision_cursor(task.body)
+    decision_cursor, approvals = _frozen_decision_cursor(task.body), owner_steps.frozen_plan_approvals(task.body)
     project = projects_db.get_project(registry, project_id)
     if project is None or not summary._eligible(registry, project_id):
         return False
     ready_work = _ready_work(project)
     # Owner rule of 2026-11-11, points 5 to 7: the final read and the commit hold one protected section. This is the
     # one writer of a review's texts and day; the quiet day uses the same section.
-    with _check_review_decisions(registry, project, result.sources, decision_cursor, result.classification):
+    with _check_review_decisions(registry, project, result.sources, decision_cursor, result.classification, approvals):
         changed = registry.execute(
             "UPDATE project_review_state SET open_task_id=NULL,open_review_date=NULL,failures=0,"
             "last_reviewed_date=?,last_reviewed_at=?,last_brief_date=?,updated_at=?,"
@@ -1627,9 +1625,9 @@ def _settle_quiet(
             # The brief and its completed day commit together. A crash must not leave an unrecorded quiet day.
             projects_db.write_project_review_brief(
                 registry, project_id, review_date=review_day, covered_from=covered_from, covered_to=review_day,
-                headline="Nothing changed since the last review.", what_changed="Nothing changed since the last review.",
+                **owner_steps.quiet_brief(registry, project, state["last_reviewed_date"] is None),
                 # Keep the unresolved items through quiet days, without asking a model to classify them again.
-                next_step="Follow the current plan.", quiet=True, classification=classification, written_at=now,
+                quiet=True, classification=classification, written_at=now,
             )
 
 
@@ -1730,7 +1728,7 @@ def _wait_order(news: _News, review_day: str) -> tuple:
 
 def _task_body(last_reviewed_date: Optional[str], review_day: str, covered: events.Cursors, frozen: str,
                conversation_cursor: Optional[str] = None, decision_cursor: Optional[str] = None,
-               refusal_line: str = "") -> str:
+               refusal_line: str = "", plan_approvals: Optional[int] = None) -> str:
     """The instruction, the line that tells why the day's last review was refused, the days the review covers, and last
     the line that names the events it covers."""
     from hermes_cli.owner_project_review_proposals import proposal_schema
@@ -1744,6 +1742,7 @@ def _task_body(last_reviewed_date: Optional[str], review_day: str, covered: even
         + _window_line(last_reviewed_date, review_day)
         + f"\nLinked conversation cursor: {conversation_cursor or 'none'}"
         + f"\nOwner decision cursor: {decision_cursor or 'none'}"
+        + ("" if plan_approvals is None else f"\nPlan approvals waiting: {plan_approvals}")
         + "\n"
         + frozen
         + "\n"
@@ -1795,7 +1794,8 @@ def _open_review_task(
         board,
         title=TITLE_PREFIX + project.name,
         body=_task_body(state["last_reviewed_date"], review_day, batch.cursors, frozen["text"], frozen["conversation_cursor"],
-                        frozen["decision_cursor"], "" if _again(state, review_day) else refusal_line(state, review_day)),
+                        frozen["decision_cursor"], "" if _again(state, review_day) else refusal_line(state, review_day),
+                        frozen["plan_approvals"]),
         assignee=summary.PLANNING_ROLE,
         created_by=CREATED_BY,
         workspace_kind="scratch",
