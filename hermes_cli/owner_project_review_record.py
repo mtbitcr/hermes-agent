@@ -9,10 +9,10 @@ import hashlib
 import json
 import math
 import sqlite3
-import threading
 from typing import TypedDict
 
 from hermes_cli import kanban_db, owner_project_summary_events as events, projects_db
+from hermes_cli.owner_project_review_owner_line import owner_projection, plan_approvals_waiting
 from hermes_constants import get_default_hermes_root, reset_hermes_home_override, set_hermes_home_override
 
 # This budget covers the normal source windows. Larger records retain explicit cut notices, including their bytes.
@@ -45,6 +45,7 @@ class ReviewInput(TypedDict):
     cuts: list[Cut]
     conversation_cursor: str | None
     decision_cursor: str | None
+    plan_approvals: int
 
 
 # Every kind of cut notice, by cut reason, with the words its line starts with. ``cut_line`` writes the lines from
@@ -325,13 +326,11 @@ def _conversation(root, registry, project, last_review, sources, cuts):
     if not path.exists():
         _reduce(cuts, "conversation", "not_available")
         return
-    from gateway.platforms.api_server import OwnerAuthorityBroken, ResponseStore
+    from gateway.platforms.api_server import OwnerAuthorityBroken
 
     with events._read_only(path) as conn:
         # The constructor migrates the schema and changes file permissions. Reuse only its read-only projection.
-        store = ResponseStore.__new__(ResponseStore)
-        store._conn, store._default_profile, store._db_path = conn, "default", str(path)
-        store._conversation_lock = threading.RLock()
+        store = owner_projection(conn, path)
         turns, unread, heads = [], False, []
         for (name,) in links:
             try:
@@ -364,7 +363,7 @@ def _registry_record(root, project, last_review, sources, cuts):
         _reduce(cuts, "conversation", "unlinked")
         _reduce(cuts, "earlier_reviews", "not_available")
         _reduce(cuts, "proposals", "not_available")
-        return
+        return None, 0
     with events._read_only(path) as conn:
         if _table(conn, "owner_workspace_receipts"):
             from hermes_cli.owner_project_review_plans import read_plan_receipts
@@ -381,9 +380,11 @@ def _registry_record(root, project, last_review, sources, cuts):
         if summary:
             sources["project"].append(summary)
         conversation_cursor = _conversation(root, conn, project, last_review, sources, cuts)
+        # The plan approvals that wait in the linked chats, from the same registry snapshot as the record.
+        chat = conversation_cursor, plan_approvals_waiting(conn, project.id)
         if not _table(conn, "project_review_briefs"):
             _reduce(cuts, "earlier_reviews", "not_available")
-            return conversation_cursor
+            return chat
         rows = list(conn.execute(
             "SELECT * FROM project_review_briefs WHERE project_id=? ORDER BY review_date DESC", (project.id,),
         ))
@@ -395,7 +396,7 @@ def _registry_record(root, project, last_review, sources, cuts):
             if i == 0:
                 item["classification"] = _json(row["classification"])
             sources["earlier_reviews"].append(item)
-        return conversation_cursor
+        return chat
 
 
 def _redacted(value):
@@ -524,7 +525,7 @@ def _freeze(sources, cuts, max_bytes: int | None = None) -> ReviewInput:
     if size > cap:
         raise ValueError("the review input cap cannot hold its omission notices")
     return {"text": text, "size": size, "sources": {source: [row[0] for row in rows[source]] for source in sources},
-            "cuts": ordered, "conversation_cursor": None, "decision_cursor": None}
+            "cuts": ordered, "conversation_cursor": None, "decision_cursor": None, "plan_approvals": 0}
 
 
 def _automations(project, sources, cuts) -> None:
@@ -579,7 +580,7 @@ def build_review_input(
     decision_cursor = None
     token = set_hermes_home_override(str(root))
     try:
-        conversation_cursor = _registry_record(root, project, last_review, sources, cuts)
+        conversation_cursor, approvals = _registry_record(root, project, last_review, sources, cuts)
         _automations(project, sources, cuts)
         if project.primary_path:
             from gateway.platforms.api_server_repository import _held
@@ -613,4 +614,5 @@ def build_review_input(
     result = _freeze(sources, cuts, max_bytes)
     result["conversation_cursor"] = conversation_cursor
     result["decision_cursor"] = decision_cursor
+    result["plan_approvals"] = approvals
     return result
