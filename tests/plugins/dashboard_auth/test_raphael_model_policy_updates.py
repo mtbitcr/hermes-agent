@@ -22,8 +22,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from hermes_cli.dashboard_auth.audit import read_audit_records
+from hermes_cli.profiles import get_profile_dir
 from hermes_constants import get_default_hermes_root
 from plugins.dashboard_auth.raphael_workspace import model_policy
 from plugins.dashboard_auth.raphael_workspace.model_policy import (
@@ -503,9 +505,9 @@ def test_one_decision_is_one_entry_that_only_moves_from_active_to_rolled_back():
 # ---------------------------------------------------------------------------
 
 
-def _models_request(path: str):
+def _models_request(path: str, method: str = "PUT"):
     return SimpleNamespace(
-        method="PUT",
+        method=method,
         url=SimpleNamespace(path=path),
         client=SimpleNamespace(host="127.0.0.1"),
         headers={},
@@ -521,7 +523,67 @@ def _models_request(path: str):
     )
 
 
+def _write_native_config(profile: str, text: str) -> Path:
+    """Write ``profile``'s real config.yaml, where the real resolver puts its home.
+
+    The config loader caches on (mtime_ns, size), so every rewrite is made
+    strictly larger than the file it replaces: no two versions of one file share
+    a size, and no read can be answered from a stale cache entry.
+    """
+    home = get_profile_dir(profile)
+    home.mkdir(parents=True, exist_ok=True)
+    path = home / "config.yaml"
+    if path.is_file():
+        shortfall = path.stat().st_size - len(text.encode("utf-8"))
+        if shortfall >= 0:
+            text += "#" * (shortfall + 1) + "\n"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _native_route(profile: str, provider: str, model: str, *, fallbacks=False) -> Path:
+    """Configure ``profile`` natively on ``provider``/``model`` at max effort."""
+    return _write_native_config(
+        profile,
+        yaml.safe_dump({
+            "model": {"provider": provider, "default": model},
+            "agent": {"reasoning_effort": "max"},
+            "fallback_providers": (
+                [{"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}]
+                if fallbacks
+                else []
+            ),
+        }),
+    )
+
+
+def _audit_info_and_batch(profile: str, provider: str) -> None:
+    """Audit one successful read and one committed route batch for ``profile``."""
+    model_policy.audit_models_machine_success(
+        _models_request("/api/model/info", method="GET"),
+        action="info",
+        profile=profile,
+        provider=provider,
+    )
+    model_policy.journal_models_machine_batch_success(
+        _models_request("/api/profiles/model-batch"),
+        action="assign",
+        roles=[(profile, provider)],
+    ).commit()
+
+
+def _audited_models() -> list:
+    return [
+        (record["profile"], record["model_provider"], record.get("model", "absent"))
+        for record in read_audit_records()
+        if record.get("source") == "raphael-models"
+    ]
+
+
 def test_models_audit_entry_carries_model():
+    # The matching control: each audited role is natively configured on the
+    # model the policy admits it, so the audit and the admission agree.
+    _native_route("raphael-planner", "anthropic", "claude-opus-5-5")
     model_policy.audit_models_machine_success(
         _models_request("/api/profiles/raphael-planner/model"),
         action="assign",
@@ -529,6 +591,10 @@ def test_models_audit_entry_carries_model():
         provider="anthropic",
     )
     _write_record(_entry(_OPUS))
+    # The batch put the planner on the new version and left the others alone.
+    _native_route("raphael-planner", "anthropic", "claude-opus-6")
+    _native_route("raphael-builder", "anthropic", "claude-sonnet-5-5")
+    _native_route("raphael-verifier", "openai-codex", "gpt-6.1-sol")
     model_policy.journal_models_machine_batch_success(
         _models_request("/api/profiles/model-batch"),
         action="assign",
@@ -556,6 +622,85 @@ def test_models_audit_entry_carries_model():
         ("raphael-verifier", "openai-codex", "gpt-6.1-sol"),
         ("raphael-planner", None, None),
     ]
+
+
+# The audit names the model the profile is natively configured with: what the
+# read reported, or what the write just put on disk. What the policy admits is
+# a different fact, and the record moves only that one.
+
+
+@pytest.mark.parametrize("fallbacks", [False, True], ids=["no-fallback", "fallback"])
+def test_audit_names_the_native_model_while_an_active_entry_admits_the_next(
+    fallbacks,
+):
+    provider, from_model, to_model = _OPUS
+    _native_route("default", provider, from_model, fallbacks=fallbacks)
+    model_policy.apply_model_update_record(_entry(_OPUS))
+    assert assignment_for("default", provider).model == to_model
+
+    _audit_info_and_batch("default", provider)
+
+    assert _audited_models() == [("default", provider, from_model)] * 2
+
+
+def test_audit_names_the_native_model_after_its_entry_is_rolled_back():
+    provider, from_model, to_model = _OPUS
+    active = _entry(_OPUS)
+    model_policy.apply_model_update_record(active)
+    _native_route("default", provider, to_model)
+    model_policy.apply_model_update_record({**active, "state": "rolled_back"})
+    assert assignment_for("default", provider).model == from_model
+
+    _audit_info_and_batch("default", provider)
+
+    assert _audited_models() == [("default", provider, to_model)] * 2
+
+
+@pytest.mark.parametrize("case", sorted(_UNREADABLE))
+def test_audit_names_the_native_model_while_the_record_is_unreadable(case):
+    provider, from_model, to_model = _OPUS
+    model_policy.apply_model_update_record(_entry(_OPUS))
+    _native_route("default", provider, to_model)
+    path = _record_path()
+    path.unlink()
+    _UNREADABLE[case](path)
+    with pytest.raises(EnrollmentUnavailable):
+        model_policy.read_model_updates()
+    assert assignment_for("default", provider).model == from_model
+
+    _audit_info_and_batch("default", provider)
+
+    assert _audited_models() == [("default", provider, to_model)] * 2
+
+
+# Native configuration that names no model on the audited provider.
+_UNKNOWN_MODEL = {
+    "other-provider": lambda profile: _native_route(
+        profile, "openai-codex", "gpt-6.1-sol"
+    ),
+    "empty-model": lambda profile: _write_native_config(
+        profile,
+        yaml.safe_dump({"model": {"provider": "anthropic"}, "fallback_providers": []}),
+    ),
+    # Cannot be read: the native reader refuses each of these.
+    "model-not-a-mapping": lambda profile: _write_native_config(
+        profile, yaml.safe_dump({"model": "claude-opus-5-5"})
+    ),
+    "missing-profile-home": lambda profile: None,
+}
+
+
+@pytest.mark.parametrize("case", sorted(_UNKNOWN_MODEL))
+def test_audit_model_is_unknown_unless_the_native_route_names_one_there(case):
+    profile, provider = "raphael-planner", "anthropic"
+    _UNKNOWN_MODEL[case](profile)
+    # The policy admits a model there all the same; that is not what this
+    # profile is configured with, so it is not what the audit names.
+    assert assignment_for(profile, provider).model == "claude-opus-5-5"
+
+    _audit_info_and_batch(profile, provider)
+
+    assert _audited_models() == [(profile, provider, None)] * 2
 
 
 # ---------------------------------------------------------------------------

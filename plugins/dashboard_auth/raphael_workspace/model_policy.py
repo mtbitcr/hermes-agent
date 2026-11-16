@@ -1512,13 +1512,30 @@ def audit_models_machine_success(
 
 
 def _audited_model(profile: Optional[str], provider: Optional[str]) -> Optional[str]:
-    """The exact model ``profile`` runs on ``provider`` now, when both name one."""
+    """The model ``profile``'s native route names on ``provider``, else ``None``.
+
+    Read from the profile's own config: what the read just reported, or what
+    the write just put on disk. Never from what the policy admits — an update
+    record moves admission, not the route a profile is configured with. A route
+    on another provider, an empty model or an unreadable route is an unknown
+    model, and an unknown model never fails the audit.
+    """
+    from hermes_cli.config_home import HomeInitializationError
+
     if not profile or not provider:
         return None
     try:
-        return assignment_for(profile, provider).model
-    except ValueError:
+        native_provider, model, _effort, _fallbacks_disabled = _configured_route(
+            profile
+        )
+    except (ValueError, OSError, HomeInitializationError):
+        # An invalid profile name, a ``model`` or ``agent`` section that is not
+        # a mapping, a named profile home that does not exist or cannot be
+        # read, or a home that cannot be initialized.
         return None
+    if native_provider != provider or not model:
+        return None
+    return model
 
 
 def _models_machine_entries(
