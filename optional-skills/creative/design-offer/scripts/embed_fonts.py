@@ -10,7 +10,9 @@ website's package.json pins both packages and both installed packages are exactl
 bytes are never changed. The page is parsed with the standard library's HTML parser and
 every address in it (an attribute that can hold one, a ``url()`` or an ``@import`` in a
 style) must be a ``data:`` address or a ``#`` reference inside the page; any other value
-is refused, before anything is written.
+is refused, before anything is written. A ``data:`` address must be a font, PNG, JPEG or
+WebP. A ``script`` element, an ``on*`` attribute and a ``url()``, ``image-set()`` or
+``@import`` argument that holds ``var(`` are refused too.
 
 Standard library only. Prints the SHA-256 of each font file, never page text.
 """
@@ -46,6 +48,7 @@ CSS_IMPORT = re.compile(r"@import", re.IGNORECASE)
 CSS_IMAGE_FUNCTION = re.compile(r"(?<![\w-])(?:-webkit-)?(?:image-set|cross-fade|image|src)\s*\(", re.IGNORECASE)
 ASCII_SPACE = "".join(chr(c) for c in range(0x21))
 DROPPED = {9: None, 10: None, 13: None}
+PICTURE_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
 
 
 class EmbedError(Exception):
@@ -67,15 +70,71 @@ class _Outside(Exception):
     """An address that is neither a data: address nor a # reference; carries what to name, never page text."""
 
 
-def _allowed(value: str) -> bool:
-    # Decide as a browser's URL parser reads it: tab and newlines vanish, leading and trailing control characters and spaces are stripped.
-    address = value.translate(DROPPED).strip(ASCII_SPACE)
-    return address[:5].lower() == "data:" or address.startswith("#")
+class _Forbidden(Exception):
+    """Something a design file never needs (script, event handler, foreign data: type, var( in an address); carries what to name, never page text."""
+
+
+def _data_type_allowed(rest: str) -> bool:
+    head, comma, _body = rest.partition(",")
+    essence = head.split(";", 1)[0].strip(ASCII_SPACE).lower()
+    kind, _slash, subtype = essence.partition("/")
+    return bool(comma) and (essence in PICTURE_TYPES or (kind == "font" and bool(subtype) and "/" not in subtype))
 
 
 def _require(value: str, name: str) -> None:
-    if not _allowed(value):
+    # Decide as a browser's URL parser reads it: tab and newlines vanish, leading and trailing control characters and spaces are stripped.
+    address = value.translate(DROPPED).strip(ASCII_SPACE)
+    if address.startswith("#"):
+        return
+    if address[:5].lower() != "data:":
         raise _Outside(name)
+    if not _data_type_allowed(address[5:]):
+        raise _Forbidden(f"a data: address in a {name} whose type is not a font, PNG, JPEG or WebP")
+
+
+def _skip_comment_or_string(text: str, i: int) -> int | None:
+    if text.startswith("/*", i):
+        end = text.find("*/", i + 2)
+        return len(text) if end < 0 else end + 2
+    if text[i] in "\"'":
+        end = text.find(text[i], i + 1)
+        return len(text) if end < 0 else end + 1
+    return None
+
+
+def _argument(text: str, i: int, stop: str = "") -> str:
+    """The text from *i* to the ``)`` that closes the open parenthesis, or (with *stop*) to the first such character outside parentheses."""
+    start, depth = i, 1 if not stop else 0
+    while i < len(text):
+        skipped = _skip_comment_or_string(text, i)
+        if skipped is not None:
+            i = skipped
+            continue
+        if stop and depth == 0 and text[i] in stop:
+            return text[start:i]
+        depth += (text[i] == "(") - (text[i] == ")")
+        if depth == 0 and not stop:
+            return text[start:i]
+        i += 1
+    return text[start:]
+
+
+def _holds_var(text: str) -> bool:
+    """True when the CSS text holds a ``var(`` function token outside strings and comments."""
+    i, n = 0, len(text)
+    while i < n:
+        skipped = _skip_comment_or_string(text, i)
+        if skipped is not None:
+            i = skipped
+        elif text[i].isalnum() or text[i] in "_-" or ord(text[i]) > 127:
+            start = i
+            while i < n and (text[i].isalnum() or text[i] in "_-" or ord(text[i]) > 127):
+                i += 1
+            if text[start:i].lower() == "var" and text[i:i + 1] == "(":
+                return True
+        else:
+            i += 1
+    return False
 
 
 def _srcset_urls(value: str) -> list[str]:
@@ -130,6 +189,8 @@ def _css_string(text: str, i: int, name: str) -> tuple[str, int]:
 def _check_css(css: str) -> None:
     text = _css_unescape(css)
     for match in CSS_URL.finditer(text):
+        if _holds_var(_argument(text, match.end())):
+            raise _Forbidden("a var( inside a url() argument")
         i = match.end()
         while i < len(text) and text[i] in " \t\n\r\f":
             i += 1
@@ -142,6 +203,8 @@ def _check_css(css: str) -> None:
             value = text[i:end]
         _require(value, "url()")
     for match in CSS_IMPORT.finditer(text):
+        if _holds_var(_argument(text, match.end(), stop=";{")):
+            raise _Forbidden("a var( inside an @import argument")
         i = _skip_css_space(text, match.end())
         if CSS_URL.match(text, i):
             continue
@@ -151,6 +214,8 @@ def _check_css(css: str) -> None:
         else:
             raise _Outside("@import")
     for match in CSS_IMAGE_FUNCTION.finditer(text):
+        if "image-set" in match.group(0).lower() and _holds_var(_argument(text, match.end())):
+            raise _Forbidden("a var( inside an image-set() argument")
         i, depth = match.end(), 1
         while i < len(text) and depth:
             char = text[i]
@@ -170,6 +235,8 @@ class _Allowlist(HTMLParser):
         self._style: list[str] | None = None
 
     def handle_starttag(self, tag, attrs):
+        if tag.rsplit(":", 1)[-1] == "script":
+            raise _Forbidden("a script element")
         attributes = {}
         for name, value in attrs:
             attributes.setdefault(name, value if value is not None else "")
@@ -178,6 +245,8 @@ class _Allowlist(HTMLParser):
             value = value if value is not None else ""
             shown = name if re.fullmatch(r"[a-z0-9:_.-]{1,40}", name) else "unnamed"
             local = name.rsplit(":", 1)[-1]
+            if name.startswith("on"):
+                raise _Forbidden(f"an {shown} attribute, which is an event handler")
             if name == "xmlns" or name.startswith("xmlns:"):
                 continue
             if name in ADDRESS_ATTRIBUTES or local in ADDRESS_ATTRIBUTES:
@@ -230,6 +299,8 @@ def check_addresses(text: str) -> None:
     except _Outside as outside:
         raise EmbedError(
             f"the page holds a {outside} that is not a data: address or a # reference; put everything inline") from None
+    except _Forbidden as forbidden:
+        raise EmbedError(f"the page holds {forbidden}; a design file of this route needs none of these") from None
 
 
 def _package_json(path: Path, what: str) -> dict:

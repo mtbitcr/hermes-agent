@@ -285,7 +285,7 @@ def test_embed_fonts_command_line_accepts_data_and_fragment_addresses_and_embeds
     body = ("<a href='#top'>t</a><svg xmlns='http://www.w3.org/2000/svg'><use xlink:href='#a'/></svg>"
             "<img src='data:image/png;base64,AAAA' srcset='data:image/png;base64,AAAA 1x, data:image/png;base64,BBBB 2x'>"
             "<div style=\"background:url(data:image/png;base64,AAAA) , url('#frag')\"></div>"
-            "<style>@import url(data:text/css,a%7B%7D);@import 'data:text/css,b%7B%7D';.x{background:url(\"#g\")}</style>")
+            "<style>@import url(data:font/woff2,AA);@import 'data:font/woff2,BB';.x{background:url(\"#g\")}</style>")
     text = PAGE.replace("</body>", body + "</body>")
     done, page = _cli(tmp_path, text)
     assert done.returncode == 0, done.stderr
@@ -356,6 +356,65 @@ def test_embed_fonts_command_line_exits_non_zero_on_a_refusal(tmp_path):
     assert done.returncode == 1
     assert "refused" in done.stderr
     assert page.read_text(encoding="utf-8") == PAGE
+
+
+@pytest.mark.parametrize("snippet", [
+    "<script>MARKER_7312()</script>",
+    "<SCRIPT>MARKER_7312()</SCRIPT>",
+    "<script src='data:text/javascript,MARKER_7312'></script>",
+    "<svg xmlns='http://www.w3.org/2000/svg'><script>MARKER_7312()</script></svg>",
+    "<iframe srcdoc='&lt;script&gt;MARKER_7312()&lt;/script&gt;'></iframe>",
+    "<body onload='MARKER_7312()'></body>",
+    "<a href='#x' onclick='MARKER_7312()'>x</a>",
+    "<body ONLOAD='MARKER_7312()'></body>",
+    "<img src='data:image/png;base64,AAAA' onerror=MARKER_7312>",
+    "<svg xmlns='http://www.w3.org/2000/svg' onload='MARKER_7312()'></svg>",
+    "<a href='data:text/css,MARKER_7312'>x</a>",
+    "<img src='data:text/html,MARKER_7312'>",
+    "<img src='data:image/svg+xml,MARKER_7312'>",
+    "<img src='data:text/javascript,MARKER_7312'>",
+    "<img src='data:,MARKER_7312'>",
+    "<img src='data:image/png'>",
+    "<img srcset='data:image/png;base64,AAAA 1x, data:image/svg+xml;base64,MARKER_7312 2x'>",
+    "<div style='background:url(data:image/svg+xml;base64,MARKER_7312)'></div>",
+    "<style>@import url(data:text/css,MARKER_7312);</style>",
+    "<style>@import 'data:text/css,MARKER_7312';</style>",
+    "<div style='background:url(var(--MARKER_7312))'></div>",
+    "<div style=\"background:URL( var(--MARKER_7312) )\"></div>",
+    "<div style='background:image-set(var(--MARKER_7312) 1x)'></div>",
+    "<div style='background:-webkit-image-set(var(--MARKER_7312) 1x)'></div>",
+    "<div style='background:image-set(url(data:image/png;base64,AAAA) calc(var(--MARKER_7312) * 1x))'></div>",
+    "<div style='background:v\\61r(--MARKER_7312);background:url(v\\61r(--MARKER_7312))'></div>",
+    "<style>@import var(--MARKER_7312);</style>",
+    "<style>@import url(var(--MARKER_7312));</style>",
+    "<style>.a{background:url(var(--MARKER_7312))}</style>",
+], ids=lambda t: re.sub(r"\W+", "_", t)[:48])
+def test_embed_fonts_command_line_refuses_script_handlers_foreign_data_types_and_var_in_addresses(tmp_path, snippet):
+    text = PAGE.replace("</body>", snippet + "</body>")
+    done, page = _cli(tmp_path, text)
+    assert done.returncode == 1
+    assert done.stderr.startswith("refused:") and done.stdout == ""
+    assert "MARKER_7312" not in done.stdout + done.stderr and PAGE_TEXT not in done.stdout + done.stderr
+    assert page.read_bytes() == text.encode("utf-8")
+
+
+@pytest.mark.parametrize("body", [
+    "<object data='data:font/woff2;base64,AAAA'></object><div style='background:url(data:font/ttf;base64,AAAA)'></div>",
+    "<img src='data:image/png;base64,AAAA'><img src=' DATA:IMAGE/PNG;base64,AAAA '>",
+    "<img src='data:image/jpeg;base64,AAAA'><img srcset='data:image/webp;base64,AAAA 1x, data:image/jpeg;base64,BBBB 2x'>",
+    "<div style='background:url(data:image/webp;base64,AAAA)'></div>",
+    "<p style='color:var(--c)'>c</p><style>:root{--c:red}.a{color:var(--c);margin:calc(var(--m) * 2)}</style>",
+    "<style>:root{--bg:url(data:image/png;base64,AAAA)}.a{background:var(--bg)}</style>",
+    "<div class='one' title='online once' data-one='1'>on</div><p>onload and script are only words here</p>",
+    "<svg xmlns='http://www.w3.org/2000/svg'><use xlink:href='#a'/></svg><a href='#top'>t</a>",
+], ids=["font", "png", "jpeg-webp", "webp-style", "var-outside-address", "var-holds-data-url", "on-in-names-and-text",
+        "svg-fragment"])
+def test_embed_fonts_command_line_keeps_accepting_inert_fonts_pictures_and_plain_variables(tmp_path, body):
+    done, page = _cli(tmp_path, PAGE.replace("</body>", body + "</body>"))
+    assert done.returncode == 0, done.stderr
+    out = page.read_text(encoding="utf-8")
+    assert _faces(out) == {"Geist": ("400 500", GEIST_BYTES), "Geist Mono": ("400", MONO_BYTES)}
+    assert body in out
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +609,19 @@ def test_check_command_line_refuses_a_failed_capture_without_printing_what_the_k
     assert "PRIVATE_PAGE_TEXT_4931" not in done.stdout + done.stderr
     assert "example.invalid" not in done.stdout + done.stderr
     assert not (out / "self-check.json").exists()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_check_command_line_refuses_a_full_page_file_with_an_outside_request_and_prints_only_the_count(tmp_path):
+    outside = {1280: _bundle(1280, SAME, blocked=["http://example.invalid/MARKER_URL_5520"]), 375: _bundle(375, SAME)}
+    done, out, _, _ = _run_check(tmp_path, _both_widths(SAME), outside)
+    shown = done.stdout + done.stderr
+    assert done.returncode == 1
+    assert re.findall(r"\d+", shown) == ["1"]
+    assert "MARKER_URL_5520" not in shown and "example.invalid" not in shown
+    assert PAGE_TEXT not in shown and "design_pin" not in shown
+    assert not (out / "self-check.json").exists()
+    assert not [p for p in tmp_path.rglob("*") if "design_pin" in p.name]
 
 
 # ---------------------------------------------------------------------------

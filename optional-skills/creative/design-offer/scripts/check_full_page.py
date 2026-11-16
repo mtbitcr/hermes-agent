@@ -139,6 +139,9 @@ def run(site, full_page, pages, chromium, out) -> dict:
     route_text = " ".join(routes)
     _capture("candidate", out / "candidate", ["--site", str(site)], route_text, chromium)
     _capture("prototype", out / "full-page", ["--prototype", str(full_page)], route_text, chromium)
+    outside = sum(len(bundle.get("blocked_requests") or []) for bundle in _read_side(out / "full-page").values())
+    if outside:
+        raise CheckError(f"the full-page file asked for {outside} request(s) beyond the page file")
     report = compare_folders(out / "candidate", out / "full-page")
     report = {"full_page": {"file": full_page.name, "sha256": _sha256(data)}, "fonts": fonts, **report}
     with open(out / REPORT, "x", encoding="utf-8") as handle:
