@@ -10,7 +10,7 @@
     "tools/owner_workspace_tools.py": "880 to 908: +28 lines, the measured net growth of card C1 of the named inputs plan. This file has no ceiling in this ledger, so this entry records the growth only. One new schema, _NAMED_INPUTS, defines the optional inputs field: one to five text files a task needs from the owner, each a plain name and a type of txt, md, csv or json. The owner_task_graph_commit and owner_project_plan_commit tool schemas now offer it on every task those tools create. Owner rule of 2026-10-21."
   },
   "cron/scheduler.py": 7536,
-  "gateway/platforms/api_server.py": 16790,
+  "gateway/platforms/api_server.py": 16786,
   "hermes_cli/kanban_db.py": 39625,
   "plugins/kanban/dashboard/plugin_api.py": 4833,
   "tools/kanban_tools.py": 4956

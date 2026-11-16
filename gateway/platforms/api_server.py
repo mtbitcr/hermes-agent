@@ -13708,6 +13708,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 list_owner_decisions,
                 resolve_owner_context,
             )
+            from hermes_cli.owner_service_access import RUN_APPROVAL_TITLES, SERVICE_ACCESS_CAPABILITY, service_access_item
 
             # Only a reader that asks for owner_waiting_v1 gets the keyword, so
             # every other request makes exactly today's kernel call.
@@ -13743,15 +13744,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=500,
             )
 
-        operation_titles = {
-            "owner_workspace_bootstrap": "Approve the new Project",
-            "owner_task_graph_commit": "Approve the first Project milestone",
-            "owner_project_plan_commit": "Approve Project changes",
-            "owner_task_move": "Approve a work-state change",
-            "owner_task_comment": "Approve an owner reply",
-            "owner_task_retry": "Approve trying stopped work again",
-            "owner_project_lifecycle": "Approve the Project lifecycle change",
-        }
         for run_id, status in self._run_statuses.items():
             context = status.get("owner_workspace_context")
             pending = status.get("pending_approval")
@@ -13763,7 +13755,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ):
                 continue
             operation = str(pending.get("operation") or "")
-            title = operation_titles.get(operation)
+            title = RUN_APPROVAL_TITLES.get(operation)
             if title is None:
                 continue
             created_at = status.get("created_at")
@@ -13789,6 +13781,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "created_at": created_iso,
             })
 
+        # Only a reader that names service_access_v1 gets the item: first, ahead of the cut.
+        if _owner_workspace_capability_requested(request, SERVICE_ACCESS_CAPABILITY):
+            service_access = service_access_item(owner_profile, time.time())
+            decisions[:0] = [service_access] if service_access else []
         return web.json_response({
             "object": "hermes.owner_workspace.decision_list",
             # Truncation is reported, not hidden: an owner who cannot tell a
