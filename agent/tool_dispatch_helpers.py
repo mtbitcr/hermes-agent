@@ -433,7 +433,7 @@ def make_tool_result_message(
 
 
 # Tools whose results carry attacker-controllable content; outputs under 32 chars skip wrapping.
-_UNTRUSTED_TOOL_NAMES = frozenset({"web_extract", "web_search"})
+_UNTRUSTED_TOOL_NAMES = frozenset({"web_extract", "web_search", "design_compare"})
 _UNTRUSTED_TOOL_PREFIXES = ("browser_", "mcp_")
 _UNTRUSTED_WRAP_MIN_CHARS = 32
 
