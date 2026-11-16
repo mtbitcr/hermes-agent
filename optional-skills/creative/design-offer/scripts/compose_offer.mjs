@@ -34,6 +34,7 @@ export const SCALE_STEP = 0.8
 export const MIN_SCALE = 0.2
 export const JPEG_TOLERANCE = 24
 export const SAMPLE_GRID = 8
+export const BLOCK_SIZE = 8
 
 export class OfferError extends Error {}
 
@@ -136,6 +137,12 @@ export async function chooseEncoding(encode, max = MAX_PICTURE_BYTES, accept = a
   throw new OfferError(reason)
 }
 
+// The corner of the block that is averaged at a sample point: on the JPEG block grid (JPEG keeps a block's mean, not a pixel's colour), inside the canvas.
+export function blockOrigin(point, width, height, size) {
+  const inside = (v, limit) => Math.max(0, Math.min(Math.floor(v / size) * size, limit - size))
+  return { x: inside(point.x, width), y: inside(point.y, height) }
+}
+
 // Centres of an even grid of cells inside one pane.
 export function samplePoints(pane, grid = SAMPLE_GRID) {
   const points = []
@@ -198,8 +205,11 @@ const PAGE_SOURCE = `(() => {
     }
   }
   const canvasFor = lay => { const c = document.createElement('canvas'); c.width = lay.width; c.height = lay.height; return c }
+  const BLOCK = ${BLOCK_SIZE}
+  const blockOrigin = ${blockOrigin}
   const blockMean = (ctx, p) => {
-    const d = ctx.getImageData(Math.max(0, p.x - 1), Math.max(0, p.y - 1), 3, 3).data
+    const o = blockOrigin(p, ctx.canvas.width, ctx.canvas.height, BLOCK)
+    const d = ctx.getImageData(o.x, o.y, BLOCK, BLOCK).data
     const sum = [0, 0, 0]
     for (let i = 0; i < d.length; i += 4) { sum[0] += d[i]; sum[1] += d[i + 1]; sum[2] += d[i + 2] }
     return sum.map(v => v / (d.length / 4))

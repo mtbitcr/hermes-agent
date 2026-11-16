@@ -64,8 +64,8 @@ const chunk = (type: string, data: Buffer) => {
   return Buffer.concat([head, data, tail])
 }
 
-// A valid RGB PNG: solid colour, or noise too dense for a 4 MiB PNG.
-function makePng(width: number, height: number, fill: [number, number, number] | 'noise') {
+// A valid RGB PNG: solid colour, incompressible colour noise, or grey noise (R=G=B).
+function makePng(width: number, height: number, fill: [number, number, number] | 'grey' | 'noise') {
   const ihdr = Buffer.alloc(13)
 
   ihdr.writeUInt32BE(width, 0)
@@ -79,7 +79,8 @@ function makePng(width: number, height: number, fill: [number, number, number] |
     const at = y * (width * 3 + 1)
 
     if (fill === 'noise') {
-      // Grey noise: JPEG halves the colour resolution, so per-channel colour noise can never match its source to 24 per channel.
+      randomBytes(width * 3).copy(rows, at + 1)
+    } else if (fill === 'grey') {
       const grey = randomBytes(width)
 
       for (let x = 0; x < width; x++) {
@@ -105,6 +106,7 @@ interface CaptureOpts {
   chromium?: string
   kit?: string
   leftHeight?: number
+  noise?: 'grey'
   noisy?: boolean
   rightHeight?: number
 }
@@ -119,7 +121,7 @@ function fakeCapture(folder: string, o: CaptureOpts = {}) {
   ]
 
   for (const [width, height, color] of sizes) {
-    writeFileSync(join(folder, `index-0a1b2c3d-${width}.png`), makePng(width, height, o.noisy ? 'noise' : color))
+    writeFileSync(join(folder, `index-0a1b2c3d-${width}.png`), makePng(width, height, o.noisy ? 'noise' : (o.noise ?? color)))
     writeFileSync(
       join(folder, `index-0a1b2c3d-${width}.json`),
       JSON.stringify({
@@ -352,6 +354,32 @@ describe('layout', () => {
         expect(p.x).toBeLessThan(pane.x + pane.w)
         expect(p.y).toBeGreaterThanOrEqual(pane.y)
         expect(p.y).toBeLessThan(pane.y + pane.h)
+      }
+    }
+  })
+
+  it('averages the block of the JPEG grid that holds the sample point, inside the canvas', () => {
+    expect(compose.BLOCK_SIZE).toBe(8)
+    expect(compose.blockOrigin({ x: 0, y: 0 }, 100, 100, 8)).toEqual({ x: 0, y: 0 })
+    expect(compose.blockOrigin({ x: 7, y: 8 }, 100, 100, 8)).toEqual({ x: 0, y: 8 })
+    expect(compose.blockOrigin({ x: 43, y: 71 }, 1000, 1000, 8)).toEqual({ x: 40, y: 64 })
+    expect(compose.blockOrigin({ x: 99, y: 99 }, 100, 100, 8)).toEqual({ x: 92, y: 92 })
+    expect(compose.blockOrigin({ x: 5, y: 5 }, 4, 4, 8)).toEqual({ x: 0, y: 0 })
+  })
+
+  it('puts every block of every sample point inside the canvas, at every scale of the ladder', () => {
+    for (const scale of [1, 0.8, 0.512, 0.2]) {
+      const l = compose.layout(left, right, scale)
+
+      for (const p of [...compose.samplePoints(l.left), ...compose.samplePoints(l.right)]) {
+        const o = compose.blockOrigin(p, l.width, l.height, compose.BLOCK_SIZE)
+
+        expect(o.x % 8).toBe(0)
+        expect(o.y % 8).toBe(0)
+        expect(o.x + 8).toBeLessThanOrEqual(l.width)
+        expect(o.y + 8).toBeLessThanOrEqual(l.height)
+        expect(o.x).toBeLessThanOrEqual(p.x)
+        expect(o.x + 8).toBeGreaterThan(p.x)
       }
     }
   })
@@ -780,6 +808,23 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
 
   it('falls back to JPEG for a page too noisy for a 4 MiB PNG', () => {
     const options = fakeOptions(2, { leftHeight: 2500, noisy: true, rightHeight: 2500 })
+    const out = join(fresh('result'), 'offer')
+    const done = composeReal(options, out)
+
+    expect(done.status, done.stderr).toBe(0)
+
+    for (const name of readdirSync(out).filter(f => f.startsWith('option-'))) {
+      const picture = readFileSync(join(out, name))
+
+      expect(picture.length).toBeLessThanOrEqual(FOUR_MIB)
+      expect(compose.pictureKind(picture)).toBe(name.endsWith('.jpg') ? 'image/jpeg' : 'image/png')
+    }
+
+    expect(readdirSync(out).some(f => f.endsWith('.jpg'))).toBe(true)
+  }, 300_000)
+
+  it('also composes a page of grey noise', () => {
+    const options = fakeOptions(2, { leftHeight: 2500, noise: 'grey', rightHeight: 2500 })
     const out = join(fresh('result'), 'offer')
     const done = composeReal(options, out)
 

@@ -28,8 +28,8 @@ FONTS = (
     ("@fontsource-variable/geist", "files/geist-latin-wght-normal.woff2", "Geist", "400 500"),
     ("@fontsource-variable/geist-mono", "files/geist-mono-latin-wght-normal.woff2", "Geist Mono", "400"),
 )
-# A browser reads https:host, https:\\host and //host as outside addresses too, so the check runs on the text a browser sees.
-OUTSIDE_ADDRESS = re.compile(r"""(?<![\w+.\-/])https?:(?=\S)|(?:^|[\s"'(=,])//[A-Za-z0-9]""", re.IGNORECASE)
+# A browser reads https:host, https:\\host and //host (any authority: IPv6 in brackets, Unicode host) as outside addresses too, so the check runs on the text a browser sees.
+OUTSIDE_ADDRESS = re.compile(r"""(?<![\w+.\-/])https?:(?=\S)|(?:^|[\s"'(=,])//[^\s"'<>)]""", re.IGNORECASE)
 CSS_ESCAPE = re.compile(r"\\(?:([0-9a-fA-F]{1,6})[ \t\n\r\f]?|(\r\n|[\n\r\f])|(.))", re.DOTALL)
 URL_NOISE = re.compile(r"[\x00-\x1f\x7f]")
 # An XML namespace name of inline SVG is an identifier, not an address the page loads from.

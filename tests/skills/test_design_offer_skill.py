@@ -208,6 +208,21 @@ def test_embed_fonts_accepts_inline_svg_namespaces_and_relative_or_data_addresse
     assert "@font-face" in page.read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize("outside", [
+    "<img src=\"//[::1]/MARKER_6841\">",
+    "<img src=\"//éxample.invalid/MARKER_6841\">",
+], ids=["scheme-relative-ipv6", "scheme-relative-unicode-host"])
+def test_embed_fonts_command_line_refuses_a_scheme_relative_authority_and_leaves_the_page(tmp_path, outside):
+    text = PAGE.replace("</head>", outside + "</head>")
+    page = _page(tmp_path, text)
+    done = subprocess.run([sys.executable, str(EMBED), "--website", str(_website(tmp_path)), "--page", str(page)],
+                          capture_output=True, text=True, timeout=60)
+    assert done.returncode == 1
+    assert "refused" in done.stderr
+    assert "MARKER_6841" not in done.stdout + done.stderr
+    assert page.read_bytes() == text.encode("utf-8")
+
+
 def test_embed_fonts_command_line_exits_non_zero_on_a_refusal(tmp_path):
     assert EMBED.is_file(), "embed_fonts.py is missing"
     page = _page(tmp_path)
