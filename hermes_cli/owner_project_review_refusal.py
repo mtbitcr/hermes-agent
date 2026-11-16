@@ -104,6 +104,8 @@ def _breach_sentence(name: str, breach: Mapping[str, Any]) -> str:
         return f"{name} breaks the owner text rule. Write it again in plain words."
     if rule == "project_prefix":
         return f"{name} must start with one of the input Project names, a colon and a space."
+    if rule == "no_owner_step":
+        return f"{name} names a Project that has nothing waiting for the owner."
     if rule == "earlier_review":
         return f"{name} refers to an earlier review, but this is the first review. Write so far instead."
     raise ValueError(rule)

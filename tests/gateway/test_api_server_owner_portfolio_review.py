@@ -20,6 +20,7 @@ from tools import approval
 from plugins.dashboard_auth.raphael_workspace import model_policy
 from tests.gateway.test_api_server_owner_board_counts import _CONFIG, _get
 from tests.gateway.test_api_server_owner_review_brief import NOW, project_review  # noqa: F401
+from tests.hermes_cli.test_owner_portfolio_review import _owner_waits
 from tests.hermes_cli.test_owner_project_review_plans import _logical_state
 
 
@@ -29,24 +30,28 @@ def portfolio(project_review, monkeypatch, request):
                         lambda profile: model_policy.assignment_for(profile, "anthropic"))
     root = Path.home() / ".hermes"
     config = yaml.safe_load((root / "config.yaml").read_text())
-    projects = [project_review]
-    if getattr(request, "param", None) == "mixed":
-        ctx = ow.OwnerContext(actor="secondary", profile="secondary", session="secondary-portfolio")
+    actor = "secondary" if getattr(request, "param", None) == "mixed" else "default"
+    ctx = ow.OwnerContext(actor=actor, profile=actor, session=f"{actor}-portfolio")
 
-        def approve_fixture(data):
-            assert approval.resolve_gateway_approval(ctx.session, "once", approval_id=data["approval_id"]) == 1
+    def approve_fixture(data):
+        assert approval.resolve_gateway_approval(ctx.session, "once", approval_id=data["approval_id"]) == 1
 
-        approval.register_gateway_notify(ctx.session, approve_fixture)
-        try:
-            projects.append(ow.bootstrap(ctx, idempotency_key="secondary-portfolio", name="Guest Visit"))
-        finally:
-            approval.unregister_gateway_notify(ctx.session)
-        assert projects[-1]["ok"] is True
+    approval.register_gateway_notify(ctx.session, approve_fixture)
+    try:
+        guest = ow.bootstrap(ctx, idempotency_key=f"{actor}-portfolio", name="Guest Visit")
+    finally:
+        approval.unregister_gateway_notify(ctx.session)
+    assert guest["ok"] is True
+    guest = next(item for item in ow.list_committed_projects(ctx) if item["project_id"] == guest["project_id"])
+    projects = [project_review, guest]
     config["owner_review"] = {"enabled": True, "allowlist": [p["project_id"] for p in projects], "portfolio": True}
     (root / "config.yaml").write_text(yaml.safe_dump(config))
     for project in projects:
         with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project["board"]), board=project["board"]) as board:
             kanban_db.create_task(board, title="Book the room", project_id=project["project_id"])
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        registered = {item.id: item for item in projects_db.list_projects(registry)}
+    _owner_waits(root, *(registered[project["project_id"]] for project in projects))
     assert review.review_tick(NOW) == len(projects)
     path = kanban_db.kanban_db_path(board="project-summaries")
     with kanban_db.connect_closing(path, board="project-summaries") as board:
@@ -69,7 +74,8 @@ def portfolio(project_review, monkeypatch, request):
             "conflicts": [], "priorities": ["Meeting Plan: Book the room."], "shared_blockers": [],
         }})
     assert review.review_tick(NOW + 2) == 0
-    return root, project_review
+    # The list orders receipts by time; the frozen clock ties them, so the idempotency key puts the guest first.
+    return root, project_review, guest
 
 
 @pytest.mark.asyncio
@@ -133,7 +139,7 @@ async def test_each_partial_owner_cannot_read_a_portfolio_from_both_receipt_scop
 
 @pytest.mark.asyncio
 async def test_legacy_advice_stays_hidden_after_an_additive_scope_migration(portfolio):
-    root, _project = portfolio
+    root, _project, _guest = portfolio
     with projects_db.connect_closing(root / "projects.db") as registry:
         before = projects_db.get_portfolio_review_brief(registry)
         with kanban_db.write_txn(registry):
@@ -186,7 +192,7 @@ async def test_the_portfolio_read_keeps_the_existing_http_authentication(portfol
     ["Meeting Plan: Read /tmp/private."],
 ])
 async def test_unreadable_advice_does_not_hide_the_owned_project_list(portfolio, value):
-    root, project = portfolio
+    root, project, guest = portfolio
     with projects_db.connect_closing(root / "projects.db") as registry:
         with kanban_db.write_txn(registry):
             registry.execute("UPDATE portfolio_review_briefs SET priorities=?", (json.dumps(value),))
@@ -194,13 +200,13 @@ async def test_unreadable_advice_does_not_hide_the_owned_project_list(portfolio,
     status, body = await _get(ctx, "?capabilities=portfolio_review")
     assert status == 200
     result = json.loads(body)
-    assert [item["project_id"] for item in result["data"]] == [project["project_id"]]
+    assert [item["project_id"] for item in result["data"]] == [guest["project_id"], project["project_id"]]
     assert result["portfolio_review"] is None
 
 
 @pytest.mark.asyncio
 async def test_the_portfolio_capability_does_not_write_registry_data_or_schema(portfolio):
-    root, _project = portfolio
+    root, _project, _guest = portfolio
     before = _logical_state(root / "projects.db")
     ctx = ow.OwnerContext(actor="default", profile="default", session="portfolio-http")
     status, body = await _get(ctx, "?capabilities=portfolio_review")
@@ -211,7 +217,7 @@ async def test_the_portfolio_capability_does_not_write_registry_data_or_schema(p
 
 @pytest.mark.asyncio
 async def test_an_advice_registry_that_cannot_be_opened_does_not_fail_the_project_list(portfolio, monkeypatch):
-    _root, project = portfolio
+    _root, project, guest = portfolio
     real = ow._open_read_only_sqlite
 
     def held(path, *, label):
@@ -225,14 +231,14 @@ async def test_an_advice_registry_that_cannot_be_opened_does_not_fail_the_projec
     status, body = await _get(ctx, "?capabilities=portfolio_review")
     assert status == 200
     result = json.loads(body)
-    assert [item["project_id"] for item in result["data"]] == [project["project_id"]]
+    assert [item["project_id"] for item in result["data"]] == [guest["project_id"], project["project_id"]]
     assert result["portfolio_review"] is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("setting", ["review_off", "portfolio_off", "removed_from_allowlist", "allowlisted_by_slug"])
 async def test_advice_follows_the_current_review_settings_and_allowlist(portfolio, setting):
-    root, project = portfolio
+    root, project, guest = portfolio
     ctx = ow.OwnerContext(actor="default", profile="default", session="portfolio-http")
     _, body = await _get(ctx, "?capabilities=portfolio_review")
     assert json.loads(body)["portfolio_review"] is not None
@@ -245,12 +251,12 @@ async def test_advice_follows_the_current_review_settings_and_allowlist(portfoli
     elif setting == "removed_from_allowlist":
         section["allowlist"] = ["another-project"]
     else:
-        section["allowlist"] = [project["slug"]]
+        section["allowlist"] = [project["slug"], guest["slug"]]
     (root / "config.yaml").write_text(yaml.safe_dump(config))
     status, body = await _get(ctx, "?capabilities=portfolio_review")
     assert status == 200
     result = json.loads(body)
-    assert [item["project_id"] for item in result["data"]] == [project["project_id"]]
+    assert [item["project_id"] for item in result["data"]] == [guest["project_id"], project["project_id"]]
     if setting == "allowlisted_by_slug":
         assert result["portfolio_review"]["priorities"] == ["Meeting Plan: Book the room."]
     else:
@@ -262,7 +268,7 @@ async def test_advice_follows_the_current_review_settings_and_allowlist(portfoli
 async def test_a_profile_prefixed_read_shows_advice_only_to_the_profile_that_holds_its_receipts(
     portfolio, monkeypatch, profile,
 ):
-    root, project = portfolio
+    root, project, guest = portfolio
     secondary = root / "profiles" / "secondary"
     secondary.mkdir(parents=True)
     (secondary / "config.yaml").write_text((root / "config.yaml").read_text())
@@ -291,7 +297,7 @@ async def test_a_profile_prefixed_read_shows_advice_only_to_the_profile_that_hol
             body = await response.json()
     assert response.status == 200
     if profile == "default":
-        assert [item["project_id"] for item in body["data"]] == [project["project_id"]]
+        assert [item["project_id"] for item in body["data"]] == [guest["project_id"], project["project_id"]]
         assert body["portfolio_review"]["priorities"] == ["Meeting Plan: Book the room."]
     else:
         assert body == {"object": "hermes.owner_workspace.project_list", "data": [], "portfolio_review": None}
