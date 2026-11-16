@@ -120,7 +120,7 @@ def _capture(side: str, folder: Path, extra: list[str], pages: str, chromium: st
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise CheckError(f"the {side} capture could not run: {type(exc).__name__}") from None
     if done.returncode != 0:
-        raise CheckError(f"the {side} capture failed (exit {done.returncode}): {done.stderr.strip()[:300]}")
+        raise CheckError(f"the {side} capture failed (exit {done.returncode})")
 
 
 def run(site, full_page, pages, chromium, out) -> dict:

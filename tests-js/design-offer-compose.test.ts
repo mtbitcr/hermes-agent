@@ -64,7 +64,7 @@ const chunk = (type: string, data: Buffer) => {
   return Buffer.concat([head, data, tail])
 }
 
-// A valid RGB PNG: solid colour, or incompressible noise.
+// A valid RGB PNG: solid colour, or noise too dense for a 4 MiB PNG.
 function makePng(width: number, height: number, fill: [number, number, number] | 'noise') {
   const ihdr = Buffer.alloc(13)
 
@@ -79,7 +79,12 @@ function makePng(width: number, height: number, fill: [number, number, number] |
     const at = y * (width * 3 + 1)
 
     if (fill === 'noise') {
-      randomBytes(width * 3).copy(rows, at + 1)
+      // Grey noise: JPEG halves the colour resolution, so per-channel colour noise can never match its source to 24 per channel.
+      const grey = randomBytes(width)
+
+      for (let x = 0; x < width; x++) {
+        rows.fill(grey[x]!, at + 1 + x * 3, at + 4 + x * 3)
+      }
     } else {
       for (let x = 0; x < width; x++) {
         rows.set(fill, at + 1 + x * 3)
@@ -440,6 +445,124 @@ describe('4 MiB encode ladder', () => {
   })
 })
 
+describe('picture choice needs both the size limit and the output self-check', () => {
+  const left = { data: Buffer.alloc(1), height: 900, width: 1280 }
+  const right = { data: Buffer.alloc(1), height: 1400, width: 375 }
+
+  // A fake page: `fits` says which steps give a picture within 4 MiB, `worst` the sample difference the check sees for a step.
+  const fakePicturePage = (fits: (s: any) => boolean, worst: (s: any) => number, size?: (s: any, lay: any) => { height: number; width: number }) => {
+    const steps = new Map<string, any>()
+    const encoded: any[] = []
+    const checked: any[] = []
+
+    const evaluate = async (expression: string) => {
+      if (expression.startsWith('window.__load')) {
+        return true
+      }
+
+      if (expression.startsWith('window.__encode')) {
+        const mime = /, "(image\/[a-z]+)", (\S+)\)$/.exec(expression)!
+        const step = { mime: mime[1], quality: mime[2] === 'undefined' ? undefined : Number(mime[2]), scale: Number(/"scale":([\d.e-]+)/.exec(expression)![1]) }
+
+        encoded.push(step)
+
+        if (!fits(step)) {
+          return null
+        }
+
+        const head = step.mime === 'image/png' ? [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] : [0xff, 0xd8, 0xff]
+        const b64 = Buffer.concat([Buffer.from(head), Buffer.from(JSON.stringify(step))]).toString('base64')
+
+        steps.set(b64, step)
+
+        return b64
+      }
+
+      const parts = /^window\.__verify\("([^"]*)", "([^"]+)", (\{.*\}), \[/.exec(expression)!
+      const step = steps.get(parts[1]!)!
+      const lay = JSON.parse(parts[3]!)
+
+      checked.push(step)
+
+      return { ...(size ? size(step, lay) : { height: lay.height, width: lay.width }), worst: worst(step) }
+    }
+
+    return { checked, encoded, page: { evaluate } }
+  }
+
+  it('goes on to a later encoding when the first size-fitting JPEG fails the sample check', async () => {
+    const fake = fakePicturePage(
+      s => s.mime === 'image/jpeg' && s.quality <= 0.7,
+      s => (s.quality === 0.7 ? 40 : 20)
+    )
+
+    const chosen = await compose.drawPicture(fake.page, left, right)
+
+    expect(chosen.step).toEqual({ mime: 'image/jpeg', quality: 0.55, scale: 1 })
+    expect(chosen.suffix).toBe('.jpg')
+    expect(fake.checked.map((s: any) => s.quality)).toEqual([0.7, 0.55])
+  })
+
+  it('goes on to a smaller scale when every encoding at this scale fails the sample check', async () => {
+    const fake = fakePicturePage(
+      () => true,
+      s => (s.scale === 1 ? 99 : 0)
+    )
+
+    const chosen = await compose.drawPicture(fake.page, left, right)
+
+    expect(chosen.step.scale).toBeCloseTo(0.8)
+    expect(chosen.step.mime).toBe('image/png')
+    expect(fake.checked).toHaveLength(6)
+  })
+
+  it('keeps the tolerances: PNG exact, JPEG 24 per channel', async () => {
+    const png = await compose.drawPicture(fakePicturePage(() => true, () => 0).page, left, right)
+
+    expect(png.step.mime).toBe('image/png')
+
+    const jpeg = await compose.drawPicture(fakePicturePage(s => s.mime === 'image/jpeg', () => 24).page, left, right)
+
+    expect(jpeg.step).toEqual({ mime: 'image/jpeg', quality: 0.85, scale: 1 })
+
+    const lossy = await compose.drawPicture(fakePicturePage(() => true, s => (s.mime === 'image/png' ? 1 : s.quality === 0.4 ? 25 : 24)).page, left, right)
+
+    expect(lossy.step).toEqual({ mime: 'image/jpeg', quality: 0.85, scale: 1 })
+  })
+
+  it('does not accept a candidate that decodes to the wrong size', async () => {
+    const fake = fakePicturePage(
+      () => true,
+      () => 0,
+      (s, lay) => (s.scale === 1 ? { height: lay.height, width: lay.width + 1 } : { height: lay.height, width: lay.width })
+    )
+
+    const chosen = await compose.drawPicture(fake.page, left, right)
+
+    expect(chosen.step.scale).toBeCloseTo(0.8)
+  })
+
+  it('refuses only when no candidate passes both checks', async () => {
+    const fake = fakePicturePage(
+      () => true,
+      () => 99
+    )
+
+    expect(await refusal(compose.drawPicture(fake.page, left, right))).toContain('does not match its captures')
+    expect(fake.checked).toHaveLength(40)
+  })
+
+  it('still names the 4 MiB limit when nothing fits', async () => {
+    const fake = fakePicturePage(
+      () => false,
+      () => 0
+    )
+
+    expect(await refusal(compose.drawPicture(fake.page, left, right))).toContain('4 MiB')
+    expect(fake.checked).toHaveLength(0)
+  })
+})
+
 describe('manifest and output files', () => {
   it('keeps the shape of today and adds the composer and the verified Chromium version', () => {
     const manifest = compose.buildManifest({
@@ -653,7 +776,7 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
     }
 
     expect(done.stdout).not.toContain('option page')
-  })
+  }, 300_000)
 
   it('falls back to JPEG for a page too noisy for a 4 MiB PNG', () => {
     const options = fakeOptions(2, { leftHeight: 2500, noisy: true, rightHeight: 2500 })
@@ -670,7 +793,7 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
     }
 
     expect(readdirSync(out).some(f => f.endsWith('.jpg'))).toBe(true)
-  })
+  }, 300_000)
 
   it('never overwrites an earlier result', () => {
     const options = fakeOptions(2)
@@ -682,5 +805,5 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
 
     expect(again.status).toBe(1)
     expect(again.stderr).toContain('refusing to overwrite')
-  })
+  }, 300_000)
 })

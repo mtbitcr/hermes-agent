@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import html
 import json
 import re
 import sys
@@ -27,13 +28,38 @@ FONTS = (
     ("@fontsource-variable/geist", "files/geist-latin-wght-normal.woff2", "Geist", "400 500"),
     ("@fontsource-variable/geist-mono", "files/geist-mono-latin-wght-normal.woff2", "Geist Mono", "400"),
 )
-OUTSIDE_ADDRESS = re.compile(r"""https?://|(?:^|[\s"'(=,])//[A-Za-z0-9]""", re.IGNORECASE)
+# A browser reads https:host, https:\\host and //host as outside addresses too, so the check runs on the text a browser sees.
+OUTSIDE_ADDRESS = re.compile(r"""(?<![\w+.\-/])https?:(?=\S)|(?:^|[\s"'(=,])//[A-Za-z0-9]""", re.IGNORECASE)
+CSS_ESCAPE = re.compile(r"\\(?:([0-9a-fA-F]{1,6})[ \t\n\r\f]?|(\r\n|[\n\r\f])|(.))", re.DOTALL)
+URL_NOISE = re.compile(r"[\x00-\x1f\x7f]")
 # An XML namespace name of inline SVG is an identifier, not an address the page loads from.
 NAMESPACE = re.compile(r"""\bxmlns(?::\w+)?\s*=\s*(["'])http://www\.w3\.org/[^"']*\1""", re.IGNORECASE)
 
 
 class EmbedError(Exception):
     """The fonts cannot be embedded; the page was not changed."""
+
+
+def _css_unescape(text: str) -> str:
+    def one(m):
+        if m.group(2):
+            return ""
+        if m.group(3):
+            return m.group(3)
+        code = int(m.group(1), 16)
+        return chr(code) if 0 < code <= 0x10FFFF and not 0xD800 <= code <= 0xDFFF else "\ufffd"
+    return CSS_ESCAPE.sub(one, text)
+
+
+def names_outside_address(text: str) -> bool:
+    """True when the page, read as a browser reads it, names an address outside itself."""
+    plain = html.unescape(text)
+    for base in (plain, URL_NOISE.sub("", plain)):
+        css = _css_unescape(base)
+        for seen in (base, css, base.replace("\\", "/"), css.replace("\\", "/")):
+            if OUTSIDE_ADDRESS.search(NAMESPACE.sub("", seen)):
+                return True
+    return False
 
 
 def _package_json(path: Path, what: str) -> dict:
@@ -71,7 +97,7 @@ def embed(website, page) -> list[dict]:
         text = page.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         raise EmbedError("the page file cannot be read") from None
-    if OUTSIDE_ADDRESS.search(NAMESPACE.sub("", text)):
+    if names_outside_address(text):
         raise EmbedError("the page names an outside address; put everything inline")
     head_end = text.lower().find("</head>")
     if head_end < 0:

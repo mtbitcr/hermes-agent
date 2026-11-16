@@ -170,10 +170,39 @@ def test_embed_fonts_refuses_a_page_that_names_an_outside_address(tmp_path, outs
     assert page.read_text(encoding="utf-8") == text
 
 
+@pytest.mark.parametrize("outside", [
+    "<img src=\"https:&#47;&#47;example.invalid/private\">",
+    "<img src=\"https&colon;&sol;&sol;example.invalid/private\">",
+    "<img src=\"&#47;&#47;example.invalid/private\">",
+    "<img src=\"https:example.invalid/private\">",
+    "<img src=\"HTTP:example.invalid/private\">",
+    "<div style=\"background:url(\\68ttps://example.invalid/p)\"></div>",
+    "<style>@import url(h\\74 tps://example.invalid/a.css);</style>",
+    "<style>@import url(https\\3a //example.invalid/a.css);</style>",
+    "<img src=\"https:\\\\example.invalid/private\">",
+    "<img src=\"https:/\\example.invalid/private\">",
+    "<img src=\"\\\\example.invalid/private\">",
+    "<style>@import url(https:\\5c \\5c example.invalid/a.css);</style>",
+    "<img src=\"ht&#9;tps://example.invalid/private\">",
+    "<img src=\"ht\ntps:\n//example.invalid/private\">",
+    "<img src=\"https:&Tab;&NewLine;//example.invalid/private\">",
+], ids=["entity-slashes", "named-entities", "entity-protocol-relative", "no-slashes", "no-slashes-upper",
+        "css-escaped-scheme", "css-escaped-scheme-space", "css-escaped-colon", "backslashes", "slash-backslash",
+        "backslash-protocol-relative", "css-escaped-backslashes", "entity-tab", "raw-newlines", "named-tab-newline"])
+def test_embed_fonts_refuses_an_outside_address_written_in_another_form(tmp_path, outside):
+    embed = _load(EMBED, "embed_fonts")
+    text = PAGE.replace("</head>", outside + "</head>")
+    page = _page(tmp_path, text)
+    with pytest.raises(embed.EmbedError):
+        embed.embed(_website(tmp_path), page)
+    assert page.read_bytes() == text.encode("utf-8")
+
+
 def test_embed_fonts_accepts_inline_svg_namespaces_and_relative_or_data_addresses(tmp_path):
     embed = _load(EMBED, "embed_fonts")
     body = ("<svg xmlns='http://www.w3.org/2000/svg'><use xlink:href='#a'/></svg><a href='/privacy'>p</a>"
-            "<img src='data:image/png;base64,AAAA'>")
+            "<img src='data:image/png;base64,AAAA'><a href='docs/https:x'>d</a><img src='img/a&#47;b.png'>"
+            "<svg xmlns=\"http&#58;//www.w3.org/2000/svg\"></svg><p>read https and http</p>")
     page = _page(tmp_path, PAGE.replace("</body>", body + "</body>"))
     embed.embed(_website(tmp_path), page)
     assert "@font-face" in page.read_text(encoding="utf-8")
@@ -300,9 +329,9 @@ def _full_page_with_fonts(tmp_path):
     return _page(tmp_path, PAGE.replace("</head>", f"<style>{css}</style></head>"))
 
 
-def _run_check(tmp_path, candidate, prototype, *, full_page=None):
+def _run_check(tmp_path, candidate, prototype, *, full_page=None, capture=FAKE_CAPTURE, extra_env=None):
     kit = _kit(tmp_path)
-    (kit / "capture.mjs").write_text(FAKE_CAPTURE)
+    (kit / "capture.mjs").write_text(capture)
     plan = tmp_path / "plan.json"
     plan.write_text(json.dumps({"candidate": {str(w): b for w, b in candidate.items()},
                                 "prototype": {str(w): b for w, b in prototype.items()}}))
@@ -310,7 +339,7 @@ def _run_check(tmp_path, candidate, prototype, *, full_page=None):
     site.mkdir()
     out = tmp_path / "out"
     full_page = full_page or _full_page_with_fonts(tmp_path)
-    env = {"PATH": "/usr/bin:/bin:/usr/local/bin", "FAKE_BUNDLES": str(plan)}
+    env = {"PATH": "/usr/bin:/bin:/usr/local/bin", "FAKE_BUNDLES": str(plan), **(extra_env or {})}
     done = subprocess.run(
         [sys.executable, str(kit / CHECK.name), "--site", str(site), "--full-page", str(full_page),
          "--pages", "/privacy", "--chromium", "/fake/chromium", "--out", str(out)],
@@ -359,6 +388,27 @@ def test_check_command_line_refuses_a_page_without_the_two_embedded_faces(tmp_pa
     done, out, _, _ = _run_check(tmp_path, _both_widths(SAME), _both_widths(SAME), full_page=_page(tmp_path))
     assert done.returncode == 1
     assert "refused" in done.stderr
+    assert not (out / "self-check.json").exists()
+
+
+FAILING_CAPTURE = """\
+const side = process.argv[process.argv.indexOf('--side') + 1]
+if (side === process.env.FAIL_SIDE) {
+  process.stderr.write('requested: https://example.invalid/PRIVATE_PAGE_TEXT_4931\\n')
+  process.stdout.write('page text PRIVATE_PAGE_TEXT_4931\\n')
+  process.exit(3)
+}
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+@pytest.mark.parametrize("side", ["candidate", "prototype"])
+def test_check_command_line_refuses_a_failed_capture_without_printing_what_the_kit_wrote(tmp_path, side):
+    done, out, _, _ = _run_check(tmp_path, {}, {}, capture=FAILING_CAPTURE, extra_env={"FAIL_SIDE": side})
+    assert done.returncode == 1
+    assert done.stderr.strip() == f"refused: the {side} capture failed (exit 3)"
+    assert "PRIVATE_PAGE_TEXT_4931" not in done.stdout + done.stderr
+    assert "example.invalid" not in done.stdout + done.stderr
     assert not (out / "self-check.json").exists()
 
 

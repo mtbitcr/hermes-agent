@@ -122,13 +122,18 @@ export function encodingLadder() {
   return ladder
 }
 
-// encode(step) returns the picture bytes, or null when they are known to exceed the limit. The first picture within the limit wins.
-export async function chooseEncoding(encode, max = MAX_PICTURE_BYTES) {
+// encode(step) returns the picture bytes, or null when they are known to exceed the limit. accept(data, step) returns null when the picture
+// passes the output self-check, else the reason it does not. The first picture within the limit that also passes wins.
+export async function chooseEncoding(encode, max = MAX_PICTURE_BYTES, accept = async () => null) {
+  let reason = 'a picture cannot be made small enough for the offer tool (4 MiB)'
   for (const step of encodingLadder()) {
     const data = await encode(step)
-    if (data && data.length <= max) return { data, step, suffix: step.mime === 'image/png' ? '.png' : '.jpg' }
+    if (!data || data.length > max) continue
+    const failure = await accept(data, step)
+    if (failure === null) return { data, step, suffix: step.mime === 'image/png' ? '.png' : '.jpg' }
+    reason = failure
   }
-  throw new OfferError('a picture cannot be made small enough for the offer tool (4 MiB)')
+  throw new OfferError(reason)
 }
 
 // Centres of an even grid of cells inside one pane.
@@ -305,15 +310,15 @@ export async function drawPicture(page, left, right) {
   const chosen = await chooseEncoding(async step => {
     const b64 = await page.evaluate(`window.__encode(${JSON.stringify(layout(left, right, step.scale))}, ${JSON.stringify(step.mime)}, ${step.quality ?? 'undefined'})`)
     return b64 === null ? null : Buffer.from(b64, 'base64')
+  }, MAX_PICTURE_BYTES, async (data, step) => {
+    const lay = layout(left, right, step.scale)
+    if (pictureKind(data) !== step.mime) return 'the browser wrote a picture of the wrong type'
+    const points = [...samplePoints(lay.left), ...samplePoints(lay.right)]
+    const check = await page.evaluate(`window.__verify(${JSON.stringify(data.toString('base64'))}, ${JSON.stringify(step.mime)}, ${JSON.stringify(lay)}, ${JSON.stringify(points)})`)
+    if (check.width !== lay.width || check.height !== lay.height) return 'the picture does not decode to the expected size'
+    if (check.worst > toleranceFor(step.mime)) return 'the picture does not match its captures'
+    return null
   })
-  const lay = layout(left, right, chosen.step.scale)
-  const mime = chosen.step.mime
-  if (pictureKind(chosen.data) !== mime) throw new OfferError('the browser wrote a picture of the wrong type')
-  if (chosen.data.length > MAX_PICTURE_BYTES) throw new OfferError('the picture is larger than 4 MiB')
-  const points = [...samplePoints(lay.left), ...samplePoints(lay.right)]
-  const check = await page.evaluate(`window.__verify(${JSON.stringify(chosen.data.toString('base64'))}, ${JSON.stringify(mime)}, ${JSON.stringify(lay)}, ${JSON.stringify(points)})`)
-  if (check.width !== lay.width || check.height !== lay.height) throw new OfferError('the picture does not decode to the expected size')
-  if (check.worst > toleranceFor(mime)) throw new OfferError('the picture does not match its captures')
   return chosen
 }
 
