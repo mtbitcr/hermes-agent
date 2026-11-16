@@ -821,3 +821,156 @@ async def test_the_closed_window_keeps_the_latest_twenty_and_cannot_hide_an_olde
     assert times == sorted(times, reverse=True)
     assert times[0] == NOW - 40 * 3600
     assert times[-1] == NOW - 192 * 3600
+
+
+@pytest.fixture
+def accepted_closure(project_review):
+    """An owner-accepted suggestion closed through the kernel after its made-from card was delivered."""
+    owner = ow.OwnerContext(actor="default", profile="default", session="accepted-closure")
+    with kb.connect_closing(board=project_review["board"]) as board:
+        suggestion = kb.create_recommendation(
+            board, project_id=project_review["project_id"], target_profile="worker", recommendation_kind="skill",
+            recommendation_subject_id="meeting-room", recommendation_label="Book the room",
+            recommendation_evidence={
+                "schema_version": 1, "need": "Repeated capability gap", "expected_benefit": "Complete the meeting work",
+                "requested_scope": {flag: False for flag in kb.RECOMMENDATION_SCOPE_FLAGS},
+                "risks": "Low", "cost": "No added cost", "rollback": "Remove the staged configuration",
+            },
+            provenance_authority="static-analyzer", provenance_ref="finding-123", provenance_observed_at=NOW,
+        )
+        # The key the owner saw while the suggestion was still pending.
+        [pending] = ow.list_owner_decisions(owner)["data"]
+        version = kb.decide_recommendation_on_owner_screen(
+            board, suggestion, decision="accepted", reason="Keep the room work.", actor="default",
+            owner_screen_ref="meeting-owner-screen", expected_lifecycle_version=board.execute(
+                "SELECT recommendation_lifecycle_version FROM tasks WHERE id=?", (suggestion,),
+            ).fetchone()[0],
+        )["lifecycle_version"]
+        delivered = kb.create_task(
+            board, title="Reserve a venue", project_id=project_review["project_id"], made_from_recommendation=suggestion,
+        )
+        assert kb.complete_task(board, delivered, summary="The venue is reserved.")
+        assert kb.close_recommendation_delivered(
+            board, suggestion, delivered, reason="The venue is reserved.", review_date="2026-11-10",
+            expected_lifecycle_version=version,
+        )["status"] == "closed"
+    return {**project_review, "suggestion_id": suggestion, "card_id": delivered, "version": version,
+            "decision_ref": pending["decision_ref"]}
+
+
+@pytest.mark.asyncio
+async def test_an_accepted_closed_suggestion_is_listed_with_todays_item_keys(accepted_closure):
+    async with TestClient(TestServer(app())) as client:
+        response = await client.get(CLOSED)
+        assert response.status == 200
+        body = await response.json()
+
+    assert body["data"] == []
+    [item] = body["closed"]
+    assert set(item) == {"decision_ref", "project_slug", "project_name", "title", "card_title", "reason", "closed_at"}
+    assert item == {
+        "decision_ref": accepted_closure["decision_ref"], "project_slug": accepted_closure["slug"],
+        "project_name": "Meeting Plan", "title": "Book the room", "card_title": "Reserve a venue",
+        "reason": "The venue is reserved.", "closed_at": NOW,
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_owner_undoes_an_accepted_closure_and_the_suggestion_stays_accepted(accepted_closure):
+    ref, suggestion = accepted_closure["decision_ref"], accepted_closure["suggestion_id"]
+    async with TestClient(TestServer(app())) as client:
+        response = await client.post(
+            f"/v1/owner-workspace/decisions/{ref}/undo_close",
+            json={"reason": "The venue needs a check.", "expected_closed_at": NOW},
+        )
+        assert response.status == 200
+        assert await response.json() == {
+            "object": "hermes.owner_workspace.closure_undo", "data": {"decision_ref": ref, "undone": True},
+        }
+        feed = await (await client.get(CLOSED)).json()
+
+    # An accepted suggestion is no pending decision, so the Undo puts nothing back in the inbox.
+    assert feed["closed"] == [] and feed["data"] == []
+    with kb.connect_closing(board=accepted_closure["board"]) as board:
+        assert tuple(board.execute(
+            "SELECT recommendation_decision,recommendation_lifecycle_version FROM tasks WHERE id=?", (suggestion,),
+        ).fetchone()) == ("accepted", accepted_closure["version"])
+        assert board.execute(
+            "SELECT undone_at FROM recommendation_closures WHERE recommendation_id=?", (suggestion,),
+        ).fetchone()[0] == NOW
+        assert board.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='recommendation_closure_undone'", (suggestion,),
+        ).fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_second_undo_of_an_accepted_closure_is_refused(accepted_closure):
+    path = f"/v1/owner-workspace/decisions/{accepted_closure['decision_ref']}/undo_close"
+    sent = {"reason": "The venue needs a check.", "expected_closed_at": NOW}
+    async with TestClient(TestServer(app())) as client:
+        assert (await client.post(path, json=sent)).status == 200
+        with kb.connect_closing(board=accepted_closure["board"]) as board:
+            before = list(board.iterdump())
+        second = await client.post(path, json=sent)
+        assert second.status == 404
+        assert (await second.json())["error"] == {
+            "message": NOT_UNDOABLE, "type": "invalid_request_error", "param": None, "code": "decision_not_found",
+        }
+    with kb.connect_closing(board=accepted_closure["board"]) as board:
+        assert list(board.iterdump()) == before
+
+
+@pytest.mark.asyncio
+async def test_a_worker_environment_cannot_undo_an_accepted_closure_and_the_owner_undo_writes_only_its_board(
+    accepted_closure, monkeypatch, tmp_path,
+):
+    root = tmp_path / ".hermes"
+    suggestion, ref = accepted_closure["suggestion_id"], accepted_closure["decision_ref"]
+    kb.create_board("worker-board")
+    with kb.connect_closing(board="worker-board", create=True) as worker:
+        worker_task = kb.create_task(worker, title="Check the venue")
+    # Each store by its own path under the root, derived here without the code under test.
+    registry_path = root / "projects.db"
+    project_board = root / "kanban" / "boards" / accepted_closure["board"] / "kanban.db"
+    worker_board = root / "kanban" / "boards" / "worker-board" / "kanban.db"
+    assert registry_path.is_file() and project_board.is_file() and worker_board.is_file()
+    profile_home = root / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+
+    # The environment the dispatcher injects into a worker: its own board pinned, its task set, a profile home.
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(worker_board))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "worker-board")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", worker_task)
+    before = {path: _dump(path) for path in (registry_path, project_board, worker_board)}
+
+    owner = ow.OwnerContext(actor="default", profile="default", session="worker-environment")
+    with pytest.raises(ow.OwnerWorkspaceError) as refused:
+        ow.undo_owner_suggestion_closure(owner, decision_ref=ref, reason="The venue needs a check.", expected_closed_at=NOW)
+    assert refused.value.code == "permission_denied"
+    assert {path: _dump(path) for path in before} == before
+
+    # An owner process that inherited the pinned board still finds the Project board and writes only it.
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    async with TestClient(TestServer(app())) as client:
+        [item] = (await (await client.get(CLOSED)).json())["closed"]
+        assert item["decision_ref"] == ref
+        response = await client.post(
+            f"/v1/owner-workspace/decisions/{ref}/undo_close",
+            json={"reason": "The venue needs a check.", "expected_closed_at": item["closed_at"]},
+        )
+        assert response.status == 200
+    assert _rows(
+        project_board, "SELECT recommendation_decision,recommendation_lifecycle_version FROM tasks WHERE id=?", suggestion,
+    ) == [("accepted", accepted_closure["version"])]
+    assert _rows(
+        project_board, "SELECT COUNT(*),SUM(undone_at=?) FROM recommendation_closures WHERE recommendation_id=?",
+        NOW, suggestion,
+    ) == [(1, 1)]
+    assert _rows(
+        project_board, "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='recommendation_closure_undone'",
+        suggestion,
+    ) == [(1,)]
+    assert _dump(worker_board) == before[worker_board]
+    assert _dump(registry_path) == before[registry_path]
