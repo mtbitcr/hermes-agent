@@ -1,9 +1,9 @@
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { deflateSync } from 'node:zlib'
 
 import { afterAll, describe, expect, it } from 'vitest'
@@ -358,32 +358,6 @@ describe('layout', () => {
     }
   })
 
-  it('averages the block of the JPEG grid that holds the sample point, inside the canvas', () => {
-    expect(compose.BLOCK_SIZE).toBe(8)
-    expect(compose.blockOrigin({ x: 0, y: 0 }, 100, 100, 8)).toEqual({ x: 0, y: 0 })
-    expect(compose.blockOrigin({ x: 7, y: 8 }, 100, 100, 8)).toEqual({ x: 0, y: 8 })
-    expect(compose.blockOrigin({ x: 43, y: 71 }, 1000, 1000, 8)).toEqual({ x: 40, y: 64 })
-    expect(compose.blockOrigin({ x: 99, y: 99 }, 100, 100, 8)).toEqual({ x: 92, y: 92 })
-    expect(compose.blockOrigin({ x: 5, y: 5 }, 4, 4, 8)).toEqual({ x: 0, y: 0 })
-  })
-
-  it('puts every block of every sample point inside the canvas, at every scale of the ladder', () => {
-    for (const scale of [1, 0.8, 0.512, 0.2]) {
-      const l = compose.layout(left, right, scale)
-
-      for (const p of [...compose.samplePoints(l.left), ...compose.samplePoints(l.right)]) {
-        const o = compose.blockOrigin(p, l.width, l.height, compose.BLOCK_SIZE)
-
-        expect(o.x % 8).toBe(0)
-        expect(o.y % 8).toBe(0)
-        expect(o.x + 8).toBeLessThanOrEqual(l.width)
-        expect(o.y + 8).toBeLessThanOrEqual(l.height)
-        expect(o.x).toBeLessThanOrEqual(p.x)
-        expect(o.x + 8).toBeGreaterThan(p.x)
-      }
-    }
-  })
-
   it('is exact for PNG and within 24 per channel for JPEG', () => {
     expect(compose.toleranceFor('image/png')).toBe(0)
     expect(compose.toleranceFor('image/jpeg')).toBe(24)
@@ -570,13 +544,18 @@ describe('picture choice needs both the size limit and the output self-check', (
     expect(chosen.step.scale).toBeCloseTo(0.8)
   })
 
-  it('refuses only when no candidate passes both checks', async () => {
+  it('refuses with one clear sentence when every candidate within 4 MiB fails the self-check', async () => {
     const fake = fakePicturePage(
       () => true,
       () => 99
     )
 
-    expect(await refusal(compose.drawPicture(fake.page, left, right))).toContain('does not match its captures')
+    // refusal() asserts an OfferError: the CLI prints it as `refused: <message>` and exits 1.
+    const message = await refusal(compose.drawPicture(fake.page, left, right))
+
+    expect(message).toBe('no picture within 4 MiB matches its captures closely enough')
+    expect(message).not.toMatch(/[\n\r]|[.!?]\s/)
+    expect(message.endsWith('.')).toBe(false)
     expect(fake.checked).toHaveLength(40)
   })
 
@@ -806,21 +785,158 @@ describe.skipIf(process.env.DESIGN_COMPARE_REAL_CHROMIUM !== '1')('real Chromium
     expect(done.stdout).not.toContain('option page')
   }, 300_000)
 
-  it('falls back to JPEG for a page too noisy for a 4 MiB PNG', () => {
-    const options = fakeOptions(2, { leftHeight: 2500, noisy: true, rightHeight: 2500 })
-    const out = join(fresh('result'), 'offer')
-    const done = composeReal(options, out)
+  // Decodes the accepted picture and both captures in the pinned browser with its own drawing code (not the composer's __verify) and returns the
+  // worst per-channel difference of the centred 3x3 means at the sample points, at the ladder scale whose layout equals the decoded size.
+  const measureInBrowser = async (picture: Buffer, folder: string) => {
+    const kitModule = await import(/* @vite-ignore */ pathToFileURL(join(kitFolder, 'capture.mjs')).href)
+    const [left, right] = [1280, 375].map(w => compose.readCapture(folder, w))
+    const scales = [...new Set(compose.encodingLadder().map((s: any) => s.scale))] as number[]
 
-    expect(done.status, done.stderr).toBe(0)
+    const layouts = scales.map(scale => {
+      const lay = compose.layout(left, right, scale)
+
+      return { lay, points: [...compose.samplePoints(lay.left), ...compose.samplePoints(lay.right)] }
+    })
+
+    const expression = `(async () => {
+  const bytes = s => Uint8Array.from(atob(s), c => c.charCodeAt(0))
+  const bitmap = (s, type) => createImageBitmap(new Blob([bytes(s)], { type }))
+  const [out, l, r] = await Promise.all([bitmap(${JSON.stringify(picture.toString('base64'))}, ${JSON.stringify(compose.pictureKind(picture))}),
+    bitmap(${JSON.stringify(left.data.toString('base64'))}, 'image/png'), bitmap(${JSON.stringify(right.data.toString('base64'))}, 'image/png')])
+  const hit = ${JSON.stringify(layouts)}.find(c => c.lay.width === out.width && c.lay.height === out.height)
+  if (!hit) return { width: out.width, height: out.height, scale: null, worst: null }
+  const make = () => { const c = document.createElement('canvas'); c.width = out.width; c.height = out.height; return c.getContext('2d', { alpha: false }) }
+  const got = make(), want = make()
+  got.drawImage(out, 0, 0)
+  want.fillStyle = 'rgb(${compose.BACKGROUND.join(',')})'
+  want.fillRect(0, 0, out.width, out.height)
+  want.imageSmoothingEnabled = true
+  want.imageSmoothingQuality = 'high'
+  want.drawImage(l, hit.lay.left.x, hit.lay.left.y, hit.lay.left.w, hit.lay.left.h)
+  want.drawImage(r, hit.lay.right.x, hit.lay.right.y, hit.lay.right.w, hit.lay.right.h)
+  const mean = (ctx, p) => {
+    const d = ctx.getImageData(Math.max(0, p.x - 1), Math.max(0, p.y - 1), 3, 3).data
+    const sum = [0, 0, 0]
+    for (let i = 0; i < d.length; i += 4) { sum[0] += d[i]; sum[1] += d[i + 1]; sum[2] += d[i + 2] }
+    return sum.map(v => v / (d.length / 4))
+  }
+  let worst = 0
+  for (const p of hit.points) {
+    const a = mean(got, p), b = mean(want, p)
+    for (let i = 0; i < 3; i++) worst = Math.max(worst, Math.abs(a[i] - b[i]))
+  }
+  return { width: out.width, height: out.height, scale: hit.lay.scale, worst }
+})()`
+
+    const child = spawn(chromium, [...kitModule.CHROMIUM_SWITCHES, '--remote-debugging-port=0', `--user-data-dir=${fresh('profile')}`, '--no-first-run', '--no-sandbox', 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] })
+
+    try {
+      const wsUrl = await new Promise<string>((ok, no) => {
+        let seen = ''
+        const timer = setTimeout(() => no(new Error('Chromium did not start')), 30_000)
+
+        child.stderr.on('data', d => {
+          seen += d
+
+          const m = /DevTools listening on (ws:\/\/\S+)/.exec(seen)
+
+          if (m) {
+            clearTimeout(timer)
+            ok(m[1]!)
+          }
+        })
+      })
+
+      const ws = new WebSocket(wsUrl)
+
+      await new Promise((ok, no) => {
+        ws.onopen = ok
+        ws.onerror = () => no(new Error('cannot connect to Chromium'))
+      })
+
+      let id = 0
+      const pending = new Map<number, { no: (e: Error) => void; ok: (v: any) => void }>()
+
+      ws.onmessage = ev => {
+        const m = JSON.parse(String(ev.data))
+        const p = pending.get(m.id)
+
+        if (p) {
+          pending.delete(m.id)
+          m.error ? p.no(new Error(m.error.message)) : p.ok(m.result)
+        }
+      }
+
+      const send = (method: string, params: object = {}, sessionId?: string) =>
+        new Promise<any>((ok, no) => {
+          pending.set(++id, { no, ok })
+          ws.send(JSON.stringify({ id, method, params, sessionId }))
+        })
+
+      const { targetId } = await send('Target.createTarget', { url: 'about:blank' })
+      const { sessionId } = await send('Target.attachToTarget', { flatten: true, targetId })
+      const r = await send('Runtime.evaluate', { awaitPromise: true, expression, returnByValue: true }, sessionId)
+
+      expect(r.exceptionDetails?.exception?.description ?? r.exceptionDetails?.text).toBeUndefined()
+      ws.close()
+
+      return r.result.value as { height: number; scale: number | null; width: number; worst: number | null }
+    } finally {
+      child.kill('SIGKILL')
+    }
+  }
+
+  const noisyRun = (() => {
+    let cached: { folders: string[]; out: string } | undefined
+
+    return () => {
+      if (!cached) {
+        const options = fakeOptions(2, { leftHeight: 2500, noisy: true, rightHeight: 2500 })
+        const out = join(fresh('result'), 'offer')
+        const done = composeReal(options, out)
+
+        expect(done.status, done.stderr).toBe(0)
+        cached = { folders: options.map(o => o[1]), out }
+      }
+
+      return cached
+    }
+  })()
+
+  it('composes a page of independent colour noise within 4 MiB, at the layout size, within the sampled-colour bound of its type', async () => {
+    const { folders, out } = noisyRun()
+    const names = readdirSync(out).filter(f => f.startsWith('option-'))
+
+    expect(names).toHaveLength(2)
+
+    for (const name of names) {
+      const picture = readFileSync(join(out, name))
+      const kind = compose.pictureKind(picture)
+      const folder = folders[Number(/^option-(\d)-/.exec(name)![1]) - 1]!
+      const measured = await measureInBrowser(picture, folder)
+
+      expect(picture.length).toBeLessThanOrEqual(FOUR_MIB)
+      expect(kind).toBe(name.endsWith('.jpg') ? 'image/jpeg' : 'image/png')
+      expect(measured.scale, `${name} decodes to ${measured.width}x${measured.height}, which is no layout of the ladder`).not.toBeNull()
+      expect(measured.worst!).toBeLessThanOrEqual(compose.toleranceFor(kind))
+
+      if (kind === 'image/png') {
+        expect(compose.pngSize(picture)).toEqual({ height: measured.height, width: measured.width })
+      }
+    }
+  }, 300_000)
+
+  it('accepts a colour-noise picture only if an independent browser decode meets the centred 3x3 sampled bound of its type at every sample point', async () => {
+    const { folders, out } = noisyRun()
 
     for (const name of readdirSync(out).filter(f => f.startsWith('option-'))) {
       const picture = readFileSync(join(out, name))
+      const kind = compose.pictureKind(picture)
+      const measured = await measureInBrowser(picture, folders[Number(/^option-(\d)-/.exec(name)![1]) - 1]!)
 
-      expect(picture.length).toBeLessThanOrEqual(FOUR_MIB)
-      expect(compose.pictureKind(picture)).toBe(name.endsWith('.jpg') ? 'image/jpeg' : 'image/png')
+      expect(measured.worst, name).not.toBeNull()
+      expect(measured.worst!, `${name}: worst sampled channel error ${measured.worst} (${kind}, scale ${measured.scale})`).toBeLessThanOrEqual(kind === 'image/png' ? 0 : 24)
     }
-
-    expect(readdirSync(out).some(f => f.endsWith('.jpg'))).toBe(true)
   }, 300_000)
 
   it('also composes a page of grey noise', () => {

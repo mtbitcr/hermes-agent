@@ -7,7 +7,10 @@ Reads the two woff2 files from the website's installed packages, refuses unless 
 website's package.json pins both packages and both installed packages are exactly
 5.3.0, and writes two ``@font-face`` rules (families 'Geist' and 'Geist Mono') whose
 ``src`` is a ``data:font/woff2;base64,...`` address into the page's head. The font
-bytes are never changed. A page that already names an outside address is refused.
+bytes are never changed. The page is parsed with the standard library's HTML parser and
+every address in it (an attribute that can hold one, a ``url()`` or an ``@import`` in a
+style) must be a ``data:`` address or a ``#`` reference inside the page; any other value
+is refused, before anything is written.
 
 Standard library only. Prints the SHA-256 of each font file, never page text.
 """
@@ -16,10 +19,10 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
-import html
 import json
 import re
 import sys
+from html.parser import HTMLParser
 from pathlib import Path
 
 PINNED_VERSION = "5.3.0"
@@ -28,12 +31,21 @@ FONTS = (
     ("@fontsource-variable/geist", "files/geist-latin-wght-normal.woff2", "Geist", "400 500"),
     ("@fontsource-variable/geist-mono", "files/geist-mono-latin-wght-normal.woff2", "Geist Mono", "400"),
 )
-# A browser reads https:host, https:\\host and //host (any authority: IPv6 in brackets, Unicode host) as outside addresses too, so the check runs on the text a browser sees.
-OUTSIDE_ADDRESS = re.compile(r"""(?<![\w+.\-/])https?:(?=\S)|(?:^|[\s"'(=,])//[^\s"'<>)]""", re.IGNORECASE)
 CSS_ESCAPE = re.compile(r"\\(?:([0-9a-fA-F]{1,6})[ \t\n\r\f]?|(\r\n|[\n\r\f])|(.))", re.DOTALL)
-URL_NOISE = re.compile(r"[\x00-\x1f\x7f]")
-# An XML namespace name of inline SVG is an identifier, not an address the page loads from.
-NAMESPACE = re.compile(r"""\bxmlns(?::\w+)?\s*=\s*(["'])http://www\.w3\.org/[^"']*\1""", re.IGNORECASE)
+# Attributes that can hold an address; a prefixed name (xlink:href) is judged by the part after the colon.
+ADDRESS_ATTRIBUTES = frozenset({
+    "src", "srcset", "imagesrcset", "href", "action", "formaction", "poster", "data", "codebase", "cite", "background",
+    "longdesc", "usemap", "manifest", "ping", "itemtype", "profile", "classid", "lowsrc", "dynsrc", "icon", "xlink:href",
+    "xml:base",
+})
+# Attributes whose value is a list of addresses.
+SRCSET_ATTRIBUTES = frozenset({"srcset", "imagesrcset"})
+LIST_ATTRIBUTES = frozenset({"ping", "itemtype"})
+CSS_URL = re.compile(r"url\s*\(", re.IGNORECASE)
+CSS_IMPORT = re.compile(r"@import", re.IGNORECASE)
+CSS_IMAGE_FUNCTION = re.compile(r"(?<![\w-])(?:-webkit-)?(?:image-set|cross-fade|image|src)\s*\(", re.IGNORECASE)
+ASCII_SPACE = "".join(chr(c) for c in range(0x21))
+DROPPED = {9: None, 10: None, 13: None}
 
 
 class EmbedError(Exception):
@@ -51,15 +63,173 @@ def _css_unescape(text: str) -> str:
     return CSS_ESCAPE.sub(one, text)
 
 
-def names_outside_address(text: str) -> bool:
-    """True when the page, read as a browser reads it, names an address outside itself."""
-    plain = html.unescape(text)
-    for base in (plain, URL_NOISE.sub("", plain)):
-        css = _css_unescape(base)
-        for seen in (base, css, base.replace("\\", "/"), css.replace("\\", "/")):
-            if OUTSIDE_ADDRESS.search(NAMESPACE.sub("", seen)):
-                return True
-    return False
+class _Outside(Exception):
+    """An address that is neither a data: address nor a # reference; carries what to name, never page text."""
+
+
+def _allowed(value: str) -> bool:
+    # Decide as a browser's URL parser reads it: tab and newlines vanish, leading and trailing control characters and spaces are stripped.
+    address = value.translate(DROPPED).strip(ASCII_SPACE)
+    return address[:5].lower() == "data:" or address.startswith("#")
+
+
+def _require(value: str, name: str) -> None:
+    if not _allowed(value):
+        raise _Outside(name)
+
+
+def _srcset_urls(value: str) -> list[str]:
+    urls, i, n = [], 0, len(value)
+    while i < n:
+        while i < n and (value[i] in ASCII_SPACE or value[i] == ","):
+            i += 1
+        start = i
+        while i < n and value[i] not in ASCII_SPACE:
+            i += 1
+        url = value[start:i]
+        if not url:
+            break
+        if url.endswith(","):
+            url = url.rstrip(",")
+        else:
+            depth = 0
+            while i < n:
+                char = value[i]
+                i += 1
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth = max(0, depth - 1)
+                elif char == "," and depth == 0:
+                    break
+        urls.append(url)
+    return urls
+
+
+def _skip_css_space(text: str, i: int) -> int:
+    while i < len(text):
+        if text[i] in " \t\n\r\f":
+            i += 1
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            if end < 0:
+                raise _Outside("@import")
+            i = end + 2
+        else:
+            break
+    return i
+
+
+def _css_string(text: str, i: int, name: str) -> tuple[str, int]:
+    end = text.find(text[i], i + 1)
+    if end < 0:
+        raise _Outside(name)
+    return text[i + 1:end], end + 1
+
+
+def _check_css(css: str) -> None:
+    text = _css_unescape(css)
+    for match in CSS_URL.finditer(text):
+        i = match.end()
+        while i < len(text) and text[i] in " \t\n\r\f":
+            i += 1
+        if i < len(text) and text[i] in "\"'":
+            value, _ = _css_string(text, i, "url()")
+        else:
+            end = text.find(")", i)
+            if end < 0:
+                raise _Outside("url()")
+            value = text[i:end]
+        _require(value, "url()")
+    for match in CSS_IMPORT.finditer(text):
+        i = _skip_css_space(text, match.end())
+        if CSS_URL.match(text, i):
+            continue
+        if i < len(text) and text[i] in "\"'":
+            value, _ = _css_string(text, i, "@import")
+            _require(value, "@import")
+        else:
+            raise _Outside("@import")
+    for match in CSS_IMAGE_FUNCTION.finditer(text):
+        i, depth = match.end(), 1
+        while i < len(text) and depth:
+            char = text[i]
+            if char in "\"'":
+                value, i = _css_string(text, i, "url()")
+                _require(value, "url()")
+                continue
+            depth += (char == "(") - (char == ")")
+            i += 1
+        if depth:
+            raise _Outside("url()")
+
+
+class _Allowlist(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._style: list[str] | None = None
+
+    def handle_starttag(self, tag, attrs):
+        attributes = {}
+        for name, value in attrs:
+            attributes.setdefault(name, value if value is not None else "")
+        refresh = attributes.get("http-equiv", "").translate(DROPPED).strip(ASCII_SPACE).lower() == "refresh"
+        for name, value in attrs:
+            value = value if value is not None else ""
+            shown = name if re.fullmatch(r"[a-z0-9:_.-]{1,40}", name) else "unnamed"
+            local = name.rsplit(":", 1)[-1]
+            if name == "xmlns" or name.startswith("xmlns:"):
+                continue
+            if name in ADDRESS_ATTRIBUTES or local in ADDRESS_ATTRIBUTES:
+                if name in SRCSET_ATTRIBUTES or local in SRCSET_ATTRIBUTES:
+                    urls = _srcset_urls(value) or [""]
+                elif name in LIST_ATTRIBUTES or local in LIST_ATTRIBUTES:
+                    urls = value.split() or [""]
+                else:
+                    urls = [value]
+                for url in urls:
+                    _require(url, f"{shown} attribute")
+            elif name == "content" and refresh:
+                rest = re.sub(r"^[\s\d.]*[;,]?\s*", "", value)
+                rest = re.sub(r"^url\s*=\s*", "", rest, flags=re.IGNORECASE).strip(ASCII_SPACE + "\"'")
+                if rest:
+                    _require(rest, "content attribute")
+            elif name == "srcdoc":
+                inner = _Allowlist()
+                inner.feed(value)
+                inner.close()
+                inner.finish()
+            _check_css(value)
+        if tag == "style":
+            self._style = []
+
+    handle_startendtag = handle_starttag
+
+    def handle_data(self, data):
+        if self._style is not None:
+            self._style.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "style":
+            self.finish()
+
+    def finish(self):
+        if self._style is not None:
+            # A style element that is never closed runs to the end of the page; the parser keeps that text unparsed.
+            css, self._style = "".join(self._style) + (self.rawdata if self.cdata_elem else ""), None
+            _check_css(css)
+
+
+def check_addresses(text: str) -> None:
+    """Refuse unless every address of the page is a data: address or a # reference inside the page."""
+    parser = _Allowlist()
+    try:
+        parser.feed(text)
+        parser.close()
+        parser.finish()
+    except _Outside as outside:
+        raise EmbedError(
+            f"the page holds a {outside} that is not a data: address or a # reference; put everything inline") from None
 
 
 def _package_json(path: Path, what: str) -> dict:
@@ -97,8 +267,7 @@ def embed(website, page) -> list[dict]:
         text = page.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         raise EmbedError("the page file cannot be read") from None
-    if names_outside_address(text):
-        raise EmbedError("the page names an outside address; put everything inline")
+    check_addresses(text)
     head_end = text.lower().find("</head>")
     if head_end < 0:
         raise EmbedError("the page has no head to hold the font faces")

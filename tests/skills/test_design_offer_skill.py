@@ -198,14 +198,139 @@ def test_embed_fonts_refuses_an_outside_address_written_in_another_form(tmp_path
     assert page.read_bytes() == text.encode("utf-8")
 
 
-def test_embed_fonts_accepts_inline_svg_namespaces_and_relative_or_data_addresses(tmp_path):
+def test_embed_fonts_accepts_inline_svg_namespaces_and_data_or_fragment_addresses(tmp_path):
     embed = _load(EMBED, "embed_fonts")
-    body = ("<svg xmlns='http://www.w3.org/2000/svg'><use xlink:href='#a'/></svg><a href='/privacy'>p</a>"
-            "<img src='data:image/png;base64,AAAA'><a href='docs/https:x'>d</a><img src='img/a&#47;b.png'>"
-            "<svg xmlns=\"http&#58;//www.w3.org/2000/svg\"></svg><p>read https and http</p>")
+    body = ("<svg xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink'><use xlink:href='#a'/></svg>"
+            "<a href='#top'>t</a><img src='data:image/png;base64,AAAA'><img src=' DATA:image/png;base64,AAAA '>"
+            "<svg xmlns=\"http&#58;//www.w3.org/2000/svg\"></svg><p>read https and http</p>"
+            "<img srcset='data:image/png;base64,AAAA 1x, data:image/png;base64,BBBB 2x'>"
+            "<meta http-equiv='refresh' content='5'><meta name='x' content='https://example.invalid/not-a-fetch'>")
     page = _page(tmp_path, PAGE.replace("</body>", body + "</body>"))
     embed.embed(_website(tmp_path), page)
     assert "@font-face" in page.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("outside", [
+    "<a href='/privacy'>p</a>",
+    "<img src='img/a.png'>",
+    "<a href='docs/https:x'>d</a>",
+    "<img src='img/a&#47;b.png'>",
+    "<img src=''>",
+    "<img src='   '>",
+    "<img src>",
+    "<a href=''>x</a>",
+    "<img src='data&#58;image/png;base64,AAAA'><img src='da ta:x'>",
+    "<img src=' data:image/png;base64,AAAA'>",
+    "<img srcset='data:image/png;base64,AAAA 1x, other.png 2x'>",
+    "<img srcset='other.png'>",
+    "<img srcset=' , '>",
+    "<link rel='preload' as='image' imagesrcset='a.png 1x'>",
+    "<a href='#x' ping='data:x https://example.invalid/p'>p</a>",
+    "<a href='#x' ping=''>p</a>",
+    "<div itemscope itemtype='https://schema.org/Thing'></div>",
+    "<form action='submit.php'></form>",
+    "<button formaction='/go'>go</button>",
+    "<video poster='p.png'></video>",
+    "<object data='movie.swf'></object>",
+    "<object codebase='/base/'></object>",
+    "<blockquote cite='source.html'>q</blockquote>",
+    "<body background='bg.png'>",
+    "<img longdesc='d.html'><img usemap='map.html#m'>",
+    "<html manifest='cache.manifest'>",
+    "<base href='/sub/'>",
+    "<script src='a.js'></script>",
+    "<iframe src='about:blank'></iframe>",
+    "<iframe srcdoc='&lt;img src=&quot;a.png&quot;&gt;'></iframe>",
+    "<svg><use xlink:href='sprite.svg#a'/></svg>",
+    "<svg><image href='a.png'/></svg>",
+    "<svg><rect fill='url(a.svg#g)'/></svg>",
+    "<meta http-equiv='refresh' content='0; url=next.html'>",
+    "<meta http-equiv=' Refresh ' content='3;URL=\"next.html\"'>",
+    "<meta http-equiv='refresh' content='0;next.html'>",
+    "<div style='background:url(a.png)'></div>",
+    "<div style=\"background:url( 'a.png' )\"></div>",
+    "<div style='background:url(/**/data:x)'></div>",
+    "<div style='background:url()'></div>",
+    "<div style='background:image-set(\"a.png\" 1x)'></div>",
+    "<div style='background:-webkit-image-set(\"a.png\" 1x)'></div>",
+    "<style>.a{background:url(a.png)}</style>",
+    "<style>.a{background:url(\"data:x\"),url(b.png)}</style>",
+    "<style>@import 'a.css';</style>",
+    "<style>@import /* c */ \"a.css\";</style>",
+    "<style>@import url(a.css);</style>",
+    "<style>@import ;</style>",
+    "<style>@font-face{font-family:x;src:url(font.woff2)}</style>",
+    "<STYLE>.a{background:URL(a.png)}</STYLE>",
+    "<style>.a{background:url(a.png)}",
+    "<IMG SRC='a.png'>",
+], ids=lambda t: re.sub(r"\W+", "_", t)[:48])
+def test_embed_fonts_refuses_every_address_that_is_not_data_or_a_fragment(tmp_path, outside):
+    embed = _load(EMBED, "embed_fonts")
+    text = PAGE.replace("</head>", outside + "</head>")
+    page = _page(tmp_path, text)
+    with pytest.raises(embed.EmbedError) as caught:
+        embed.embed(_website(tmp_path), page)
+    assert PAGE_TEXT not in str(caught.value)
+    assert page.read_bytes() == text.encode("utf-8")
+
+
+def _cli(tmp_path, text):
+    page = _page(tmp_path, text)
+    done = subprocess.run([sys.executable, str(EMBED), "--website", str(_website(tmp_path)), "--page", str(page)],
+                          capture_output=True, text=True, timeout=60)
+    return done, page
+
+
+def test_embed_fonts_command_line_accepts_data_and_fragment_addresses_and_embeds_both_fonts(tmp_path):
+    body = ("<a href='#top'>t</a><svg xmlns='http://www.w3.org/2000/svg'><use xlink:href='#a'/></svg>"
+            "<img src='data:image/png;base64,AAAA' srcset='data:image/png;base64,AAAA 1x, data:image/png;base64,BBBB 2x'>"
+            "<div style=\"background:url(data:image/png;base64,AAAA) , url('#frag')\"></div>"
+            "<style>@import url(data:text/css,a%7B%7D);@import 'data:text/css,b%7B%7D';.x{background:url(\"#g\")}</style>")
+    text = PAGE.replace("</body>", body + "</body>")
+    done, page = _cli(tmp_path, text)
+    assert done.returncode == 0, done.stderr
+    out = page.read_text(encoding="utf-8")
+    assert _faces(out) == {"Geist": ("400 500", GEIST_BYTES), "Geist Mono": ("400", MONO_BYTES)}
+    assert {line.split("  ", 1)[0] for line in done.stdout.splitlines()} == {_sha(GEIST_BYTES), _sha(MONO_BYTES)}
+    assert body in out and PAGE_TEXT not in done.stdout + done.stderr
+
+
+@pytest.mark.parametrize("outside", [
+    "<img src='relative-MARKER_6841.png'>",
+    "<img src='http://example.invalid/MARKER_6841.png'>",
+    "<img src='//example.invalid/MARKER_6841.png'>",
+    "<div style=\"background:url(MARKER_6841.png)\"></div>",
+    "<style>@import 'MARKER_6841.css';</style>",
+    "<img srcset='data:image/png;base64,AAAA 1x, MARKER_6841.png 2x'>",
+], ids=["relative-src", "absolute-http", "scheme-relative-host", "url-in-style", "import", "srcset-entry"])
+def test_embed_fonts_command_line_refuses_a_non_data_non_fragment_address_and_leaves_the_page(tmp_path, outside):
+    text = PAGE.replace("</head>", outside + "</head>")
+    done, page = _cli(tmp_path, text)
+    assert done.returncode == 1
+    assert done.stderr.startswith("refused:") and done.stdout == ""
+    assert "MARKER_6841" not in done.stdout + done.stderr
+    assert page.read_bytes() == text.encode("utf-8")
+
+
+def test_embed_fonts_refusal_names_the_attribute_and_no_page_text_and_leaves_the_bytes(tmp_path):
+    text = PAGE.replace("</body>", "<img src=\"relative-MARKER_6841.png\"></body>")
+    done, page = _cli(tmp_path, text)
+    assert done.returncode == 1
+    assert done.stderr.count("\n") == 1 and "src" in done.stderr
+    assert "MARKER_6841" not in done.stderr and PAGE_TEXT not in done.stdout + done.stderr
+    assert page.read_bytes() == text.encode("utf-8")
+
+
+@pytest.mark.parametrize("inner, name", [
+    ("<div style='background:url(MARKER_6841.png)'></div>", "url()"),
+    ("<style>@import 'MARKER_6841.css';</style>", "@import"),
+], ids=["url", "import"])
+def test_embed_fonts_refusal_names_url_and_import_and_no_page_text(tmp_path, inner, name):
+    embed = _load(EMBED, "embed_fonts")
+    page = _page(tmp_path, PAGE.replace("</body>", inner + "</body>"))
+    with pytest.raises(embed.EmbedError) as caught:
+        embed.embed(_website(tmp_path), page)
+    assert name in str(caught.value) and "MARKER_6841" not in str(caught.value)
 
 
 @pytest.mark.parametrize("outside", [
