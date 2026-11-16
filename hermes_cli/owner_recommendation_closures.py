@@ -3,9 +3,21 @@
 from __future__ import annotations
 
 import contextlib
+import sqlite3
 
 from hermes_cli import kanban_db
 from hermes_cli.owner_text import check_owner_text
+
+# A closed suggestion the owner can see: pending in review, or accepted (Undo never changes the decision).
+_CLOSED_SUGGESTION_SQL = (
+    "SELECT r.id,r.recommendation_label,w.title AS card_title,c.reason,c.closed_at "
+    "FROM recommendation_closures c JOIN tasks r ON r.id=c.recommendation_id "
+    "LEFT JOIN tasks w ON w.id=c.card_id AND w.project_id=c.project_id AND w.task_kind='work' "
+    "WHERE c.project_id=? AND r.project_id=c.project_id "
+    "AND r.task_kind='recommendation' AND r.review_policy='owner' "
+    "AND ((COALESCE(r.recommendation_decision,'pending')='pending' AND r.status='review') "
+    "OR r.recommendation_decision='accepted') AND c.undone_at IS NULL"
+)
 
 
 def _has_closures(board):
@@ -29,13 +41,7 @@ def recent_closed_suggestions(board, ctx, project, current):
     # The delivery card is joined loosely: a live closure hides its suggestion from the pending list, so the
     # closure stays listed, and undoable, after its card is deleted.
     rows = board.execute(
-        "SELECT r.id,r.recommendation_label,w.title AS card_title,c.reason,c.closed_at "
-        "FROM recommendation_closures c JOIN tasks r ON r.id=c.recommendation_id "
-        "LEFT JOIN tasks w ON w.id=c.card_id AND w.project_id=c.project_id AND w.task_kind='work' "
-        "WHERE c.project_id=? AND r.project_id=c.project_id "
-        "AND r.task_kind='recommendation' AND r.status='review' "
-        "AND r.review_policy='owner' AND COALESCE(r.recommendation_decision,'pending')='pending' "
-        "AND c.undone_at IS NULL ORDER BY c.closed_at DESC,r.id ASC LIMIT 20", (project["project_id"],),
+        _CLOSED_SUGGESTION_SQL + " ORDER BY c.closed_at DESC,r.id ASC LIMIT 20", (project["project_id"],),
     ).fetchall()
     added = [{
         "decision_ref": _owner_decision_ref(ctx, authority="recommendation", native_id=str(row["id"])),
@@ -44,6 +50,34 @@ def recent_closed_suggestions(board, ctx, project, current):
         "reason": check_owner_text(row["reason"], "planner_prose"), "closed_at": int(row["closed_at"]),
     } for row in rows]
     return sorted([*current, *added], key=lambda item: (-item["closed_at"], item["decision_ref"]))[:20]
+
+
+def _closed_suggestion(ctx, decision_ref):
+    """Resolve a Decisions-feed key to this owner's suggestion with a live closure; never writes.
+
+    The Project loop of ``owner_workspace._owner_pending_suggestion`` over the suggestions the closed list shows.
+    """
+    from hermes_cli import owner_workspace as ow
+
+    for project in ow.list_committed_projects(ctx):
+        if project["archived"]:
+            continue
+        project_id = str(project["project_id"])
+        board_slug = str(project["board"])
+        if not kanban_db.board_exists(board_slug) and ow._completed_removal_state(project_id) is not None:
+            continue
+        board = ow._open_read_only_sqlite(ow._listed_board_path(board_slug), label="kanban.db")
+        try:
+            # An older board without the closure table has no closed suggestion, and this read adds no table.
+            rows = board.execute(_CLOSED_SUGGESTION_SQL, (project_id,)).fetchall() if _has_closures(board) else []
+        except sqlite3.Error as exc:
+            raise ow.OwnerWorkspaceError("snapshot_unavailable", "the Project decisions could not be read") from exc
+        finally:
+            board.close()
+        for row in rows:
+            if ow._owner_decision_ref(ctx, authority="recommendation", native_id=str(row["id"])) == decision_ref:
+                return board_slug, row
+    return None
 
 
 def undo_closed_suggestion(ctx, *, decision_ref, reason, expected_closed_at):
@@ -59,7 +93,7 @@ def undo_closed_suggestion(ctx, *, decision_ref, reason, expected_closed_at):
             or not isinstance(reason, str) or not reason or len(reason) > 500
             or check_owner_text(reason, "planner_prose") != reason):
         raise ow.OwnerWorkspaceError("invalid_argument", "a closure Undo needs a valid reason and token")
-    found = ow._owner_pending_suggestion(ctx, decision_ref)
+    found = _closed_suggestion(ctx, decision_ref)
     if found is None:
         raise ow.OwnerWorkspaceError("decision_not_found", "this suggestion is no longer closed")
     board_slug, row = found
