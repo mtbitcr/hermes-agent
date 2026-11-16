@@ -182,13 +182,20 @@ _DEEP_ROUTES: dict[tuple[str, str], tuple[str, str, str]] = {
 _EXECUTION_TIERS = frozenset({"routine", "deep"})
 
 
-def assignment_for(profile: str, provider: str) -> ModelAssignment:
-    """Return the one admitted assignment for ``profile`` and ``provider``."""
+def _matrix_assignment(profile: str, provider: str) -> ModelAssignment:
+    """The hard-coded base route, before any owner-approved model update."""
     key = (str(profile or "").strip(), str(provider or "").strip())
     try:
         return _ASSIGNMENTS[key]
     except KeyError as exc:
         raise ValueError("unadmitted Raphael model assignment") from exc
+
+
+def assignment_for(profile: str, provider: str) -> ModelAssignment:
+    """Return the one admitted assignment for ``profile`` and ``provider``."""
+    return _apply_model_updates(
+        _matrix_assignment(profile, provider), _model_updates()
+    )[0]
 
 
 def validate_assignment(
@@ -218,6 +225,19 @@ def normalize_execution_tier(value: Any) -> str:
     return tier
 
 
+def _matrix_task_assignment(
+    profile: str, provider: str, execution_tier: str
+) -> ModelAssignment:
+    """The hard-coded task route, before any owner-approved model update."""
+    tier = normalize_execution_tier(execution_tier)
+    base = _matrix_assignment(profile, provider)
+    if tier == "deep":
+        deep = _DEEP_ROUTES.get((base.profile, base.provider))
+        if deep is not None:
+            return _assignment(base.profile, base.provider, *deep)
+    return base
+
+
 def task_assignment_for(
     profile: str, provider: str, execution_tier: str
 ) -> ModelAssignment:
@@ -230,13 +250,9 @@ def task_assignment_for(
     included, retains its admitted profile assignment until that provider has
     a separately qualified deep lane.
     """
-    tier = normalize_execution_tier(execution_tier)
-    base = assignment_for(profile, provider)
-    if tier == "deep":
-        deep = _DEEP_ROUTES.get((base.profile, base.provider))
-        if deep is not None:
-            return _assignment(base.profile, base.provider, *deep)
-    return base
+    return _apply_model_updates(
+        _matrix_task_assignment(profile, provider, execution_tier), _model_updates()
+    )[0]
 
 
 def validate_runtime_assignment(
@@ -564,8 +580,10 @@ def _route_authority_error(
     """Return why this five-tuple is not an admitted locked route, else None.
 
     ``admit_superseded`` additionally accepts a route recorded in
-    ``_SUPERSEDED_ROUTES`` for this exact assignee/provider/tier.  Only lock
-    validation passes it; minting always requires the current route.
+    ``_SUPERSEDED_ROUTES`` for this exact assignee/provider/tier, and a model
+    an owner-approved update moved this exact route off (see
+    :func:`_apply_model_updates`).  Only lock validation passes it; minting
+    always requires the current route.
 
     ``admit_pinned_effort`` additionally accepts the route's own model at
     every effort a card can be pinned at by its risk tier (high next to max,
@@ -575,7 +593,8 @@ def _route_authority_error(
 
     Both together, which only seal validation (:func:`policy_lock_error`)
     passes, also accept ``_SUPERSEDED_PINNED_ROUTES`` for this exact
-    assignee/provider/tier.
+    assignee/provider/tier, and a model an update moved it off at every pinned
+    effort.
     """
     if not assignee or not provider or not model or not reasoning_effort:
         return (
@@ -593,12 +612,15 @@ def _route_authority_error(
             f"{reasoning_effort!r}"
         )
     try:
-        expected = task_assignment_for(assignee, provider, execution_tier)
+        route = _matrix_task_assignment(assignee, provider, execution_tier)
     except ValueError:
         return (
             "policy-locked route names no admitted authority for "
             f"{assignee!r}/{provider!r}/{execution_tier or None!r}"
         )
+    # One read of the update record answers both the current route and the
+    # models it ran before an owner-approved update moved it.
+    expected, updated_from = _apply_model_updates(route, _model_updates())
     admitted = {(expected.model, expected.reasoning_effort)}
     if admit_pinned_effort:
         admitted |= {(expected.model, effort) for effort in PINNED_EFFORTS}
@@ -606,10 +628,14 @@ def _route_authority_error(
         admitted |= _SUPERSEDED_ROUTES.get(
             (expected.profile, expected.provider, execution_tier), frozenset()
         )
+        admitted |= {(model, expected.reasoning_effort) for model in updated_from}
     if admit_superseded and admit_pinned_effort:
         admitted |= _SUPERSEDED_PINNED_ROUTES.get(
             (expected.profile, expected.provider, execution_tier), frozenset()
         )
+        admitted |= {
+            (model, effort) for model in updated_from for effort in PINNED_EFFORTS
+        }
     if (model, reasoning_effort) not in admitted:
         return (
             f"policy-locked route {model!r}/{reasoning_effort!r} is not the "
@@ -962,6 +988,262 @@ def restore_enrollment(snapshot: Optional[str]) -> None:
             ) from exc
 
 
+# ---------------------------------------------------------------------------
+# Owner-approved model updates
+# ---------------------------------------------------------------------------
+#
+# The route matrix is written in code, so on its own a new model version needs
+# a code edit. One small Hermes-owned record lets an owner Decision move a
+# model to its next version instead. Each entry is ONE Decision and covers
+# every role and tier that runs the model it names. It changes only that
+# model's version inside the same provider: never a provider, an effort or a
+# role. An entry outside that boundary, or with no owner decision reference,
+# is ignored, and a record that cannot be read leaves the matrix in force and
+# refuses every write.
+#
+# Like the enrollment record it lives under the hermes root (NOT under any
+# single profile home), so a worker whose HERMES_HOME is its profile home
+# reads the same record, and it is written only under the enrollment registry
+# lock.
+
+_MODEL_UPDATES_SCHEMA_VERSION = 1
+_MODEL_UPDATE_FIELDS = frozenset({
+    "provider", "from_model", "to_model", "decision_ref", "approved_at", "state",
+})
+_MODEL_UPDATE_STATES = ("active", "rolled_back")
+# One run of version digits, such as "5" or "6.1": the only part of a model id
+# an update may change.
+_VERSION_PART_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*")
+
+
+def _model_updates_path():
+    """Where the Hermes-owned Raphael model update record lives."""
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root() / "raphael" / "model_policy_updates.json"
+
+
+def _load_model_updates(path) -> tuple:
+    """Return ``(exact prior file text or None, validated document)``.
+
+    Only a missing record reads as empty. Anything else at the path that is not
+    a record of this build's shape, a directory included, fails closed.
+    """
+    try:
+        if not path.exists():
+            return None, {"version": _MODEL_UPDATES_SCHEMA_VERSION, "updates": []}
+        if not path.is_file():
+            raise EnrollmentUnavailable(
+                "the Raphael model update record is not a file"
+            )
+        text = path.read_text(encoding="utf-8")
+        raw = json.loads(text)
+    except (OSError, ValueError) as exc:
+        raise EnrollmentUnavailable(
+            "the Raphael model update record could not be read"
+        ) from exc
+    if (
+        not isinstance(raw, dict)
+        or raw.get("version") != _MODEL_UPDATES_SCHEMA_VERSION
+        or not isinstance(raw.get("updates"), list)
+    ):
+        raise EnrollmentUnavailable(
+            "the Raphael model update record is not a shape this build wrote"
+        )
+    return text, raw
+
+
+def _model_family(model: str) -> tuple:
+    """``model`` with each run of version parts folded into one placeholder."""
+    family = []
+    for part in model.split("-"):
+        if _VERSION_PART_RE.fullmatch(part):
+            if family and family[-1] is None:
+                continue
+            part = None
+        family.append(part)
+    return tuple(family)
+
+
+def _is_model_update(entry: Any) -> bool:
+    """Whether ``entry`` is one owner Decision inside the record's boundary.
+
+    Exactly this build's fields, so no entry can name a role, an effort or a
+    second provider. The provider is admitted, the decision reference and the
+    approval time are present, neither model is never-admissible, and the two
+    models differ in their version parts only.
+    """
+    if not isinstance(entry, dict) or set(entry) != _MODEL_UPDATE_FIELDS:
+        return False
+    decision_ref = entry["decision_ref"]
+    approved_at = entry["approved_at"]
+    if (
+        entry["provider"] not in admitted_provider_ids()
+        or entry["state"] not in _MODEL_UPDATE_STATES
+        or not isinstance(decision_ref, str)
+        or not decision_ref.strip()
+        or not (
+            (isinstance(approved_at, str) and approved_at.strip())
+            or (type(approved_at) is int and approved_at >= 0)
+        )
+    ):
+        return False
+    from_model, to_model = entry["from_model"], entry["to_model"]
+    for model in (from_model, to_model):
+        if not isinstance(model, str) or not model or model != model.strip():
+            return False
+        if any(marker in model.lower() for marker in _FORBIDDEN_MODEL_MARKERS):
+            return False
+    if from_model == to_model:
+        return False
+    return _model_family(from_model) == _model_family(to_model)
+
+
+def read_model_updates() -> tuple[dict, ...]:
+    """Return the owner-approved model updates the policy applies, in order.
+
+    Entries outside the record's boundary are left out. Raises
+    :class:`EnrollmentUnavailable` when the record cannot be read; every route
+    read then applies the hard-coded matrix (see :func:`_model_updates`).
+    """
+    _prior_text, document = _load_model_updates(_model_updates_path())
+    return tuple(
+        dict(entry) for entry in document["updates"] if _is_model_update(entry)
+    )
+
+
+def _model_updates() -> tuple[dict, ...]:
+    """The updates every route read applies: none when the record is unreadable."""
+    try:
+        return read_model_updates()
+    except EnrollmentUnavailable:
+        return ()
+
+
+def _apply_model_updates(
+    route: ModelAssignment, updates
+) -> tuple[ModelAssignment, frozenset[str]]:
+    """Return ``route`` as the updates move it, and the models it ran before.
+
+    Entries apply in record order, so a later Decision can move the version an
+    earlier one introduced. An active entry moves the route when it starts from
+    the model the route runs now, and the effort never changes. Every model an
+    entry moved the route through (the ``from_model`` an active entry
+    replaced, the ``to_model`` of one rolled back) still verifies the locks
+    sealed on it, but only the current model can be minted.
+    """
+    model = route.model
+    reached = {model}
+    for update in updates:
+        if update["provider"] != route.provider or update["from_model"] not in reached:
+            continue
+        reached.add(update["to_model"])
+        if update["state"] == "active" and update["from_model"] == model:
+            model = update["to_model"]
+    if model != route.model:
+        # Named by its exact model id, never by the replaced model's label.
+        route = _assignment(
+            route.profile, route.provider, model, model, route.reasoning_effort
+        )
+    return route, frozenset(reached - {model})
+
+
+def _matrix_routes():
+    """Every hard-coded route: each role's base route and each deep lane."""
+    yield from _ASSIGNMENTS.values()
+    for (profile, provider), deep in _DEEP_ROUTES.items():
+        yield _assignment(profile, provider, *deep)
+
+
+def apply_model_update_record(update: Mapping[str, Any]) -> Optional[str]:
+    """Record one owner Decision's model update, or mark it rolled back.
+
+    Returns the record's EXACT prior file text (``None`` when there was no
+    file), so a caller whose later step fails can put it back — see
+    :func:`restore_model_update_record`.
+
+    One Decision is one entry. A new entry is active and starts from a model
+    some role runs now; the only later change is that same entry going from
+    ``active`` to ``rolled_back``. Recording what is already recorded writes
+    nothing. The record is re-read INSIDE the enrollment registry lock, and an
+    unreadable one is refused and left exactly as it is.
+    """
+    from utils import atomic_json_write
+
+    entry = dict(update)
+    if not _is_model_update(entry):
+        raise ValueError("unadmitted Raphael model update")
+
+    with _enrollment_registry_lock():
+        path = _model_updates_path()
+        prior_text, document = _load_model_updates(path)
+        updates = document["updates"]
+        current = [existing for existing in updates if _is_model_update(existing)]
+        runs_now, ran = set(), set()
+        for route in _matrix_routes():
+            if route.provider == entry["provider"]:
+                moved, updated_from = _apply_model_updates(route, current)
+                runs_now.add(moved.model)
+                ran |= updated_from | {moved.model}
+        # An entry about a model no role on its provider ever ran changes
+        # nothing, so it is refused rather than recorded.
+        if entry["from_model"] not in ran:
+            raise ValueError("unadmitted Raphael model update")
+        recorded = [
+            index
+            for index, existing in enumerate(updates)
+            if isinstance(existing, dict)
+            and existing.get("decision_ref") == entry["decision_ref"]
+        ]
+        if not recorded:
+            # A new Decision moves a model some role runs now.
+            if entry["state"] != "active" or entry["from_model"] not in runs_now:
+                raise ValueError("unadmitted Raphael model update")
+            updates.append(entry)
+        else:
+            existing = updates[recorded[0]]
+            if (
+                len(recorded) != 1
+                or not _is_model_update(existing)
+                or {**existing, "state": None} != {**entry, "state": None}
+            ):
+                raise ValueError("this decision already records another model update")
+            if existing["state"] == entry["state"]:
+                return prior_text
+            if entry["state"] != "rolled_back":
+                raise ValueError("a rolled-back model update needs a new decision")
+            updates[recorded[0]] = entry
+        try:
+            atomic_json_write(path, document)
+        except OSError as exc:
+            raise EnrollmentUnavailable(
+                "the Raphael model update record could not be written"
+            ) from exc
+        return prior_text
+
+
+def restore_model_update_record(snapshot: Optional[str]) -> None:
+    """Put the record back to the exact text :func:`apply_model_update_record` saw.
+
+    ``None`` means the record did not exist and is removed again. Restoring
+    goes through the same lock as the write, and through the same atomic
+    replace, so permissions, ownership and symlinks survive.
+    """
+    from utils import atomic_write_text
+
+    with _enrollment_registry_lock():
+        path = _model_updates_path()
+        try:
+            if snapshot is None:
+                path.unlink(missing_ok=True)
+            else:
+                atomic_write_text(path, snapshot, preserve_mode=True)
+        except OSError as exc:
+            raise EnrollmentUnavailable(
+                "the Raphael model update record could not be restored"
+            ) from exc
+
+
 def model_machine_request(request: Any) -> bool:
     """True only for a verified bearer from the Models token provider."""
     state = getattr(request, "state", None)
@@ -1068,8 +1350,9 @@ def _admitted_models_for(profile: Optional[str], provider: str) -> set:
     """
     key = str(profile or "").strip()
     if not key:
+        updates = _model_updates()
         return {
-            assignment.model
+            _apply_model_updates(assignment, updates)[0].model
             for assignment in _ASSIGNMENTS.values()
             if assignment.provider == provider
         }
@@ -1228,6 +1511,16 @@ def audit_models_machine_success(
         raise HTTPException(status_code=503, detail="Service Unavailable") from exc
 
 
+def _audited_model(profile: Optional[str], provider: Optional[str]) -> Optional[str]:
+    """The exact model ``profile`` runs on ``provider`` now, when both name one."""
+    if not profile or not provider:
+        return None
+    try:
+        return assignment_for(profile, provider).model
+    except ValueError:
+        return None
+
+
 def _models_machine_entries(
     request: Request,
     *,
@@ -1256,6 +1549,7 @@ def _models_machine_entries(
                 "action": action,
                 "profile": profile,
                 "model_provider": provider,
+                "model": _audited_model(profile, provider),
                 "decision": "allow",
                 "status": 200,
                 "ip": ip,
