@@ -11,8 +11,10 @@ An owned folder owns every file in it, for every rule; ``--owned .`` owns the wh
 repository (no hints, all counts zero). There is no file size limit. A file with a NUL byte
 in its first 8 KiB is binary and is not searched. A text file that cannot be read whole (an
 OS error, or bytes that are not UTF-8) is named in one ``unreadable<TAB>path`` line, after
-the hints, and counted in a final ``# unreadable: N`` line; both appear only when there is
-such a file.
+the hints, and counted in a final ``# unreadable: N`` line. So is a folder that cannot be
+listed, named with a trailing ``/`` (``unreadable<TAB>path/``); its files are not searched,
+and an owned one adds no files to the owned inventory, so the counts of that part are
+incomplete. Both lines appear only when there is such a path.
 
 Exit 0 on success, 2 when an owned path or the root is refused (outside the repository,
 or the root is not a folder) or no owned path is given.

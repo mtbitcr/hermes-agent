@@ -9,8 +9,10 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -296,3 +298,73 @@ def test_file_the_search_cannot_read_is_named_and_counted(repo, capsys):
     # The key matches are still first, and the four rule counts are still printed.
     assert _output_paths("\n".join(out))[:3] == ["config/settings.json", "docs/notes.md", "tests/test_pin_key.py"]
     assert len([line for line in out if line.startswith("# rule")]) == 4
+
+
+def _run_cli_unprivileged(args: list[str], build, locked: dict[str, int]) -> subprocess.CompletedProcess:
+    """Build a repository under /tmp with *build(repo)*, set the modes in *locked* (path
+    relative to the repository), and run the real script as a user that obeys them (root
+    ignores modes, so drop to uid 65534). The modes are restored before the cleanup."""
+    base = Path(tempfile.mkdtemp(dir="/tmp"))
+    repo_dir = base / "repo"
+    try:
+        os.chmod(base, 0o755)
+        for rel, original in (
+            ("hermes_cli/__init__.py", None),
+            ("hermes_cli/kanban_scope_hints.py", Path(hints.__file__)),
+            ("scripts/kanban_scope_hints.py", SCRIPT),
+        ):
+            _write(base / "tool" / rel, "" if original is None else original.read_text(encoding="utf-8"))
+        repo_dir.mkdir()
+        build(repo_dir)
+        for dirpath, dirnames, filenames in os.walk(base):
+            for name in dirnames:
+                os.chmod(Path(dirpath, name), 0o755)
+            for name in filenames:
+                os.chmod(Path(dirpath, name), 0o644)
+        for rel, mode in locked.items():
+            os.chmod(repo_dir / rel, mode)
+
+        def drop() -> None:
+            os.setgroups([])
+            os.setgid(65534)
+            os.setuid(65534)
+
+        env = {k: v for k, v in os.environ.items() if k not in ("PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX")}
+        return subprocess.run(
+            [sys.executable, str(base / "tool" / "scripts" / "kanban_scope_hints.py"), "--root", str(repo_dir), *args],
+            cwd=base, env=env, capture_output=True, text=True, timeout=60,
+            preexec_fn=drop if os.geteuid() == 0 else None,
+        )
+    finally:
+        for rel in locked:
+            os.chmod(repo_dir / rel, 0o755)
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_directory_the_search_cannot_list_is_named_and_counted():
+    def build(repo: Path) -> None:
+        _write(repo / "owned.py", "VALUE = 1\n")
+        _write(repo / "open" / "pin.txt", f'"{KEY}"\n')
+        _write(repo / "locked" / "pin.txt", f'"{KEY}"\n')
+
+    run = _run_cli_unprivileged(["--owned", "owned.py", "--key", KEY], build, {"locked": 0o000})
+    assert run.returncode == 0, run.stderr
+    out = run.stdout.splitlines()
+    assert [line for line in out if line.startswith("unreadable")] == ["unreadable\tlocked/"]
+    assert [line for line in out if line.startswith("# unreadable")] == ["# unreadable: 1"]
+    assert [p for p in _output_paths(run.stdout) if p != "unreadable"] == ["open/pin.txt"]
+    assert [line.split(":")[0] for line in out if line.startswith("# rule")] == [
+        f"# rule {rule} ({name})" for rule, name in hints.RULE_NAMES.items()
+    ]
+
+
+def test_owned_directory_the_search_cannot_list_is_named_and_counted():
+    def build(repo: Path) -> None:
+        _write(repo / "locked" / "widget.py", "VALUE = 1\n")
+        _write(repo / "notes.txt", "See 'locked/widget.py' for details.\n")
+
+    run = _run_cli_unprivileged(["--owned", "locked"], build, {"locked": 0o111})
+    assert run.returncode == 0, run.stderr
+    out = run.stdout.splitlines()
+    assert [line for line in out if line.startswith("unreadable")] == ["unreadable\tlocked/"]
+    assert [line for line in out if line.startswith("# unreadable")] == ["# unreadable: 1"]

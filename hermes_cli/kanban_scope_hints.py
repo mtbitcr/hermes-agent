@@ -17,7 +17,9 @@ refused) and it does not look inside ``SKIP_DIRS``.
 
 There is no size limit. A file with a NUL byte in its first 8 KiB is binary and is not
 searched. A text file that cannot be read whole (an OS error, or bytes that are not UTF-8)
-is never left out in silence: it is listed in ``Report.unreadable``.
+is never left out in silence: it is listed in ``Report.unreadable``. So is a folder that
+cannot be listed (its files are not searched, and an owned one contributes no files to the
+owned inventory): it is listed there with a trailing ``/``.
 """
 
 from __future__ import annotations
@@ -54,7 +56,8 @@ class Hint:
 @dataclass(frozen=True)
 class Report:
     """The hints (files matching a key first, then by path), the files per rule, and the
-    text files that could not be read whole (by path)."""
+    text files that could not be read whole and the folders that could not be listed (a path
+    ending in ``/``), sorted by path."""
 
     hints: tuple[Hint, ...]
     counts: dict[int, int]
@@ -108,8 +111,15 @@ def _absolute_module(node: ast.ImportFrom, directory: list[str]) -> str | None:
     return ".".join([*directory[:keep], *([node.module] if node.module else [])]) or None
 
 
-def _walk_files(root: Path) -> Iterator[Path]:
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+def _walk_files(top: Path, root: Path, unlistable: set[str]) -> Iterator[Path]:
+    """The files under *top*; each folder that cannot be listed is added to *unlistable* as
+    its path relative to *root* with a trailing ``/`` (a folder that does not exist is not)."""
+
+    def failed(error: OSError) -> None:
+        if error.filename is not None and not isinstance(error, FileNotFoundError):
+            unlistable.add(Path(error.filename).relative_to(root).as_posix() + "/")
+
+    for dirpath, dirnames, filenames in os.walk(top, onerror=failed, followlinks=False):
         dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
         for name in sorted(filenames):
             yield Path(dirpath, name)
@@ -156,8 +166,9 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
     if "." in owned_dirs:
         return Report((), {rule: 0 for rule in RULE_NAMES})
     owned_files = {rel for rel, is_dir in owned_paths if not is_dir}
+    unlistable: set[str] = set()
     for rel in owned_dirs:
-        owned_files.update(p.relative_to(root).as_posix() for p in _walk_files(root / rel))
+        owned_files.update(p.relative_to(root).as_posix() for p in _walk_files(root / rel, root, unlistable))
     modules = {_module_name(rel) for rel in owned_files} - {None}
     module_prefixes = [rel.replace("/", ".") for rel in owned_dirs]
     path_pattern = (
@@ -174,7 +185,7 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
 
     hints: list[Hint] = []
     unreadable: list[str] = []
-    for path in _walk_files(root):
+    for path in _walk_files(root, root, unlistable):
         rel = path.relative_to(root).as_posix()
         real = path
         if path.is_symlink():
@@ -225,13 +236,14 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
 
     hints.sort(key=lambda h: (4 not in h.rules, h.path))
     counts = {rule: sum(rule in h.rules for h in hints) for rule in RULE_NAMES}
-    return Report(tuple(hints), counts, tuple(unreadable))
+    return Report(tuple(hints), counts, tuple(sorted({*unreadable, *unlistable})))
 
 
 def format_report(report: Report) -> list[str]:
     """One ``path<TAB>rules`` line per hint, one ``unreadable<TAB>path`` line per file that
-    could not be read, then one ``# rule N (...): count`` line per rule and, only when some
-    file was unreadable, a ``# unreadable: N`` line."""
+    could not be read or folder (``path/``) that could not be listed, then one
+    ``# rule N (...): count`` line per rule and, only when some path was unreadable, a
+    ``# unreadable: N`` line."""
     lines = []
     for hint in report.hints:
         labels = []
