@@ -11,7 +11,6 @@ import contextlib
 import logging
 import time
 import unicodedata
-from collections import Counter
 from datetime import date
 
 from gateway import owner_channel_pause, owner_heads_up
@@ -19,6 +18,8 @@ from gateway.config import Platform
 from gateway.platforms.api_server_owner_projects import _portfolio_view
 from gateway.status import _release_file_lock, _try_acquire_file_lock
 from hermes_cli import owner_project_review as review, owner_project_summary as summary, owner_workspace, projects_db
+from hermes_cli import owner_project_summary_events as events
+from hermes_cli.owner_project_review_owner_line import owner_line, plan_approvals_waiting
 from hermes_cli.owner_text import check_owner_text
 from hermes_constants import get_default_hermes_root, reset_hermes_home_override, set_hermes_home_override
 
@@ -149,18 +150,22 @@ def _ready(settings, day, now):
         return None
     waits, read = owner_heads_up._waiting()
     scope = {project["project_id"] for project in visible}
-    # An unread board gives neither its wait count nor its questions. Leave the day due for a later tick.
+    # An unread board gives neither its owner steps nor its questions. Leave the day due for a later tick.
     if not scope <= read:
         return None
-    counts = Counter(wait.project_id for wait in waits if wait.project_id in scope
-                     and heads.get(wait.key, {}).get("state") not in ("sent", "paused", "unknown", "sending"))
-    # Counts lead, so the cut at MAX_MESSAGE removes advice before an answer waiting on the owner.
+    # Owner lines lead, so the cut at MAX_MESSAGE removes advice before a step that waits on the owner.
+    # A read that raises leaves the day due as well: tick writes no record for a pass that raised.
     lines = []
-    for project in visible:
-        count = counts[project["project_id"]]
-        if count:
-            noun = "answer" if count == 1 else "answers"
-            lines.append(f'{project["name"]}: {count} {noun} waiting on Decisions')
+    with contextlib.closing(owner_workspace._open_read_only_sqlite(
+        get_default_hermes_root() / "projects.db", label="projects.db",
+    )) as registry:
+        for project in visible:
+            with events._read_only(events._board_path(project["board"])) as board:
+                decisions = review._owner_decisions(board, project["project_id"])
+            line = owner_line(len(decisions["waits"]), len(decisions["suggestions"]),
+                              plan_approvals_waiting(registry, project["project_id"]))
+            if line:
+                lines.append(f'{project["name"]}: {line}')
     if advised:
         notes.extend(text for key in ("conflicts", "priorities", "shared_blockers") for text in portfolio[key])
     # Valid prose can still quote a live question of any Project, also in part or in another spelling.
