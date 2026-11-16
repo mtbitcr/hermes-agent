@@ -530,7 +530,7 @@ def test_the_portfolio_input_does_not_read_a_cap_delay_as_a_review(root, monkeyp
     # The portfolio reads stored briefs only, as before: the waiting Project is not reviewed today.
     record = frozen['projects'][1]
     assert record['name'] == waiting.name and record['review_state'] == 'not reviewed today'
-    assert record['brief']['headline'] == 'The room plan is updated.'
+    assert record['brief'] == {'needs_you': None}
 
 
 # ---------------------------------------------------------------------------------------------------------------

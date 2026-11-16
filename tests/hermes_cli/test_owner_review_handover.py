@@ -27,6 +27,7 @@ import pytest
 import yaml
 
 from hermes_cli import config, kanban_db, owner_project_review as review, projects_db
+from tests.hermes_cli.test_owner_portfolio_review import _waiting_pair
 from tests.hermes_cli.test_owner_project_review_result import NOW, _quiet_project, _suggestion, root  # noqa: F401
 
 SUMMARIES = "project-summaries"
@@ -197,9 +198,9 @@ def test_a_coverage_miss_is_handed_back_with_the_expected_items(root, monkeypatc
 
 
 def test_a_refused_portfolio_line_is_handed_back_and_the_morning_advice_is_stored(root, monkeypatch, caplog):
-    project = _quiet_project(root)
+    first, second = _waiting_pair(root)
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
-        "enabled": True, "allowlist": [project.id], "portfolio": True,
+        "enabled": True, "allowlist": [first.id, second.id], "portfolio": True,
     }}))
     assert review.review_tick(NOW) == 1
     task_id = _task_with_key(root, f"project-review:portfolio:{DAY}:0")
@@ -425,16 +426,16 @@ def test_a_second_completion_of_a_finished_review_task_gets_the_unchanged_answer
 
 
 def test_a_second_completion_of_a_finished_portfolio_task_gets_the_unchanged_answer(root, monkeypatch, caplog):
-    project = _quiet_project(root)
+    first, second = _waiting_pair(root)
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
-        "enabled": True, "allowlist": [project.id], "portfolio": True,
+        "enabled": True, "allowlist": [first.id, second.id], "portfolio": True,
     }}))
     assert review.review_tick(NOW) == 1
     task_id = _task_with_key(root, f"project-review:portfolio:{DAY}:0")
-    long_line = f"{project.name}: " + _text(201)
+    long_line = f"{first.name}: " + _text(201)
     assert len(long_line) == 215
     _assert_a_second_completion_is_unchanged(
-        root, monkeypatch, caplog, task_id, _advice(f"{project.name}: Book the room."), _advice(long_line),
+        root, monkeypatch, caplog, task_id, _advice(f"{first.name}: Book the room."), _advice(long_line),
         "SELECT * FROM portfolio_review_briefs",
     )
     # No harvest ran: no advice is stored.
@@ -500,15 +501,15 @@ def _cold_task(root, monkeypatch, kind):
         _project, task_id, _ = _news_project(root, monkeypatch)
         broken = {"summary": "Reviewed.", "metadata": _payload(_text(412))}
         return task_id, broken, {"summary": "Reviewed.", "metadata": _payload()}, "review_text_length_invalid"
-    project = _quiet_project(root)
+    first, second = _waiting_pair(root)
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
-        "enabled": True, "allowlist": [project.id], "portfolio": True,
+        "enabled": True, "allowlist": [first.id, second.id], "portfolio": True,
     }}))
     assert review.review_tick(NOW) == 1
-    long_line = f"{project.name}: " + _text(201)
+    long_line = f"{first.name}: " + _text(201)
     assert len(long_line) == 215
     return (_task_with_key(root, f"project-review:portfolio:{DAY}:0"), _advice(long_line),
-            _advice(f"{project.name}: Book the room."), "portfolio_result_text_invalid")
+            _advice(f"{first.name}: Book the room."), "portfolio_result_text_invalid")
 
 
 def _modes_and_change_times(paths):

@@ -244,8 +244,10 @@ async def test_the_registered_watcher_never_sends_a_live_question_quoted_without
         # The quote was the only news, and a digest with nothing to report is not sent.
         assert adapter.sent == []
     else:
+        # The headline cases empty the stored advice above, so their second line is the no-advice line.
+        second = "Raphael has no advice across your projects today." if source == "headline" else NOTES_LINE
         assert adapter.sent == [(HOME_CHAT, "\n".join(
-            ["Your daily project review (2026-11-10)", NOTES_LINE, "Meeting Plan: 1 answer waiting on Decisions"]))]
+            ["Your daily project review (2026-11-10)", second, "Meeting Plan: 1 answer waiting on Decisions"]))]
 
 
 @pytest.mark.asyncio
