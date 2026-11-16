@@ -52,8 +52,7 @@ def _input(registry, projects, day, now=None):
         if approvals is not None:
             steps["plan_approvals"] = approvals
         since = [wait[2] for wait in decisions["waits"]]
-        text = ({key: brief[key] for key in ("headline", "needs_you")} if brief else
-                {"headline": "No Project review is available for this day.", "needs_you": None})
+        text = {"needs_you": brief["needs_you"] if brief else None}
         records.append({"name": project.name,
                         "review_state": "reviewed" if brief and brief["review_date"] == day else "not reviewed today",
                         "brief": text, "owner_steps": steps,

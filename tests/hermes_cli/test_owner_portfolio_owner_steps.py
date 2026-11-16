@@ -16,13 +16,15 @@ from hermes_cli.owner_review_handover import handover_refusal
 from tests.gateway.test_owner_heads_up import root as digest_root  # noqa: F401
 from tests.gateway.test_owner_review_digest import NOTES_LINE, Adapter, _project, _ready, _runner
 from tests.hermes_cli.test_owner_portfolio_review import (
-    SUMMARIES, _brief, _finish_portfolio, _frozen, _portfolio_body, _portfolio_on, _project_board, _summaries,
+    SUMMARIES, _brief, _finish_portfolio, _frozen, _news, _portfolio_body, _portfolio_on, _project_board, _summaries,
+    _waiting_pair,
 )
 from tests.hermes_cli.test_owner_project_review_cycle import PLANNER, _at, _enter_planning_worker
 from tests.hermes_cli.test_owner_project_review_owner_line import NAME, RID, _chat, _consume, _independent_count, _link
 from tests.hermes_cli.test_owner_project_review_result import (  # noqa: F401
     NOW, _owner_turn, _quiet_project, _suggestion, root,
 )
+from tests.hermes_cli.test_owner_review_handover import _complete, _payload, _read, _task_with_key, _worker
 
 DAY = "2026-11-09"
 KEY = f"project-review:portfolio:{DAY}:0"
@@ -107,11 +109,43 @@ def test_the_frozen_input_holds_only_the_owner_steps_of_each_project(root):
     assert set(records) == {"Meeting Plan", "Guest Visit"}
     for item in records.values():
         assert set(item) == {"name", "review_state", "brief", "owner_steps", "oldest_answer_days"}
-        assert set(item["brief"]) == {"headline", "needs_you"}
+        assert set(item["brief"]) == {"needs_you"}
         assert item["owner_steps"] == {"answers": 1, "suggestions": 0, "plan_approvals": 0}
     assert records["Meeting Plan"]["oldest_answer_days"] == 3
     assert records["Guest Visit"]["oldest_answer_days"] == 0
     assert not any(key in body for key in OLD_KEYS)
+
+
+@pytest.mark.parametrize("sentence", [
+    "Three parked tasks wait for Monday.", "The default worker is preparing the room.",
+], ids=["parked-count", "helper-name"])
+def test_a_headline_a_worker_wrote_never_reaches_the_frozen_input(root, monkeypatch, sentence):
+    first, second = _waiting_pair(root)
+    _portfolio_on(root, first, second)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    _news(first)
+    assert review.review_tick(NOW) == 1
+    review_task = _task_with_key(root, f"project-review:{first.id}:{DAY}:0")
+
+    card = _work_card(first)
+    claim = {"item": card, "class": "still actionable", "evidence": [f"decisions:wait:{card}"]}
+    payload = _payload(classification=[claim])
+    payload["project_review"]["brief"]["headline"] = sentence
+    with _worker(root, monkeypatch, review_task):
+        accepted = json.loads(_complete({"summary": "Reviewed.", "metadata": payload}))
+        assert accepted.get("ok") is True, accepted
+    assert review.review_tick(NOW + 1) == 1
+
+    # The harvest kept the worker's headline in the Project's own brief; the frozen input of the day holds no trace.
+    brief = _read(root / "projects.db", "SELECT review_date, headline FROM project_review_briefs WHERE project_id=?",
+                  first.id)
+    assert brief == [(DAY, sentence)]
+    body = _portfolio_body()
+    records = {item["name"]: item for item in _frozen(body)["projects"]}
+    assert set(records) == {"Meeting Plan", "Guest Visit"}
+    assert records["Meeting Plan"]["review_state"] == "reviewed"
+    assert all(item["owner_steps"]["answers"] == 1 for item in records.values())
+    assert sentence not in body
 
 
 @pytest.mark.parametrize("where", ["handover", "harvest"])

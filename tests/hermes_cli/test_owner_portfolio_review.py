@@ -157,7 +157,7 @@ def test_quiet_projects_get_one_portfolio_review_and_one_text_result(root, fault
         for item in frozen["projects"]:
             assert set(item) == {"name", "review_state", "brief", "owner_steps", "oldest_answer_days"}
             assert item["review_state"] == "reviewed"
-            assert set(item["brief"]) == {"headline", "needs_you"}
+            assert set(item["brief"]) == {"needs_you"}
         task_id = task["id"]
     assert review.review_tick(NOW + 1) == 0
     result = {"conflicts": [], "priorities": ["Meeting Plan: Book the room."], "shared_blockers": []}
