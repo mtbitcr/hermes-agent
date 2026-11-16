@@ -5,8 +5,9 @@ prepare verifies the pin and stores the hashed capture kit on the card; judge re
 bundles and pictures, runs the measurement check (design_compare_judge) and the pixel check
 (design_compare_pixels), stores the crops and returns findings for the typed handback, at most four
 undecided regions to look at, or verdict stop with one plain question for the owner; classify records
-the reviewer's judgment of undecided regions. Every call passes check_design_access first, and only
-the reviewer on a review run gets through.
+the reviewer's judgment of undecided regions. Every call passes check_design_access first; prepare, judge
+and classify let only the reviewer on a review run through, designer_kit (design_compare_kit) only the
+designer on its own card outside a review run.
 """
 
 import base64
@@ -24,6 +25,7 @@ from tools.design_compare_judge import (
     BOX_TOLERANCE, PIXEL_CHANNEL_DELTA, PIXEL_REGION_MIN_PIXELS, PIXEL_REGION_MIN_SIDE, WIDTHS, Finding, _entries,
     _name, compare_bundles, parse_allowed_changes,
 )
+from tools.design_compare_kit import deliver
 from tools.design_compare_pixels import (
     MAX_CROP_BYTES, _rect, _rgb, attach_regions, compare_element, compare_pages, cut_crops,
 )
@@ -405,18 +407,19 @@ def _classify(kb, conn, ctx, task, args):
                        "next": "Call judge again with the same captures."})
 
 
-_ACTIONS = {"prepare": _prepare, "judge": _judge, "classify": _classify}
+_ACTIONS = {"prepare": _prepare, "judge": _judge, "classify": _classify,
+            "designer_kit": lambda kb, conn, ctx, task, args: deliver(kb, conn, ctx)}
 
 
 def design_compare(args: dict, task_id: Optional[str] = None):
     access = check_design_access(_config())
     if not access.allowed:
         return tool_error(REFUSED + access.reason)
-    if access.role != REVIEWER:
-        return tool_error(REFUSED + NOT_REVIEWER)
     action = args.get("action")
+    if access.role != REVIEWER and action != "designer_kit":  # designer_kit checks its caller itself
+        return tool_error(REFUSED + NOT_REVIEWER)
     if action not in _ACTIONS:
-        return tool_error("action must be prepare, judge or classify")
+        return tool_error("action must be prepare, judge, classify or designer_kit")
     from hermes_cli import kanban_db as kb
 
     ctx = _Run(os.environ["HERMES_KANBAN_TASK"], int(os.environ["HERMES_KANBAN_RUN_ID"]),
@@ -436,7 +439,9 @@ DESIGN_COMPARE_SCHEMA = {
         "and says what to import. judge "
         "reads the exported capture bundles and pictures and returns findings to submit unchanged, at most 4 "
         "undecided regions to look at, or verdict stop with one question for the owner. classify records your "
-        "judgment of undecided regions."
+        "judgment of undecided regions. designer_kit is the designer's alone, on its own card outside a review "
+        "run: it stores the capture kit, the judge and the design-offer scripts on this card with one SHA-256 "
+        "each, to import into one folder."
     ),
     "parameters": {
         "type": "object",
