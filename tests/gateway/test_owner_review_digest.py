@@ -165,11 +165,9 @@ async def test_review_prose_cannot_repeat_a_live_wait_question(root, ready, anno
         registry.execute("UPDATE portfolio_review_briefs SET priorities=?", (json.dumps(["Meeting Plan: " + quote]),))
         registry.commit()
     digest = importlib.import_module("gateway.owner_review_digest")
-    assert await digest.tick(runner) == (0 if announced else 1)
-    if not announced:
-        assert adapter.sent[0][1].splitlines()[1:] == [NOTES_LINE, "Meeting Plan: 1 answer waiting on Decisions"]
-    else:
-        assert adapter.sent == []
+    assert await digest.tick(runner) == 1
+    # A told wait is named as an untold one is, and the quote stays out in both cases.
+    assert adapter.sent[0][1].splitlines()[1:] == [NOTES_LINE, "Meeting Plan: An answer is waiting on Decisions."]
 
 
 def test_the_compared_form_splits_words_at_punctuation_and_also_drops_punctuation_inside_a_word():
@@ -240,14 +238,11 @@ async def test_the_registered_watcher_never_sends_a_live_question_quoted_without
         registry.commit()
     await asyncio.wait_for(watcher(interval=0), 15)
     assert all(quote not in text for _chat, text in adapter.sent)
-    if announced:
-        # The quote was the only news, and a digest with nothing to report is not sent.
-        assert adapter.sent == []
-    else:
-        # The headline cases empty the stored advice above, so their second line is the no-advice line.
-        second = "Raphael has no advice across your projects today." if source == "headline" else NOTES_LINE
-        assert adapter.sent == [(HOME_CHAT, "\n".join(
-            ["Your daily project review (2026-11-10)", second, "Meeting Plan: 1 answer waiting on Decisions"]))]
+    # The guard drops the quote, so the owner line of the wait is all that the digest holds, told or not.
+    # The headline cases empty the stored advice above, so their second line is the no-advice line.
+    second = "Raphael has no advice across your projects today." if source == "headline" else NOTES_LINE
+    assert adapter.sent == [(HOME_CHAT, "\n".join(
+        ["Your daily project review (2026-11-10)", second, "Meeting Plan: An answer is waiting on Decisions."]))]
 
 
 @pytest.mark.asyncio
@@ -311,7 +306,7 @@ async def test_an_unproven_portfolio_or_an_unread_board_leaves_the_day_unsent(ro
     if fault == "board_unread":
         unreadable[0] = False
         assert await digest.tick(_runner(adapter)) == 1
-        assert "Meeting Plan: 1 answer waiting on Decisions" in adapter.sent[0][1]
+        assert "Meeting Plan: An answer is waiting on Decisions." in adapter.sent[0][1]
 
 
 @pytest.mark.asyncio
@@ -372,7 +367,7 @@ async def test_wait_counts_lead_after_the_notes_line_and_survive_the_cut(root, r
     assert await digest.tick(_runner(adapter)) == 1
     text = adapter.sent[0][1]
     assert len(text) == 1500 and text.endswith("…")
-    assert text.splitlines()[1:3] == [NOTES_LINE, "Project 11: 1 answer waiting on Decisions"]
+    assert text.splitlines()[1:3] == [NOTES_LINE, "Project 11: An answer is waiting on Decisions."]
     assert text.splitlines()[3] == "Meeting Plan: " + headline
 
 
@@ -770,7 +765,8 @@ async def test_the_digest_adds_headlines_and_only_unannounced_wait_counts_withou
     assert await digest.tick(runner) == 1
     text = adapter.sent[0][1]
     assert "Meeting Plan: The room is booked." in text
-    assert "1 answer waiting on Decisions" in text
+    # The told wait and the new wait are both open owner steps of the Project, named by one line.
+    assert "Meeting Plan: 2 answers are waiting on Decisions." in text
     assert "Which room" not in text and "Which meal" not in text
 
 
