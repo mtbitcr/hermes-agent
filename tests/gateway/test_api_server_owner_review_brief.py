@@ -823,9 +823,8 @@ async def test_the_closed_window_keeps_the_latest_twenty_and_cannot_hide_an_olde
     assert times[-1] == NOW - 192 * 3600
 
 
-@pytest.fixture
-def accepted_closure(project_review):
-    """An owner-accepted suggestion closed through the kernel after its made-from card was delivered."""
+def _accepted_suggestion(project_review):
+    """An owner-accepted suggestion whose made-from card was delivered; this closes nothing."""
     owner = ow.OwnerContext(actor="default", profile="default", session="accepted-closure")
     with kb.connect_closing(board=project_review["board"]) as board:
         suggestion = kb.create_recommendation(
@@ -850,12 +849,26 @@ def accepted_closure(project_review):
             board, title="Reserve a venue", project_id=project_review["project_id"], made_from_recommendation=suggestion,
         )
         assert kb.complete_task(board, delivered, summary="The venue is reserved.")
-        assert kb.close_recommendation_delivered(
-            board, suggestion, delivered, reason="The venue is reserved.", review_date="2026-11-10",
-            expected_lifecycle_version=version,
-        )["status"] == "closed"
     return {**project_review, "suggestion_id": suggestion, "card_id": delivered, "version": version,
             "decision_ref": pending["decision_ref"]}
+
+
+@pytest.fixture
+def accepted_closure(project_review, tmp_path):
+    """The accepted suggestion with the closure row the kernel close writes for its delivered made-from card."""
+    accepted = _accepted_suggestion(project_review)
+    # Seeded by plain SQL outside the code under test, with the kernel close's values,
+    # so that the reader and Undo tests reach their requests on any kernel.
+    project_board = tmp_path / ".hermes" / "kanban" / "boards" / accepted["board"] / "kanban.db"
+    with contextlib.closing(sqlite3.connect(project_board)) as conn:
+        conn.execute(
+            "INSERT INTO recommendation_closures (recommendation_id,project_id,card_id,card_state,reason,closed_by,"
+            "review_date,closed_at,undone_at,undone_by,undo_reason) VALUES (?,?,?,?,?,?,?,?,NULL,NULL,NULL)",
+            (accepted["suggestion_id"], accepted["project_id"], accepted["card_id"], "done", "The venue is reserved.",
+             "project-review", "2026-11-10", NOW),
+        )
+        conn.commit()
+    return accepted
 
 
 @pytest.mark.asyncio
@@ -974,3 +987,34 @@ async def test_a_worker_environment_cannot_undo_an_accepted_closure_and_the_owne
     ) == [(1,)]
     assert _dump(worker_board) == before[worker_board]
     assert _dump(registry_path) == before[registry_path]
+
+
+@pytest.mark.asyncio
+async def test_an_accepted_suggestion_closed_through_the_kernel_is_listed_and_its_undo_keeps_it_accepted(
+    project_review,
+):
+    accepted = _accepted_suggestion(project_review)
+    suggestion, ref = accepted["suggestion_id"], accepted["decision_ref"]
+    with kb.connect_closing(board=accepted["board"]) as board:
+        assert kb.close_recommendation_delivered(
+            board, suggestion, accepted["card_id"], reason="The venue is reserved.", review_date="2026-11-10",
+            expected_lifecycle_version=accepted["version"],
+        )["status"] == "closed"
+    async with TestClient(TestServer(app())) as client:
+        response = await client.get(CLOSED)
+        assert response.status == 200
+        [item] = (await response.json())["closed"]
+        assert item == {
+            "decision_ref": ref, "project_slug": accepted["slug"],
+            "project_name": "Meeting Plan", "title": "Book the room", "card_title": "Reserve a venue",
+            "reason": "The venue is reserved.", "closed_at": NOW,
+        }
+        response = await client.post(
+            f"/v1/owner-workspace/decisions/{ref}/undo_close",
+            json={"reason": "The venue needs a check.", "expected_closed_at": NOW},
+        )
+        assert response.status == 200
+    with kb.connect_closing(board=accepted["board"]) as board:
+        assert tuple(board.execute(
+            "SELECT recommendation_decision,recommendation_lifecycle_version FROM tasks WHERE id=?", (suggestion,),
+        ).fetchone()) == ("accepted", accepted["version"])
