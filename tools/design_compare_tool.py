@@ -1,4 +1,5 @@
-"""design_compare: the reviewer compares a website card with the chosen design file pinned in its body.
+"""design_compare: the reviewer compares a website card with the chosen design file pinned in its body or
+recorded by its designer card.
 
 prepare verifies the pin and stores the hashed capture kit on the card; judge reads the exported
 bundles and pictures, runs the measurement check (design_compare_judge) and the pixel check
@@ -41,6 +42,7 @@ RECORD = "design_compare_regions.json"
 REFUSED = "design compare refused: "
 NOT_REVIEWER = "only the reviewer may use it, in a review run"
 NO_PIN = "this card names no chosen design file"
+NO_RECORD = "the chosen design has no full-page design file on its designer card"
 NO_PAGES = "this card names no pages to compare"
 NO_CANDIDATE = "this review run names no reviewed candidate"
 MISMATCH = ("The chosen design file for '{title}' is not the one this card was created with. "
@@ -76,9 +78,39 @@ def _lines(body: str, prefix: str) -> list:
     return [line.rstrip() for line in body.splitlines() if line.startswith(prefix)]
 
 
+def _recorded(kb, conn, parents):
+    """For a body with no pin line: the one direct parent carrying the owner's design_option_chosen event, with the
+    pin and pages lines of the design_pin record in its latest completed run's metadata. None when no parent
+    carries the event; the refusal when there is no one readable record."""
+    from hermes_cli.owner_design_choices import CHOSEN_EVENT
+
+    chosen = [p for p in parents if any(e.kind == CHOSEN_EVENT for e in kb.list_events(conn, p))]
+    if not chosen:
+        return None
+    runs = kb.list_runs(conn, chosen[0], state_type="outcome", state_name="completed") if len(chosen) == 1 else []
+    meta = runs[-1].metadata if runs else None
+    record = meta.get("design_pin") if isinstance(meta, dict) else None
+    record = record if isinstance(record, dict) else {}
+    pin = (f"Prototype pin: attachment={record.get('attachment_id')} sha256={record.get('sha256')} "
+           f"file={record.get('file')}")
+    if not _PIN.fullmatch(pin):  # two chosen designs, no record, or one that names no full page
+        return tool_error(NO_RECORD)
+    pages = record.get("pages")
+    if isinstance(pages, list) and all(isinstance(page, str) for page in pages):
+        return chosen, [pin], ["Compare pages: " + " ".join(pages)]
+    return chosen, [pin], []
+
+
 def _pinned(kb, conn, ctx, task, action):
-    """The pinned prototype verified (attachment, sha256, pages, candidate digest), or the result to return."""
+    """The pinned prototype verified (attachment, sha256, pages, candidate digest), or the result to return. The
+    pin is the body's line, else the chosen designer card's record, whose file must be on that card."""
     pins, pages = _lines(task.body or "", "Prototype pin:"), _lines(task.body or "", "Compare pages:")
+    owners = kb.parent_ids(conn, task.id)  # never the build card itself
+    recorded = None if pins else _recorded(kb, conn, owners)
+    if isinstance(recorded, str):
+        return recorded
+    if recorded:
+        owners, pins, pages = recorded[0], recorded[1], pages or recorded[2]
     pin = _PIN.fullmatch(pins[0]) if len(pins) == 1 else None
     if pin is None:
         return tool_error(NO_PIN)
@@ -88,7 +120,7 @@ def _pinned(kb, conn, ctx, task, action):
     stop = json.dumps({"action": action, "verdict": "stop", "question": MISMATCH.format(title=task.title)})
     att = kb.get_attachment(conn, int(pin.group(1)))
     if (att is None or not att.filename.lower().endswith(".html") or att.size > MAX_PROTOTYPE_BYTES
-            or att.task_id not in kb.parent_ids(conn, task.id)):  # never the build card itself
+            or att.task_id not in owners):
         return stop
     try:
         data = kb.read_attachment_bytes(att, board=ctx.board)
@@ -400,7 +432,8 @@ DESIGN_COMPARE_SCHEMA = {
     "name": "design_compare",
     "description": (
         "Reviewer only, in a review run: compare this website card with the chosen design file pinned in its "
-        "body. prepare verifies the pin, stores the capture kit on this card and says what to import. judge "
+        "body or recorded by its designer card. prepare verifies the pin, stores the capture kit on this card "
+        "and says what to import. judge "
         "reads the exported capture bundles and pictures and returns findings to submit unchanged, at most 4 "
         "undecided regions to look at, or verdict stop with one question for the owner. classify records your "
         "judgment of undecided regions."
