@@ -54,10 +54,17 @@ def record_made_from(conn: sqlite3.Connection, card_id: str, recommendation_id: 
     """The kernel's lineage of a card it creates from a suggestion, in the transaction that inserts the card."""
     card = conn.execute("SELECT project_id,task_kind FROM tasks WHERE id=?", (card_id,)).fetchone()
     source = conn.execute(
-        "SELECT project_id FROM tasks WHERE id=? AND task_kind='recommendation'", (recommendation_id,),
+        "SELECT project_id,review_policy,recommendation_decision FROM tasks WHERE id=? AND task_kind='recommendation'",
+        (recommendation_id,),
     ).fetchone() if isinstance(recommendation_id, str) else None
+    # Only an owner's suggestion still open to delivery, with no live closure and no linked card yet, gets a link.
     if (card is None or card["task_kind"] != "work" or not card["project_id"] or source is None
-            or source["project_id"] != card["project_id"]):
+            or source["project_id"] != card["project_id"] or source["review_policy"] != "owner"
+            or (source["recommendation_decision"] or "pending") not in ("pending", "accepted")
+            or has_live_recommendation_closure(conn, recommendation_id)
+            or conn.execute(
+                "SELECT 1 FROM recommendation_made_from WHERE recommendation_id=?", (recommendation_id,),
+            ).fetchone() is not None):
         raise ValueError("made_from_recommendation must name a suggestion of the card's Project")
     conn.execute(
         "INSERT INTO recommendation_made_from (card_id,recommendation_id,recorded_at) VALUES (?,?,?)",
@@ -142,7 +149,9 @@ def close_recommendation_delivered(
         snapshot = kb.recommendation_lifecycle_snapshot(row)
         if snapshot["lifecycle_version"] != expected_lifecycle_version:
             raise ValueError("recommendation lifecycle version mismatch")
-        if snapshot["decision"] != "pending" or row["status"] != "review":
+        # A pending suggestion waits in review; an accepted one closes only while nothing of it is applied.
+        if not ((snapshot["decision"] == "pending" and row["status"] == "review")
+                or (snapshot["decision"] == "accepted" and snapshot["effective_state"] == "none")):
             raise ValueError("not_waiting")
         project_id = row["project_id"]
         card = conn.execute(
@@ -208,7 +217,9 @@ def undo_recommendation_closure(
         raise ValueError("review_closure_reason_invalid")
     with kb.write_txn(conn):
         row = kb._recommendation_row(conn, recommendation_id)
-        if ((row["recommendation_decision"] or "pending") != "pending" or row["status"] != "review"
+        decision = row["recommendation_decision"] or "pending"
+        # Undo never changes the owner's decision: an accepted suggestion stays accepted.
+        if (not ((decision == "pending" and row["status"] == "review") or decision == "accepted")
                 or not has_live_recommendation_closure(conn, recommendation_id)):
             return {"status": "not_waiting", "recommendation_id": recommendation_id}
         now = int(time.time())

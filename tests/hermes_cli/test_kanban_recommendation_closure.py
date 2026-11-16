@@ -216,6 +216,91 @@ def test_a_legacy_board_without_the_lineage_table_reads_as_no_made_from_link(pro
         _close(board, suggestion, delivered, version)
 
 
+def _decide(board, suggestion, decision="accepted"):
+    """The owner's decision on the owner screen; it raises the lifecycle version by one."""
+    return kb.decide_recommendation_on_owner_screen(
+        board, suggestion, decision=decision, reason="Keep the room work.", actor="default",
+        owner_screen_ref="meeting-owner-screen", expected_lifecycle_version=_version(board, suggestion),
+    )["lifecycle_version"]
+
+
+def _refused_made_from(board, pid, suggestion):
+    before = list(board.iterdump())
+    with pytest.raises(ValueError, match="made_from_recommendation"):
+        kb.create_task(board, title="Reserve a venue", project_id=pid, made_from_recommendation=suggestion)
+    # No card, no event and no lineage row.
+    assert list(board.iterdump()) == before
+
+
+@pytest.mark.parametrize("decision", ["rejected", "deferred"])
+def test_a_made_from_link_to_a_rejected_or_deferred_suggestion_creates_nothing(project_board, decision):
+    board, pid = project_board
+    suggestion = _suggestion(board, pid)
+    _decide(board, suggestion, decision)
+
+    _refused_made_from(board, pid, suggestion)
+    assert board.execute("SELECT COUNT(*) FROM recommendation_made_from").fetchone()[0] == 0
+
+
+def test_a_second_card_made_from_a_suggestion_with_a_linked_card_creates_nothing(project_board):
+    board, pid = project_board
+    suggestion = _suggestion(board, pid)
+    first = kb.create_task(board, title="Book a room", project_id=pid, made_from_recommendation=suggestion)
+
+    _refused_made_from(board, pid, suggestion)
+    assert [tuple(row) for row in board.execute(
+        "SELECT card_id,recommendation_id FROM recommendation_made_from",
+    )] == [(first, suggestion)]
+
+
+def test_a_card_made_from_a_suggestion_with_a_live_closure_creates_nothing(project_board):
+    board, pid = project_board
+    suggestion, delivered, version = _delivered_pair(board, pid)
+    assert _close(board, suggestion, delivered, version)["status"] == "closed"
+
+    _refused_made_from(board, pid, suggestion)
+    assert board.execute("SELECT COUNT(*) FROM recommendation_made_from").fetchone()[0] == 0
+
+
+def test_an_accepted_suggestion_with_a_delivered_made_from_card_closes_and_stays_accepted(project_board):
+    board, pid = project_board
+    suggestion = _suggestion(board, pid)
+    version = _decide(board, suggestion)
+    made = kb.create_task(board, title="Reserve a venue", project_id=pid, made_from_recommendation=suggestion)
+    assert kb.complete_task(board, made, summary="The venue is reserved.")
+    before_suggestion = dict(board.execute("SELECT * FROM tasks WHERE id=?", (suggestion,)).fetchone())
+
+    assert _close(board, suggestion, made, version) == {"status": "closed", "recommendation_id": suggestion, "closed_at": NOW}
+
+    assert tuple(board.execute(
+        "SELECT card_id,card_state,undone_at FROM recommendation_closures WHERE recommendation_id=?", (suggestion,),
+    ).fetchone()) == (made, "done", None)
+    after = dict(board.execute("SELECT * FROM tasks WHERE id=?", (suggestion,)).fetchone())
+    assert after == before_suggestion and after["recommendation_decision"] == "accepted"
+
+
+def test_an_accepted_suggestion_already_being_applied_is_not_closed_and_its_unapplied_twin_is(project_board):
+    board, pid = project_board
+    cards, versions = {}, {}
+    for subject, label in (("meeting-room", "Book the room"), ("meeting-speaker", "Call the speaker")):
+        suggestion = _suggestion(board, pid, subject=subject, label=label)
+        versions[suggestion] = _decide(board, suggestion)
+        cards[suggestion] = kb.create_task(board, title="Reserve a venue", project_id=pid,
+                                           made_from_recommendation=suggestion)
+        assert kb.complete_task(board, cards[suggestion], summary="The venue is reserved.")
+    applied, twin = cards
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET recommendation_effective_state='staged' WHERE id=?", (applied,))
+    before = list(board.iterdump())
+
+    with pytest.raises(ValueError, match="not_waiting"):
+        _close(board, applied, cards[applied], versions[applied])
+    assert list(board.iterdump()) == before
+
+    # The twin differs only in what is applied, so the state check is what refuses the first one.
+    assert _close(board, twin, cards[twin], versions[twin])["status"] == "closed"
+
+
 @pytest.mark.parametrize(("first_time", "last_time", "review_day", "next_day"), [
     ("2026-11-09T23:05:00+00:00", "2026-11-10T22:59:59+00:00", "2026-11-10", "2026-11-11"),
     # The 23-hour and the 25-hour Vienna days.
