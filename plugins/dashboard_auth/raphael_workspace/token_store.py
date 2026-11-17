@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_constants import get_hermes_home, secure_parent_dir
-from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log, audit_log_batch
 # Frozen authority contract (Item 32G-A) — not configurable. Widening any of
 # these would widen the credential beyond the one surface it was designed
 # for, so there is deliberately no code path that accepts a different value.
@@ -132,6 +132,12 @@ DEFAULT_TTL_SECONDS = 90 * 86400  # 90 days
 MAX_TTL_SECONDS = 397 * 86400  # ~13 months
 RECOMMENDATIONS_DEFAULT_TTL_SECONDS = 8 * 3600
 RECOMMENDATIONS_MAX_TTL_SECONDS = 8 * 3600
+
+# Self-renewal (owner decision of 16 November): a still-valid key may ask for
+# its successor only in its last 21 days, and a successor younger than 15
+# minutes means a renewal is already under way.
+RENEWAL_WINDOW_SECONDS = 21 * 86400
+RENEWAL_RACE_SECONDS = 15 * 60
 
 _FIXED_TOKEN_POLICIES = {
     WORKSPACE_SURFACE: FixedTokenPolicy(
@@ -223,6 +229,14 @@ class TokenStoreError(Exception):
 
 class UnknownTokenError(TokenStoreError):
     """``revoke()`` was asked about a token_id that does not exist."""
+
+
+class NotDue(TokenStoreError):
+    """``renew()`` was asked by a key that ends more than 21 days from now."""
+
+
+class AlreadyRenewed(TokenStoreError):
+    """``renew()`` was asked by a key whose successor is under 15 minutes old."""
 
 
 class PlaintextOutputError(Exception):
@@ -730,6 +744,139 @@ def revoke(token_id: str) -> TokenRecord:
         revoked_at=updated.revoked_at,
     )
     return updated
+
+
+def _renewal_policy(token_id: str) -> FixedTokenPolicy:
+    """The fixed policy a key renews under; a recommendations key never renews."""
+    policy = policy_for_token_id(token_id)
+    if policy is None:
+        raise UnknownTokenError("calling token is not active")
+    if policy.surface == RECOMMENDATIONS_SURFACE:
+        raise TokenStoreError("this credential surface cannot renew itself")
+    return policy
+
+
+def renew(
+    caller_token_id: str, out: Optional[Path] = None
+) -> tuple[TokenRecord, str]:
+    """Mint the successor of a still-valid key; return it with its secret.
+
+    The whole check-and-append runs in one ``_locked_store()`` block, so two
+    racing renewals cannot both pass the successor check. The caller must be
+    active, of a fixed surface other than recommendations, and end within 21
+    days (else :class:`NotDue`). A same-surface key issued after it less than
+    15 minutes ago means a renewal is under way (:class:`AlreadyRenewed`); an
+    older one was never confirmed (its ``retire_older`` would have revoked
+    the caller), so it is revoked here. The issuance is audited strictly,
+    with ``replaces_credential_id``, before the new record becomes active.
+    The caller is never revoked: on any failure it stays valid and no record
+    is added. With ``out`` the bearer also goes there, written once.
+    """
+    policy = _renewal_policy(caller_token_id)
+    with _locked_store():
+        records = _load_records_unlocked()
+        now = int(time.time())
+        caller = next((r for r in records if r.token_id == caller_token_id), None)
+        if caller is None or caller.status != "active":
+            raise UnknownTokenError("calling token is not active")
+        if caller.expires_at - now > RENEWAL_WINDOW_SECONDS:
+            raise NotDue("calling token is not due for renewal")
+        successors = [
+            r
+            for r in records
+            if r.status == "active"
+            and r.issued_at > caller.issued_at
+            and policy_for_token_id(r.token_id) == policy
+        ]
+        if any(now - r.issued_at < RENEWAL_RACE_SECONDS for r in successors):
+            raise AlreadyRenewed("calling token already has a recent successor")
+        token_id = _new_token_id(policy)
+        if any(existing.token_id == token_id for existing in records):
+            raise TokenStoreError("generated token_id already exists")
+        secret = _new_secret()
+        record = TokenRecord(
+            token_id=token_id,
+            digest=hashlib.sha256(secret.encode("utf-8")).hexdigest(),
+            principal=policy.principal,
+            scope=policy.scope,
+            project=policy.project,
+            board=policy.board,
+            grant=policy.grant,
+            issued_at=now,
+            expires_at=now + policy.default_ttl_seconds,
+            revoked_at=None,
+        )
+        record.validate()
+        if out is not None:
+            write_plaintext_once(out, f"{token_id}.{secret}\n")
+        try:
+            issued = {
+                "provider": policy.provider,
+                "principal": policy.principal,
+                "credential_id": token_id,
+                "scope": policy.scope,
+                "project": policy.project,
+                "board": policy.board,
+                "grant": policy.grant,
+                "expires_at": record.expires_at,
+                "replaces_credential_id": caller.token_id,
+                "decision": "allow",
+            }
+            revoked = [
+                {
+                    "provider": policy.provider,
+                    "principal": policy.principal,
+                    "credential_id": orphan.token_id,
+                    "grant": policy.grant,
+                    "decision": "revoke",
+                    "revoked_at": now,
+                }
+                for orphan in successors
+            ]
+            audit_log_batch(
+                [(AuditEvent.MACHINE_TOKEN_ISSUED, issued)]
+                + [(AuditEvent.MACHINE_TOKEN_REVOKED, fields) for fields in revoked],
+                strict=True,
+            )
+            orphans = {orphan.token_id for orphan in successors}
+            records = [
+                replace(r, revoked_at=now) if r.token_id in orphans else r
+                for r in records
+            ]
+            records.append(record)
+            _save_records_unlocked(records)
+        except Exception:
+            if out is not None:
+                try:
+                    out.unlink()
+                except OSError:
+                    pass
+            raise
+    return record, secret
+
+
+def retire_older(successor_token_id: str) -> int:
+    """Revoke the active same-surface keys issued before ``successor_token_id``.
+
+    Signed by the successor once the owner app holds it, which confirms the
+    renewal. Each key goes through :func:`revoke`, which audits it; newer
+    keys and other surfaces are left alone. Returns how many were retired.
+    """
+    policy = _renewal_policy(successor_token_id)
+    records = load_records()
+    successor = next((r for r in records if r.token_id == successor_token_id), None)
+    if successor is None or successor.status != "active":
+        raise UnknownTokenError("calling token is not active")
+    older = [
+        r.token_id
+        for r in records
+        if r.status == "active"
+        and r.issued_at < successor.issued_at
+        and policy_for_token_id(r.token_id) == policy
+    ]
+    for token_id in older:
+        revoke(token_id)
+    return len(older)
 
 
 def verify(token_id: str, secret: str) -> Optional[TokenRecord]:
