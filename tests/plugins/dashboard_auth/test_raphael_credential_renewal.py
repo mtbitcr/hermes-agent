@@ -288,6 +288,73 @@ def test_retire_older_revokes_only_older_keys_of_same_surface(home, clock, clien
     assert token_store.retire_older(successor.split(".", 1)[0]) == 0
 
 
+@pytest.mark.parametrize("surface", FAMILIES)
+def test_duplicate_renewal_in_the_issuance_second_is_already_renewed(home, clock, client, surface):
+    caller, bearer = _issue(home, surface=surface)
+    first = _post(client, surface, "renew", bearer)  # still the caller's issuance second
+    assert first.status_code == 200
+    assert token_store.find(first.json()["token"].split(".", 1)[0]).issued_at == caller.issued_at
+    before = _state()
+
+    second = _post(client, surface, "renew", bearer)
+
+    assert second.status_code == 409
+    assert second.json() == {"error": "already_renewed"}
+    assert _state() == before
+    assert _verifies(bearer) and _verifies(first.json()["token"])
+
+
+@pytest.mark.parametrize("surface", FAMILIES)
+def test_retry_one_second_after_a_same_second_renewal_is_already_renewed(home, clock, client, surface):
+    caller, bearer = _issue(home, surface=surface)
+    first = _post(client, surface, "renew", bearer)  # in the caller's issuance second
+    assert first.status_code == 200
+    assert token_store.find(first.json()["token"].split(".", 1)[0]).issued_at == caller.issued_at
+    clock["t"] += 1
+    before = _state()
+
+    retry = _post(client, surface, "renew", bearer)
+
+    assert retry.status_code == 409
+    assert retry.json() == {"error": "already_renewed"}
+    assert _state() == before
+    assert _verifies(bearer) and _verifies(first.json()["token"])
+
+
+@pytest.mark.parametrize("surface", FAMILIES)
+def test_same_second_orphan_successor_is_revoked_after_15_minutes(home, clock, client, surface):
+    older, older_bearer = _issue(home, surface=surface)  # same second, before the caller: never a successor
+    caller, bearer = _issue(home, surface=surface)
+    orphan, _ = token_store.renew(caller.token_id)  # same second; minted, never saved by the app
+    assert older.issued_at == caller.issued_at == orphan.issued_at
+    clock["t"] += 15 * 60 + 1
+
+    response = _post(client, surface, "renew", bearer)
+
+    assert response.status_code == 200
+    assert token_store.find(orphan.token_id).status == "revoked"
+    assert _verifies(bearer) and _verifies(response.json()["token"]) and _verifies(older_bearer)
+    revoked = _audit_events(home, AuditEvent.MACHINE_TOKEN_REVOKED)
+    assert [r["credential_id"] for r in revoked] == [orphan.token_id]
+
+
+@pytest.mark.parametrize("surface", FAMILIES)
+def test_retire_older_by_a_same_second_successor_revokes_its_predecessor(home, clock, client, surface):
+    predecessor, predecessor_bearer = _issue(home, surface=surface)
+    other, other_bearer = _issue(home, surface=FAMILIES[FAMILIES.index(surface) - 1])
+    successor = _post(client, surface, "renew", predecessor_bearer).json()["token"]
+    newer, newer_bearer = _issue(home, surface=surface)  # same second, after the successor
+    successor_record = token_store.find(successor.split(".", 1)[0])
+    assert predecessor.issued_at == other.issued_at == successor_record.issued_at == newer.issued_at
+
+    response = _post(client, surface, "retire-older", successor)
+
+    assert response.status_code == 200
+    assert response.json() == {"retired": 1}
+    assert not _verifies(predecessor_bearer)
+    assert _verifies(successor) and _verifies(newer_bearer) and _verifies(other_bearer)
+
+
 def test_cross_surface_and_recommendations_are_refused(home, clock, client):
     workspace, workspace_bearer = _issue(home)
     connections, connections_bearer = _issue(home, surface="connections")

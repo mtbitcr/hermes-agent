@@ -756,6 +756,18 @@ def _renewal_policy(token_id: str) -> FixedTokenPolicy:
     return policy
 
 
+def _issuance_order(records: list[TokenRecord]) -> dict[str, tuple[int, int]]:
+    """Each record's place in the one issuance order: ``issued_at``, then registry position.
+
+    ``issued_at`` counts whole seconds, so keys minted in the same second are
+    told apart by where they were appended. No write moves a record (``revoke``
+    rewrites it in place; ``issue`` and ``renew`` append), so the order holds
+    when the registry is rewritten. The renewal race check, the orphan cleanup
+    and the retirement all read this one order, so they cannot disagree.
+    """
+    return {r.token_id: (r.issued_at, position) for position, r in enumerate(records)}
+
+
 def renew(
     caller_token_id: str, out: Optional[Path] = None
 ) -> tuple[TokenRecord, str]:
@@ -781,11 +793,12 @@ def renew(
             raise UnknownTokenError("calling token is not active")
         if caller.expires_at - now > RENEWAL_WINDOW_SECONDS:
             raise NotDue("calling token is not due for renewal")
+        order = _issuance_order(records)
         successors = [
             r
             for r in records
             if r.status == "active"
-            and r.issued_at > caller.issued_at
+            and order[r.token_id] > order[caller.token_id]
             and policy_for_token_id(r.token_id) == policy
         ]
         if any(now - r.issued_at < RENEWAL_RACE_SECONDS for r in successors):
@@ -867,11 +880,12 @@ def retire_older(successor_token_id: str) -> int:
     successor = next((r for r in records if r.token_id == successor_token_id), None)
     if successor is None or successor.status != "active":
         raise UnknownTokenError("calling token is not active")
+    order = _issuance_order(records)
     older = [
         r.token_id
         for r in records
         if r.status == "active"
-        and r.issued_at < successor.issued_at
+        and order[r.token_id] < order[successor.token_id]
         and policy_for_token_id(r.token_id) == policy
     ]
     for token_id in older:
