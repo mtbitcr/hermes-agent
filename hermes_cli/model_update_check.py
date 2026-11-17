@@ -67,6 +67,8 @@ _ANSWER_RE = re.compile(rf"\s*{re.escape(PROBE_ANSWER)}[.!]?\s*")
 # estimate for one probe is about 2-8k tokens.
 _PROBE_MAX_TOKENS = 8000
 _PROBE_TIMEOUT_SECONDS = 120.0
+# The check's own clock for the probe's deadline; a test moves it instead of waiting.
+_clock = time.monotonic
 
 OWNER_TITLE = "A newer version of an AI model is ready for part of your team."
 _CHECKED = (
@@ -136,6 +138,9 @@ class ProbeReply:
     text: str
     input_tokens: int
     output_tokens: int
+    # From the send to the end of the reply's read, by the check's clock; None
+    # when the probe does not time its own send.
+    seconds: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -192,15 +197,69 @@ def _configured_routes(role: str) -> tuple:
     return tuple(routes)
 
 
-def _gateway_token() -> str:
+def _refresh_pending() -> bool:
+    """True when the legacy resolver would refresh an expired shared login, which writes it."""
     from agent import anthropic_credentials
 
-    # The resolver refreshes an expired shared login, which writes it; the
-    # check never asks then, so that sign-in stays unproven.
     login = anthropic_credentials.read_claude_code_credentials()
-    if login and login.get("refreshToken") and not anthropic_credentials.is_claude_code_token_valid(login):
+    return bool(login and login.get("refreshToken") and not anthropic_credentials.is_claude_code_token_valid(login))
+
+
+def _runtime_token(provider: str) -> str:
+    """The sign-in the runtime of ``provider`` selects now, in the runtime's own order.
+
+    ``runtime_provider._ladder_rungs`` takes the credential pool's choice
+    before the legacy environment resolver, and so does this, with no order of
+    its own. The pool is read with ``preview_runtime_selection``, which heals,
+    stores, leases, counts and refreshes nothing. Only when the pool has no
+    choice is the runtime's own legacy rung asked (``_anthropic_env_runtime``),
+    and never when it would refresh an expired shared login. Any other case is
+    "" and leaves the sign-in unproven; a store that cannot be read raises.
+    """
+    from agent.credential_pool import credential_pool_matches_provider, preview_runtime_selection
+    from hermes_cli import runtime_provider
+
+    entry, _borrowed = preview_runtime_selection(provider)
+    if entry is not None:
+        value = runtime_provider._pool_entry_api_key(entry)
+        base_url = runtime_provider._pool_entry_base_url(entry)
+        if value and credential_pool_matches_provider(provider, provider, base_url=base_url):
+            return str(value).strip()
+    if provider != "anthropic" or _refresh_pending():
         return ""
-    return (anthropic_credentials.resolve_anthropic_token() or "").strip()
+    try:
+        runtime = runtime_provider._anthropic_env_runtime(provider, _model_section())
+    except runtime_provider.AuthError:
+        return ""
+    return str(runtime.get("api_key") or "").strip()
+
+
+def _model_section() -> dict:
+    """The scope's ``model`` config section as the runtime loads it, read with no write.
+
+    ``runtime_provider._get_model_config`` reads it through ``load_config``,
+    which first builds the home's skeleton (directories and a default file).
+    So ``load_config``'s read-only steps run here on the file as written: its
+    canonical form, its ``${VAR}`` references in this scope and the managed
+    overlay. The legacy rung needs only the section's provider, base URL and
+    key hints; no file means no section.
+    """
+    from hermes_cli import config
+
+    canonical = config._canonicalize_config(config.read_raw_config())
+    loaded, _managed = config._merge_managed_overlay(config._expand_env_vars(canonical))
+    section = loaded.get("model")
+    if not isinstance(section, dict):
+        return {}
+    cfg = dict(section)
+    if isinstance(cfg.get("default"), dict) and not cfg.get("provider"):
+        cfg["provider"] = config.split_model_config_default(cfg["default"])[1]
+    return cfg
+
+
+def _gateway_token() -> str:
+    """The Anthropic account the runtime selects."""
+    return _runtime_token("anthropic")
 
 
 def _build_token() -> str:
@@ -212,12 +271,7 @@ def _build_token() -> str:
 
 def _codex_token() -> str:
     """The account the openai-codex runtime selects (web_server.py:7087-7107)."""
-    from agent.credential_pool import preview_runtime_selection
-
-    entry, _borrowed = preview_runtime_selection("openai-codex")
-    if entry is None:
-        return ""
-    return str(entry.runtime_api_key or entry.access_token or "").strip()
+    return _runtime_token("openai-codex")
 
 
 def _anthropic_ids(token: str):
@@ -309,7 +363,8 @@ def _in_scope(home, secrets: dict, reader: Callable[[], str]) -> str:
     home_token = set_hermes_home_override(home)
     secret_token = set_secret_scope(secrets)
     try:
-        return (reader() or "").strip()
+        with _no_log_records():
+            return (reader() or "").strip()
     finally:
         reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
@@ -346,8 +401,19 @@ def _role_sign_ins(role: str, provider: str) -> tuple:
     ``_SignIn``. The coding worker's builds sign in through the host resolver
     of the build machine, which prefers the build sign-in and can fall back to
     other credentials; which one it picks is proven by comparing its value
-    with the worker's own sign-ins in memory.
+    with the worker's own sign-ins in memory. A choice that cannot be read
+    without a refresh, a write or a lease is not proven, and neither is one
+    whose store raises; the reason names the error's type only.
     """
+    try:
+        with _no_log_records():
+            return _read_sign_ins(role, provider)
+    except Exception as exc:
+        logger.warning("model update check: a sign-in could not be read (%s)", type(exc).__name__)
+        return None, f"The role's own sign-in for this provider could not be read ({type(exc).__name__})."
+
+
+def _read_sign_ins(role: str, provider: str) -> tuple:
     from plugins.dashboard_auth.raphael_workspace import sandbox_dispatch
 
     if provider == "openai-codex":
@@ -362,6 +428,9 @@ def _role_sign_ins(role: str, provider: str) -> tuple:
         return None, "The role's own sign-in for this provider could not be proven."
     if role != sandbox_dispatch.WORKER_PROFILE:
         return (_SignIn("gateway", gateway),), ""
+    if _refresh_pending():
+        # The host resolver ends in the legacy resolver, which would refresh it.
+        return None, "The worker's builds would refresh a sign-in to say which account they use."
     used = sandbox_dispatch._resolve_host_credential()
     if not used:
         return None, "The worker's builds have no sign-in now, so the check cannot tell which account they use."
@@ -452,50 +521,107 @@ def _capability_row(provider: str, model: str) -> Capability:
 
 
 def _probe_call(provider: str, model: str, sign_in, effort: str, question: str) -> ProbeReply:
-    """One short call on this sign-in and model; the caller disables fallbacks.
+    """One request on this sign-in and model, and nothing else; the caller disables fallbacks.
 
     The client is built for exactly this provider, model and sign-in value,
     not through ``call_llm``: with fallbacks disabled that pins a call to the
     planning profile's main route, which refuses the candidate or swaps its
-    key. The request is sent once, with no retry, refresh, rotation or
-    fallback, and anything else is refused before it is sent.
+    key. Nor through the shared auxiliary wrappers, which repeat a refused
+    stream as a plain request, replace the output cap and the timeout, and log
+    raw error text: the probe calls the provider adapters' public functions.
+    The SDK never retries and a refusal ends the probe. No log record is made
+    from the build of the client to the read of the reply, nested errors
+    included (``_no_log_records``); the caller names only the error's type.
+    """
+    messages = [{"role": "user", "content": question}]
+    reasoning = None if effort in _NO_EFFORT else {"enabled": True, "effort": effort}
+    with _no_log_records():
+        value = _value_of(provider, sign_in)
+        if provider == "anthropic":
+            return _anthropic_probe(model, value, messages, reasoning)
+        if provider == "openai-codex":
+            return _codex_probe(model, value, messages, reasoning)
+    raise LookupError("the check has no probe for this provider")
+
+
+def _anthropic_probe(model: str, value: str, messages: list, reasoning: Optional[dict]) -> ProbeReply:
+    """One plain ``messages.create``: max_tokens 8000, a 120 s transport timeout, no retry."""
+    from agent import anthropic_adapter
+    from agent.anthropic_credentials import _is_oauth_token
+    from agent.auxiliary_client import _ANTHROPIC_DEFAULT_BASE_URL
+
+    kwargs = anthropic_adapter.build_anthropic_kwargs(
+        model=model,
+        messages=messages,
+        tools=None,
+        max_tokens=_PROBE_MAX_TOKENS,
+        reasoning_config=reasoning,
+        is_oauth=_is_oauth_token(value),
+        base_url=_ANTHROPIC_DEFAULT_BASE_URL,
+    )
+    # A model with a manual thinking budget raises the cap; that is no short probe.
+    if (kwargs.get("model"), kwargs.get("max_tokens")) != (model, _PROBE_MAX_TOKENS):
+        raise LookupError("the request would not go to exactly this model with the probe's cap")
+    # max_retries=0, and the timeout bounds read, write and pool (connect: 10 s).
+    client = anthropic_adapter.build_anthropic_client(
+        value, _ANTHROPIC_DEFAULT_BASE_URL, timeout=_PROBE_TIMEOUT_SECONDS
+    )
+    try:
+        sent = _clock()
+        reply = anthropic_adapter.create_anthropic_message(client, kwargs, prefer_stream=False)
+        seconds = _clock() - sent
+    finally:
+        client.close()
+    if not isinstance(getattr(reply, "content", None), list):
+        raise TypeError("the reply is not one message")
+    usage = getattr(reply, "usage", None)
+    return ProbeReply(
+        text="".join(str(getattr(block, "text", "") or "") for block in reply.content
+                     if getattr(block, "type", "") == "text"),
+        input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+        output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+        seconds=seconds,
+    )
+
+
+def _codex_probe(model: str, value: str, messages: list, reasoning: Optional[dict]) -> ProbeReply:
+    """One streamed Responses request through the Codex client: no retry, 120 s in total.
+
+    The service refuses an output cap field, so the bound is the client's
+    total timeout and the check's own clock (``_probe``).
     """
     from agent import auxiliary_client as aux
 
-    value = _value_of(provider, sign_in)
-    if provider == "anthropic":
-        client, final = aux._get_cached_client(provider, model, api_key=value)
-    elif provider == "openai-codex":
-        client = aux.CodexAuxiliaryClient(
-            aux._create_openai_client(
-                api_key=value,
-                base_url=aux._CODEX_AUX_BASE_URL,
-                default_headers=aux._codex_cloudflare_headers(value),
-            ),
-            model,
-        )
-        final = model
-    else:
-        raise LookupError("the check has no probe for this provider")
-    if client is None or final != model:
-        raise LookupError("no client for exactly this model and sign-in")
-    kwargs = aux._build_call_kwargs(
-        provider,
-        model,
-        [{"role": "user", "content": question}],
-        max_tokens=_PROBE_MAX_TOKENS,
-        timeout=_PROBE_TIMEOUT_SECONDS,
-        reasoning_config=None if effort in _NO_EFFORT else {"enabled": True, "effort": effort},
-        base_url=str(getattr(client, "base_url", "") or ""),
+    client = aux._create_openai_client(
+        api_key=value,
+        base_url=aux._CODEX_AUX_BASE_URL,
+        default_headers=aux._codex_cloudflare_headers(value),
+        max_retries=0,
     )
-    if kwargs.get("model") != model:
-        raise LookupError("the request would not go to exactly this model")
-    response = client.chat.completions.create(**kwargs)
+    try:
+        kwargs = aux._build_call_kwargs(
+            "openai-codex",
+            model,
+            messages,
+            max_tokens=_PROBE_MAX_TOKENS,
+            timeout=_PROBE_TIMEOUT_SECONDS,
+            reasoning_config=reasoning,
+            base_url=aux._CODEX_AUX_BASE_URL,
+        )
+        if kwargs.get("model") != model or kwargs.get("timeout") != _PROBE_TIMEOUT_SECONDS:
+            raise LookupError("the request would not go to exactly this model within the probe's time")
+        completions = aux.CodexAuxiliaryClient(client, model).chat.completions
+        sent = _clock()
+        response = completions.create(**kwargs)
+        seconds = _clock() - sent
+    finally:
+        client.close()
     usage = getattr(response, "usage", None)
     return ProbeReply(
         text=str(response.choices[0].message.content or ""),
         input_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
         output_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
+        seconds=seconds,
     )
 
 
@@ -728,8 +854,15 @@ def _answered(text: Optional[str]) -> bool:
 
 
 def _probe(seams: Seams, provider: str, model: str, sign_in, effort: str, label: str) -> dict:
-    started = time.monotonic()
+    """One probe's result; a reply after ``_PROBE_TIMEOUT_SECONDS`` by the check's clock fails.
+
+    The clock runs from the send to the reply when the probe times its own
+    send (``ProbeReply.seconds``), so a slow first build of a client is no
+    late reply; otherwise it runs over the whole call.
+    """
+    started = _clock()
     result = {"sign_in": label, "passed": False, "input_tokens": 0, "output_tokens": 0}
+    reply = None
     try:
         with _fallbacks_disabled():
             reply = seams.probe(provider, model, sign_in, effort, PROBE_QUESTION)
@@ -743,7 +876,13 @@ def _probe(seams: Seams, provider: str, model: str, sign_in, effort: str, label:
             input_tokens=int(reply.input_tokens),
             output_tokens=int(reply.output_tokens),
         )
-    result["seconds"] = round(time.monotonic() - started, 3)
+    seconds = _clock() - started
+    if reply is not None and reply.seconds is not None:
+        seconds = reply.seconds
+    result["seconds"] = round(seconds, 3)
+    if seconds > _PROBE_TIMEOUT_SECONDS:
+        # Too late to count, however it reads; the tokens it cost stay recorded.
+        result.update(passed=False, late=True)
     return result
 
 

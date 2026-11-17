@@ -961,9 +961,14 @@ def test_concurrent_runs_under_one_planning_card_file_at_most_one(world, monkeyp
 
 
 def _cli(world, seams, *argv, env=None):
-    """``hermes model update-check`` through the installed entry point, as the worker."""
+    """``hermes model update-check`` through the installed entry point, as the worker.
+
+    Where no ``hermes`` script is installed next to this Python, the target
+    the script would call (``[project.scripts]`` in pyproject.toml) runs.
+    """
     muc = _muc()
     env = dict(world.env if env is None else env)
+    script = Path(sys.executable).parent / "hermes"
     with pytest.MonkeyPatch.context() as patch:
         for key in [key for key in os.environ if key not in env]:
             patch.delenv(key)
@@ -972,7 +977,12 @@ def _cli(world, seams, *argv, env=None):
         patch.setattr(muc, "default_seams", lambda: seams)
         patch.setattr(sys, "argv", ["hermes", "model", "update-check", *argv])
         try:
-            runpy.run_path(str(Path(sys.executable).parent / "hermes"), run_name="__main__")
+            if script.exists():
+                runpy.run_path(str(script), run_name="__main__")
+            else:
+                from hermes_cli.main import main
+
+                sys.exit(main())
         except SystemExit as exc:
             assert exc.code in (None, 0), f"the command exited with {exc.code}"
     return _receipts(world)[-1]["payload"]
@@ -989,29 +999,68 @@ def _planner_pinned(world):
     return {**world.env, fallback_config.FALLBACKS_DISABLED_ENV: "1"}
 
 
-class _Wire:
-    """The fake client boundary: every client built and every request it was sent."""
+class _Http:
+    """The fake HTTP boundary under the real provider SDKs: every request sent, and its answer.
 
-    def __init__(self):
-        self.clients = []
-        self.sent = []
+    It answers each request in the format it asks for (a stream or one body),
+    with 7 input and 1 output tokens. A refusal (``status``) echoes the sign-in
+    the request carried, as a careless provider would. While a request is in
+    flight the check's own clock moves ``after`` seconds, so no test waits.
+    """
 
-    def client(self):
-        def create(**kwargs):
-            self.sent.append(kwargs)
-            return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content="45", tool_calls=None),
-                                         finish_reason="stop")],
-                usage=SimpleNamespace(prompt_tokens=7, completion_tokens=1),
-                model=kwargs.get("model"),
-            )
+    def __init__(self, monkeypatch, *, status=200, after=1.0):
+        import httpx
 
-        return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
-                               base_url="https://example.invalid/v1")
+        self.requests = []
+        self.status, self.after, self.now = status, after, 5000.0
+        monkeypatch.setattr(httpx.Client, "send", lambda _client, request, **_kwargs: self.answer(request))
+        monkeypatch.setattr(_muc(), "_clock", lambda: self.now, raising=False)
 
-    def cached_client(self, *args, **kwargs):
-        self.clients.append((args, kwargs))
-        return self.client(), args[1]
+    def sent(self):
+        return [json.loads(request.content) for request in self.requests]
+
+    @staticmethod
+    def credential(request):
+        return request.headers.get("x-api-key") or request.headers.get("authorization", "").removeprefix("Bearer ")
+
+    def answer(self, request):
+        import httpx
+
+        self.requests.append(request)
+        self.now += self.after
+        body = json.loads(request.content)
+        if self.status != 200:
+            error = {"type": "invalid_request_error",
+                     "message": f"stream not supported for {self.credential(request)}"}
+            return httpx.Response(self.status, json={"type": "error", "error": error}, request=request)
+        if request.url.path.endswith("/responses"):
+            item = {"type": "message", "id": "msg_fake", "role": "assistant", "status": "completed",
+                    "content": [{"type": "output_text", "text": "45", "annotations": []}]}
+            reply = {"id": "resp_fake", "object": "response", "created_at": 0, "status": "completed",
+                     "model": body["model"], "output": [item],
+                     "usage": {"input_tokens": 7, "output_tokens": 1, "total_tokens": 8}}
+            events = [{"type": "response.output_item.done", "output_index": 0, "item": item},
+                      {"type": "response.completed", "response": reply}]
+            stream = "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"
+        else:
+            reply = {"id": "msg_fake", "type": "message", "role": "assistant", "model": body["model"],
+                     "content": [{"type": "text", "text": "45"}], "stop_reason": "end_turn",
+                     "stop_sequence": None, "usage": {"input_tokens": 7, "output_tokens": 1}}
+            events = [
+                {"type": "message_start", "message": {**reply, "content": [], "stop_reason": None,
+                                                      "usage": {"input_tokens": 7, "output_tokens": 0}}},
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "45"}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                 "usage": {"output_tokens": 1}},
+                {"type": "message_stop"},
+            ]
+            stream = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events)
+        if body.get("stream"):
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=stream,
+                                  request=request)
+        return httpx.Response(200, json=reply, request=request)
 
 
 def _probes(checked):
@@ -1020,37 +1069,31 @@ def _probes(checked):
 
 
 def test_newer_candidate_probe_reaches_the_client_with_its_route_effort_and_sign_in(world, monkeypatch):
-    from agent import auxiliary_client as aux
-
     muc = _muc()
     env = _planner_pinned(world)
-    wire = _Wire()
+    http = _Http(monkeypatch)
     monkeypatch.setattr(muc, "_sign_in_value", lambda provider, name: f"placeholder-{name}")
-    monkeypatch.setattr(aux, "_get_cached_client", wire.cached_client)
     fake = Fake(routes=[(PLANNER, "anthropic", OPUS, "max", "routine")],
                 lists={("anthropic", "gateway"): [OPUS, OPUS_NEW]})
 
     receipt = _cli(world, replace(fake.seams(muc), probe=muc._probe_call), env=env)
 
     assert receipt["result"] == "filed"
-    # One client pinned to the candidate and that sign-in's exact value, one request.
-    assert wire.clients == [(("anthropic", OPUS_NEW), {"api_key": "placeholder-gateway"})]
-    (sent,) = wire.sent
+    # One request, to the candidate, with that sign-in's exact value and the route's effort.
+    assert [http.credential(request) for request in http.requests] == ["placeholder-gateway"]
+    (sent,) = http.sent()
     assert sent["model"] == OPUS_NEW
-    assert sent["_reasoning_config"] == {"enabled": True, "effort": "max"}
+    assert (sent["thinking"]["type"], sent["output_config"]) == ("adaptive", {"effort": "max"})
     (checked,) = receipt["candidates"]
     assert _probes(checked) == [("gateway", True, 7, 1)]
     assert "placeholder-gateway" not in json.dumps(receipt) + _dump(world)
 
 
 def test_practice_probe_sends_each_sign_ins_exact_value_once_in_order(world, monkeypatch):
-    from agent import auxiliary_client as aux
-
     muc = _muc()
     env = _planner_pinned(world)
-    wire = _Wire()
+    http = _Http(monkeypatch)
     monkeypatch.setattr(muc, "_sign_in_value", lambda provider, name: f"placeholder-{name}")
-    monkeypatch.setattr(aux, "_get_cached_client", wire.cached_client)
     fake = Fake(routes=[(WORKER, "anthropic", OPUS, "max", "deep")],
                 lists={("anthropic", "gateway"): [OPUS], ("anthropic", "build"): [OPUS]},
                 sign_ins={WORKER: (("gateway", "build"), "")})
@@ -1058,11 +1101,8 @@ def test_practice_probe_sends_each_sign_ins_exact_value_once_in_order(world, mon
     receipt = _cli(world, replace(fake.seams(muc), probe=muc._probe_call), "--practice", WORKER, env=env)
 
     assert receipt["result"] == "filed"
-    assert wire.clients == [
-        (("anthropic", OPUS), {"api_key": "placeholder-gateway"}),
-        (("anthropic", OPUS), {"api_key": "placeholder-build"}),
-    ]
-    assert [sent["model"] for sent in wire.sent] == [OPUS, OPUS]
+    assert [http.credential(request) for request in http.requests] == ["placeholder-gateway", "placeholder-build"]
+    assert [sent["model"] for sent in http.sent()] == [OPUS, OPUS]
     assert _probes(receipt["candidates"][0]) == [("gateway", True, 7, 1), ("build", True, 7, 1)]
 
 
@@ -1071,22 +1111,11 @@ def test_codex_probe_builds_its_client_from_that_sign_ins_exact_value(world, mon
 
     muc = _muc()
     env = _planner_pinned(world)
-    wire = _Wire()
-    built = []
-
-    def openai_client(*, api_key, base_url, **_kwargs):
-        built.append(api_key)
-        return SimpleNamespace(api_key=api_key, base_url=base_url)
-
-    def codex_client(real_client, model):
-        wire.clients.append((real_client.api_key, model))
-        return wire.client()
+    http = _Http(monkeypatch)
 
     def refuse(*_args, **_kwargs):
         raise AssertionError("the probe never reads the pool, the stored login or the shared client cache")
 
-    monkeypatch.setattr(aux, "_create_openai_client", openai_client)
-    monkeypatch.setattr(aux, "CodexAuxiliaryClient", codex_client)
     for name in ("_read_codex_access_token", "_select_pool_entry", "_peek_pool_entry", "_get_cached_client"):
         monkeypatch.setattr(aux, name, refuse)
     monkeypatch.setattr(muc, "_sign_in_value", lambda provider, name: f"placeholder-{name}")
@@ -1096,9 +1125,8 @@ def test_codex_probe_builds_its_client_from_that_sign_ins_exact_value(world, mon
     receipt = _cli(world, replace(fake.seams(muc), probe=muc._probe_call), env=env)
 
     assert receipt["result"] == "filed"
-    assert built == ["placeholder-codex"]
-    assert wire.clients == [("placeholder-codex", SOL_NEW)]
-    assert [sent["model"] for sent in wire.sent] == [SOL_NEW]
+    assert [http.credential(request) for request in http.requests] == ["placeholder-codex"]
+    assert [(sent["model"], sent["stream"]) for sent in http.sent()] == [(SOL_NEW, True)]
     assert _probes(receipt["candidates"][0]) == [("codex", True, 7, 1)]
 
 
@@ -1220,7 +1248,6 @@ def test_role_whose_own_sign_in_cannot_be_proven_files_nothing_for_that_model(wo
 
 def test_every_proven_account_lists_the_candidate_files_with_one_list_and_probe_per_account(world, monkeypatch):
     from agent import anthropic_credentials
-    from agent import auxiliary_client as aux
 
     from hermes_cli import models
 
@@ -1232,8 +1259,7 @@ def test_every_proven_account_lists_the_candidate_files_with_one_list_and_probe_
     asked = []
     monkeypatch.setattr(models, "_fetch_anthropic_models",
                         lambda *, api_key, **_kwargs: asked.append(api_key) or [OPUS, OPUS_NEW])
-    wire = _Wire()
-    monkeypatch.setattr(aux, "_get_cached_client", wire.cached_client)
+    http = _Http(monkeypatch)
     fake = Fake(routes=[(role, "anthropic", OPUS, "max", "routine") for role in (PLANNER, DESIGNER, BUSINESS)],
                 lists={})
     seams = replace(fake.seams(muc), sign_ins=muc._role_sign_ins, account_models=muc._account_model_ids,
@@ -1245,8 +1271,8 @@ def test_every_proven_account_lists_the_candidate_files_with_one_list_and_probe_
     assert set(scopes) == {PLANNER, DESIGNER, BUSINESS}
     distinct = sorted(set(values.values()))
     assert sorted(asked) == distinct
-    assert sorted(kwargs["api_key"] for _args, kwargs in wire.clients) == distinct
-    assert len(wire.sent) == 2
+    assert sorted(http.credential(request) for request in http.requests) == distinct
+    assert len(http.requests) == 2
     (entry,) = receipt["models"]
     assert sorted(sorted(group["roles"]) for group in entry["sign_ins"]) == [
         [BUSINESS], sorted([PLANNER, DESIGNER])
@@ -1256,3 +1282,188 @@ def test_every_proven_account_lists_the_candidate_files_with_one_list_and_probe_
     assert [probe["passed"] for probe in checked["probe"]] == [True, True]
     written = json.dumps(receipt) + _dump(world)
     assert not any(value in written for value in values.values())
+
+
+# ---------------------------------------------------------------------------
+# The owner rule of 2026-11-17, contracts A to D, each as a whole class. The
+# probe runs on the real provider SDKs; only the HTTP send is fake.
+# ---------------------------------------------------------------------------
+
+
+def _probed(provider):
+    """One route whose newer candidate every sign-in lists, so only the probe decides."""
+    if provider == "anthropic":
+        return Fake(routes=[(PLANNER, "anthropic", OPUS, "max", "routine")],
+                    lists={("anthropic", "gateway"): [OPUS, OPUS_NEW]})
+    return Fake(routes=[(DEFAULT, "openai-codex", SOL, "max", "routine")],
+                lists={("openai-codex", "codex"): [SOL, SOL_NEW]})
+
+
+def _probe_run(world, monkeypatch, provider, value=None, **http):
+    muc = _muc()
+    env = _planner_pinned(world)
+    wire = _Http(monkeypatch, **http)
+    monkeypatch.setattr(muc, "_sign_in_value", lambda _provider, name: value or f"placeholder-{name}")
+    with _every_log_record() as records:
+        receipt = _cli(world, replace(_probed(provider).seams(muc), probe=muc._probe_call), env=env)
+    return receipt, wire, records
+
+
+@pytest.mark.parametrize("active_lists_it", [False, True], ids=["active-unlisted", "active-listed"])
+def test_account_check_lists_the_account_the_roles_runtime_selects(world, monkeypatch, active_lists_it):
+    """Contract A: the runtime takes the pool's choice before the legacy env resolver; so does the check."""
+    from agent import credential_pool
+
+    from hermes_cli import auth, models, runtime_provider
+
+    muc = _muc()
+    home = world.root / "profiles" / PLANNER
+    active, other = "placeholder-active-pool-account", "placeholder-other-env-account"
+    (home / ".env").write_text(f"ANTHROPIC_API_KEY={other}\n")
+    row = {"id": "placeholder-active-row", "label": "placeholder active account", "auth_type": "api_key",
+           "priority": 0, "source": "manual", "access_token": active, "base_url": "https://api.anthropic.com"}
+
+    def in_planner_scope(reader):
+        from agent.secret_scope import build_profile_secret_scope
+
+        return muc._in_scope(home, build_profile_secret_scope(home), reader)
+
+    store = []
+    in_planner_scope(lambda: store.append(auth.write_credential_pool("anthropic", [row])) or "")
+    # The real runtime and the read-only preview both run on the active pool account.
+    assert in_planner_scope(lambda: runtime_provider.resolve_runtime_provider(
+        requested="anthropic", target_model=OPUS)["api_key"]) == active
+    assert in_planner_scope(lambda: credential_pool.preview_runtime_selection("anthropic")[0].runtime_api_key) == active
+    before = store[0].read_bytes()
+    asked = []
+
+    def listed(*, api_key, **_kwargs):
+        asked.append({active: "active", other: "other"}.get(api_key, "unexpected"))
+        return [OPUS, OPUS_NEW] if (api_key == active) == active_lists_it else [OPUS]
+
+    monkeypatch.setattr(models, "_fetch_anthropic_models", listed)
+    fake = Fake(routes=[(PLANNER, "anthropic", OPUS, "max", "routine")], lists={})
+
+    receipt = _cli(world, replace(fake.seams(muc), sign_ins=muc._role_sign_ins, account_models=muc._account_model_ids))
+
+    assert asked == ["active"]
+    assert receipt["result"] == ("filed" if active_lists_it else "nothing_filed")
+    assert len(_suggestions(world)) == int(active_lists_it)
+    assert [call[1] for call in fake.probe_calls] == ([OPUS_NEW] if active_lists_it else [])
+    # Reading the choice wrote nothing to the store.
+    assert store[0].read_bytes() == before
+    written = json.dumps(receipt) + _dump(world)
+    assert active not in written and other not in written
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai-codex"])
+def test_role_whose_runtime_choice_cannot_be_read_files_nothing_for_that_model(world, monkeypatch, provider):
+    """Contract A: no read of the choice, no proof; no other source stands in for it."""
+    from agent import anthropic_credentials, credential_pool
+
+    from hermes_cli import codex_models, models
+
+    muc = _muc()
+
+    def unreadable(_provider):
+        raise PermissionError("the fake store cannot be read")
+
+    monkeypatch.setattr(credential_pool, "preview_runtime_selection", unreadable)
+    monkeypatch.setattr(anthropic_credentials, "resolve_anthropic_token", lambda *_: "placeholder-env-account")
+    asked = []
+    monkeypatch.setattr(models, "_fetch_anthropic_models",
+                        lambda *, api_key, **_kwargs: asked.append(api_key) or [OPUS, OPUS_NEW])
+    monkeypatch.setattr(codex_models, "_fetch_models_from_api", lambda value: asked.append(value) or [SOL, SOL_NEW])
+    fake = Fake(routes=[(PLANNER, provider, OPUS if provider == "anthropic" else SOL, "max", "routine")], lists={})
+
+    receipt = _cli(world, replace(fake.seams(muc), sign_ins=muc._role_sign_ins, account_models=muc._account_model_ids))
+
+    (entry,) = receipt["models"]
+    assert (entry["result"], entry["role"]) == ("sign_in_unproven", PLANNER)
+    assert "PermissionError" in entry["reason"] and "fake store" not in json.dumps(receipt)
+    assert receipt["result"] == "nothing_filed" and _suggestions(world) == []
+    assert asked == [] and fake.probe_calls == []
+
+
+@pytest.mark.parametrize("provider,status", [("anthropic", 400), ("anthropic", 529),
+                                             ("openai-codex", 400), ("openai-codex", 500)])
+def test_probe_refusal_is_one_request_and_a_failed_probe(world, monkeypatch, provider, status):
+    """Contract B: no SDK retry, no repeat in another format, no other model or sign-in."""
+    receipt, wire, _records = _probe_run(world, monkeypatch, provider, status=status)
+
+    name, candidate = ("gateway", OPUS_NEW) if provider == "anthropic" else ("codex", SOL_NEW)
+    assert [(http_sent["model"], _Http.credential(request))
+            for http_sent, request in zip(wire.sent(), wire.requests)] == [(candidate, f"placeholder-{name}")]
+    (checked,) = receipt["candidates"]
+    assert [(probe["sign_in"], probe["passed"]) for probe in checked["probe"]] == [(name, False)]
+    assert receipt["result"] == "nothing_filed" and _suggestions(world) == []
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai-codex"])
+def test_probe_wire_carries_the_output_cap_and_a_two_minute_timeout(world, monkeypatch, provider):
+    """Contract C: Anthropic sends max_tokens 8000; each provider's transport is bound to 120 s."""
+    receipt, wire, _records = _probe_run(world, monkeypatch, provider)
+
+    (request,) = wire.requests
+    (sent,) = wire.sent()
+    if provider == "anthropic":
+        assert sent["max_tokens"] == 8000
+    timeout = request.extensions["timeout"]
+    assert set(timeout) == {"connect", "read", "write", "pool"}
+    assert all(seconds is not None and 0 < seconds <= 120 for seconds in timeout.values()), timeout
+    assert receipt["result"] == "filed"
+
+
+@pytest.mark.parametrize("after,in_time", [(1.0, True), (121.0, False)], ids=["in-time", "late"])
+@pytest.mark.parametrize("provider", ["anthropic", "openai-codex"])
+def test_probe_reply_after_two_minutes_by_the_checks_clock_is_failed(world, monkeypatch, provider, after, in_time):
+    """Contract C: the check's own clock decides; a late reply files nothing and keeps its real tokens."""
+    receipt, wire, _records = _probe_run(world, monkeypatch, provider, after=after)
+
+    name = "gateway" if provider == "anthropic" else "codex"
+    assert len(wire.requests) == 1
+    (checked,) = receipt["candidates"]
+    assert _probes(checked) == [(name, in_time, 7, 1)]
+    assert receipt["result"] == ("filed" if in_time else "nothing_filed")
+    assert len(_suggestions(world)) == int(in_time)
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai-codex"])
+def test_probe_deadline_runs_from_the_send_to_the_reply(world, monkeypatch, provider):
+    """Contract C: a slow first client build (the SDK's import) is no late reply."""
+    from agent import anthropic_adapter
+    from agent import auxiliary_client as aux
+
+    muc = _muc()
+    env = _planner_pinned(world)
+    wire = _Http(monkeypatch, after=2.0)
+    owner, name = (anthropic_adapter, "build_anthropic_client") if provider == "anthropic" else (aux, "_create_openai_client")
+    build = getattr(owner, name)
+
+    def slow_build(*args, **kwargs):
+        wire.now += 119.0
+        return build(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name, slow_build)
+    monkeypatch.setattr(muc, "_sign_in_value", lambda _provider, sign_in: f"placeholder-{sign_in}")
+    receipt = _cli(world, replace(_probed(provider).seams(muc), probe=muc._probe_call), env=env)
+
+    label = "gateway" if provider == "anthropic" else "codex"
+    assert len(wire.requests) == 1
+    (checked,) = receipt["candidates"]
+    assert _probes(checked) == [(label, True, 7, 1)]
+    assert [probe["seconds"] for probe in checked["probe"]] == [2.0]
+    assert receipt["result"] == "filed"
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai-codex"])
+def test_probe_refusal_echoing_the_sign_in_leaves_no_raw_log_record(world, monkeypatch, provider):
+    """Contract D: no record from the client build to the reply read, nested errors included."""
+    receipt, wire, records = _probe_run(world, monkeypatch, provider, value=LEAK, status=400)
+
+    assert [_Http.credential(request) for request in wire.requests] == [LEAK]
+    assert receipt["result"] == "nothing_filed" and _suggestions(world) == []
+    (checked,) = receipt["candidates"]
+    assert [probe["error"] for probe in checked["probe"]] == ["BadRequestError"]
+    assert LEAK not in _raw_text(records)
+    assert LEAK not in json.dumps(receipt) + _dump(world)
