@@ -10,9 +10,10 @@ import sys
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
-from hermes_cli import kanban_db, owner_workspace, projects_db
+from hermes_cli import kanban_db, owner_project_review as review, owner_workspace, projects_db
 from tests.gateway.test_api_server_owner_review_advice import accepted_advice, app, stable  # noqa: F401
 from tests.hermes_cli.test_owner_project_review_record import root  # noqa: F401
+from tests.hermes_cli.test_owner_project_review_suggestions import NOW, _commit, _complete, _plan, _result, world  # noqa: F401
 from tests.hermes_cli.test_owner_workspace import ctx  # noqa: F401
 
 HINT = "Ask Raphael in the Project chat to postpone Book the room."
@@ -128,3 +129,103 @@ def test_a_planner_worker_reads_the_pinned_source_from_the_root_registry_and_the
     assert confirmed_plan_trigger(project.id, owner_workspace._digest({**expected, "summary": "Other."})) == "owner_request"
     # Nothing was read from, or created in, the profile home.
     assert not (profile_home / "projects.db").exists()
+
+
+def _read(path):
+    return contextlib.closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True))
+
+
+def _board_file(root, slug):
+    return root / "kanban.db" if slug == "default" else root / "kanban" / "boards" / slug / "kanban.db"
+
+
+def _request(project_id, plan):
+    """The digest of the owner's exact approval of ``plan``, built the way the owner commit builds it."""
+    changes, risk = owner_workspace._normalize_project_changes(plan["changes"])
+    return owner_workspace._digest({
+        "project_id": project_id, "trigger": "owner_request",
+        **{name: plan[name] for name in ("request_title", "summary", "specification", "current_milestone",
+                                         "owner_visible_result")},
+        "later_milestones": owner_workspace._normalize_later_milestones(plan["later_milestones"]),
+        "risk_level": risk, "changes": changes})
+
+
+def _counts(world, digest):
+    """The independent count: plain read-only SQLite of the root files, with no Hermes path helper."""
+    root, accepted = world["root"], world["accepted"]
+    with _read(root / "projects.db") as registry:
+        denials = registry.execute("SELECT COUNT(*) FROM owner_workspace_receipts WHERE status='denied' "
+                                   "AND operation='owner_project_plan_commit' AND request_digest=?", (digest,)).fetchone()[0]
+    with _read(_board_file(root, "project-summaries")) as board:
+        [(metadata,)] = board.execute("SELECT metadata FROM task_runs WHERE task_id=? AND outcome='completed'",
+                                      (world["review_task"],)).fetchall()
+    with _read(_board_file(root, world["project"].board_slug)) as board:
+        decision = board.execute("SELECT recommendation_decision FROM tasks WHERE id=?", (accepted,)).fetchone()[0]
+        links = board.execute("SELECT COUNT(*) FROM recommendation_made_from WHERE recommendation_id=?",
+                              (accepted,)).fetchone()[0]
+    return {"denials": denials, "stored": json.loads(metadata)["project_review"], "decision": decision, "links": links}
+
+
+@contextlib.contextmanager
+def _worker(world, pinned):
+    """The dispatcher's worker environment: its own board and task pinned, and a profile home under the root."""
+    root = world["root"]
+    slug, task = (("project-summaries", world["review_task"]) if pinned == "project-summaries"
+                  else (world["project"].board_slug, world["booked"]))
+    profile_home = root / "profiles" / "raphael-planner"
+    profile_home.mkdir(parents=True, exist_ok=True)
+    with pytest.MonkeyPatch.context() as env:
+        env.setenv("HERMES_HOME", str(profile_home))
+        env.setenv("HERMES_PROFILE", "raphael-planner")
+        env.setenv("HERMES_KANBAN_BOARD", slug)
+        env.setenv("HERMES_KANBAN_DB", str(_board_file(root, slug)))
+        env.setenv("HERMES_KANBAN_TASK", task)
+        assert projects_db.projects_db_path() == profile_home / "projects.db"
+        assert {kanban_db.kanban_db_path(board=name) for name in ("project-summaries", world["project"].board_slug)} == {
+            _board_file(root, slug)}
+        yield
+    assert not (profile_home / "projects.db").exists()
+
+
+@pytest.mark.parametrize("pinned", ["project-summaries", "project"])
+def test_t8_a_planner_worker_checks_the_pairs_against_the_root_registry_and_every_board(world, ctx, pinned):
+    """The worker's pins name one board and a profile home; the pair check and the commit links still read the root
+    registry, the review board and the Project board."""
+    from hermes_cli.owner_project_review_origin import confirmed_plan_links
+    from hermes_cli.owner_project_review_suggestions import check_plan_suggestions
+    from hermes_cli.owner_project_review_view import project_review_advice_view
+
+    project, accepted, plan = world["project"], world["accepted"], _plan()
+    _complete(world, _result(world, plan=plan, pairs=[{"change": 0, "suggestion": accepted}]))
+    review.review_tick(NOW + 1)
+    assert project_review_advice_view(project.id) == {"review_date": "2026-11-10", "proposal": plan}
+    assert _commit(ctx, world, plan, key="denied-room-plan", choice="deny")["error"] == "confirmation_denied"
+    digest = _request(project.id, plan)
+    counts = _counts(world, digest)
+    assert (counts["denials"], counts["decision"], counts["links"]) == (1, "accepted", 0)
+    pairs = [(pair["change"], pair["suggestion"]) for pair in counts["stored"]["plan_suggestions"]]
+    assert pairs == [(0, accepted)]
+    with _read(_board_file(world["root"], "project-summaries")) as board:
+        sources, _cut = review._frozen_sources(
+            board.execute("SELECT body FROM tasks WHERE id=?", (world["review_task"],)).fetchone()[0])
+
+    with _worker(world, pinned):
+        assert confirmed_plan_links(project.id, digest) == pairs
+        assert confirmed_plan_links(project.id, _request(project.id, {**plan, "summary": "Other."})) == []
+        # The owner denied this exact plan: it is not proposed again, to the owner or to a worker.
+        assert project_review_advice_view(project.id) is None
+        with review._review_evidence_board(project.id) as (board, registry, live), \
+                pytest.raises(review.ReviewRefused) as refused:
+            check_plan_suggestions(counts["stored"], sources, board, registry, live)
+        assert refused.value.code == "review_plan_suggestion_denied"
+
+    # A card made from the suggestion since the review is on the Project board only.
+    with kanban_db.connect_closing(_board_file(world["root"], project.board_slug), board=project.board_slug) as board:
+        kanban_db.create_task(board, title="Hold the meeting room", project_id=project.id,
+                              made_from_recommendation=accepted)
+    assert _counts(world, digest)["links"] == 1
+    with _worker(world, pinned):
+        with review._review_evidence_board(project.id) as (board, registry, live), \
+                pytest.raises(review.ReviewRefused) as refused:
+            check_plan_suggestions(counts["stored"], sources, board, registry, live)
+        assert refused.value.code == "review_plan_suggestion_linked"
