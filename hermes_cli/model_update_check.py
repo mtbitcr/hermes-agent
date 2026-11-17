@@ -197,24 +197,14 @@ def _configured_routes(role: str) -> tuple:
     return tuple(routes)
 
 
-def _refresh_pending() -> bool:
-    """True when the legacy resolver would refresh an expired shared login, which writes it."""
-    from agent import anthropic_credentials
-
-    login = anthropic_credentials.read_claude_code_credentials()
-    return bool(login and login.get("refreshToken") and not anthropic_credentials.is_claude_code_token_valid(login))
-
-
 def _runtime_token(provider: str) -> str:
-    """The sign-in the runtime of ``provider`` selects now, in the runtime's own order.
+    """The sign-in the runtime of ``provider`` selects now: the pool's choice, and nothing else.
 
-    ``runtime_provider._ladder_rungs`` takes the credential pool's choice
-    before the legacy environment resolver, and so does this, with no order of
-    its own. The pool is read with ``preview_runtime_selection``, which heals,
-    stores, leases, counts and refreshes nothing. Only when the pool has no
-    choice is the runtime's own legacy rung asked (``_anthropic_env_runtime``),
-    and never when it would refresh an expired shared login. Any other case is
-    "" and leaves the sign-in unproven; a store that cannot be read raises.
+    The choice is read with ``preview_runtime_selection`` in the scope the
+    caller opened; it heals, stores, leases, counts and refreshes nothing. It is
+    the only source. No legacy or environment resolver is asked, since those can
+    load, heal, prune, refresh, lease or store a pool. No usable choice is ""
+    and leaves the sign-in unproven; a store that cannot be read raises.
     """
     from agent.credential_pool import credential_pool_matches_provider, preview_runtime_selection
     from hermes_cli import runtime_provider
@@ -225,48 +215,12 @@ def _runtime_token(provider: str) -> str:
         base_url = runtime_provider._pool_entry_base_url(entry)
         if value and credential_pool_matches_provider(provider, provider, base_url=base_url):
             return str(value).strip()
-    if provider != "anthropic" or _refresh_pending():
-        return ""
-    try:
-        runtime = runtime_provider._anthropic_env_runtime(provider, _model_section())
-    except runtime_provider.AuthError:
-        return ""
-    return str(runtime.get("api_key") or "").strip()
-
-
-def _model_section() -> dict:
-    """The scope's ``model`` config section as the runtime loads it, read with no write.
-
-    ``runtime_provider._get_model_config`` reads it through ``load_config``,
-    which first builds the home's skeleton (directories and a default file).
-    So ``load_config``'s read-only steps run here on the file as written: its
-    canonical form, its ``${VAR}`` references in this scope and the managed
-    overlay. The legacy rung needs only the section's provider, base URL and
-    key hints; no file means no section.
-    """
-    from hermes_cli import config
-
-    canonical = config._canonicalize_config(config.read_raw_config())
-    loaded, _managed = config._merge_managed_overlay(config._expand_env_vars(canonical))
-    section = loaded.get("model")
-    if not isinstance(section, dict):
-        return {}
-    cfg = dict(section)
-    if isinstance(cfg.get("default"), dict) and not cfg.get("provider"):
-        cfg["provider"] = config.split_model_config_default(cfg["default"])[1]
-    return cfg
+    return ""
 
 
 def _gateway_token() -> str:
     """The Anthropic account the runtime selects."""
     return _runtime_token("anthropic")
-
-
-def _build_token() -> str:
-    from plugins.dashboard_auth.raphael_workspace.build_sign_in_file import read_build_token
-
-    found = read_build_token()
-    return found[0] if found is not None else ""
 
 
 def _codex_token() -> str:
@@ -296,7 +250,6 @@ def _codex_ids(token: str):
 # The value stays in memory: it is only ever handed to the reader or the probe.
 _SIGN_INS = {
     ("anthropic", "gateway"): (_gateway_token, _anthropic_ids),
-    ("anthropic", "build"): (_build_token, _anthropic_ids),
     ("openai-codex", "codex"): (_codex_token, _codex_ids),
 }
 
@@ -397,13 +350,11 @@ def _role_value(role: str, reader: Callable[[], str]) -> str:
 def _role_sign_ins(role: str, provider: str) -> tuple:
     """The sign-ins ``role`` itself uses for ``provider``: ``(sign-ins, "")`` or ``(None, why)``.
 
-    Each is resolved in the role's own read-only scope and held as a
-    ``_SignIn``. The coding worker's builds sign in through the host resolver
-    of the build machine, which prefers the build sign-in and can fall back to
-    other credentials; which one it picks is proven by comparing its value
-    with the worker's own sign-ins in memory. A choice that cannot be read
-    without a refresh, a write or a lease is not proven, and neither is one
-    whose store raises; the reason names the error's type only.
+    The one sign-in is the pool's choice that ``preview_runtime_selection``
+    reads in the role's own read-only scope, held as a ``_SignIn``; the coding
+    worker's is read the same way, and no resolver behind the preview is asked.
+    No usable choice is not proven, and neither is a choice whose store raises;
+    the reason names the error's type only.
     """
     try:
         with _no_log_records():
@@ -414,8 +365,6 @@ def _role_sign_ins(role: str, provider: str) -> tuple:
 
 
 def _read_sign_ins(role: str, provider: str) -> tuple:
-    from plugins.dashboard_auth.raphael_workspace import sandbox_dispatch
-
     if provider == "openai-codex":
         value = _role_value(role, _codex_token)
         if not value:
@@ -426,21 +375,7 @@ def _read_sign_ins(role: str, provider: str) -> tuple:
     gateway = _role_value(role, _gateway_token)
     if not gateway:
         return None, "The role's own sign-in for this provider could not be proven."
-    if role != sandbox_dispatch.WORKER_PROFILE:
-        return (_SignIn("gateway", gateway),), ""
-    if _refresh_pending():
-        # The host resolver ends in the legacy resolver, which would refresh it.
-        return None, "The worker's builds would refresh a sign-in to say which account they use."
-    used = sandbox_dispatch._resolve_host_credential()
-    if not used:
-        return None, "The worker's builds have no sign-in now, so the check cannot tell which account they use."
-    for name, value in (("build", _role_value(role, _build_token)), ("gateway", gateway)):
-        if used == value:
-            return tuple(dict.fromkeys((_SignIn("gateway", gateway), _SignIn(name, value)))), ""
-    return None, (
-        "The worker's builds sign in with a credential that is neither the build "
-        "sign-in nor the gateway sign-in, so the check cannot list its models."
-    )
+    return (_SignIn("gateway", gateway),), ""
 
 
 _QUIET = threading.Lock()
@@ -529,9 +464,11 @@ def _probe_call(provider: str, model: str, sign_in, effort: str, question: str) 
     key. Nor through the shared auxiliary wrappers, which repeat a refused
     stream as a plain request, replace the output cap and the timeout, and log
     raw error text: the probe calls the provider adapters' public functions.
-    The SDK never retries and a refusal ends the probe. No log record is made
-    from the build of the client to the read of the reply, nested errors
-    included (``_no_log_records``); the caller names only the error's type.
+    The SDK never retries and a refusal ends the probe. Its HTTP client follows
+    no redirect and sends no second request (``_one_request``), so a redirect
+    ends the probe as failed too. No log record is made from the build of the
+    client to the read of the reply, nested errors included
+    (``_no_log_records``); the caller names only the error's type.
     """
     messages = [{"role": "user", "content": question}]
     reasoning = None if effort in _NO_EFFORT else {"enabled": True, "effort": effort}
@@ -544,8 +481,32 @@ def _probe_call(provider: str, model: str, sign_in, effort: str, question: str) 
     raise LookupError("the check has no probe for this provider")
 
 
+def _one_request(client: Any) -> None:
+    """Bind the probe client's own HTTP client to one request: no redirect, nothing sent again.
+
+    The SDKs' HTTP clients follow redirects. Here a redirect answer comes back
+    as it is, and the SDK raises on any answer that is no success. Any second
+    request through this client (a redirect hop, a retry, a repeat) is refused
+    before it is sent. A client whose HTTP client cannot be bound sends nothing.
+    """
+    import httpx
+
+    http = getattr(client, "_client", None)
+    if not isinstance(http, httpx.Client):
+        raise LookupError("the probe's HTTP client cannot be bound to one request")
+    sent = []
+
+    def once(_request) -> None:
+        if sent:
+            raise LookupError("the probe sends one request")
+        sent.append(True)
+
+    http.follow_redirects = False
+    http.event_hooks = {**http.event_hooks, "request": [*http.event_hooks["request"], once]}
+
+
 def _anthropic_probe(model: str, value: str, messages: list, reasoning: Optional[dict]) -> ProbeReply:
-    """One plain ``messages.create``: max_tokens 8000, a 120 s transport timeout, no retry."""
+    """One plain ``messages.create``: max_tokens 8000, a 120 s transport timeout, no retry, no redirect."""
     from agent import anthropic_adapter
     from agent.anthropic_credentials import _is_oauth_token
     from agent.auxiliary_client import _ANTHROPIC_DEFAULT_BASE_URL
@@ -567,6 +528,7 @@ def _anthropic_probe(model: str, value: str, messages: list, reasoning: Optional
         value, _ANTHROPIC_DEFAULT_BASE_URL, timeout=_PROBE_TIMEOUT_SECONDS
     )
     try:
+        _one_request(client)
         sent = _clock()
         reply = anthropic_adapter.create_anthropic_message(client, kwargs, prefer_stream=False)
         seconds = _clock() - sent
@@ -585,7 +547,7 @@ def _anthropic_probe(model: str, value: str, messages: list, reasoning: Optional
 
 
 def _codex_probe(model: str, value: str, messages: list, reasoning: Optional[dict]) -> ProbeReply:
-    """One streamed Responses request through the Codex client: no retry, 120 s in total.
+    """One streamed Responses request through the Codex client: no retry, no redirect, 120 s in total.
 
     The service refuses an output cap field, so the bound is the client's
     total timeout and the check's own clock (``_probe``).
@@ -599,6 +561,7 @@ def _codex_probe(model: str, value: str, messages: list, reasoning: Optional[dic
         max_retries=0,
     )
     try:
+        _one_request(client)
         kwargs = aux._build_call_kwargs(
             "openai-codex",
             model,

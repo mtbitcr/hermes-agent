@@ -1145,13 +1145,16 @@ def _scoped_values(monkeypatch, module, name, answer):
 
 
 def test_each_roles_own_gateway_account_must_list_the_candidate(world, monkeypatch):
-    from agent import anthropic_credentials
+    from agent import credential_pool
 
     from hermes_cli import models
 
     muc = _muc()
     values = {PLANNER: "placeholder-planner-account", DESIGNER: "placeholder-designer-account"}
-    scopes = _scoped_values(monkeypatch, anthropic_credentials, "resolve_anthropic_token", values.get)
+    scopes = _scoped_values(
+        monkeypatch, credential_pool, "preview_runtime_selection",
+        lambda scope: (SimpleNamespace(runtime_api_key=values.get(scope), access_token=""), False),
+    )
     listed = {values[PLANNER]: [OPUS, OPUS_NEW], values[DESIGNER]: [OPUS]}
     asked = []
     monkeypatch.setattr(models, "_fetch_anthropic_models",
@@ -1203,7 +1206,7 @@ def test_each_roles_own_codex_pool_account_must_list_the_candidate(world, monkey
 
 @pytest.mark.parametrize("borrowed", [False, True], ids=["own-scope-empty", "only-planner-env"])
 def test_role_whose_own_sign_in_cannot_be_proven_files_nothing_for_that_model(world, monkeypatch, borrowed):
-    from agent import anthropic_credentials
+    from agent import credential_pool
     from agent.secret_scope import get_secret
 
     from hermes_cli import models
@@ -1220,8 +1223,10 @@ def test_role_whose_own_sign_in_cannot_be_proven_files_nothing_for_that_model(wo
         env["ANTHROPIC_TOKEN"] = f"placeholder-{PLANNER}"
     else:
         env.pop("ANTHROPIC_TOKEN", None)
-    scopes = _scoped_values(monkeypatch, anthropic_credentials, "resolve_anthropic_token",
-                            lambda _scope: get_secret("ANTHROPIC_TOKEN"))
+    scopes = _scoped_values(
+        monkeypatch, credential_pool, "preview_runtime_selection",
+        lambda _scope: (SimpleNamespace(runtime_api_key=get_secret("ANTHROPIC_TOKEN"), access_token=""), False),
+    )
     asked = []
     monkeypatch.setattr(models, "_fetch_anthropic_models",
                         lambda *, api_key, **_kwargs: asked.append(api_key) or [OPUS, OPUS_NEW, SONNET, SONNET_NEW])
@@ -1247,7 +1252,7 @@ def test_role_whose_own_sign_in_cannot_be_proven_files_nothing_for_that_model(wo
 
 
 def test_every_proven_account_lists_the_candidate_files_with_one_list_and_probe_per_account(world, monkeypatch):
-    from agent import anthropic_credentials
+    from agent import credential_pool
 
     from hermes_cli import models
 
@@ -1255,7 +1260,10 @@ def test_every_proven_account_lists_the_candidate_files_with_one_list_and_probe_
     # The planner and the designer share one account; the business role has its own.
     values = {PLANNER: "placeholder-shared-account", DESIGNER: "placeholder-shared-account",
               BUSINESS: "placeholder-business-account"}
-    scopes = _scoped_values(monkeypatch, anthropic_credentials, "resolve_anthropic_token", values.get)
+    scopes = _scoped_values(
+        monkeypatch, credential_pool, "preview_runtime_selection",
+        lambda scope: (SimpleNamespace(runtime_api_key=values.get(scope), access_token=""), False),
+    )
     asked = []
     monkeypatch.setattr(models, "_fetch_anthropic_models",
                         lambda *, api_key, **_kwargs: asked.append(api_key) or [OPUS, OPUS_NEW])
@@ -1467,3 +1475,146 @@ def test_probe_refusal_echoing_the_sign_in_leaves_no_raw_log_record(world, monke
     assert [probe["error"] for probe in checked["probe"]] == ["BadRequestError"]
     assert LEAK not in _raw_text(records)
     assert LEAK not in json.dumps(receipt) + _dump(world)
+
+
+# ---------------------------------------------------------------------------
+# The owner's two corrections of candidate 0d223b17: the account proof has one
+# source, and one request reaches the transport. HTTPX's own send and redirect
+# handling stay real here; only the transport below them is fake.
+# ---------------------------------------------------------------------------
+
+
+def _transport_wire(after=1.0):
+    """``_Http``'s answers without its patch of ``httpx.Client.send``."""
+    wire = object.__new__(_Http)
+    wire.requests, wire.status, wire.after, wire.now = [], 200, after, 5000.0
+    return wire
+
+
+def _transport_run(world, monkeypatch, provider, wire, respond):
+    """The probe through the real SDKs and HTTPX's own send; ``respond`` is the fake transport."""
+    import httpx
+
+    muc = _muc()
+    transport = httpx.MockTransport(respond)
+    monkeypatch.setattr(httpx.Client, "_transport_for_url", lambda _client, _url: transport)
+    monkeypatch.setattr(muc, "_clock", lambda: wire.now)
+    monkeypatch.setattr(muc, "_sign_in_value", lambda _provider, name: f"placeholder-{name}")
+    return _cli(world, replace(_probed(provider).seams(muc), probe=muc._probe_call), env=_planner_pinned(world))
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai-codex"])
+@pytest.mark.parametrize("answer", ["success", "refusal", "server-error", "redirect", "timeout"])
+def test_cli_probe_sends_at_most_one_http_request(world, monkeypatch, provider, answer):
+    """Contract B at the transport: one request whatever the provider answers, a redirect included."""
+    import httpx
+
+    wire = _transport_wire()
+
+    def respond(request):
+        first = not wire.requests
+        # A repeat gets a valid answer, so a probe that repeated its request would pass and file.
+        wire.status = {"refusal": 400, "server-error": 500}.get(answer, 200) if first else 200
+        if first and answer == "redirect":
+            wire.requests.append(request)
+            location = str(request.url.copy_with(query=b"probe-hop=1"))
+            return httpx.Response(307, headers={"location": location}, request=request)
+        if first and answer == "timeout":
+            wire.requests.append(request)
+            raise httpx.ReadTimeout("the fake provider did not answer in time", request=request)
+        return wire.answer(request)
+
+    receipt = _transport_run(world, monkeypatch, provider, wire, respond)
+
+    passed = answer == "success"
+    name, candidate = ("gateway", OPUS_NEW) if provider == "anthropic" else ("codex", SOL_NEW)
+    assert len(wire.requests) == 1, "one probe sent more than one HTTP request"
+    assert [(sent["model"], _Http.credential(request))
+            for sent, request in zip(wire.sent(), wire.requests)] == [(candidate, f"placeholder-{name}")]
+    (checked,) = receipt["candidates"]
+    assert [(probe["sign_in"], probe["passed"]) for probe in checked["probe"]] == [(name, passed)]
+    assert receipt["result"] == ("filed" if passed else "nothing_filed")
+    assert len(_suggestions(world)) == int(passed)
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai-codex"])
+def test_cli_late_reply_fails_under_real_httpx_dispatch(world, monkeypatch, provider):
+    """Contract C at the transport: a reply after two minutes by the check's clock files nothing."""
+    wire = _transport_wire(after=121.0)
+
+    receipt = _transport_run(world, monkeypatch, provider, wire, wire.answer)
+
+    assert len(wire.requests) == 1
+    assert receipt["result"] == "nothing_filed" and _suggestions(world) == []
+    (checked,) = receipt["candidates"]
+    (probe,) = checked["probe"]
+    assert (probe["passed"], probe["late"], probe["input_tokens"], probe["output_tokens"]) == (False, True, 7, 1)
+
+
+def _stale_login_row():
+    """A naturally stale singleton-seeded row: its login file has since been removed."""
+    return {"id": "placeholder-stale-row", "label": "placeholder stale login", "auth_type": "oauth",
+            "source": "claude_code", "priority": 0, "access_token": "placeholder-stale-token",
+            "base_url": "https://api.anthropic.com"}
+
+
+def _in_profile_scope(home, reader):
+    from agent.secret_scope import build_profile_secret_scope
+
+    return _muc()._in_scope(home, build_profile_secret_scope(home), reader)
+
+
+def test_cli_unprovable_legacy_fallback_does_not_rewrite_the_auth_store(world):
+    """Contract A: no usable runtime choice is no proof, and no resolver behind the preview is asked."""
+    from agent import credential_pool
+
+    from hermes_cli import auth
+
+    muc = _muc()
+    env = _planner_pinned(world)
+    home = world.root / "profiles" / PLANNER
+    store = []
+    _in_profile_scope(home, lambda: store.append(auth.write_credential_pool("anthropic", [_stale_login_row()])) or "")
+    before = store[0].read_bytes()
+    selected = []
+    _in_profile_scope(home, lambda: selected.append(credential_pool.preview_runtime_selection("anthropic")[0]) or "")
+    assert selected == [None], "the fake store must have no usable runtime choice"
+    assert store[0].read_bytes() == before, "the preview itself is read-only"
+    fake = Fake(routes=[(PLANNER, "anthropic", OPUS, "max", "routine")],
+                lists={("anthropic", "gateway"): [OPUS, OPUS_NEW]})
+
+    receipt = _cli(world, replace(fake.seams(muc), sign_ins=muc._role_sign_ins), env=env)
+
+    assert store[0].read_bytes() == before, "a read-only update check rewrote the auth store"
+    (entry,) = receipt["models"]
+    assert (entry["result"], entry["role"]) == ("sign_in_unproven", PLANNER)
+    assert receipt["result"] == "nothing_filed" and _suggestions(world) == []
+    assert fake.probe_calls == []
+
+
+def test_worker_sign_in_is_its_own_runtime_choice_and_no_store_is_rewritten(world, monkeypatch):
+    """Contract A for the coding worker too: the preview's choice in its own scope, and no other source."""
+    from hermes_cli import auth, models
+
+    muc = _muc()
+    planner, worker = world.root / "profiles" / PLANNER, world.root / "profiles" / WORKER
+    worker.mkdir(parents=True, exist_ok=True)
+    account = "placeholder-worker-account"
+    row = {"id": "placeholder-worker-row", "label": "placeholder worker account", "auth_type": "api_key",
+           "priority": 0, "source": "manual", "access_token": account, "base_url": "https://api.anthropic.com"}
+    stores = []
+    # The process's own store has no usable choice; the worker's own store has one account.
+    _in_profile_scope(planner, lambda: stores.append(auth.write_credential_pool("anthropic", [_stale_login_row()])) or "")
+    _in_profile_scope(worker, lambda: stores.append(auth.write_credential_pool("anthropic", [row])) or "")
+    before = [store.read_bytes() for store in stores]
+    asked = []
+    monkeypatch.setattr(models, "_fetch_anthropic_models",
+                        lambda *, api_key, **_kwargs: asked.append(api_key) or [OPUS, OPUS_NEW])
+    fake = Fake(routes=[(WORKER, "anthropic", OPUS, "max", "deep")], lists={})
+
+    receipt = _cli(world, replace(fake.seams(muc), sign_ins=muc._role_sign_ins, account_models=muc._account_model_ids))
+
+    assert [store.read_bytes() for store in stores] == before, "a read-only update check rewrote an auth store"
+    assert asked == [account]
+    assert receipt["result"] == "filed" and len(_suggestions(world)) == 1
+    assert account not in json.dumps(receipt) + _dump(world)
