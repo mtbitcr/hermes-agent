@@ -65,7 +65,7 @@ from hermes_cli import kanban_db, owner_project_review_owner_line as owner_steps
 from hermes_cli import owner_project_summary as summary
 from hermes_cli import owner_project_summary_events as events
 from hermes_cli.kanban_recommendation_closure import content_link, delivery_after_undo
-from hermes_cli.owner_project_review_suggestions import _review_closures, check_closure_shapes
+from hermes_cli.owner_project_review_suggestions import _review_closures, check_closure_shapes, check_plan_suggestions
 from hermes_cli.sqlite_util import write_txn
 
 logger = logging.getLogger(__name__)
@@ -137,6 +137,8 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
    specification, current_milestone, owner_visible_result, later_milestones, and changes.
    Use the native plan change schema. Each existing task reference must use its input status and event revision.
    This is advice for the Project chat. It grants no approval and changes no work.
+   An accepted suggestion with a null linked_card may be planned there: add plan_suggestions, at most three objects
+   with exactly change (the index of an add change in changes) and suggestion (its id).
 9. When Review days start from the start, this is the Project's first review and no review came before it.
    Do not write last review, previous review, earlier review or prior review. Write so far instead.
 """
@@ -349,6 +351,11 @@ def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, s
         ):
             actual = "answered"
             evidence = [f"decisions:event:{max(item['event_id'] for item in answers)}"]
+        elif (tid in suggestions and suggestions[tid]["decision"] == "accepted" and (made := suggestions[tid].get("linked_card"))
+              and by_item[tid]["class"] == "superseded" and f"tasks:{made}" in by_item[tid]["evidence"]
+              and made in tasks and _delivered_match(board, project_id, tid, tasks[made])):
+            # An accepted suggestion whose own linked card is delivered, as the worker's evidence names it.
+            actual, evidence = "superseded", [f"tasks:{made}"]
         elif tid in suggestions and suggestions[tid]["decision"] != "pending":
             actual = "answered"
             evidence = [f"suggestions:{tid}"]
@@ -433,8 +440,9 @@ def check_result_texts(value: Any, sources: Optional[dict[str, list[dict]]] = No
     from hermes_cli.owner_project_review_record import TOTAL_INPUT_CAP_BYTES
 
     required = {"summary", "brief", "classification", "proposed_closures"}
-    # Plan advice is the one optional key. Every other extra key stays invalid.
-    if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(required | {"plan_proposal"}):
+    # Plan advice and the suggestions it plans are the optional keys. Every other extra key stays invalid.
+    if (not isinstance(value, dict) or not required.issubset(value)
+            or not set(value).issubset(required | {"plan_proposal", "plan_suggestions"})):
         raise ReviewRefused("review_result_keys_invalid")
     try:
         if len(json.dumps(value, allow_nan=False).encode("utf-8")) > TOTAL_INPUT_CAP_BYTES:
@@ -505,8 +513,9 @@ def parse_review_result(
         try:
             hint = proposal_hint(
                 value.get("plan_proposal"), sources, project_board, registry, project, now=now,
-                limit=_BRIEF_LIMITS["next_step"], max_bytes=TOTAL_INPUT_CAP_BYTES,
+                limit=_BRIEF_LIMITS["next_step"], max_bytes=TOTAL_INPUT_CAP_BYTES, pairs=value.get("plan_suggestions"),
             )
+            check_plan_suggestions(value, sources, project_board, registry, project)
         except ReviewRefused:
             raise
         except ValueError as exc:

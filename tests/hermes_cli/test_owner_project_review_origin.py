@@ -13,7 +13,9 @@ from aiohttp.test_utils import TestClient, TestServer
 from hermes_cli import kanban_db, owner_project_review as review, owner_workspace, projects_db
 from tests.gateway.test_api_server_owner_review_advice import accepted_advice, app, stable  # noqa: F401
 from tests.hermes_cli.test_owner_project_review_record import root  # noqa: F401
-from tests.hermes_cli.test_owner_project_review_suggestions import NOW, _commit, _complete, _plan, _result, world  # noqa: F401
+from tests.hermes_cli.test_owner_project_review_suggestions import (  # noqa: F401
+    NOW, _commit, _complete, _plan, _request, _result, world,
+)
 from tests.hermes_cli.test_owner_workspace import ctx  # noqa: F401
 
 HINT = "Ask Raphael in the Project chat to postpone Book the room."
@@ -137,17 +139,6 @@ def _read(path):
 
 def _board_file(root, slug):
     return root / "kanban.db" if slug == "default" else root / "kanban" / "boards" / slug / "kanban.db"
-
-
-def _request(project_id, plan):
-    """The digest of the owner's exact approval of ``plan``, built the way the owner commit builds it."""
-    changes, risk = owner_workspace._normalize_project_changes(plan["changes"])
-    return owner_workspace._digest({
-        "project_id": project_id, "trigger": "owner_request",
-        **{name: plan[name] for name in ("request_title", "summary", "specification", "current_milestone",
-                                         "owner_visible_result")},
-        "later_milestones": owner_workspace._normalize_later_milestones(plan["later_milestones"]),
-        "risk_level": risk, "changes": changes})
 
 
 def _counts(world, digest):

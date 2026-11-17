@@ -274,6 +274,12 @@ def _suggestions(board, project, sources, cuts):
             if closure:
                 item["closure"] = {key: closure[key] for key in
                                    ("card_id", "card_state", "reason", "review_date", "closed_at", "undone_at")}
+        # The kernel's lineage: the card made from this suggestion, null on a board from before the lineage table.
+        made = _table(board, "recommendation_made_from") and board.execute(
+            "SELECT card_id FROM recommendation_made_from WHERE recommendation_id=? ORDER BY recorded_at,card_id LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        item["linked_card"] = made[0] if made else None
         sources["suggestions"].append(item)
 
 

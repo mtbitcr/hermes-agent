@@ -141,6 +141,17 @@ def _trigger(world, card):
     return plan["trigger"]
 
 
+def _request(project_id, plan):
+    """The digest of the owner's exact approval of ``plan``, built the way the owner commit builds it."""
+    changes, risk = owner_workspace._normalize_project_changes(plan["changes"])
+    return owner_workspace._digest({
+        "project_id": project_id, "trigger": "owner_request",
+        **{name: plan[name] for name in ("request_title", "summary", "specification", "current_milestone",
+                                         "owner_visible_result")},
+        "later_milestones": owner_workspace._normalize_later_milestones(plan["later_milestones"]),
+        "risk_level": risk, "changes": changes})
+
+
 def test_t1_a_result_with_a_valid_plan_suggestions_pair_is_accepted(world):
     _complete(world, _result(world, plan=_plan(), pairs=[{"change": 0, "suggestion": world["accepted"]}]))
 
@@ -289,3 +300,49 @@ def test_t7_a_denied_plan_writes_nothing_and_the_next_review_does_not_propose_it
     with pytest.raises(review.ReviewRefused) as refused:
         _parse(world)
     assert refused.value.code == "review_plan_suggestion_denied"
+
+
+def test_t7_a_denied_reviewed_plan_is_not_proposed_again_for_its_suggestion_in_other_words(world, ctx):
+    from hermes_cli.owner_project_review_proposals import proposal_hint
+    from hermes_cli.owner_project_review_view import project_review_advice_view
+
+    project, plan, pairs = world["project"], _plan(), [{"change": 0, "suggestion": world["accepted"]}]
+    # A review pairs the accepted suggestion with a plan, and the harvest accepts it: the owner sees the hint.
+    _complete(world, _result(world, plan=plan, pairs=pairs))
+    assert _parse(world).brief["next_step"] == HINT
+    assert review.review_tick(NOW + 1) == 0
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        assert registry.execute("SELECT next_step FROM project_review_briefs WHERE project_id=?",
+                                (project.id,)).fetchone()[0] == HINT
+    assert project_review_advice_view(project.id) == {"review_date": "2026-11-10", "proposal": plan}
+
+    # The owner denies exactly that reviewed plan in the Project chat.
+    assert _commit(ctx, world, plan, key="denied-reviewed-plan", choice="deny")["error"] == "confirmation_denied"
+    assert project_review_advice_view(project.id) is None
+
+    # News opens the next day's review, which pairs the same suggestion with a reworded plan.
+    with _written_at(NOW + 3600), _project_board(project) as board:
+        kanban_db.add_comment(board, world["booked"], "default", "The hall must seat forty guests.")
+    assert review.review_tick(NOW + 86400) == 1
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        later = registry.execute("SELECT open_task_id FROM project_review_state WHERE project_id=?",
+                                 (project.id,)).fetchone()[0]
+    assert later != world["review_task"]
+    reworded = {**_plan(_add("Reserve the large conference hall")), "summary": "Reserve a large hall for the visit."}
+    _complete({**world, "review_task": later}, _result(world, plan=reworded, pairs=pairs))
+    # Only the first plan's exact approval was denied: the reworded plan has a digest of its own.
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        denials = [row[0] for row in registry.execute(
+            "SELECT request_digest FROM owner_workspace_receipts WHERE status='denied' "
+            "AND operation='owner_project_plan_commit'")]
+    assert denials == [_request(project.id, plan)] and _request(project.id, reworded) not in denials
+
+    with _summary_board() as board:
+        with pytest.raises(review.ReviewRefused) as refused:
+            review.parse_review_result(board, later, project_id=project.id, now=NOW + 86400, stale_days=14)
+        sources, _cut = review._frozen_sources(kanban_db.get_task(board, later).body)
+    assert refused.value.code == "review_plan_suggestion_denied"
+    # No hint names the reworded plan for the suggestion whose reviewed plan the owner denied.
+    with review._review_evidence_board(project.id) as (board, registry, live):
+        assert proposal_hint(reworded, sources, board, registry, live, now=NOW + 86400, limit=240,
+                             max_bytes=record.TOTAL_INPUT_CAP_BYTES, pairs=pairs) is None
