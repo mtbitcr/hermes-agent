@@ -16,8 +16,8 @@ from hermes_cli.owner_review_handover import handover_refusal
 from tests.gateway.test_owner_heads_up import root as digest_root  # noqa: F401
 from tests.gateway.test_owner_review_digest import NOTES_LINE, Adapter, _project, _ready, _runner
 from tests.hermes_cli.test_owner_portfolio_review import (
-    SUMMARIES, _brief, _finish_portfolio, _frozen, _news, _portfolio_body, _portfolio_on, _project_board, _summaries,
-    _waiting_pair,
+    SUMMARIES, _brief, _complete_project, _finish_portfolio, _frozen, _news, _portfolio_body, _portfolio_on,
+    _project_board, _summaries, _waiting_pair,
 )
 from tests.hermes_cli.test_owner_project_review_cycle import PLANNER, _at, _enter_planning_worker
 from tests.hermes_cli.test_owner_project_review_owner_line import NAME, RID, _chat, _consume, _independent_count, _link
@@ -308,6 +308,76 @@ def test_a_plan_approval_read_that_raises_is_refused_by_the_existing_input_rule_
 
     assert review.review_tick(NOW + 2) == 1
     assert {item["name"] for item in _frozen(_portfolio_body())["projects"]} == {"Meeting Plan", "Guest Visit"}
+
+
+# A complete Project joins the cross-project review on a day when it holds an owner step.
+SUGGESTION_FIRST = "Design Loop: Decide the waiting suggestion first."
+
+
+def _asker(root):
+    """An active Project whose work waits for the owner's answer, with no news of the day."""
+    project = _quiet_project(root, "Meeting Plan")
+    _ask_owner(project)
+    _settle(root, project)
+    return project
+
+
+def _harvested(root, advice):
+    """Finish the day's portfolio task with ``advice`` as its one priority; the brief the next tick stores."""
+    _finish_portfolio({"conflicts": [], "priorities": [advice], "shared_blockers": []})
+    assert review.review_tick(NOW + 1) == 0
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        return _brief(registry, DAY)
+
+
+def test_a_complete_project_with_one_pending_suggestion_is_in_the_frozen_input_and_the_stored_scope(root):
+    asker, done = _asker(root), _complete_project(root, "Design Loop")
+    _portfolio_on(root, asker, done)
+
+    # The complete Project is the second Project with an owner step, so the day gets advice.
+    assert review.review_tick(NOW) == 1
+
+    frozen = _frozen(_portfolio_body())
+    records = {item["name"]: item for item in frozen["projects"]}
+    assert records["Design Loop"] == {
+        "name": "Design Loop", "review_state": "not reviewed today", "brief": {"needs_you": None},
+        "owner_steps": {"answers": 0, "suggestions": 1, "plan_approvals": 0}, "oldest_answer_days": None,
+    }
+    assert sorted(frozen["project_scope"]) == sorted([asker.id, done.id])
+    brief = _harvested(root, SUGGESTION_FIRST)
+    assert brief["priorities"] == [SUGGESTION_FIRST]
+    assert sorted(brief["project_scope"]) == sorted([asker.id, done.id])
+
+
+def test_a_complete_project_with_no_owner_step_stays_out_next_to_one_with_a_suggestion(root):
+    asker = _asker(root)
+    done, idle = _complete_project(root, "Design Loop"), _complete_project(root, "Garden Shed", suggestion=False)
+    _portfolio_on(root, asker, done, idle)
+
+    assert review.review_tick(NOW) == 1
+
+    frozen = _frozen(_portfolio_body())
+    assert {item["name"] for item in frozen["projects"]} == {"Meeting Plan", "Design Loop"}
+    assert sorted(frozen["project_scope"]) == sorted([asker.id, done.id])
+    assert sorted(_harvested(root, SUGGESTION_FIRST)["project_scope"]) == sorted([asker.id, done.id])
+
+
+def test_a_paused_project_and_one_off_the_allowlist_stay_out_also_with_an_owner_step(root):
+    asker = _asker(root)
+    done, paused, unlisted = (_complete_project(root, name) for name in ("Design Loop", "Hotel Search", "Guest Visit"))
+    kanban_db.write_board_dispatch_state(paused.board_slug, dispatch_paused_by_owner=True)
+    _portfolio_on(root, asker, done, paused)
+    # Each of the two holds its pending suggestion, counted as the portfolio input counts it.
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        held = portfolio._input(registry, [paused, unlisted], DAY, NOW)["projects"]
+    assert [item["owner_steps"]["suggestions"] for item in held] == [1, 1]
+
+    assert review.review_tick(NOW) == 1
+
+    frozen = _frozen(_portfolio_body())
+    assert {item["name"] for item in frozen["projects"]} == {"Meeting Plan", "Design Loop"}
+    assert sorted(frozen["project_scope"]) == sorted([asker.id, done.id])
+    assert sorted(_harvested(root, SUGGESTION_FIRST)["project_scope"]) == sorted([asker.id, done.id])
 
 
 # A morning message whose stored portfolio brief holds no advice says so; one line of advice keeps the notes line.

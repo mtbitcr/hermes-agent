@@ -268,11 +268,18 @@ def register(ctx) -> None:
     from plugins.dashboard_auth.raphael_workspace.model_policy import (
         register_models_machine_routes,
     )
+    from plugins.dashboard_auth.raphael_workspace.renewal import (
+        register_renewal_routes,
+    )
     from plugins.dashboard_auth.raphael_workspace.sandbox_dispatch import (
         register_sandbox_tool,
     )
 
     register_models_machine_routes()
+    # POST /api/service-access/<surface>/renew and
+    # POST /api/service-access/<surface>/retire-older; hermes_cli/web_server.py
+    # mounts their router.
+    register_renewal_routes()
     register_sandbox_tool(ctx)
     ctx.register_dashboard_auth_provider(WorkspaceReadTokenProvider())
     ctx.register_dashboard_auth_provider(RecommendationsReadTokenProvider())
