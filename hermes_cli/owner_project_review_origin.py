@@ -123,16 +123,18 @@ def confirmed_plan_links(project_id, request_digest):
 def _denied_plan(registry, project_id, proposal, suggestions=()):
     """Whether the owner denied this reviewed plan, or a reviewed plan for one of its accepted suggestions.
 
-    A denied plan commit in the root registry is the owner's answer to its exact approval digest. The pairs of the
-    stored accepted reviews tie each reviewed plan to its suggestions, so a reworded plan for a suggestion whose
-    reviewed plan was denied is not proposed again. ``suggestions`` are the plan's own pairs; the pairs a stored review
-    gave this same plan count too. Read only: an absent table or an unreadable store denies nothing. The plan commit
-    never reads this, so the owner can still ask for the work in the Project chat.
+    A denied plan commit in the root registry is the owner's answer to its exact approval digest; a silence, an
+    approval that timed out with no answer of the owner, denies nothing. The pairs of the stored accepted reviews tie
+    each reviewed plan to its suggestions, so a reworded plan for a suggestion whose reviewed plan was denied is not
+    proposed again while the brief history (its latest 90 briefs) holds that pair. ``suggestions`` are the plan's own
+    pairs; the pairs a stored review gave this same plan count too. Read only: an absent table or an unreadable store
+    denies nothing. The plan commit never reads this, so the owner can still ask for the work in the Project chat.
     """
     try:
-        denied = {row[0] for row in registry.execute(
-            "SELECT request_digest FROM owner_workspace_receipts "
-            "WHERE operation='owner_project_plan_commit' AND status='denied'")}
+        denied = {row["request_digest"] for row in registry.execute(
+            "SELECT request_digest,status,result_json FROM owner_workspace_receipts "
+            "WHERE operation='owner_project_plan_commit' AND status='denied'")
+            if not owner_workspace._is_retryable_confirmation_timeout(row)}
         digest = _plan_digest(project_id, proposal)
         if not denied or digest in denied:
             return digest in denied

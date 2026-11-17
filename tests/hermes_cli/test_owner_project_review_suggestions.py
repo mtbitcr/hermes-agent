@@ -124,6 +124,14 @@ def _commit(ctx, world, plan, *, key, choice="once"):
         approver.join()
 
 
+def _silence(ctx, world, plan, *, key):
+    """The owner's normal plan commit that ends with no answer of the owner: its approval times out."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(owner_workspace, "_confirm", lambda *args, **kwargs: {"approved": False, "reason": "timeout"})
+        return _commit_project_plan(ctx, idempotency_key=key, project_id=world["project"].id, trigger="owner_request",
+                                    **plan)
+
+
 def _links(world):
     with _project_board(world["project"]) as board:
         return sorted(tuple(row) for row in board.execute("SELECT card_id,recommendation_id FROM recommendation_made_from"))
@@ -166,6 +174,33 @@ def test_t1_a_result_with_a_valid_plan_suggestions_pair_is_accepted(world):
             "SELECT next_step,source_digest FROM project_review_briefs WHERE project_id=?", (world["project"].id,),
         ).fetchone()
     assert tuple(stored) == (HINT, result.source_digest)
+
+
+def test_t1_a_pair_after_two_long_changes_keeps_its_phrase_in_the_bounded_hint(world):
+    from hermes_cli.owner_project_review_proposals import _render
+
+    titles = ("Arrange comfortable seating for the guests in the reception room",
+              "Prepare fresh refreshments for visitors before the evening reception",
+              "Organize suitable transport for visitors after the evening reception")
+    plan = _plan(*(_add(title) for title in titles))
+    _complete(world, _result(world, plan=plan, pairs=[{"change": 2, "suggestion": world["accepted"]}]))
+
+    result = _parse(world)
+
+    assert review.review_tick(NOW + 1) == 0
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        shown = projects_db.get_project_review_brief(registry, world["project"].id)["next_step"]
+    # The paired change comes first, with the stored label; the count names the change the bounded hint leaves out.
+    assert shown == result.brief["next_step"] == (
+        "Ask Raphael in the Project chat to add Organize suitable transport for visitors after the evening… "
+        f"for your accepted suggestion {ROOM}; add Arrange comfortable seating for the guests in the reception…; "
+        "and 1 more change.")
+    assert f" for your accepted suggestion {ROOM}" in shown and len(shown) <= 240
+    # The same plan without a pair keeps its hint as it was: its own order, and all three changes fit.
+    assert _render(plan["changes"], {"tasks": []}, limit=240) == (
+        "Ask Raphael in the Project chat to add Arrange comfortable seating for the guests in the reception…; "
+        "add Prepare fresh refreshments for visitors before the evening…; "
+        "add Organize suitable transport for visitors after the evening….")
 
 
 @pytest.mark.parametrize(("case", "code"), [
@@ -346,3 +381,87 @@ def test_t7_a_denied_reviewed_plan_is_not_proposed_again_for_its_suggestion_in_o
     with review._review_evidence_board(project.id) as (board, registry, live):
         assert proposal_hint(reworded, sources, board, registry, live, now=NOW + 86400, limit=240,
                              max_bytes=record.TOTAL_INPUT_CAP_BYTES, pairs=pairs) is None
+    # The real harvest of that review, while the brief history holds the pair: no hint is stored, the pair is refused.
+    review.review_tick(NOW + 86401)
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        briefs = registry.execute("SELECT next_step,source_task_id FROM project_review_briefs WHERE project_id=?",
+                                  (project.id,)).fetchall()
+        refusal = registry.execute("SELECT last_refusal FROM project_review_state WHERE project_id=?",
+                                   (project.id,)).fetchone()[0]
+    assert [tuple(brief) for brief in briefs] == [(HINT, world["review_task"])]
+    assert json.loads(refusal)["code"] == "review_plan_suggestion_denied"
+
+
+def test_t7_a_silence_denies_nothing_and_the_next_review_gives_the_hint_and_accepts_the_pair(world, ctx):
+    from hermes_cli.owner_project_review_view import project_review_advice_view
+
+    project, plan, pairs = world["project"], _plan(), [{"change": 0, "suggestion": world["accepted"]}]
+    _complete(world, _result(world, plan=plan, pairs=pairs))
+    assert review.review_tick(NOW + 1) == 0
+    before = (_links(world), _work_titles(world))
+
+    # The owner gives no answer: the approval times out, and the receipt records the silence.
+    silent = _silence(ctx, world, plan, key="silent-room-plan")
+
+    assert silent == {"ok": False, "error": "confirmation_denied", "reason": "timeout"}
+    assert (_links(world), _work_titles(world)) == before
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        [receipt] = registry.execute("SELECT * FROM owner_workspace_receipts WHERE status='denied' "
+                                     "AND operation='owner_project_plan_commit'").fetchall()
+    assert receipt["request_digest"] == _request(project.id, plan)
+    assert owner_workspace._is_retryable_confirmation_timeout(receipt)
+    # News opens the next day's review, which pairs the same suggestion with the same plan.
+    with _written_at(NOW + 3600), _project_board(project) as board:
+        kanban_db.add_comment(board, world["booked"], "default", "The hall must seat forty guests.")
+    assert review.review_tick(NOW + 86400) == 1
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        later = registry.execute("SELECT open_task_id FROM project_review_state WHERE project_id=?",
+                                 (project.id,)).fetchone()[0]
+    _complete({**world, "review_task": later}, _result(world, plan=plan, pairs=pairs))
+
+    review.review_tick(NOW + 86401)
+
+    # The real harvest gives the hint and accepts the pair: the silence denied nothing.
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        brief = registry.execute("SELECT next_step,source_task_id FROM project_review_briefs WHERE project_id=? "
+                                 "ORDER BY review_date DESC LIMIT 1", (project.id,)).fetchone()
+        refusal = registry.execute("SELECT last_refusal FROM project_review_state WHERE project_id=?",
+                                   (project.id,)).fetchone()[0]
+    assert (tuple(brief), refusal) == ((HINT, later), None)
+    assert project_review_advice_view(project.id) == {"review_date": "2026-11-11", "proposal": plan}
+
+
+def test_t7_after_its_pair_left_the_brief_history_the_review_gives_the_hint_again(world, ctx):
+    """The accepted limit of the owner rule of 2026-11-17: the 90 briefs of the history remember a denial."""
+    project, pairs = world["project"], [{"change": 0, "suggestion": world["accepted"]}]
+    _complete(world, _result(world, plan=_plan(), pairs=pairs))
+    assert review.review_tick(NOW + 1) == 0
+    assert _commit(ctx, world, _plan(), key="denied-room-plan", choice="deny")["error"] == "confirmation_denied"
+    # Daily review ticks until the normal retention drops the brief that paired the plan with the suggestion.
+    for day in range(1, 92):
+        review.review_tick(NOW + day * 86400)
+        with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+            task = registry.execute("SELECT open_task_id FROM project_review_state WHERE project_id=?",
+                                    (project.id,)).fetchone()[0]
+        if task:
+            _complete({**world, "review_task": task}, _result(world))
+            review.review_tick(NOW + day * 86400 + 1)
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        assert registry.execute("SELECT COUNT(*) FROM project_review_briefs WHERE source_task_id=?",
+                                (world["review_task"],)).fetchone()[0] == 0
+    when = NOW + 92 * 86400
+    with _written_at(when - 3600), _project_board(project) as board:
+        kanban_db.add_comment(board, world["booked"], "default", "The hall needs forty seats.")
+    assert review.review_tick(when) == 1
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        later = registry.execute("SELECT open_task_id FROM project_review_state WHERE project_id=?",
+                                 (project.id,)).fetchone()[0]
+    reworded = {**_plan(_add("Reserve the large conference hall")), "summary": "Reserve a larger hall for the visit."}
+    _complete({**world, "review_task": later}, _result(world, plan=reworded, pairs=pairs))
+
+    review.review_tick(when + 1)
+
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        brief = registry.execute("SELECT next_step,source_task_id FROM project_review_briefs WHERE project_id=? "
+                                 "ORDER BY review_date DESC LIMIT 1", (project.id,)).fetchone()
+    assert tuple(brief) == (HINT.replace(HALL, "Reserve the large conference hall"), later)

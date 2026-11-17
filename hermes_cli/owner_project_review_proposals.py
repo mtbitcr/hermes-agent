@@ -112,6 +112,9 @@ def _render(changes, sources, *, limit, labels=None):
     names the accepted suggestion an add change plans, by the change's index."""
     titles = {item["id"]: item["title"] for item in sources["tasks"]}
     labels = labels or {}
+    # A paired change comes before the changes without a pair, so a bounded hint always names a pair. Without a pair
+    # the order is the plan's own.
+    order = sorted(range(len(changes)), key=lambda index: index not in labels)
 
     def works(change):
         refs = change["targets"] if "targets" in change else [change["target"]] if "target" in change else []
@@ -136,14 +139,14 @@ def _render(changes, sources, *, limit, labels=None):
 
     # The longest run of whole changes that fits, then a count of the rest.
     for shown in range(len(changes), 0, -1):
-        text = hint([phrase(index) for index in range(shown)], len(changes) - shown)
+        text = hint([phrase(index) for index in order[:shown]], len(changes) - shown)
         if len(text) <= limit:
             return text
     # The first change alone keeps its action: first its list of titles is cut to a count, then the title itself.
-    first, rest = changes[0], len(changes) - 1
+    first, rest = changes[order[0]], len(changes) - 1
     size = max(map(len, works(first)))
     for keep, width in [(keep, 60) for keep in range(size - 1, 0, -1)] + [(1, width) for width in range(59, 1, -1)]:
-        text = hint([phrase(0, keep, width)], rest)
+        text = hint([phrase(order[0], keep, width)], rest)
         if len(text) <= limit:
             return text
     return text

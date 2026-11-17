@@ -14,7 +14,7 @@ from hermes_cli import kanban_db, owner_project_review as review, owner_workspac
 from tests.gateway.test_api_server_owner_review_advice import accepted_advice, app, stable  # noqa: F401
 from tests.hermes_cli.test_owner_project_review_record import root  # noqa: F401
 from tests.hermes_cli.test_owner_project_review_suggestions import (  # noqa: F401
-    NOW, _commit, _complete, _plan, _request, _result, world,
+    NOW, _commit, _complete, _plan, _request, _result, _silence, world,
 )
 from tests.hermes_cli.test_owner_workspace import ctx  # noqa: F401
 
@@ -142,11 +142,14 @@ def _board_file(root, slug):
 
 
 def _counts(world, digest):
-    """The independent count: plain read-only SQLite of the root files, with no Hermes path helper."""
+    """The independent count: plain read-only SQLite of the root files, with no Hermes path helper. A receipt whose
+    approval timed out records a silence, the others the owner's own denial."""
     root, accepted = world["root"], world["accepted"]
     with _read(root / "projects.db") as registry:
-        denials = registry.execute("SELECT COUNT(*) FROM owner_workspace_receipts WHERE status='denied' "
-                                   "AND operation='owner_project_plan_commit' AND request_digest=?", (digest,)).fetchone()[0]
+        denials, silences = registry.execute(
+            "SELECT COUNT(*) FILTER (WHERE json_extract(result_json,'$.reason') IS NOT 'timeout'),"
+            "COUNT(*) FILTER (WHERE json_extract(result_json,'$.reason')='timeout') FROM owner_workspace_receipts "
+            "WHERE status='denied' AND operation='owner_project_plan_commit' AND request_digest=?", (digest,)).fetchone()
     with _read(_board_file(root, "project-summaries")) as board:
         [(metadata,)] = board.execute("SELECT metadata FROM task_runs WHERE task_id=? AND outcome='completed'",
                                       (world["review_task"],)).fetchall()
@@ -154,7 +157,8 @@ def _counts(world, digest):
         decision = board.execute("SELECT recommendation_decision FROM tasks WHERE id=?", (accepted,)).fetchone()[0]
         links = board.execute("SELECT COUNT(*) FROM recommendation_made_from WHERE recommendation_id=?",
                               (accepted,)).fetchone()[0]
-    return {"denials": denials, "stored": json.loads(metadata)["project_review"], "decision": decision, "links": links}
+    return {"denials": denials, "silences": silences, "stored": json.loads(metadata)["project_review"],
+            "decision": decision, "links": links}
 
 
 @contextlib.contextmanager
@@ -190,15 +194,25 @@ def test_t8_a_planner_worker_checks_the_pairs_against_the_root_registry_and_ever
     _complete(world, _result(world, plan=plan, pairs=[{"change": 0, "suggestion": accepted}]))
     review.review_tick(NOW + 1)
     assert project_review_advice_view(project.id) == {"review_date": "2026-11-10", "proposal": plan}
-    assert _commit(ctx, world, plan, key="denied-room-plan", choice="deny")["error"] == "confirmation_denied"
     digest = _request(project.id, plan)
-    counts = _counts(world, digest)
-    assert (counts["denials"], counts["decision"], counts["links"]) == (1, "accepted", 0)
-    pairs = [(pair["change"], pair["suggestion"]) for pair in counts["stored"]["plan_suggestions"]]
-    assert pairs == [(0, accepted)]
     with _read(_board_file(world["root"], "project-summaries")) as board:
         sources, _cut = review._frozen_sources(
             board.execute("SELECT body FROM tasks WHERE id=?", (world["review_task"],)).fetchone()[0])
+
+    # The owner gives no answer: a silence in the root registry denies nothing, to the owner or to a worker.
+    assert _silence(ctx, world, plan, key="silent-room-plan")["reason"] == "timeout"
+    counts = _counts(world, digest)
+    assert (counts["denials"], counts["silences"], counts["decision"], counts["links"]) == (0, 1, "accepted", 0)
+    with _worker(world, pinned):
+        assert project_review_advice_view(project.id) == {"review_date": "2026-11-10", "proposal": plan}
+        with review._review_evidence_board(project.id) as (board, registry, live):
+            check_plan_suggestions(counts["stored"], sources, board, registry, live)
+
+    assert _commit(ctx, world, plan, key="denied-room-plan", choice="deny")["error"] == "confirmation_denied"
+    counts = _counts(world, digest)
+    assert (counts["denials"], counts["silences"], counts["decision"], counts["links"]) == (1, 1, "accepted", 0)
+    pairs = [(pair["change"], pair["suggestion"]) for pair in counts["stored"]["plan_suggestions"]]
+    assert pairs == [(0, accepted)]
 
     with _worker(world, pinned):
         assert confirmed_plan_links(project.id, digest) == pairs

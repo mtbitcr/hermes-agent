@@ -72,8 +72,9 @@ def check_plan_suggestions(value, sources, board, registry, project) -> None:
 
     Each pair names an add change of the checked plan_proposal and a suggestion of the frozen input that is accepted
     or pending, has no live closure and no linked card; no suggestion and no change appears twice, and a list without
-    a plan is refused. A suggestion whose reviewed plan the owner denied is not planned again. The pairs are only the
-    review's proposal: a link is written by the kernel, in the owner's exactly approved plan commit.
+    a plan is refused. A suggestion whose reviewed plan the owner denied is not planned again while the brief history
+    holds that pair (origin._denied_plan). The pairs are only the review's proposal: a link is written by the kernel,
+    in the owner's exactly approved plan commit.
     """
     from hermes_cli.owner_project_review import ReviewRefused
     from hermes_cli.owner_project_review_origin import _denied_plan
