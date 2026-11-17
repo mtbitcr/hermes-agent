@@ -4,10 +4,12 @@ Card 2 of the model update flow. For every model a role uses now, the check
 looks for a higher version of the same family in the live account lists and
 runs three checks on it, cheapest first:
 
-1. Account: every sign-in a role of that model uses lists the version.
+1. Account: every sign-in a role of that model uses, read in that role's own
+   profile, lists the version.
 2. Compatibility, local and free: the capability row supports each role's
    effort, and the context window is not smaller than the current one's.
-3. Probe: one short coding question per sign-in, with fallbacks disabled.
+3. Probe: one short coding question per distinct sign-in, with fallbacks
+   disabled.
 
 The first ranked candidate that passes all three is filed as one suggestion
 through Decisions (a ``provider_model_policy`` recommendation on the board of
@@ -191,9 +193,14 @@ def _configured_routes(role: str) -> tuple:
 
 
 def _gateway_token() -> str:
-    from agent.anthropic_credentials import resolve_anthropic_token
+    from agent import anthropic_credentials
 
-    return (resolve_anthropic_token() or "").strip()
+    # The resolver refreshes an expired shared login, which writes it; the
+    # check never asks then, so that sign-in stays unproven.
+    login = anthropic_credentials.read_claude_code_credentials()
+    if login and login.get("refreshToken") and not anthropic_credentials.is_claude_code_token_valid(login):
+        return ""
+    return (anthropic_credentials.resolve_anthropic_token() or "").strip()
 
 
 def _build_token() -> str:
@@ -252,28 +259,115 @@ def _sign_in_value(provider: str, sign_in: str) -> str:
     return value
 
 
-def _role_sign_ins(role: str, provider: str) -> tuple:
-    """Which sign-ins ``role`` uses for ``provider``: ``(names, "")`` or ``(None, why)``.
+class _SignIn:
+    """One sign-in a role uses: its name, and its value in memory only.
 
-    The coding worker's builds sign in through the host resolver of the build
-    machine, which prefers the build sign-in and can fall back to other
-    credentials; which one it picks is proven by comparing values in memory.
-    Every other role runs on the gateway's sign-in of its provider.
+    Two sign-ins are the same account when their values are equal, which is
+    compared here and nowhere else. Showing, copying or pickling one gives its
+    name only, so a value never reaches a receipt, a log or a suggestion.
+    """
+
+    __slots__ = ("name", "value")
+
+    def __init__(self, name: str, value: str):
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "value", value)
+
+    def __setattr__(self, _name, _value):
+        raise AttributeError("a sign-in is read-only")
+
+    def __eq__(self, other):
+        return isinstance(other, _SignIn) and other.value == self.value
+
+    def __hash__(self):
+        return hash((_SignIn, self.value))
+
+    def __repr__(self):
+        return f"_SignIn({self.name!r})"
+
+    def __str__(self):
+        return self.name
+
+    def __reduce__(self):
+        return (str, (self.name,))
+
+
+def _value_of(provider: str, sign_in) -> str:
+    """The value of a proven sign-in, or of a named one in the current scope."""
+    return sign_in.value if isinstance(sign_in, _SignIn) else _sign_in_value(provider, sign_in)
+
+
+def _name_of(sign_in) -> str:
+    return getattr(sign_in, "name", sign_in)
+
+
+def _in_scope(home, secrets: dict, reader: Callable[[], str]) -> str:
+    """``reader`` run in one profile's read-only scope: its home and its secrets."""
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home_token = set_hermes_home_override(home)
+    secret_token = set_secret_scope(secrets)
+    try:
+        return (reader() or "").strip()
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
+def _role_value(role: str, reader: Callable[[], str]) -> str:
+    """What ``reader`` resolves in ``role``'s own scope, or "" when that is not proven.
+
+    A secret the role's own sources lack falls through to this process's
+    environment, which holds the planning profile's values. So for any other
+    role the answer must stay the same when every secret only the planning
+    profile defines is blanked; one that changes was borrowed, never the
+    role's own.
+    """
+    from agent.secret_scope import build_profile_secret_scope
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_constants import get_hermes_home
+
+    planner_home, home = get_hermes_home(), get_profile_dir(role)
+    secrets = build_profile_secret_scope(home)
+    value = _in_scope(home, secrets, reader)
+    if home.resolve() == planner_home.resolve():
+        return value
+    masked = {name: "" for name in build_profile_secret_scope(planner_home) if name not in secrets}
+    if not value or value != _in_scope(home, {**masked, **secrets}, reader):
+        return ""
+    return value
+
+
+def _role_sign_ins(role: str, provider: str) -> tuple:
+    """The sign-ins ``role`` itself uses for ``provider``: ``(sign-ins, "")`` or ``(None, why)``.
+
+    Each is resolved in the role's own read-only scope and held as a
+    ``_SignIn``. The coding worker's builds sign in through the host resolver
+    of the build machine, which prefers the build sign-in and can fall back to
+    other credentials; which one it picks is proven by comparing its value
+    with the worker's own sign-ins in memory.
     """
     from plugins.dashboard_auth.raphael_workspace import sandbox_dispatch
 
     if provider == "openai-codex":
-        return ("codex",), ""
+        value = _role_value(role, _codex_token)
+        if not value:
+            return None, "The role's own sign-in for this provider could not be proven."
+        return (_SignIn("codex", value),), ""
     if provider != "anthropic":
         return None, "The check has no account list for this provider."
+    gateway = _role_value(role, _gateway_token)
+    if not gateway:
+        return None, "The role's own sign-in for this provider could not be proven."
     if role != sandbox_dispatch.WORKER_PROFILE:
-        return ("gateway",), ""
+        return (_SignIn("gateway", gateway),), ""
     used = sandbox_dispatch._resolve_host_credential()
     if not used:
         return None, "The worker's builds have no sign-in now, so the check cannot tell which account they use."
-    for name in ("build", "gateway"):
-        if used == _held_value(provider, name):
-            return tuple(dict.fromkeys(("gateway", name))), ""
+    for name, value in (("build", _role_value(role, _build_token)), ("gateway", gateway)):
+        if used == value:
+            return tuple(dict.fromkeys((_SignIn("gateway", gateway), _SignIn(name, value)))), ""
     return None, (
         "The worker's builds sign in with a credential that is neither the build "
         "sign-in nor the gateway sign-in, so the check cannot list its models."
@@ -308,9 +402,9 @@ def _no_log_records():
                 logging.disable(_quiet["prior"])
 
 
-def _account_model_ids(provider: str, sign_in: str) -> tuple:
+def _account_model_ids(provider: str, sign_in) -> tuple:
     with _no_log_records():
-        listed = _SIGN_INS[(provider, sign_in)][1](_sign_in_value(provider, sign_in))
+        listed = _SIGN_INS[(provider, _name_of(sign_in))][1](_value_of(provider, sign_in))
     if listed is None:
         raise LookupError("the account list could not be read")
     return tuple(listed)
@@ -357,23 +451,46 @@ def _capability_row(provider: str, model: str) -> Capability:
     )
 
 
-def _probe_call(provider: str, model: str, sign_in: str, effort: str, question: str) -> ProbeReply:
+def _probe_call(provider: str, model: str, sign_in, effort: str, question: str) -> ProbeReply:
     """One short call on this sign-in and model; the caller disables fallbacks.
 
-    An anthropic call uses exactly the key passed. An openai-codex call uses
-    the account the codex runtime selects, the same one ``_codex_token`` reads.
+    The client is built for exactly this provider, model and sign-in value,
+    not through ``call_llm``: with fallbacks disabled that pins a call to the
+    planning profile's main route, which refuses the candidate or swaps its
+    key. The request is sent once, with no retry, refresh, rotation or
+    fallback, and anything else is refused before it is sent.
     """
-    from agent.auxiliary_client import call_llm
+    from agent import auxiliary_client as aux
 
-    response = call_llm(
-        provider=provider,
-        model=model,
-        api_key=_sign_in_value(provider, sign_in),
-        messages=[{"role": "user", "content": question}],
+    value = _value_of(provider, sign_in)
+    if provider == "anthropic":
+        client, final = aux._get_cached_client(provider, model, api_key=value)
+    elif provider == "openai-codex":
+        client = aux.CodexAuxiliaryClient(
+            aux._create_openai_client(
+                api_key=value,
+                base_url=aux._CODEX_AUX_BASE_URL,
+                default_headers=aux._codex_cloudflare_headers(value),
+            ),
+            model,
+        )
+        final = model
+    else:
+        raise LookupError("the check has no probe for this provider")
+    if client is None or final != model:
+        raise LookupError("no client for exactly this model and sign-in")
+    kwargs = aux._build_call_kwargs(
+        provider,
+        model,
+        [{"role": "user", "content": question}],
         max_tokens=_PROBE_MAX_TOKENS,
-        reasoning_config=None if effort in _NO_EFFORT else {"enabled": True, "effort": effort},
         timeout=_PROBE_TIMEOUT_SECONDS,
+        reasoning_config=None if effort in _NO_EFFORT else {"enabled": True, "effort": effort},
+        base_url=str(getattr(client, "base_url", "") or ""),
     )
+    if kwargs.get("model") != model:
+        raise LookupError("the request would not go to exactly this model")
+    response = client.chat.completions.create(**kwargs)
     usage = getattr(response, "usage", None)
     return ProbeReply(
         text=str(response.choices[0].message.content or ""),
@@ -610,9 +727,9 @@ def _answered(text: Optional[str]) -> bool:
     return _ANSWER_RE.fullmatch(text or "") is not None
 
 
-def _probe(seams: Seams, provider: str, model: str, sign_in: str, effort: str) -> dict:
+def _probe(seams: Seams, provider: str, model: str, sign_in, effort: str, label: str) -> dict:
     started = time.monotonic()
-    result = {"sign_in": sign_in, "passed": False, "input_tokens": 0, "output_tokens": 0}
+    result = {"sign_in": label, "passed": False, "input_tokens": 0, "output_tokens": 0}
     try:
         with _fallbacks_disabled():
             reply = seams.probe(provider, model, sign_in, effort, PROBE_QUESTION)
@@ -665,7 +782,7 @@ def _compatibility(model: _Model, new: Capability, old: Capability) -> dict:
     return found
 
 
-def _check(seams: Seams, model: _Model, to_model: str, sign_ins: list, listed: dict,
+def _check(seams: Seams, model: _Model, to_model: str, accounts: list, listed: dict,
            blocked: Optional[str]) -> dict:
     """Run the three checks on one candidate, stopping at the first that fails."""
     provider = model.provider
@@ -675,7 +792,7 @@ def _check(seams: Seams, model: _Model, to_model: str, sign_ins: list, listed: d
         "to_model": to_model,
         "roles": list(model.roles),
         "result": None,
-        "account": {name: to_model in (listed[name] or ()) for name in sign_ins},
+        "account": {label: to_model in (listed[label] or ()) for label, _, _ in accounts},
         "compatibility": {"effort": None, "context": None},
         "probe": [],
         "route_revisions": {role: seams.route_revision(role) for role in model.roles},
@@ -694,9 +811,8 @@ def _check(seams: Seams, model: _Model, to_model: str, sign_ins: list, listed: d
         checked["result"] = compatibility.pop("result")
         return checked
     compatibility.pop("result")
-    for name in sign_ins:
-        role = next(role for role in model.roles if name in model.sign_ins[role])
-        probed = _probe(seams, provider, to_model, name, model.efforts[role][0])
+    for label, sign_in, roles in accounts:
+        probed = _probe(seams, provider, to_model, sign_in, model.efforts[roles[0]][0], label)
         checked["probe"].append(probed)
         if not probed["passed"]:
             checked["result"] = "probe_failed"
@@ -705,15 +821,35 @@ def _check(seams: Seams, model: _Model, to_model: str, sign_ins: list, listed: d
     return checked
 
 
-def _list_ids(seams: Seams, provider: str, sign_in: str) -> Optional[frozenset]:
+def _list_ids(seams: Seams, provider: str, sign_in, label: str) -> Optional[frozenset]:
     try:
         return frozenset(seams.account_models(provider, sign_in))
     except Exception as exc:
         logger.warning(
             "model update check: the %s account list could not be read (%s)",
-            sign_in, type(exc).__name__,
+            label, type(exc).__name__,
         )
         return None
+
+
+def _accounts(model: _Model) -> list:
+    """The distinct accounts the model's roles use, in role order: ``(label, sign-in, roles)``.
+
+    Roles share an account only when their sign-ins are equal in memory. The
+    label is the sign-in's name, with its first role added when distinct
+    accounts of this model share that name.
+    """
+    groups: dict = {}
+    for role in model.roles:
+        for sign_in in model.sign_ins[role]:
+            roles = groups.setdefault(sign_in, [])
+            if role not in roles:
+                roles.append(role)
+    names = [_name_of(sign_in) for sign_in in groups]
+    return [
+        (name if names.count(name) == 1 else f"{name}:{roles[0]}", sign_in, roles)
+        for name, (sign_in, roles) in zip(names, groups.items())
+    ]
 
 
 def _file(card: _Card, checked: dict, month: str, practice: bool) -> Optional[dict]:
@@ -775,10 +911,10 @@ def _write_receipt(card: _Card, receipt: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _candidates(model: _Model, sign_ins: list, listed: dict, practice: bool) -> list:
+def _candidates(model: _Model, listed: dict, practice: bool) -> list:
     if practice:
         return [model.model]
-    seen = set().union(*(listed[name] or () for name in sign_ins))
+    seen = set().union(*(ids or () for ids in listed.values()))
     newer = [candidate for candidate in seen if _is_newer(candidate, model.model)]
     return sorted(newer, key=lambda candidate: (_version(candidate), candidate), reverse=True)
 
@@ -829,14 +965,15 @@ def _run(seams: Seams, card: _Card, practice_role: Optional[str], receipt: dict)
             model.sign_ins[role] = tuple(names)
         if entry.get("result"):
             continue
-        sign_ins = list(dict.fromkeys(name for role in model.roles for name in model.sign_ins[role]))
-        entry["sign_ins"] = sign_ins
-        for name in sign_ins:
-            if (model.provider, name) not in lists:
-                lists[(model.provider, name)] = _list_ids(seams, model.provider, name)
-        listed = {name: lists[(model.provider, name)] for name in sign_ins}
-        entry["unreadable_lists"] = [name for name in sign_ins if listed[name] is None]
-        candidates = _candidates(model, sign_ins, listed, practice)
+        # Every role is proven: each distinct account is listed and probed once.
+        accounts = _accounts(model)
+        entry["sign_ins"] = [{"sign_in": label, "roles": roles} for label, _, roles in accounts]
+        for label, sign_in, _ in accounts:
+            if (model.provider, sign_in) not in lists:
+                lists[(model.provider, sign_in)] = _list_ids(seams, model.provider, sign_in, label)
+        listed = {label: lists[(model.provider, sign_in)] for label, sign_in, _ in accounts}
+        entry["unreadable_lists"] = [label for label, ids in listed.items() if ids is None]
+        candidates = _candidates(model, listed, practice)
         if candidates:
             entry["result"] = "candidates"
         else:
@@ -846,7 +983,7 @@ def _run(seams: Seams, card: _Card, practice_role: Optional[str], receipt: dict)
                                        month, practice)
             if blocked is None and not practice and (model.provider, to_model) in approved:
                 blocked = "already_approved"
-            checked = _check(seams, model, to_model, sign_ins, listed, blocked)
+            checked = _check(seams, model, to_model, accounts, listed, blocked)
             receipt["candidates"].append(checked)
             if checked["result"] == "passed":
                 filed = _file(card, checked, month, practice)

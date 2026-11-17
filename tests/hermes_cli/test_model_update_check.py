@@ -20,13 +20,16 @@ import importlib
 import json
 import logging
 import os
+import runpy
 import shutil
 import sqlite3
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -948,3 +951,308 @@ def test_concurrent_runs_under_one_planning_card_file_at_most_one(world, monkeyp
     assert len(_suggestions(world)) == 1
     receipts = [event["payload"] for event in _receipts(world)]
     assert sorted(receipt["result"] for receipt in receipts) == ["filed", "nothing_filed"]
+
+
+# ---------------------------------------------------------------------------
+# Second review: the real probe and each role's own sign-in, through the
+# installed ``hermes`` entry point as the worker. Fakes sit only at the client
+# and account boundaries; every value below is a placeholder, not a sign-in.
+# ---------------------------------------------------------------------------
+
+
+def _cli(world, seams, *argv, env=None):
+    """``hermes model update-check`` through the installed entry point, as the worker."""
+    muc = _muc()
+    env = dict(world.env if env is None else env)
+    with pytest.MonkeyPatch.context() as patch:
+        for key in [key for key in os.environ if key not in env]:
+            patch.delenv(key)
+        for key, value in env.items():
+            patch.setenv(key, value)
+        patch.setattr(muc, "default_seams", lambda: seams)
+        patch.setattr(sys, "argv", ["hermes", "model", "update-check", *argv])
+        try:
+            runpy.run_path(str(Path(sys.executable).parent / "hermes"), run_name="__main__")
+        except SystemExit as exc:
+            assert exc.code in (None, 0), f"the command exited with {exc.code}"
+    return _receipts(world)[-1]["payload"]
+
+
+def _planner_pinned(world):
+    """The planning profile runs on another model and the dispatcher's fallback switch is on."""
+    (world.root / "profiles" / PLANNER / "config.yaml").write_text(json.dumps({
+        "model": {"provider": "anthropic", "default": OPUS},
+        "agent": {"reasoning_effort": "max"},
+        "fallback_providers": [],
+        "fallback_model": None,
+    }))
+    return {**world.env, fallback_config.FALLBACKS_DISABLED_ENV: "1"}
+
+
+class _Wire:
+    """The fake client boundary: every client built and every request it was sent."""
+
+    def __init__(self):
+        self.clients = []
+        self.sent = []
+
+    def client(self):
+        def create(**kwargs):
+            self.sent.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="45", tool_calls=None),
+                                         finish_reason="stop")],
+                usage=SimpleNamespace(prompt_tokens=7, completion_tokens=1),
+                model=kwargs.get("model"),
+            )
+
+        return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+                               base_url="https://example.invalid/v1")
+
+    def cached_client(self, *args, **kwargs):
+        self.clients.append((args, kwargs))
+        return self.client(), args[1]
+
+
+def _probes(checked):
+    return [(probe["sign_in"], probe["passed"], probe["input_tokens"], probe["output_tokens"])
+            for probe in checked["probe"]]
+
+
+def test_newer_candidate_probe_reaches_the_client_with_its_route_effort_and_sign_in(world, monkeypatch):
+    from agent import auxiliary_client as aux
+
+    muc = _muc()
+    env = _planner_pinned(world)
+    wire = _Wire()
+    monkeypatch.setattr(muc, "_sign_in_value", lambda provider, name: f"placeholder-{name}")
+    monkeypatch.setattr(aux, "_get_cached_client", wire.cached_client)
+    fake = Fake(routes=[(PLANNER, "anthropic", OPUS, "max", "routine")],
+                lists={("anthropic", "gateway"): [OPUS, OPUS_NEW]})
+
+    receipt = _cli(world, replace(fake.seams(muc), probe=muc._probe_call), env=env)
+
+    assert receipt["result"] == "filed"
+    # One client pinned to the candidate and that sign-in's exact value, one request.
+    assert wire.clients == [(("anthropic", OPUS_NEW), {"api_key": "placeholder-gateway"})]
+    (sent,) = wire.sent
+    assert sent["model"] == OPUS_NEW
+    assert sent["_reasoning_config"] == {"enabled": True, "effort": "max"}
+    (checked,) = receipt["candidates"]
+    assert _probes(checked) == [("gateway", True, 7, 1)]
+    assert "placeholder-gateway" not in json.dumps(receipt) + _dump(world)
+
+
+def test_practice_probe_sends_each_sign_ins_exact_value_once_in_order(world, monkeypatch):
+    from agent import auxiliary_client as aux
+
+    muc = _muc()
+    env = _planner_pinned(world)
+    wire = _Wire()
+    monkeypatch.setattr(muc, "_sign_in_value", lambda provider, name: f"placeholder-{name}")
+    monkeypatch.setattr(aux, "_get_cached_client", wire.cached_client)
+    fake = Fake(routes=[(WORKER, "anthropic", OPUS, "max", "deep")],
+                lists={("anthropic", "gateway"): [OPUS], ("anthropic", "build"): [OPUS]},
+                sign_ins={WORKER: (("gateway", "build"), "")})
+
+    receipt = _cli(world, replace(fake.seams(muc), probe=muc._probe_call), "--practice", WORKER, env=env)
+
+    assert receipt["result"] == "filed"
+    assert wire.clients == [
+        (("anthropic", OPUS), {"api_key": "placeholder-gateway"}),
+        (("anthropic", OPUS), {"api_key": "placeholder-build"}),
+    ]
+    assert [sent["model"] for sent in wire.sent] == [OPUS, OPUS]
+    assert _probes(receipt["candidates"][0]) == [("gateway", True, 7, 1), ("build", True, 7, 1)]
+
+
+def test_codex_probe_builds_its_client_from_that_sign_ins_exact_value(world, monkeypatch):
+    from agent import auxiliary_client as aux
+
+    muc = _muc()
+    env = _planner_pinned(world)
+    wire = _Wire()
+    built = []
+
+    def openai_client(*, api_key, base_url, **_kwargs):
+        built.append(api_key)
+        return SimpleNamespace(api_key=api_key, base_url=base_url)
+
+    def codex_client(real_client, model):
+        wire.clients.append((real_client.api_key, model))
+        return wire.client()
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the probe never reads the pool, the stored login or the shared client cache")
+
+    monkeypatch.setattr(aux, "_create_openai_client", openai_client)
+    monkeypatch.setattr(aux, "CodexAuxiliaryClient", codex_client)
+    for name in ("_read_codex_access_token", "_select_pool_entry", "_peek_pool_entry", "_get_cached_client"):
+        monkeypatch.setattr(aux, name, refuse)
+    monkeypatch.setattr(muc, "_sign_in_value", lambda provider, name: f"placeholder-{name}")
+    fake = Fake(routes=[(DEFAULT, "openai-codex", SOL, "max", "routine")],
+                lists={("openai-codex", "codex"): [SOL, SOL_NEW]})
+
+    receipt = _cli(world, replace(fake.seams(muc), probe=muc._probe_call), env=env)
+
+    assert receipt["result"] == "filed"
+    assert built == ["placeholder-codex"]
+    assert wire.clients == [("placeholder-codex", SOL_NEW)]
+    assert [sent["model"] for sent in wire.sent] == [SOL_NEW]
+    assert _probes(receipt["candidates"][0]) == [("codex", True, 7, 1)]
+
+
+def _scoped_values(monkeypatch, module, name, answer):
+    """Replace one sign-in resolver; it answers from the profile scope it runs in."""
+    from hermes_constants import get_hermes_home
+
+    scopes = []
+
+    def resolver(*_args):
+        scopes.append(get_hermes_home().name)
+        return answer(get_hermes_home().name)
+
+    monkeypatch.setattr(module, name, resolver)
+    return scopes
+
+
+def test_each_roles_own_gateway_account_must_list_the_candidate(world, monkeypatch):
+    from agent import anthropic_credentials
+
+    from hermes_cli import models
+
+    muc = _muc()
+    values = {PLANNER: "placeholder-planner-account", DESIGNER: "placeholder-designer-account"}
+    scopes = _scoped_values(monkeypatch, anthropic_credentials, "resolve_anthropic_token", values.get)
+    listed = {values[PLANNER]: [OPUS, OPUS_NEW], values[DESIGNER]: [OPUS]}
+    asked = []
+    monkeypatch.setattr(models, "_fetch_anthropic_models",
+                        lambda *, api_key, **_kwargs: asked.append(api_key) or listed[api_key])
+    fake = Fake(routes=[(PLANNER, "anthropic", OPUS, "max", "routine"), (DESIGNER, "anthropic", OPUS, "max", "routine")],
+                lists={})
+
+    receipt = _cli(world, replace(fake.seams(muc), sign_ins=muc._role_sign_ins, account_models=muc._account_model_ids))
+
+    assert receipt["result"] == "nothing_filed" and _suggestions(world) == []
+    assert set(scopes) == {PLANNER, DESIGNER}
+    (checked,) = receipt["candidates"]
+    assert (checked["to_model"], checked["result"]) == (OPUS_NEW, "not_listed")
+    assert sorted(checked["account"].values()) == [False, True]
+    assert sorted(asked) == sorted(values.values())
+    assert fake.probe_calls == []
+    written = json.dumps(receipt) + _dump(world)
+    assert not any(value in written for value in values.values())
+
+
+def test_each_roles_own_codex_pool_account_must_list_the_candidate(world, monkeypatch):
+    from agent import credential_pool
+
+    from hermes_cli import codex_models
+
+    muc = _muc()
+    root = world.root.name
+    values = {root: "placeholder-default-pool", BUSINESS: "placeholder-business-pool"}
+    scopes = _scoped_values(
+        monkeypatch, credential_pool, "preview_runtime_selection",
+        lambda scope: (SimpleNamespace(runtime_api_key=values[scope], access_token=""), False),
+    )
+    listed = {values[root]: [SOL, SOL_NEW], values[BUSINESS]: [SOL]}
+    monkeypatch.setattr(codex_models, "_fetch_models_from_api", lambda value: listed[value])
+    fake = Fake(routes=[(DEFAULT, "openai-codex", SOL, "max", "routine"),
+                        (BUSINESS, "openai-codex", SOL, "max", "routine")], lists={})
+
+    receipt = _cli(world, replace(fake.seams(muc), sign_ins=muc._role_sign_ins, account_models=muc._account_model_ids))
+
+    assert receipt["result"] == "nothing_filed" and _suggestions(world) == []
+    assert set(scopes) == {root, BUSINESS}
+    (checked,) = receipt["candidates"]
+    assert (checked["to_model"], checked["result"]) == (SOL_NEW, "not_listed")
+    assert sorted(checked["account"].values()) == [False, True]
+    assert fake.probe_calls == []
+    written = json.dumps(receipt) + _dump(world)
+    assert not any(value in written for value in values.values())
+
+
+@pytest.mark.parametrize("borrowed", [False, True], ids=["own-scope-empty", "only-planner-env"])
+def test_role_whose_own_sign_in_cannot_be_proven_files_nothing_for_that_model(world, monkeypatch, borrowed):
+    from agent import anthropic_credentials
+    from agent.secret_scope import get_secret
+
+    from hermes_cli import models
+
+    muc = _muc()
+    # The planner and the business role have their own value; the designer has none.
+    for role in (PLANNER, BUSINESS):
+        home = world.root / "profiles" / role
+        home.mkdir(parents=True, exist_ok=True)
+        (home / ".env").write_text(f"ANTHROPIC_TOKEN=placeholder-{role}\n")
+    env = dict(world.env)
+    if borrowed:
+        # The worker's own process environment holds the planner's value.
+        env["ANTHROPIC_TOKEN"] = f"placeholder-{PLANNER}"
+    else:
+        env.pop("ANTHROPIC_TOKEN", None)
+    scopes = _scoped_values(monkeypatch, anthropic_credentials, "resolve_anthropic_token",
+                            lambda _scope: get_secret("ANTHROPIC_TOKEN"))
+    asked = []
+    monkeypatch.setattr(models, "_fetch_anthropic_models",
+                        lambda *, api_key, **_kwargs: asked.append(api_key) or [OPUS, OPUS_NEW, SONNET, SONNET_NEW])
+    fake = Fake(routes=[(PLANNER, "anthropic", OPUS, "max", "routine"),
+                        (DESIGNER, "anthropic", OPUS, "max", "routine"),
+                        (BUSINESS, "anthropic", SONNET, "high", "routine")], lists={})
+
+    receipt = _cli(world, replace(fake.seams(muc), sign_ins=muc._role_sign_ins, account_models=muc._account_model_ids),
+                   env=env)
+
+    assert DESIGNER in scopes
+    (opus,) = [entry for entry in receipt["models"] if entry["model"] == OPUS]
+    assert (opus["result"], opus["role"]) == ("sign_in_unproven", DESIGNER)
+    assert opus["reason"]
+    # The other model still runs its checks, on its own role's account only.
+    assert [row["recommendation_subject_id"] for row in _suggestions(world)] == [
+        _update("anthropic", SONNET, SONNET_NEW)
+    ]
+    assert asked == [f"placeholder-{BUSINESS}"]
+    assert [call[1] for call in fake.probe_calls] == [SONNET_NEW]
+    written = json.dumps(receipt) + _dump(world)
+    assert "placeholder-raphael" not in written and str(world.root) not in written
+
+
+def test_every_proven_account_lists_the_candidate_files_with_one_list_and_probe_per_account(world, monkeypatch):
+    from agent import anthropic_credentials
+    from agent import auxiliary_client as aux
+
+    from hermes_cli import models
+
+    muc = _muc()
+    # The planner and the designer share one account; the business role has its own.
+    values = {PLANNER: "placeholder-shared-account", DESIGNER: "placeholder-shared-account",
+              BUSINESS: "placeholder-business-account"}
+    scopes = _scoped_values(monkeypatch, anthropic_credentials, "resolve_anthropic_token", values.get)
+    asked = []
+    monkeypatch.setattr(models, "_fetch_anthropic_models",
+                        lambda *, api_key, **_kwargs: asked.append(api_key) or [OPUS, OPUS_NEW])
+    wire = _Wire()
+    monkeypatch.setattr(aux, "_get_cached_client", wire.cached_client)
+    fake = Fake(routes=[(role, "anthropic", OPUS, "max", "routine") for role in (PLANNER, DESIGNER, BUSINESS)],
+                lists={})
+    seams = replace(fake.seams(muc), sign_ins=muc._role_sign_ins, account_models=muc._account_model_ids,
+                    probe=muc._probe_call)
+
+    receipt = _cli(world, seams, env=_planner_pinned(world))
+
+    assert receipt["result"] == "filed"
+    assert set(scopes) == {PLANNER, DESIGNER, BUSINESS}
+    distinct = sorted(set(values.values()))
+    assert sorted(asked) == distinct
+    assert sorted(kwargs["api_key"] for _args, kwargs in wire.clients) == distinct
+    assert len(wire.sent) == 2
+    (entry,) = receipt["models"]
+    assert sorted(sorted(group["roles"]) for group in entry["sign_ins"]) == [
+        [BUSINESS], sorted([PLANNER, DESIGNER])
+    ]
+    (checked,) = receipt["candidates"]
+    assert list(checked["account"].values()) == [True, True]
+    assert [probe["passed"] for probe in checked["probe"]] == [True, True]
+    written = json.dumps(receipt) + _dump(world)
+    assert not any(value in written for value in values.values())
