@@ -26,8 +26,7 @@ from hermes_constants import get_bundled_skills_dir, get_hermes_home, get_option
 from agent.skill_utils import ESSENTIAL_SKILLS, is_excluded_skill_path
 from tools.skill_usage import _read_skill_name, read_suppressed_names
 from tools.skills_sync_optional import (
-    _backfill_optional_provenance, _hand_over_moved_skill, _ignore_runtime_cache, _is_runtime_cache,
-    _read_hub_install_paths,
+    _hand_over_moved_skill, _ignore_runtime_cache, _is_runtime_cache, _read_hub_install_paths,
 )
 from utils import atomic_write_text
 
@@ -125,12 +124,18 @@ def _read_suppressed_names() -> set:
     return read_suppressed_names()
 
 
+def _write_manifest_or_raise(entries: Dict[str, str]) -> None:
+    """Atomic v2 write, preserving an existing file's mode/owner (not mkstemp's 0600); raises on
+    failure (an update's record step must know its line was not written)."""
+    data = "".join(f"{n}:{h}\n" for n, h in sorted(entries.items()))
+    atomic_write_text(_manifest_file(), data, tmp_prefix=".bundled_manifest_", preserve_mode=True)
+
+
 def _write_manifest(entries: Dict[str, str]):
-    """Atomic v2 write, preserving an existing file's mode/owner (not mkstemp's 0600)."""
+    """``_write_manifest_or_raise`` that logs a failure instead of raising."""
     _manifest_file().parent.mkdir(parents=True, exist_ok=True)
     try:
-        data = "".join(f"{n}:{h}\n" for n, h in sorted(entries.items()))
-        atomic_write_text(_manifest_file(), data, tmp_prefix=".bundled_manifest_", preserve_mode=True)
+        _write_manifest_or_raise(entries)
     except Exception as e:
         logger.debug("Failed to write skills manifest %s: %s", _manifest_file(), e, exc_info=True)
 
@@ -167,32 +172,74 @@ def _dir_hash(directory: Path, *, include_runtime_cache: bool = False) -> str:
     return hasher.hexdigest()
 
 
-def _read_whole_copy(directory: Path) -> None:
-    """Raise OSError unless every folder under ``directory`` lists and every file reads.
+def _copy_change(directory: Path, recorded: Optional[str], kind: str = "manifest") -> Optional[str]:
+    """The one check that a copy is unchanged since Hermes wrote it: None, else why it counts as
+    the owner's ("changed", "unreadable", "link"). Every path that replaces, moves, hands over,
+    adopts or deletes a copy asks this, never a hash comparison of its own.
 
-    ``rglob`` silently skips a folder it cannot list, so ``_dir_hash`` and ``content_hash`` can
-    match a fingerprint while owner data sits unseen: a copy is never replaced, or adopted as
-    unchanged, on a hash match unless this passes first.
+    An allowlist: the copy is a real folder whose whole tree lists and holds only plain folders and
+    regular files (runtime caches included: a link of any kind is "link", any other entry type is
+    "changed"), every file reads, and the fingerprint of exactly those files equals ``recorded``
+    (a missing record is "changed"). ``kind`` "manifest" is ``_dir_hash`` (or its exact legacy
+    variant with the runtime caches, never re-baselined); "lock" is ``skills_guard.content_hash``.
+    Nothing outside the copy is followed to manufacture a match.
     """
-    with os.scandir(directory) as entries:
+    try:
+        mode = os.lstat(directory).st_mode
+    except OSError:
+        return "unreadable"
+    if stat.S_ISLNK(mode):
+        return "link"
+    if not stat.S_ISDIR(mode) or not recorded:
+        return "changed"
+    files: List[Tuple[Path, bytes]] = []
+
+    def walk(folder: Path) -> Optional[str]:
+        try:
+            with os.scandir(folder) as listing:
+                entries = list(listing)
+        except OSError:
+            return "unreadable"
         for entry in entries:
-            if entry.is_dir(follow_symlinks=False):
-                _read_whole_copy(Path(entry.path))
-            elif entry.is_file():
-                Path(entry.path).read_bytes()
+            is_junction = getattr(entry, "is_junction", None)
+            try:
+                if entry.is_symlink() or (is_junction is not None and is_junction()):
+                    return "link"
+                if entry.is_dir(follow_symlinks=False):
+                    if reason := walk(Path(entry.path)):
+                        return reason
+                elif entry.is_file(follow_symlinks=False):
+                    files.append((Path(entry.path), Path(entry.path).read_bytes()))
+                else:  # FIFO, socket, device: nothing Hermes writes
+                    return "changed"
+            except OSError:
+                return "unreadable"
+        return None
+
+    if reason := walk(directory):
+        return reason
+    if kind == "lock":
+        digest = hashlib.sha256()
+        for rel, data in sorted(((path.relative_to(directory).as_posix(), data) for path, data in files),
+                                key=lambda item: item[0]):
+            digest.update(rel.encode("utf-8") + b"\x00")
+            digest.update(data)
+        return None if f"sha256:{digest.hexdigest()[:16]}" == recorded else "changed"
+
+    def md5(entries) -> str:
+        digest = hashlib.md5()
+        for path, data in entries:
+            digest.update(str(path.relative_to(directory)).encode("utf-8"))
+            digest.update(data)
+        return digest.hexdigest()
+    ordered = sorted(files, key=lambda item: item[0])  # _dir_hash's order: sorted paths
+    clean = md5((path, data) for path, data in ordered if not _is_runtime_cache(path, directory))
+    return None if recorded in (clean, md5(ordered)) else "changed"
 
 
-def _matches_origin_hash(directory: Path, origin_hash: str, user_hash: Optional[str] = None) -> bool:
-    """Prove unchanged package ownership against a clean OR exact legacy hash.
-
-    Never re-baseline a differing package merely because it contains a cache:
-    if legacy cached bytes changed/disappeared, the old origin cannot be proven.
-    A genuinely edited package must remain protected in that case.
-    """
-    if not origin_hash:
-        return False
-    current = _dir_hash(directory) if user_hash is None else user_hash
-    return current == origin_hash or _dir_hash(directory, include_runtime_cache=True) == origin_hash
+def _matches_origin_hash(directory: Path, origin_hash: str) -> bool:
+    """Whether ``directory`` is unchanged since Hermes wrote it (``_copy_change``, as a bool)."""
+    return _copy_change(directory, origin_hash) is None
 
 
 def _move_dir(src: Path, dest: Path) -> None:
@@ -226,7 +273,8 @@ def _recover_renamed_skill(st: "_SyncState", skill_name: str, dest: Path) -> Opt
             continue
         if rel in st.hub_paths:  # the hub owns its install paths
             continue
-        if not _matches_origin_hash(candidate, origin_hash):  # moving a customized copy would edit user work
+        if (reason := _copy_change(candidate, origin_hash)) is not None:  # moving it would edit user work
+            st.kept.append({"name": skill_name, "reason": reason})
             st.say(
                 f"  ⚠ {skill_name}: upstream moved this skill to {_rel_skills_posix(dest)}, but your "
                 f"modified copy at {rel} was kept — it will not receive updates. "
@@ -252,6 +300,8 @@ class _SyncState:
     copied: List[str] = field(default_factory=list)
     updated: List[str] = field(default_factory=list)
     user_modified: List[str] = field(default_factory=list)
+    kept: List[dict] = field(default_factory=list)  # {"name", "reason"}: copies _copy_change did not pass
+    refused: List[dict] = field(default_factory=list)  # {"name", "reason"}: replacements that did not happen
     suppressed: List[str] = field(default_factory=list)
     relocated: List[str] = field(default_factory=list)
     shadowed_by_external: List[str] = field(default_factory=list)
@@ -278,16 +328,19 @@ def _recover_orphan_backup(dest: Path) -> None:
 def _defer_to_external(st: _SyncState, skill_name: str, dest: Path, bundled_hash: str) -> None:
     """An external_dirs source provides this skill; a local copy would be a name collision the
     loader refuses. Defer for ALL manifest states; remove a stale local shadow from an earlier
-    sync only when byte-identical and read whole (a user's own skill differs)."""
+    sync only when its line is this release's hash and the copy is unchanged since (a copy
+    without a line, or one the owner changed, is kept)."""
     st.shadowed_by_external.append(skill_name)
     st.skipped += 1
     st.say(f"  ⇢ {skill_name} (deferred to external_dirs, not written to local tree)")
-    if dest.exists() and _dir_hash(dest) == bundled_hash:
-        try:
-            _read_whole_copy(dest)
-        except OSError as e:  # the hash may have missed what cannot be read: never removed blind
-            st.say(f"  ~ {skill_name} (cannot read the whole local copy, kept: {e})")
-            return
+    if not dest.exists():
+        return
+    line = st.manifest.get(skill_name, "")
+    if (reason := _copy_change(dest, line)) is not None:
+        st.kept.append({"name": skill_name, "reason": reason})
+        st.say(f"  ~ {skill_name} (local copy kept: {reason})")
+        return
+    if line == bundled_hash:
         _rmtree_writable(dest)
         st.say(f"  ✓ removed stale shadow of {skill_name}")
         st.manifest.pop(skill_name, None)
@@ -297,12 +350,16 @@ def _install_new_skill(st: _SyncState, skill_name: str, skill_src: Path, dest: P
     """Handle a skill never offered before (not in manifest)."""
     try:
         if dest.exists():
-            # Never overwrite a same-named user skill. Baseline the manifest only when
-            # byte-identical: a differing copy's bundled_hash reads as "user-modified" forever.
+            # Never overwrite a same-named user skill. Adopt it (a manifest line) only when it is
+            # unchanged against this release and the hub does not own the path: `hermes skills
+            # reset` relies on this to re-baseline after dropping the line (pinned by
+            # TestResetBundledSkill::test_reset_clears_stuck_user_modified_flag).
             st.skipped += 1
-            if _dir_hash(dest) == bundled_hash:
+            reason = _copy_change(dest, bundled_hash)
+            if reason is None and _rel_skills_posix(dest) not in _read_hub_install_paths():
                 st.manifest[skill_name] = bundled_hash
-            else:
+            elif reason is not None:
+                st.kept.append({"name": skill_name, "reason": reason})
                 st.say(
                     f"  ⚠ {skill_name}: bundled version shipped but you already have a local skill "
                     f"by this name — yours was kept. Run `hermes skills reset {skill_name}` to "
@@ -351,26 +408,26 @@ def _update_existing_skill(st: _SyncState, skill_name: str, skill_src: Path, des
     if origin_hash and bundled_hash == origin_hash:  # bundled unchanged: skip without hashing the user copy
         st.skipped += 1
         return
-    user_hash = _dir_hash(dest)
-    if not origin_hash:  # v1 migration: baseline from user's copy (can't tell edit from upstream)
-        st.manifest[skill_name] = user_hash
-        st.skipped += 1
-        return
-    if not _matches_origin_hash(dest, origin_hash, user_hash):
+    # A v1 line (no hash) is a missing record: the copy is kept, and its line stays as it is
+    # (re-checked every sync) until the owner runs `hermes skills reset`.
+    if (reason := _copy_change(dest, origin_hash)) is not None:
         st.user_modified.append(skill_name)
-        st.say(f"  ~ {skill_name} (user-modified, skipping)")
+        st.kept.append({"name": skill_name, "reason": reason})
+        st.say(f"  ~ {skill_name} (kept as yours: {reason})")
         return
+    # bundled changed and the user copy is pristine -> update; the new line is written before
+    # the old copy goes, and a failed write puts the old copy (and its line) back
+    failed = "copy write failed"
+
+    def record() -> None:
+        nonlocal failed
+        failed = "record write failed"
+        _write_manifest_or_raise({**st.manifest, skill_name: bundled_hash})
     try:
-        _read_whole_copy(dest)
-    except OSError as e:  # the hash may have missed what cannot be read: treat as changed
-        st.user_modified.append(skill_name)
-        st.say(f"  ~ {skill_name} (cannot read the whole copy, skipping: {e})")
-        return
-    # bundled changed and the user copy is pristine -> update
-    try:
-        _replace_skill_dir(skill_src, dest)
-    except OSError as e:
-        st.say(f"  ! Failed to update {skill_name}: {e}")
+        _replace_skill_dir(skill_src, dest, record)
+    except Exception as e:
+        st.refused.append({"name": skill_name, "reason": failed})
+        st.say(f"  ! Failed to update {skill_name} ({failed}; old copy kept): {e}")
         return
     st.manifest[skill_name] = bundled_hash
     st.updated.append(skill_name)
@@ -402,7 +459,7 @@ def sync_skills(quiet: bool = False) -> dict:
     if not bundled_dir.exists():
         return {"copied": [], "updated": [], "skipped": 0, "user_modified": [], "cleaned": [],
                 "suppressed": [], "total_bundled": 0, "not_seeded_by_marker": 0, "moved_to_official": [],
-                "moved_kept_changed": [], "optional_provenance_backfilled": []}
+                "moved_kept_changed": [], "optional_provenance_backfilled": [], "kept": [], "refused": []}
     _skills_dir().mkdir(parents=True, exist_ok=True)
     all_bundled = _discover_bundled_skills(bundled_dir)
     suppressed = _read_suppressed_names()
@@ -432,27 +489,26 @@ def sync_skills(quiet: bool = False) -> dict:
         else:
             st.skipped += 1  # in manifest but not on disk — user deleted it
     # Clean manifest entries for names no longer built-in (full set, every role). A copy that moved
-    # to the optional catalog is handed over first; a failed hand-over keeps its line for a retry.
+    # to the optional catalog is handed over first; a refused hand-over keeps its line for a retry,
+    # and a kept (changed) copy keeps its line so every later sync checks and reports it again.
     cleaned: List[str] = []
     moved_to_official: List[str] = []
     moved_kept_changed: List[str] = []
-    not_handed_over: Set[str] = set()  # the backfill below must not adopt these in this same pass
     for name in sorted(set(st.manifest) - {name for name, _ in all_bundled}):
-        outcome = _hand_over_moved_skill(name, st.manifest[name])
-        if outcome in ("failed", "refused_ambiguous"):
-            not_handed_over.add(name)
-            st.say(f"  ! Failed to hand {name} over to the official optional catalog (retried next sync)"
-                   if outcome == "failed" else
-                   f"  ! {name} moved to the optional catalog but matches more than one folder; "
-                   "neither was handed over")
+        outcome, reason = _hand_over_moved_skill(name, st.manifest[name])
+        if outcome == "refused":
+            st.refused.append({"name": name, "reason": reason})
+            st.say(f"  ! {name} was not handed over to the official optional catalog ({reason}); "
+                   "retried next sync")
+            continue
+        if outcome == "kept_changed":
+            moved_kept_changed.append(name)
+            st.kept.append({"name": name, "reason": reason})
+            st.say(f"  ~ {name} (moved to the optional catalog; your copy is kept: {reason})")
             continue
         if outcome == "moved_to_official":
             moved_to_official.append(name)
             st.say(f"  ↑ {name} (moved to the official optional catalog)")
-        elif outcome == "kept_changed":
-            not_handed_over.add(name)
-            moved_kept_changed.append(name)
-            st.say(f"  ~ {name} (moved to the optional catalog; user-modified or unreadable copy kept)")
         del st.manifest[name]
         cleaned.append(name)
     _seed_category_descriptions(bundled_dir, {
@@ -467,8 +523,11 @@ def sync_skills(quiet: bool = False) -> dict:
                           else len(bundled_skills)),
         "not_seeded_by_marker": len(all_bundled) - len(bundled_skills),
         "moved_to_official": moved_to_official, "moved_kept_changed": moved_kept_changed,
-        "optional_provenance_backfilled": _backfill_optional_provenance(quiet=quiet, skip=not_handed_over),
+        # A sync adopts no optional copy without a record (`hermes skills repair-official` does,
+        # on request, for an exact copy).
+        "optional_provenance_backfilled": [],
         "shadowed_by_external": st.shadowed_by_external,
+        "kept": st.kept, "refused": st.refused,
         "skipped_opt_out": marked}  # lets callers report "opted out", not a normal sync
 
 

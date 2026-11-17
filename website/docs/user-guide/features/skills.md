@@ -1008,15 +1008,17 @@ Taps are stored in `~/.hermes/skills/.hub/taps.json` (created on demand).
 
 Hermes ships with a set of bundled skills in `skills/` inside the repo. On install and on every `hermes update`, a sync pass copies those into `~/.hermes/skills/` and records a manifest at `~/.hermes/skills/.bundled_manifest` mapping each skill name to the content hash at the time it was synced (the **origin hash**).
 
-On each sync, Hermes recomputes the hash of your local copy and compares it to the origin hash:
+On each sync, Hermes checks your local copy against the origin hash:
 
-- **Unchanged** → safe to pull upstream changes, copy the new bundled version in, record the new origin hash.
-- **Changed** → treated as **user-modified** and skipped forever, so your edits never get stomped.
+- **Unchanged** → only when Hermes can read all of it, it holds only ordinary files and folders, and it matches the origin hash. Then the new bundled version is copied in and the new origin hash recorded.
+- **Changed** → treated as **user-modified**: the copy stays yours on every later sync, so your edits never get stomped, until you run `hermes skills reset <name>`.
 
 The same care applies to official optional skills (their record is `skills/.hub/lock.json`) and to a bundled skill that moves to the optional catalog:
 
-- **Can't be read whole** → if any file or folder in your copy can't be read (for example, a folder without read permission), Hermes can't tell whether you changed it, so it leaves the copy alone and reports it.
+- **A link, a special file, or a part Hermes can't read** → a symlink (to a file or a folder), a pipe or device file, or a file or folder Hermes can't read (for example, a folder without read permission) keeps the copy yours. Hermes leaves it alone and reports why: `link`, `changed` or `unreadable`.
 - **Changed, then matches a release** → a copy you changed stays yours, even if it later matches a newer release byte for byte. Only the recorded hash says Hermes wrote it.
+- **Changed optional copy** → stays yours until you run `hermes skills repair-official <name> --restore`.
+- **No record** → Hermes no longer takes over an optional copy that has no record. `hermes skills repair-official <name>` does that when you ask, and only for a copy that is exactly the official version.
 - **A write fails** → if the new copy or its record can't be written, the old copy is put back and the old record kept. The next update tries again.
 - **Moved skill, several folders** → if a skill moved to the optional catalog and more than one of your folders has its name, Hermes hands neither over and reports it as `ambiguous`.
 
@@ -1027,8 +1029,9 @@ The protection is good, but it has one sharp edge. If you edit a bundled skill a
 `hermes skills reset` is the escape hatch:
 
 ```bash
-# Safe: clears the manifest entry for this skill. Your current copy is preserved,
-# but the next sync re-baselines against it so future updates work normally.
+# Safe: clears the manifest entry for this skill. Your current copy is preserved;
+# if it matches the current bundled version, the next sync records it again so
+# future updates work normally.
 hermes skills reset google-workspace
 
 # Full restore: also deletes your local copy and re-copies the current bundled

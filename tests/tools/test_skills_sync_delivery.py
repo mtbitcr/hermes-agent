@@ -8,6 +8,7 @@ A "release" is a change to those trees followed by the sync (and the official re
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -18,7 +19,8 @@ import pytest
 
 from agent.skill_utils import ESSENTIAL_SKILLS
 from tools.skills_guard import content_hash
-from tools.skills_sync import NO_BUNDLED_SKILLS_MARKER, sync_skills
+from tools.skills_sync import NO_BUNDLED_SKILLS_MARKER, _dir_hash, sync_skills
+from tools.skills_sync_optional import restore_official_optional_skill
 
 ESSENTIAL = sorted(ESSENTIAL_SKILLS)[0]
 
@@ -79,10 +81,11 @@ def _mark(role) -> None:
 
 
 def _adopt_official_copy(role, rel: str, body: str) -> Path:
-    """An official optional skill whose copy matches its hub lock (adopted by the real sync)."""
+    """An official optional skill whose copy matches its hub lock (adopted on the owner's
+    request, `hermes skills repair-official <name>`: the sync adopts nothing it has no record of)."""
     src = _write_skill(role.optional, rel, body)
     shutil.copytree(src, role.skills / rel)
-    sync_skills(quiet=True)
+    assert restore_official_optional_skill(src.name)["backfilled"] == [src.name]
     assert src.name in _lock(role)["installed"]
     return src
 
@@ -166,6 +169,35 @@ def _deny_lock_write(patched) -> None:
             raise PermissionError(13, "Permission denied", kwargs["dir"])
         return real_mkstemp(*args, **kwargs)
     patched.setattr(tempfile, "mkstemp", mkstemp)
+
+
+def _deny_manifest_write(patched) -> None:
+    """The atomic manifest write cannot create its temporary file in skills/."""
+    real_mkstemp = tempfile.mkstemp
+
+    def mkstemp(*args, **kwargs):
+        if str(kwargs.get("prefix", "")).startswith(".bundled_manifest"):
+            raise PermissionError(13, "Permission denied", kwargs.get("dir"))
+        return real_mkstemp(*args, **kwargs)
+    patched.setattr(tempfile, "mkstemp", mkstemp)
+
+
+def _add_owner_link(copy: Path, outside: Path) -> tuple:
+    """The owner links a folder of their own, kept outside the skills tree, into ``copy``."""
+    target = outside / f"owner-notes-{copy.name}"
+    target.mkdir(parents=True)
+    (target / "notes.txt").write_text("owner-created notes\n", encoding="utf-8")
+    link = copy / "private"
+    os.symlink(target, link, target_is_directory=True)
+    return link, target
+
+
+def _assert_owner_link_kept(copy: Path, before: dict, link: Path, target: Path) -> None:
+    """The copy, the owner's link itself and the bytes it points at are all as they were."""
+    assert _files(copy) == before
+    assert os.path.islink(link) and os.readlink(link) == str(target)
+    assert _files(target) == {"notes.txt": b"owner-created notes\n"}
+    assert not copy.with_suffix(".bak").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +350,7 @@ def test_moved_to_optional_changed_copy_kept_byte_for_byte_without_lock_entry(ro
     _mark(role)
     copy = role.skills / "media" / "ascii-art"
     _edit(copy)
-    before = _files(copy)
+    before, line = _files(copy), _manifest(role)["ascii-art"]
     shutil.rmtree(role.bundled / "media")
     _write_skill(role.optional, "creative/ascii-art", "official optional v2")
 
@@ -328,6 +360,10 @@ def test_moved_to_optional_changed_copy_kept_byte_for_byte_without_lock_entry(ro
     assert "ascii-art" not in _lock(role).get("installed", {})
     assert result["moved_kept_changed"] == ["ascii-art"]
     assert result["moved_to_official"] == []
+    assert result["kept"] == [{"name": "ascii-art", "reason": "changed"}]
+    # "Changed" is durable: the line stays exactly as it was, so every later sync keeps the copy.
+    assert _manifest(role)["ascii-art"] == line
+    assert "ascii-art" not in result["cleaned"]
 
 
 def test_moved_to_optional_without_copy_creates_nothing(role):
@@ -399,7 +435,7 @@ def test_optional_official_changed_copy_kept_with_newer_official_and_hash(role):
 
     assert _files(copy) == before
     assert report["kept_changed"] == [
-        {"name": "yuanbao", "newer_official": True, "official_hash": content_hash(src)}]
+        {"name": "yuanbao", "newer_official": True, "official_hash": content_hash(src), "reason": "changed"}]
     assert report["updated"] == []
     assert _lock_bytes(role) == lock_before
 
@@ -427,7 +463,7 @@ def test_optional_copy_without_record_untouched_and_reported_untracked(role):
     report = _refresh()
 
     assert _files(stale) == before
-    assert report["kept_untracked"] == ["blogwatcher"]
+    assert report["kept_untracked"] == [{"name": "blogwatcher", "reason": "changed"}]
     assert "blogwatcher" not in _lock(role).get("installed", {})
 
 
@@ -450,14 +486,14 @@ def test_unsafe_lock_install_path_refused_and_nothing_written(role, tmp_path, ki
 
     report = _refresh()
 
-    assert [item["name"] for item in report["refused"]] == ["yuanbao"]
-    assert report["refused"][0]["reason"]
+    reason = "link" if kind == "symlink" else "unsafe path"
+    assert report["refused"] == [{"name": "yuanbao", "reason": reason}]
     assert report["updated"] == []
     assert _files(role.skills) == skills_before
     assert _files(outside) == outside_before
 
 
-def test_unreadable_official_copy_refused_and_nothing_written(role, monkeypatch):
+def test_unreadable_official_copy_kept_as_unreadable_and_nothing_written(role, monkeypatch):
     """Tests run as root, which reads everything, so the copy's files are made to fail on read."""
     src = _adopt_official_copy(role, "communication/yuanbao", "official v1")
     _write_skill(role.optional, "communication/yuanbao", "official v2")
@@ -474,8 +510,8 @@ def test_unreadable_official_copy_refused_and_nothing_written(role, monkeypatch)
         patched.setattr(Path, "read_bytes", read_bytes)
         report = _refresh()
 
-    assert [item["name"] for item in report["refused"]] == ["yuanbao"]
-    assert report["refused"][0]["reason"]
+    assert [(item["name"], item["reason"]) for item in report["kept_changed"]] == [("yuanbao", "unreadable")]
+    assert report["refused"] == []
     assert report["updated"] == []
     assert _files(copy) == before != _files(src)
     assert _lock_bytes(role) == lock_before
@@ -607,8 +643,9 @@ def test_data_rule_failed_replacement_restores_old_copy(role, monkeypatch):
         assert not (role.skills / rel).with_suffix(".bak").exists(), rel
     assert result["updated"] == []
     assert result["moved_to_official"] == []
-    assert [item["name"] for item in report["refused"]] == ["yuanbao"]
-    assert report["refused"][0]["reason"]
+    assert sorted(result["refused"], key=lambda item: item["name"]) == [
+        {"name": "ascii-art", "reason": "copy write failed"}, {"name": "spike", "reason": "copy write failed"}]
+    assert report["refused"] == [{"name": "yuanbao", "reason": "copy write failed"}]
     assert _lock_bytes(role) == lock_before
 
     result = sync_skills(quiet=True)
@@ -629,9 +666,13 @@ def _assert_every_unreadable_copy_kept(role, results, before, lock_before) -> No
         assert "spike" in result["user_modified"]
         assert result["updated"] == []
         assert result["moved_to_official"] == []
+        assert result["moved_kept_changed"] == ["ascii-art"]
+        assert sorted(result["kept"], key=lambda item: item["name"]) == [
+            {"name": "ascii-art", "reason": "unreadable"}, {"name": "spike", "reason": "unreadable"}]
         assert result["official"]["updated"] == []
-        assert "yuanbao" in [item["name"] for item in result["official"]["refused"]]
-    assert results[0]["moved_kept_changed"] == ["ascii-art"]
+        assert [(item["name"], item["reason"]) for item in result["official"]["kept_changed"]] == [
+            ("yuanbao", "unreadable")]
+    assert "ascii-art" in _manifest(role)
     for copy, files in before.items():
         assert _files(copy) == files, copy  # the owner's file is still in the active copy
         assert not copy.with_suffix(".bak").exists(), copy
@@ -782,12 +823,13 @@ def test_shadowed_copy_whose_folder_cannot_be_listed_is_kept_through_next_sync(r
 def _assert_lock_failure_rolled_back(role, result, before, lock_before) -> None:
     assert result is not None  # the seeding child finished
     assert result["moved_to_official"] == []
-    assert "ascii-art" not in result["cleaned"]
+    assert "ascii-art" not in result["cleaned"] + result["updated"]
+    # The moved skill itself is refused with its reason, not only the refreshed optional skill.
+    assert {"name": "ascii-art", "reason": "record write failed"} in result["refused"]
     assert "ascii-art" in _manifest(role)  # the hand-over is retried next sync
     assert result["optional_provenance_backfilled"] == []
     assert result["official"]["updated"] == []
-    assert [item["name"] for item in result["official"]["refused"]] == ["yuanbao"]
-    assert result["official"]["refused"][0]["reason"]
+    assert result["official"]["refused"] == [{"name": "yuanbao", "reason": "record write failed"}]
     for copy, files in before.items():
         assert _files(copy) == files, copy
         assert not copy.with_suffix(".bak").exists(), copy
@@ -847,13 +889,405 @@ def test_moved_skill_matching_two_folders_hands_over_neither_and_is_refused_ambi
 
     result = _seed(role.home, refresh_official=True)
 
-    assert {"name": "ascii-art", "reason": "ambiguous"} in result["official"]["refused"]
+    assert result["refused"] == [{"name": "ascii-art", "reason": "ambiguous"}]
+    assert result["official"]["refused"] == []  # the sync reports it, once
     assert result["moved_to_official"] == []
     assert "ascii-art" not in result["cleaned"]
     assert result["optional_provenance_backfilled"] == []
     for copy, files in before.items():
         assert _files(copy) == files, copy
     assert "ascii-art" not in _lock(role).get("installed", {})
+
+
+@needs_real_permissions
+def test_unreadable_official_source_refuses_the_hand_over_through_seeding(role):
+    """Real mode 000 on a folder of the official source: the hand-over cannot write the new
+    copy, puts the old one back, keeps the line and names the moved skill under refused."""
+    _write_skill(role.bundled, "media/ascii-art", "built-in v1")
+    assert _seed(role.home) is not None
+    copy = role.skills / "media" / "ascii-art"
+    before, line = _files(copy), _manifest(role)["ascii-art"]
+    shutil.rmtree(role.bundled / "media")
+    hidden = _add_owner_folder(_write_skill(role.optional, "creative/ascii-art", "official optional v2"))
+    try:
+        hidden.chmod(0)
+        result = _seed(role.home, refresh_official=True)
+    finally:
+        hidden.chmod(0o755)
+
+    assert result is not None
+    assert {"name": "ascii-art", "reason": "copy write failed"} in result["refused"]
+    assert "ascii-art" not in result["moved_to_official"] + result["updated"] + result["cleaned"]
+    assert _files(copy) == before
+    assert not copy.with_suffix(".bak").exists()
+    assert _manifest(role)["ascii-art"] == line
+    assert "ascii-art" not in _lock(role).get("installed", {})
+    assert _seed(role.home, refresh_official=True)["moved_to_official"] == ["ascii-art"]
+
+
+def test_built_in_update_whose_manifest_write_fails_restores_old_copy_and_line(role, monkeypatch):
+    """The new line is written before the old copy goes: when it cannot be written, the old
+    copy and the old line stay, and the skill is refused, not updated. The next sync retries."""
+    _write_skill(role.bundled, "software-development/spike", "built-in v1")
+    sync_skills(quiet=True)
+    copy = role.skills / "software-development" / "spike"
+    before, manifest_before = _files(copy), (role.skills / ".bundled_manifest").read_bytes()
+    _write_skill(role.bundled, "software-development/spike", "built-in v2")
+
+    with monkeypatch.context() as patched:
+        _deny_manifest_write(patched)
+        result = sync_skills(quiet=True)
+
+    assert _files(copy) == before
+    assert not copy.with_suffix(".bak").exists()
+    assert (role.skills / ".bundled_manifest").read_bytes() == manifest_before
+    assert result["refused"] == [{"name": "spike", "reason": "record write failed"}]
+    assert result["updated"] == []
+
+    retried = sync_skills(quiet=True)
+    assert retried["updated"] == ["spike"]
+    assert _manifest(role)["spike"] == _dir_hash(role.bundled / "software-development" / "spike")
+
+
+# ---------------------------------------------------------------------------
+# One check decides "unchanged": a link, a special file or a missing record keeps the copy
+# ---------------------------------------------------------------------------
+
+def _builtin_copy_with_owner_link(role, tmp_path) -> tuple:
+    """Hermes installs built-in ascii-art v1; the owner links a folder of their own into it."""
+    _write_skill(role.bundled, "media/ascii-art", "built-in v1")
+    assert _seed(role.home) is not None
+    copy = role.skills / "media" / "ascii-art"
+    link, target = _add_owner_link(copy, tmp_path / "outside")
+    return copy, link, target, _files(copy), _manifest(role)["ascii-art"]
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marked", "unmarked"])
+def test_owner_link_keeps_built_in_copy_at_update(role, tmp_path, marked):
+    copy, link, target, before, line = _builtin_copy_with_owner_link(role, tmp_path)
+    if marked:
+        _mark(role)
+    _write_skill(role.bundled, "media/ascii-art", "built-in v2")
+
+    result = _seed(role.home, refresh_official=True)
+
+    _assert_owner_link_kept(copy, before, link, target)
+    assert _manifest(role)["ascii-art"] == line
+    assert result["kept"] == [{"name": "ascii-art", "reason": "link"}]
+    assert "ascii-art" in result["user_modified"]
+    assert "ascii-art" not in result["updated"]
+
+
+def test_owner_link_keeps_moved_copy_at_hand_over(role, tmp_path):
+    copy, link, target, before, line = _builtin_copy_with_owner_link(role, tmp_path)
+    shutil.rmtree(role.bundled / "media")
+    _write_skill(role.optional, "creative/ascii-art", "released optional v2")
+
+    result = _seed(role.home, refresh_official=True)
+
+    _assert_owner_link_kept(copy, before, link, target)
+    assert _manifest(role)["ascii-art"] == line
+    assert "ascii-art" not in _lock(role).get("installed", {})
+    assert result["kept"] == [{"name": "ascii-art", "reason": "link"}]
+    assert result["moved_to_official"] == []
+
+
+def test_owner_link_keeps_official_optional_copy_at_refresh(role, tmp_path):
+    _adopt_official_copy(role, "communication/yuanbao", "official v1")
+    copy = role.skills / "communication" / "yuanbao"
+    link, target = _add_owner_link(copy, tmp_path / "outside")
+    before, lock_before = _files(copy), _lock_bytes(role)
+    _write_skill(role.optional, "communication/yuanbao", "released optional v2")
+
+    result = _seed(role.home, refresh_official=True)
+
+    _assert_owner_link_kept(copy, before, link, target)
+    assert _lock_bytes(role) == lock_before
+    assert [(item["name"], item["reason"]) for item in result["official"]["kept_changed"]] == [("yuanbao", "link")]
+    assert result["official"]["updated"] == []
+
+
+def test_owner_link_keeps_copy_that_an_external_folder_now_provides(role, tmp_path):
+    """Marked role, configured external source: the local copy only looks like the stale shadow
+    Hermes wrote, so it is not deleted."""
+    _write_skill(role.bundled, "devops/ascii-art", "bundled v1")
+    assert _seed(role.home) is not None
+    copy = role.skills / "devops" / "ascii-art"
+    link, target = _add_owner_link(copy, tmp_path / "outside")
+    before, line = _files(copy), _manifest(role)["ascii-art"]
+    _mark(role)
+    external = tmp_path / "external"
+    _write_skill(external, "devops/ascii-art", "external v1")
+    (role.home / "config.yaml").write_text(f"skills:\n  external_dirs:\n    - {external}\n", encoding="utf-8")
+
+    result = _seed(role.home, refresh_official=True)
+
+    _assert_owner_link_kept(copy, before, link, target)
+    assert _manifest(role)["ascii-art"] == line
+    assert result["shadowed_by_external"] == ["ascii-art"]
+    assert result["kept"] == [{"name": "ascii-art", "reason": "link"}]
+
+
+def test_owner_link_keeps_copy_at_rename_recovery(role, tmp_path):
+    """The release moves the built-in to another category: the copy is not moved."""
+    copy, link, target, before, line = _builtin_copy_with_owner_link(role, tmp_path)
+    shutil.rmtree(role.bundled / "media")
+    _write_skill(role.bundled, "creative/ascii-art", "built-in v2")
+
+    result = sync_skills(quiet=True)
+
+    _assert_owner_link_kept(copy, before, link, target)
+    assert not (role.skills / "creative" / "ascii-art").exists()
+    assert _manifest(role)["ascii-art"] == line
+    assert result["kept"] == [{"name": "ascii-art", "reason": "link"}]
+    assert result["relocated"] == []
+
+
+def test_owner_link_keeps_same_named_folder_from_adoption_by_a_new_built_in(role, tmp_path):
+    """The owner's folder equals a new built-in's files but holds a link: it is not adopted
+    (no line), so the release after it does not replace it either."""
+    src = _write_skill(role.bundled, "media/ascii-art", "built-in v1")
+    copy = role.skills / "media" / "ascii-art"
+    shutil.copytree(src, copy)
+    link, target = _add_owner_link(copy, tmp_path / "outside")
+    before = _files(copy)
+
+    results = [sync_skills(quiet=True)]
+    _write_skill(role.bundled, "media/ascii-art", "built-in v2")
+    results.append(sync_skills(quiet=True))
+
+    _assert_owner_link_kept(copy, before, link, target)
+    assert "ascii-art" not in _manifest(role)
+    for result in results:
+        assert result["kept"] == [{"name": "ascii-art", "reason": "link"}]
+        assert "ascii-art" not in result["copied"] + result["updated"]
+
+
+def test_owner_link_keeps_copy_from_adoption_by_repair_official(role, tmp_path):
+    src = _write_skill(role.optional, "communication/yuanbao", "official v1")
+    copy = role.skills / "communication" / "yuanbao"
+    shutil.copytree(src, copy)
+    link, target = _add_owner_link(copy, tmp_path / "outside")
+    before = _files(copy)
+
+    report = restore_official_optional_skill("yuanbao")
+
+    assert report["ok"] is True
+    assert report["backfilled"] == []
+    assert "yuanbao" not in _lock(role).get("installed", {})
+    _assert_owner_link_kept(copy, before, link, target)
+
+
+def test_file_link_holding_the_recorded_bytes_keeps_the_copy(role, tmp_path):
+    _write_skill(role.bundled, "media/ascii-art", "built-in v1")
+    sync_skills(quiet=True)
+    copy = role.skills / "media" / "ascii-art"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "SKILL.md").write_bytes((copy / "SKILL.md").read_bytes())
+    (copy / "SKILL.md").unlink()
+    os.symlink(outside / "SKILL.md", copy / "SKILL.md")
+    line = _manifest(role)["ascii-art"]
+    _write_skill(role.bundled, "media/ascii-art", "built-in v2")
+
+    result = sync_skills(quiet=True)
+
+    assert os.path.islink(copy / "SKILL.md") and os.readlink(copy / "SKILL.md") == str(outside / "SKILL.md")
+    assert _manifest(role)["ascii-art"] == line
+    assert result["kept"] == [{"name": "ascii-art", "reason": "link"}]
+    assert result["updated"] == []
+
+
+def test_copy_folder_that_is_a_link_is_kept(role, tmp_path):
+    src = _write_skill(role.bundled, "media/ascii-art", "built-in v1")
+    sync_skills(quiet=True)
+    copy = role.skills / "media" / "ascii-art"
+    outside = tmp_path / "outside" / "ascii-art"
+    shutil.copytree(src, outside)
+    shutil.rmtree(copy)
+    os.symlink(outside, copy, target_is_directory=True)
+    before, line = _files(outside), _manifest(role)["ascii-art"]
+    _write_skill(role.bundled, "media/ascii-art", "built-in v2")
+
+    result = sync_skills(quiet=True)
+
+    assert os.path.islink(copy) and os.readlink(copy) == str(outside)
+    assert _files(outside) == before
+    assert _manifest(role)["ascii-art"] == line
+    assert result["kept"] == [{"name": "ascii-art", "reason": "link"}]
+    assert result["updated"] == []
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo")
+def test_special_file_in_a_copy_keeps_it_as_changed(role):
+    _write_skill(role.bundled, "media/ascii-art", "built-in v1")
+    sync_skills(quiet=True)
+    copy = role.skills / "media" / "ascii-art"
+    os.mkfifo(copy / "pipe")
+    before, line = _files(copy), _manifest(role)["ascii-art"]
+    _write_skill(role.bundled, "media/ascii-art", "built-in v2")
+
+    result = sync_skills(quiet=True)
+
+    assert stat.S_ISFIFO(os.lstat(copy / "pipe").st_mode)
+    assert _files(copy) == before
+    assert _manifest(role)["ascii-art"] == line
+    assert result["kept"] == [{"name": "ascii-art", "reason": "changed"}]
+    assert result["updated"] == []
+
+
+@pytest.mark.parametrize("first", ["sync-first", "refresh-first"])
+def test_moved_copy_kept_as_changed_stays_kept_through_later_syncs_and_releases(role, first):
+    """Finding 2: Hermes installs built-in v1 and the owner edits the copy to bytes equal to the
+    optional version it moves to. The first pass keeps it; a second ordinary sync at the same
+    release, the release step at that release and the release step at the next one keep it too:
+    its line stays exactly as it was and no lock entry is ever written for it."""
+    _write_skill(role.bundled, "media/ascii-art", "Hermes wrote v1")
+    assert _seed(role.home) is not None
+    copy = _write_skill(role.skills, "media/ascii-art", "owner edit equal to optional v2")
+    owners, line = _files(copy), _manifest(role)["ascii-art"]
+    shutil.rmtree(role.bundled / "media")
+    _write_skill(role.optional, "creative/ascii-art", "owner edit equal to optional v2")
+
+    def check(result) -> None:
+        assert result is not None
+        assert result["kept"] == [{"name": "ascii-art", "reason": "changed"}]
+        assert result["moved_kept_changed"] == ["ascii-art"]
+        assert "ascii-art" not in result["cleaned"] + result["moved_to_official"]
+        assert result.get("official", {}).get("updated", []) == []
+        assert _files(copy) == owners
+        assert _manifest(role)["ascii-art"] == line
+        assert "ascii-art" not in _lock(role).get("installed", {})
+
+    check(_seed(role.home, refresh_official=True) if first == "refresh-first" else sync_skills(quiet=True))
+    legacy = _seed(role.home)  # a second ordinary sync at the same release, without the keyword
+    assert legacy is not None
+    assert "ascii-art" not in legacy["cleaned"]
+    assert legacy["optional_provenance_backfilled"] == []
+    check(sync_skills(quiet=True))
+    check(_seed(role.home, refresh_official=True))
+    _write_skill(role.optional, "creative/ascii-art", "optional v3")
+    check(_seed(role.home, refresh_official=True))
+
+
+def test_sync_never_adopts_an_optional_copy_without_a_record_but_repair_official_does(role):
+    src = _write_skill(role.optional, "research/blogwatcher", "official v1")
+    copy = role.skills / "research" / "blogwatcher"
+    shutil.copytree(src, copy)  # byte-identical to the official source, but Hermes wrote no record
+
+    result = _seed(role.home, refresh_official=True)
+    again = sync_skills(quiet=True)
+
+    assert result["optional_provenance_backfilled"] == again["optional_provenance_backfilled"] == []
+    assert result["official"]["kept_untracked"] == [{"name": "blogwatcher", "reason": "changed"}]
+    assert "blogwatcher" not in _lock(role).get("installed", {})
+
+    report = restore_official_optional_skill("blogwatcher")  # the owner's explicit request
+
+    assert report["backfilled"] == ["blogwatcher"]
+    assert _lock(role)["installed"]["blogwatcher"]["content_hash"] == content_hash(copy)
+    assert _files(copy) == _files(src)
+
+
+def test_v1_manifest_line_is_a_missing_record_and_keeps_the_copy(role):
+    _write_skill(role.bundled, "software-development/spike", "built-in v1")
+    sync_skills(quiet=True)
+    copy = role.skills / "software-development" / "spike"
+    before = _files(copy)
+    (role.skills / ".bundled_manifest").write_text("spike\n", encoding="utf-8")  # v1: a name, no fingerprint
+    _write_skill(role.bundled, "software-development/spike", "built-in v2")
+
+    for _sync in range(2):
+        result = sync_skills(quiet=True)
+        assert _files(copy) == before
+        assert _manifest(role) == {"spike": ""}
+        assert result["kept"] == [{"name": "spike", "reason": "changed"}]
+        assert result["updated"] == []
+
+
+def _plain_tree(root: Path) -> Path:
+    """A copy whose path order and POSIX-string order differ ("a/b.md", "a-b/x.md"), with an
+    empty folder and runtime caches."""
+    copy = _write_skill(root, "pkg/tree-skill", "body")
+    for rel, data in (("a/b.md", b"one"), ("a-b/x.md", b"two"), ("scripts/tool.py", b"print(1)\n"),
+                      ("scripts/tool.pyc", b"\x00cache"), ("scripts/__pycache__/tool.cpython-312.pyc", b"\x01")):
+        (copy / rel).parent.mkdir(parents=True, exist_ok=True)
+        (copy / rel).write_bytes(data)
+    (copy / "empty").mkdir()
+    return copy
+
+
+def test_copy_check_accepts_only_the_recorded_fingerprint_of_a_plain_copy(tmp_path):
+    from tools.skills_sync import _copy_change
+    copy = _plain_tree(tmp_path)
+    recorded = _dir_hash(copy)
+
+    assert recorded != _dir_hash(copy, include_runtime_cache=True)
+    assert _copy_change(copy, recorded) is None
+    assert _copy_change(copy, _dir_hash(copy, include_runtime_cache=True)) is None  # exact legacy record
+    assert _copy_change(copy, content_hash(copy), kind="lock") is None
+    assert _copy_change(copy, recorded, kind="lock") == "changed"
+    assert _copy_change(copy, content_hash(copy)) == "changed"
+    for missing in ("", None):
+        assert _copy_change(copy, missing) == "changed"
+        assert _copy_change(copy, missing, kind="lock") == "changed"
+
+    (copy / "scripts" / "__pycache__" / "tool.cpython-312.pyc").write_bytes(b"regenerated")
+    assert _copy_change(copy, recorded) is None  # runtime caches are left out of the manifest kind
+    (copy / "a" / "b.md").write_bytes(b"edited")
+    assert _copy_change(copy, recorded) == "changed"
+
+
+def test_copy_check_refuses_a_link_anywhere_runtime_caches_included(tmp_path):
+    from tools.skills_sync import _copy_change
+    copy = _plain_tree(tmp_path / "skills")
+    recorded = _dir_hash(copy)
+    (tmp_path / "elsewhere").mkdir()
+    os.symlink(tmp_path / "elsewhere", copy / "scripts" / "__pycache__" / "linked", target_is_directory=True)
+
+    assert _dir_hash(copy) == recorded  # the fingerprint alone cannot see it
+    assert _copy_change(copy, recorded) == "link"
+
+
+@needs_real_permissions
+def test_copy_check_reports_an_unreadable_file_or_folder(tmp_path):
+    from tools.skills_sync import _copy_change
+    copy = _plain_tree(tmp_path)
+    recorded = _dir_hash(copy)
+    secret = copy / "a" / "b.md"
+    secret.chmod(0)
+    try:
+        assert _copy_change(copy, recorded) == "unreadable"
+    finally:
+        secret.chmod(0o644)
+    hidden = _add_owner_folder(copy)
+    hidden.chmod(0)
+    try:
+        assert _copy_change(copy, _dir_hash(copy)) == "unreadable"  # the hash skips what it cannot list
+    finally:
+        hidden.chmod(0o755)
+
+
+def test_copy_check_reports_unreadable_when_listing_or_reading_fails(tmp_path, monkeypatch):
+    """Twin of the mode-000 test that runs as any user."""
+    from tools.skills_sync import _copy_change
+    copy = _plain_tree(tmp_path)
+    _add_owner_folder(copy)
+    recorded = _dir_hash(copy)
+    real_read_bytes = Path.read_bytes
+
+    def read_bytes(path):
+        if path.name == "owner.txt":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_read_bytes(path)
+
+    with monkeypatch.context() as patched:
+        _deny_listing(patched)
+        assert _copy_change(copy, recorded) == "unreadable"
+    with monkeypatch.context() as patched:
+        patched.setattr(Path, "read_bytes", read_bytes)
+        assert _copy_change(copy, recorded) == "unreadable"
+    assert _copy_change(copy, recorded) is None
 
 
 # ---------------------------------------------------------------------------
@@ -918,6 +1352,6 @@ def test_seed_profile_skills_keyword_prints_the_extended_result_with_official(ro
     assert child_stdout == [json.dumps(refreshed) + "\n"]
     assert refreshed["copied"] == ["spike"]
     assert set(refreshed) >= set(json.loads(LEGACY_STDOUT[0])) | {
-        "not_seeded_by_marker", "moved_to_official", "moved_kept_changed", "official"}
+        "not_seeded_by_marker", "moved_to_official", "moved_kept_changed", "kept", "refused", "official"}
     assert set(refreshed["official"]) == {
         "updated", "kept_changed", "kept_untracked", "skipped_deleted", "skipped_removed_upstream", "refused"}
