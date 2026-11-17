@@ -65,6 +65,7 @@ from hermes_cli import kanban_db, owner_project_review_owner_line as owner_steps
 from hermes_cli import owner_project_summary as summary
 from hermes_cli import owner_project_summary_events as events
 from hermes_cli.kanban_recommendation_closure import content_link, delivery_after_undo
+from hermes_cli.owner_project_review_suggestions import _review_closures, check_closure_shapes, check_plan_suggestions
 from hermes_cli.sqlite_util import write_txn
 
 logger = logging.getLogger(__name__)
@@ -136,6 +137,8 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
    specification, current_milestone, owner_visible_result, later_milestones, and changes.
    Use the native plan change schema. Each existing task reference must use its input status and event revision.
    This is advice for the Project chat. It grants no approval and changes no work.
+   An accepted suggestion with a null linked_card may be planned there: add plan_suggestions, at most three objects
+   with exactly change (the index of an add change in changes) and suggestion (its id).
 9. When Review days start from the start, this is the Project's first review and no review came before it.
    Do not write last review, previous review, earlier review or prior review. Write so far instead.
 """
@@ -348,6 +351,11 @@ def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, s
         ):
             actual = "answered"
             evidence = [f"decisions:event:{max(item['event_id'] for item in answers)}"]
+        elif (tid in suggestions and suggestions[tid]["decision"] == "accepted" and (made := suggestions[tid].get("linked_card"))
+              and by_item[tid]["class"] == "superseded" and f"tasks:{made}" in by_item[tid]["evidence"]
+              and made in tasks and _delivered_match(board, project_id, tid, tasks[made])):
+            # An accepted suggestion whose own linked card is delivered, as the worker's evidence names it.
+            actual, evidence = "superseded", [f"tasks:{made}"]
         elif tid in suggestions and suggestions[tid]["decision"] != "pending":
             actual = "answered"
             evidence = [f"suggestions:{tid}"]
@@ -426,67 +434,15 @@ def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, s
     return classified
 
 
-def check_closure_shapes(proposals: Any) -> None:
-    """The closure list size, each proposal's keys and its reason text, without the evidence only the harvest checks."""
-    if not isinstance(proposals, list) or len(proposals) > 3:
-        raise ReviewRefused("review_closure_list_invalid")
-    for index, proposal in enumerate(proposals):
-        if (not isinstance(proposal, dict)
-                or set(proposal) != {"recommendation_id", "card_id", "reason", "evidence"}
-                or not isinstance(proposal["recommendation_id"], str)
-                or not isinstance(proposal["card_id"], str)):
-            raise ReviewRefused("review_closure_keys_invalid")
-        _review_texts({"reason": proposal["reason"]}, {"reason": _CLOSURE_REASON_LIMIT}, "", f"proposed_closures[{index}]")
-
-
-def _review_closures(board, project_id, sources, classification, proposals) -> list[dict]:
-    """The result's closures its classification proves. Without a board, a stored review's closures are read again:
-    the closure step then checks the live state in its own board transaction."""
-    check_closure_shapes(proposals)
-    suggestions = {item["id"]: item for item in sources["suggestions"]}
-    cards = {item["id"]: item for item in sources["tasks"]}
-    classes = {item["item"]: item for item in classification}
-    checked = []
-    seen = set()
-    for proposal in proposals:
-        tid, card_id = proposal["recommendation_id"], proposal["card_id"]
-        evidence = [f"suggestions:{tid}", f"tasks:{card_id}"]
-        if (tid in seen or tid not in suggestions or card_id not in cards
-                or not isinstance(proposal["evidence"], list) or len(proposal["evidence"]) != 2
-                or not all(isinstance(ref, str) for ref in proposal["evidence"])
-                or set(proposal["evidence"]) != set(evidence)
-                or classes.get(tid, {}).get("class") != "superseded"
-                or f"tasks:{card_id}" not in classes[tid]["evidence"]
-                or suggestions[tid]["decision"] != "pending"
-                or (suggestions[tid].get("closure") and suggestions[tid]["closure"].get("undone_at") is None)):
-            raise ReviewRefused("review_closure_evidence_required")
-        delivery_state, lifecycle = cards[card_id].get("delivery_state"), suggestions[tid]
-        if board is not None:
-            delivery_state = _delivered_match(board, project_id, tid, cards[card_id])
-            if delivery_state is None:
-                raise ReviewRefused("review_closure_evidence_required")
-            row = board.execute(
-                "SELECT * FROM tasks WHERE id=? AND project_id=? AND task_kind='recommendation'", (tid, project_id),
-            ).fetchone()
-            lifecycle = kanban_db.recommendation_lifecycle_snapshot(row)
-            if any(lifecycle[key] != suggestions[tid].get(key) for key in lifecycle):
-                raise ReviewRefused("review_recommendation_state_changed")
-        # check_closure_shapes passed this reason through _review_texts, which returns it stripped.
-        reason = proposal["reason"].strip()
-        seen.add(tid)
-        checked.append({"recommendation_id": tid, "card_id": card_id, "reason": reason,
-                        "evidence": evidence, "card_state": delivery_state, "expected_lifecycle_version": lifecycle["lifecycle_version"]})
-    return checked
-
-
 def check_result_texts(value: Any, sources: Optional[dict[str, list[dict]]] = None, *, first: bool = False):
     """The result's keys and size, then with its frozen input the summary, the brief and the work-title rule: one rule,
     which the hand-over runs too. Without sources only the keys and size are checked, ahead of the frozen input."""
     from hermes_cli.owner_project_review_record import TOTAL_INPUT_CAP_BYTES
 
     required = {"summary", "brief", "classification", "proposed_closures"}
-    # Plan advice is the one optional key. Every other extra key stays invalid.
-    if not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(required | {"plan_proposal"}):
+    # Plan advice and the suggestions it plans are the optional keys. Every other extra key stays invalid.
+    if (not isinstance(value, dict) or not required.issubset(value)
+            or not set(value).issubset(required | {"plan_proposal", "plan_suggestions"})):
         raise ReviewRefused("review_result_keys_invalid")
     try:
         if len(json.dumps(value, allow_nan=False).encode("utf-8")) > TOTAL_INPUT_CAP_BYTES:
@@ -557,8 +513,9 @@ def parse_review_result(
         try:
             hint = proposal_hint(
                 value.get("plan_proposal"), sources, project_board, registry, project, now=now,
-                limit=_BRIEF_LIMITS["next_step"], max_bytes=TOTAL_INPUT_CAP_BYTES,
+                limit=_BRIEF_LIMITS["next_step"], max_bytes=TOTAL_INPUT_CAP_BYTES, pairs=value.get("plan_suggestions"),
             )
+            check_plan_suggestions(value, sources, project_board, registry, project)
         except ReviewRefused:
             raise
         except ValueError as exc:
