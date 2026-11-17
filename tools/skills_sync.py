@@ -26,7 +26,8 @@ from hermes_constants import get_bundled_skills_dir, get_hermes_home, get_option
 from agent.skill_utils import ESSENTIAL_SKILLS, is_excluded_skill_path
 from tools.skill_usage import _read_skill_name, read_suppressed_names
 from tools.skills_sync_optional import (
-    _hand_over_moved_skill, _ignore_runtime_cache, _is_runtime_cache, _read_hub_install_paths,
+    _hand_over_moved_skill, _ignore_runtime_cache, _is_runtime_cache, _optional_skill_index,
+    _read_hub_install_paths, _walk_skill_candidates,
 )
 from utils import atomic_write_text
 
@@ -131,13 +132,30 @@ def _write_manifest_or_raise(entries: Dict[str, str]) -> None:
     atomic_write_text(_manifest_file(), data, tmp_prefix=".bundled_manifest_", preserve_mode=True)
 
 
-def _write_manifest(entries: Dict[str, str]):
-    """``_write_manifest_or_raise`` that logs a failure instead of raising."""
+# The one re-baseline: `hermes skills reset NAME` (no --restore) drops the line through
+# _write_manifest, then syncs, and that one sync may record the copy again. Holds the
+# (manifest file, name) pairs whose lines _write_manifest removed; sync_skills takes and clears it
+# at its start. Its own writes (_store_manifest) and a hand edit of the file grant nothing.
+_RESET_GRANTS: Set[Tuple[str, str]] = set()
+
+
+def _store_manifest(entries: Dict[str, str]) -> bool:
+    """``_write_manifest_or_raise`` that logs a failure instead of raising and grants nothing."""
     _manifest_file().parent.mkdir(parents=True, exist_ok=True)
     try:
         _write_manifest_or_raise(entries)
+        return True
     except Exception as e:
         logger.debug("Failed to write skills manifest %s: %s", _manifest_file(), e, exc_info=True)
+        return False
+
+
+def _write_manifest(entries: Dict[str, str]):
+    """``_store_manifest`` for callers outside the sync (``hermes skills reset``): the names whose
+    lines this call removes may be recorded again by the next sync_skills() in this process."""
+    removed = set(_read_manifest()) - set(entries)
+    if _store_manifest(entries):
+        _RESET_GRANTS.update((str(_manifest_file()), name) for name in removed)
 
 
 def _discover_bundled_skills(bundled_dir: Path) -> List[Tuple[str, Path]]:
@@ -182,8 +200,26 @@ def _copy_change(directory: Path, recorded: Optional[str], kind: str = "manifest
     "changed"), every file reads, and the fingerprint of exactly those files equals ``recorded``
     (a missing record is "changed"). ``kind`` "manifest" is ``_dir_hash`` (or its exact legacy
     variant with the runtime caches, never re-baselined); "lock" is ``skills_guard.content_hash``.
-    Nothing outside the copy is followed to manufacture a match.
+    Nothing outside the copy is followed to manufacture a match. For a copy lexically under the
+    skills root, every path component from the root (exclusive) down to the copy (inclusive) must
+    be a plain folder too: a link or junction on the way is "link", anything else "changed".
     """
+    root = _skills_dir()
+    try:
+        parts = Path(directory).relative_to(root).parts
+    except ValueError:
+        parts = ()  # outside the skills tree: only the checks below
+    isjunction = getattr(os.path, "isjunction", None)
+    for depth in range(1, len(parts) + 1):
+        component = root.joinpath(*parts[:depth])
+        try:
+            mode = os.lstat(component).st_mode
+        except OSError:
+            return "unreadable"
+        if stat.S_ISLNK(mode) or (isjunction is not None and isjunction(component)):
+            return "link"
+        if not stat.S_ISDIR(mode):
+            return "changed"
     try:
         mode = os.lstat(directory).st_mode
     except OSError:
@@ -280,10 +316,19 @@ def _recover_renamed_skill(st: "_SyncState", skill_name: str, dest: Path) -> Opt
                 f"modified copy at {rel} was kept — it will not receive updates. "
                 f"Run `hermes skills reset {skill_name} --restore` to move to the new location.")
             continue
+        # A refused move leaves the copy where it is and its line as it is (the caller then does
+        # not count the skill as deleted); nothing is moved through a link on the way to ``dest``.
+        failed = "link" if _copy_change(dest, None) == "link" else ""
         try:
-            _move_dir(candidate, dest)
+            if not failed:
+                _move_dir(candidate, dest)
         except OSError:
             logger.warning("Could not relocate renamed skill %s -> %s", candidate, dest, exc_info=True)
+            failed = "copy write failed"
+        if failed:
+            st.refused.append({"name": skill_name, "reason": failed})
+            st.say(f"  ! {skill_name} was not moved to {_rel_skills_posix(dest)} ({failed}); your copy "
+                   f"at {rel} stays")
             return None
         logger.info("Relocated renamed bundled skill: %s -> %s", candidate, dest)
         st.say(f"  → {skill_name} (moved {rel} → {_rel_skills_posix(dest)})")
@@ -305,6 +350,7 @@ class _SyncState:
     suppressed: List[str] = field(default_factory=list)
     relocated: List[str] = field(default_factory=list)
     shadowed_by_external: List[str] = field(default_factory=list)
+    reset: Set[str] = field(default_factory=set)  # names `hermes skills reset` lets this sync record
     active_index: Optional[Dict[str, List[Path]]] = None  # rename-recovery indexes are expensive on
     hub_paths: Set[str] = field(default_factory=set)  # bind mounts: built lazily, only when needed
 
@@ -317,7 +363,7 @@ def _recover_orphan_backup(dest: Path) -> None:
     """If an interrupted update left the user's only copy in ``dest.bak`` with dest gone, move it
     back so the skill isn't misread as user-deleted."""
     orphan = dest.with_suffix(".bak")
-    if orphan.exists() and not dest.exists():
+    if orphan.exists() and not os.path.lexists(dest):
         try:
             _move_dir(orphan, dest)
             logger.info("Recovered orphaned skill backup: %s", orphan)
@@ -333,7 +379,7 @@ def _defer_to_external(st: _SyncState, skill_name: str, dest: Path, bundled_hash
     st.shadowed_by_external.append(skill_name)
     st.skipped += 1
     st.say(f"  ⇢ {skill_name} (deferred to external_dirs, not written to local tree)")
-    if not dest.exists():
+    if not os.path.lexists(dest):
         return
     line = st.manifest.get(skill_name, "")
     if (reason := _copy_change(dest, line)) is not None:
@@ -349,21 +395,24 @@ def _defer_to_external(st: _SyncState, skill_name: str, dest: Path, bundled_hash
 def _install_new_skill(st: _SyncState, skill_name: str, skill_src: Path, dest: Path, bundled_hash: str) -> None:
     """Handle a skill never offered before (not in manifest)."""
     try:
-        if dest.exists():
-            # Never overwrite a same-named user skill. Adopt it (a manifest line) only when it is
-            # unchanged against this release and the hub does not own the path: `hermes skills
-            # reset` relies on this to re-baseline after dropping the line (pinned by
-            # TestResetBundledSkill::test_reset_clears_stuck_user_modified_flag).
+        if os.path.lexists(dest):
+            # Never overwrite or adopt a same-named entry Hermes did not just write: no record
+            # proves nothing. The one exception is the copy whose line `hermes skills reset` just
+            # dropped, when it is unchanged against this release and the hub does not own the path
+            # (pinned by TestResetBundledSkill::test_reset_clears_stuck_user_modified_flag).
             st.skipped += 1
-            reason = _copy_change(dest, bundled_hash)
-            if reason is None and _rel_skills_posix(dest) not in _read_hub_install_paths():
+            if (skill_name in st.reset and _copy_change(dest, bundled_hash) is None
+                    and _rel_skills_posix(dest) not in _read_hub_install_paths()):
                 st.manifest[skill_name] = bundled_hash
-            elif reason is not None:
-                st.kept.append({"name": skill_name, "reason": reason})
-                st.say(
-                    f"  ⚠ {skill_name}: bundled version shipped but you already have a local skill "
-                    f"by this name — yours was kept. Run `hermes skills reset {skill_name}` to "
-                    f"replace it with the bundled version.")
+                return
+            st.kept.append({"name": skill_name, "reason": _copy_change(dest, None)})
+            st.say(
+                f"  ⚠ {skill_name}: bundled version shipped but you already have a local skill "
+                f"by this name — yours was kept. Run `hermes skills reset {skill_name}` to "
+                f"replace it with the bundled version.")
+        elif _copy_change(dest, None) == "link":  # a link on the way: nothing is written through it
+            st.refused.append({"name": skill_name, "reason": "link"})
+            st.say(f"  ! {skill_name} was not installed: a link is on the way to {_rel_skills_posix(dest)}")
         else:
             _copy_dir(skill_src, dest)
             st.copied.append(skill_name)
@@ -378,7 +427,7 @@ def _replace_skill_dir(skill_src: Path, dest: Path, record: Optional[Callable[[]
     ``record`` (the new copy's provenance write) runs before the backup goes: if it fails too,
     the old copy is restored."""
     backup = dest.with_suffix(".bak")
-    if backup.exists():  # a stale .bak would make shutil.move() nest dest INSIDE it
+    if os.path.lexists(backup):  # a stale .bak would make shutil.move() nest dest INSIDE it
         _rmtree_writable(backup)
     shutil.move(str(dest), str(backup))
     try:
@@ -386,31 +435,35 @@ def _replace_skill_dir(skill_src: Path, dest: Path, record: Optional[Callable[[]
         if record is not None:
             record()
     except Exception:
-        if backup.exists():  # clear a partially-written dest so it can't shadow/block the restore
-            if dest.exists():
+        if os.path.lexists(backup):  # clear a partially-written dest so it can't shadow/block the restore
+            if os.path.lexists(dest):
                 try:
                     _rmtree_writable(dest)
                 except OSError:
                     logger.warning("Could not clear partial copy %s during restore", dest,
                                    exc_info=True)
-            if not dest.exists():
+            if not os.path.lexists(dest):
                 shutil.move(str(backup), str(dest))
         raise
-    try:
+    try:  # the new copy and its record are written: the replacement stands whatever happens here
         _rmtree_writable(backup)
-    except OSError:
-        logger.debug("Could not remove backup %s", backup, exc_info=True)
+    except Exception:  # OSError, the rmtree scope guard, anything: the .bak stays
+        logger.warning("Could not remove backup %s", backup, exc_info=True)
 
 
 def _update_existing_skill(st: _SyncState, skill_name: str, skill_src: Path, dest: Path, bundled_hash: str) -> None:
     """Handle a skill that is in the manifest AND on disk."""
     origin_hash = st.manifest.get(skill_name, "")
-    if origin_hash and bundled_hash == origin_hash:  # bundled unchanged: skip without hashing the user copy
-        st.skipped += 1
-        return
+    # The copy is checked first, even when the built-in did not change: a kept copy is always named.
     # A v1 line (no hash) is a missing record: the copy is kept, and its line stays as it is
     # (re-checked every sync) until the owner runs `hermes skills reset`.
-    if (reason := _copy_change(dest, origin_hash)) is not None:
+    reason = _copy_change(dest, origin_hash)
+    if origin_hash and bundled_hash == origin_hash:  # bundled unchanged: nothing to deliver
+        st.skipped += 1
+        if reason is not None:
+            st.kept.append({"name": skill_name, "reason": reason})
+        return
+    if reason is not None:
         st.user_modified.append(skill_name)
         st.kept.append({"name": skill_name, "reason": reason})
         st.say(f"  ~ {skill_name} (kept as yours: {reason})")
@@ -439,7 +492,9 @@ def _seed_category_descriptions(bundled_dir: Path, only_dirs: Optional[Set[Path]
     seeding to the essential skills' categories on opted-out profiles."""
     for desc_md in bundled_dir.rglob("DESCRIPTION.md"):
         dest_desc = _skills_dir() / desc_md.relative_to(bundled_dir)
-        if (only_dirs is not None and dest_desc.parent not in only_dirs) or dest_desc.exists():
+        if (only_dirs is not None and dest_desc.parent not in only_dirs) or os.path.lexists(dest_desc):
+            continue
+        if _copy_change(dest_desc.parent, None) == "link":  # nothing is written through a link
             continue
         try:
             dest_desc.parent.mkdir(parents=True, exist_ok=True)
@@ -452,6 +507,8 @@ def sync_skills(quiet: bool = False) -> dict:
     """Sync bundled skills into ~/.hermes/skills/ using the manifest; returns the per-category
     result dict. Opted-out profiles seed no NEW skill except ESSENTIAL_SKILLS (the system prompt
     always points at ``hermes-agent``); skills they already hold a manifest line for still update."""
+    reset = {name for path, name in _RESET_GRANTS if path == str(_manifest_file())}
+    _RESET_GRANTS.clear()  # one sync only, whatever happens below
     marked = (_hermes_home() / NO_BUNDLED_SKILLS_MARKER).exists()
     if marked and not quiet:
         print("  (profile opted out of bundled skills via .no-bundled-skills — seeding essential skills only)")
@@ -464,7 +521,7 @@ def sync_skills(quiet: bool = False) -> dict:
     all_bundled = _discover_bundled_skills(bundled_dir)
     suppressed = _read_suppressed_names()
     external_index = _build_external_skill_index()
-    st = _SyncState(manifest=_read_manifest(), quiet=quiet)
+    st = _SyncState(manifest=_read_manifest(), quiet=quiet, reset=reset)
     # The marker stops only NEW built-ins: names with a manifest line run every branch below.
     bundled_skills = [(name, src) for name, src in all_bundled
                       if not marked or name in st.manifest or name in ESSENTIAL_SKILLS]
@@ -478,24 +535,31 @@ def sync_skills(quiet: bool = False) -> dict:
         bundled_hash = _dir_hash(skill_src)
         # Recoveries run BEFORE classification so a missing dest isn't misread as user-deleted.
         _recover_orphan_backup(dest)
-        if not dest.exists() and skill_name in st.manifest and _recover_renamed_skill(st, skill_name, dest):
+        if not os.path.lexists(dest) and skill_name in st.manifest and _recover_renamed_skill(st, skill_name, dest):
             st.relocated.append(skill_name)
+        if any(item["name"] == skill_name for item in st.refused):
+            continue  # a move that did not happen: the old copy stays with its line, not user-deleted
         if skill_name in external_index:
             _defer_to_external(st, skill_name, dest, bundled_hash)
         elif skill_name not in st.manifest:
             _install_new_skill(st, skill_name, skill_src, dest, bundled_hash)
-        elif dest.exists():
+        elif os.path.lexists(dest):
             _update_existing_skill(st, skill_name, skill_src, dest, bundled_hash)
         else:
             st.skipped += 1  # in manifest but not on disk — user deleted it
     # Clean manifest entries for names no longer built-in (full set, every role). A copy that moved
     # to the optional catalog is handed over first; a refused hand-over keeps its line for a retry,
-    # and a kept (changed) copy keeps its line so every later sync checks and reports it again.
+    # and a kept copy (changed, or not found for sure) keeps its line so every later sync checks
+    # and reports it again. One candidate walk serves every such name.
     cleaned: List[str] = []
     moved_to_official: List[str] = []
     moved_kept_changed: List[str] = []
-    for name in sorted(set(st.manifest) - {name for name, _ in all_bundled}):
-        outcome, reason = _hand_over_moved_skill(name, st.manifest[name])
+    stale = sorted(set(st.manifest) - {name for name, _ in all_bundled})
+    official = _optional_skill_index() if stale else {}
+    walk = (_walk_skill_candidates({official[name][0] if name in official else name for name in stale})
+            if stale else ({}, True))
+    for name in stale:
+        outcome, reason = _hand_over_moved_skill(name, st.manifest[name], walk)
         if outcome == "refused":
             st.refused.append({"name": name, "reason": reason})
             st.say(f"  ! {name} was not handed over to the official optional catalog ({reason}); "
@@ -506,6 +570,10 @@ def sync_skills(quiet: bool = False) -> dict:
             st.kept.append({"name": name, "reason": reason})
             st.say(f"  ~ {name} (moved to the optional catalog; your copy is kept: {reason})")
             continue
+        if outcome == "kept":
+            st.kept.append({"name": name, "reason": reason})
+            st.say(f"  ~ {name} (no longer a built-in; your copy and its record are kept: {reason})")
+            continue
         if outcome == "moved_to_official":
             moved_to_official.append(name)
             st.say(f"  ↑ {name} (moved to the official optional catalog)")
@@ -514,7 +582,7 @@ def sync_skills(quiet: bool = False) -> dict:
     _seed_category_descriptions(bundled_dir, {
         _compute_relative_dest(src, bundled_dir).parent
         for name, src in bundled_skills if name in ESSENTIAL_SKILLS} if marked else None)
-    _write_manifest(st.manifest)
+    _store_manifest(st.manifest)
     return {
         "copied": st.copied, "updated": st.updated, "skipped": st.skipped, "user_modified": st.user_modified,
         "cleaned": cleaned, "suppressed": st.suppressed, "relocated": st.relocated,

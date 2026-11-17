@@ -4,6 +4,7 @@ helpers resolve through ``_ss()`` at call time so ``tools.skills_sync`` patches 
 
 import json
 import logging
+import os
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -127,9 +128,13 @@ def _move_to_restore_backup(path: Path, backup_root: Path) -> str:
 
 
 def restore_official_optional_skill(name: str, *, restore: bool = False) -> dict:
-    """Restore one or all official optional skills from repo source. ``restore=False`` only
-    backfills exact-match provenance; ``restore=True`` also backs up matching active copies
-    and copies the official source into its canonical path."""
+    """Restore one or all official optional skills from repo source (``hermes skills
+    repair-official``). It acts only on the skills it names (all of them for 'all' or '*').
+    ``restore=False`` only records exact official copies that have no record of any kind
+    (``_backfill_optional_provenance``); ``restore=True`` also backs up matching active copies
+    and copies the official source into its canonical path, and each copy it writes gets its
+    lock entry (the next sync then cleans a built-in line of that name: the hub owns it).
+    Copies it leaves alone are named under ``kept`` with their reason."""
     ss = _ss()
     index = _optional_skill_index()
     if index and name in {"all", "*"}:
@@ -138,31 +143,73 @@ def restore_official_optional_skill(name: str, *, restore: bool = False) -> dict
         targets = [index[name]]
     else:
         message = f"Official optional skill not found: {name}" if index else "No official optional skills directory found."
-        return {"ok": False, "message": message, "restored": [], "backfilled": [], "backed_up": []}
+        return {"ok": False, "message": message, "restored": [], "backfilled": [], "backed_up": [], "kept": []}
     restored: List[str] = []
     backed_up: List[str] = []
+    written: List[Tuple[str, str, Path]] = []
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     backup_root = ss._skills_dir() / ".restore-backups" / f"official-optional-{timestamp}"
     for folder_name, install_path, src in targets if restore else []:
         dest = ss._skills_dir() / Path(*install_path.split("/"))
-        canonical_ok = dest.exists() and ss._copy_change(dest, ss._dir_hash(src)) is None
+        canonical_ok = os.path.lexists(dest) and ss._copy_change(dest, ss._dir_hash(src)) is None
         # Active copies by frontmatter name or folder slug (the curator may have moved the skill
         # into another category); ``dest`` itself is handled below.
         names = {folder_name, ss._read_skill_name(src / "SKILL.md", folder_name)}
         for md in ss._iter_active_skill_mds(sort=True):
             match = md.parent
-            if match != dest and match.exists() and (
+            if match != dest and os.path.lexists(match) and (
                     match.name == folder_name or ss._read_skill_name(md, match.name) in names):
                 backed_up.append(_move_to_restore_backup(match, backup_root))
-        if dest.exists() and not canonical_ok:
+        if os.path.lexists(dest) and not canonical_ok:
             backed_up.append(_move_to_restore_backup(dest, backup_root))
-        if not dest.exists():
+        if not os.path.lexists(dest):
             ss._copy_dir(src, dest)
             restored.append(folder_name)
+            written.append((folder_name, install_path, dest))
+    if written:  # the owner's restore: the copy written from the official source is the hub's
+        data = _load_hub_lock() or {"version": 1, "installed": {}}
+        for folder_name, install_path, dest in written:
+            data.setdefault("installed", {})[folder_name] = _official_lock_entry(
+                dest, install_path, install_path, "optional-skills")
+        _write_hub_lock(data)
+    backfilled, kept = _backfill_optional_provenance(quiet=True, targets=targets)
     return {
         "ok": True, "message": "Official optional skill repair complete.", "restored": restored,
-        "backfilled": _backfill_optional_provenance(quiet=True), "backed_up": backed_up,
-        "backup_dir": str(backup_root) if backed_up else ""}
+        "backfilled": [folder_name for folder_name, _path, _dest in written] + backfilled,
+        "backed_up": backed_up, "backup_dir": str(backup_root) if backed_up else "", "kept": kept}
+
+
+def _walk_skill_candidates(folders: Set[str]) -> Tuple[Dict[str, List[Path]], bool]:
+    """``({folder name: [candidate, ...]}, complete)``: every entry of the active skills tree named
+    like one of ``folders``, whatever its kind (folder, link to anything, file, special file). One
+    ``os.scandir`` walk from the root that follows no link, skips exactly what the active-skill
+    index skips and does not descend into a candidate; a folder it cannot list makes the walk
+    incomplete. Finding no SKILL.md proves nothing: a copy is looked up here, not by its SKILL.md."""
+    root = _ss()._skills_dir()
+    found: Dict[str, List[Path]] = {}
+    complete, pending = True, [root]
+    while pending:
+        folder = pending.pop()
+        try:
+            with os.scandir(folder) as listing:
+                entries = list(listing)
+        except OSError:
+            complete = complete and folder == root and not os.path.lexists(root)  # no tree: nothing hides
+            continue
+        for entry in entries:
+            path = Path(entry.path)
+            if is_excluded_skill_path(path / "SKILL.md"):  # .hub, .archive, support dirs, ...
+                continue
+            if entry.name in folders:
+                found.setdefault(entry.name, []).append(path)
+                continue
+            is_junction = getattr(entry, "is_junction", None)
+            try:
+                if entry.is_dir(follow_symlinks=False) and not (is_junction is not None and is_junction()):
+                    pending.append(path)
+            except OSError:
+                complete = False
+    return {name: sorted(paths) for name, paths in found.items()}, complete
 
 
 def _index_installed_skill_dirs_by_name() -> Dict[str, List[Path]]:
@@ -209,69 +256,101 @@ def _write_hub_lock(data: dict) -> None:
                       content=json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
-def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
-    """Mark already-present official optional skills as hub-installed, only on the owner's
-    request (``hermes skills repair-official``; a sync never adopts): a copy gets official
-    provenance only when it passes ``_copy_change`` against the source's lock fingerprint;
-    modified/local skills, and copies holding a link or an unreadable part, are left alone."""
+def _backfill_optional_provenance(quiet: bool = False, targets: Optional[List[Tuple[str, str, Path]]] = None
+                                  ) -> Tuple[List[str], List[dict]]:
+    """Record exact official optional copies as hub-installed, only on the owner's request
+    (``hermes skills repair-official``; a sync never adopts) and only for ``targets``, the
+    ``(folder_name, install_path, source_dir)`` of the skills the command names (None: all).
+    The copy is the one at the canonical path, else the one entry of that folder name a complete
+    candidate walk finds. A copy with any lock entry is left as it is. A copy whose folder or
+    frontmatter name has a built-in manifest line keeps that line as its record and is never
+    recorded here (kept, with the reason ``_copy_change`` gives against the line, or "changed").
+    A copy with no record is recorded only when ``_copy_change`` passes it against the source's
+    lock fingerprint, else kept with that reason. Returns ``(backfilled, kept)``."""
     ss = _ss()
-    optional_dir = ss._get_optional_dir()
-    if not optional_dir.exists():
-        return []
+    if targets is None:
+        targets = sorted(set(_optional_skill_index().values()), key=lambda item: item[1])
     data = _load_hub_lock()
     if data is None:
         data = {"version": 1, "installed": {}}
     installed = data.setdefault("installed", {})
-    existing_paths = {entry.get("install_path") for entry in _hub_lock_entries(data)}
+    existing_paths = {str(entry.get("install_path", "")).strip("/") for entry in _hub_lock_entries(data)}
+    manifest = ss._read_manifest()
     backfilled: List[str] = []
-    installed_dir_index: Optional[Dict[str, List[Path]]] = None
-    for _skill_md, src, install_path in _iter_optional_skills(optional_dir, root_relative=False):
-        lock_name = src.name
-        if lock_name in installed or install_path in existing_paths:
+    kept: List[dict] = []
+    walk: Optional[Tuple[Dict[str, List[Path]], bool]] = None
+    for folder_name, install_path, src in targets:
+        names = {folder_name, ss._read_skill_name(src / "SKILL.md", folder_name)}
+        if not names.isdisjoint(installed) or install_path in existing_paths:
             continue
         dest = ss._skills_dir() / Path(*install_path.split("/"))
-        if not dest.is_dir():
-            if installed_dir_index is None:
-                installed_dir_index = _index_installed_skill_dirs_by_name()
-            if (found := _relocated_dest(src.name, installed_dir_index)) is None:
+        if not os.path.lexists(dest):
+            if walk is None:
+                walk = _walk_skill_candidates({folder for folder, _path, _src in targets})
+            if not (copies := walk[0].get(folder_name)):
+                continue  # no copy to record
+            if len(copies) > 1 or not walk[1]:  # which one is the official copy is not known
+                kept.append({"name": folder_name, "reason": "ambiguous" if walk[1] else "unreadable"})
+                continue
+            if (found := _relocated_dest(folder_name, walk[0])) is None:
+                kept.append({"name": folder_name, "reason": "unsafe path"})
                 continue
             dest, install_path = found  # still requires an unchanged copy below
-        if install_path in existing_paths or ss._copy_change(dest, _content_hash(src), kind="lock") is not None:
+            if install_path in existing_paths:
+                continue
+        if lines := sorted(names & set(manifest)):  # the built-in line is this copy's record
+            kept.append({"name": folder_name, "reason": ss._copy_change(dest, manifest[lines[0]]) or "changed"})
             continue
-        installed[lock_name] = _official_lock_entry(dest, install_path, install_path, "optional-skills")
+        if (reason := ss._copy_change(dest, _content_hash(src), kind="lock")) is not None:
+            kept.append({"name": folder_name, "reason": reason})
+            continue
+        installed[folder_name] = _official_lock_entry(dest, install_path, install_path, "optional-skills")
         existing_paths.add(install_path)
-        backfilled.append(lock_name)
+        backfilled.append(folder_name)
         if not quiet:
-            print(f"  = {lock_name} (official optional provenance backfilled)")
+            print(f"  = {folder_name} (official optional provenance backfilled)")
     if backfilled:
         _write_hub_lock(data)
-    return backfilled
+    return backfilled, kept
 
 
-def _hand_over_moved_skill(name: str, origin_hash: str) -> Tuple[str, str]:
-    """Hand a built-in that moved to the optional catalog over to it, before its manifest line is
-    cleaned. The role's copy (unique folder-name match, any category) is replaced in place with the
-    official source only while ``_copy_change`` passes it against ``origin_hash``, the line's
-    fingerprint (equality with the release proves nothing); it then gets an official hub-lock entry
-    at its real path, written before the old copy is dropped. Nothing is deleted or created.
-    Returns ``(outcome, reason)``: ``moved_to_official``, ``kept_changed`` (reason from
-    ``_copy_change``: the caller keeps the line), ``refused`` (``ambiguous``: more than one folder
-    matches, neither is touched; ``copy write failed`` / ``record write failed``: old copy and lock
-    kept; the caller keeps the line so the next sync retries), ``skipped_deleted``, ``hub_owned``
-    or ``removed_upstream``."""
+def _hand_over_moved_skill(name: str, origin_hash: str,
+                           walk: Tuple[Dict[str, List[Path]], bool]) -> Tuple[str, str]:
+    """What becomes of a manifest line whose name is no longer built-in, decided before the line
+    is cleaned. ``walk`` is the sync's one ``_walk_skill_candidates`` over these names (by the
+    official folder name when the name moved to the optional catalog): finding no SKILL.md proves
+    no deletion. A built-in that moved is handed over to the catalog: its one copy is replaced in
+    place with the official source only while ``_copy_change`` passes it against ``origin_hash``,
+    the line's fingerprint (equality with the release proves nothing); it then gets an official
+    hub-lock entry at its real path, written before the old copy is dropped. A name removed from
+    both catalogs never touches its copy. Returns ``(outcome, reason)``; the caller cleans the line
+    on ``moved_to_official``, ``skipped_deleted`` (complete walk, no candidate), ``hub_owned`` and
+    ``removed_upstream`` (no candidate, or one unchanged copy), and keeps it on ``kept_changed``
+    (a moved name: walk incomplete, "unreadable", or its one copy fails ``_copy_change``, the
+    reason), ``kept`` (the same for a removed name, or more than one candidate: "ambiguous") and
+    ``refused`` (a moved name with more than one candidate:
+    "ambiguous", none is touched; "copy write failed" / "record write failed": old copy and lock
+    kept, retried next sync)."""
     ss = _ss()
-    if (official := _optional_skill_index().get(name)) is None:
-        return "removed_upstream", ""
-    folder, official_path, src = official
+    official = _optional_skill_index().get(name)
+    folder = name if official is None else official[0]
     data = _load_hub_lock() or {"version": 1, "installed": {}}
     installed = data.setdefault("installed", {})
-    if name in installed or folder in installed:
+    if official is not None and (name in installed or folder in installed):
         return "hub_owned", ""
-    copies = _index_installed_skill_dirs_by_name()
-    if not copies.get(folder):
-        return "skipped_deleted", ""
-    if (found := _relocated_dest(folder, copies)) is None:
-        return "refused", "ambiguous"
+    candidates, complete = walk
+    if not complete:  # a folder the walk could not list may hold the copy
+        return ("kept" if official is None else "kept_changed"), "unreadable"
+    if not (copies := candidates.get(folder)):
+        return ("removed_upstream" if official is None else "skipped_deleted"), ""
+    if len(copies) > 1:
+        return ("kept", "ambiguous") if official is None else ("refused", "ambiguous")
+    if official is None:  # removed from both catalogs: the copy stays, its line goes only if unchanged
+        reason = ss._copy_change(copies[0], origin_hash)
+        return ("kept", reason) if reason is not None else ("removed_upstream", "")
+    _folder, official_path, src = official
+    if (found := _relocated_dest(folder, candidates)) is None:
+        return "refused", "unsafe path"
     dest, install_path = found
     if install_path in {str(e.get("install_path", "")).strip("/") for e in _hub_lock_entries(data)}:
         return "hub_owned", ""
@@ -295,8 +374,9 @@ def _hand_over_moved_skill(name: str, origin_hash: str) -> Tuple[str, str]:
 
 def _lock_install_dir(install_path: object) -> Path:
     """The folder a hub-lock ``install_path`` names. ValueError (the refusal reason: ``link`` or
-    ``unsafe path``) unless it is a relative skill-folder path strictly inside the skills tree that
-    runs through no symlink."""
+    ``unsafe path``) unless it is a relative skill-folder path strictly inside the skills tree whose
+    folders on the way run through no symlink. The entry itself may be anything: ``_copy_change``
+    classifies it (a link or a file there is the owner's copy, kept with its reason)."""
     root = _ss()._skills_dir()
     try:
         parts = _safe_rel_install_path(root / str(install_path or ""), root).split("/")
@@ -304,10 +384,10 @@ def _lock_install_dir(install_path: object) -> Path:
         raise ValueError("unsafe path") from None
     if is_excluded_skill_path(Path(*parts, "SKILL.md"), root=root):  # .hub, .archive, support dirs...
         raise ValueError("unsafe path")
-    if any(root.joinpath(*parts[:depth]).is_symlink() for depth in range(1, len(parts) + 1)):
+    if any(root.joinpath(*parts[:depth]).is_symlink() for depth in range(1, len(parts))):
         raise ValueError("link")
     dest = root.joinpath(*parts)
-    if root.resolve() not in dest.resolve().parents:
+    if (parent := dest.parent.resolve()) != root.resolve() and root.resolve() not in parent.parents:
         raise ValueError("unsafe path")
     return dest
 
@@ -339,7 +419,7 @@ def refresh_official_optional_skills(dry_run: bool = False) -> dict:
         except OSError:
             report["refused"].append({"name": name, "reason": "unreadable"})
             continue
-        if not dest.is_dir():  # deleted copies are never recreated
+        if not os.path.lexists(dest):  # deleted copies are never recreated; a file or link is kept below
             report["skipped_deleted"].append(name)
             continue
         if (official := index.get(name) or index.get(dest.name)) is None:

@@ -1015,12 +1015,12 @@ On each sync, Hermes checks your local copy against the origin hash:
 
 The same care applies to official optional skills (their record is `skills/.hub/lock.json`) and to a bundled skill that moves to the optional catalog:
 
-- **A link, a special file, or a part Hermes can't read** → a symlink (to a file or a folder), a pipe or device file, or a file or folder Hermes can't read (for example, a folder without read permission) keeps the copy yours. Hermes leaves it alone and reports why: `link`, `changed` or `unreadable`.
+- **A link, a special file, or a part Hermes can't read** → a symlink anywhere on the way to a copy (for example, a category folder that is a link) or inside it, a pipe or device file, or a file or folder Hermes can't read (for example, a folder without read permission) keeps the copy yours. Hermes leaves it alone, writes nothing through the link, and reports why: `link`, `changed` or `unreadable`.
 - **Changed, then matches a release** → a copy you changed stays yours, even if it later matches a newer release byte for byte. Only the recorded hash says Hermes wrote it.
 - **Changed optional copy** → stays yours until you run `hermes skills repair-official <name> --restore`.
-- **No record** → Hermes no longer takes over an optional copy that has no record. `hermes skills repair-official <name>` does that when you ask, and only for a copy that is exactly the official version.
+- **No record** → a sync never takes over a copy that has no record, even one that matches the release byte for byte. For a bundled skill, only `hermes skills reset <name>` records it again. `hermes skills repair-official <name>` records only the copies you name, only exact official copies with no record, and never a copy whose built-in record says it changed.
 - **A write fails** → if the new copy or its record can't be written, the old copy is put back and the old record kept. The next update tries again.
-- **Moved skill, several folders** → if a skill moved to the optional catalog and more than one of your folders has its name, Hermes hands neither over and reports it as `ambiguous`.
+- **A copy Hermes can't find or read** → keeps its record. When a skill leaves the bundled set (removed, or moved to the optional catalog), Hermes looks through your whole skills folder for anything with its name. It drops the record only when that full look finds nothing, because then you deleted the copy. If a folder can't be listed, the record stays and Hermes reports `unreadable`; if more than one entry has the name, Hermes touches none of them and reports `ambiguous`.
 
 Generated runtime caches inside a skill (`__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, and a `.pyc` sitting next to its `.py`) are not part of the hash, so running a skill's helper script never marks it user-modified or hides it from `hermes skills list-modified` / `diff`.
 
