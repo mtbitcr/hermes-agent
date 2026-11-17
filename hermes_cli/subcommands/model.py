@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import Callable
 
 
@@ -34,3 +35,35 @@ def build_model_parser(subparsers, *, cmd_model: Callable) -> None:
         "--insecure", action="store_true",
         help="Disable TLS verification for Nous login (testing only)")
     model_parser.set_defaults(func=cmd_model)
+
+    # Optional, so a bare ``hermes model`` keeps the picker above; the check
+    # sets its own handler because main.py dispatches ``args.func(args)``.
+    model_subparsers = model_parser.add_subparsers(dest="model_command")
+    update_check = model_subparsers.add_parser(
+        "update-check",
+        help="Look for a newer version of each model in use and file at most one suggestion",
+        description=(
+            "Look for a newer version of every model a role uses, check that every "
+            "sign-in lists it, that it supports the role's effort and that it answers "
+            "one probe, then file at most one suggestion in Decisions. Nothing changes "
+            "until the owner clicks Update. Runs inside the monthly planning card."))
+    update_check.add_argument(
+        "--practice", metavar="ROLE", default=None,
+        help="File a practice suggestion for ROLE's current model; clicking Update then changes nothing")
+    update_check.set_defaults(func=cmd_model_update_check)
+
+
+def cmd_model_update_check(args) -> int:
+    """Run ``hermes model update-check`` and print the receipt's outcome."""
+    from hermes_cli import model_update_check
+
+    try:
+        receipt = model_update_check.run_update_check(practice_role=args.practice)
+    except model_update_check.UpdateCheckRefused as exc:
+        print(f"Update check refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"{receipt['result']}: {receipt['reason']}")
+    filed = receipt.get("filed")
+    if filed:
+        print(f"Filed {filed['subject_id']} as {filed['task_id']} on board {filed['board']}.")
+    return 0
