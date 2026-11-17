@@ -1337,6 +1337,7 @@ async def _apply_models_machine_batch(
                     (profile, (entry.provider or "").strip())
                     for profile, entry in prepared
                 ],
+                models={profile: (entry.model or "").strip() for profile, entry in prepared},
             )
             # Every write this operation owes — the configs, the enrollment —
             # has now landed and nothing left can revert them, so the batch's

@@ -126,6 +126,28 @@ def _waiting_pair(root):
     return pair
 
 
+def _complete_project(root, name, *, suggestion=True):
+    """A quiet Project whose one work card is done, so its approved work is complete; with one pending suggestion
+    unless ``suggestion`` is false.
+
+    The review cursor moves past that news, so the complete Project gets no review of the day.
+    """
+    project = _quiet_project(root, name)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(time, "time", lambda: NOW - 86400)
+        with _project_board(project) as board:
+            card = board.execute("SELECT id FROM tasks WHERE task_kind='work'").fetchone()[0]
+            assert kanban_db.complete_task(board, card, summary="Done.")
+            if suggestion:
+                _suggestion(board, project)
+            cursor = board.execute("SELECT MAX(id) FROM task_events").fetchone()[0]
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        with kanban_db.write_txn(registry):
+            registry.execute("UPDATE project_review_state SET event_cursor=? WHERE project_id=?", (cursor, project.id))
+    assert owner_workspace.project_steward_snapshot(project_id=project.id)["execution"]["state"] == "complete"
+    return project
+
+
 def _parallel_portfolio_tick(barrier, results):
     try:
         barrier.wait(timeout=15)
@@ -217,6 +239,30 @@ def test_portfolio_waits_for_project_reviews_or_the_two_hour_limit(root, when):
         [line] = [line for line in body.splitlines() if line.startswith("Portfolio input: ")]
         frozen = json.loads(line.removeprefix("Portfolio input: "))
         assert frozen["projects"][0]["review_state"] == "not reviewed today"
+
+
+def test_a_complete_project_with_an_owner_step_and_no_review_of_the_day_does_not_hold_the_portfolio_back(root):
+    project, other = _waiting_pair(root)
+    done = _complete_project(root, "Design Loop")
+    _portfolio_on(root, project, other, done)
+
+    # The first tick of the day settles the two quiet Projects; the complete one has no news and no review to wait for.
+    assert review.review_tick(NOW) == 1
+
+    with _summaries() as board:
+        keys = [row[0] for row in board.execute("SELECT idempotency_key FROM tasks WHERE created_by='project-review'")]
+    assert keys == ["project-review:portfolio:2026-11-09:0"]
+    frozen = _frozen(_portfolio_body())
+    assert sorted(frozen["project_scope"]) == sorted([project.id, other.id, done.id])
+    [record] = [item for item in frozen["projects"] if item["name"] == "Design Loop"]
+    assert record["review_state"] == "not reviewed today"
+    assert record["owner_steps"] == {"answers": 0, "suggestions": 1, "plan_approvals": 0}
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        state = registry.execute(
+            "SELECT last_reviewed_date, open_task_id FROM project_review_state WHERE project_id=?", (done.id,),
+        ).fetchone()
+        assert tuple(state) == ("2026-11-08", None)
+        assert projects_db.get_project_review_brief(registry, done.id) is None
 
 
 def test_a_late_portfolio_result_keeps_its_original_day_before_the_next_review_hour(root):
