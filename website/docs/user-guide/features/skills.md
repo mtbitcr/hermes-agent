@@ -41,7 +41,7 @@ hermes skills opt-out --remove   # also delete UNMODIFIED bundled skills (confir
 hermes skills opt-in --sync      # undo: remove the marker and re-seed now
 ```
 
-All three paths write a `.no-bundled-skills` marker into the profile directory. While the marker is present, the installer, `hermes update`, and any skill sync all skip bundled-skill seeding for that profile. The marker stops only *new* bundled skills: skills already present keep receiving updates unless you changed them. Delete the marker (or run `hermes skills opt-in`) to re-enable.
+All three paths write a `.no-bundled-skills` marker into the profile directory. While the marker is present, the installer, `hermes update`, and any skill sync all skip bundled-skill seeding for that profile. The marker stops *new* bundled skills, except the essential ones. A bundled skill the profile already has at its usual place still gets each released change while your copy is unchanged since Hermes wrote it: only ordinary files and folders, all readable, matching the record. A changed copy, a copy with a link in it, a copy Hermes can't read, or a copy with a `.bak` folder beside it is kept as it is, and the sync names it with the reason. A copy you deleted or moved is not brought back or searched for. Delete the marker (or run `hermes skills opt-in`) to re-enable.
 
 :::note Safe by default
 `hermes skills opt-out` only stops *future* seeding — it never deletes anything already on disk. The optional `--remove` flag deletes bundled skills **only** when they are unmodified (byte-identical to the version Hermes installed). Skills you have edited, skills installed from the hub, and skills you wrote yourself are always kept.
@@ -1012,15 +1012,10 @@ On each sync, Hermes checks your local copy against the origin hash:
 
 - **Unchanged** → only when Hermes can read all of it, it holds only ordinary files and folders, and it matches the origin hash. Then the new bundled version is copied in and the new origin hash recorded.
 - **Changed** → treated as **user-modified**: the copy stays yours on every later sync, so your edits never get stomped, until you run `hermes skills reset <name>`.
-
-The same care applies to official optional skills (their record is `skills/.hub/lock.json`) and to a bundled skill that moves to the optional catalog:
-
 - **A link, a special file, or a part Hermes can't read** → a symlink anywhere on the way to a copy (for example, a category folder that is a link) or inside it, a pipe or device file, or a file or folder Hermes can't read (for example, a folder without read permission) keeps the copy yours. Hermes leaves it alone, writes nothing through the link, and reports why: `link`, `changed` or `unreadable`.
 - **Changed, then matches a release** → a copy you changed stays yours, even if it later matches a newer release byte for byte. Only the recorded hash says Hermes wrote it.
-- **Changed optional copy** → stays yours until you run `hermes skills repair-official <name> --restore`.
-- **No record** → a sync never takes over a copy that has no record, even one that matches the release byte for byte. For a bundled skill, only `hermes skills reset <name>` records it again. `hermes skills repair-official <name>` records only the copies you name, only exact official copies with no record, and never a copy whose built-in record says it changed.
+- **No record** → a sync never takes over a copy that has no record, even one that matches the release byte for byte. Only `hermes skills reset <name>` records it again.
 - **A write fails** → if the new copy or its record can't be written, the old copy is put back and the old record kept. The next update tries again.
-- **A copy Hermes can't find or read** → keeps its record. When a skill leaves the bundled set (removed, or moved to the optional catalog), Hermes looks through your whole skills folder for anything with its name. It drops the record only when that full look finds nothing, because then you deleted the copy. If a folder can't be listed, the record stays and Hermes reports `unreadable`; if more than one entry has the name, Hermes touches none of them and reports `ambiguous`.
 
 Generated runtime caches inside a skill (`__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, and a `.pyc` sitting next to its `.py`) are not part of the hash, so running a skill's helper script never marks it user-modified or hides it from `hermes skills list-modified` / `diff`.
 

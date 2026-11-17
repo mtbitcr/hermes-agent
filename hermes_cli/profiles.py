@@ -953,22 +953,16 @@ def create_profile(
     return profile_dir
 
 
-def seed_profile_skills(profile_dir: Path, quiet: bool = False, refresh_official: bool = False) -> Optional[dict]:
+def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict]:
     """Seed bundled skills into a profile via subprocess (sync_skills() caches HERMES_HOME at
     module level). Returns the sync result dict, or None on failure. ``--no-skills`` profiles
     still run the sync: ``sync_skills()`` detects the marker and seeds only essentials.
-    ``refresh_official`` (release step only) also refreshes unchanged official optional copies
-    and adds that report to the extended result under ``official``; without it the child prints
-    the legacy keys only, in their legacy order."""
+    The child prints the legacy keys only, in their legacy order, so its output stays as before."""
     project_root = Path(__file__).parent.parent.resolve()
-    code = "import json; from tools.skills_sync import sync_skills; r = sync_skills(quiet=True); "
-    if refresh_official:
-        code += ("from tools.skills_sync_optional import refresh_official_optional_skills; "
-                 "r['official'] = refresh_official_optional_skills(); ")
-    else:  # the update command's input, byte for byte as before the release step existed
-        code += ("r = {k: r[k] for k in ('copied', 'updated', 'skipped', 'user_modified', 'cleaned', "
-                 "'suppressed', 'relocated', 'total_bundled', 'optional_provenance_backfilled', "
-                 "'shadowed_by_external', 'skipped_opt_out') if k in r}; ")
+    code = ("import json; from tools.skills_sync import sync_skills; r = sync_skills(quiet=True); "
+            "r = {k: r[k] for k in ('copied', 'updated', 'skipped', 'user_modified', 'cleaned', "
+            "'suppressed', 'relocated', 'total_bundled', 'optional_provenance_backfilled', "
+            "'shadowed_by_external', 'skipped_opt_out') if k in r}; ")
     try:
         result = subprocess.run(
             [sys.executable, "-c", code + "print(json.dumps(r))"],

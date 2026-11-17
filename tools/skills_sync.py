@@ -26,8 +26,7 @@ from hermes_constants import get_bundled_skills_dir, get_hermes_home, get_option
 from agent.skill_utils import ESSENTIAL_SKILLS, is_excluded_skill_path
 from tools.skill_usage import _read_skill_name, read_suppressed_names
 from tools.skills_sync_optional import (
-    _hand_over_moved_skill, _ignore_runtime_cache, _is_runtime_cache, _optional_skill_index,
-    _read_hub_install_paths, _walk_skill_candidates,
+    _ignore_runtime_cache, _is_runtime_cache, _read_hub_install_paths,
 )
 from utils import atomic_write_text
 
@@ -192,8 +191,8 @@ def _dir_hash(directory: Path, *, include_runtime_cache: bool = False) -> str:
 
 def _copy_change(directory: Path, recorded: Optional[str], kind: str = "manifest") -> Optional[str]:
     """The one check that a copy is unchanged since Hermes wrote it: None, else why it counts as
-    the owner's ("changed", "unreadable", "link"). Every path that replaces, moves, hands over,
-    adopts or deletes a copy asks this, never a hash comparison of its own.
+    the owner's ("changed", "unreadable", "link"). Every path that replaces, moves, adopts or
+    deletes a copy asks this, never a hash comparison of its own.
 
     An allowlist: the copy is a real folder whose whole tree lists and holds only plain folders and
     regular files (runtime caches included: a link of any kind is "link", any other entry type is
@@ -487,6 +486,26 @@ def _update_existing_skill(st: _SyncState, skill_name: str, skill_src: Path, des
     st.say(f"  ↑ {skill_name} (updated)")
 
 
+def _update_in_marked_role(st: _SyncState, skill_name: str, skill_src: Path, dest: Path, bundled_hash: str,
+                           external_index: Set[str]) -> None:
+    """A role with the marker file, a built-in that is not essential and has a manifest line: the
+    copy at its expected path gets the released version when it is unchanged, and nothing else
+    happens (no backup recovery, no search in other folders, no removal, no new copy)."""
+    if skill_name in external_index:  # deferred: nothing is written and no local copy is removed
+        st.shadowed_by_external.append(skill_name)
+        st.skipped += 1
+        return
+    if not os.path.lexists(dest):  # deleted, moved or renamed: not searched, not brought back
+        st.skipped += 1
+        return
+    if os.path.lexists(dest.with_suffix(".bak")):  # the copy, the backup and the line stay as they are
+        st.skipped += 1
+        st.kept.append({"name": skill_name, "reason": "backup present"})
+        st.say(f"  ~ {skill_name} (kept as it is: backup present)")
+        return
+    _update_existing_skill(st, skill_name, skill_src, dest, bundled_hash)
+
+
 def _seed_category_descriptions(bundled_dir: Path, only_dirs: Optional[Set[Path]]) -> None:
     """Copy category DESCRIPTION.md files not already present; ``only_dirs`` restricts
     seeding to the essential skills' categories on opted-out profiles."""
@@ -506,7 +525,8 @@ def _seed_category_descriptions(bundled_dir: Path, only_dirs: Optional[Set[Path]
 def sync_skills(quiet: bool = False) -> dict:
     """Sync bundled skills into ~/.hermes/skills/ using the manifest; returns the per-category
     result dict. Opted-out profiles seed no NEW skill except ESSENTIAL_SKILLS (the system prompt
-    always points at ``hermes-agent``); skills they already hold a manifest line for still update."""
+    always points at ``hermes-agent``); a skill they already hold a manifest line for gets only the
+    update of an unchanged copy at its expected path (``_update_in_marked_role``)."""
     reset = {name for path, name in _RESET_GRANTS if path == str(_manifest_file())}
     _RESET_GRANTS.clear()  # one sync only, whatever happens below
     marked = (_hermes_home() / NO_BUNDLED_SKILLS_MARKER).exists()
@@ -515,14 +535,14 @@ def sync_skills(quiet: bool = False) -> dict:
     bundled_dir = _get_bundled_dir()
     if not bundled_dir.exists():
         return {"copied": [], "updated": [], "skipped": 0, "user_modified": [], "cleaned": [],
-                "suppressed": [], "total_bundled": 0, "not_seeded_by_marker": 0, "moved_to_official": [],
-                "moved_kept_changed": [], "optional_provenance_backfilled": [], "kept": [], "refused": []}
+                "suppressed": [], "total_bundled": 0, "not_seeded_by_marker": 0,
+                "optional_provenance_backfilled": [], "kept": [], "refused": []}
     _skills_dir().mkdir(parents=True, exist_ok=True)
     all_bundled = _discover_bundled_skills(bundled_dir)
     suppressed = _read_suppressed_names()
     external_index = _build_external_skill_index()
     st = _SyncState(manifest=_read_manifest(), quiet=quiet, reset=reset)
-    # The marker stops only NEW built-ins: names with a manifest line run every branch below.
+    # The marker stops NEW built-ins: a name with a manifest line gets only _update_in_marked_role.
     bundled_skills = [(name, src) for name, src in all_bundled
                       if not marked or name in st.manifest or name in ESSENTIAL_SKILLS]
 
@@ -533,6 +553,9 @@ def sync_skills(quiet: bool = False) -> dict:
             continue
         dest = _compute_relative_dest(skill_src, bundled_dir)
         bundled_hash = _dir_hash(skill_src)
+        if marked and skill_name not in ESSENTIAL_SKILLS:
+            _update_in_marked_role(st, skill_name, skill_src, dest, bundled_hash, external_index)
+            continue
         # Recoveries run BEFORE classification so a missing dest isn't misread as user-deleted.
         _recover_orphan_backup(dest)
         if not os.path.lexists(dest) and skill_name in st.manifest and _recover_renamed_skill(st, skill_name, dest):
@@ -547,38 +570,11 @@ def sync_skills(quiet: bool = False) -> dict:
             _update_existing_skill(st, skill_name, skill_src, dest, bundled_hash)
         else:
             st.skipped += 1  # in manifest but not on disk — user deleted it
-    # Clean manifest entries for names no longer built-in (full set, every role). A copy that moved
-    # to the optional catalog is handed over first; a refused hand-over keeps its line for a retry,
-    # and a kept copy (changed, or not found for sure) keeps its line so every later sync checks
-    # and reports it again. One candidate walk serves every such name.
-    cleaned: List[str] = []
-    moved_to_official: List[str] = []
-    moved_kept_changed: List[str] = []
-    stale = sorted(set(st.manifest) - {name for name, _ in all_bundled})
-    official = _optional_skill_index() if stale else {}
-    walk = (_walk_skill_candidates({official[name][0] if name in official else name for name in stale})
-            if stale else ({}, True))
-    for name in stale:
-        outcome, reason = _hand_over_moved_skill(name, st.manifest[name], walk)
-        if outcome == "refused":
-            st.refused.append({"name": name, "reason": reason})
-            st.say(f"  ! {name} was not handed over to the official optional catalog ({reason}); "
-                   "retried next sync")
-            continue
-        if outcome == "kept_changed":
-            moved_kept_changed.append(name)
-            st.kept.append({"name": name, "reason": reason})
-            st.say(f"  ~ {name} (moved to the optional catalog; your copy is kept: {reason})")
-            continue
-        if outcome == "kept":
-            st.kept.append({"name": name, "reason": reason})
-            st.say(f"  ~ {name} (no longer a built-in; your copy and its record are kept: {reason})")
-            continue
-        if outcome == "moved_to_official":
-            moved_to_official.append(name)
-            st.say(f"  ↑ {name} (moved to the official optional catalog)")
+    # Clean manifest entries for skills removed upstream. Skipped when opted out: a marked role
+    # changes no line but the one an update writes.
+    cleaned = [] if marked else sorted(set(st.manifest) - {name for name, _ in bundled_skills})
+    for name in cleaned:
         del st.manifest[name]
-        cleaned.append(name)
     _seed_category_descriptions(bundled_dir, {
         _compute_relative_dest(src, bundled_dir).parent
         for name, src in bundled_skills if name in ESSENTIAL_SKILLS} if marked else None)
@@ -590,7 +586,6 @@ def sync_skills(quiet: bool = False) -> dict:
         "total_bundled": (sum(1 for name, _ in all_bundled if name in ESSENTIAL_SKILLS) if marked
                           else len(bundled_skills)),
         "not_seeded_by_marker": len(all_bundled) - len(bundled_skills),
-        "moved_to_official": moved_to_official, "moved_kept_changed": moved_kept_changed,
         # A sync adopts no optional copy without a record (`hermes skills repair-official` does,
         # on request, for an exact copy).
         "optional_provenance_backfilled": [],
