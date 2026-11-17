@@ -18,6 +18,8 @@ NOW = int(datetime(2026, 11, 10, 7, tzinfo=timezone.utc).timestamp())
 ROOM = "Reserve a meeting room"
 HALL = "Book the conference hall"
 HINT = f"Ask Raphael in the Project chat to add {HALL} for your accepted suggestion {ROOM}."
+# A title equivalent to the accepted suggestion's label under the content-link rule of the closures.
+SAME = "Reserve the meeting room"
 
 
 def _project_board(project):
@@ -149,6 +151,40 @@ def _trigger(world, card):
     return plan["trigger"]
 
 
+def _paired_hint(title):
+    return f"Ask Raphael in the Project chat to add {title} for your accepted suggestion {ROOM}."
+
+
+def _brief(world):
+    """The Project's latest stored brief, read back from the root registry: its next step and accepted source."""
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        return tuple(registry.execute(
+            "SELECT next_step,source_task_id,source_run_id,source_digest FROM project_review_briefs WHERE project_id=? "
+            "ORDER BY review_date DESC LIMIT 1", (world["project"].id,)).fetchone())
+
+
+def _next_review(world):
+    """News opens the next day's review: its task."""
+    with _written_at(NOW + 3600), _project_board(world["project"]) as board:
+        kanban_db.add_comment(board, world["booked"], "default", "The hall must seat forty guests.")
+    assert review.review_tick(NOW + 86400) == 1
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        return registry.execute("SELECT open_task_id FROM project_review_state WHERE project_id=?",
+                                (world["project"].id,)).fetchone()[0]
+
+
+def _recheck(world, plan, task, **pairs):
+    """The hint the review rechecks for ``plan`` against the frozen input of ``task``; without ``pairs`` as the
+    accepted-advice read calls it."""
+    from hermes_cli.owner_project_review_proposals import proposal_hint
+
+    with _summary_board() as board:
+        sources, _cut = review._frozen_sources(kanban_db.get_task(board, task).body)
+    with review._review_evidence_board(world["project"].id) as (board, registry, live):
+        return proposal_hint(plan, sources, board, registry, live, now=NOW + 86400, limit=review._BRIEF_LIMITS["next_step"],
+                             max_bytes=record.TOTAL_INPUT_CAP_BYTES, **pairs)
+
+
 def _request(project_id, plan):
     """The digest of the owner's exact approval of ``plan``, built the way the owner commit builds it."""
     changes, risk = owner_workspace._normalize_project_changes(plan["changes"])
@@ -201,6 +237,69 @@ def test_t1_a_pair_after_two_long_changes_keeps_its_phrase_in_the_bounded_hint(w
         "Ask Raphael in the Project chat to add Arrange comfortable seating for the guests in the reception…; "
         "add Prepare fresh refreshments for visitors before the evening…; "
         "add Organize suitable transport for visitors after the evening….")
+
+
+@pytest.mark.parametrize("title", [ROOM, SAME])
+def test_t1_a_pair_titled_like_its_own_accepted_suggestion_keeps_its_hint_and_its_accepted_advice(world, title):
+    from hermes_cli.owner_project_review_origin import accepted_review_source
+    from hermes_cli.owner_project_review_view import project_review_advice_view
+
+    project, plan = world["project"], _plan(_add(title))
+    _complete(world, _result(world, plan=plan, pairs=[{"change": 0, "suggestion": world["accepted"]}]))
+
+    assert review.review_tick(NOW + 1) == 0
+
+    # The real harvest keeps the paired hint with the stored label, and stores the accepted source.
+    next_step, task, run, digest = _brief(world)
+    assert next_step == _paired_hint(title)
+    assert (task, run is not None, digest is not None) == (world["review_task"], True, True)
+    assert accepted_review_source(project.id) is not None
+    # The accepted-advice read rechecks the same hint with the pairs the harvest checked and stored.
+    assert project_review_advice_view(project.id) == {"review_date": "2026-11-10", "proposal": plan}
+    assert _recheck(world, plan, world["review_task"]) == _paired_hint(title)
+
+
+def test_t1_a_same_label_pair_after_two_unrelated_changes_keeps_its_phrase_first(world):
+    from hermes_cli.owner_project_review_view import project_review_advice_view
+
+    plan = _plan(_add("Print the visitor badges"), _add("Check the reception desk"), _add(ROOM))
+    _complete(world, _result(world, plan=plan, pairs=[{"change": 2, "suggestion": world["accepted"]}]))
+
+    assert review.review_tick(NOW + 1) == 0
+
+    next_step, task, _run, _digest = _brief(world)
+    assert next_step == (f"Ask Raphael in the Project chat to add {ROOM} for your accepted suggestion {ROOM}; "
+                         "add Print the visitor badges; add Check the reception desk.")
+    assert task == world["review_task"]
+    assert project_review_advice_view(world["project"].id) == {"review_date": "2026-11-10", "proposal": plan}
+
+
+@pytest.mark.parametrize("case", ["unpaired_plan", "unpaired_change", "other_suggestion", "work_card"])
+def test_t1_a_duplicate_outside_its_checked_pair_still_gets_no_hint(world, case):
+    """Controls: only the paired suggestion of its own add change is exempt. Actual work, any other suggestion, a
+    plan with no pair and a change with no pair keep the duplicate check."""
+    from hermes_cli.owner_project_review_view import project_review_advice_view
+
+    plan, pairs = _plan(_add(ROOM)), [{"change": 0, "suggestion": world["accepted"]}]
+    if case == "unpaired_plan":
+        pairs = None
+    elif case == "unpaired_change":
+        plan = _plan(_add(HALL), _add(SAME))
+    elif case == "other_suggestion":
+        # The label of the rejected suggestion of the frozen input.
+        plan = _plan(_add("Hire a string quartet"))
+    elif case == "work_card":
+        # The title of the done card of the frozen input.
+        plan = _plan(_add("Order lunch for the guests"))
+    _complete(world, _result(world, plan=plan, pairs=pairs))
+
+    result = _parse(world)
+
+    assert result.brief["next_step"] == result.summary["next_action"] == f"{HALL}."
+    assert result.source_run_id is None
+    assert review.review_tick(NOW + 1) == 0
+    assert _brief(world)[:2] == (f"{HALL}.", None)
+    assert project_review_advice_view(world["project"].id) is None
 
 
 @pytest.mark.parametrize(("case", "code"), [
@@ -301,6 +400,73 @@ def test_t5_the_exact_reviewed_plan_links_its_card_in_the_card_transaction(world
     assert failed.value.code == "crash_recovery_failed"
     assert _links(world) == sorted(before + [(other, world["accepted"])])
     assert HALL not in _work_titles(world)
+
+
+@pytest.mark.parametrize("title", [ROOM, SAME, HALL])
+def test_t5_a_pair_titled_like_its_own_suggestion_links_its_card_at_the_exact_plan_commit(world, ctx, title):
+    """The same-label pairs, and the differently titled control: the owner's exactly approved commit links the card."""
+    from hermes_cli.owner_project_review_origin import confirmed_plan_links
+
+    project, accepted, plan = world["project"], world["accepted"], _plan(_add(title))
+    _complete(world, _result(world, plan=plan, pairs=[{"change": 0, "suggestion": accepted}]))
+    assert review.review_tick(NOW + 1) == 0
+    before = _links(world)
+    next_step, task, run, digest = _brief(world)
+    facts = {"hint": next_step, "source": (task, run is not None, digest is not None),
+             "pairs": confirmed_plan_links(project.id, _request(project.id, plan))}
+
+    committed = _commit(ctx, world, plan, key="same-label-room-plan")
+
+    [card] = committed["created_task_ids"]
+    assert title in _work_titles(world)
+    # The provenance and the new made-from row of the created card, read back from the registry and the Project board.
+    facts.update(trigger=_trigger(world, card), made_from=sorted(set(_links(world)) - set(before)))
+    assert facts == {"hint": _paired_hint(title), "source": (world["review_task"], True, True),
+                     "pairs": [(0, accepted)], "trigger": "scheduled_review", "made_from": [(card, accepted)]}
+
+
+def test_t5_after_the_owner_denies_a_same_label_pair_the_next_review_gives_no_hint_and_refuses_it(world, ctx):
+    """Control: the one denial rule (origin._denied_plan) still answers for a same-label pair."""
+    from hermes_cli.owner_project_review_view import project_review_advice_view
+
+    project, plan, pairs = world["project"], _plan(_add(ROOM)), [{"change": 0, "suggestion": world["accepted"]}]
+    _complete(world, _result(world, plan=plan, pairs=pairs))
+    review.review_tick(NOW + 1)
+    assert _commit(ctx, world, plan, key="denied-same-label-plan", choice="deny")["error"] == "confirmation_denied"
+    later = _next_review(world)
+    _complete({**world, "review_task": later}, _result(world, plan=plan, pairs=pairs))
+
+    assert _recheck(world, plan, later, pairs=pairs) is None
+    review.review_tick(NOW + 86401)
+
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        later_briefs = registry.execute("SELECT COUNT(*) FROM project_review_briefs WHERE source_task_id=?",
+                                        (later,)).fetchone()[0]
+        refusal = registry.execute("SELECT last_refusal FROM project_review_state WHERE project_id=?",
+                                   (project.id,)).fetchone()[0]
+    assert later_briefs == 0
+    assert json.loads(refusal)["code"] == "review_plan_suggestion_denied"
+    assert project_review_advice_view(project.id) is None
+
+
+def test_t5_a_silence_on_a_same_label_pair_denies_nothing(world, ctx):
+    """Control: a receipt with the reason timeout denies nothing; the next review gives the hint and accepts the pair."""
+    from hermes_cli.owner_project_review_view import project_review_advice_view
+
+    project, plan, pairs = world["project"], _plan(_add(ROOM)), [{"change": 0, "suggestion": world["accepted"]}]
+    _complete(world, _result(world, plan=plan, pairs=pairs))
+    review.review_tick(NOW + 1)
+    assert _silence(ctx, world, plan, key="silent-same-label-plan")["reason"] == "timeout"
+    later = _next_review(world)
+    _complete({**world, "review_task": later}, _result(world, plan=plan, pairs=pairs))
+
+    review.review_tick(NOW + 86401)
+
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        refusal = registry.execute("SELECT last_refusal FROM project_review_state WHERE project_id=?",
+                                   (project.id,)).fetchone()[0]
+    assert (_brief(world)[:2], refusal) == ((_paired_hint(ROOM), later), None)
+    assert project_review_advice_view(project.id) == {"review_date": "2026-11-11", "proposal": plan}
 
 
 def test_t6_a_changed_plan_creates_its_card_and_writes_no_row(world, ctx):
