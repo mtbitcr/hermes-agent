@@ -2042,7 +2042,7 @@ def _concurrent_batch_worker(
     from plugins.dashboard_auth.raphael_workspace import model_policy as mp
 
     if fail:
-        def _enrolled_then_boom(request, *, action, roles):
+        def _enrolled_then_boom(request, *, action, roles, models=None):
             # Held INSIDE the registry transaction, so the sibling genuinely
             # contends for the lock instead of finishing first by luck.
             _time.sleep(0.25)

@@ -6866,7 +6866,7 @@ def get_model_info(request: Request, profile: Optional[str] = None):
                 "fallback_disabled": result["fallback_disabled"],
             }
         audit_models_machine_success(
-            request, action="info", profile=scoped_profile, provider=provider
+            request, action="info", profile=scoped_profile, provider=provider, model=result["model"]
         )
         return result
     except HTTPException:
