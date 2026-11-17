@@ -14,7 +14,7 @@ import sys
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 # Force UTF-8 stdout/stderr: GBK-style Windows locales can't encode the glyphs
 # printed here (✓ ↑ →), and install.ps1 parses this script's stdout as UTF-8.
@@ -167,6 +167,21 @@ def _dir_hash(directory: Path, *, include_runtime_cache: bool = False) -> str:
     return hasher.hexdigest()
 
 
+def _read_whole_copy(directory: Path) -> None:
+    """Raise OSError unless every folder under ``directory`` lists and every file reads.
+
+    ``rglob`` silently skips a folder it cannot list, so ``_dir_hash`` and ``content_hash`` can
+    match a fingerprint while owner data sits unseen: a copy is never replaced, or adopted as
+    unchanged, on a hash match unless this passes first.
+    """
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if entry.is_dir(follow_symlinks=False):
+                _read_whole_copy(Path(entry.path))
+            elif entry.is_file():
+                Path(entry.path).read_bytes()
+
+
 def _matches_origin_hash(directory: Path, origin_hash: str, user_hash: Optional[str] = None) -> bool:
     """Prove unchanged package ownership against a clean OR exact legacy hash.
 
@@ -263,11 +278,16 @@ def _recover_orphan_backup(dest: Path) -> None:
 def _defer_to_external(st: _SyncState, skill_name: str, dest: Path, bundled_hash: str) -> None:
     """An external_dirs source provides this skill; a local copy would be a name collision the
     loader refuses. Defer for ALL manifest states; remove a stale local shadow from an earlier
-    sync only when byte-identical (a user's own skill differs)."""
+    sync only when byte-identical and read whole (a user's own skill differs)."""
     st.shadowed_by_external.append(skill_name)
     st.skipped += 1
     st.say(f"  ⇢ {skill_name} (deferred to external_dirs, not written to local tree)")
     if dest.exists() and _dir_hash(dest) == bundled_hash:
+        try:
+            _read_whole_copy(dest)
+        except OSError as e:  # the hash may have missed what cannot be read: never removed blind
+            st.say(f"  ~ {skill_name} (cannot read the whole local copy, kept: {e})")
+            return
         _rmtree_writable(dest)
         st.say(f"  ✓ removed stale shadow of {skill_name}")
         st.manifest.pop(skill_name, None)
@@ -296,15 +316,19 @@ def _install_new_skill(st: _SyncState, skill_name: str, skill_src: Path, dest: P
         st.say(f"  ! Failed to copy {skill_name}: {e}")  # not in manifest — next sync retries
 
 
-def _replace_skill_dir(skill_src: Path, dest: Path) -> None:
-    """Replace ``dest`` with a fresh copy of ``skill_src`` via a .bak sibling; restore on failure."""
+def _replace_skill_dir(skill_src: Path, dest: Path, record: Optional[Callable[[], None]] = None) -> None:
+    """Replace ``dest`` with a fresh copy of ``skill_src`` via a .bak sibling; restore on failure.
+    ``record`` (the new copy's provenance write) runs before the backup goes: if it fails too,
+    the old copy is restored."""
     backup = dest.with_suffix(".bak")
     if backup.exists():  # a stale .bak would make shutil.move() nest dest INSIDE it
         _rmtree_writable(backup)
     shutil.move(str(dest), str(backup))
     try:
         shutil.copytree(skill_src, dest, ignore=_ignore_runtime_cache)
-    except OSError:
+        if record is not None:
+            record()
+    except Exception:
         if backup.exists():  # clear a partially-written dest so it can't shadow/block the restore
             if dest.exists():
                 try:
@@ -335,6 +359,12 @@ def _update_existing_skill(st: _SyncState, skill_name: str, skill_src: Path, des
     if not _matches_origin_hash(dest, origin_hash, user_hash):
         st.user_modified.append(skill_name)
         st.say(f"  ~ {skill_name} (user-modified, skipping)")
+        return
+    try:
+        _read_whole_copy(dest)
+    except OSError as e:  # the hash may have missed what cannot be read: treat as changed
+        st.user_modified.append(skill_name)
+        st.say(f"  ~ {skill_name} (cannot read the whole copy, skipping: {e})")
         return
     # bundled changed and the user copy is pristine -> update
     try:
@@ -406,17 +436,23 @@ def sync_skills(quiet: bool = False) -> dict:
     cleaned: List[str] = []
     moved_to_official: List[str] = []
     moved_kept_changed: List[str] = []
+    not_handed_over: Set[str] = set()  # the backfill below must not adopt these in this same pass
     for name in sorted(set(st.manifest) - {name for name, _ in all_bundled}):
         outcome = _hand_over_moved_skill(name, st.manifest[name])
-        if outcome == "failed":
-            st.say(f"  ! Failed to hand {name} over to the official optional catalog (retried next sync)")
+        if outcome in ("failed", "refused_ambiguous"):
+            not_handed_over.add(name)
+            st.say(f"  ! Failed to hand {name} over to the official optional catalog (retried next sync)"
+                   if outcome == "failed" else
+                   f"  ! {name} moved to the optional catalog but matches more than one folder; "
+                   "neither was handed over")
             continue
         if outcome == "moved_to_official":
             moved_to_official.append(name)
             st.say(f"  ↑ {name} (moved to the official optional catalog)")
         elif outcome == "kept_changed":
+            not_handed_over.add(name)
             moved_kept_changed.append(name)
-            st.say(f"  ~ {name} (moved to the optional catalog; user-modified copy kept)")
+            st.say(f"  ~ {name} (moved to the optional catalog; user-modified or unreadable copy kept)")
         del st.manifest[name]
         cleaned.append(name)
     _seed_category_descriptions(bundled_dir, {
@@ -426,9 +462,12 @@ def sync_skills(quiet: bool = False) -> dict:
     return {
         "copied": st.copied, "updated": st.updated, "skipped": st.skipped, "user_modified": st.user_modified,
         "cleaned": cleaned, "suppressed": st.suppressed, "relocated": st.relocated,
-        "total_bundled": len(bundled_skills), "not_seeded_by_marker": len(all_bundled) - len(bundled_skills),
+        # What the role may be seeded with: a marked role, only the essentials in the catalog.
+        "total_bundled": (sum(1 for name, _ in all_bundled if name in ESSENTIAL_SKILLS) if marked
+                          else len(bundled_skills)),
+        "not_seeded_by_marker": len(all_bundled) - len(bundled_skills),
         "moved_to_official": moved_to_official, "moved_kept_changed": moved_kept_changed,
-        "optional_provenance_backfilled": _backfill_optional_provenance(quiet=quiet),
+        "optional_provenance_backfilled": _backfill_optional_provenance(quiet=quiet, skip=not_handed_over),
         "shadowed_by_external": st.shadowed_by_external,
         "skipped_opt_out": marked}  # lets callers report "opted out", not a normal sync
 
@@ -449,6 +488,8 @@ def _rmtree_writable(path: Path) -> None:
         raise ValueError(f"refusing to rmtree {target!r}: not strictly under {skills_root!r} (scope guard — see #48200)")
 
     def _on_error(func, fpath, exc_info):
+        if func is os.open:  # a folder that cannot be opened cannot be listed: never cleared blind
+            raise exc_info[1]
         for p in (os.path.dirname(fpath), fpath):
             with suppress(OSError):
                 os.chmod(p, stat.S_IRWXU)

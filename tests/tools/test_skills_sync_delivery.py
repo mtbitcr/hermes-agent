@@ -6,8 +6,11 @@ A "release" is a change to those trees followed by the sync (and the official re
 """
 
 import json
+import os
 import shutil
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +21,11 @@ from tools.skills_guard import content_hash
 from tools.skills_sync import NO_BUNDLED_SKILLS_MARKER, sync_skills
 
 ESSENTIAL = sorted(ESSENTIAL_SKILLS)[0]
+
+# Root reads and writes whatever the mode, so a chmod-based denial only shows for other users.
+# Each test with this mark has a twin that makes the same call fail without real permissions.
+needs_real_permissions = pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0, reason="chmod-based access denial needs a non-root user")
 
 
 @pytest.fixture
@@ -101,6 +109,63 @@ def _three_kinds_then_release(role, *, marked: bool) -> tuple:
         _write_skill(role.optional, "creative/ascii-art", "official optional v2")
         _write_skill(role.optional, "communication/yuanbao", "official v2")
     return rels, release
+
+
+def _release_v3(role) -> None:
+    """The release after ``_three_kinds_then_release``'s: every official version moves again."""
+    _write_skill(role.bundled, "software-development/spike", "built-in v3")
+    _write_skill(role.optional, "creative/ascii-art", "official optional v3")
+    _write_skill(role.optional, "communication/yuanbao", "official v3")
+
+
+def _seed(profile: Path, **kwargs):
+    """The real profile seeding: a child process whose ``HERMES_HOME`` is ``profile``."""
+    from hermes_cli.profiles import seed_profile_skills
+    return seed_profile_skills(profile, quiet=True, **kwargs)
+
+
+def _sync_and_refresh() -> dict:
+    """In-process twin of ``_seed(..., refresh_official=True)``, for tests that patch a call."""
+    return {**sync_skills(quiet=True), "official": _refresh()}
+
+
+def _add_owner_folder(copy: Path) -> Path:
+    """The owner adds a folder of their own, with a file in it, to ``copy``."""
+    folder = copy / "zz-private"
+    folder.mkdir(parents=True)
+    (folder / "owner.txt").write_text("owner data\n", encoding="utf-8")
+    return folder
+
+
+def _readable_again(*folders: Path) -> None:
+    """Undo mode 000 on the owner's folders, wherever a run may have moved them (``.bak``)."""
+    for folder in folders:
+        for path in (folder, folder.parent.with_suffix(".bak") / folder.name):
+            if os.path.lexists(path):
+                path.chmod(0o755)
+
+
+def _deny_listing(patched) -> None:
+    """Twin of mode 000 on the owner's folders: listing one fails at ``os.scandir``, the call that
+    pathlib's ``rglob``, ``os.walk`` and ``shutil`` go through."""
+    real_scandir = os.scandir
+
+    def scandir(path=".", *args, **kwargs):
+        if isinstance(path, (str, os.PathLike)) and os.path.basename(os.fspath(path)) == "zz-private":
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return real_scandir(path, *args, **kwargs)
+    patched.setattr(os, "scandir", scandir)
+
+
+def _deny_lock_write(patched) -> None:
+    """Twin of mode 0555 on skills/.hub: the atomic lock write cannot create its temporary file."""
+    real_mkstemp = tempfile.mkstemp
+
+    def mkstemp(*args, **kwargs):
+        if os.path.basename(str(kwargs.get("dir", ""))) == ".hub":
+            raise PermissionError(13, "Permission denied", kwargs["dir"])
+        return real_mkstemp(*args, **kwargs)
+    patched.setattr(tempfile, "mkstemp", mkstemp)
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +271,22 @@ def test_marked_role_reports_not_seeded_by_marker_for_built_ins_without_a_line(r
 # ---------------------------------------------------------------------------
 # A built-in that moved to the optional catalog, or left both trees
 # ---------------------------------------------------------------------------
+
+def test_marked_role_total_bundled_counts_only_the_essential_skills_in_the_catalog(role):
+    """``total_bundled`` keeps its meaning, the skills the role may be seeded with: with the
+    marker, the essential skills in the catalog, even when the role tracks other built-ins."""
+    _write_skill(role.bundled, f"autonomous-ai-agents/{ESSENTIAL}", "essential v1")
+    _write_skill(role.bundled, "software-development/spike", "v1")
+    _write_skill(role.bundled, "software-development/sketch", "v1")
+    unmarked = sync_skills(quiet=True)
+    _mark(role)
+
+    marked = sync_skills(quiet=True)
+
+    assert set(_manifest(role)) == {ESSENTIAL, "spike", "sketch"}
+    assert unmarked["total_bundled"] == 3
+    assert marked["total_bundled"] == 1
+
 
 @pytest.mark.parametrize("marked", [True, False], ids=["marked", "unmarked"])
 def test_moved_to_optional_unchanged_copy_replaced_in_place_with_official_source(role, marked):
@@ -400,21 +481,54 @@ def test_unreadable_official_copy_refused_and_nothing_written(role, monkeypatch)
     assert _lock_bytes(role) == lock_before
 
 
-def test_interrupted_refresh_hash_is_recorded_next_time_not_reported_changed(role):
-    """A run stopped after the copy was replaced but before the lock was written leaves the copy
-    equal to the official source under the old hash; the next refresh records the hash."""
-    src = _adopt_official_copy(role, "communication/yuanbao", "official v1")
+def test_owner_edit_equal_to_the_new_release_stays_the_owners_through_the_next_release(role):
+    """Ownership comes from the recorded hash only: Hermes installs v1 and the owner edits the
+    copy to bytes equal to v2. The refresh keeps it as changed without moving the lock's hash,
+    and release v3 still leaves it untouched."""
+    _adopt_official_copy(role, "communication/yuanbao", "official v1")
     _write_skill(role.optional, "communication/yuanbao", "official v2")
-    copy = role.skills / "communication" / "yuanbao"
-    shutil.rmtree(copy)
-    shutil.copytree(src, copy)
+    copy = _write_skill(role.skills, "communication/yuanbao", "official v2")  # the owner's edit
+    owners, lock_before = _files(copy), _lock_bytes(role)
 
     report = _refresh()
 
-    assert report["kept_changed"] == []
+    assert [item["name"] for item in report["kept_changed"]] == ["yuanbao"]
     assert report["updated"] == []
-    assert _files(copy) == _files(src)
-    assert _lock(role)["installed"]["yuanbao"]["content_hash"] == content_hash(copy)
+    assert _lock_bytes(role) == lock_before
+
+    _write_skill(role.optional, "communication/yuanbao", "official v3")
+    report = _sync_and_refresh()["official"]
+
+    assert [item["name"] for item in report["kept_changed"]] == ["yuanbao"]
+    assert report["updated"] == []
+    assert _files(copy) == owners
+    assert _lock_bytes(role) == lock_before
+
+
+def test_moved_skill_edited_to_equal_its_official_source_stays_the_owners_through_next_release(role):
+    """The owner edits a built-in copy to bytes equal to the optional version it moves to. The
+    hand-over keeps it as changed (its manifest hash says so), the same sync's backfill does not
+    adopt it, and the release after it leaves it untouched."""
+    _write_skill(role.bundled, "media/ascii-art", "built-in v1")
+    sync_skills(quiet=True)
+    copy = _write_skill(role.skills, "media/ascii-art", "official optional v2")  # the owner's edit
+    owners = _files(copy)
+    shutil.rmtree(role.bundled / "media")
+    _write_skill(role.optional, "creative/ascii-art", "official optional v2")
+
+    result = _sync_and_refresh()
+
+    assert result["moved_kept_changed"] == ["ascii-art"]
+    assert result["moved_to_official"] == []
+    assert result["optional_provenance_backfilled"] == []
+    assert "ascii-art" not in _lock(role).get("installed", {})
+
+    _write_skill(role.optional, "creative/ascii-art", "official optional v3")
+    result = _sync_and_refresh()
+
+    assert result["official"]["updated"] == []
+    assert _files(copy) == owners
+    assert "ascii-art" not in _lock(role).get("installed", {})
 
 
 def test_refresh_dry_run_writes_nothing(role):
@@ -506,17 +620,264 @@ def test_data_rule_failed_replacement_restores_old_copy(role, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# A copy Hermes cannot read whole is never replaced
+# ---------------------------------------------------------------------------
+
+def _assert_every_unreadable_copy_kept(role, results, before, lock_before) -> None:
+    for result in results:
+        assert result is not None  # the seeding child finished
+        assert "spike" in result["user_modified"]
+        assert result["updated"] == []
+        assert result["moved_to_official"] == []
+        assert result["official"]["updated"] == []
+        assert "yuanbao" in [item["name"] for item in result["official"]["refused"]]
+    assert results[0]["moved_kept_changed"] == ["ascii-art"]
+    for copy, files in before.items():
+        assert _files(copy) == files, copy  # the owner's file is still in the active copy
+        assert not copy.with_suffix(".bak").exists(), copy
+    assert _lock_bytes(role) == lock_before
+
+
+@needs_real_permissions
+def test_folder_the_owner_made_unreadable_keeps_every_copy_through_seeding_and_next_release(role):
+    """Real mode 000 on a folder the owner added to a built-in copy, a moved built-in's copy and
+    an official optional copy. Seeding at the release, seeding again and seeding at the release
+    after it replace none of them, report each one and still return a result."""
+    rels, release = _three_kinds_then_release(role, marked=True)
+    copies = [role.skills / rel for rel in rels]
+    hidden = [_add_owner_folder(copy) for copy in copies]
+    before, lock_before = {copy: _files(copy) for copy in copies}, _lock_bytes(role)
+    try:
+        for folder in hidden:
+            folder.chmod(0)
+        release()
+        results = [_seed(role.home, refresh_official=True) for _ in range(2)]
+        _release_v3(role)
+        results.append(_seed(role.home, refresh_official=True))
+    finally:
+        _readable_again(*hidden)
+
+    _assert_every_unreadable_copy_kept(role, results, before, lock_before)
+
+
+def test_folder_that_cannot_be_listed_keeps_every_copy_through_next_release(role, monkeypatch):
+    """Twin of the mode-000 test that runs as any user: listing the owner's folder fails."""
+    rels, release = _three_kinds_then_release(role, marked=True)
+    copies = [role.skills / rel for rel in rels]
+    for copy in copies:
+        _add_owner_folder(copy)
+    before, lock_before = {copy: _files(copy) for copy in copies}, _lock_bytes(role)
+    release()
+
+    with monkeypatch.context() as patched:
+        _deny_listing(patched)
+        results = [_sync_and_refresh() for _ in range(2)]
+        _release_v3(role)
+        results.append(_sync_and_refresh())
+
+    _assert_every_unreadable_copy_kept(role, results, before, lock_before)
+
+
+def _stale_backup_with_owner_folder(role) -> tuple:
+    """Built-in spike v1, plus a backup an earlier interrupted run left beside it that holds a
+    folder of the owner's; then the release brings spike v2."""
+    _write_skill(role.bundled, "software-development/spike", "built-in v1")
+    sync_skills(quiet=True)
+    copy = role.skills / "software-development" / "spike"
+    hidden = _add_owner_folder(copy.with_suffix(".bak"))
+    _write_skill(role.bundled, "software-development/spike", "built-in v2")
+    return copy, hidden
+
+
+@needs_real_permissions
+def test_stale_backup_with_unreadable_folder_is_kept_and_seeding_finishes(role):
+    """Real mode 000 inside a stale backup: clearing it fails, so the update waits; the copy and
+    the owner's folder stay and seeding still returns a result (no crash in the cleanup)."""
+    copy, hidden = _stale_backup_with_owner_folder(role)
+    before = _files(copy)
+    try:
+        hidden.chmod(0)
+        result = _seed(role.home)
+    finally:
+        hidden.chmod(0o755)
+
+    assert result is not None
+    assert result["updated"] == []
+    assert _files(copy) == before
+    assert (hidden / "owner.txt").read_text(encoding="utf-8") == "owner data\n"
+
+
+def test_stale_backup_whose_folder_cannot_be_opened_is_kept_and_sync_finishes(role, monkeypatch):
+    """Twin that runs as any user: the cleanup's own ``os.open`` of the owner's folder fails."""
+    copy, hidden = _stale_backup_with_owner_folder(role)
+    before = _files(copy)
+    real_open = os.open
+
+    def deny_open(path, *args, **kwargs):  # rmtree opens each folder it clears, with flags
+        if args and os.path.basename(os.fspath(path)) == "zz-private":
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return real_open(path, *args, **kwargs)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "open", deny_open)
+        result = sync_skills(quiet=True)
+
+    assert result["updated"] == []
+    assert _files(copy) == before
+    assert (hidden / "owner.txt").read_text(encoding="utf-8") == "owner data\n"
+
+
+def _shadowed_copy_with_owner_folder(role, tmp_path) -> tuple:
+    """Built-in clair-qa synced into the role, a folder the owner adds to the copy, and then an
+    external folder, named in the role's config, that provides clair-qa too."""
+    _write_skill(role.bundled, "devops/clair-qa", "built-in v1")
+    sync_skills(quiet=True)
+    copy = role.skills / "devops" / "clair-qa"
+    hidden = _add_owner_folder(copy)
+    external = tmp_path / "external"
+    _write_skill(external, "devops/clair-qa", "external")
+    (role.home / "config.yaml").write_text(
+        f"skills:\n  external_dirs:\n    - {external}\n", encoding="utf-8")
+    return copy, hidden
+
+
+def _assert_shadowed_copy_kept(results, copy, before) -> None:
+    for result in results:
+        assert result is not None  # the seeding child finished
+        assert result["shadowed_by_external"] == ["clair-qa"]
+    assert _files(copy) == before  # never removed as an identical stale shadow
+
+
+@needs_real_permissions
+def test_shadowed_copy_with_unreadable_folder_is_kept_through_seeding_and_next_sync(role, tmp_path):
+    """Real mode 000 on the owner's folder in a copy an external folder now provides: the copy
+    only looks identical to the built-in, so seeding and the seeding after it keep it whole."""
+    copy, hidden = _shadowed_copy_with_owner_folder(role, tmp_path)
+    before = _files(copy)
+    try:
+        hidden.chmod(0)
+        results = [_seed(role.home, refresh_official=True) for _ in range(2)]
+    finally:
+        _readable_again(hidden)
+
+    _assert_shadowed_copy_kept(results, copy, before)
+
+
+def test_shadowed_copy_whose_folder_cannot_be_listed_is_kept_through_next_sync(role, tmp_path, monkeypatch):
+    """Twin of the mode-000 test that runs as any user: listing the owner's folder fails."""
+    copy, _ = _shadowed_copy_with_owner_folder(role, tmp_path)
+    before = _files(copy)
+
+    with monkeypatch.context() as patched:
+        _deny_listing(patched)
+        results = [_sync_and_refresh() for _ in range(2)]
+
+    _assert_shadowed_copy_kept(results, copy, before)
+
+
+# ---------------------------------------------------------------------------
+# A failed lock write keeps the old copy and the old lock
+# ---------------------------------------------------------------------------
+
+def _assert_lock_failure_rolled_back(role, result, before, lock_before) -> None:
+    assert result is not None  # the seeding child finished
+    assert result["moved_to_official"] == []
+    assert "ascii-art" not in result["cleaned"]
+    assert "ascii-art" in _manifest(role)  # the hand-over is retried next sync
+    assert result["optional_provenance_backfilled"] == []
+    assert result["official"]["updated"] == []
+    assert [item["name"] for item in result["official"]["refused"]] == ["yuanbao"]
+    assert result["official"]["refused"][0]["reason"]
+    for copy, files in before.items():
+        assert _files(copy) == files, copy
+        assert not copy.with_suffix(".bak").exists(), copy
+    assert _lock_bytes(role) == lock_before
+
+
+@needs_real_permissions
+def test_unwritable_hub_restores_old_copies_and_prior_lock_through_seeding(role):
+    """Real mode 0555 on skills/.hub: the hand-over and the optional refresh each put the old
+    copy back, keep the prior lock and report a refusal, not an update, and nothing later in the
+    run commits the failed hand-over. Once the lock is writable, the next seeding delivers both."""
+    rels, release = _three_kinds_then_release(role, marked=True)
+    kept = [role.skills / rel for rel in rels[1:]]
+    before, lock_before = {copy: _files(copy) for copy in kept}, _lock_bytes(role)
+    hub = role.skills / ".hub"
+    release()
+    try:
+        hub.chmod(0o555)
+        result = _seed(role.home, refresh_official=True)
+    finally:
+        hub.chmod(0o755)
+
+    _assert_lock_failure_rolled_back(role, result, before, lock_before)
+    retried = _seed(role.home, refresh_official=True)
+    assert retried["moved_to_official"] == ["ascii-art"]
+    assert retried["official"]["updated"] == ["yuanbao"]
+
+
+def test_lock_write_failure_restores_old_copies_and_prior_lock(role, monkeypatch):
+    """Twin that runs as any user: the lock's temporary file cannot be created in skills/.hub,
+    for the hand-over and for the optional refresh; the copy-failure test is separate."""
+    rels, release = _three_kinds_then_release(role, marked=True)
+    kept = [role.skills / rel for rel in rels[1:]]
+    before, lock_before = {copy: _files(copy) for copy in kept}, _lock_bytes(role)
+    release()
+
+    with monkeypatch.context() as patched:
+        _deny_lock_write(patched)
+        result = _sync_and_refresh()
+
+    _assert_lock_failure_rolled_back(role, result, before, lock_before)
+    retried = _sync_and_refresh()
+    assert retried["moved_to_official"] == ["ascii-art"]
+    assert retried["official"]["updated"] == ["yuanbao"]
+
+
+def test_moved_skill_matching_two_folders_hands_over_neither_and_is_refused_ambiguous(role):
+    """A built-in moved to the optional catalog whose name matches two folders: neither is
+    overwritten or recorded, and the release step reports a refusal with reason "ambiguous"."""
+    _write_skill(role.bundled, "media/ascii-art", "built-in v1")
+    sync_skills(quiet=True)
+    copies = [role.skills / "media" / "ascii-art", role.skills / "art" / "ascii-art"]
+    shutil.copytree(copies[0], copies[1])
+    before = {copy: _files(copy) for copy in copies}
+    shutil.rmtree(role.bundled / "media")
+    _write_skill(role.optional, "creative/ascii-art", "official optional v2")
+
+    result = _seed(role.home, refresh_official=True)
+
+    assert {"name": "ascii-art", "reason": "ambiguous"} in result["official"]["refused"]
+    assert result["moved_to_official"] == []
+    assert "ascii-art" not in result["cleaned"]
+    assert result["optional_provenance_backfilled"] == []
+    for copy, files in before.items():
+        assert _files(copy) == files, copy
+    assert "ascii-art" not in _lock(role).get("installed", {})
+
+
+# ---------------------------------------------------------------------------
 # Profile setup: the child's output
 # ---------------------------------------------------------------------------
 
-def test_seed_profile_skills_keyword_adds_official_and_default_keeps_old_shape(role, monkeypatch):
-    """Without the keyword the child prints exactly ``json.dumps(result) + "\\n"`` (the update
-    command's input, unchanged); with it, one JSON object that also holds ``official``."""
-    from hermes_cli.profiles import seed_profile_skills
+# The original base's child printed exactly these lines for the steps below (captured from the
+# base before this change, on the same temporary input).
+LEGACY_STDOUT = [
+    '{"copied": ["spike"], "updated": [], "skipped": 0, "user_modified": [], "cleaned": [], '
+    '"suppressed": [], "relocated": [], "total_bundled": 1, "optional_provenance_backfilled": [], '
+    '"shadowed_by_external": [], "skipped_opt_out": false}\n',
+    '{"copied": [], "updated": ["spike"], "skipped": 0, "user_modified": [], "cleaned": [], '
+    '"suppressed": [], "relocated": [], "total_bundled": 1, "optional_provenance_backfilled": [], '
+    '"shadowed_by_external": [], "skipped_opt_out": false}\n',
+    '{"copied": [], "updated": [], "skipped": 0, "user_modified": [], "cleaned": ["spike"], '
+    '"suppressed": [], "relocated": [], "total_bundled": 0, "optional_provenance_backfilled": [], '
+    '"shadowed_by_external": [], "skipped_opt_out": false}\n',
+]
 
-    _write_skill(role.bundled, "software-development/spike", "v1")
-    profile = role.home / "profiles" / "builder"
-    (profile / "skills").mkdir(parents=True)
+
+@pytest.fixture
+def child_stdout(monkeypatch) -> list:
+    """Everything the seeding child prints, one entry per run."""
     stdouts = []
     real_run = subprocess.run
 
@@ -524,21 +885,39 @@ def test_seed_profile_skills_keyword_adds_official_and_default_keeps_old_shape(r
         completed = real_run(*args, **kwargs)
         stdouts.append(completed.stdout)
         return completed
-
     monkeypatch.setattr(subprocess, "run", recording_run)
+    return stdouts
 
-    result = seed_profile_skills(profile, quiet=True)
 
-    assert isinstance(result, dict)
-    assert "spike" in result["copied"]
-    assert "official" not in result
-    assert stdouts == [json.dumps(result) + "\n"]
+def test_seed_profile_skills_without_keyword_prints_the_legacy_output_byte_for_byte(role, child_stdout):
+    """Without ``refresh_official`` (omitted or False) the child prints the old keys, in the old
+    order and serialization, byte for byte: the update command's input is unchanged."""
+    profile = role.home / "profiles" / "builder"
+    (profile / "skills").mkdir(parents=True)
 
-    refreshed = seed_profile_skills(profile, quiet=True, refresh_official=True)
+    _write_skill(role.bundled, "software-development/spike", "v1")
+    results = [_seed(profile)]
+    _write_skill(role.bundled, "software-development/spike", "v2")
+    results.append(_seed(profile, refresh_official=False))
+    shutil.rmtree(role.bundled / "software-development")
+    results.append(_seed(profile))
 
-    assert len(stdouts) == 2
-    assert json.loads(stdouts[1]) == refreshed
-    assert stdouts[1].count("\n") == 1
-    assert set(refreshed) == set(result) | {"official"}
-    assert set(refreshed["official"]) >= {
+    assert child_stdout == LEGACY_STDOUT
+    assert results == [json.loads(line) for line in LEGACY_STDOUT]
+
+
+def test_seed_profile_skills_keyword_prints_the_extended_result_with_official(role, child_stdout):
+    """With ``refresh_official=True`` the child prints one JSON object: the extended sync
+    result plus the official refresh's report under ``official``."""
+    profile = role.home / "profiles" / "builder"
+    (profile / "skills").mkdir(parents=True)
+    _write_skill(role.bundled, "software-development/spike", "v1")
+
+    refreshed = _seed(profile, refresh_official=True)
+
+    assert child_stdout == [json.dumps(refreshed) + "\n"]
+    assert refreshed["copied"] == ["spike"]
+    assert set(refreshed) >= set(json.loads(LEGACY_STDOUT[0])) | {
+        "not_seeded_by_marker", "moved_to_official", "moved_kept_changed", "official"}
+    assert set(refreshed["official"]) == {
         "updated", "kept_changed", "kept_untracked", "skipped_deleted", "skipped_removed_upstream", "refused"}

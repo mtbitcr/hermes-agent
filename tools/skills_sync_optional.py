@@ -209,10 +209,11 @@ def _write_hub_lock(data: dict) -> None:
                       content=json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
-def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
+def _backfill_optional_provenance(quiet: bool = False, skip: Optional[Set[str]] = None) -> List[str]:
     """Mark already-present official optional skills as hub-installed: formerly bundled (or
     hand-copied) skills now under optional-skills/ get official provenance when byte-identical
-    to the source; modified/local skills are left alone."""
+    to the source; modified/local skills are left alone. ``skip``: moved built-ins whose
+    hand-over this same sync kept, refused or could not record (never adopted here)."""
     ss = _ss()
     optional_dir = ss._get_optional_dir()
     if not optional_dir.exists():
@@ -224,9 +225,11 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
     existing_paths = {entry.get("install_path") for entry in _hub_lock_entries(data)}
     backfilled: List[str] = []
     installed_dir_index: Optional[Dict[str, List[Path]]] = None
+    index = _optional_skill_index() if skip else {}
+    skip_folders = set(skip or ()) | {index[name][0] for name in skip or () if name in index}
     for _skill_md, src, install_path in _iter_optional_skills(optional_dir, root_relative=False):
         lock_name = src.name
-        if lock_name in installed or install_path in existing_paths:
+        if lock_name in skip_folders or lock_name in installed or install_path in existing_paths:
             continue
         dest = ss._skills_dir() / Path(*install_path.split("/"))
         if not dest.is_dir():
@@ -250,11 +253,13 @@ def _backfill_optional_provenance(quiet: bool = False) -> List[str]:
 def _hand_over_moved_skill(name: str, origin_hash: str) -> str:
     """Hand a built-in that moved to the optional catalog over to it, before its manifest line is
     cleaned. The role's copy (unique folder-name match, any category) is replaced in place with the
-    official source only while it still matches ``origin_hash``, the line's fingerprint; it then
-    gets an official hub-lock entry at its real path. Nothing is deleted or created. Returns
-    ``moved_to_official``, ``kept_changed``, ``skipped_deleted``, ``refused_ambiguous``,
-    ``hub_owned``, ``removed_upstream``, or ``failed`` (old copy kept: the caller keeps the line
-    so the next sync retries)."""
+    official source only while it still matches ``origin_hash``, the line's fingerprint (equality
+    with the release proves nothing), and reads whole; it then gets an official hub-lock entry at
+    its real path, written before the old copy is dropped. Nothing is deleted or created. Returns
+    ``moved_to_official``, ``kept_changed`` (changed, or not readable whole), ``skipped_deleted``,
+    ``refused_ambiguous`` (more than one folder matches: neither is touched; the caller keeps the
+    line), ``hub_owned``, ``removed_upstream``, or ``failed`` (old copy and lock kept: the caller
+    keeps the line so the next sync retries)."""
     ss = _ss()
     if (official := _optional_skill_index().get(name)) is None:
         return "removed_upstream"
@@ -271,19 +276,22 @@ def _hand_over_moved_skill(name: str, origin_hash: str) -> str:
     dest, install_path = found
     if install_path in {str(e.get("install_path", "")).strip("/") for e in _hub_lock_entries(data)}:
         return "hub_owned"
-    if ss._dir_hash(dest) != ss._dir_hash(src):  # an identical copy only needs its lock entry
-        if not ss._matches_origin_hash(dest, origin_hash):
-            return "kept_changed"
-        try:
-            ss._replace_skill_dir(src, dest)
-        except (OSError, ValueError):
-            logger.warning("Could not hand %s over to the official optional catalog", dest, exc_info=True)
-            return "failed"
-    installed[folder] = _official_lock_entry(dest, install_path, official_path, "bundled")
+    if not ss._matches_origin_hash(dest, origin_hash):
+        return "kept_changed"
     try:
+        ss._read_whole_copy(dest)
+    except OSError:
+        logger.warning("Keeping %s: part of it cannot be read", dest, exc_info=True)
+        return "kept_changed"
+
+    def record() -> None:
+        installed[folder] = _official_lock_entry(dest, install_path, official_path, "bundled")
         _write_hub_lock(data)
-    except OSError:  # the copy is now official: the retry records it via the identical-copy path
-        logger.warning("Could not record official provenance for %s", dest, exc_info=True)
+    try:
+        ss._replace_skill_dir(src, dest, record=record)
+    except (OSError, ValueError):  # the old copy is back and the lock file is as it was
+        installed.pop(folder, None)
+        logger.warning("Could not hand %s over to the official optional catalog", dest, exc_info=True)
         return "failed"
     return "moved_to_official"
 
@@ -309,10 +317,12 @@ def _lock_install_dir(install_path: object) -> Path:
 def refresh_official_optional_skills(dry_run: bool = False) -> dict:
     """Release step: each official optional copy (hub-lock source ``official``) that still matches
     its recorded ``content_hash`` gets the current official source through the safe swap, and its
-    entry's ``content_hash``, ``files`` and ``updated_at`` move with it. Changed, deleted and
+    entry's ``content_hash``, ``files`` and ``updated_at`` move with it (the lock is written before
+    the old copy is dropped). Changed copies (even one equal to a release), deleted and
     removed-upstream copies, and official names on disk with no record, are only reported; an
-    unsafe path or a failed copy changes nothing and is refused with the reason. ``dry_run``
-    writes nothing."""
+    unsafe path, a copy that cannot be read whole, or a failed copy or lock write changes nothing
+    and is refused with the reason, as is a moved built-in matching more than one folder
+    (``ambiguous``). ``dry_run`` writes nothing."""
     from tools.skills_guard import content_hash  # no fallback here: an unreadable copy is refused
     ss = _ss()
     report: Dict[str, list] = {"updated": [], "kept_changed": [], "kept_untracked": [],
@@ -320,7 +330,6 @@ def refresh_official_optional_skills(dry_run: bool = False) -> dict:
     data = _load_hub_lock() or {}
     installed = data.get("installed") or {}
     index = _optional_skill_index()
-    dirty = False
     for name, entry in sorted(installed.items()):
         if not isinstance(entry, dict) or entry.get("source") != "official":
             continue
@@ -339,33 +348,36 @@ def refresh_official_optional_skills(dry_run: bool = False) -> dict:
             report["refused"].append({"name": name, "reason": "no recorded content hash"})
             continue
         try:
+            ss._read_whole_copy(dest)  # a folder that cannot be listed would leave the hash partial
             current, newest = content_hash(dest), content_hash(official[2])
         except OSError as e:
             report["refused"].append({"name": name, "reason": f"unreadable copy or source: {e}"})
             continue
-        if current == newest:  # already official; a hash lost by an interrupted run is recorded
-            if current != recorded and not dry_run:
-                entry.update(content_hash=current, files=_skill_file_list(dest),
-                             updated_at=datetime.now(timezone.utc).isoformat())
-                dirty = True
-            continue
-        if current != recorded:  # same test as `hermes skills` uses for local edits
+        if current != recorded:  # changed since Hermes wrote it, even if it now equals a release
             report["kept_changed"].append(
                 {"name": name, "newer_official": newest != recorded, "official_hash": newest})
             continue
+        if newest == recorded:
+            continue
         if not dry_run:
+            prior = dict(entry)
+
+            def record() -> None:
+                entry.update(content_hash=_content_hash(dest), files=_skill_file_list(dest),
+                             updated_at=datetime.now(timezone.utc).isoformat())
+                _write_hub_lock(data)
             try:
-                ss._replace_skill_dir(official[2], dest)
-            except (OSError, ValueError) as e:
+                ss._replace_skill_dir(official[2], dest, record=record)
+            except (OSError, ValueError) as e:  # the old copy is back and the lock file is as it was
+                entry.clear()
+                entry.update(prior)
                 logger.warning("Could not refresh official optional skill %s", dest, exc_info=True)
-                report["refused"].append({"name": name, "reason": f"copy failed, old copy kept: {e}"})
+                report["refused"].append({"name": name, "reason": f"copy or its record failed, old copy kept: {e}"})
                 continue
-            entry.update(content_hash=_content_hash(dest), files=_skill_file_list(dest),
-                         updated_at=datetime.now(timezone.utc).isoformat())
-            dirty = True
         report["updated"].append(name)
     # Official names on disk with neither a lock entry nor a manifest line: kept, never touched.
-    tracked = set(installed) | set(ss._read_manifest())
+    manifest = ss._read_manifest()
+    tracked = set(installed) | set(manifest)
     lock_paths = {str(e.get("install_path", "")).strip("/") for e in _hub_lock_entries(data)}
     on_disk, root = _index_installed_skill_dirs_by_name(), ss._skills_dir()
     names_by_folder: Dict[str, Set[str]] = {}
@@ -374,12 +386,12 @@ def refresh_official_optional_skills(dry_run: bool = False) -> dict:
     report["kept_untracked"] = sorted(
         folder for folder, names in names_by_folder.items() if names.isdisjoint(tracked) and any(
             path.relative_to(root).as_posix() not in lock_paths for path in on_disk.get(folder, [])))
-    if dirty:
-        try:
-            _write_hub_lock(data)
-        except OSError as e:
-            logger.warning("Could not record refreshed official optional hashes: %s", e)
-            report["refused"].extend(
-                {"name": name, "reason": f"copy updated but its hash was not recorded ({e}); "
-                                         "the next refresh records it"} for name in report["updated"])
+    # A built-in moved here whose name matches more than one folder keeps its manifest line and
+    # is never handed over: refused, so the caller can say why it was not delivered.
+    if (bundled_dir := ss._get_bundled_dir()).exists():
+        built_in = {skill_name for skill_name, _ in ss._discover_bundled_skills(bundled_dir)}
+        for name in sorted(set(manifest) - built_in):
+            folder = (index.get(name) or (None,))[0]
+            if folder and not {name, folder} & set(installed) and len(on_disk.get(folder, [])) > 1:
+                report["refused"].append({"name": name, "reason": "ambiguous"})
     return report
