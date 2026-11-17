@@ -36,12 +36,12 @@ hermes profile create research --no-skills
 **On an already-installed profile** (default or named), toggle it at runtime:
 
 ```bash
-hermes skills opt-out            # stop future seeding — nothing on disk is touched
+hermes skills opt-out            # stop seeding new bundled skills — nothing is deleted
 hermes skills opt-out --remove   # also delete UNMODIFIED bundled skills (confirms first)
 hermes skills opt-in --sync      # undo: remove the marker and re-seed now
 ```
 
-All three paths write a `.no-bundled-skills` marker into the profile directory. While the marker is present, the installer, `hermes update`, and any skill sync all skip bundled-skill seeding for that profile. Delete the marker (or run `hermes skills opt-in`) to re-enable.
+All three paths write a `.no-bundled-skills` marker into the profile directory. While the marker is present, the installer, `hermes update`, and any skill sync all skip bundled-skill seeding for that profile. The marker stops only *new* bundled skills: skills already present keep receiving updates unless you changed them. Delete the marker (or run `hermes skills opt-in`) to re-enable.
 
 :::note Safe by default
 `hermes skills opt-out` only stops *future* seeding — it never deletes anything already on disk. The optional `--remove` flag deletes bundled skills **only** when they are unmodified (byte-identical to the version Hermes installed). Skills you have edited, skills installed from the hub, and skills you wrote yourself are always kept.

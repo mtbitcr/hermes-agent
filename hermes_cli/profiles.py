@@ -953,16 +953,20 @@ def create_profile(
     return profile_dir
 
 
-def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict]:
+def seed_profile_skills(profile_dir: Path, quiet: bool = False, refresh_official: bool = False) -> Optional[dict]:
     """Seed bundled skills into a profile via subprocess (sync_skills() caches HERMES_HOME at
     module level). Returns the sync result dict, or None on failure. ``--no-skills`` profiles
-    still run the sync: ``sync_skills()`` detects the marker and seeds only essentials."""
+    still run the sync: ``sync_skills()`` detects the marker and seeds only essentials.
+    ``refresh_official`` (release step only) also refreshes unchanged official optional copies
+    and adds that report to the result under ``official``."""
     project_root = Path(__file__).parent.parent.resolve()
+    code = "import json; from tools.skills_sync import sync_skills; r = sync_skills(quiet=True); "
+    if refresh_official:
+        code += ("from tools.skills_sync_optional import refresh_official_optional_skills; "
+                 "r['official'] = refresh_official_optional_skills(); ")
     try:
         result = subprocess.run(
-            [sys.executable, "-c",
-             "import json; from tools.skills_sync import sync_skills; "
-             "r = sync_skills(quiet=True); print(json.dumps(r))"],
+            [sys.executable, "-c", code + "print(json.dumps(r))"],
             env={**os.environ, "HERMES_HOME": str(profile_dir)},
             cwd=str(project_root),
             capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60,

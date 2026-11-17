@@ -26,7 +26,8 @@ from hermes_constants import get_bundled_skills_dir, get_hermes_home, get_option
 from agent.skill_utils import ESSENTIAL_SKILLS, is_excluded_skill_path
 from tools.skill_usage import _read_skill_name, read_suppressed_names
 from tools.skills_sync_optional import (
-    _backfill_optional_provenance, _ignore_runtime_cache, _is_runtime_cache, _read_hub_install_paths,
+    _backfill_optional_provenance, _hand_over_moved_skill, _ignore_runtime_cache, _is_runtime_cache,
+    _read_hub_install_paths,
 )
 from utils import atomic_write_text
 
@@ -362,22 +363,24 @@ def _seed_category_descriptions(bundled_dir: Path, only_dirs: Optional[Set[Path]
 
 def sync_skills(quiet: bool = False) -> dict:
     """Sync bundled skills into ~/.hermes/skills/ using the manifest; returns the per-category
-    result dict. Opted-out profiles seed ONLY ESSENTIAL_SKILLS (the system prompt always
-    points at ``hermes-agent``)."""
-    essential_only = (_hermes_home() / NO_BUNDLED_SKILLS_MARKER).exists()
-    if essential_only and not quiet:
+    result dict. Opted-out profiles seed no NEW skill except ESSENTIAL_SKILLS (the system prompt
+    always points at ``hermes-agent``); skills they already hold a manifest line for still update."""
+    marked = (_hermes_home() / NO_BUNDLED_SKILLS_MARKER).exists()
+    if marked and not quiet:
         print("  (profile opted out of bundled skills via .no-bundled-skills — seeding essential skills only)")
     bundled_dir = _get_bundled_dir()
     if not bundled_dir.exists():
         return {"copied": [], "updated": [], "skipped": 0, "user_modified": [], "cleaned": [],
-                "suppressed": [], "total_bundled": 0, "optional_provenance_backfilled": []}
+                "suppressed": [], "total_bundled": 0, "not_seeded_by_marker": 0, "moved_to_official": [],
+                "moved_kept_changed": [], "optional_provenance_backfilled": []}
     _skills_dir().mkdir(parents=True, exist_ok=True)
-    bundled_skills = _discover_bundled_skills(bundled_dir)
-    if essential_only:
-        bundled_skills = [(name, src) for name, src in bundled_skills if name in ESSENTIAL_SKILLS]
+    all_bundled = _discover_bundled_skills(bundled_dir)
     suppressed = _read_suppressed_names()
     external_index = _build_external_skill_index()
     st = _SyncState(manifest=_read_manifest(), quiet=quiet)
+    # The marker stops only NEW built-ins: names with a manifest line run every branch below.
+    bundled_skills = [(name, src) for name, src in all_bundled
+                      if not marked or name in st.manifest or name in ESSENTIAL_SKILLS]
 
     for skill_name, skill_src in bundled_skills:
         # Curator-pruned built-ins must not resurrect on every update; essentials are exempt.
@@ -398,22 +401,36 @@ def sync_skills(quiet: bool = False) -> dict:
             _update_existing_skill(st, skill_name, skill_src, dest, bundled_hash)
         else:
             st.skipped += 1  # in manifest but not on disk — user deleted it
-    # Clean manifest entries for skills removed upstream. Skipped when opted out: bundled_skills
-    # is only the essential set there, so cleaning would drop tracking for everything else.
-    cleaned = [] if essential_only else sorted(set(st.manifest) - {name for name, _ in bundled_skills})
-    for name in cleaned:
+    # Clean manifest entries for names no longer built-in (full set, every role). A copy that moved
+    # to the optional catalog is handed over first; a failed hand-over keeps its line for a retry.
+    cleaned: List[str] = []
+    moved_to_official: List[str] = []
+    moved_kept_changed: List[str] = []
+    for name in sorted(set(st.manifest) - {name for name, _ in all_bundled}):
+        outcome = _hand_over_moved_skill(name, st.manifest[name])
+        if outcome == "failed":
+            st.say(f"  ! Failed to hand {name} over to the official optional catalog (retried next sync)")
+            continue
+        if outcome == "moved_to_official":
+            moved_to_official.append(name)
+            st.say(f"  ↑ {name} (moved to the official optional catalog)")
+        elif outcome == "kept_changed":
+            moved_kept_changed.append(name)
+            st.say(f"  ~ {name} (moved to the optional catalog; user-modified copy kept)")
         del st.manifest[name]
-    _seed_category_descriptions(
-        bundled_dir,
-        {_compute_relative_dest(src, bundled_dir).parent for _, src in bundled_skills} if essential_only else None)
+        cleaned.append(name)
+    _seed_category_descriptions(bundled_dir, {
+        _compute_relative_dest(src, bundled_dir).parent
+        for name, src in bundled_skills if name in ESSENTIAL_SKILLS} if marked else None)
     _write_manifest(st.manifest)
     return {
         "copied": st.copied, "updated": st.updated, "skipped": st.skipped, "user_modified": st.user_modified,
         "cleaned": cleaned, "suppressed": st.suppressed, "relocated": st.relocated,
-        "total_bundled": len(bundled_skills),
+        "total_bundled": len(bundled_skills), "not_seeded_by_marker": len(all_bundled) - len(bundled_skills),
+        "moved_to_official": moved_to_official, "moved_kept_changed": moved_kept_changed,
         "optional_provenance_backfilled": _backfill_optional_provenance(quiet=quiet),
         "shadowed_by_external": st.shadowed_by_external,
-        "skipped_opt_out": essential_only}  # lets callers report "opted out", not a normal sync
+        "skipped_opt_out": marked}  # lets callers report "opted out", not a normal sync
 
 
 def _rmtree_writable(path: Path) -> None:
