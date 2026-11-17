@@ -36,6 +36,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -57,6 +58,9 @@ PROBE_QUESTION = (
     "Reply with the number only."
 )
 PROBE_ANSWER = "45"
+# The narrow format the question asks for: the number only, then at most one
+# full stop or exclamation mark; surrounding whitespace is ignored.
+_ANSWER_RE = re.compile(rf"\s*{re.escape(PROBE_ANSWER)}[.!]?\s*")
 # Room for a reasoning model to think briefly and still answer: the plan's
 # estimate for one probe is about 2-8k tokens.
 _PROBE_MAX_TOKENS = 8000
@@ -114,10 +118,15 @@ class Route:
 
 @dataclass(frozen=True)
 class Capability:
-    """The capability row of one model; ``context_window`` None when unknown."""
+    """What the catalog proves about one model; a field is None when it is unknown.
 
-    reasoning: bool
+    ``efforts`` is the set of efforts the provider's route sends unchanged for
+    this model, so a role's exact effort is checked, not reasoning in general.
+    """
+
+    reasoning: Optional[bool]
     context_window: Optional[int]
+    efforts: Optional[frozenset] = None
 
 
 @dataclass(frozen=True)
@@ -271,21 +280,81 @@ def _role_sign_ins(role: str, provider: str) -> tuple:
     )
 
 
+_QUIET = threading.Lock()
+_quiet = {"depth": 0, "prior": logging.NOTSET}
+
+
+@contextmanager
+def _no_log_records():
+    """No log record is created anywhere while a shared helper holds a sign-in value.
+
+    The shared account-list helpers log the raw text of a remote error
+    (models.py:1798, codex_models.py:167), and that text can echo the sign-in
+    the request carried. Records are switched off for the length of the call,
+    so no handler, formatter or record factory ever sees it; the check then
+    logs the error's type only.
+    """
+    with _QUIET:
+        if _quiet["depth"] == 0:
+            _quiet["prior"] = logging.root.manager.disable
+            logging.disable(logging.CRITICAL)
+        _quiet["depth"] += 1
+    try:
+        yield
+    finally:
+        with _QUIET:
+            _quiet["depth"] -= 1
+            if _quiet["depth"] == 0:
+                logging.disable(_quiet["prior"])
+
+
 def _account_model_ids(provider: str, sign_in: str) -> tuple:
-    listed = _SIGN_INS[(provider, sign_in)][1](_sign_in_value(provider, sign_in))
+    with _no_log_records():
+        listed = _SIGN_INS[(provider, sign_in)][1](_sign_in_value(provider, sign_in))
     if listed is None:
         raise LookupError("the account list could not be read")
     return tuple(listed)
 
 
+def _route_efforts(provider: str, model: str) -> Optional[frozenset]:
+    """The efforts the provider's adapter sends unchanged for ``model``; None when unknown.
+
+    The anthropic adapter turns an effort it cannot send into another one (xhigh
+    into max, or a fixed budget), so only the efforts it keeps count.
+    """
+    if provider == "anthropic":
+        from agent import anthropic_adapter
+
+        if not anthropic_adapter._supports_adaptive_thinking(model):
+            return frozenset(anthropic_adapter.THINKING_BUDGET)
+        efforts = {"low", "medium", "high", "max"}
+        if anthropic_adapter._supports_xhigh_effort(model):
+            efforts.add("xhigh")
+        return frozenset(efforts)
+    if provider == "openai-codex":
+        from agent.reasoning_effort import codex_supported_efforts
+
+        return frozenset(codex_supported_efforts(model))
+    return None
+
+
 def _capability_row(provider: str, model: str) -> Capability:
-    """The capability row inventory.py:272 shows: reasoning defaults to True."""
-    from agent.models_dev import get_model_capabilities
+    """The capability row inventory.py:272 shows, without its defaults.
+
+    A model the catalog does not know is unknown, never capable; the context
+    window comes only from a catalog or override value, because the row's own
+    200000 is a default when the catalog has none.
+    """
+    from agent.models_dev import get_model_capabilities, lookup_models_dev_context
 
     meta = get_model_capabilities(provider, model)
     if meta is None:
-        return Capability(reasoning=True, context_window=None)
-    return Capability(reasoning=bool(meta.supports_reasoning), context_window=int(meta.context_window))
+        return Capability(reasoning=None, context_window=None, efforts=None)
+    return Capability(
+        reasoning=bool(meta.supports_reasoning),
+        context_window=lookup_models_dev_context(provider, model),
+        efforts=_route_efforts(provider, model) if meta.supports_reasoning else frozenset(),
+    )
 
 
 def _probe_call(provider: str, model: str, sign_in: str, effort: str, question: str) -> ProbeReply:
@@ -393,8 +462,16 @@ def _planning_card() -> _Card:
     )
 
 
-def _past_suggestions(receipt: dict) -> dict:
-    """``(provider, from, to) -> [(month, decision)]`` from every board."""
+def _provenance_ref(card: _Card) -> str:
+    return f"kanban-task:{card.task_id}"
+
+
+def _past_suggestions(receipt: dict, card: _Card) -> dict:
+    """``(provider, from, to) -> [(month, decision)]`` from every board.
+
+    A suggestion this planning card filed, in any run, is also noted in the
+    receipt's budget: the card files at most one.
+    """
     past: dict = {}
     for meta in kb.list_boards(include_archived=True):
         slug = meta.get("slug")
@@ -403,12 +480,17 @@ def _past_suggestions(receipt: dict) -> dict:
             continue
         with kb.connect_closing(db_path=store) as conn:
             rows = conn.execute(
-                "SELECT recommendation_subject_id, recommendation_decision FROM tasks "
-                "WHERE task_kind = 'recommendation' AND recommendation_subject_id LIKE ?",
+                "SELECT id, recommendation_subject_id, recommendation_decision, provenance_ref "
+                "FROM tasks WHERE task_kind = 'recommendation' AND recommendation_subject_id LIKE ? "
+                "ORDER BY rowid",
                 (SUBJECT_PREFIX + "%",),
             ).fetchall()
         receipt["boards_read"].append(slug)
-        for subject, decision in rows:
+        for task_id, subject, decision, ref in rows:
+            if ref == _provenance_ref(card):
+                receipt["budget"]["filed_before"].append(
+                    {"board": slug, "task_id": task_id, "subject_id": subject}
+                )
             parts = str(subject).split(":")
             if len(parts) == 5:
                 past.setdefault(tuple(parts[1:4]), []).append((parts[4], decision))
@@ -480,10 +562,17 @@ def _models_in_use(routes: list, roles: tuple) -> list:
         entry.rank = min(entry.rank, rank)
         if route.role not in entry.roles:
             entry.roles.append(route.role)
-        entry.efforts.setdefault(route.role, route.effort)
+        # Every effort the role runs this model at: its routine and deep lanes.
+        efforts = entry.efforts.setdefault(route.role, [])
+        if route.effort not in efforts:
+            efforts.append(route.effort)
     for entry in found.values():
         entry.roles.sort(key=roles.index)
     return sorted(found.values(), key=lambda entry: entry.rank)
+
+
+_SWITCH = threading.Lock()
+_switch: dict = {"depth": 0, "prior": None}
 
 
 @contextmanager
@@ -494,20 +583,31 @@ def _fallbacks_disabled():
     environment switch every model call honours and restores it afterwards.
     """
     name = fallback_config.FALLBACKS_DISABLED_ENV
-    prior = os.environ.get(name)
-    os.environ[name] = "1"
+    with _SWITCH:
+        if _switch["depth"] == 0:
+            _switch["prior"] = os.environ.get(name)
+            os.environ[name] = "1"
+        _switch["depth"] += 1
     try:
         yield
     finally:
-        if prior is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = prior
+        with _SWITCH:
+            _switch["depth"] -= 1
+            if _switch["depth"] == 0:
+                if _switch["prior"] is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = _switch["prior"]
 
 
-def _answered(text: str) -> bool:
-    """The known answer stands alone: "45" or "45." pass, "145" or "45.5" do not."""
-    return re.search(rf"(?<![\w.]){re.escape(PROBE_ANSWER)}(?!\w|\.\d)", text or "") is not None
+def _answered(text: Optional[str]) -> bool:
+    """The whole reply is the number the probe asks for, as it asks for it.
+
+    "45", "45." or " 45 " pass. A reply that only contains the number, such as
+    a contradiction, a negation or an explanation, fails, and so does a near
+    match such as "-45" or "45.0".
+    """
+    return _ANSWER_RE.fullmatch(text or "") is not None
 
 
 def _probe(seams: Seams, provider: str, model: str, sign_in: str, effort: str) -> dict:
@@ -528,6 +628,41 @@ def _probe(seams: Seams, provider: str, model: str, sign_in: str, effort: str) -
         )
     result["seconds"] = round(time.monotonic() - started, 3)
     return result
+
+
+def _compatibility(model: _Model, new: Capability, old: Capability) -> dict:
+    """The local check: True, False or None (unknown) per property, and why it stops.
+
+    Every exact effort an affected role runs this model at must be one the
+    candidate's route accepts, and the candidate's context window must be
+    known and not smaller than the current model's known one.
+    """
+    needed = sorted({effort for efforts in model.efforts.values() for effort in efforts
+                     if effort not in _NO_EFFORT})
+    found = {"effort": None, "context": None, "efforts": needed, "result": "compatible", "reason": ""}
+    if new.reasoning is None:
+        found.update(result="capability_unknown",
+                     reason="The catalog has no capability row for the new version.")
+        return found
+    if needed and new.efforts is None:
+        found.update(result="effort_unknown",
+                     reason="The catalog does not show which efforts the new version accepts.")
+        return found
+    missing = [effort for effort in needed if effort not in (new.efforts or ())]
+    found["effort"] = not missing
+    if missing:
+        found.update(result="effort_unsupported",
+                     reason="The new version does not accept the effort a role uses: " + ", ".join(missing) + ".")
+        return found
+    if new.context_window is None or old.context_window is None:
+        found.update(result="context_unknown",
+                     reason="The catalog does not show the context window of the new or the current version.")
+        return found
+    found["context"] = new.context_window >= old.context_window
+    if not found["context"]:
+        found.update(result="context_smaller",
+                     reason="The new version has a smaller context window than the current one.")
+    return found
 
 
 def _check(seams: Seams, model: _Model, to_model: str, sign_ins: list, listed: dict,
@@ -551,24 +686,17 @@ def _check(seams: Seams, model: _Model, to_model: str, sign_ins: list, listed: d
     if not all(checked["account"].values()):
         checked["result"] = "not_listed"
         return checked
-    new, old = seams.capabilities(provider, to_model), seams.capabilities(provider, model.model)
-    effort_ok = all(effort in _NO_EFFORT or new.reasoning for effort in model.efforts.values())
-    # A catalog silent on a new version does not block it; the probe still runs.
-    context_ok = (
-        new.context_window is None
-        or old.context_window is None
-        or new.context_window >= old.context_window
-    )
-    checked["compatibility"] = {"effort": effort_ok, "context": context_ok}
-    if not effort_ok:
-        checked["result"] = "effort_unsupported"
+    compatibility = _compatibility(model, seams.capabilities(provider, to_model),
+                                   seams.capabilities(provider, model.model))
+    checked["compatibility"] = compatibility
+    if compatibility["result"] != "compatible":
+        # Unknown is not a pass: every property must be proven before the probe.
+        checked["result"] = compatibility.pop("result")
         return checked
-    if not context_ok:
-        checked["result"] = "context_smaller"
-        return checked
+    compatibility.pop("result")
     for name in sign_ins:
         role = next(role for role in model.roles if name in model.sign_ins[role])
-        probed = _probe(seams, provider, to_model, name, model.efforts[role])
+        probed = _probe(seams, provider, to_model, name, model.efforts[role][0])
         checked["probe"].append(probed)
         if not probed["passed"]:
             checked["result"] = "probe_failed"
@@ -588,7 +716,13 @@ def _list_ids(seams: Seams, provider: str, sign_in: str) -> Optional[frozenset]:
         return None
 
 
-def _file(card: _Card, checked: dict, month: str, practice: bool) -> dict:
+def _file(card: _Card, checked: dict, month: str, practice: bool) -> Optional[dict]:
+    """File the one suggestion, or None when this planning card already filed one.
+
+    The budget check and the new row share one write transaction on the
+    project's board, so of two runs of the card at the same time only one
+    files; the other sees the first one's row.
+    """
     subject = SUBJECT_PREFIX + ":".join(
         (checked["provider"], checked["from_model"], checked["to_model"], month)
     )
@@ -600,7 +734,14 @@ def _file(card: _Card, checked: dict, month: str, practice: bool) -> dict:
         flag: flag == "production_effect" and not practice
         for flag in kb.RECOMMENDATION_SCOPE_FLAGS
     }
-    with kb.connect_closing(db_path=_board_store(card.project_board)) as conn:
+    with kb.connect_closing(db_path=_board_store(card.project_board)) as conn, kb.write_txn(conn):
+        spent = conn.execute(
+            "SELECT 1 FROM tasks WHERE task_kind = 'recommendation' AND provenance_ref = ? "
+            "AND recommendation_subject_id LIKE ? LIMIT 1",
+            (_provenance_ref(card), SUBJECT_PREFIX + "%"),
+        ).fetchone()
+        if spent is not None:
+            return None
         task_id = kb.create_recommendation(
             conn,
             project_id=card.project_id,
@@ -611,7 +752,7 @@ def _file(card: _Card, checked: dict, month: str, practice: bool) -> dict:
             recommendation_rationale=_PRACTICE_REASON if practice else OWNER_REASON,
             recommendation_evidence=evidence,
             provenance_authority=f"hermes-profile:{card.profile}",
-            provenance_ref=f"kanban-task:{card.task_id}",
+            provenance_ref=_provenance_ref(card),
             provenance_observed_at=int(time.time()),
         )
     return {
@@ -671,7 +812,11 @@ def _run(seams: Seams, card: _Card, practice_role: Optional[str], receipt: dict)
     except model_policy.EnrollmentUnavailable:
         receipt["reason"] = "The approved update record could not be read."
         return
-    past = _past_suggestions(receipt)
+    past = _past_suggestions(receipt, card)
+    if receipt["budget"]["filed_before"]:
+        # Checked before any pair is chosen: the card's one suggestion is spent.
+        receipt["reason"] = "This planning card already filed its one suggestion."
+        return
     lists: dict = {}
     for model in _models_in_use(routes, roles):
         entry = {"provider": model.provider, "model": model.model, "roles": list(model.roles)}
@@ -704,7 +849,12 @@ def _run(seams: Seams, card: _Card, practice_role: Optional[str], receipt: dict)
             checked = _check(seams, model, to_model, sign_ins, listed, blocked)
             receipt["candidates"].append(checked)
             if checked["result"] == "passed":
-                receipt["filed"] = _file(card, checked, month, practice)
+                filed = _file(card, checked, month, practice)
+                if filed is None:
+                    checked["result"] = "budget_spent"
+                    receipt["reason"] = "Another run of this planning card filed its one suggestion first."
+                    return
+                receipt["filed"] = filed
                 receipt["result"] = "filed"
                 receipt["reason"] = "One suggestion was filed."
                 return
@@ -738,6 +888,8 @@ def run_update_check(*, practice_role: Optional[str] = None,
         "models": [],
         "candidates": [],
         "filed": None,
+        # The planning card files at most one suggestion over all its runs.
+        "budget": {"planning_card": card.task_id, "filed_before": []},
         "error": None,
     }
     try:

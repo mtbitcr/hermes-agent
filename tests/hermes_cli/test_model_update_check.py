@@ -14,14 +14,17 @@ value exists anywhere in this file.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import subprocess
-from dataclasses import dataclass, field
+import threading
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,6 +46,8 @@ MONTH = "2026-11"
 RECEIPT = "model_update_checked"
 # Text a fake sign-in reader or probe puts in its error; it must never be written.
 LEAK = "fake-sign-in-value-never-written"
+# Every effort a fake capability row accepts when it supports reasoning.
+EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
 
 def _muc():
@@ -65,7 +70,7 @@ class Fake:
         self.routes = [tuple(route) for route in routes]  # (role, provider, model, effort, tier)
         self.lists = dict(lists)  # (provider, sign-in name) -> ids, or the error the reader raises
         self.sign_ins = dict(sign_ins or {})  # role -> (sign-in names | None, reason)
-        self.capabilities = dict(capabilities or {})  # model -> (reasoning, context window)
+        self.capabilities = dict(capabilities or {})  # model -> (reasoning, context window[, efforts])
         self.answers = dict(answers or {})  # model -> probe reply text, or the error the probe raises
         self.when = _at(2026, 11)
         self.list_calls = []
@@ -88,8 +93,11 @@ class Fake:
             return tuple(listed)
 
         def capabilities(provider, model):
-            reasoning, context = self.capabilities.get(model, (True, 200_000))
-            return muc.Capability(reasoning=reasoning, context_window=context)
+            # (reasoning, context window[, accepted efforts]); None is unknown.
+            reasoning, context, *efforts = self.capabilities.get(model, (True, 200_000))
+            if not efforts:
+                efforts = [None if reasoning is None else EFFORTS if reasoning else frozenset()]
+            return muc.Capability(reasoning=reasoning, context_window=context, efforts=efforts[0])
 
         def probe(provider, model, sign_in, effort, question):
             self.probe_calls.append(
@@ -140,8 +148,14 @@ def _dispatcher_env(task, workspace):
     return captured["env"]
 
 
+# The boards, the root registry and the unclaimed card, made once per module by
+# the real APIs in the first test's home and copied into every later one. Making
+# them costs seconds per test; the claim and the spawn below stay per test.
+_TEMPLATE: dict = {}
+
+
 @pytest.fixture
-def world(fence_home, monkeypatch):
+def world(fence_home, monkeypatch, tmp_path_factory):
     """Root home with four boards, a root registry and a claimed planning card.
 
     The card runs on the ``planning`` board; its project is registered to the
@@ -151,15 +165,23 @@ def world(fence_home, monkeypatch):
                 fallback_config.FALLBACKS_DISABLED_ENV):
         monkeypatch.delenv(var, raising=False)
     root = fence_home
-    kb.init_db()
-    for slug in ("planning", "shop", "garden"):
-        kb.create_board(slug)
-    with projects_db.connect_closing(root / "projects.db") as conn:
-        shop = projects_db.create_project(conn, name="Shop", board_slug="shop")
-        garden = projects_db.create_project(conn, name="Garden", board_slug="garden")
-    (root / "profiles" / PLANNER).mkdir(parents=True)
+    if _TEMPLATE:
+        shutil.copytree(_TEMPLATE["home"], root, dirs_exist_ok=True)
+        shop, garden, card = _TEMPLATE["shop"], _TEMPLATE["garden"], _TEMPLATE["card"]
+    else:
+        kb.init_db()
+        for slug in ("planning", "shop", "garden"):
+            kb.create_board(slug)
+        with projects_db.connect_closing(root / "projects.db") as conn:
+            shop = projects_db.create_project(conn, name="Shop", board_slug="shop")
+            garden = projects_db.create_project(conn, name="Garden", board_slug="garden")
+        (root / "profiles" / PLANNER).mkdir(parents=True)
+        with kb.connect_closing(board="planning") as conn:
+            card = kb.create_task(conn, title="Monthly model check", assignee=PLANNER, project_id=shop)
+        home = tmp_path_factory.mktemp("world") / "home"
+        shutil.copytree(root, home, ignore=shutil.ignore_patterns("*.lock", "state.db*", "cache"))
+        _TEMPLATE.update(home=home, shop=shop, garden=garden, card=card)
     with kb.connect_closing(board="planning") as conn:
-        card = kb.create_task(conn, title="Monthly model check", assignee=PLANNER, project_id=shop)
         assert kb.get_task(conn, card).project_id == shop
         task = kb.claim_task(conn, card)
     assert task is not None and task.current_run_id is not None
@@ -641,3 +663,288 @@ def test_update_check_command_runs_the_check_with_the_practice_role(monkeypatch)
     assert model_subcommand.cmd_model_update_check(argparse.Namespace(practice=None)) == 0
     assert model_subcommand.cmd_model_update_check(argparse.Namespace(practice=PLANNER)) == 0
     assert calls == [None, PLANNER]
+
+
+# ---------------------------------------------------------------------------
+# Review regressions: every run below goes through the command, in-process.
+# ---------------------------------------------------------------------------
+
+
+def _command(world, seams, *argv):
+    """``hermes model update-check`` through the model parser and its handler, as the worker."""
+    from hermes_cli.subcommands.model import build_model_parser
+
+    muc = _muc()
+    parser = argparse.ArgumentParser(prog="hermes")
+    build_model_parser(parser.add_subparsers(dest="command"), cmd_model=lambda args: 0)
+    with pytest.MonkeyPatch.context() as patch:
+        for key in [key for key in os.environ if key not in world.env]:
+            patch.delenv(key)
+        for key, value in world.env.items():
+            if os.environ.get(key) != value:
+                patch.setenv(key, value)
+        patch.setattr(muc, "default_seams", lambda: seams)
+        args = parser.parse_args(["model", "update-check", *argv])
+        assert args.func(args) == 0
+    return _receipts(world)[-1]["payload"]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "The expression evaluates to 99, not 45.",
+        "Not 45.",
+        "It adds the whole numbers from 0 to 9.",
+        "-45",
+        "45.0",
+    ],
+    ids=["contradictory", "negated", "explanation-only", "near-negative", "near-decimal"],
+)
+def test_probe_answer_that_is_not_the_bare_number_files_nothing(world, answer):
+    fake = Fake(
+        routes=[(PLANNER, "anthropic", OPUS, "max", "routine")],
+        lists={("anthropic", "gateway"): [OPUS, OPUS_NEW]},
+        answers={OPUS_NEW: answer},
+    )
+
+    receipt = _command(world, fake.seams(_muc()))
+
+    assert _suggestions(world) == []
+    assert receipt["result"] == "nothing_filed"
+    (checked,) = receipt["candidates"]
+    assert checked["result"] == "probe_failed"
+    assert [probe["passed"] for probe in checked["probe"]] == [False]
+
+
+@pytest.mark.parametrize("answer", ["45", "45.", " 45 \n"], ids=["bare", "full-stop", "whitespace"])
+def test_probe_answer_of_the_bare_number_passes(world, answer):
+    fake = Fake(
+        routes=[(PLANNER, "anthropic", OPUS, "max", "routine")],
+        lists={("anthropic", "gateway"): [OPUS, OPUS_NEW]},
+        answers={OPUS_NEW: answer},
+    )
+
+    receipt = _command(world, fake.seams(_muc()))
+
+    assert receipt["result"] == "filed"
+    assert [row["recommendation_subject_id"] for row in _suggestions(world)] == [
+        _update("anthropic", OPUS, OPUS_NEW)
+    ]
+
+
+def test_probe_answer_format_is_the_whole_reply():
+    muc = _muc()
+    for text in ("45", "45.", "45!", "45\n", "  45  "):
+        assert muc._answered(text), text
+    for text in ("The expression evaluates to 99, not 45.", "Not 45", "45, not 99", "45 or 46",
+                 "Answer: 45", "145", "450", "4.5", "45.5", "45.0", "-45", "forty-five", "", None):
+        assert not muc._answered(text), text
+
+
+def _catalog(monkeypatch, rows, contexts):
+    """The catalog the default capability reader sees: ``rows`` models and ``contexts`` windows."""
+    from agent import models_dev
+
+    def capabilities(provider, model, **_kwargs):
+        return models_dev.ModelCapabilities(supports_reasoning=True) if model in rows else None
+
+    monkeypatch.setattr(models_dev, "get_model_capabilities", capabilities)
+    monkeypatch.setattr(models_dev, "lookup_models_dev_context", lambda provider, model, **_: contexts.get(model))
+
+
+@pytest.mark.parametrize(
+    ("rows", "contexts", "result", "compatibility"),
+    [
+        pytest.param({OPUS}, {OPUS: 200_000}, "capability_unknown", (None, None), id="no-candidate-row"),
+        pytest.param(set(), {}, "capability_unknown", (None, None), id="no-rows-at-all"),
+        pytest.param({OPUS, OPUS_NEW}, {OPUS: 200_000}, "context_unknown", (True, None), id="no-candidate-context"),
+        pytest.param({OPUS, OPUS_NEW}, {OPUS_NEW: 200_000}, "context_unknown", (True, None), id="no-current-context"),
+    ],
+)
+def test_missing_compatibility_evidence_files_nothing_and_says_why(world, monkeypatch, rows, contexts,
+                                                                   result, compatibility):
+    muc = _muc()
+    _catalog(monkeypatch, rows, contexts)
+    fake = Fake(routes=[(PLANNER, "anthropic", OPUS, "max", "routine")],
+                lists={("anthropic", "gateway"): [OPUS, OPUS_NEW]})
+
+    receipt = _command(world, replace(fake.seams(muc), capabilities=muc._capability_row))
+
+    assert _suggestions(world) == []
+    assert receipt["result"] == "nothing_filed"
+    (checked,) = receipt["candidates"]
+    assert checked["result"] == result
+    assert (checked["compatibility"]["effort"], checked["compatibility"]["context"]) == compatibility
+    assert checked["compatibility"]["reason"]
+    assert fake.probe_calls == []
+
+
+def test_effort_the_role_uses_must_be_accepted_exactly(world):
+    # The candidate reasons, but does not accept the exact effort the role runs at.
+    fake = Fake(
+        routes=[(PLANNER, "anthropic", OPUS, "max", "routine"), (DESIGNER, "anthropic", OPUS, "high", "deep")],
+        lists={("anthropic", "gateway"): [OPUS, OPUS_NEW]},
+        capabilities={OPUS_NEW: (True, 200_000, frozenset({"low", "medium", "high"}))},
+    )
+
+    receipt = _command(world, fake.seams(_muc()))
+
+    assert _suggestions(world) == []
+    (checked,) = receipt["candidates"]
+    assert checked["result"] == "effort_unsupported"
+    assert checked["compatibility"]["effort"] is False
+    assert checked["compatibility"]["efforts"] == ["high", "max"]
+    assert "max" in checked["compatibility"]["reason"]
+    assert fake.probe_calls == []
+
+
+def test_known_compatible_candidate_passes_through_the_default_reader(world, monkeypatch):
+    muc = _muc()
+    _catalog(monkeypatch, {OPUS, OPUS_NEW}, {OPUS: 200_000, OPUS_NEW: 1_000_000})
+    fake = Fake(routes=[(PLANNER, "anthropic", OPUS, "max", "routine")],
+                lists={("anthropic", "gateway"): [OPUS, OPUS_NEW]})
+
+    receipt = _command(world, replace(fake.seams(muc), capabilities=muc._capability_row))
+
+    assert receipt["result"] == "filed"
+    (checked,) = receipt["candidates"]
+    assert (checked["compatibility"]["effort"], checked["compatibility"]["context"]) == (True, True)
+    assert [call[1:4] for call in fake.probe_calls] == [(OPUS_NEW, "gateway", "max")]
+
+
+@contextlib.contextmanager
+def _every_log_record():
+    """Every record any logger creates, at DEBUG: raw message, args and exception, not a formatted view."""
+    records = []
+    factory = logging.getLogRecordFactory()
+
+    def capture(*args, **kwargs):
+        record = factory(*args, **kwargs)
+        records.append(record)
+        return record
+
+    loggers = [logging.getLogger()] + [
+        found for found in logging.root.manager.loggerDict.values() if isinstance(found, logging.Logger)
+    ]
+    prior = [(found, found.level, found.disabled) for found in loggers]
+    logging.setLogRecordFactory(capture)
+    for found in loggers:
+        found.setLevel(logging.DEBUG)
+        found.disabled = False
+    try:
+        yield records
+    finally:
+        logging.setLogRecordFactory(factory)
+        for found, level, disabled in prior:
+            found.setLevel(level)
+            found.disabled = disabled
+
+
+def _raw_text(records):
+    parts = []
+    for record in records:
+        parts += [str(record.msg), repr(record.args), str(record.exc_text), str(record.stack_info)]
+        if record.exc_info:
+            parts.append(logging.Formatter().formatException(record.exc_info))
+        try:
+            parts.append(record.getMessage())
+        except Exception:  # noqa: BLE001 - a bad record still has its raw parts above
+            pass
+    return "\n".join(parts)
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai-codex"])
+def test_default_account_list_error_never_logs_the_sign_in_value(world, monkeypatch, provider):
+    import httpx
+
+    from hermes_cli import models
+
+    muc = _muc()
+    monkeypatch.setattr(muc, "_sign_in_value", lambda *_: LEAK)
+
+    def echoing(*_args, **kwargs):
+        headers = kwargs.get("headers") or {}
+        raise RuntimeError("Account response echoed " + " ".join(headers.values()))
+
+    monkeypatch.setattr(models, "_get_json", echoing)
+    monkeypatch.setattr(httpx, "get", echoing)
+    role = (PLANNER, "anthropic", OPUS) if provider == "anthropic" else (DEFAULT, "openai-codex", SOL)
+    fake = Fake(routes=[(*role, "max", "routine")], lists={})
+
+    with _every_log_record() as records:
+        receipt = _command(world, replace(fake.seams(muc), account_models=muc._account_model_ids))
+
+    assert receipt["result"] == "nothing_filed"
+    (entry,) = receipt["models"]
+    assert entry["result"] == "list_unreadable"
+    # The capture works: the check's own type-only line is there, the value is not.
+    assert any("account list could not be read" in str(record.msg) for record in records)
+    assert LEAK not in _raw_text(records)
+    assert LEAK not in json.dumps(receipt) + _dump(world)
+
+
+def test_repeated_run_under_one_planning_card_files_no_second_suggestion(world):
+    fake = Fake(routes=[(PLANNER, "anthropic", OPUS, "max", "routine")],
+                lists={("anthropic", "gateway"): [OPUS, OPUS_NEW, OPUS_NEWER]})
+    boards = _board_files(world.root)
+    before = _count(boards)
+
+    first = _command(world, fake.seams(_muc()))
+    second = _command(world, fake.seams(_muc()))
+
+    after = _count(boards)
+    assert [row["recommendation_subject_id"] for row in _suggestions(world)] == [
+        _update("anthropic", OPUS, OPUS_NEWER)
+    ]
+    assert {board: after[board][0] - before[board][0] for board in boards} == {
+        "default": 0, "planning": 0, "shop": 1, "garden": 0,
+    }
+    assert [event["payload"] for event in _receipts(world)] == [first, second]
+    assert (first["result"], second["result"]) == ("filed", "nothing_filed")
+    # The budget is checked before any further pair is chosen or probed.
+    assert second["candidates"] == [] and second["models"] == []
+    assert second["budget"]["filed_before"] == [
+        {"board": "shop", "task_id": first["filed"]["task_id"], "subject_id": first["filed"]["subject_id"]}
+    ]
+    assert [call[1] for call in fake.probe_calls] == [OPUS_NEWER]
+
+
+def test_concurrent_runs_under_one_planning_card_file_at_most_one(world, monkeypatch):
+    from hermes_cli.subcommands.model import build_model_parser
+
+    muc = _muc()
+    barrier = threading.Barrier(2, timeout=60)
+    seams = {}
+    for name in ("monthly", "practice"):
+        base = Fake(routes=[(PLANNER, "anthropic", OPUS, "max", "routine")],
+                    lists={("anthropic", "gateway"): [OPUS, OPUS_NEWER]}).seams(muc)
+
+        def probe(*args, _base=base):
+            barrier.wait()  # both runs are past every check before either files
+            return _base.probe(*args)
+
+        seams[name] = replace(base, probe=probe)
+    for key in [key for key in os.environ if key not in world.env]:
+        monkeypatch.delenv(key)
+    for key, value in world.env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(muc, "default_seams", lambda: seams[threading.current_thread().name])
+    parser = argparse.ArgumentParser(prog="hermes")
+    build_model_parser(parser.add_subparsers(dest="command"), cmd_model=lambda args: 0)
+    codes = {}
+
+    def command(name, *argv):
+        args = parser.parse_args(["model", "update-check", *argv])
+        codes[name] = args.func(args)
+
+    threads = [threading.Thread(target=command, name="monthly", args=("monthly",)),
+               threading.Thread(target=command, name="practice", args=("practice", "--practice", PLANNER))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(120)
+
+    assert codes == {"monthly": 0, "practice": 0}
+    assert len(_suggestions(world)) == 1
+    receipts = [event["payload"] for event in _receipts(world)]
+    assert sorted(receipt["result"] for receipt in receipts) == ["filed", "nothing_filed"]
