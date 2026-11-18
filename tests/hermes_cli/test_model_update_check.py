@@ -1618,3 +1618,83 @@ def test_worker_sign_in_is_its_own_runtime_choice_and_no_store_is_rewritten(worl
     assert asked == [account]
     assert receipt["result"] == "filed" and len(_suggestions(world)) == 1
     assert account not in json.dumps(receipt) + _dump(world)
+
+
+@pytest.mark.parametrize("build_state", ["different-unlisted", "different-listed", "same-account", "absent"])
+def test_cli_worker_build_sign_in_must_list_the_candidate_and_gets_its_own_probe(world, monkeypatch, build_state):
+    """The erratum: the coding worker's build sign-in, read only by ``read_build_token``, is a second account.
+
+    Each distinct account must list the candidate and gets one probe; an equal
+    value is the same account. No resolver is asked and nothing is rewritten.
+    """
+    from agent import anthropic_credentials
+    from hermes_cli import auth, models, runtime_provider
+    from plugins.dashboard_auth.raphael_workspace import build_sign_in_file, sandbox_dispatch
+
+    muc = _muc()
+    env = _planner_pinned(world)
+    worker = world.root / "profiles" / WORKER
+    worker.mkdir(parents=True, exist_ok=True)
+    gateway = "placeholder-worker-gateway"
+    build = gateway if build_state == "same-account" else "placeholder-worker-build"
+    row = {"id": "placeholder-worker-row", "label": "placeholder worker account", "auth_type": "api_key",
+           "priority": 0, "source": "manual", "access_token": gateway, "base_url": "https://api.anthropic.com"}
+    stores = []
+    _in_profile_scope(worker, lambda: stores.append(auth.write_credential_pool("anthropic", [row])) or "")
+    if build_state == "absent":
+        assert build_sign_in_file.read_build_token() is None
+    else:
+        build_sign_in_file.write_build_token(build)
+        assert build_sign_in_file.read_build_token()[0] == build
+
+    def held():
+        # The worker's auth store and the root's build sign-in file; a file made by the run shows too.
+        return {str(path): path.read_bytes()
+                for path in [*stores, *(world.root / "secrets").glob("build-sign-in.json")]}
+
+    before = held()
+    resolved = []
+
+    def resolver(*_args, **_kwargs):
+        resolved.append(True)
+        raise AssertionError("the update check called a resolver")
+
+    # The adapter's resolve_anthropic_token is only a lazy pointer to this one.
+    monkeypatch.setattr(sandbox_dispatch, "_resolve_host_credential", resolver)
+    monkeypatch.setattr(anthropic_credentials, "resolve_anthropic_token", resolver)
+    monkeypatch.setattr(runtime_provider, "_anthropic_env_runtime", resolver)
+    listed = []
+
+    def fetch(*, api_key, **_kwargs):
+        listed.append(api_key)
+        return [OPUS] if api_key == build and build_state == "different-unlisted" else [OPUS, OPUS_NEW]
+
+    monkeypatch.setattr(models, "_fetch_anthropic_models", fetch)
+    fake = Fake(routes=[(WORKER, "anthropic", OPUS, "max", "deep")], lists={})
+
+    receipt = _cli(world, replace(fake.seams(muc), sign_ins=muc._role_sign_ins,
+                                  account_models=muc._account_model_ids), env=env)
+
+    probed = [call[2].value for call in fake.probe_calls]
+    assert held() == before, "a read-only update check rewrote an auth store or the build sign-in file"
+    assert resolved == [], "the update check called a resolver"
+    for value in (gateway, build):
+        assert value not in json.dumps(receipt) + _dump(world)
+    if build_state == "different-unlisted":
+        assert receipt["result"] == "nothing_filed", "an unlisted build account was ignored and a suggestion was filed"
+        assert _suggestions(world) == [] and probed == []
+        assert listed == [gateway, build]
+        (checked,) = receipt["candidates"]
+        assert (checked["result"], checked["account"]) == ("not_listed", {"gateway": True, "build": False})
+        return
+    assert receipt["result"] == "filed" and len(_suggestions(world)) == 1
+    accounts = [gateway, build] if build_state == "different-listed" else [gateway]
+    assert listed == accounts, "each distinct account is listed once"
+    assert probed == accounts, "each distinct account is probed once"
+    if build_state == "different-listed":
+        # The receipt names the build sign-in by its name, never by its value.
+        (entry,) = receipt["models"]
+        assert entry["sign_ins"] == [{"sign_in": "gateway", "roles": [WORKER]},
+                                     {"sign_in": "build", "roles": [WORKER]}]
+        (checked,) = receipt["candidates"]
+        assert [probe["sign_in"] for probe in checked["probe"]] == ["gateway", "build"]

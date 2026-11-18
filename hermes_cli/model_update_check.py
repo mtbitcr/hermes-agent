@@ -223,6 +223,13 @@ def _gateway_token() -> str:
     return _runtime_token("anthropic")
 
 
+def _build_token() -> str:
+    from plugins.dashboard_auth.raphael_workspace.build_sign_in_file import read_build_token
+
+    found = read_build_token()
+    return found[0] if found is not None else ""
+
+
 def _codex_token() -> str:
     """The account the openai-codex runtime selects (web_server.py:7087-7107)."""
     return _runtime_token("openai-codex")
@@ -250,6 +257,7 @@ def _codex_ids(token: str):
 # The value stays in memory: it is only ever handed to the reader or the probe.
 _SIGN_INS = {
     ("anthropic", "gateway"): (_gateway_token, _anthropic_ids),
+    ("anthropic", "build"): (_build_token, _anthropic_ids),
     ("openai-codex", "codex"): (_codex_token, _codex_ids),
 }
 
@@ -350,9 +358,10 @@ def _role_value(role: str, reader: Callable[[], str]) -> str:
 def _role_sign_ins(role: str, provider: str) -> tuple:
     """The sign-ins ``role`` itself uses for ``provider``: ``(sign-ins, "")`` or ``(None, why)``.
 
-    The one sign-in is the pool's choice that ``preview_runtime_selection``
-    reads in the role's own read-only scope, held as a ``_SignIn``; the coding
-    worker's is read the same way, and no resolver behind the preview is asked.
+    Each role's gateway or codex sign-in is the pool's choice that
+    ``preview_runtime_selection`` reads in the role's own read-only scope, held
+    as a ``_SignIn``. The coding worker also uses the build sign-in when
+    ``read_build_token`` finds one in its file; no resolver is asked.
     No usable choice is not proven, and neither is a choice whose store raises;
     the reason names the error's type only.
     """
@@ -365,6 +374,12 @@ def _role_sign_ins(role: str, provider: str) -> tuple:
 
 
 def _read_sign_ins(role: str, provider: str) -> tuple:
+    """Once the coding worker's gateway sign-in is proven, a build sign-in in its file is its second one.
+
+    A build value equal to the gateway's is the same account, so it is kept once.
+    """
+    from plugins.dashboard_auth.raphael_workspace.sandbox_dispatch import WORKER_PROFILE
+
     if provider == "openai-codex":
         value = _role_value(role, _codex_token)
         if not value:
@@ -375,7 +390,12 @@ def _read_sign_ins(role: str, provider: str) -> tuple:
     gateway = _role_value(role, _gateway_token)
     if not gateway:
         return None, "The role's own sign-in for this provider could not be proven."
-    return (_SignIn("gateway", gateway),), ""
+    sign_ins = (_SignIn("gateway", gateway),)
+    if role == WORKER_PROFILE:
+        build = _role_value(role, _build_token)
+        if build:
+            sign_ins = tuple(dict.fromkeys((*sign_ins, _SignIn("build", build))))
+    return sign_ins, ""
 
 
 _QUIET = threading.Lock()
