@@ -23,6 +23,7 @@ import os
 import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 
@@ -525,19 +526,24 @@ def _finished(team, suggestion_id, prior):
 
 
 def test_an_audit_that_cannot_begin_restores_everything(team, monkeypatch):
-    _apply(team)
+    suggestion_id = _apply(team)
     before = (_record_bytes(), _configs())
+    prior = {role: _revision(role) for role in MOVED}
 
     def fail(*args, **kwargs):
         raise model_policy.AuditWriteError("synthetic pre-commit failure")
 
-    monkeypatch.setattr(model_policy, "begin_audit_batch", fail)
-    resp = _undo(team)
+    with monkeypatch.context() as patch:
+        patch.setattr(model_policy, "begin_audit_batch", fail)
+        resp = _undo(team)
 
     assert (resp.status_code, resp.json()) == (503, {"detail": "Service Unavailable"})
     assert (_record_bytes(), _configs()) == before
     assert _undo_audit() == []
-    assert not _undo_state_path().exists()
+    assert _undo_state_path().exists()
+    assert _undo(team).json() == {"state": "undone", "roles": MOVED, "from_model": A, "to_model": B}
+    _finished(team, suggestion_id, prior)
+    assert sorted(_undo_audit()) == [(role, _PROVIDER, A) for role in MOVED]
 
 
 def test_a_commit_marker_that_cannot_be_written_leaves_no_successful_audit(team, monkeypatch):
@@ -580,8 +586,11 @@ def test_an_audit_that_cannot_commit_after_the_marker_answers_503_and_the_undo_s
     assert _entries() == [(A, B, "rolled_back")]
     assert [_model(role) for role in MOVED] == [A, A]
     assert _undo_audit() == []
+    assert _undo(team).json()["state"] == "undone"
+    assert sorted(_undo_audit()) == [(role, _PROVIDER, A) for role in MOVED]
     assert _undo(team).json()["state"] == "already_undone"
     _finished(team, suggestion_id, prior)
+    assert sorted(_undo_audit()) == [(role, _PROVIDER, A) for role in MOVED]
 
 
 def test_an_unreconciled_journal_refuses_the_undo_before_it_changes_anything(team, monkeypatch):
@@ -616,9 +625,9 @@ def test_a_receipt_that_cannot_be_written_answers_503_and_the_retry_writes_it_on
     assert (first.status_code, first.json()) == (503, {"detail": "Service Unavailable"})
     assert _rolled_back(team, suggestion_id) == []
     assert _undo_state_path().exists()
-    for _ in range(2):
+    for state in ("undone", "already_undone"):
         resp = _undo(team)
-        assert (resp.status_code, resp.json()) == (200, {"state": "already_undone", "from_model": A, "to_model": B})
+        assert (resp.status_code, resp.json()["state"]) == (200, state)
     _finished(team, suggestion_id, prior)
     assert sorted(_undo_audit()) == [(role, _PROVIDER, A) for role in MOVED]
 
@@ -755,9 +764,257 @@ def test_a_real_process_exit_then_the_cli_start_and_the_next_undo_leave_the_undo
     resp = _undo(team)
 
     assert resp.status_code == 200, resp.text
-    assert resp.json()["state"] == ("already_undone" if committed else "undone")
+    assert resp.json()["state"] == "undone"
     _finished(team, suggestion_id, prior)
-    assert sorted(_undo_audit()) == ([] if committed else [(role, _PROVIDER, A) for role in MOVED])
+    assert sorted(_undo_audit()) == [(role, _PROVIDER, A) for role in MOVED]
+
+
+# ---------------------------------------------------------------------------
+# Owner rule 1: each seam of the undo, each read of its role set, two faults
+# ---------------------------------------------------------------------------
+
+# Each call of the undo that writes, in its order: the seam, then the module
+# attribute its fault wraps and which call of it. The restore writes run only
+# after a fault in the batch, so they are reached through _BATCH_FAULT first.
+_SEAMS = [
+    ("01 undo state, prepared", omu, "_save_undo_state", 1),
+    ("02 record flip", model_policy, "apply_model_update_record", 1),
+    ("03 route write, first role", omu, "_write_model", 1),
+    ("04 route write, second role", omu, "_write_model", 2),
+    ("05 enrollment mark", hermes_config, "mark_route_batch_enrollment_written", 1),
+    ("06 audit begin", model_policy, "begin_audit_batch", 1),
+    ("07 batch commit mark", hermes_config, "mark_route_batch_audit_committed", 1),
+    ("08 undo state, committed", omu, "_save_undo_state", 2),
+    ("09 audit commit", model_policy, "commit_audit_batch", 1),
+    ("10 event", omu, "_append_receipt", 1),
+    ("11 undo state removal", omu, "_clear_undo_state", 1),
+    ("12 restore of a config", hermes_config, "_restore_config_snapshot", 1),
+    ("13 restore of the record", model_policy, "restore_model_update_record", 1),
+]
+_RESTORES = {"12 restore of a config", "13 restore of the record"}
+_BATCH_FAULT = (omu, "_write_model", 2)
+
+
+def _fault(patch, module, name, call, kind):
+    """At the ``call``-th call of ``module.name``: an error in its place, or a real exit right after it."""
+    original = getattr(module, name)
+    calls = itertools.count(1)
+
+    def faulted(*args, **kwargs):
+        if next(calls) != call:
+            return original(*args, **kwargs)
+        if kind == "error":
+            raise OSError(errno.EIO, f"synthetic fault at {name}")
+        original(*args, **kwargs)
+        os._exit(77)
+
+    patch.setattr(module, name, faulted)
+
+
+def _seam_faults(patch, seam, kind):
+    name, module, attribute, call = seam
+    if name in _RESTORES:
+        _fault(patch, *_BATCH_FAULT, "error")
+    _fault(patch, module, attribute, call, kind)
+
+
+def _stores(team, suggestion_id):
+    """All the undo writes: the record, each config, its audit and its event."""
+    return _record_bytes(), _configs(), sorted(_undo_audit()), _rolled_back(team, suggestion_id)
+
+
+def _whole(team, suggestion_id, before):
+    """The one whole outcome the stores hold, A or B, with no undo state; fails on any other."""
+    assert not _undo_state_path().exists()
+    if _entries() == [(A, B, "rolled_back")]:
+        assert [_model(role) for role in MOVED] == [A, A]
+        assert sorted(_undo_audit()) == [(role, _PROVIDER, A) for role in MOVED]
+        assert len(_rolled_back(team, suggestion_id)) == 1
+        return "A"
+    assert (_record_bytes(), _configs()) == before
+    assert (_undo_audit(), _rolled_back(team, suggestion_id)) == ([], [])
+    return "B"
+
+
+def _answer_is_true(resp, team, suggestion_id, before, earlier):
+    """Point 2 of the rule; ``earlier`` is what the stores held before this call."""
+    if resp.status_code == 503:
+        assert resp.json() == {"detail": "Service Unavailable"}
+        assert _undo_state_path().exists() or _stores(team, suggestion_id) == earlier
+        return
+    assert resp.status_code == 200, resp.text
+    state = resp.json()["state"]
+    assert state in ("undone", "already_undone", "not_applied", "busy")
+    if state == "already_undone":
+        assert _stores(team, suggestion_id) == earlier
+    assert _whole(team, suggestion_id, before) == ("A" if state.endswith("undone") else "B")
+
+
+@pytest.mark.parametrize("seam", _SEAMS, ids=[seam[0] for seam in _SEAMS])
+def test_an_error_at_each_seam_then_one_more_undo_ends_whole(team, monkeypatch, seam):
+    suggestion_id = _apply(team)
+    before = (_record_bytes(), _configs())
+    earlier = _stores(team, suggestion_id)
+    with monkeypatch.context() as patch:
+        _seam_faults(patch, seam, "error")
+        first = _undo(team)
+    _answer_is_true(first, team, suggestion_id, before, earlier)
+
+    earlier = _stores(team, suggestion_id)
+    resp = _undo(team)
+
+    assert resp.status_code == 200, resp.text
+    _answer_is_true(resp, team, suggestion_id, before, earlier)
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("seam", _SEAMS, ids=[seam[0] for seam in _SEAMS])
+def test_a_real_exit_right_after_each_seam_then_one_more_undo_ends_whole(team, seam):
+    suggestion_id = _apply(team)
+    before = (_record_bytes(), _configs())
+    child = os.fork()
+    if child == 0:
+        try:
+            signal.alarm(30)
+            with pytest.MonkeyPatch.context() as patch:
+                _seam_faults(patch, seam, "exit")
+                _undo(team)
+        finally:
+            os._exit(98)
+    _, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 77
+    earlier = _stores(team, suggestion_id)
+
+    resp = _undo(team)
+
+    assert resp.status_code == 200, resp.text
+    _answer_is_true(resp, team, suggestion_id, before, earlier)
+
+
+def _read_fails(name):
+    """A predicate that is true for the call ``name`` of the role-set read makes for the first moved role."""
+    home = get_profile_dir(MOVED[0])
+    return {
+        "admitted roles": lambda *args: sys._getframe(2).f_globals.get("__name__") == omu.__name__,
+        "configured route": lambda *args: args[:1] == (MOVED[0],),
+        "native config read": lambda *args: get_hermes_home() == home,
+        "route revision": lambda *args: args[:1] == (home,),
+    }[name]
+
+
+_ROLE_READS = {
+    "admitted roles": (model_policy, "admitted_profile_ids"),
+    "configured route": (model_policy, "configured_assignment_for"),
+    "native config read": (hermes_config, "load_config_readonly"),
+    "route revision": (hermes_config, "profile_route_revision"),
+}
+
+
+@pytest.mark.parametrize("read", sorted(_ROLE_READS))
+def test_a_role_set_read_that_fails_answers_503_and_changes_nothing(team, monkeypatch, read):
+    _apply(team)
+    before = (_record_bytes(), _configs())
+    module, attribute = _ROLE_READS[read]
+    original, fails = getattr(module, attribute), _read_fails(read)
+
+    def failing(*args, **kwargs):
+        if fails(*args):
+            raise PermissionError(errno.EACCES, "synthetic role read failure")
+        return original(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, attribute, failing)
+        resp = _undo(team)
+
+    assert (resp.status_code, resp.json()) == (503, {"detail": "Service Unavailable"})
+    assert (_record_bytes(), _configs()) == before
+    assert _undo_audit() == []
+    assert not _undo_state_path().exists()
+
+
+def test_a_batch_fault_and_a_restore_fault_answer_503_keep_the_state_and_the_next_undo_ends_whole(
+    team, monkeypatch,
+):
+    suggestion_id = _apply(team)
+    before = (_record_bytes(), _configs())
+    with monkeypatch.context() as patch:
+        _fault(patch, *_BATCH_FAULT, "error")
+        patch.setattr(hermes_config, "_restore_config_snapshot", lambda *args, **kwargs: False)
+        first = _undo(team)
+
+    assert (first.status_code, first.json()) == (503, {"detail": "Service Unavailable"})
+    assert _undo_state_path().exists()
+    earlier = _stores(team, suggestion_id)
+    resp = _undo(team)
+    assert resp.json() == {"state": "undone", "roles": MOVED, "from_model": A, "to_model": B}
+    _answer_is_true(resp, team, suggestion_id, before, earlier)
+
+
+def _pending_undo(team, patch):
+    """An undo whose event cannot be written while ``patch`` lasts: 503, and its state stays."""
+    suggestion_id = _apply(team)
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    patch.setattr(omu, "_append_receipt", locked)
+    assert _undo(team).status_code == 503
+    assert _undo_state_path().exists()
+    return suggestion_id
+
+
+def test_an_update_while_an_undo_is_pending_answers_503_then_settles_first(team, monkeypatch):
+    from gateway.platforms import api_server_owner_model_updates as update_route
+
+    later = _suggestion(team.project, f"model-update:{_PROVIDER}:{A}:{B}:2026-10")
+    ref = ow._owner_decision_ref(team.owner, authority="recommendation", native_id=later)
+    with monkeypatch.context() as patch:
+        suggestion_id = _pending_undo(team, patch)
+        pending = (_record_bytes(), _configs(), _undo_state_path().read_bytes())
+        with pytest.raises(ow.OwnerWorkspaceError) as refused:
+            omu.apply_model_update(team.owner, decision_ref=ref, reason="Update")
+        assert refused.value.code not in update_route._REFUSALS  # the Update route answers 503
+        assert (_record_bytes(), _configs(), _undo_state_path().read_bytes()) == pending
+        assert omu._pending_update(team.owner, ref)[1] == later  # still waiting
+
+    omu.apply_model_update(team.owner, decision_ref=ref, reason="Update")
+
+    assert len(_rolled_back(team, suggestion_id)) == 1
+    assert not _undo_state_path().exists()
+    assert _entries() == [(A, B, "rolled_back"), (A, B, "active")]
+    assert [_model(role) for role in MOVED] == [B, B]
+    assert sorted(_undo_audit()) == [(role, _PROVIDER, A) for role in MOVED]
+
+
+def test_a_practice_while_an_undo_is_pending_answers_503_then_settles_first(team, monkeypatch):
+    with monkeypatch.context() as patch:
+        suggestion_id = _pending_undo(team, patch)
+        pending = (_unchanged(), _undo_state_path().read_bytes(), _tasks(team))
+        resp = _practice(team)
+        assert (resp.status_code, resp.json()) == (503, {"detail": "Service Unavailable"})
+        assert (_unchanged(), _undo_state_path().read_bytes(), _tasks(team)) == pending
+
+    resp = _practice(team)
+
+    assert resp.json() == {"state": "started", "roles": [ROLE]}
+    assert len(_practice_cards(team)) == 1
+    assert len(_rolled_back(team, suggestion_id)) == 1
+    assert not _undo_state_path().exists()
+    assert _entries() == [(A, B, "rolled_back")]
+    assert [_model(role) for role in MOVED] == [A, A]
+
+
+def test_a_pending_undo_state_holds_no_sign_in_value(team, monkeypatch, tmp_path):
+    # The Models machine's own secret, from the token file the dash fixture minted.
+    secret = (tmp_path / "machine-tokens" / "models.token").read_text(encoding="utf-8").strip().rsplit(".", 1)[1]
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SIGN_IN)
+    with monkeypatch.context() as patch:
+        _pending_undo(team, patch)
+        text = _undo_state_path().read_text(encoding="utf-8")
+
+    assert json.loads(text)["audit"]
+    for value in (SIGN_IN, secret):
+        assert not _holds_part_of(text, value)
 
 
 # ---------------------------------------------------------------------------

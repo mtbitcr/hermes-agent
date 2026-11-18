@@ -58,27 +58,16 @@ async def undo_model_update(request: Request, profile: Optional[str] = None):
     from hermes_cli import owner_model_updates as omu
     from plugins.dashboard_auth.raphael_workspace import model_policy
 
-    def journal(revisions: dict, provider: str, model: str):
-        try:
-            audit = model_policy.journal_models_machine_batch_success(
-                request,
-                action="model_update_undo",
-                roles=[(role, provider) for role in sorted(revisions)],
-                models={role: model for role in revisions},
-            )
-        except Exception as exc:
-            raise omu.Unavailable() from exc
-
-        def commit() -> None:
-            try:
-                audit.commit()
-            except Exception as exc:
-                raise omu.Unavailable() from exc
-
-        return commit
+    def audit(roles: list, provider: str, model: str) -> list:
+        # The fields of each role's audit record, none secret: the undo keeps
+        # them in its state and writes them itself, once, from there.
+        entries = model_policy._models_machine_entries(
+            request, action="model_update_undo", roles=[(role, provider, model) for role in roles]
+        )
+        return [fields for _event, fields in entries or ()]
 
     try:
-        result = await run_in_threadpool(omu.undo_last_model_update, journal=journal)
+        result = await run_in_threadpool(omu.undo_last_model_update, audit=audit)
     except Exception as exc:
         raise _unavailable("undo", exc) from None
     if not getattr(request.state, "token_route_audited", False):
