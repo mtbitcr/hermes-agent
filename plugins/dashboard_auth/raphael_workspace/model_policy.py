@@ -1023,6 +1023,30 @@ def _model_updates_path():
     return get_default_hermes_root() / "raphael" / "model_policy_updates.json"
 
 
+def _model_update_undo_path():
+    """Where an unfinished undo keeps what its recovery needs, beside the record."""
+    return _model_updates_path().with_name("model_policy_updates.undo.json")
+
+
+def _refuse_while_undo_pending(entry: dict) -> None:
+    """Only a pending undo's own flip is written until that undo is settled.
+
+    Until it is committed, its recovery may put the whole prior record text
+    back, which would erase any other entry written in between.
+    """
+    try:
+        pending = json.loads(_model_update_undo_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as exc:
+        raise EnrollmentUnavailable("an unfinished model update undo could not be read") from exc
+    if isinstance(pending, dict) and pending.get("phase") == "committed":
+        return  # Only its receipt is owed; the record is not put back.
+    stored = pending.get("entry") if isinstance(pending, dict) else None
+    if not isinstance(stored, dict) or entry != {**stored, "state": "rolled_back"}:
+        raise EnrollmentUnavailable("an unfinished model update undo is not settled yet")
+
+
 def _load_model_updates(path) -> tuple:
     """Return ``(exact prior file text or None, validated document)``.
 
@@ -1175,6 +1199,7 @@ def apply_model_update_record(update: Mapping[str, Any]) -> Optional[str]:
         raise ValueError("unadmitted Raphael model update")
 
     with _enrollment_registry_lock():
+        _refuse_while_undo_pending(entry)
         path = _model_updates_path()
         prior_text, document = _load_model_updates(path)
         updates = document["updates"]

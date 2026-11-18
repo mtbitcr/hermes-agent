@@ -13,12 +13,14 @@ stubbed.
 from __future__ import annotations
 
 import contextlib
+import errno
 import functools
 import importlib
 import importlib.util
 import itertools
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import threading
@@ -483,6 +485,279 @@ def test_u9_an_unreadable_record_answers_503_and_writes_nothing(team):
     assert resp.json() == {"detail": "Service Unavailable"}
     assert _record_bytes() == record
     assert _configs() == configs
+
+
+# ---------------------------------------------------------------------------
+# Undo recovery: an interrupted undo, the commit marker and the receipt
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _restore_route_latch():
+    """A test that latches the route journal does not latch the next one."""
+    before = hermes_config._ROUTE_JOURNAL_BLOCKED
+    try:
+        yield
+    finally:
+        hermes_config._ROUTE_JOURNAL_BLOCKED = before
+
+
+class _AbruptStop(BaseException):
+    """A stop that no ``except Exception`` sees, as a process end is."""
+
+
+def _undo_state_path():
+    return get_default_hermes_root() / "raphael" / "model_policy_updates.undo.json"
+
+
+def _rolled_back(team, suggestion_id):
+    return _events(team.project, suggestion_id, "model_update_rolled_back")
+
+
+def _finished(team, suggestion_id, prior):
+    """The undo is whole: record rolled back, both roles on A, one receipt, no pending state."""
+    assert _entries() == [(A, B, "rolled_back")]
+    assert [_model(role) for role in MOVED] == [A, A]
+    [event] = _rolled_back(team, suggestion_id)
+    assert event["revisions"] == {role: _revision(role) for role in MOVED}
+    assert (event["roles"], event["prior_revisions"]) == (MOVED, prior)
+    assert not _undo_state_path().exists()
+
+
+def test_an_audit_that_cannot_begin_restores_everything(team, monkeypatch):
+    _apply(team)
+    before = (_record_bytes(), _configs())
+
+    def fail(*args, **kwargs):
+        raise model_policy.AuditWriteError("synthetic pre-commit failure")
+
+    monkeypatch.setattr(model_policy, "begin_audit_batch", fail)
+    resp = _undo(team)
+
+    assert (resp.status_code, resp.json()) == (503, {"detail": "Service Unavailable"})
+    assert (_record_bytes(), _configs()) == before
+    assert _undo_audit() == []
+    assert not _undo_state_path().exists()
+
+
+def test_a_commit_marker_that_cannot_be_written_leaves_no_successful_audit(team, monkeypatch):
+    suggestion_id = _apply(team)
+    before = (_record_bytes(), _configs())
+    prior = {role: _revision(role) for role in MOVED}
+    original = hermes_config._write_route_batch_journal_record
+
+    def fail_marker(record):
+        if record["phase"] == hermes_config._ROUTE_BATCH_AUDIT_COMMITTED:
+            raise OSError(errno.EIO, "synthetic journal marker I/O failure")
+        return original(record)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(hermes_config, "_write_route_batch_journal_record", fail_marker)
+        resp = _undo(team)
+
+    assert (resp.status_code, resp.json()) == (503, {"detail": "Service Unavailable"})
+    assert (_record_bytes(), _configs()) == before
+    assert _undo_audit() == []
+    assert _rolled_back(team, suggestion_id) == []
+    assert hermes_config.reconcile_profile_route_batch_journal() == []  # the next start
+    assert _undo(team).json()["state"] == "undone"
+    _finished(team, suggestion_id, prior)
+    assert sorted(_undo_audit()) == [(role, _PROVIDER, A) for role in MOVED]
+
+
+def test_an_audit_that_cannot_commit_after_the_marker_answers_503_and_the_undo_stands(team, monkeypatch):
+    suggestion_id = _apply(team)
+    prior = {role: _revision(role) for role in MOVED}
+
+    def fail(*args, **kwargs):
+        raise model_policy.AuditWriteError("synthetic commit failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(model_policy, "commit_audit_batch", fail)
+        resp = _undo(team)
+
+    assert (resp.status_code, resp.json()) == (503, {"detail": "Service Unavailable"})
+    assert _entries() == [(A, B, "rolled_back")]
+    assert [_model(role) for role in MOVED] == [A, A]
+    assert _undo_audit() == []
+    assert _undo(team).json()["state"] == "already_undone"
+    _finished(team, suggestion_id, prior)
+
+
+def test_an_unreconciled_journal_refuses_the_undo_before_it_changes_anything(team, monkeypatch):
+    def fail_retirement():
+        raise hermes_config._block_route_journal("synthetic retirement I/O failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(hermes_config, "_clear_route_batch_journal", fail_retirement)
+        _apply(team)
+    assert hermes_config._ROUTE_JOURNAL_BLOCKED is not None
+    before = (_record_bytes(), _configs())
+
+    resp = _undo(team)
+
+    assert (resp.status_code, resp.json()) == (503, {"detail": "Service Unavailable"})
+    assert (_record_bytes(), _configs()) == before
+    assert hermes_config._ROUTE_JOURNAL_BLOCKED is not None
+    assert not _undo_state_path().exists()
+
+
+def test_a_receipt_that_cannot_be_written_answers_503_and_the_retry_writes_it_once(team, monkeypatch):
+    suggestion_id = _apply(team)
+    prior = {role: _revision(role) for role in MOVED}
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(omu, "_append_receipt", locked)
+        first = _undo(team)
+
+    assert (first.status_code, first.json()) == (503, {"detail": "Service Unavailable"})
+    assert _rolled_back(team, suggestion_id) == []
+    assert _undo_state_path().exists()
+    for _ in range(2):
+        resp = _undo(team)
+        assert (resp.status_code, resp.json()) == (200, {"state": "already_undone", "from_model": A, "to_model": B})
+    _finished(team, suggestion_id, prior)
+    assert sorted(_undo_audit()) == [(role, _PROVIDER, A) for role in MOVED]
+
+
+def test_an_undo_whose_suggestion_is_gone_stands_without_a_receipt(team, monkeypatch):
+    suggestion_id = _apply(team)
+    monkeypatch.setattr(ow, "_owner_decision_ref", lambda *args, **kwargs: "decision:gone")
+
+    resp = _undo(team)
+
+    assert resp.json() == {"state": "undone", "roles": MOVED, "from_model": A, "to_model": B}
+    assert _rolled_back(team, suggestion_id) == []
+    assert not _undo_state_path().exists()
+
+
+def test_a_stop_right_after_the_receipt_does_not_write_it_twice(team, monkeypatch):
+    suggestion_id = _apply(team)
+    prior = {role: _revision(role) for role in MOVED}
+    original = omu._append_receipt
+
+    def stop_after(*args, **kwargs):
+        original(*args, **kwargs)
+        raise _AbruptStop()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(omu, "_append_receipt", stop_after)
+        with pytest.raises(BaseException):
+            _undo(team)
+
+    assert _undo(team).json()["state"] == "already_undone"
+    _finished(team, suggestion_id, prior)
+
+
+def test_a_stop_after_the_first_config_is_settled_by_the_next_start_and_undo(team, monkeypatch):
+    suggestion_id = _apply(team)
+    before = (_record_bytes(), _configs())
+    prior = {role: _revision(role) for role in MOVED}
+    original = omu._write_model
+
+    def stop_after_first_config(*args, **kwargs):
+        original(*args, **kwargs)
+        raise _AbruptStop()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(omu, "_write_model", stop_after_first_config)
+        with pytest.raises(BaseException):
+            _undo(team)
+
+    assert hermes_config.reconcile_profile_route_batch_journal() == MOVED  # the next start
+    assert _configs() == before[1]
+    resp = _undo(team)
+    assert resp.json() == {"state": "undone", "roles": MOVED, "from_model": A, "to_model": B}
+    _finished(team, suggestion_id, prior)
+    assert sorted(_undo_audit()) == [(role, _PROVIDER, A) for role in MOVED]
+
+
+def test_no_update_is_recorded_while_an_interrupted_undo_is_unsettled(team, monkeypatch):
+    _apply(team)
+    original = omu._write_model
+
+    def stop_after_first_config(*args, **kwargs):
+        original(*args, **kwargs)
+        raise _AbruptStop()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(omu, "_write_model", stop_after_first_config)
+        with pytest.raises(BaseException):
+            _undo(team)
+    hermes_config.reconcile_profile_route_batch_journal()
+    pending = (_record_bytes(), _configs())
+    [entry] = json.loads(_record_path().read_text())["updates"]
+    later = {**entry, "decision_ref": entry["decision_ref"] + ":later", "state": "active"}
+
+    with pytest.raises(model_policy.EnrollmentUnavailable):
+        model_policy.apply_model_update_record(later)
+
+    assert (_record_bytes(), _configs()) == pending
+    assert _undo(team).json()["state"] == "undone"
+    assert _entries() == [(A, B, "rolled_back")]
+    assert [_model(role) for role in MOVED] == [A, A]
+    model_policy.apply_model_update_record(later)
+    assert _entries() == [(A, B, "rolled_back"), (A, B, "active")]
+
+
+def _exit_after(module, name):
+    original = getattr(module, name)
+
+    def exit_after(*args, **kwargs):
+        original(*args, **kwargs)
+        os._exit(77)
+
+    setattr(module, name, exit_after)
+
+
+def _exit_before(module, name):
+    setattr(module, name, lambda *args, **kwargs: os._exit(77))
+
+
+_STOPS = {
+    "after the record flip": lambda: _exit_after(model_policy, "apply_model_update_record"),
+    "after the first config": lambda: _exit_after(omu, "_write_model"),
+    "after every config, before the commit": lambda: _exit_before(hermes_config, "mark_route_batch_audit_committed"),
+    "after the commit marker": lambda: _exit_after(hermes_config, "mark_route_batch_audit_committed"),
+}
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("stop", sorted(_STOPS))
+def test_a_real_process_exit_then_the_cli_start_and_the_next_undo_leave_the_undo_whole(team, stop):
+    suggestion_id = _apply(team)
+    before = (_record_bytes(), _configs())
+    prior = {role: _revision(role) for role in MOVED}
+    child = os.fork()
+    if child == 0:
+        signal.alarm(30)
+        _STOPS[stop]()
+        _undo(team)
+        os._exit(98)
+    _, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 77
+    restart = os.fork()
+    if restart == 0:
+        signal.alarm(30)
+        from hermes_cli import main
+
+        importlib.reload(main)
+        os._exit(0)
+    _, status = os.waitpid(restart, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert not hermes_config._route_batch_journal_path().exists()
+    committed = stop == "after the commit marker"
+    assert (_configs() == before[1]) is not committed
+
+    resp = _undo(team)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["state"] == ("already_undone" if committed else "undone")
+    _finished(team, suggestion_id, prior)
+    assert sorted(_undo_audit()) == ([] if committed else [(role, _PROVIDER, A) for role in MOVED])
 
 
 # ---------------------------------------------------------------------------

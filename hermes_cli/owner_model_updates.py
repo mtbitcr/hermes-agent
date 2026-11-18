@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -342,28 +343,35 @@ def undo_last_model_update(*, journal) -> dict:
     back answers ``already_undone``, so an older update is never reached. The
     entry flips first, so the policy admits the earlier version again, and then
     every role on the newer version moves back in one batch with the revisions
-    read at the start. ``journal(revisions, provider, model)`` writes the audit
+    read at the start. ``journal(revisions, provider, model)`` begins the audit
     of the moved roles, each now on ``model``, inside the enrollment
-    transaction. A batch that fails puts the record back, so nothing changed:
+    transaction and returns its commit, which runs only once the batch journal
+    is committed. A batch that fails puts the record back, so nothing changed:
     ``busy`` when the fence refused, else ``not_applied``. Held under the route
-    batch journal lock, as Update is. Raises :class:`Unavailable` for an
+    batch journal lock, as Update is. The undo state (see
+    :func:`_settle_pending_undo`) is durable before the record flips and goes
+    once the receipt is on the suggestion. Raises :class:`Unavailable` for an
     unreadable record, an unreconciled journal or an audit that cannot be
-    written; a record that cannot be put back raises as it is.
+    written; a record that cannot be put back, or a receipt or undo state that
+    cannot be written, raises as it is.
     """
     from hermes_cli import config as hermes_config
     from plugins.dashboard_auth.raphael_workspace import model_policy
 
     committed: dict[str, str] = {}
+    audits: list = []
 
     def enroll(revisions: dict[str, str]) -> None:
         with model_policy.enrollment_transaction(sorted(revisions)) as snapshot:
             hermes_config.mark_route_batch_enrollment_written(snapshot)
-            journal(revisions, last["provider"], last["from_model"])
+            audits.append(journal(revisions, last["provider"], last["from_model"]))
             hermes_config.mark_route_batch_audit_committed()
             committed.update(revisions)
 
     with hermes_config._route_batch_journal_lock():
         try:
+            hermes_config.assert_route_journal_reconciled()
+            _settle_pending_undo()
             entries = model_policy.read_model_updates()
             last = entries[-1] if entries else None
             roles = roles_on(last["provider"], last["to_model"]) if last else {}
@@ -375,10 +383,16 @@ def undo_last_model_update(*, journal) -> dict:
         if last["state"] != "active":
             return {"state": "already_undone", **update}
         try:
-            prior = model_policy.apply_model_update_record({**last, "state": "rolled_back"})
-        except model_policy.EnrollmentUnavailable as exc:
+            prior, _document = model_policy._load_model_updates(model_policy._model_updates_path())
+            state = _save_undo_state({"phase": "prepared", "entry": last, "roles": roles, "prior": prior})
+        except (model_policy.EnrollmentUnavailable, OSError) as exc:
             raise Unavailable() from exc
+        try:
+            model_policy.apply_model_update_record({**last, "state": "rolled_back"})
+        except model_policy.EnrollmentUnavailable as exc:
+            raise Unavailable() from exc  # The next undo settles the state it left.
         except ValueError:
+            _clear_undo_state()
             return {"state": "not_applied"}
         try:
             revisions = hermes_config.apply_profile_route_batch(
@@ -389,15 +403,13 @@ def undo_last_model_update(*, journal) -> dict:
         except Exception as exc:
             if not committed:
                 model_policy.restore_model_update_record(prior)
+                _clear_undo_state()
                 return _undo_refused(exc, sorted(roles))
             revisions = committed  # Rolled forward: the earlier routes are live.
-    try:
-        _rolled_back_receipt(last, {
-            **update, "provider": last["provider"], "roles": sorted(roles),
-            "revisions": dict(sorted(revisions.items())), "prior_revisions": dict(sorted(roles.items())),
-        })
-    except Exception as exc:  # The undo stands; only its receipt is missing.
-        _log.warning("model update undo: receipt not written (%s)", type(exc).__name__)
+        state = _save_undo_state({**state, "phase": "committed", "receipt": _receipt(last, roles, revisions)})
+        for commit in audits:
+            commit()  # A failure leaves the undo standing; the next undo appends the receipt.
+        _finish_undo(state)
     return {"state": "undone", "roles": sorted(roles), **update}
 
 
@@ -435,8 +447,12 @@ def _running_roles(roles: list[str]) -> list[str]:
     return sorted(running)
 
 
-def _rolled_back_receipt(entry: dict, receipt: dict) -> None:
-    """One ``model_update_rolled_back`` event on the suggestion of ``entry``'s decision."""
+def _rolled_back_receipt(entry: dict, receipt: dict) -> bool:
+    """One ``model_update_rolled_back`` event on the suggestion of ``entry``'s decision.
+
+    An entry is rolled back once, so a suggestion that already holds the event
+    is not given a second. False when no suggestion row is found.
+    """
     from hermes_cli.owner_workspace import _owner_decision_ref, list_committed_projects, resolve_owner_context
 
     ctx = resolve_owner_context()
@@ -444,15 +460,95 @@ def _rolled_back_receipt(entry: dict, receipt: dict) -> None:
     for project in list_committed_projects(ctx):
         with contextlib.closing(kanban_db.connect(board=project["board"])) as conn:
             rows = conn.execute(
-                "SELECT id FROM tasks WHERE task_kind = 'recommendation' "
+                "SELECT id, EXISTS (SELECT 1 FROM task_events WHERE task_id = tasks.id AND kind = ?) AS done "
+                "FROM tasks WHERE task_kind = 'recommendation' "
                 "AND recommendation_kind = ? AND recommendation_subject_id LIKE ?",
-                (_KIND, subject),
+                ("model_update_rolled_back", _KIND, subject),
             ).fetchall()
         for row in rows:
             ref = _owner_decision_ref(ctx, authority="recommendation", native_id=str(row["id"]))
             if ref == entry["decision_ref"]:
-                _append_receipt(project["board"], str(row["id"]), "model_update_rolled_back", receipt)
-                return
+                if not row["done"]:
+                    _append_receipt(project["board"], str(row["id"]), "model_update_rolled_back", receipt)
+                return True
+    return False
+
+
+def _receipt(entry: dict, prior: dict[str, str], revisions: dict[str, str]) -> dict:
+    return {
+        "from_model": entry["from_model"], "to_model": entry["to_model"], "provider": entry["provider"],
+        "roles": sorted(prior), "revisions": dict(sorted(revisions.items())),
+        "prior_revisions": dict(sorted(prior.items())),
+    }
+
+
+def _settle_pending_undo() -> None:
+    """Finish, or put back, an undo that a process exit or a failed step left pending.
+
+    Called under the route batch journal lock. Once the batch journal is
+    settled its batch is all or nothing, so the roles' configs say whether the
+    undo took effect: if any role still has its prior revision, the record goes
+    back to its exact prior text; if every role moved, only the receipt is owed.
+    No other record write lands while the state is pending (see
+    ``model_policy._refuse_while_undo_pending``), so the prior text erases no
+    later entry.
+    """
+    from hermes_cli import config as hermes_config
+    from hermes_cli.profiles import get_profile_dir
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    state = _read_undo_state()
+    if state is None:
+        return
+    if state["phase"] != "committed":
+        hermes_config.reconcile_profile_route_batch_journal()
+        prior = state["roles"]
+        now = {role: hermes_config.profile_route_revision(get_profile_dir(role)) for role in prior}
+        if not prior or any(now[role] == prior[role] for role in prior):
+            model_policy.restore_model_update_record(state["prior"])
+            _clear_undo_state()
+            return
+        state = _save_undo_state({**state, "phase": "committed", "receipt": _receipt(state["entry"], prior, now)})
+    _finish_undo(state)
+
+
+def _finish_undo(state: dict) -> None:
+    """Put the pending receipt on the suggestion, then drop the undo state."""
+    if not _rolled_back_receipt(state["entry"], state["receipt"]):
+        # The suggestion is gone, so there is nothing to hold the receipt.
+        _log.warning("model update undo: no suggestion for its receipt")
+    _clear_undo_state()
+
+
+def _read_undo_state() -> Optional[dict]:
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    try:
+        return json.loads(model_policy._model_update_undo_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise Unavailable() from exc
+
+
+def _save_undo_state(state: dict) -> dict:
+    from hermes_cli.config import _fsync_directory
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+    from utils import atomic_json_write
+
+    path = model_policy._model_update_undo_path()
+    atomic_json_write(path, state)
+    _fsync_directory(path.parent)
+    return state
+
+
+def _clear_undo_state() -> None:
+    from hermes_cli.config import _fsync_directory
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    path = model_policy._model_update_undo_path()
+    path.unlink(missing_ok=True)
+    _fsync_directory(path.parent)
 
 
 def start_practice(project: dict, role: str) -> str:

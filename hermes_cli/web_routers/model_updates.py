@@ -58,16 +58,24 @@ async def undo_model_update(request: Request, profile: Optional[str] = None):
     from hermes_cli import owner_model_updates as omu
     from plugins.dashboard_auth.raphael_workspace import model_policy
 
-    def journal(revisions: dict, provider: str, model: str) -> None:
+    def journal(revisions: dict, provider: str, model: str):
         try:
-            model_policy.journal_models_machine_batch_success(
+            audit = model_policy.journal_models_machine_batch_success(
                 request,
                 action="model_update_undo",
                 roles=[(role, provider) for role in sorted(revisions)],
                 models={role: model for role in revisions},
-            ).commit()
+            )
         except Exception as exc:
             raise omu.Unavailable() from exc
+
+        def commit() -> None:
+            try:
+                audit.commit()
+            except Exception as exc:
+                raise omu.Unavailable() from exc
+
+        return commit
 
     try:
         result = await run_in_threadpool(omu.undo_last_model_update, journal=journal)
