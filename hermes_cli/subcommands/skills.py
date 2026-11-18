@@ -119,9 +119,9 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
     skills_opt_out = skills_subparsers.add_parser(
         "opt-out", help="Stop bundled skills from being seeded into this profile",
         description="Write the .no-bundled-skills marker so the installer, "
-            "`hermes update`, and any direct sync stop seeding bundled skills "
-            "into the active profile. By default nothing already on disk is "
-            "touched. Pass --remove to ALSO delete bundled skills that are "
+            "`hermes update`, and any direct sync stop seeding new bundled skills "
+            "into the active profile; bundled skills already present keep receiving "
+            "updates unless you changed them. Pass --remove to ALSO delete bundled skills that are "
             "unmodified (user-edited and hub/local skills are never removed).")
     _flag(skills_opt_out, "--remove", help="Also delete already-present unmodified bundled skills")
     add_yes_flag(skills_opt_out, "Skip confirmation prompt when using --remove")
