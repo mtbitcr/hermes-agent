@@ -351,6 +351,16 @@ def test_t3_the_frozen_input_marks_each_suggestion_with_its_linked_card(world):
     assert {item["id"]: item.get("linked_card", "absent") for item in frozen["sources"]["suggestions"]} == dict.fromkeys(linked)
 
 
+def test_t3_the_instruction_requires_planning_an_accepted_suggestion_with_a_null_linked_card(world):
+    with _summary_board() as board:
+        body = kanban_db.get_task(board, world["review_task"]).body
+    instruction = " ".join(body.split("<<<BEGIN UNTRUSTED DATA")[0].lower().split())
+
+    assert "must plan" in instruction
+    assert "plans three" in instruction
+    assert "refuses" in instruction
+
+
 def test_t4_a_delivered_linked_card_settles_its_accepted_suggestion_and_the_review_closes_it(world):
     linked, card = world["linked"], world["card"]
     proposal = {"recommendation_id": linked, "card_id": card, "reason": "Lunch for the guests is ordered.",
