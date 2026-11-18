@@ -40,10 +40,10 @@ class PortfolioRefused(ValueError):
         self.detail = dict(detail or {})
 
 
-def _input(registry, projects, day, now=None):
+def _input(registry, projects, day, now=None, complete=()):
     now = int(time.time()) if now is None else now
-    records = []
-    for project in projects:
+    records, scope = [], []
+    for project in [*projects, *complete]:
         brief = projects_db.get_project_review_brief(registry, project.id)
         with events._read_only(events._board_path(project.board_slug)) as board:
             decisions = review._owner_decisions(board, project.id)
@@ -51,13 +51,17 @@ def _input(registry, projects, day, now=None):
         approvals = plan_approvals_waiting(registry, project.id)
         if approvals is not None:
             steps["plan_approvals"] = approvals
+        # A Project whose approved work is complete joins only on a day when it holds an owner step.
+        if project in complete and not sum(steps.values()):
+            continue
         since = [wait[2] for wait in decisions["waits"]]
         text = {"needs_you": brief["needs_you"] if brief else None}
         records.append({"name": project.name,
                         "review_state": "reviewed" if brief and brief["review_date"] == day else "not reviewed today",
                         "brief": text, "owner_steps": steps,
                         "oldest_answer_days": max(0, (now - min(since)) // 86400) if since else None})
-    return {"projects": records, "project_scope": [project.id for project in projects]}
+        scope.append(project.id)
+    return {"projects": records, "project_scope": scope}
 
 
 def _owner_step_total(record):
@@ -240,12 +244,22 @@ def _portfolio_tick(registry, settings, now, *, room):
     key = f"project-review:portfolio:{day}:0"
     if room < 1 or review.budget(registry, day)[1] >= settings.portfolio_cap:
         return 0
-    projects = [project for project in projects_db.list_projects(registry) if review._allowed(registry, settings, project.id)]
-    if not projects or not _ready(registry, projects, day, settings, now):
+    # A Project whose approved work is complete is active only to "finish" a review (review._active). It joins on a day
+    # when it holds an owner step (_input); _ready does not wait for it, as without news it gets no daily review.
+    projects, complete = [], []
+    for project in projects_db.list_projects(registry):
+        if review._allowed(registry, settings, project.id):
+            projects.append(project)
+        elif review._allowed(registry, settings, project.id, step="finish"):
+            complete.append(project)
+    if not (projects or complete) or not _ready(registry, projects, day, settings, now):
         return 0
     gated = False
     try:
-        value = _input(registry, projects, day, now)
+        value = _input(registry, projects, day, now, complete)
+        if not value["project_scope"]:
+            # Only complete Projects with no owner step: the day has no Project to review, as with none allowed.
+            return 0
         gated = sum(1 for record in value["projects"] if _owner_step_total(record) > 0) < 2
         if not gated:
             fitted = _fit(value)

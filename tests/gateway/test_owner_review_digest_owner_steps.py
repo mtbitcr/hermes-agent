@@ -5,9 +5,10 @@ import json
 import time
 
 import pytest
+import yaml
 
 from gateway import owner_channel_pause
-from hermes_cli import projects_db
+from hermes_cli import kanban_db, owner_project_review as review, owner_workspace as ow, projects_db
 from hermes_cli.owner_project_review_owner_line import owner_line
 from tests.gateway.test_owner_heads_up import HOME_CHAT, root  # noqa: F401
 from tests.gateway.test_owner_heads_up import _waiting
@@ -16,9 +17,11 @@ from tests.gateway.test_owner_review_digest import (  # noqa: F401
 )
 from tests.hermes_cli.test_owner_project_review_cycle import _at
 from tests.hermes_cli.test_owner_project_review_owner_line import NAME, RID, _chat, _link
+from tests.hermes_cli.test_owner_project_review_result import _suggestion
 
 ROOM_IS_BOOKED = "Meeting Plan: The room is booked."
 GUEST_LIST = "Meeting Plan: Prepare the guest list."
+NO_ADVICE_LINE = "Raphael has no advice across your projects today."
 
 
 def _line(project, waiting=0, pending=0, approvals=None):
@@ -52,6 +55,37 @@ async def test_a_wait_whose_heads_up_was_sent_is_named_on_the_next_morning_and_o
         # The wait is named one time, by the fixed owner line alone, and its question is not in the message.
         assert adapter.sent == [(HOME_CHAT, _morning(day, _line(ready, waiting=1), ROOM_IS_BOOKED, GUEST_LIST))]
         adapter.sent.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_complete_project_in_the_scope_the_portfolio_stored_has_its_owner_line(root, monkeypatch):
+    now = _at(2026, 11, 10, 6, 30)
+    monkeypatch.setattr(time, "time", lambda: now)
+    project = _project(root, "Design Loop")
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        done = projects_db.get_project(registry, project["project_id"])
+    # Its one approved card is done, so its work is complete; one suggestion still waits for the owner.
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board=done.board_slug), board=done.board_slug) as board:
+        card = kanban_db.create_task(board, title="Draw the loop", project_id=done.id)
+        assert kanban_db.complete_task(board, card, summary="Done.")
+        _suggestion(board, done)
+    assert ow.project_steward_snapshot(project_id=done.id)["execution"]["state"] == "complete"
+    config = yaml.safe_load((root / "config.yaml").read_text())
+    config["owner_review"] = {"enabled": True, "portfolio": True, "digest": True, "allowlist": [done.id]}
+    (root / "config.yaml").write_text(yaml.safe_dump(config))
+
+    # The daily tick stores the day's portfolio brief through owner_portfolio_review; nothing writes it by hand.
+    assert review.review_tick(now) == 0
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        brief = projects_db.get_portfolio_review_brief(registry, "2026-11-10")
+    assert brief is not None and brief["project_scope"] == [done.id]
+
+    adapter = Adapter()
+    digest = importlib.import_module("gateway.owner_review_digest")
+    assert await digest.tick(_runner(adapter)) == 1
+    assert adapter.sent == [(HOME_CHAT, "\n".join([
+        "Your daily project review (2026-11-10)", NO_ADVICE_LINE, _line(project, pending=1),
+    ]))]
 
 
 @pytest.mark.asyncio

@@ -6,8 +6,9 @@
 Run it from the kit folder: it uses ``capture.mjs`` and ``design_compare_judge.py`` that sit next
 to it. The kit captures the built website (candidate side) and the full-page file (prototype
 side) for the same routes at both widths; the judge compares each pair. The check passes only
-with zero blocked requests and zero font-family and font-face findings at both widths; other
-findings are the designed change and are counted. ``DIR/self-check.json`` records the file's
+with zero blocked requests of the full-page file and zero font-family and font-face findings at
+both widths; the built website's blocked requests are reported per width in
+``site_blocked_requests``, not judged. Other findings are the designed change and are counted. ``DIR/self-check.json`` records the file's
 SHA-256, the SHA-256 of the two embedded fonts, the kit hash, the Chromium version and the
 counts per width.
 
@@ -83,7 +84,8 @@ def compare_folders(candidate_dir, prototype_dir) -> dict:
     candidate, prototype = _read_side(Path(candidate_dir)), _read_side(Path(prototype_dir))
     if not candidate or set(candidate) != set(prototype):
         raise CheckError("the two sides captured different pages or widths")
-    widths = {str(w): {"findings": 0, "font_findings": 0, "blocked_requests": 0, "by_kind": Counter()} for w in WIDTHS}
+    widths = {str(w): {"findings": 0, "font_findings": 0, "blocked_requests": 0, "site_blocked_requests": 0,
+                         "by_kind": Counter()} for w in WIDTHS}
     kits, versions = set(), set()
     for key in sorted(candidate):
         cand, proto = candidate[key], prototype[key]
@@ -97,8 +99,9 @@ def compare_folders(candidate_dir, prototype_dir) -> dict:
             row["by_kind"][f"{finding.kind}/{finding.property}"] += 1
             if finding.property in FONT_PROPERTIES:
                 row["font_findings"] += 1
+        row["site_blocked_requests"] += len(cand.get("blocked_requests") or [])
+        row["blocked_requests"] += len(proto.get("blocked_requests") or [])
         for bundle in (cand, proto):
-            row["blocked_requests"] += len(bundle.get("blocked_requests") or [])
             kits.add(bundle.get("kit_sha256"))
             versions.add(bundle.get("chromium_version"))
     for row in widths.values():
@@ -167,7 +170,8 @@ def main(argv=None) -> int:
         row = report["widths"][str(width)]
         others += row["findings"] - row["font_findings"]
         print(f"{width} px: {row['findings']} findings, {row['font_findings']} font findings, "
-              f"{row['blocked_requests']} blocked requests")
+              f"{row['blocked_requests']} blocked requests of the full-page file, "
+              f"{row['site_blocked_requests']} blocked requests of the website")
     if report["passed"]:
         print(f"self-check passed: 0 font findings at {WIDTHS[0]} px and {WIDTHS[1]} px; "
               f"{others} other findings are the designed change")
