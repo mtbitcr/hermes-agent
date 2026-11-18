@@ -30,6 +30,7 @@ from hermes_cli import owner_project_summary_events as summary_events
 from hermes_cli import release_ledger as ledger
 from hermes_cli.profiles import seed_profile_skills
 from hermes_cli.subcommands.release import build_release_parser
+from hermes_constants import mark_named_profile_deleted
 # The run's and the recovery's own test hosts and helpers, as those files build them.
 from tests.hermes_cli import test_release_recover as recover_tests
 from tests.hermes_cli import test_release_run as run_tests
@@ -110,6 +111,25 @@ def test_full_result_returns_the_whole_sync_result_and_the_call_without_it_is_un
     assert capsys.readouterr().out == "⚠ Skill seeding timed out (60s)\n"
     assert seed_profile_skills(role.home, quiet=True, full_result=True) is None
     assert capsys.readouterr().out == ""
+
+
+def test_full_result_refuses_a_deleted_role_home_in_the_child(served):
+    """The child refuses a tombstoned role home before the sync can create anything in it, its
+    tree gone or still there, so a stale role list cannot bring a deleted role back. A live
+    role home still gets its result."""
+    _write_skill(served.bundled, "tools/alpha", "v1")
+    live, gone, left = served.home("live"), served.home("gone"), served.home("left")
+    assert isinstance(seed_profile_skills(live, quiet=True, full_result=True), dict)
+    assert (live / "skills" / "tools" / "alpha" / "SKILL.md").is_file()
+    for home in (gone, left):
+        mark_named_profile_deleted(home)
+    shutil.rmtree(gone)
+    before = sorted(left.rglob("*"))
+
+    assert seed_profile_skills(gone, quiet=True, full_result=True) is None
+    assert not gone.exists()
+    assert seed_profile_skills(left, quiet=True, full_result=True) is None
+    assert sorted(left.rglob("*")) == before
 
 
 # ── The record: record_skill_delivery and last_skill_delivery ───────────────────────────
@@ -324,9 +344,24 @@ def _refreshed_line(batch_id: int, role: str, updated: int = 0, kept: str = "non
             f"kept: {kept}; refused: {refused}; {unseeded} not seeded because of the marker.")
 
 
-def _failed_line(batch_id: int, role: str) -> str:
+def _failed_line(batch_id: int, role: str, updated: int = 0, kept: str = "none", refused: str = "none",
+                 unseeded: int = 0, unavailable: bool = False) -> str:
+    items = f"{updated} updated; kept: {kept}; refused: {refused}; {unseeded} not seeded because of the marker."
+    if unavailable:
+        return (f"Skills after release {batch_id}, role {role}: not refreshed (the role no longer exists). "
+                f"{items} The release itself is done.")
     return (f"Skills after release {batch_id}, role {role}: not refreshed (the refresh did not finish). "
-            "It keeps its earlier skills until the next release; the release itself is done.")
+            f"{items} It keeps its earlier skills until the next release; the release itself is done.")
+
+
+def _entry_line(batch_id: int, entry: dict) -> str:
+    """The owner line rendered from one ledger entry alone: its status, its reason and its four items."""
+    kept, refused = (", ".join(f"{item['name']} ({item['reason']})" for item in entry[key]) or "none"
+                     for key in ("kept", "refused"))
+    items = (entry["updated"], kept, refused, entry["not_seeded_by_marker"])
+    if entry["status"] == "refreshed":
+        return _refreshed_line(batch_id, entry["role"], *items)
+    return _failed_line(batch_id, entry["role"], *items, unavailable=entry["reason"] == "unavailable")
 
 
 def _only_the_error_type(out: str, name: str, *hidden: str) -> None:
@@ -404,6 +439,70 @@ def test_each_role_gets_one_entry_and_one_line_and_a_role_without_a_result_is_fa
                                _failed_line(released, "broken"), _failed_line(released, "slow")])]
     for text in (json.dumps(row), told[0]):
         assert "official" not in text and "/" not in text and str(tmp_path) not in text
+
+
+def test_a_failed_roles_line_holds_the_four_items_of_its_entry(conn, served, told, capsys, monkeypatch):
+    """Owner fact 4 for failed roles: the sync of ``broken`` exits non-zero, the one of ``slow``
+    passes its time limit and the call for ``raising`` raises. Each role's owner line is the one
+    its ledger entry renders from its status and its four items, with no path."""
+    released = _released(conn, "released")
+    broken, slow, raising = served.home("broken"), served.home("slow"), served.home("raising")
+    started = _children(monkeypatch, {str(served.root): FOUR_ITEMS, str(broken): 1,
+                                      str(slow): subprocess.TimeoutExpired(["python"], 60)})
+    seeded = release_cmd.seed_profile_skills
+
+    def seed(home, **options):
+        if home == raising:
+            raise RuntimeError(f"the sync broke in {home}")
+        return seeded(home, **options)
+
+    monkeypatch.setattr(release_cmd, "seed_profile_skills", seed)
+    assert release_cmd._deliver_skills(released, _Actions([served.root, broken, slow, raising])) is None
+
+    _only_the_error_type(capsys.readouterr().out, "RuntimeError", "the sync broke")
+    assert started == [str(served.root), str(broken), str(slow)]
+    row = ledger.last_skill_delivery(conn)
+    assert row == {
+        "roles": [_four_items_entry("default"), {"role": "broken", **FAILED, "reason": "no result"},
+                  {"role": "slow", **FAILED, "reason": "no result"},
+                  {"role": "raising", **FAILED, "reason": "RuntimeError"}],
+        "refreshed": 1, "failed": 3,
+    }
+    assert told == ["\n".join(_entry_line(released, entry) for entry in row["roles"])]
+    assert "/" not in told[0] and "official" not in told[0]
+
+
+def test_a_role_deleted_while_an_earlier_role_syncs_is_not_brought_back(conn, served, told, capsys, monkeypatch):
+    """The role list is read once, and ``victim`` is deleted as ``hermes profile delete`` does it,
+    its tombstone and then its tree, while the root's real sync runs. No sync starts in its home,
+    the home stays gone, and its entry and its line say that the role no longer exists."""
+    released = _released(conn, "released")
+    victim = served.home("victim")
+    _write_skill(served.bundled, "tools/alpha", "v1")
+    real_run, started = subprocess.run, []
+
+    def child(*args, **kwargs):
+        started.append(kwargs["env"]["HERMES_HOME"])
+        if kwargs["env"]["HERMES_HOME"] == str(served.root):
+            mark_named_profile_deleted(victim)
+            shutil.rmtree(victim)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(profiles.subprocess, "run", child)
+    assert release_cmd._deliver_skills(released, _Actions([served.root, victim])) is None
+
+    assert capsys.readouterr().out == ""
+    assert not victim.exists()
+    assert started == [str(served.root)]
+    assert ledger.last_skill_delivery(conn) == {
+        "roles": [{"role": "default", "status": "refreshed", "updated": 0, "kept": [], "refused": [],
+                   "not_seeded_by_marker": 0},
+                  {"role": "victim", "status": "failed", "updated": 0, "kept": [], "refused": [],
+                   "not_seeded_by_marker": 0, "reason": "unavailable"}],
+        "refreshed": 1, "failed": 1,
+    }
+    assert told == ["\n".join([_refreshed_line(released, "default"),
+                               _failed_line(released, "victim", unavailable=True)])]
 
 
 def test_a_record_that_cannot_be_written_prints_only_the_error_type_and_still_tells_the_owner(
@@ -543,6 +642,8 @@ def test_a_released_run_delivers_once_after_its_outcome_and_resume_and_before_th
     it was: released, exit 0, its pause lifted, nothing rolled back."""
     batch_id = run_tests._accepted(1)["batch_id"]
     broken, slow = run_root / "profiles" / "broken", run_root / "profiles" / "slow"
+    for home in (broken, slow):
+        home.mkdir(parents=True)
     host = run_tests.FakeHost()
     host._served_homes = lambda: [run_root, broken, slow]
     started = _children(monkeypatch, {str(run_root): FOUR_ITEMS, str(broken): 1,
@@ -606,6 +707,28 @@ def test_a_recovery_that_ends_released_delivers_once_after_its_outcome_and_resum
     assert told == [released, _four_items_line(batch_id, "default")]
 
 
+def test_a_recovery_that_ends_released_tells_a_failed_role_its_four_items(recover_root, told, monkeypatch):
+    """The sync of ``coder`` exits non-zero: its line, like the root's, is the one its ledger
+    entry renders, with its four items."""
+    batch_id = recover_tests._stopped_midway()
+    recover_tests._snapshots(recover_root, f"config/{recover_tests.NEW}")  # published before the cutover
+    coder = recover_root / "profiles" / "coder"
+    coder.mkdir(parents=True)
+    host = recover_tests.FakeHost()  # at NEW, which reads back
+    host._served_homes = lambda: [recover_root, coder]
+    started = _children(monkeypatch, {str(recover_root): FOUR_ITEMS, str(coder): 1})
+
+    assert recover_tests._command(monkeypatch, host, "recover", str(batch_id)) == 0
+
+    assert started == [str(recover_root), str(coder)]
+    with contextlib.closing(ledger.connect()) as conn:
+        row = ledger.last_skill_delivery(conn)
+    assert row == {"roles": [_four_items_entry("default"), {"role": "coder", **FAILED, "reason": "no result"}],
+                   "refreshed": 1, "failed": 1}
+    assert told == [f"Release {batch_id} was released.",
+                    "\n".join(_entry_line(batch_id, entry) for entry in row["roles"])]
+
+
 def test_a_recovery_that_ends_restored_never_delivers(recover_root, steps, monkeypatch):
     batch_id = recover_tests._stopped_midway()
     recover_tests._snapshots(recover_root, f"config/{recover_tests.NEW}")  # published before the cutover
@@ -625,6 +748,8 @@ def test_a_run_whose_every_role_fails_still_ends_released(run_root, told, monkey
     Only the interrupt, an error inside the step, reaches the journal, by its type alone."""
     batch_id = run_tests._accepted(1)["batch_id"]
     coder, writer = run_root / "profiles" / "coder", run_root / "profiles" / "writer"
+    for home in (coder, writer):
+        home.mkdir(parents=True)
     host = run_tests.FakeHost()
     host._served_homes = lambda: [run_root, coder, writer]
     _children(monkeypatch, {str(run_root): 1, str(coder): subprocess.TimeoutExpired(["python"], 60),

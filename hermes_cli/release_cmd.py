@@ -55,7 +55,7 @@ from hermes_cli.release_guards import GATEWAY_UNIT, GUARDS, SERVE_UNIT, Pins, Re
 from hermes_cli.release_host import LiveHostReader
 from hermes_cli.release_host_actions import SYNC_EXTRAS, ReleaseHostActions
 from hermes_cli.release_runner import SANDBOX_TUNNEL_UNIT, run_release
-from hermes_constants import get_default_hermes_root, get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home, named_profile_is_deleted
 
 # The host's unit names and readback address are not in the repository, so an empty one refuses
 # here, before anything runs, instead of failing a readback after the cutover.
@@ -451,9 +451,10 @@ def _deliver_skills(batch_id: int, actions: ReleaseHostActions) -> None:
     """After a released batch, run the approved skill delivery in every role the gateway serves,
     the root first: the role's seeding with its full result, one role at a time. One
     ``skills_delivered`` row records each role (names, reasons and counts, never a path) and the
-    owner gets one plain line per role. An error, a missing result or the time limit fails only
-    that role, and the journal shows only the type of an error. Nothing here raises, and nothing
-    changes the outcome, the exit status or the pause."""
+    owner gets one plain line per role, rendered from its entry. A named role deleted since the list
+    was read gets no sync and fails as unavailable. An error, a missing result or the time limit
+    fails only that role, and the journal shows only the type of an error. Nothing here raises, and
+    nothing changes the outcome, the exit status or the pause."""
     try:
         homes = [Path(home) for home in actions._served_homes()]
     except (Exception, KeyboardInterrupt) as error:
@@ -467,6 +468,10 @@ def _deliver_skills(batch_id: int, actions: ReleaseHostActions) -> None:
         entry = {"role": role, "status": "failed", "updated": 0, "kept": [], "refused": [],
                  "not_seeded_by_marker": 0, "reason": "no result"}
         try:
+            if index and (named_profile_is_deleted(home) or not home.is_dir()):
+                # Deleted since the role list was read: its sync would create the home again.
+                roles.append({**entry, "reason": "unavailable"})
+                continue
             result = seed_profile_skills(home, quiet=True, full_result=True)
             if isinstance(result, dict):  # None: a non-zero exit, unreadable output or the time limit
                 entry = {
@@ -482,16 +487,20 @@ def _deliver_skills(batch_id: int, actions: ReleaseHostActions) -> None:
             print(f"The skills of role {role} were not refreshed ({type(error).__name__}).")
         roles.append(entry)
     lines = []
-    for entry in roles:
+    for entry in roles:  # each line from its role's entry alone: its status and its four items
         head = f"Skills after release {batch_id}, role {entry['role']}:"
-        if entry["status"] == "failed":
-            lines.append(f"{head} not refreshed (the refresh did not finish). It keeps its earlier"
-                         " skills until the next release; the release itself is done.")
-            continue
         kept, refused = (", ".join(f"{item['name']} ({item['reason']})" for item in entry[key]) or "none"
                          for key in ("kept", "refused"))
-        lines.append(f"{head} refreshed. {entry['updated']} updated; kept: {kept}; refused: {refused};"
-                     f" {entry['not_seeded_by_marker']} not seeded because of the marker.")
+        items = (f"{entry['updated']} updated; kept: {kept}; refused: {refused};"
+                 f" {entry['not_seeded_by_marker']} not seeded because of the marker.")
+        if entry["status"] == "refreshed":
+            lines.append(f"{head} refreshed. {items}")
+        elif entry["reason"] == "unavailable":
+            lines.append(f"{head} not refreshed (the role no longer exists). {items} The release itself"
+                         " is done.")
+        else:
+            lines.append(f"{head} not refreshed (the refresh did not finish). {items} It keeps its earlier"
+                         " skills until the next release; the release itself is done.")
     refreshed = sum(entry["status"] == "refreshed" for entry in roles)
     payload = {"roles": roles, "refreshed": refreshed, "failed": len(roles) - refreshed}
     try:
