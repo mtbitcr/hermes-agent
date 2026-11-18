@@ -133,12 +133,16 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
 7. Propose at most three closures. Each has exactly recommendation_id, card_id, reason, and evidence.
 """ + f"   The reason has at most {_CLOSURE_REASON_LIMIT} characters." + """ Evidence must name suggestions:<id> and tasks:<id> from this input.
    The card must deliver the suggestion in this Project. A proposal cannot decide or close the suggestion.
-8. You may add plan_proposal, or leave it out. It is null or an object with exactly request_title, summary,
+8. plan_proposal is null or an object with exactly request_title, summary,
    specification, current_milestone, owner_visible_result, later_milestones, and changes.
    Use the native plan change schema. Each existing task reference must use its input status and event revision.
    This is advice for the Project chat. It grants no approval and changes no work.
-   An accepted suggestion with a null linked_card may be planned there: add plan_suggestions, at most three objects
-   with exactly change (the index of an add change in changes) and suggestion (its id).
+   When the input holds an accepted suggestion with a null linked_card, the review must plan it: plan_proposal holds
+   one add change for each such suggestion, and plan_suggestions holds one object for each, with exactly change
+   (the index of an add change in changes) and suggestion (its id). When more than three such suggestions exist, the
+   review plans three of them, the ones last in the input's suggestions list first (the oldest). It leaves one out only
+   when the kernel refuses its pair in the same run, for example for a plan the owner denied: then it removes that
+   pair and keeps each other pair. With no such suggestion, you may add plan_proposal or leave it out.
 9. When Review days start from the start, this is the Project's first review and no review came before it.
    Do not write last review, previous review, earlier review or prior review. Write so far instead.
 """
