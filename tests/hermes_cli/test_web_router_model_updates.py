@@ -12,20 +12,24 @@ stubbed.
 
 from __future__ import annotations
 
+import builtins
 import contextlib
 import errno
 import functools
 import importlib
 import importlib.util
+import io
 import itertools
 import json
 import os
+import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 import yaml
@@ -34,6 +38,7 @@ from hermes_cli import config as hermes_config
 from hermes_cli import kanban_db, owner_workspace as ow, projects_db
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import owner_model_updates as omu
+from hermes_cli.dashboard_auth.audit import _resolve_log_path
 from hermes_cli.profiles import get_profile_dir
 from hermes_constants import get_default_hermes_root, get_hermes_home
 from plugins.dashboard_auth.raphael_workspace import model_policy
@@ -1258,3 +1263,535 @@ def test_every_new_owner_text_passes_the_owner_text_check_and_names_no_model():
         assert check_owner_text(text, "stop_reason_decision") == text
         for name in ("claude", "sonnet", "opus", "gpt", "anthropic", "openai"):
             assert name not in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Owner rule 2: the fault sweep by call count, the deciding proof
+# ---------------------------------------------------------------------------
+
+_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
+
+
+class _Calls:
+    """Point 6: count each call of one run inside the test's Hermes home.
+
+    Counted: each open of a file to read or write (as builtins and pathlib
+    open it, and ``os.open``), each rename, removal and sync, and each open
+    and commit of a board database. The audit store is a file, so its open
+    and its commit (the sync) count the same way. At call ``fault`` an
+    ``"error"`` raises a real ``OSError(EIO)`` instead of the call; an
+    ``"exit"`` ends the process right after the ``fault``-th call that writes.
+    """
+
+    def __init__(self, fault=0, mode="error"):
+        self.fault, self.mode, self.calls, self.paths = fault, mode, [], []
+        self.root = os.path.realpath(get_default_hermes_root())
+        self._lock, self._fds = threading.Lock(), {}
+
+    def _inside(self, target):
+        try:
+            if isinstance(target, int) or hasattr(target, "fileno"):
+                fd = target if isinstance(target, int) else target.fileno()
+                try:
+                    target = os.readlink(f"/proc/self/fd/{fd}")
+                except OSError:
+                    target = self._fds.get(fd, "")
+            target = os.fsdecode(os.fspath(target))
+            if target.startswith("file:"):
+                target = target[5:].split("?", 1)[0]
+            real = os.path.realpath(target)
+        except (OSError, TypeError, ValueError):
+            return False
+        return real == self.root or real.startswith(self.root + os.sep)
+
+    def call(self, kind, target, writes, run):
+        if not self._inside(target):
+            return run()
+        with self._lock:
+            self.calls.append((kind, writes))
+            self.paths.append(os.path.relpath(os.fsdecode(os.fspath(target)), self.root)
+                              if isinstance(target, (str, bytes, os.PathLike)) else repr(target))
+            k = len(self.calls)
+            w = len(self.writes)
+        if k == self.fault and self.mode == "error":
+            raise OSError(errno.EIO, f"synthetic input-output error at call {k} ({kind})")
+        result = run()
+        if writes and w == self.fault and self.mode == "exit":
+            os._exit(77)
+        return result
+
+    def _counted_connection(self, database):
+        calls = self
+
+        class Counted(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):
+                run = functools.partial(sqlite3.Connection.execute, self, sql, *args, **kwargs)
+                if str(sql).lstrip().upper().startswith(("COMMIT", "END")):
+                    return calls.call("commit", database, True, run)
+                return run()
+
+            def commit(self):
+                return calls.call("commit", database, True, functools.partial(sqlite3.Connection.commit, self))
+
+        return Counted
+
+    def __enter__(self):
+        real_open, real_os_open, real_connect = io.open, os.open, sqlite3.connect
+        originals = {name: getattr(os, name) for name in ("replace", "rename", "remove", "unlink", "fsync")}
+
+        def counted_open(file, mode="r", *args, **kwargs):
+            handle = self.call("open", file, any(c in mode for c in "wax+"),
+                               lambda: real_open(file, mode, *args, **kwargs))
+            if isinstance(file, (str, bytes, os.PathLike)):
+                with contextlib.suppress(Exception):
+                    self._fds[handle.fileno()] = os.fspath(file)
+            return handle
+
+        def counted_os_open(path, flags, *args, **kwargs):
+            fd = self.call("os.open", path, bool(flags & _WRITE_FLAGS),
+                           lambda: real_os_open(path, flags, *args, **kwargs))
+            self._fds[fd] = os.fspath(path)
+            return fd
+
+        def counted(name, writes=True):
+            def run(target, *args, **kwargs):
+                return self.call(name, target, writes, lambda: originals[name](target, *args, **kwargs))
+            return run
+
+        def counted_connect(database, *args, **kwargs):
+            if "factory" not in kwargs and not args and self._inside(database):
+                kwargs["factory"] = self._counted_connection(database)
+            return self.call("connect", database, False, lambda: real_connect(database, *args, **kwargs))
+
+        self._patch = pytest.MonkeyPatch()
+        self._patch.setattr(builtins, "open", counted_open)
+        self._patch.setattr(io, "open", counted_open)
+        self._patch.setattr(os, "open", counted_os_open)
+        for name in originals:
+            self._patch.setattr(os, name, counted(name))
+        self._patch.setattr(sqlite3, "connect", counted_connect)
+        return self
+
+    def __exit__(self, *exc):
+        self._patch.undo()
+        return False
+
+    @property
+    def writes(self):
+        return [k for k, (_, writes) in enumerate(self.calls, start=1) if writes]
+
+
+def _eio(*args, **kwargs):
+    raise OSError(errno.EIO, "synthetic input-output error")
+
+
+def _stop_after_first(original):
+    def stop_after(*args, **kwargs):
+        original(*args, **kwargs)
+        raise _AbruptStop()
+
+    return stop_after
+
+
+# Point 7: the fault-free undo, and the settle (by the next undo) of each
+# state a fault can leave.
+_SWEEP = {
+    "fault-free undo of two roles": None,
+    "settle after a fault in the event write": lambda patch: patch.setattr(omu, "_append_receipt", _eio),
+    "settle after a fault in the audit commit": lambda patch: patch.setattr(model_policy, "commit_audit_batch", _eio),
+    "settle after a fault between the two route writes":
+        lambda patch: patch.setattr(omu, "_write_model", _stop_after_first(omu._write_model)),
+}
+
+
+def _sweep_start(team, scenario, saved):
+    """Build the scenario's start state once and keep a copy of the home."""
+    suggestion_id = _apply(team)
+    before = (_record_bytes(), _configs())
+    if _SWEEP[scenario] is not None:
+        with pytest.MonkeyPatch.context() as patch:
+            _SWEEP[scenario](patch)
+            try:
+                assert _undo(team).status_code == 503
+            except BaseException as exc:  # the stop, as the test client's task group raises it
+                if not isinstance(exc, (_AbruptStop, BaseExceptionGroup)):
+                    raise
+        assert _undo_state_path().exists()
+    shutil.copytree(get_default_hermes_root(), saved, symlinks=True)
+    return suggestion_id, before
+
+
+def _restore_home(saved):
+    """The scenario's start again: the home's bytes, and no process memory of a run."""
+    root = get_default_hermes_root()
+    shutil.rmtree(root)
+    shutil.copytree(saved, root, symlinks=True)
+    hermes_config._ROUTE_JOURNAL_BLOCKED = None
+    hermes_config._LOAD_CONFIG_CACHE.clear()
+    hermes_config._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+
+
+def _counted_undo(team, fault=0):
+    """One undo through the signed-in route with an EIO at call ``fault``."""
+    with _Calls(fault) as calls:
+        try:
+            resp = _undo(team)
+        except Exception as exc:  # what escaped the app, as the test client raises it
+            resp = exc
+    return resp, calls
+
+
+def _fault_free_count(team, saved, suggestion_id, before):
+    """Point 7: N from a fault-free run, the same on a repeat run."""
+    runs = []
+    for _ in range(2):
+        _restore_home(saved)
+        earlier = _stores(team, suggestion_id)
+        resp, calls = _counted_undo(team)
+        _answer_is_true(resp, team, suggestion_id, before, earlier)
+        assert resp.status_code == 200 and _whole(team, suggestion_id, before) == "A"
+        runs.append(calls)
+    assert len(runs[0].calls) > 0
+    assert runs[0].calls == runs[1].calls, "the fault-free count differs on a repeat run"
+    return runs[0]
+
+
+def _first_then_second(team, suggestion_id, before, earlier, first, where):
+    """Point 9: a true first answer, then one fault-free undo that ends whole."""
+    assert not isinstance(first, BaseException), f"{where}: the first answer is an exception: {first!r}"
+    if first.status_code == 503:  # the route's 503, or the sign-in's own before the route
+        assert first.json()["detail"] == "Service Unavailable", f"{where}: {first.text}"
+        if not _undo_state_path().exists():
+            _whole(team, suggestion_id, before)
+    else:
+        _answer_is_true(first, team, suggestion_id, before, earlier)
+    earlier = _stores(team, suggestion_id)
+    second = _undo(team)
+    assert second.status_code == 200, f"{where}: second answer {second.status_code} {second.text}"
+    _answer_is_true(second, team, suggestion_id, before, earlier)
+    return _whole(team, suggestion_id, before)
+
+
+@pytest.mark.parametrize("scenario", sorted(_SWEEP))
+def test_rule2_an_error_at_each_counted_call_then_one_more_undo_ends_whole(team, tmp_path, scenario):
+    suggestion_id, before = _sweep_start(team, scenario, tmp_path / "saved-home")
+    n = len(_fault_free_count(team, tmp_path / "saved-home", suggestion_id, before).calls)
+    print(f"RULE2_SWEEP error {scenario}: N={n}")
+    for k in range(1, n + 1):
+        _restore_home(tmp_path / "saved-home")
+        earlier = _stores(team, suggestion_id)
+        first, calls = _counted_undo(team, fault=k)
+        assert len(calls.calls) >= k, f"call {k} was not reached"
+        _first_then_second(team, suggestion_id, before, earlier, first, f"call {k} {calls.calls[k - 1]} {calls.paths[k - 1]}")
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("scenario", sorted(_SWEEP))
+def test_rule2_a_real_exit_right_after_each_counted_write_then_one_more_undo_ends_whole(team, tmp_path, scenario):
+    suggestion_id, before = _sweep_start(team, scenario, tmp_path / "saved-home")
+    writes = _fault_free_count(team, tmp_path / "saved-home", suggestion_id, before).writes
+    print(f"RULE2_SWEEP exit {scenario}: writes={len(writes)}")
+    assert writes
+    seen = tmp_path / "child-calls.json"
+    for k in range(1, len(writes) + 1):
+        _restore_home(tmp_path / "saved-home")
+        child = os.fork()
+        if child == 0:
+            try:
+                signal.alarm(60)
+                with _Calls(k, "exit") as calls:
+                    _undo(team)
+                seen.write_text(json.dumps(calls.calls))
+            finally:
+                os._exit(98)
+        _, status = os.waitpid(child, 0)
+        assert os.waitstatus_to_exitcode(status) == 77, (
+            f"write {k}: the child did not stop there; it made {seen.read_text() if seen.exists() else '?'}")
+        hermes_config._ROUTE_JOURNAL_BLOCKED = None
+        hermes_config._LOAD_CONFIG_CACHE.clear()
+        hermes_config._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+        if not _undo_state_path().exists():
+            _whole(team, suggestion_id, before)
+        earlier = _stores(team, suggestion_id)
+        second = _undo(team)
+        assert second.status_code == 200, f"write {k}: second answer {second.status_code} {second.text}"
+        _answer_is_true(second, team, suggestion_id, before, earlier)
+        _whole(team, suggestion_id, before)
+
+
+# ---------------------------------------------------------------------------
+# The probes of review rounds one to three (attachments 1830, 1841, 1849),
+# each with its fault and its assertions; the autouse latch fixture above
+# restores the route journal latch after each.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.linux_only
+def test_review_r1_real_process_exit_and_cli_startup_keep_record_and_configs_together(team):
+    _apply(team)
+    before = (_record_bytes(), _configs())
+    child = os.fork()
+    if child == 0:
+        signal.alarm(30)
+        original = omu._write_model
+
+        def exit_after_durable_config(*args, **kwargs):
+            original(*args, **kwargs)
+            os._exit(77)
+
+        omu._write_model = exit_after_durable_config
+        _undo(team)
+        os._exit(98)
+    _, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 77
+    assert hermes_config._route_batch_journal_path().exists()
+    restart = os.fork()
+    if restart == 0:
+        signal.alarm(30)
+        from hermes_cli import main
+
+        importlib.reload(main)
+        os._exit(0)
+    _, status = os.waitpid(restart, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert not hermes_config._route_batch_journal_path().exists()
+    _undo(team)
+    assert _record_bytes() == before[0] or all(_model(role) == A for role in MOVED)
+
+
+def test_review_r1_audit_write_failure_before_commit_restores_everything(team, monkeypatch):
+    _apply(team)
+    before = (_record_bytes(), _configs())
+
+    def fail(*args, **kwargs):
+        raise model_policy.AuditWriteError("synthetic pre-commit failure")
+
+    monkeypatch.setattr(model_policy, "begin_audit_batch", fail)
+    resp = _undo(team)
+    assert resp.status_code == 503
+    assert (_record_bytes(), _configs()) == before
+    assert _undo_audit() == []
+
+
+def test_review_r1_a_committed_audit_never_describes_reverted_routes(team, monkeypatch):
+    _apply(team)
+    original = hermes_config._write_route_batch_journal_record
+
+    def fail_marker(record):
+        if record["phase"] == hermes_config._ROUTE_BATCH_AUDIT_COMMITTED:
+            raise OSError(errno.EIO, "synthetic journal marker I/O failure")
+        return original(record)
+
+    monkeypatch.setattr(hermes_config, "_write_route_batch_journal_record", fail_marker)
+    _undo(team)
+    actual = {role: _model(role) for role in MOVED}
+    assert all(actual[role] == model for role, provider, model in _undo_audit())
+
+
+def test_review_r1_unreconciled_journal_refuses_before_flipping_record(team, monkeypatch):
+    def fail_retirement():
+        raise hermes_config._block_route_journal("synthetic retirement I/O failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(hermes_config, "_clear_route_batch_journal", fail_retirement)
+        _apply(team)
+    assert hermes_config._ROUTE_JOURNAL_BLOCKED is not None
+    before = (_record_bytes(), _configs())
+    resp = _undo(team)
+    assert resp.status_code == 503
+    assert (_record_bytes(), _configs()) == before
+
+
+def test_review_r1_receipt_failure_is_not_a_permanent_unrecorded_success(team, monkeypatch):
+    suggestion_id = _apply(team)
+
+    def unavailable(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(omu, "_append_receipt", unavailable)
+        first = _undo(team)
+    _undo(team)
+    assert _events(team.project, suggestion_id, "model_update_rolled_back") or first.status_code >= 500
+
+
+def test_review_r1_restart_reconciles_record_with_interrupted_configs(team, monkeypatch):
+    _apply(team)
+    before = (_record_bytes(), _configs())
+    with monkeypatch.context() as patch:
+        patch.setattr(omu, "_write_model", _stop_after_first(omu._write_model))
+        try:
+            _undo(team)
+        except BaseException:
+            pass
+        else:
+            pytest.fail("expected the simulated shutdown to interrupt the served route")
+    hermes_config.reconcile_profile_route_batch_journal()
+    _undo(team)
+    assert _record_bytes() == before[0] or all(_model(role) == A for role in MOVED)
+
+
+def test_review_r2_audit_commit_failure_then_retry_keeps_a_durable_per_role_audit(team, monkeypatch):
+    _apply(team)
+
+    def fail(*args, **kwargs):
+        raise model_policy.AuditWriteError("synthetic audit commit storage failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(model_policy, "commit_audit_batch", fail)
+        _undo(team)
+    second = _undo(team)
+    assert second.status_code >= 500 or sorted(_undo_audit()) == [(r, _PROVIDER, A) for r in MOVED]
+
+
+@pytest.mark.linux_only
+def test_review_r2_crash_after_marker_cannot_erase_the_per_role_audit(team):
+    _apply(team)
+    child = os.fork()
+    if child == 0:
+        signal.alarm(30)
+        original = hermes_config.mark_route_batch_audit_committed
+
+        def stop(*args, **kwargs):
+            original(*args, **kwargs)
+            os._exit(77)
+
+        hermes_config.mark_route_batch_audit_committed = stop
+        _undo(team)
+        os._exit(98)
+    _, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 77
+    restart = os.fork()
+    if restart == 0:
+        signal.alarm(30)
+        from hermes_cli import main
+
+        importlib.reload(main)
+        os._exit(0)
+    _, status = os.waitpid(restart, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    retry = _undo(team)
+    assert retry.status_code >= 500 or sorted(_undo_audit()) == [(r, _PROVIDER, A) for r in MOVED]
+
+
+def test_review_r2_failed_config_rollback_is_not_acknowledged_as_nothing_changed(team, monkeypatch):
+    _apply(team)
+    before = (_record_bytes(), _configs())
+    original = omu._write_model
+
+    def write_then_error(*args, **kwargs):
+        if args[1] == MOVED[1]:
+            raise OSError(errno.EIO, "synthetic second-profile config device I/O failure")
+        return original(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(omu, "_write_model", write_then_error)
+        patch.setattr(hermes_config, "_restore_config_snapshot", lambda *args, **kwargs: False)
+        first = _undo(team)
+    assert (_record_bytes(), _configs()) == before or first.status_code >= 500
+
+
+def test_review_r2_unreadable_role_route_is_unknown_not_a_successful_undo(team, monkeypatch):
+    _apply(team)
+    original = model_policy.configured_assignment_for
+
+    def unreadable(profile, *args, **kwargs):
+        if profile == MOVED[0]:
+            raise model_policy.EnrollmentUnavailable("synthetic role config could not be read")
+        return original(profile, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(model_policy, "configured_assignment_for", unreadable)
+        result = _undo(team)
+    assert result.status_code >= 500 or all(_model(r) == A for r in MOVED)
+
+
+def test_review_r2_native_config_read_io_failure_does_not_omit_an_affected_role(team, monkeypatch):
+    _apply(team)
+    original = hermes_config.load_config_readonly
+    target = get_profile_dir(MOVED[0])
+
+    def fail_native_read(*args, **kwargs):
+        if get_hermes_home() == target:
+            raise PermissionError(errno.EACCES, "synthetic unreadable config.yaml")
+        return original(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(hermes_config, "load_config_readonly", fail_native_read)
+        result = _undo(team)
+    assert result.status_code >= 500 or all(_model(r) == A for r in MOVED)
+
+
+def test_review_r3_explicit_authority_store_read_error_is_not_an_absent_role(team, monkeypatch):
+    _apply(team)
+    before = (_record_bytes(), _configs())
+    target, original_text = _record_path(), Path.read_text
+    original_assignment = model_policy.configured_assignment_for
+    scope, errors = threading.local(), []
+
+    def in_role_scope(profile, *args, **kwargs):
+        scope.target = profile == MOVED[0]
+        try:
+            return original_assignment(profile, *args, **kwargs)
+        finally:
+            scope.target = False
+
+    def native_read_error(path, *args, **kwargs):
+        if path == target and getattr(scope, "target", False):
+            errors.append(str(path))
+            raise OSError(errno.EIO, "synthetic model policy record I/O outage during role authority read")
+        return original_text(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(model_policy, "configured_assignment_for", in_role_scope)
+        patch.setattr(Path, "read_text", native_read_error)
+        answer = _undo(team)
+    assert errors, "the native storage error was not reached"
+    assert (answer.status_code, answer.json()) == (503, {"detail": "Service Unavailable"})
+    assert (_record_bytes(), _configs()) == before
+    assert not _undo_state_path().exists()
+
+
+def _r3_pending_after_audit(team, monkeypatch):
+    suggestion_id = _apply(team)
+    with monkeypatch.context() as patch:
+        patch.setattr(omu, "_append_receipt", _eio)
+        assert _undo(team).status_code == 503
+    assert sorted(_undo_audit()) == [(r, _PROVIDER, A) for r in MOVED]
+    return suggestion_id
+
+
+def _r3_one_audit_read_error(monkeypatch, call):
+    target, original, errors = _resolve_log_path(), Path.read_text, []
+
+    def unreadable_once(path, *args, **kwargs):
+        if path == target and not errors:
+            errors.append(str(path))
+            raise OSError(errno.EIO, "synthetic audit log read outage")
+        return original(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_text", unreadable_once)
+        answer = call()
+    return answer, len(errors)
+
+
+def test_review_r3_native_audit_read_error_cannot_duplicate_existing_records(team, monkeypatch):
+    _r3_pending_after_audit(team, monkeypatch)
+    _r3_one_audit_read_error(monkeypatch, lambda: _undo(team))
+    assert sorted(_undo_audit()) == [(r, _PROVIDER, A) for r in MOVED]
+
+
+def test_review_r3_control_no_prior_committed_audit_has_no_duplicate(team, monkeypatch):
+    _apply(team)
+    _r3_one_audit_read_error(monkeypatch, lambda: _undo(team))
+    assert sorted(_undo_audit()) == [(r, _PROVIDER, A) for r in MOVED]
+
+
+def test_review_r3_control_pending_audit_and_no_read_fault_settles_once(team, monkeypatch):
+    suggestion_id = _r3_pending_after_audit(team, monkeypatch)
+    answer = _undo(team)
+    assert answer.status_code == 200
+    assert sorted(_undo_audit()) == [(r, _PROVIDER, A) for r in MOVED]
+    assert len(_events(team.project, suggestion_id, "model_update_rolled_back")) == 1
+    assert _undo(team).json()["state"] == "already_undone"

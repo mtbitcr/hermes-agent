@@ -428,15 +428,19 @@ def _undo_roles(entry: dict) -> dict[str, str]:
 
     Unlike :func:`roles_on`, a role whose route or authority cannot be read
     is unknown, not absent, and raises :class:`Unavailable` before anything
-    is written. Only a role with no live profile home, a route read whole and
-    refused as unapproved (a plain ``ValueError``), or one on another version,
-    is outside the set.
+    is written. Only a role with no live profile home, or one that the strict
+    read of its route (:func:`_strict_route`) shows on another version, is
+    outside the set. A role on the newer version is in it only when the
+    native authority reader admits that route; any error of that reader is a
+    503, never an absence (``configured_assignment_for`` raises the same
+    error for both).
     """
     from hermes_cli import config as hermes_config
     from hermes_cli.profiles import get_profile_dir
     from hermes_constants import assert_named_profile_home_live
     from plugins.dashboard_auth.raphael_workspace import model_policy
 
+    newer = (entry["provider"], entry["to_model"])
     roles: dict[str, str] = {}
     try:
         for profile in model_policy.admitted_profile_ids():
@@ -444,17 +448,57 @@ def _undo_roles(entry: dict) -> dict[str, str]:
                 assert_named_profile_home_live(get_profile_dir(profile))
             except FileNotFoundError:
                 continue  # Missing or deleted, so the role runs no model.
-            try:
-                route = model_policy.configured_assignment_for(profile)
-            except ValueError as exc:
-                if type(exc) is not ValueError:
-                    raise
-                continue
-            if (route.provider, route.model) == (entry["provider"], entry["to_model"]):
-                roles[profile] = hermes_config.profile_route_revision(get_profile_dir(profile))
+            if _strict_route(profile) != newer:
+                continue  # Read whole, and on another version.
+            # The native loader keeps the defaults it served for a read error
+            # as the file's cached copy; read the file again, not that copy.
+            config_key = str(get_profile_dir(profile) / "config.yaml")
+            hermes_config._LOAD_CONFIG_CACHE.pop(config_key, None)
+            hermes_config._LAST_EXPANDED_CONFIG_BY_PATH.pop(config_key, None)
+            route = model_policy.configured_assignment_for(profile)
+            if (route.provider, route.model) != newer:
+                raise Unavailable()
+            roles[profile] = hermes_config.profile_route_revision(get_profile_dir(profile))
     except Exception as exc:
         raise Unavailable() from exc
     return roles
+
+
+def _strict_route(profile: str) -> tuple[str, str]:
+    """``(provider, model)`` of the role's native config from one strict read.
+
+    The native loader answers a read or parse error with its last good copy
+    or the defaults, so it cannot prove a version. This reads the file once
+    and merges it as that loader does, with no fallback and no cache: only a
+    missing file reads as the defaults, and any other error raises. A file
+    read whole with no model block shows no version: ``("", "")``.
+    """
+    import copy
+    from collections.abc import Mapping
+
+    from hermes_cli import config as hermes_config
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = get_profile_dir(profile)
+    try:
+        with open(home / "config.yaml", encoding="utf-8") as handle:
+            user = hermes_config.fast_safe_load(handle) or {}
+    except FileNotFoundError:
+        user = {}
+    if not isinstance(user, Mapping):
+        raise Unavailable()
+    token = set_hermes_home_override(str(home))
+    try:
+        merged = hermes_config._deep_merge(copy.deepcopy(hermes_config.DEFAULT_CONFIG), dict(user))
+        config, _managed = hermes_config._merge_managed_overlay(
+            hermes_config._expand_env_vars(hermes_config._canonicalize_config(merged)))
+    finally:
+        reset_hermes_home_override(token)
+    route = config.get("model")
+    if not isinstance(route, Mapping):
+        return "", ""  # Read whole, and no route of any version.
+    return str(route.get("provider") or ""), str(route.get("default") or route.get("model") or "")
 
 
 def _begin_audit(state: dict, roles: set) -> Any:
@@ -532,10 +576,11 @@ def _running_roles(roles: list[str]) -> list[str]:
     return sorted(running)
 
 
-def _rolled_back_event(entry: dict) -> Optional[tuple[str, str, bool]]:
-    """``(board, suggestion id, holds the event)`` for the suggestion of ``entry``'s decision.
+def _rolled_back_event(entry: dict) -> Optional[tuple[str, str, int]]:
+    """``(board, suggestion id, its count of the event)`` for the suggestion of ``entry``'s decision.
 
-    None when no suggestion row is found: then nothing can hold the event.
+    One read of each board, counted, never set membership. None when no
+    suggestion row is found: then nothing can hold the event.
     """
     from hermes_cli.owner_workspace import _owner_decision_ref, list_committed_projects, resolve_owner_context
 
@@ -544,7 +589,7 @@ def _rolled_back_event(entry: dict) -> Optional[tuple[str, str, bool]]:
     for project in list_committed_projects(ctx):
         with contextlib.closing(kanban_db.connect(board=project["board"])) as conn:
             rows = conn.execute(
-                "SELECT id, EXISTS (SELECT 1 FROM task_events WHERE task_id = tasks.id AND kind = ?) AS done "
+                "SELECT id, (SELECT COUNT(*) FROM task_events WHERE task_id = tasks.id AND kind = ?) AS done "
                 "FROM tasks WHERE task_kind = 'recommendation' "
                 "AND recommendation_kind = ? AND recommendation_subject_id LIKE ?",
                 ("model_update_rolled_back", _KIND, subject),
@@ -552,7 +597,7 @@ def _rolled_back_event(entry: dict) -> Optional[tuple[str, str, bool]]:
         for row in rows:
             ref = _owner_decision_ref(ctx, authority="recommendation", native_id=str(row["id"]))
             if ref == entry["decision_ref"]:
-                return project["board"], str(row["id"]), bool(row["done"])
+                return project["board"], str(row["id"]), int(row["done"])
     return None
 
 
@@ -604,18 +649,27 @@ def _settle_undo(state: dict, *, begun: Any = None, end_at_b: bool = True) -> st
         if _record_entry(entry)["state"] == "active":
             model_policy.apply_model_update_record({**entry, "state": "rolled_back"})
             wrote = True
-        audited = _audited(state["undo_id"])
-        missing = {fields["profile"] for fields in state["audit"]} - audited
-        if missing:
-            if begun is None or audited:
-                begun = _begin_audit(state, missing)
+        expected = {fields["profile"]: 1 for fields in state["audit"]}
+        if begun is not None:
+            # This call's own batch, begun under its fresh undo id: no record
+            # of that id can be committed by anything else, so it is written
+            # once without a read, and the read below confirms it.
             model_policy.commit_audit_batch(begun)
             wrote = True
+        else:
+            audited = _audit_counts(state["undo_id"])
+            if not audited:
+                model_policy.commit_audit_batch(_begin_audit(state, set(expected)))
+                wrote = True
+            elif audited != expected:
+                raise Unavailable()  # A part or a copy: no write can make it exactly one.
         found = _rolled_back_event(entry)
         if found is None:
             # The suggestion is gone, so there is nothing to hold the event.
             _log.warning("model update undo: no suggestion for its receipt")
-        elif not found[2]:
+        elif found[2] > 1:
+            raise Unavailable()
+        elif found[2] == 0:
             revisions = state["receipt"].get("revisions") or {
                 role: hermes_config.profile_route_revision(get_profile_dir(role)) for role in roles
             }
@@ -635,7 +689,7 @@ def _on_earlier(state: dict) -> list[bool]:
     from plugins.dashboard_auth.raphael_workspace import model_policy
 
     earlier = (state["entry"]["provider"], state["entry"]["from_model"])
-    return [model_policy._configured_route(role)[:2] == earlier for role in sorted(state["roles"])]
+    return [_strict_route(role) == earlier for role in sorted(state["roles"])]
 
 
 def _record_entry(entry: dict) -> dict:
@@ -648,37 +702,59 @@ def _record_entry(entry: dict) -> dict:
     return found[-1]
 
 
-def _audited(undo_id: str) -> set:
-    """Each role with a committed audit record of the undo ``undo_id``; an unreadable log raises."""
+class _AuditSnapshot:
+    """The audit log's text from one strict read, handed to the merged parser."""
+
+    def __init__(self, text: str):
+        self._text = text
+
+    def read_text(self, *args: Any, **kwargs: Any) -> str:
+        return self._text
+
+
+def _audit_counts(undo_id: str) -> dict[str, int]:
+    """Committed audit records of the undo ``undo_id`` per role, from one strict read.
+
+    ``read_audit_records`` answers a read error with no record, so it cannot
+    prove absence. This reads the log once, lets any error raise, and parses
+    that one text with the merged reader. Only a missing log reads as empty.
+    """
     from hermes_cli.dashboard_auth import audit as dashboard_audit
 
-    path = dashboard_audit._resolve_log_path()
     try:
-        path.read_bytes()
+        text = dashboard_audit._resolve_log_path().read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
-        return set()
-    return {
-        record.get("profile") for record in dashboard_audit.read_audit_records(path)
-        if record.get("undo_id") == undo_id
-    }
+        text = ""
+    counts: dict[str, int] = {}
+    for record in dashboard_audit.read_audit_records(_AuditSnapshot(text)):
+        if record.get("undo_id") == undo_id:
+            profile = str(record.get("profile"))
+            counts[profile] = counts.get(profile, 0) + 1
+    return counts
 
 
 def _confirm(state: dict, outcome: str) -> None:
     """Read each part of ``outcome`` back; :class:`Unavailable` unless it is whole."""
     from plugins.dashboard_auth.raphael_workspace import model_policy
 
-    on_earlier = _on_earlier(state)
-    audited = _audited(state["undo_id"])
-    found = _rolled_back_event(state["entry"])
+    entry = state["entry"]
+    routes = [_strict_route(role) for role in sorted(state["roles"])]
+    audited = _audit_counts(state["undo_id"])
+    found = _rolled_back_event(entry)
     if outcome == "A":
         whole = (
-            _record_entry(state["entry"])["state"] == "rolled_back" and all(on_earlier)
-            and audited >= {fields["profile"] for fields in state["audit"]}
-            and (found is None or found[2])
+            _record_entry(entry)["state"] == "rolled_back"
+            and all(route == (entry["provider"], entry["from_model"]) for route in routes)
+            and audited == {fields["profile"]: 1 for fields in state["audit"]}
+            and (found is None or found[2] == 1)
         )
     else:
         text, _document = model_policy._load_model_updates(model_policy._model_updates_path())
-        whole = text == state["prior"] and not any(on_earlier) and not audited and not (found and found[2])
+        whole = (
+            text == state["prior"]
+            and not any(route == (entry["provider"], entry["from_model"]) for route in routes)
+            and not audited and not (found and found[2])
+        )
     if not whole:
         raise Unavailable()
 
