@@ -195,8 +195,9 @@ def _copy_change(directory: Path, recorded: Optional[str], kind: str = "manifest
     deletes a copy asks this, never a hash comparison of its own.
 
     An allowlist: the copy is a real folder whose whole tree lists and holds only plain folders and
-    regular files (runtime caches included: a link of any kind is "link", any other entry type is
-    "changed"), every file reads, and the fingerprint of exactly those files equals ``recorded``
+    regular files (runtime caches included: a link of any kind is "link", a regular file whose link
+    count is above 1 too, any other entry type is "changed"), every file reads, and the fingerprint
+    of exactly those files equals ``recorded``
     (a missing record is "changed"). ``kind`` "manifest" is ``_dir_hash`` (or its exact legacy
     variant with the runtime caches, never re-baselined); "lock" is ``skills_guard.content_hash``.
     Nothing outside the copy is followed to manufacture a match. For a copy lexically under the
@@ -244,6 +245,8 @@ def _copy_change(directory: Path, recorded: Optional[str], kind: str = "manifest
                     if reason := walk(Path(entry.path)):
                         return reason
                 elif entry.is_file(follow_symlinks=False):
+                    if os.lstat(entry.path).st_nlink > 1:  # a hard link (entry.stat() has no count on Windows)
+                        return "link"
                     files.append((Path(entry.path), Path(entry.path).read_bytes()))
                 else:  # FIFO, socket, device: nothing Hermes writes
                     return "changed"

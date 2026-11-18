@@ -744,6 +744,32 @@ def test_owner_link_keeps_built_in_copy_at_update(role, tmp_path, marked):
     assert "ascii-art" not in result["updated"]
 
 
+@pytest.mark.parametrize("linked", ["SKILL.md", "scripts/helper.py"], ids=["top-level", "nested"])
+def test_owner_hard_link_keeps_built_in_copy_at_update_in_a_marked_role(role, tmp_path, linked):
+    """Owner rule 3: a file of the copy with a second hard link outside it is a link, though its
+    bytes still match the record."""
+    src = _write_skill(role.bundled, "media/ascii-art", "built-in v1")
+    (src / "scripts").mkdir()
+    (src / "scripts" / "helper.py").write_text("print('v1')\n", encoding="utf-8")
+    sync_skills(quiet=True)
+    _mark(role)
+    copy, outside = role.skills / "media" / "ascii-art", tmp_path / "owner-linked-file"
+    os.link(copy / linked, outside)
+    assert os.lstat(copy / linked).st_nlink == 2
+    before, outside_bytes, line = _files(copy), outside.read_bytes(), _manifest(role)["ascii-art"]
+    _write_skill(role.bundled, "media/ascii-art", "built-in v2")
+    (src / "scripts" / "helper.py").write_text("print('v2')\n", encoding="utf-8")
+
+    result = sync_skills(quiet=True)
+
+    assert _files(copy) == before
+    assert os.path.samefile(copy / linked, outside)
+    assert outside.read_bytes() == outside_bytes
+    assert _manifest(role)["ascii-art"] == line
+    assert result["kept"] == [{"name": "ascii-art", "reason": "link"}]
+    assert "ascii-art" not in result["updated"]
+
+
 @pytest.mark.parametrize("marked", [True, False], ids=["marked", "unmarked"])
 def test_owner_link_keeps_copy_that_an_external_folder_now_provides(role, tmp_path, marked):
     """Configured external source: the local copy only looks like the stale shadow Hermes wrote,
