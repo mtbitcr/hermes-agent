@@ -95,6 +95,34 @@ def test_config_get_unset_subcommands_parse():
     assert ns.key == "terminal.backend"
 
 
+def test_model_update_check_subcommand_sets_its_own_handler():
+    """`hermes model update-check [--practice <role>]` reaches its own handler.
+
+    The main command file passes only ``cmd_model``; the nested subcommand
+    sets its handler inside the model subcommand file, and a bare
+    `hermes model` keeps the picker.
+    """
+    from hermes_cli.subcommands import model as model_subcommand
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    handler = _h("model")
+    build_model_parser(sub, cmd_model=handler)
+    update_check = model_subcommand.cmd_model_update_check
+
+    ns = parser.parse_args(["model", "update-check"])
+    assert ns.func is update_check
+    assert ns.practice is None
+
+    ns = parser.parse_args(["model", "update-check", "--practice", "raphael-planner"])
+    assert ns.func is update_check
+    assert ns.practice == "raphael-planner"
+
+    ns = parser.parse_args(["model", "--refresh"])
+    assert ns.func is handler
+    assert ns.refresh is True
+
+
 
 
 # ── deprecated `hermes login` fails gracefully, not with argparse error ────

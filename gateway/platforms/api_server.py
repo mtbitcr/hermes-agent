@@ -7402,6 +7402,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 __import__("gateway.platforms.api_server_owner_inputs", fromlist=["route"]).route(self),
             ),
             ("POST", "/v1/owner-workspace/decisions/{ref}/choose/{n}", __import__("gateway.platforms.api_server_owner_choices", fromlist=["route"]).route(self)),
+            ("POST", "/v1/owner-workspace/decisions/{ref}/update", __import__("gateway.platforms.api_server_owner_model_updates", fromlist=["route"]).route(self)),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -13729,6 +13730,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 waiting["design_options"] = True
             if _owner_workspace_capability_requested(request, OWNER_CLOSED_SUGGESTIONS_CAPABILITY):
                 waiting["closed_suggestions"] = True
+            from hermes_cli.owner_model_updates import MODEL_UPDATE_CAPABILITY
+            if _owner_workspace_capability_requested(request, MODEL_UPDATE_CAPABILITY):
+                waiting["model_update"] = True
             owner = resolve_owner_context()
             projected = list_owner_decisions(owner, **waiting)
             decisions = list(projected["data"])

@@ -4254,7 +4254,7 @@ _SUGGESTION_FALLBACK_TITLE = "A suggested capability change"
 
 def list_owner_decisions(
     ctx: OwnerContext, *, owner_waiting: bool = False, owner_input_upload: bool = False, design_options: bool = False,
-    closed_suggestions: bool = False,
+    closed_suggestions: bool = False, model_update: bool = False,
 ) -> dict:
     """Project pending native gates into one owner-safe read-only inbox.
 
@@ -4336,7 +4336,7 @@ def list_owner_decisions(
             rows = conn.execute(
                 "SELECT id, title, status, created_at, task_kind, block_kind, "
                 "review_policy, recommendation_label, recommendation_rationale, "
-                "recommendation_decision, recommendation_kind "
+                "recommendation_decision, recommendation_kind, recommendation_subject_id "
                 "FROM tasks WHERE project_id = ? AND ("
                 "(task_kind = 'work' AND status = 'blocked' "
                 "AND block_kind = 'needs_input') OR "
@@ -4396,6 +4396,16 @@ def list_owner_decisions(
             rows = rows[:_OWNER_DECISIONS_LIMIT]
         for row in rows:
             task_kind = str(row["task_kind"])
+            if model_update and task_kind == "recommendation":
+                from hermes_cli.owner_model_updates import feed_item
+
+                item = feed_item(
+                    _owner_decision_ref(ctx, authority="recommendation", native_id=str(row["id"])),
+                    row["recommendation_kind"], row["recommendation_subject_id"],
+                )
+                if item is not None:
+                    decisions.append(item)
+                    continue
             if task_kind == "recommendation":
                 authority = "recommendation"
                 kind = "capability"
@@ -4467,7 +4477,7 @@ def list_owner_decisions(
     decisions.sort(
         key=lambda item: (
             authority_order.get(item["kind"], 9),
-            str(item["project_name"]).casefold(),
+            str(item.get("project_name", "")).casefold(),
             str(item["title"]).casefold(),
             str(item["decision_ref"]),
         )

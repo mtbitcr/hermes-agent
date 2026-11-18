@@ -277,6 +277,18 @@ def sent(monkeypatch: pytest.MonkeyPatch) -> Sent:
     return lines
 
 
+@pytest.fixture(autouse=True)
+def delivered(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Every test here: the skill delivery after a released batch is replaced by a record of its
+    batch ids, so no test runs a role's sync, tells its lines or counts its processes. The record
+    imports nothing when called, as K6 needs; test_release_skills_delivery.py tests the step."""
+    from hermes_cli import release_cmd
+
+    batches: list[int] = []
+    monkeypatch.setattr(release_cmd, "_deliver_skills", lambda batch_id, actions: batches.append(batch_id))
+    return batches
+
+
 def _accepted(*tiers: object) -> dict:
     """Record one change per tier, NEW the last, and accept the batch they joined."""
     with contextlib.closing(ledger.connect()) as conn:
