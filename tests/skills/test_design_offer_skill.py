@@ -502,7 +502,21 @@ def test_check_fails_on_a_blocked_request_even_with_no_findings(tmp_path, side):
                                           375: _bundle(375, SAME)}
     _, report = _compare(tmp_path, *((blocked, clean) if side == "candidate" else (clean, blocked)))
     assert report["widths"]["1280"]["findings"] == 0
+    if side == "candidate":
+        assert report["widths"]["1280"]["blocked_requests"] == 0
+        assert report["widths"]["1280"]["site_blocked_requests"] == 1
+        assert report["widths"]["375"]["site_blocked_requests"] == 0
+        assert report["passed"] is True
+    else:
+        assert report["widths"]["1280"]["blocked_requests"] == 1
+        assert report["passed"] is False
+
+
+def test_check_fails_on_a_blocked_request_on_both_sides(tmp_path):
+    blocked = {1280: _bundle(1280, SAME, blocked=["http://x.example/a.css"]), 375: _bundle(375, SAME)}
+    _, report = _compare(tmp_path, blocked, blocked)
     assert report["widths"]["1280"]["blocked_requests"] == 1
+    assert report["widths"]["1280"]["site_blocked_requests"] == 1
     assert report["passed"] is False
 
 

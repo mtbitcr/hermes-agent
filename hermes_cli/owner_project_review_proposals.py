@@ -21,6 +21,8 @@ _EVIDENCE_EVENTS = ("completed", "blocked", "gave_up", "review_requested", "chan
 _PHRASES = {"add": "add {new}", "replace": "replace {old} with {new}", "split": "split {old} into {new}",
             "merge": "merge {old} into {new}", "move": "move {old} to {status}", "postpone": "postpone {old}",
             "cancel": "cancel {old}"}
+# proposal_hint called without pairs: the accepted-advice read, which takes the accepted review's stored pairs.
+_STORED = object()
 
 
 def proposal_schema(*, limit):
@@ -73,23 +75,28 @@ def _settled(board, task_id, events, *, ended):
     return not any(event["id"] > latest and event["kind"] in _EVIDENCE_EVENTS and event["id"] != own for event in events)
 
 
-def _equivalent_created_work(changes, sources, board, project):
+def _equivalent_created_work(changes, sources, board, project, paired=None):
+    """``paired`` maps the index of an add change to the suggestion its checked pair plans: that one suggestion is
+    the change's own source, not a duplicate of it. Work, any other suggestion and a change with no pair keep the check."""
     # The content-link rule of the closures: token-set similarity of at least 0.8.
     from hermes_cli.kanban_recommendation_closure import same_review_work
 
+    paired = paired or {}
     frozen = {item["id"]: item.get("events", []) for item in sources["tasks"]}
     # The input holds the latest event of each suggestion, enough to show an event after its decision. Its kind decides.
     for item in sources.get("suggestions", []):
         frozen[item["id"]] = [dict(row) for row in board.execute(
             "SELECT id,kind FROM task_events WHERE id=? AND task_id=?", (item.get("event_revision", 0), item["id"]))]
     proposed_titles = []
-    for change in changes:
+    for index, change in enumerate(changes):
         action = change["action"]
         specs = ([change] if action == "add" else change["replacements"] if action == "split"
                  else [change["replacement"]] if action in {"replace", "merge"} else [])
         excluded = {ref["task_id"] for ref in change.get("targets", [])}
         if "target" in change:
             excluded.add(change["target"]["task_id"])
+        if index in paired:
+            excluded.add(paired[index])
         for spec in specs:
             if any(same_review_work(spec["title"], title) for title in proposed_titles):
                 return True
@@ -107,9 +114,14 @@ def _equivalent_created_work(changes, sources, board, project):
     return False
 
 
-def _render(changes, sources, *, limit):
-    """Name each checked change and its work: the owner title of the frozen input, or the proposed title."""
+def _render(changes, sources, *, limit, labels=None):
+    """Name each checked change and its work: the owner title of the frozen input, or the proposed title. ``labels``
+    names the accepted suggestion an add change plans, by the change's index."""
     titles = {item["id"]: item["title"] for item in sources["tasks"]}
+    labels = labels or {}
+    # A paired change comes before the changes without a pair, so a bounded hint always names a pair. Without a pair
+    # the order is the plan's own.
+    order = sorted(range(len(changes)), key=lambda index: index not in labels)
 
     def works(change):
         refs = change["targets"] if "targets" in change else [change["target"]] if "target" in change else []
@@ -121,10 +133,12 @@ def _render(changes, sources, *, limit):
         shown += [f"{len(values) - keep} more"] if len(values) > keep else []
         return ", ".join(shown[:-1]) + " and " + shown[-1] if len(shown) > 1 else "".join(shown)
 
-    def phrase(change, keep=None, width=60):
+    def phrase(index, keep=None, width=60):
+        change = changes[index]
         old, new = works(change)
+        label = f" for your accepted suggestion {names([labels[index]], 1, width)}" if index in labels else ""
         return _PHRASES[change["action"]].format(old=names(old, keep or len(old), width),
-                                                 new=names(new, keep or len(new), width), status=change.get("to_status"))
+                                                 new=names(new, keep or len(new), width), status=change.get("to_status")) + label
 
     def hint(phrases, rest):
         more = f"; and {rest} more change{'s' if rest > 1 else ''}" if rest else ""
@@ -132,21 +146,24 @@ def _render(changes, sources, *, limit):
 
     # The longest run of whole changes that fits, then a count of the rest.
     for shown in range(len(changes), 0, -1):
-        text = hint([phrase(change) for change in changes[:shown]], len(changes) - shown)
+        text = hint([phrase(index) for index in order[:shown]], len(changes) - shown)
         if len(text) <= limit:
             return text
     # The first change alone keeps its action: first its list of titles is cut to a count, then the title itself.
-    first, rest = changes[0], len(changes) - 1
+    first, rest = changes[order[0]], len(changes) - 1
     size = max(map(len, works(first)))
     for keep, width in [(keep, 60) for keep in range(size - 1, 0, -1)] + [(1, width) for width in range(59, 1, -1)]:
-        text = hint([phrase(first, keep, width)], rest)
+        text = hint([phrase(order[0], keep, width)], rest)
         if len(text) <= limit:
             return text
     return text
 
 
-def proposal_hint(value, sources, board, registry, project, *, now, limit, max_bytes):
-    """Render checked advice for the existing brief and summary fields."""
+def proposal_hint(value, sources, board, registry, project, *, now, limit, max_bytes, pairs=_STORED):
+    """Render checked advice for the existing brief and summary fields. ``pairs`` are the result's plan_suggestions,
+    which the harvest checks after this hint (owner_project_review_suggestions.check_plan_suggestions) and refuses
+    the result for a pair that fails. Without ``pairs``, as the accepted-advice read rechecks it, they are the pairs
+    the harvest checked and stored with the accepted review of this exact proposal."""
     if value is None:
         return None
     if not isinstance(value, dict) or set(value) != set(_TEXT_LIMITS) | {"later_milestones", "changes"}:
@@ -180,9 +197,29 @@ def proposal_hint(value, sources, board, registry, project, *, now, limit, max_b
     # One gate: a settled decision on the affected work reopens only with a newer event of that work in the input.
     if any(_settled(board, task_id, frozen[task_id].get("events", []), ended=False) for task_id in mutated):
         return None
-    if _equivalent_created_work(changes, sources, board, project):
+    from hermes_cli.owner_project_review_origin import _accepted_review, _denied_plan
+
+    if pairs is _STORED:
+        accepted = _accepted_review(project.id)
+        pairs = accepted[4].get("plan_suggestions") if accepted is not None and accepted[2] == value else None
+    pairs = [pair for pair in pairs if isinstance(pair, dict)] if isinstance(pairs, list) else []
+    labels, paired = {}, {}
+    for pair in pairs:
+        row = board.execute(
+            "SELECT recommendation_label FROM tasks WHERE id=? AND project_id=? AND task_kind='recommendation'",
+            (pair.get("suggestion"), project.id),
+        ).fetchone() if isinstance(pair.get("suggestion"), str) else None
+        index = pair.get("change")
+        # A malformed pair gets no label here; the pair check refuses it.
+        if row is not None and type(index) is int and 0 <= index < len(changes) and changes[index]["action"] == "add":
+            labels[index], paired[index] = owner_workspace.owner_title(row["recommendation_label"]), pair["suggestion"]
+    if _equivalent_created_work(changes, sources, board, project, paired):
         return None
-    hint = _render(changes, sources, limit=limit)
+    planned = {pair["suggestion"] for pair in pairs if isinstance(pair.get("suggestion"), str)}
+    # The owner denied this plan, or a reviewed plan for one of its suggestions: the review does not ask again.
+    if _denied_plan(registry, project.id, value, planned):
+        return None
+    hint = _render(changes, sources, limit=limit, labels=labels)
     if len(hint) > limit or check_owner_text(hint, "planner_prose") != hint:
         raise ValueError("review_plan_proposal_text_invalid")
     return hint

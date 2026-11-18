@@ -6173,6 +6173,29 @@ def _commit_named_inputs(
         raise OwnerWorkspaceError("crash_recovery_failed", str(exc)) from None
 
 
+def _commit_plan_creations(
+    kconn: sqlite3.Connection, changes: list[dict], task_ids: list[str], links: list[tuple[int, str]],
+) -> None:
+    """The plan commit's ``on_created`` hook: the named inputs, then the made-from links of a proven review.
+
+    ``links`` pair an add change's index with the accepted suggestion the
+    exactly approved daily review planned it for. Each link is written on
+    ``kconn`` in the transaction that creates the parked cards: a refused link
+    fails the whole plan, like a refused named input, and leaves no card.
+    """
+    from hermes_cli.kanban_recommendation_closure import record_made_from
+
+    _commit_named_inputs(kconn, _plan_created_task_specs(changes), task_ids)
+    # Each created card's change index, in the apply order; an add change creates exactly one card.
+    made = [index for index, change in enumerate(changes) for _spec in _plan_created_task_specs([change])]
+    cards = {index: task_id for index, task_id in zip(made, task_ids) if changes[index]["action"] == "add"}
+    try:
+        for index, suggestion in links:
+            record_made_from(kconn, cards.get(index), suggestion)
+    except ValueError as exc:
+        raise OwnerWorkspaceError("crash_recovery_failed", str(exc)) from None
+
+
 def _commit_plan_review_requirements(
     kconn: sqlite3.Connection,
     changes: list[dict],
@@ -6886,11 +6909,14 @@ def commit_project_plan(
             return committed
         project, board_slug = _resolve_existing_project_board(pconn, project_id)
         # Preserve the approved payload and its replay identity. A proven review changes only the audit origin.
-        recorded_trigger = trigger
+        recorded_trigger, links = trigger, []
         if trigger == "owner_request":
-            from hermes_cli.owner_project_review_origin import confirmed_plan_trigger
+            from hermes_cli.owner_project_review_origin import confirmed_plan_links, confirmed_plan_trigger
 
             recorded_trigger = confirmed_plan_trigger(project_id, digest)
+            if recorded_trigger == "scheduled_review":
+                # Read once, before the approval wait: the proven review's pairs link the cards its add changes create.
+                links = confirmed_plan_links(project_id, digest)
         kconn = kanban_db.connect(board=board_slug)
         try:
             # Before the scope check, so a boundary inherited from a superseded
@@ -7034,8 +7060,8 @@ def commit_project_plan(
                             current_milestone=current_milestone,
                             later_milestones=normalized_later,
                             board=board_slug,
-                            on_created=lambda conn, ids: _commit_named_inputs(
-                                conn, _plan_created_task_specs(normalized_changes), ids,
+                            on_created=lambda conn, ids: _commit_plan_creations(
+                                conn, normalized_changes, ids, links,
                             ),
                         )
 

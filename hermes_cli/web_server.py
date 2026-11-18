@@ -6866,7 +6866,7 @@ def get_model_info(request: Request, profile: Optional[str] = None):
                 "fallback_disabled": result["fallback_disabled"],
             }
         audit_models_machine_success(
-            request, action="info", profile=scoped_profile, provider=provider
+            request, action="info", profile=scoped_profile, provider=provider, model=result["model"]
         )
         return result
     except HTTPException:
@@ -13776,6 +13776,7 @@ from hermes_cli.web_routers import connection_rows as _connection_rows_routes  #
 app.include_router(_connection_rows_routes.router)
 from hermes_cli.web_routers import owner_channel as _owner_channel_routes  # noqa: E402
 app.include_router(_owner_channel_routes.router)
+app.include_router(importlib.import_module("plugins.dashboard_auth.raphael_workspace.renewal").router)
 
 
 
