@@ -1,0 +1,27 @@
+{
+  "already_undone": {
+    "from_model": "claude-sonnet-5-5",
+    "state": "already_undone",
+    "to_model": "claude-sonnet-5-6"
+  },
+  "busy": {
+    "roles": [
+      "raphael-business"
+    ],
+    "state": "busy"
+  },
+  "none": {
+    "state": "none"
+  },
+  "not_applied": {
+    "state": "not_applied"
+  },
+  "undone": {
+    "from_model": "claude-sonnet-5-5",
+    "roles": [
+      "raphael-builder"
+    ],
+    "state": "undone",
+    "to_model": "claude-sonnet-5-6"
+  }
+}
