@@ -1,0 +1,14 @@
+{
+  "already_started": {
+    "roles": [
+      "raphael-builder"
+    ],
+    "state": "already_started"
+  },
+  "started": {
+    "roles": [
+      "raphael-builder"
+    ],
+    "state": "started"
+  }
+}

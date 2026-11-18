@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -32,6 +33,8 @@ from hermes_cli.owner_workspace import (
 )
 
 MODEL_UPDATE_CAPABILITY = "model_update_v1"
+
+_log = logging.getLogger(__name__)
 
 # The owner's fixed texts. None names a model or a provider.
 TITLE = "A newer version of an AI model is ready for part of your team."
@@ -46,6 +49,19 @@ DONE = "Done. New work will use the newer version."
 NOT_AVAILABLE = "This update is no longer available, so nothing changed."
 NOT_APPLIED = "Raphael could not apply this update, so nothing changed."
 NOT_WAITING = "This choice is no longer waiting."
+# What the owner app says for each answer of the Settings undo and practice.
+UNDO_TEXTS = {
+    "undone": "The last model update was undone. New work uses the earlier version again.",
+    "none": "There is no model update to undo.",
+    "already_undone": "The last model update was already undone.",
+    "busy": "Some work is running right now, so nothing changed. Try again when it has finished.",
+    "not_applied": "Raphael could not undo this update, so nothing changed.",
+}
+PRACTICE_TEXTS = {
+    "started": "A practice update is on its way. It will show in Decisions in a few minutes.",
+    "already_started": "A practice update for this part of your team has already started this month.",
+}
+PRACTICE_CARD_TITLE = "Practice a model update for part of the team"
 
 _ACTIONS = ("update", "later", "keep_current")
 _KIND = "provider_model_policy"
@@ -313,3 +329,162 @@ def _append_receipt(board_slug: str, suggestion_id: str, kind: str, payload: dic
     with contextlib.closing(kanban_db.connect(board=board_slug)) as conn:
         with kanban_db.write_txn(conn):
             kanban_db._append_event(conn, suggestion_id, kind, payload)
+
+
+class Unavailable(Exception):
+    """The record, the route journal, the audit or the board could not be used."""
+
+
+def undo_last_model_update(*, journal) -> dict:
+    """Roll the last applied model update back: its record entry and every role it moved.
+
+    The last entry of the record is the last update; an entry already rolled
+    back answers ``already_undone``, so an older update is never reached. The
+    entry flips first, so the policy admits the earlier version again, and then
+    every role on the newer version moves back in one batch with the revisions
+    read at the start. ``journal(revisions, provider, model)`` writes the audit
+    of the moved roles, each now on ``model``, inside the enrollment
+    transaction. A batch that fails puts the record back, so nothing changed:
+    ``busy`` when the fence refused, else ``not_applied``. Held under the route
+    batch journal lock, as Update is. Raises :class:`Unavailable` for an
+    unreadable record, an unreconciled journal or an audit that cannot be
+    written; a record that cannot be put back raises as it is.
+    """
+    from hermes_cli import config as hermes_config
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    committed: dict[str, str] = {}
+
+    def enroll(revisions: dict[str, str]) -> None:
+        with model_policy.enrollment_transaction(sorted(revisions)) as snapshot:
+            hermes_config.mark_route_batch_enrollment_written(snapshot)
+            journal(revisions, last["provider"], last["from_model"])
+            hermes_config.mark_route_batch_audit_committed()
+            committed.update(revisions)
+
+    with hermes_config._route_batch_journal_lock():
+        try:
+            entries = model_policy.read_model_updates()
+            last = entries[-1] if entries else None
+            roles = roles_on(last["provider"], last["to_model"]) if last else {}
+        except (model_policy.EnrollmentUnavailable, hermes_config.RouteJournalUnreconciled) as exc:
+            raise Unavailable() from exc
+        if last is None:
+            return {"state": "none"}
+        update = {"from_model": last["from_model"], "to_model": last["to_model"]}
+        if last["state"] != "active":
+            return {"state": "already_undone", **update}
+        try:
+            prior = model_policy.apply_model_update_record({**last, "state": "rolled_back"})
+        except model_policy.EnrollmentUnavailable as exc:
+            raise Unavailable() from exc
+        except ValueError:
+            return {"state": "not_applied"}
+        try:
+            revisions = hermes_config.apply_profile_route_batch(
+                sorted(roles.items()),
+                apply_one=functools.partial(_write_model, last["from_model"]),
+                after_write=enroll,
+            ) if roles else {}
+        except Exception as exc:
+            if not committed:
+                model_policy.restore_model_update_record(prior)
+                return _undo_refused(exc, sorted(roles))
+            revisions = committed  # Rolled forward: the earlier routes are live.
+    try:
+        _rolled_back_receipt(last, {
+            **update, "provider": last["provider"], "roles": sorted(roles),
+            "revisions": dict(sorted(revisions.items())), "prior_revisions": dict(sorted(roles.items())),
+        })
+    except Exception as exc:  # The undo stands; only its receipt is missing.
+        _log.warning("model update undo: receipt not written (%s)", type(exc).__name__)
+    return {"state": "undone", "roles": sorted(roles), **update}
+
+
+def _undo_refused(exc: BaseException, roles: list[str]) -> dict:
+    """The answer for a batch that changed nothing, by what refused it."""
+    from hermes_cli.config import ProfileRouteBatchError, RouteJournalUnreconciled
+
+    seen, cause = [], exc
+    while cause is not None and cause not in seen:
+        seen.append(cause)
+        cause = cause.__cause__ or cause.__context__
+    if any(isinstance(error, (RouteJournalUnreconciled, Unavailable)) for error in seen):
+        raise Unavailable() from exc
+    if any(getattr(error, "code", None) == "execution_state_busy" for error in seen):
+        try:
+            busy = _running_roles(roles)
+        except Exception:
+            busy = []
+        refused = [error.profile for error in seen if isinstance(error, ProfileRouteBatchError) and error.profile]
+        return {"state": "busy", "roles": busy or refused[:1]}
+    return {"state": "not_applied"}
+
+
+def _running_roles(roles: list[str]) -> list[str]:
+    """Each of ``roles`` whose owner work the fence would refuse to move now; reads only."""
+    from hermes_cli.owner_workspace import _owner_receipt_task_ids, _owner_tasks_for_role
+
+    running = set()
+    for board_slug, task_ids in sorted(_owner_receipt_task_ids().items()):
+        with contextlib.closing(kanban_db.connect(board=board_slug)) as conn:
+            for role in roles:
+                held = _owner_tasks_for_role(conn, task_ids, role)
+                if held and kanban_db.list_active_unpinned_owner_tasks(conn, task_ids=held):
+                    running.add(role)
+    return sorted(running)
+
+
+def _rolled_back_receipt(entry: dict, receipt: dict) -> None:
+    """One ``model_update_rolled_back`` event on the suggestion of ``entry``'s decision."""
+    from hermes_cli.owner_workspace import _owner_decision_ref, list_committed_projects, resolve_owner_context
+
+    ctx = resolve_owner_context()
+    subject = f"{_PREFIX}{entry['provider']}:{entry['from_model']}:{entry['to_model']}:%"
+    for project in list_committed_projects(ctx):
+        with contextlib.closing(kanban_db.connect(board=project["board"])) as conn:
+            rows = conn.execute(
+                "SELECT id FROM tasks WHERE task_kind = 'recommendation' "
+                "AND recommendation_kind = ? AND recommendation_subject_id LIKE ?",
+                (_KIND, subject),
+            ).fetchall()
+        for row in rows:
+            ref = _owner_decision_ref(ctx, authority="recommendation", native_id=str(row["id"]))
+            if ref == entry["decision_ref"]:
+                _append_receipt(project["board"], str(row["id"]), "model_update_rolled_back", receipt)
+                return
+
+
+def start_practice(project: dict, role: str) -> str:
+    """File the practice card for ``role`` on ``project``'s board, once a month.
+
+    The card is ordinary work of the planning role, sealed on that role's
+    current route, and its worker runs the check card's command for ``role``.
+    It is the only write. The look-up and the create run under the route batch
+    journal lock, as Update and undo do, because the board's own idempotency
+    look-up is not atomic. Answers ``started`` or ``already_started``.
+    """
+    from hermes_cli import config as hermes_config
+    from hermes_cli.owner_workspace import _resolved_route_pin
+
+    key = f"model-update-practice:{role}:{time.strftime('%Y-%m', time.gmtime())}"
+    body = (
+        f"Run `hermes model update-check --practice {role}` and finish with its receipt. "
+        "It is a practice model update: it changes no setting."
+    )
+    with hermes_config._route_batch_journal_lock():
+        with contextlib.closing(kanban_db.connect(board=project["board"])) as conn:
+            found = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+                "AND task_kind = 'work'",
+                (key,),
+            ).fetchone()
+            if found:
+                return "already_started"
+            kanban_db.create_task(
+                conn, title=PRACTICE_CARD_TITLE, body=body, assignee="raphael-planner",
+                project_id=project["project_id"], idempotency_key=key, board=project["board"],
+                created_by="model-update-practice",
+                **_resolved_route_pin("raphael-planner", "routine", "assignee"),
+            )
+    return "started"

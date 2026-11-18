@@ -1463,6 +1463,9 @@ _LITERAL_ROUTES = (
     # One all-or-nothing multi-role selection. Workspace calls this instead of
     # emulating a transaction across several single-profile writes.
     ("POST", "/api/profiles/model-batch"),
+    # Settings: undo the last model update, start a practice update.
+    ("POST", "/api/model-updates/undo"),
+    ("POST", "/api/model-updates/practice"),
 )
 _TEMPLATE_ROUTES = (("GET", "/api/providers/oauth/openai-codex/poll/{session_id}"),)
 

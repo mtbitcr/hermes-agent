@@ -347,6 +347,10 @@ CLOSED_VOCABULARIES = (
 
     # models (the next card): web_server.py:7071
     ("models/invalid_model_options", ("detail",), frozenset({"Invalid model options"})),
+    # Settings model update undo and practice: hermes_cli/owner_model_updates.py
+    ("models/model_update_undo", ("state",),
+     frozenset({"undone", "none", "already_undone", "busy", "not_applied"})),
+    ("models/model_update_practice", ("state",), frozenset({"started", "already_started"})),
 )
 _OUTSIDE = object()
 
