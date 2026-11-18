@@ -70,6 +70,8 @@ _WAITING_SQL = "state IN ('open', 'deferred')"
 _UNFINISHED_STATES = ("releasing", "failed")
 _UNFINISHED_SQL = "state IN ('releasing', 'failed')"
 _OUTCOMES = frozenset({"released", "restored", "refused", "failed"})
+# A skill delivery row holds names, reasons and counts only: at most this many bytes of compact JSON.
+_SKILL_DELIVERY_MAX_BYTES = 65536
 # A kanban board slug, or empty when the merge step does not name one.
 _BOARD_RE = re.compile(r"(?:[a-z0-9][a-z0-9_-]{0,63})?")
 # The first build's batch columns, copied as they are when its store is upgraded.
@@ -486,6 +488,39 @@ def settle_outside_release(
             "released": _snapshot(conn, released),
             "waiting": _snapshot(conn, waiting["batch_id"]) if left else None,
         }
+
+
+def record_skill_delivery(conn: sqlite3.Connection, batch_id: int, payload: dict[str, Any]) -> None:
+    """Record what the skill delivery after a released batch did per role: one
+    ``skills_delivered`` event holding ``payload`` (names, reasons and counts,
+    never a path).
+
+    A board worker never writes it (``PermissionError``). A batch that is not
+    released, and a payload over ``_SKILL_DELIVERY_MAX_BYTES`` of compact JSON,
+    raise ``ValueError`` and write nothing.
+    """
+    _refuse_worker_context()
+    _own_store(conn)
+    _require_batch_id(batch_id)
+
+    with write_txn(conn):
+        state = _snapshot(conn, batch_id)["state"]
+        if state != "released":
+            raise ValueError(f"release batch {batch_id} is {state}, not released")
+        size = len(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        if size > _SKILL_DELIVERY_MAX_BYTES:
+            raise ValueError(f"a skill delivery record holds at most {_SKILL_DELIVERY_MAX_BYTES} bytes")
+        _record_event(conn, batch_id, "skills_delivered", payload, int(time.time()))
+
+
+def last_skill_delivery(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
+    """Payload of the newest ``skills_delivered`` event, or ``None`` while there
+    is none. The order is that of the events, never of the clock."""
+    _own_store(conn)
+    row = conn.execute(
+        "SELECT payload FROM release_events WHERE kind = 'skills_delivered' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    return None if row is None else json.loads(row["payload"])
 
 
 def list_batches(conn: sqlite3.Connection) -> list[dict[str, Any]]:
