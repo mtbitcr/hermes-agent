@@ -36,12 +36,12 @@ hermes profile create research --no-skills
 **On an already-installed profile** (default or named), toggle it at runtime:
 
 ```bash
-hermes skills opt-out            # stop future seeding — nothing on disk is touched
+hermes skills opt-out            # stop seeding new bundled skills — nothing is deleted
 hermes skills opt-out --remove   # also delete UNMODIFIED bundled skills (confirms first)
 hermes skills opt-in --sync      # undo: remove the marker and re-seed now
 ```
 
-All three paths write a `.no-bundled-skills` marker into the profile directory. While the marker is present, the installer, `hermes update`, and any skill sync all skip bundled-skill seeding for that profile. Delete the marker (or run `hermes skills opt-in`) to re-enable.
+All three paths write a `.no-bundled-skills` marker into the profile directory. While the marker is present, the installer, `hermes update`, and any skill sync all skip bundled-skill seeding for that profile. The marker stops *new* bundled skills, except the essential ones. A bundled skill the profile already has at its usual place still gets each released change while your copy is unchanged since Hermes wrote it: only ordinary files and folders, all readable, matching the record. A changed copy, a copy with a link in it, a copy Hermes can't read, or a copy with a `.bak` folder beside it is kept as it is, and the sync names it with the reason. A copy you deleted or moved is not brought back or searched for. Delete the marker (or run `hermes skills opt-in`) to re-enable.
 
 :::note Safe by default
 `hermes skills opt-out` only stops *future* seeding — it never deletes anything already on disk. The optional `--remove` flag deletes bundled skills **only** when they are unmodified (byte-identical to the version Hermes installed). Skills you have edited, skills installed from the hub, and skills you wrote yourself are always kept.
@@ -1008,10 +1008,14 @@ Taps are stored in `~/.hermes/skills/.hub/taps.json` (created on demand).
 
 Hermes ships with a set of bundled skills in `skills/` inside the repo. On install and on every `hermes update`, a sync pass copies those into `~/.hermes/skills/` and records a manifest at `~/.hermes/skills/.bundled_manifest` mapping each skill name to the content hash at the time it was synced (the **origin hash**).
 
-On each sync, Hermes recomputes the hash of your local copy and compares it to the origin hash:
+On each sync, Hermes checks your local copy against the origin hash:
 
-- **Unchanged** → safe to pull upstream changes, copy the new bundled version in, record the new origin hash.
-- **Changed** → treated as **user-modified** and skipped forever, so your edits never get stomped.
+- **Unchanged** → only when Hermes can read all of it, it holds only ordinary files and folders, and it matches the origin hash. Then the new bundled version is copied in and the new origin hash recorded.
+- **Changed** → treated as **user-modified**: the copy stays yours on every later sync, so your edits never get stomped, until you run `hermes skills reset <name>`.
+- **A link, a special file, or a part Hermes can't read** → a symlink anywhere on the way to a copy (for example, a category folder that is a link) or inside it, a pipe or device file, or a file or folder Hermes can't read (for example, a folder without read permission) keeps the copy yours. Hermes leaves it alone, writes nothing through the link, and reports why: `link`, `changed` or `unreadable`.
+- **Changed, then matches a release** → a copy you changed stays yours, even if it later matches a newer release byte for byte. Only the recorded hash says Hermes wrote it.
+- **No record** → a sync never takes over a copy that has no record, even one that matches the release byte for byte. Only `hermes skills reset <name>` records it again.
+- **A write fails** → if the new copy or its record can't be written, the old copy is put back and the old record kept. The next update tries again.
 
 Generated runtime caches inside a skill (`__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, and a `.pyc` sitting next to its `.py`) are not part of the hash, so running a skill's helper script never marks it user-modified or hides it from `hermes skills list-modified` / `diff`.
 
@@ -1020,8 +1024,9 @@ The protection is good, but it has one sharp edge. If you edit a bundled skill a
 `hermes skills reset` is the escape hatch:
 
 ```bash
-# Safe: clears the manifest entry for this skill. Your current copy is preserved,
-# but the next sync re-baselines against it so future updates work normally.
+# Safe: clears the manifest entry for this skill. Your current copy is preserved;
+# if it matches the current bundled version, the next sync records it again so
+# future updates work normally.
 hermes skills reset google-workspace
 
 # Full restore: also deletes your local copy and re-copies the current bundled

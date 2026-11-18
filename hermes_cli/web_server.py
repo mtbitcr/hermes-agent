@@ -12024,6 +12024,8 @@ async def cancel_oauth_session(
 
 from hermes_cli.web_routers import build_sign_in as _build_sign_in_routes  # noqa: E402
 app.include_router(_build_sign_in_routes.router)
+from hermes_cli.web_routers import model_updates as _model_updates_routes  # noqa: E402
+app.include_router(_model_updates_routes.router)
 
 # ---------------------------------------------------------------------------
 # Session detail endpoints
