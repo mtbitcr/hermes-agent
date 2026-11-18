@@ -12,6 +12,7 @@ stubbed.
 
 from __future__ import annotations
 
+import asyncio
 import builtins
 import contextlib
 import errno
@@ -33,6 +34,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from aiohttp.test_utils import TestClient, TestServer
 
 from hermes_cli import config as hermes_config
 from hermes_cli import kanban_db, owner_workspace as ow, projects_db
@@ -47,10 +49,12 @@ from tests.gateway.test_api_server_owner_model_updates import (  # noqa: F401  (
     _NEWER as B,
     _PROVIDER,
     _SUBJECT,
+    _app,
     _events,
     _project,
     _record_graph_receipt,
     _suggestion,
+    _update,
     _write_route,
     live_models,
     owner,
@@ -146,8 +150,12 @@ def _unchanged():
     return _configs(), _record_bytes(), journal.read_bytes() if journal.exists() else None
 
 
+# The sweeps read a role's model hundreds of times: libyaml's safe loader, when built.
+_SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
 def _model(profile):
-    return yaml.safe_load((get_profile_dir(profile) / "config.yaml").read_text())["model"]["default"]
+    return yaml.load((get_profile_dir(profile) / "config.yaml").read_text(), Loader=_SAFE_LOADER)["model"]["default"]
 
 
 def _revision(profile):
@@ -517,7 +525,15 @@ def _undo_state_path():
 
 
 def _rolled_back(team, suggestion_id):
-    return _events(team.project, suggestion_id, "model_update_rolled_back")
+    """The suggestion's rollback events, as ``_events`` reads them, from one plain read of its board."""
+    return [
+        json.loads(row["payload"])
+        for row in _rows(
+            _board_file(team.project["board"]),
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id",
+            (suggestion_id, "model_update_rolled_back"),
+        )
+    ]
 
 
 def _finished(team, suggestion_id, prior):
@@ -828,12 +844,15 @@ def _stores(team, suggestion_id):
     return _record_bytes(), _configs(), sorted(_undo_audit()), _rolled_back(team, suggestion_id)
 
 
-def _whole(team, suggestion_id, before):
-    """The one whole outcome the stores hold, A or B, with no undo state; fails on any other."""
+def _whole(team, suggestion_id, before, roles=MOVED):
+    """The one whole outcome the stores hold, A or B, with no undo state; fails on any other.
+
+    ``roles`` is the undo's role set: one audit record for each in A.
+    """
     assert not _undo_state_path().exists()
     if _entries() == [(A, B, "rolled_back")]:
         assert [_model(role) for role in MOVED] == [A, A]
-        assert sorted(_undo_audit()) == [(role, _PROVIDER, A) for role in MOVED]
+        assert sorted(_undo_audit()) == [(role, _PROVIDER, A) for role in roles]
         assert len(_rolled_back(team, suggestion_id)) == 1
         return "A"
     assert (_record_bytes(), _configs()) == before
@@ -841,7 +860,7 @@ def _whole(team, suggestion_id, before):
     return "B"
 
 
-def _answer_is_true(resp, team, suggestion_id, before, earlier):
+def _answer_is_true(resp, team, suggestion_id, before, earlier, roles=MOVED):
     """Point 2 of the rule; ``earlier`` is what the stores held before this call."""
     if resp.status_code == 503:
         assert resp.json() == {"detail": "Service Unavailable"}
@@ -850,26 +869,15 @@ def _answer_is_true(resp, team, suggestion_id, before, earlier):
     assert resp.status_code == 200, resp.text
     state = resp.json()["state"]
     assert state in ("undone", "already_undone", "not_applied", "busy")
+    if state == "undone":
+        assert resp.json()["roles"] == roles
     if state == "already_undone":
         assert _stores(team, suggestion_id) == earlier
-    assert _whole(team, suggestion_id, before) == ("A" if state.endswith("undone") else "B")
+    assert _whole(team, suggestion_id, before, roles) == ("A" if state.endswith("undone") else "B")
 
 
-@pytest.mark.parametrize("seam", _SEAMS, ids=[seam[0] for seam in _SEAMS])
-def test_an_error_at_each_seam_then_one_more_undo_ends_whole(team, monkeypatch, seam):
-    suggestion_id = _apply(team)
-    before = (_record_bytes(), _configs())
-    earlier = _stores(team, suggestion_id)
-    with monkeypatch.context() as patch:
-        _seam_faults(patch, seam, "error")
-        first = _undo(team)
-    _answer_is_true(first, team, suggestion_id, before, earlier)
-
-    earlier = _stores(team, suggestion_id)
-    resp = _undo(team)
-
-    assert resp.status_code == 200, resp.text
-    _answer_is_true(resp, team, suggestion_id, before, earlier)
+# The error at each seam runs in tests/contracts/test_model_update_examples.py,
+# so that each of the two files keeps the owner's time limit.
 
 
 @pytest.mark.linux_only
@@ -1394,19 +1402,45 @@ def _stop_after_first(original):
 
 
 # Point 7: the fault-free undo, and the settle (by the next undo) of each
-# state a fault can leave.
+# state a fault can leave. The owner's note of 2026-11-18 adds the undo of an
+# empty role set (plan 3.3 point 7): the record entry says active, but no
+# role runs the newer version.
+_EMPTY = "undo of an empty role set"
 _SWEEP = {
     "fault-free undo of two roles": None,
     "settle after a fault in the event write": lambda patch: patch.setattr(omu, "_append_receipt", _eio),
     "settle after a fault in the audit commit": lambda patch: patch.setattr(model_policy, "commit_audit_batch", _eio),
     "settle after a fault between the two route writes":
         lambda patch: patch.setattr(omu, "_write_model", _stop_after_first(omu._write_model)),
+    _EMPTY: None,
 }
+
+
+def _sweep_roles(scenario):
+    """The scenario's undo role set: one audit record for each in outcome A."""
+    return [] if scenario == _EMPTY else MOVED
+
+
+def _abrupt_stop(*args, **kwargs):
+    raise _AbruptStop()
+
+
+def _update_stopped_before_its_routes(team):
+    """An Update that stopped after its record write and before its first route write."""
+    suggestion_id = _suggestion(team.project, _SUBJECT)
+    ref = ow._owner_decision_ref(team.owner, authority="recommendation", native_id=suggestion_id)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(hermes_config, "apply_profile_route_batch", _abrupt_stop)
+        with pytest.raises(_AbruptStop):
+            omu.apply_model_update(team.owner, decision_ref=ref, reason="Update")
+    assert _entries() == [(A, B, "active")]
+    assert [_model(role) for role in MOVED] == [A, A]
+    return suggestion_id
 
 
 def _sweep_start(team, scenario, saved):
     """Build the scenario's start state once and keep a copy of the home."""
-    suggestion_id = _apply(team)
+    suggestion_id = _update_stopped_before_its_routes(team) if scenario == _EMPTY else _apply(team)
     before = (_record_bytes(), _configs())
     if _SWEEP[scenario] is not None:
         with pytest.MonkeyPatch.context() as patch:
@@ -1441,55 +1475,47 @@ def _counted_undo(team, fault=0):
     return resp, calls
 
 
-def _fault_free_count(team, saved, suggestion_id, before):
+def _fault_free_count(team, saved, suggestion_id, before, roles=MOVED):
     """Point 7: N from a fault-free run, the same on a repeat run."""
     runs = []
     for _ in range(2):
         _restore_home(saved)
         earlier = _stores(team, suggestion_id)
         resp, calls = _counted_undo(team)
-        _answer_is_true(resp, team, suggestion_id, before, earlier)
-        assert resp.status_code == 200 and _whole(team, suggestion_id, before) == "A"
+        _answer_is_true(resp, team, suggestion_id, before, earlier, roles)
+        assert resp.status_code == 200 and _whole(team, suggestion_id, before, roles) == "A"
         runs.append(calls)
     assert len(runs[0].calls) > 0
     assert runs[0].calls == runs[1].calls, "the fault-free count differs on a repeat run"
     return runs[0]
 
 
-def _first_then_second(team, suggestion_id, before, earlier, first, where):
+def _first_then_second(team, suggestion_id, before, earlier, first, where, roles=MOVED):
     """Point 9: a true first answer, then one fault-free undo that ends whole."""
     assert not isinstance(first, BaseException), f"{where}: the first answer is an exception: {first!r}"
     if first.status_code == 503:  # the route's 503, or the sign-in's own before the route
         assert first.json()["detail"] == "Service Unavailable", f"{where}: {first.text}"
         if not _undo_state_path().exists():
-            _whole(team, suggestion_id, before)
+            _whole(team, suggestion_id, before, roles)
     else:
-        _answer_is_true(first, team, suggestion_id, before, earlier)
+        _answer_is_true(first, team, suggestion_id, before, earlier, roles)
     earlier = _stores(team, suggestion_id)
     second = _undo(team)
     assert second.status_code == 200, f"{where}: second answer {second.status_code} {second.text}"
-    _answer_is_true(second, team, suggestion_id, before, earlier)
-    return _whole(team, suggestion_id, before)
+    _answer_is_true(second, team, suggestion_id, before, earlier, roles)
+    return _whole(team, suggestion_id, before, roles)
 
 
-@pytest.mark.parametrize("scenario", sorted(_SWEEP))
-def test_rule2_an_error_at_each_counted_call_then_one_more_undo_ends_whole(team, tmp_path, scenario):
-    suggestion_id, before = _sweep_start(team, scenario, tmp_path / "saved-home")
-    n = len(_fault_free_count(team, tmp_path / "saved-home", suggestion_id, before).calls)
-    print(f"RULE2_SWEEP error {scenario}: N={n}")
-    for k in range(1, n + 1):
-        _restore_home(tmp_path / "saved-home")
-        earlier = _stores(team, suggestion_id)
-        first, calls = _counted_undo(team, fault=k)
-        assert len(calls.calls) >= k, f"call {k} was not reached"
-        _first_then_second(team, suggestion_id, before, earlier, first, f"call {k} {calls.calls[k - 1]} {calls.paths[k - 1]}")
+# The error sweep of point 8 runs in tests/contracts/test_model_update_examples.py,
+# so that each of the two files keeps the owner's time limit.
 
 
 @pytest.mark.linux_only
 @pytest.mark.parametrize("scenario", sorted(_SWEEP))
 def test_rule2_a_real_exit_right_after_each_counted_write_then_one_more_undo_ends_whole(team, tmp_path, scenario):
+    roles = _sweep_roles(scenario)
     suggestion_id, before = _sweep_start(team, scenario, tmp_path / "saved-home")
-    writes = _fault_free_count(team, tmp_path / "saved-home", suggestion_id, before).writes
+    writes = _fault_free_count(team, tmp_path / "saved-home", suggestion_id, before, roles).writes
     print(f"RULE2_SWEEP exit {scenario}: writes={len(writes)}")
     assert writes
     seen = tmp_path / "child-calls.json"
@@ -1511,12 +1537,12 @@ def test_rule2_a_real_exit_right_after_each_counted_write_then_one_more_undo_end
         hermes_config._LOAD_CONFIG_CACHE.clear()
         hermes_config._LAST_EXPANDED_CONFIG_BY_PATH.clear()
         if not _undo_state_path().exists():
-            _whole(team, suggestion_id, before)
+            _whole(team, suggestion_id, before, roles)
         earlier = _stores(team, suggestion_id)
         second = _undo(team)
         assert second.status_code == 200, f"write {k}: second answer {second.status_code} {second.text}"
-        _answer_is_true(second, team, suggestion_id, before, earlier)
-        _whole(team, suggestion_id, before)
+        _answer_is_true(second, team, suggestion_id, before, earlier, roles)
+        _whole(team, suggestion_id, before, roles)
 
 
 # ---------------------------------------------------------------------------
@@ -1795,3 +1821,64 @@ def test_review_r3_control_pending_audit_and_no_read_fault_settles_once(team, mo
     assert sorted(_undo_audit()) == [(r, _PROVIDER, A) for r in MOVED]
     assert len(_events(team.project, suggestion_id, "model_update_rolled_back")) == 1
     assert _undo(team).json()["state"] == "already_undone"
+
+
+# ---------------------------------------------------------------------------
+# The probe of review round four (attachment 1860): an Update that exited
+# after its record write and before its first route write leaves an empty
+# role set; the undo, its retry and a practice start still end whole.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("stop_prior_update", [False, True])
+def test_empty_affected_role_set_does_not_leave_undo_and_practice_stuck(team, stop_prior_update):
+    if importlib.util.find_spec(ROUTER) is None:
+        assert _undo(team).status_code == 403
+        return
+    suggestion = _suggestion(team.project)
+    ref = ow._owner_decision_ref(team.owner, authority="recommendation", native_id=suggestion)
+    child = os.fork()
+    if child == 0:
+        signal.alarm(60)
+        if stop_prior_update:
+            def stop(*args, **kwargs):
+                os._exit(77)
+            hermes_config.apply_profile_route_batch = stop
+
+        async def update():
+            async with TestClient(TestServer(_app())) as client:
+                resp = await _update(client, ref)
+                assert resp.status == 200, await resp.text()
+        try:
+            asyncio.run(update())
+        except BaseException:
+            os._exit(98)
+        os._exit(0)
+    _, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == (77 if stop_prior_update else 0)
+    hermes_config._LOAD_CONFIG_CACHE.clear()
+    hermes_config._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    assert _entries() == [(A, B, "active")]
+    assert [_model(role) for role in MOVED] == [A if stop_prior_update else B] * 2
+    before = _configs()
+    first = _undo(team)
+    second = _undo(team)
+    practice = _practice(team)
+    expected_roles = [] if stop_prior_update else MOVED
+    facts = {"prior_update_exited": stop_prior_update, "first_status": first.status_code, "first": first.json(),
+             "second_status": second.status_code, "second": second.json(),
+             "practice_status": practice.status_code, "practice": practice.json(), "record": _entries(),
+             "pending_state": _undo_state_path().exists(), "audits": _undo_audit(),
+             "receipts": len(_rolled_back(team, suggestion)),
+             "role_models": {role: _model(role) for role in MOVED}, "config_bytes_unchanged": _configs() == before}
+    print("EMPTY_ROLE_UNDO " + json.dumps(facts, sort_keys=True))
+    assert first.status_code == 200, facts
+    assert first.json() == {"state": "undone", "roles": expected_roles, "from_model": A, "to_model": B}
+    assert second.status_code == 200 and second.json()["state"] == "already_undone"
+    assert practice.status_code == 200
+    assert not _undo_state_path().exists()
+    assert sorted(_undo_audit()) == [(role, _PROVIDER, A) for role in expected_roles]
+    assert len(_rolled_back(team, suggestion)) == 1
+    if not expected_roles:
+        assert _configs() == before

@@ -571,26 +571,39 @@ def _repository_bindings(value):
                 yield module, name
 
 
+@pytest.fixture
+def real_clock_and_ids():
+    """Keep the real clock and real ids: no ``frozen_clock``, no ``frozen_ids``.
+
+    For a test moved here unchanged from another test file, so that it runs
+    as it ran there; it saves no example.
+    """
+
+
 @pytest.fixture(autouse=True)
-def frozen_clock(monkeypatch):
+def frozen_clock(request, monkeypatch):
     """Wall-clock reads return one instant; monotonic time still moves.
 
     ``time.time`` is frozen, and ``datetime.now`` wherever an imported
     repository module bound the ``datetime`` class, ``hermes_time.now``
     included. The ``datetime`` module itself is left alone.
     """
+    if "real_clock_and_ids" in request.fixturenames:
+        return
     monkeypatch.setattr(time, "time", lambda: FROZEN_TIME)
     for module, name in list(_repository_bindings(_REAL_DATETIME)):
         monkeypatch.setattr(module, name, _FrozenDatetime)
 
 
 @pytest.fixture(autouse=True)
-def frozen_ids(monkeypatch):
+def frozen_ids(request, monkeypatch):
     """``uuid4`` and ``token_hex`` hash a counter into every byte they return.
 
     Ids repeat from run to run, yet any prefix a producer keeps still differs
     between draws, and a ``uuid4`` keeps its version and variant bits.
     """
+    if "real_clock_and_ids" in request.fixturenames:
+        return
     counter = itertools.count(1)
 
     def _drawn(size: int) -> bytes:

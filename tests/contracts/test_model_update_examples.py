@@ -14,10 +14,24 @@ import pytest
 from plugins.dashboard_auth.raphael_workspace import model_policy
 from tests.contracts import conftest as contract
 from tests.hermes_cli.test_web_router_model_updates import (  # noqa: F401  (fixtures)
+    _SEAMS,
+    _SWEEP,
+    _answer_is_true,
     _apply,
+    _configs,
+    _counted_undo,
+    _fault_free_count,
     _finish,
+    _first_then_second,
     _practice,
+    _record_bytes,
+    _restore_home,
+    _restore_route_latch,
     _running_work,
+    _seam_faults,
+    _stores,
+    _sweep_roles,
+    _sweep_start,
     _undo,
     _write_route,
     dash,
@@ -66,3 +80,44 @@ def test_the_model_update_examples_take_every_state():
         ("model_update_practice", {"started", "already_started"}),
     ):
         assert (f"{FAMILY}/{record_kind}", ("state",), frozenset(states)) in contract.CLOSED_VOCABULARIES
+
+
+# ---------------------------------------------------------------------------
+# Moved here unchanged from tests/hermes_cli/test_web_router_model_updates.py,
+# so that each of the two files keeps the owner's time limit: the error at
+# each seam of owner rule 1 and the error sweep of point 8 of owner rule 2
+# (their real-exit twins stay there). They run on the real clock and real
+# ids, as they did there.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("seam", _SEAMS, ids=[seam[0] for seam in _SEAMS])
+def test_an_error_at_each_seam_then_one_more_undo_ends_whole(team, monkeypatch, seam, real_clock_and_ids):
+    suggestion_id = _apply(team)
+    before = (_record_bytes(), _configs())
+    earlier = _stores(team, suggestion_id)
+    with monkeypatch.context() as patch:
+        _seam_faults(patch, seam, "error")
+        first = _undo(team)
+    _answer_is_true(first, team, suggestion_id, before, earlier)
+
+    earlier = _stores(team, suggestion_id)
+    resp = _undo(team)
+
+    assert resp.status_code == 200, resp.text
+    _answer_is_true(resp, team, suggestion_id, before, earlier)
+
+
+@pytest.mark.parametrize("scenario", sorted(_SWEEP))
+def test_rule2_an_error_at_each_counted_call_then_one_more_undo_ends_whole(team, tmp_path, scenario, real_clock_and_ids):
+    roles = _sweep_roles(scenario)
+    suggestion_id, before = _sweep_start(team, scenario, tmp_path / "saved-home")
+    n = len(_fault_free_count(team, tmp_path / "saved-home", suggestion_id, before, roles).calls)
+    print(f"RULE2_SWEEP error {scenario}: N={n}")
+    for k in range(1, n + 1):
+        _restore_home(tmp_path / "saved-home")
+        earlier = _stores(team, suggestion_id)
+        first, calls = _counted_undo(team, fault=k)
+        assert len(calls.calls) >= k, f"call {k} was not reached"
+        _first_then_second(team, suggestion_id, before, earlier, first,
+                           f"call {k} {calls.calls[k - 1]} {calls.paths[k - 1]}", roles)

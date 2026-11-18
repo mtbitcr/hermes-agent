@@ -658,11 +658,12 @@ def _settle_undo(state: dict, *, begun: Any = None, end_at_b: bool = True) -> st
             wrote = True
         else:
             audited = _audit_counts(state["undo_id"])
-            if not audited:
+            if not audited and expected:
                 model_policy.commit_audit_batch(_begin_audit(state, set(expected)))
                 wrote = True
             elif audited != expected:
                 raise Unavailable()  # A part or a copy: no write can make it exactly one.
+            # An empty role set expects no audit record and begins no batch.
         found = _rolled_back_event(entry)
         if found is None:
             # The suggestion is gone, so there is nothing to hold the event.
