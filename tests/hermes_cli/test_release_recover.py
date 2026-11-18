@@ -243,6 +243,18 @@ def sent(monkeypatch: pytest.MonkeyPatch) -> Sent:
 
 
 @pytest.fixture(autouse=True)
+def delivered(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Every test here: the skill delivery after a released batch is replaced by a record of its
+    batch ids, so no test runs a role's sync, tells its lines or counts its processes. The record
+    imports nothing when called, as K6 needs; test_release_skills_delivery.py tests the step."""
+    from hermes_cli import release_cmd
+
+    batches: list[int] = []
+    monkeypatch.setattr(release_cmd, "_deliver_skills", lambda batch_id, actions: batches.append(batch_id))
+    return batches
+
+
+@pytest.fixture(autouse=True)
 def _default_sigint():
     """A recovery installs no SIGINT handler of its own. A runner can start the tests with SIGINT
     ignored, so each test runs under Python's default handler and the caller's is put back."""

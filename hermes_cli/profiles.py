@@ -953,16 +953,19 @@ def create_profile(
     return profile_dir
 
 
-def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict]:
+def seed_profile_skills(profile_dir: Path, quiet: bool = False, full_result: bool = False) -> Optional[dict]:
     """Seed bundled skills into a profile via subprocess (sync_skills() caches HERMES_HOME at
     module level). Returns the sync result dict, or None on failure. ``--no-skills`` profiles
     still run the sync: ``sync_skills()`` detects the marker and seeds only essentials.
-    The child prints the legacy keys only, in their legacy order, so its output stays as before."""
+    The child prints the legacy keys only, in their legacy order, so its output stays as before;
+    ``full_result=True`` has it print the whole result (with ``kept``, ``refused`` and
+    ``not_seeded_by_marker``) for the release's skill delivery."""
     project_root = Path(__file__).parent.parent.resolve()
-    code = ("import json; from tools.skills_sync import sync_skills; r = sync_skills(quiet=True); "
-            "r = {k: r[k] for k in ('copied', 'updated', 'skipped', 'user_modified', 'cleaned', "
-            "'suppressed', 'relocated', 'total_bundled', 'optional_provenance_backfilled', "
-            "'shadowed_by_external', 'skipped_opt_out') if k in r}; ")
+    code = "import json; from tools.skills_sync import sync_skills; r = sync_skills(quiet=True); "
+    if not full_result:
+        code += ("r = {k: r[k] for k in ('copied', 'updated', 'skipped', 'user_modified', 'cleaned', "
+                 "'suppressed', 'relocated', 'total_bundled', 'optional_provenance_backfilled', "
+                 "'shadowed_by_external', 'skipped_opt_out') if k in r}; ")
     try:
         result = subprocess.run(
             [sys.executable, "-c", code + "print(json.dumps(r))"],

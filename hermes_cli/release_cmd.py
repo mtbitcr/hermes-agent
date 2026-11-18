@@ -50,6 +50,7 @@ from hermes_cli.config import (
     get_project_root,
     read_raw_config,
 )
+from hermes_cli.profiles import seed_profile_skills
 from hermes_cli.release_guards import GATEWAY_UNIT, GUARDS, SERVE_UNIT, Pins, RecordedMerge
 from hermes_cli.release_host import LiveHostReader
 from hermes_cli.release_host_actions import SYNC_EXTRAS, ReleaseHostActions
@@ -411,6 +412,7 @@ def _release(inputs: tuple[Any, ...], host: _Host, token: str) -> int:
         return release_unit.RESTORED_EXIT_STATUS
     if outcome != "released":
         return 1
+    _deliver_skills(batch_id, actions)
     _start_journeys()
     return 0
 
@@ -443,6 +445,62 @@ def _tell_owner(line: str) -> None:
     else:
         if sent.returncode:
             print(f"The owner was not told: the send exited with status {sent.returncode}.")
+
+
+def _deliver_skills(batch_id: int, actions: ReleaseHostActions) -> None:
+    """After a released batch, run the approved skill delivery in every role the gateway serves,
+    the root first: the role's seeding with its full result, one role at a time. One
+    ``skills_delivered`` row records each role (names, reasons and counts, never a path) and the
+    owner gets one plain line per role. An error, a missing result or the time limit fails only
+    that role, and the journal shows only the type of an error. Nothing here raises, and nothing
+    changes the outcome, the exit status or the pause."""
+    try:
+        homes = [Path(home) for home in actions._served_homes()]
+    except (Exception, KeyboardInterrupt) as error:
+        print(f"The skills were not delivered: the role list could not be read ({type(error).__name__}).")
+        _tell_owner(f"Skills after release {batch_id}: the role list could not be read, so no role was"
+                    " refreshed. The release itself is done.")
+        return
+    roles = []
+    for index, home in enumerate(homes):
+        role = "default" if index == 0 else home.name
+        entry = {"role": role, "status": "failed", "updated": 0, "kept": [], "refused": [],
+                 "not_seeded_by_marker": 0, "reason": "no result"}
+        try:
+            result = seed_profile_skills(home, quiet=True, full_result=True)
+            if isinstance(result, dict):  # None: a non-zero exit, unreadable output or the time limit
+                entry = {
+                    "role": role, "status": "refreshed", "updated": len(result["updated"]),
+                    "kept": [{"name": str(item["name"]), "reason": str(item["reason"])}
+                             for item in result["kept"]],
+                    "refused": [{"name": str(item["name"]), "reason": str(item["reason"])}
+                                for item in result["refused"]],
+                    "not_seeded_by_marker": int(result.get("not_seeded_by_marker", 0)),
+                }
+        except (Exception, KeyboardInterrupt) as error:
+            entry["reason"] = type(error).__name__
+            print(f"The skills of role {role} were not refreshed ({type(error).__name__}).")
+        roles.append(entry)
+    lines = []
+    for entry in roles:
+        head = f"Skills after release {batch_id}, role {entry['role']}:"
+        if entry["status"] == "failed":
+            lines.append(f"{head} not refreshed (the refresh did not finish). It keeps its earlier"
+                         " skills until the next release; the release itself is done.")
+            continue
+        kept, refused = (", ".join(f"{item['name']} ({item['reason']})" for item in entry[key]) or "none"
+                         for key in ("kept", "refused"))
+        lines.append(f"{head} refreshed. {entry['updated']} updated; kept: {kept}; refused: {refused};"
+                     f" {entry['not_seeded_by_marker']} not seeded because of the marker.")
+    refreshed = sum(entry["status"] == "refreshed" for entry in roles)
+    payload = {"roles": roles, "refreshed": refreshed, "failed": len(roles) - refreshed}
+    try:
+        with contextlib.closing(release_ledger.connect()) as conn:
+            release_ledger.record_skill_delivery(conn, batch_id, payload)
+    except (Exception, KeyboardInterrupt) as error:
+        print(f"The skill record could not be saved ({type(error).__name__}).")
+        lines.append("The skill record could not be saved.")
+    _tell_owner("\n".join(lines))
 
 
 def _start_journeys() -> None:
@@ -808,6 +866,8 @@ def _recover(batch_id: int) -> int:
         return 0
     if outcome == "restored":
         return release_unit.RESTORED_EXIT_STATUS
+    if outcome == "released":
+        _deliver_skills(batch_id, actions)
     return 0 if outcome == "released" else 1
 
 
