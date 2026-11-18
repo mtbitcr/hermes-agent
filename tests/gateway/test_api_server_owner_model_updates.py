@@ -14,7 +14,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
+import threading
 import time
+import urllib.error
 
 import pytest
 import yaml
@@ -63,6 +66,9 @@ _PRACTICE = "This is a practice run. Clicking Update changes nothing."
 _DONE = "Done. New work will use the newer version."
 _NOT_AVAILABLE = "This update is no longer available, so nothing changed."
 _NOT_APPLIED = "Raphael could not apply this update, so nothing changed."
+_NOT_WAITING = "This choice is no longer waiting."
+# A placeholder sign-in: it must reach the provider read and nothing else.
+_SIGN_IN = "placeholder-sign-in-not-a-live-key"
 
 
 def _write_owner_workspace_config(*, enabled: bool) -> None:
@@ -104,14 +110,21 @@ def roles(owner) -> None:
 
 
 @pytest.fixture
-def live_models(monkeypatch) -> dict[str, list[str]]:
-    """The provider's live model list, the one outside read Update makes."""
-    listed = {_PROVIDER: [_CURRENT, _NEWER, "claude-opus-5-5"]}
+def live_models(monkeypatch) -> dict[str, list[str] | None]:
+    """The account's own model list, the one outside read Update makes; None is a failed read.
 
-    def provider_model_ids(provider, *, force_refresh=False):
-        return list(listed.get(provider, []))
+    Only the provider's reply is stubbed, so the sign-in lookup and the
+    account reader above it run as deployed and no picker list can stand in.
+    """
+    listed: dict[str, list[str] | None] = {_PROVIDER: [_CURRENT, _NEWER, "claude-opus-5-5"]}
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _SIGN_IN)
 
-    monkeypatch.setattr("hermes_cli.models.provider_model_ids", provider_model_ids)
+    def get_json(url, **kwargs):
+        if listed[_PROVIDER] is None:
+            raise urllib.error.URLError("the provider could not be reached")
+        return {"data": [{"id": model} for model in listed[_PROVIDER]]}
+
+    monkeypatch.setattr("hermes_cli.models._get_json", get_json)
     return listed
 
 
@@ -277,12 +290,34 @@ async def test_two_updates_at_once_apply_the_update_once(owner, roles, live_mode
     project = _project(owner)
     suggestion_id = _suggestion(project)
     prior = {profile: _revision(profile) for profile in _ROUTES}
+    # Revisions name content, not how often it was written, so the writes are
+    # counted where configuration reaches disk, with the real write path running.
+    config_files = {str(get_profile_dir(profile) / "config.yaml"): profile for profile in _ROUTES}
+    written: list[str] = []
+    batches: list[list] = []
+    real_write = hermes_config.atomic_yaml_write
+    real_batch = hermes_config.apply_profile_route_batch
 
-    async with TestClient(TestServer(_app())) as client:
-        ref = (await _model_update(client))["decision_ref"]
-        answers = await asyncio.gather(_update(client, ref), _update(client, ref))
-        bodies = [(resp.status, await resp.json()) for resp in answers]
+    def counted_write(path, *args, **kwargs):
+        result = real_write(path, *args, **kwargs)
+        written.append(config_files.get(str(path), str(path)))
+        return result
 
+    def counted_batch(changes, **kwargs):
+        batches.append(list(changes))
+        return real_batch(changes, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(hermes_config, "atomic_yaml_write", counted_write)
+        patch.setattr(hermes_config, "apply_profile_route_batch", counted_batch)
+        async with TestClient(TestServer(_app())) as client:
+            ref = (await _model_update(client))["decision_ref"]
+            answers = await asyncio.gather(_update(client, ref), _update(client, ref))
+            bodies = [(resp.status, await resp.json()) for resp in answers]
+
+    # One successful write per affected role, none for the planner, one batch.
+    assert sorted(written) == sorted(_ON_CURRENT)
+    assert len(batches) == 1
     bodies.sort(key=lambda answer: answer[0])
     assert [status for status, _ in bodies] == [200, 404]
     assert bodies[0][1]["data"]["message"] == _DONE
@@ -303,6 +338,52 @@ async def test_two_updates_at_once_apply_the_update_once(owner, roles, live_mode
         for entry in model_policy.read_model_updates()
     ] == [(_CURRENT, _NEWER, "active")]
     assert _decision(project, suggestion_id)["decision"] == "accepted"
+
+
+# 1, after the routes moved: the slower click reads the routes only once the winner
+# has moved them, and is still told the choice is gone rather than unavailable.
+@pytest.mark.asyncio
+async def test_concurrent_loser_returns_not_waiting_even_after_routes_move(
+    owner, roles, live_models, monkeypatch
+):
+    from hermes_cli import owner_model_updates as updates
+
+    project = _project(owner)
+    suggestion_id = _suggestion(project)
+    real_roles_on = updates.roles_on
+    first_reading, second_reading, first_done = (
+        threading.Event(), threading.Event(), threading.Event()
+    )
+
+    def roles_on(*args):
+        if not first_reading.is_set():
+            first_reading.set()
+            assert second_reading.wait(30), "the second click never read the routes"
+        else:
+            second_reading.set()
+            assert first_done.wait(30), "the first click never finished"
+        return real_roles_on(*args)
+
+    async with TestClient(TestServer(_app())) as client:
+        ref = (await _model_update(client))["decision_ref"]
+        monkeypatch.setattr(updates, "roles_on", roles_on)
+        first = asyncio.create_task(_update(client, ref))
+        assert await asyncio.to_thread(first_reading.wait, 30)
+        second = asyncio.create_task(_update(client, ref))
+        try:
+            winner = await first
+        finally:
+            first_done.set()
+        loser = await second
+        bodies = [(resp.status, await resp.json()) for resp in (winner, loser)]
+
+    assert [status for status, _ in bodies] == [200, 404]
+    assert bodies[0][1]["data"]["message"] == _DONE
+    assert bodies[1][1]["error"]["code"] == "decision_not_found"
+    assert bodies[1][1]["error"]["message"] == _NOT_WAITING
+    [receipt] = _receipts(project, suggestion_id)
+    assert sorted(receipt["roles"]) == sorted(_ON_CURRENT)
+    assert [_configured_model(profile) for profile in _ON_CURRENT] == [_NEWER, _NEWER]
 
 
 # 2. Update in one tab and Later in another: exactly one outcome.
@@ -383,12 +464,12 @@ async def test_a_failed_batch_restores_the_record_and_changes_nothing(
     else:
         # Settings moves one role while the owner's click is being checked, so
         # the revision Update read is no longer the one on disk.
-        def provider_model_ids(provider, *, force_refresh=False):
+        def get_json(url, **kwargs):
             _write_route("raphael-business", "openai-codex", "gpt-5.6-terra", "max")
             configs.update(_config_bytes())
-            return [_CURRENT, _NEWER]
+            return {"data": [{"id": _CURRENT}, {"id": _NEWER}]}
 
-        monkeypatch.setattr("hermes_cli.models.provider_model_ids", provider_model_ids)
+        monkeypatch.setattr("hermes_cli.models._get_json", get_json)
 
     async with TestClient(TestServer(_app())) as client:
         ref = (await _model_update(client))["decision_ref"]
@@ -406,6 +487,83 @@ async def test_a_failed_batch_restores_the_record_and_changes_nothing(
     [not_applied] = _events(project, suggestion_id, "model_update_not_applied")
     assert not_applied["to_model"] == _NEWER
     assert _decision(project, suggestion_id)["decision"] == "accepted"
+
+
+# 4, beside another Update: a failed Update puts back only what it changed, so an
+# Update that started while it was paused keeps its record and its routes agree.
+@pytest.mark.asyncio
+async def test_failed_update_cannot_erase_another_updates_record(
+    owner, roles, live_models, monkeypatch
+):
+    project = _project(owner)
+    sonnet = _suggestion(project)
+    opus = _suggestion(project, "model-update:anthropic:claude-opus-5-5:claude-opus-5-6:2026-11")
+    live_models[_PROVIDER].append("claude-opus-5-6")
+    # The business role is busy, so Update A (the sonnet roles) fails at the fence.
+    with contextlib.closing(kanban_db.connect(board=project["board"])) as conn:
+        running = kanban_db.create_task(
+            conn,
+            title="work in progress",
+            assignee="raphael-business",
+            execution_tier="routine",
+            project_id=project["project_id"],
+        )
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (running,))
+        conn.commit()
+    _record_graph_receipt(owner, project, [running])
+
+    # A pauses just after writing its record until Update B (the planner) has
+    # started; B then waits at the route lock until A has failed and restored.
+    a_thread: list[int] = []
+    a_recorded, b_started, a_done = threading.Event(), threading.Event(), threading.Event()
+    real_record = model_policy.apply_model_update_record
+    real_lock = hermes_config._route_batch_journal_lock
+
+    def record(update):
+        snapshot = real_record(update)
+        if update["from_model"] == _CURRENT:
+            a_thread.append(threading.get_ident())
+            a_recorded.set()
+            assert b_started.wait(30), "Update B never started"
+        return snapshot
+
+    @contextlib.contextmanager
+    def route_lock():
+        ident = threading.get_ident()
+        if a_recorded.is_set() and ident not in a_thread and not b_started.is_set():
+            b_started.set()
+            assert a_done.wait(30), "Update A never finished"
+        with real_lock():
+            yield
+
+    monkeypatch.setattr(model_policy, "apply_model_update_record", record)
+    monkeypatch.setattr(hermes_config, "_route_batch_journal_lock", route_lock)
+    a_ref, b_ref = (
+        ow._owner_decision_ref(owner, authority="recommendation", native_id=native_id)
+        for native_id in (sonnet, opus)
+    )
+    async with TestClient(TestServer(_app())) as client:
+        a_task = asyncio.create_task(_update(client, a_ref))
+        assert await asyncio.to_thread(a_recorded.wait, 30)
+        b_task = asyncio.create_task(_update(client, b_ref))
+        try:
+            a = await a_task
+            a_body = await a.json()
+        finally:
+            a_done.set()
+        b = await b_task
+
+    assert a.status == 409
+    assert a_body["error"]["code"] == "model_update_not_applied"
+    assert b.status == 200
+    assert [
+        (entry["from_model"], entry["to_model"], entry["state"])
+        for entry in model_policy.read_model_updates()
+    ] == [("claude-opus-5-5", "claude-opus-5-6", "active")]
+    assert _configured_model("raphael-planner") == "claude-opus-5-6"
+    assert [_configured_model(profile) for profile in _ON_CURRENT] == [_CURRENT, _CURRENT]
+    for profile in _ROUTES:
+        assert _configured_model(profile) == model_policy.assignment_for(profile, _PROVIDER).model
 
 
 # 5. A running locked task keeps its model, and its lock still validates.
@@ -480,14 +638,13 @@ async def test_a_queued_card_and_a_retry_start_with_the_old_model(
 @pytest.mark.parametrize("listing", ["missing", "empty", "failed"])
 @pytest.mark.asyncio
 async def test_an_unavailable_new_model_is_refused_before_any_write(
-    owner, roles, monkeypatch, listing
+    owner, roles, live_models, listing
 ):
-    def provider_model_ids(provider, *, force_refresh=False):
-        if listing == "failed":
-            raise RuntimeError("the provider could not be reached")
-        return [] if listing == "empty" else [_CURRENT, "claude-opus-5-5"]
-
-    monkeypatch.setattr("hermes_cli.models.provider_model_ids", provider_model_ids)
+    live_models[_PROVIDER] = {
+        "missing": [_CURRENT, "claude-opus-5-5"],
+        "empty": [],
+        "failed": None,
+    }[listing]
     project = _project(owner)
     suggestion_id = _suggestion(project)
     configs = _config_bytes()
@@ -505,6 +662,85 @@ async def test_an_unavailable_new_model_is_refused_before_any_write(
     assert _record_bytes() is None
     assert _receipts(project, suggestion_id) == []
     assert _decision(project, suggestion_id) == pending
+
+
+# 7, with a picker that already offers the new version: only the account's list counts.
+@pytest.mark.parametrize("listing", ["missing", "empty", "failed"])
+@pytest.mark.asyncio
+async def test_fresh_account_list_not_picker_fallback(
+    owner, roles, live_models, monkeypatch, listing
+):
+    from hermes_cli import models
+
+    monkeypatch.setitem(models._PROVIDER_MODELS, _PROVIDER, [_CURRENT, _NEWER])
+    await test_an_unavailable_new_model_is_refused_before_any_write(
+        owner, roles, live_models, listing
+    )
+
+
+# 7, on Codex: the offline catalog an empty or failed account answer falls back to
+# is not the account's list, and the account's own list is what admits the version.
+@pytest.mark.parametrize("status", [200, 503])
+@pytest.mark.asyncio
+async def test_codex_fallback_is_not_account_availability(
+    owner, roles, monkeypatch, caplog, status
+):
+    from hermes_cli import codex_models
+
+    caplog.set_level(logging.DEBUG)
+    old, new = "gpt-5.6-terra", "gpt-5.7-terra"
+    _write_route("raphael-business", "openai-codex", old, "max")
+    monkeypatch.setattr(
+        codex_models, "DEFAULT_CODEX_MODELS", [*codex_models.DEFAULT_CODEX_MODELS, new]
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_codex_runtime_credentials",
+        lambda **kwargs: {"api_key": _SIGN_IN},
+    )
+    reply = {"status": status, "models": []}
+    signed = []
+
+    class Reply:
+        def __init__(self):
+            self.status_code = reply["status"]
+
+        def json(self):
+            return {"models": reply["models"]}
+
+    def get(url, *, headers, **kwargs):
+        signed.append(headers["Authorization"])
+        return Reply()
+
+    monkeypatch.setattr("httpx.get", get)
+    project = _project(owner)
+    suggestion_id = _suggestion(project, f"model-update:openai-codex:{old}:{new}:2026-11")
+    configs = _config_bytes()
+
+    async with TestClient(TestServer(_app())) as client:
+        ref = (await _model_update(client))["decision_ref"]
+        refused = await _update(client, ref)
+        refused_body = await refused.json()
+        assert refused.status == 409
+        assert refused_body["error"]["code"] == "model_update_unavailable"
+        assert _config_bytes() == configs
+        assert _record_bytes() is None
+        assert _decision(project, suggestion_id)["decision"] == "pending"
+
+        reply.update(status=200, models=[{"slug": new, "priority": 1}])
+        applied = await _update(client, ref)
+        applied_body = await applied.json()
+
+    assert applied.status == 200
+    assert _configured_model("raphael-business") == new
+    # The runtime's sign-in reached the provider read, and nothing else kept it.
+    assert signed and set(signed) == {f"Bearer {_SIGN_IN}"}
+    for kept in (
+        json.dumps([refused_body, applied_body]),
+        _record_bytes().decode(),
+        json.dumps(_receipts(project, suggestion_id)),
+        caplog.text,
+    ):
+        assert _SIGN_IN not in kept
 
 
 # 8. A request that does not name the capability gets the generic suggestion.

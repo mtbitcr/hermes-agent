@@ -90,14 +90,45 @@ def feed_item(decision_ref: str, kind: Any, subject: Any) -> Optional[dict]:
 
 
 def model_available(provider: str, model: str) -> bool:
-    """Whether the provider lists ``model`` right now; a failed or empty read is no."""
+    """Whether this account's fresh model list names ``model`` right now.
+
+    The list is the provider's own answer for the sign-in the runtime resolves,
+    never a picker catalog: a picker falls back to curated or default entries
+    when that answer is empty or fails, and those say nothing about this
+    account. No sign-in, a provider without such a list, an empty answer or a
+    failed one is no. The sign-in goes to the provider read and nowhere else.
+    """
+    read = _ACCOUNT_MODEL_LISTS.get(provider)
+    if read is None:
+        return False
+    try:
+        listed = read()
+    except Exception:
+        return False  # e.g. no sign-in the runtime can resolve
+    return bool(listed) and model in listed
+
+
+def _anthropic_account_models() -> Optional[list[str]]:
+    from agent.anthropic_credentials import resolve_anthropic_token
     from hermes_cli import models
 
-    try:
-        listed = models.provider_model_ids(provider, force_refresh=True)
-    except Exception:
-        return False
-    return bool(listed) and model in listed
+    sign_in = resolve_anthropic_token()
+    return models._fetch_anthropic_models(api_key=sign_in) if sign_in else None
+
+
+def _codex_account_models() -> Optional[list[str]]:
+    from hermes_cli import codex_models
+    from hermes_cli.auth import resolve_codex_runtime_credentials
+
+    sign_in = resolve_codex_runtime_credentials(refresh_if_expiring=True).get("api_key")
+    return codex_models._fetch_models_from_api(sign_in) if sign_in else None
+
+
+# The account model list of each provider an admitted route runs on.
+_ACCOUNT_MODEL_LISTS = {
+    "anthropic": _anthropic_account_models,
+    "openai-codex": _codex_account_models,
+}
 
 
 def roles_on(provider: str, model: str) -> dict[str, str]:
@@ -121,11 +152,13 @@ def apply_model_update(ctx: OwnerContext, *, decision_ref: Any, reason: Any) -> 
     """Decide Update on one pending model update suggestion and apply it once.
 
     Refused with nothing written (``model_update_unavailable``) when no role
-    runs the current model or the provider does not list the new one now.
-    Otherwise the decision is taken by compare-and-swap before any write, so a
-    lost race is ``decision_not_found``. A batch that fails after the decision
-    leaves the record and every config as they were, appends one
-    ``model_update_not_applied`` event and raises ``model_update_not_applied``.
+    runs the current model or the account does not list the new one now, and
+    the suggestion is still waiting; if another click has taken it meanwhile,
+    the answer is ``decision_not_found``. Otherwise the decision is taken by
+    compare-and-swap before any write, so a lost race is ``decision_not_found``.
+    A batch that fails after the decision leaves the record and every config as
+    they were, appends one ``model_update_not_applied`` event and raises
+    ``model_update_not_applied``.
     """
     if not isinstance(reason, str) or not reason.strip():
         raise OwnerWorkspaceError("invalid_argument", "a decision needs the owner's reason")
@@ -136,6 +169,9 @@ def apply_model_update(ctx: OwnerContext, *, decision_ref: Any, reason: Any) -> 
     board_slug, suggestion_id, version, update = _pending_update(ctx, decision_ref)
     roles = roles_on(update.provider, update.from_model)
     if not roles or not model_available(update.provider, update.to_model):
+        # The click that took this decision meanwhile may be what moved the
+        # routes; then the choice is gone, not unavailable.
+        _pending_update(ctx, decision_ref)
         raise OwnerWorkspaceError("model_update_unavailable", NOT_AVAILABLE)
 
     with contextlib.closing(kanban_db.connect(board=board_slug)) as conn:
@@ -208,23 +244,18 @@ class _NotApplied(Exception):
 def _apply_routes(update: ModelUpdate, decision_ref: str, roles: dict[str, str]) -> dict[str, str]:
     """Record the update, then move every role in one batch; undo the record on failure.
 
+    The record is one document for every Update, and the undo puts back the
+    whole text this Update read. So the record write, the batch and the undo
+    run under the route batch journal lock, first in the route lock order (the
+    batch takes it again inside): no other Update can commit an entry in
+    between for the undo to erase from under that Update's live routes.
+
     A record that cannot be put back is not "nothing changed", so that error
     propagates as it is rather than as :class:`_NotApplied`.
     """
     from hermes_cli import config as hermes_config
     from plugins.dashboard_auth.raphael_workspace import model_policy
 
-    try:
-        prior = model_policy.apply_model_update_record({
-            "provider": update.provider,
-            "from_model": update.from_model,
-            "to_model": update.to_model,
-            "decision_ref": decision_ref,
-            "approved_at": int(time.time()),
-            "state": "active",
-        })
-    except Exception as exc:
-        raise _NotApplied() from exc
     committed: dict[str, str] = {}
 
     def enroll(revisions: dict[str, str]) -> None:
@@ -233,17 +264,30 @@ def _apply_routes(update: ModelUpdate, decision_ref: str, roles: dict[str, str])
             hermes_config.mark_route_batch_audit_committed()
             committed.update(revisions)
 
-    try:
-        return hermes_config.apply_profile_route_batch(
-            sorted(roles.items()),
-            apply_one=functools.partial(_write_model, update.to_model),
-            after_write=enroll,
-        )
-    except Exception as exc:
-        if committed:
-            return committed  # Rolled forward: the new routes are live.
-        model_policy.restore_model_update_record(prior)
-        raise _NotApplied() from exc
+    with contextlib.ExitStack() as held:
+        try:
+            held.enter_context(hermes_config._route_batch_journal_lock())
+            prior = model_policy.apply_model_update_record({
+                "provider": update.provider,
+                "from_model": update.from_model,
+                "to_model": update.to_model,
+                "decision_ref": decision_ref,
+                "approved_at": int(time.time()),
+                "state": "active",
+            })
+        except Exception as exc:
+            raise _NotApplied() from exc
+        try:
+            return hermes_config.apply_profile_route_batch(
+                sorted(roles.items()),
+                apply_one=functools.partial(_write_model, update.to_model),
+                after_write=enroll,
+            )
+        except Exception as exc:
+            if committed:
+                return committed  # Rolled forward: the new routes are live.
+            model_policy.restore_model_update_record(prior)
+            raise _NotApplied() from exc
 
 
 def _write_model(model: str, profile: str, expected_revision: str) -> str:
