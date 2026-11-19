@@ -40,7 +40,9 @@ CODEX_ASTRA_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 ASTRA_MODEL_IDS: frozenset[str] = frozenset({"gpt-6-astra", "gpt-6-astra-900k"})
 # GPT-6.1 Sol speaks Astra's wire vocabulary: its model page (2026-09-29) accepts low..max and
 # rejects none and minimal, so a disable request floors at low instead of reaching the wire.
-_CODEX_NO_DISABLE_MODEL_IDS: frozenset[str] = frozenset({"gpt-6.1-sol"})
+# GPT-6.2 Sol speaks the same set: the OpenAI developer documentation (read 2026-11-19) lists
+# low..max for it and says it rejects none.
+_CODEX_NO_DISABLE_MODEL_IDS: frozenset[str] = frozenset({"gpt-6.1-sol", "gpt-6.2-sol"})
 
 #: xAI Responses — Grok 4.6+ accepts xhigh; older Grok tops out at high.
 XAI_GROK46_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
