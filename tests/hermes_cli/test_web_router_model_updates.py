@@ -1167,6 +1167,125 @@ def test_after_an_undo_the_check_does_not_suggest_the_undone_pair_again(team):
     assert len(_receipts_on(garden["board"], card)) == 1
 
 
+def _repository(team):
+    """Give the Project a repository, as a Project whose builds run has: its cards get worktrees."""
+    with projects_db.connect_closing() as conn:
+        projects_db.add_folder(conn, team.project["project_id"], str(get_default_hermes_root() / "repository"),
+                               is_primary=True)
+
+
+def _read_only_card(team):
+    """A card made as the monthly host job makes its card: ``hermes kanban create --read-only``."""
+    import argparse
+
+    from hermes_cli.kanban import build_parser, kanban_command
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    build_parser(parser.add_subparsers())
+    args = parser.parse_args([
+        "kanban", "--board", team.project["board"], "create", "Monthly model check", "--assignee", PLANNER,
+        "--project", team.project["project_id"], "--read-only", "--json",
+    ])
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert kanban_command(args) == 0
+    return json.loads(out.getvalue())["id"]
+
+
+def _owned_paths(board, card):
+    """``owned_paths`` as stored on ``card``'s row, read straight off its board file."""
+    [row] = _rows(_board_file(board), "SELECT owned_paths FROM tasks WHERE id = ?", (card,))
+    return row["owned_paths"]
+
+
+def _run_check_tool(env, fake):
+    """Run the check card's board tool as the worker: the dispatcher's env and nothing else."""
+    from tools.registry import registry
+
+    tool = importlib.import_module("tools.model_update_check_tool")
+    muc = importlib.import_module("hermes_cli.model_update_check")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(muc, "default_seams", lambda: fake.seams(muc))
+        for key in [key for key in os.environ if key not in env]:
+            patch.delenv(key)
+        for key, value in env.items():
+            if os.environ.get(key) != value:
+                patch.setenv(key, value)
+        return json.loads(registry.dispatch(tool.TOOL_NAME, {}))
+
+
+def test_read_only_practice_card_stores_the_owned_paths_of_kanban_create_read_only(team):
+    """Facts sheet items 6 and 9: the practice card is read-only as the host job's card is."""
+    assert _practice(team).json()["state"] == "started"
+    [card] = _practice_cards(team)
+
+    read_only = _read_only_card(team)
+
+    board = team.project["board"]
+    assert _owned_paths(board, card["id"]) == _owned_paths(board, read_only)
+    assert json.loads(_owned_paths(board, read_only)) == []
+
+
+def test_read_only_practice_card_is_claimed_while_work_that_owns_a_path_runs(team):
+    """Facts sheet item 9: a build of the same Project runs; the dispatcher's claim does not wait for it."""
+    board = team.project["board"]
+    _repository(team)
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        build = kanban_db.create_task(
+            conn, title="build in progress", assignee="raphael-business", execution_tier="routine",
+            project_id=team.project["project_id"], owned_paths=["src"],
+        )
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (build,))
+        conn.commit()
+    assert _practice(team).json()["state"] == "started"
+    [card] = _practice_cards(team)
+    kinds = {task["id"]: task["workspace_kind"] for task in _tasks(team)}
+    assert (kinds[build], kinds[card["id"]]) == ("worktree", "worktree")
+
+    with contextlib.closing(kanban_db.connect(board=board)) as conn:
+        claimed = kanban_db.claim_task(conn, card["id"])
+
+    deferred = _rows(_board_file(board), "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+                     (card["id"], "claim_deferred_file_scope"))
+    assert claimed is not None and claimed.status == "running", deferred
+    assert deferred == []
+
+
+def test_read_only_practice_card_second_start_answers_already_started_and_makes_no_card(team):
+    assert omu.start_practice(team.project, ROLE) == "started"
+    cards = _practice_cards(team)
+
+    assert omu.start_practice(team.project, ROLE) == "already_started"
+    assert len(cards) == 1 and _practice_cards(team) == cards
+
+
+def test_read_only_practice_card_check_tool_writes_its_receipt_and_files_one_suggestion(team):
+    """Facts sheet item 10: the check's board tool, run by the worker the dispatcher started."""
+    board = team.project["board"]
+    _repository(team)
+    assert _practice(team).json()["state"] == "started"
+    [card] = _practice_cards(team)
+    env = _worker_env(team, card["id"])
+    before, counts = _unchanged(), _suggestion_counts()
+    fake = Fake(routes=[(ROLE, _PROVIDER, A, "max", "routine")], lists={(_PROVIDER, "gateway"): [A, B]})
+
+    answer = _run_check_tool(env, fake)
+
+    after = _suggestion_counts()
+    assert {slug: after[slug] - counts.get(slug, 0) for slug in after} == {
+        slug: int(slug == board) for slug in after
+    }
+    [row] = _rows(_board_file(board), "SELECT * FROM tasks WHERE task_kind = 'recommendation'")
+    assert row["recommendation_subject_id"] == f"model-update:{_PROVIDER}:{A}:{A}:2026-11"
+    assert row["provenance_ref"] == f"kanban-task:{card['id']}"
+    [stored] = _receipts_on(board, card["id"])
+    receipt = json.loads(stored["payload"])
+    assert (receipt["result"], receipt["practice"], receipt["filed"]["task_id"]) == ("filed", True, row["id"])
+    assert (answer["result"], answer["filed"]) == ("filed", True)
+    assert _unchanged() == before
+    assert _owned_paths(board, card["id"]) == "[]"
+
+
 # ---------------------------------------------------------------------------
 # Both routes
 # ---------------------------------------------------------------------------
