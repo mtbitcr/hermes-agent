@@ -837,7 +837,7 @@ def start_practice(project: dict, role: str) -> str:
             kanban_db.create_task(
                 conn, title=PRACTICE_CARD_TITLE, body=body, assignee="raphael-planner",
                 project_id=project["project_id"], idempotency_key=key, board=project["board"],
-                created_by="model-update-practice",
+                created_by="model-update-practice", owned_paths=[],
                 **_resolved_route_pin("raphael-planner", "routine", "assignee"),
             )
     return "started"
