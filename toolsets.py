@@ -92,6 +92,9 @@ _HERMES_CORE_TOOLS = [
     "kanban_recommend",
     # Same narrow gate, on the worker's own card (see _check_design_options_mode).
     "kanban_offer_design_options",
+    # Narrower still: the worker of a model update check card only
+    # (tools/model_update_check_tool.py). Core, so Tool Search never folds it.
+    "kanban_model_update_check",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
 ]
