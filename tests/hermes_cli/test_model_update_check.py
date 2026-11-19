@@ -14,6 +14,7 @@ value exists anywhere in this file.
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import hashlib
 import importlib
@@ -26,6 +27,8 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import tomllib
+import warnings
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1698,3 +1701,209 @@ def test_cli_worker_build_sign_in_must_list_the_candidate_and_gets_its_own_probe
                                      {"sign_in": "build", "roles": [WORKER]}]
         (checked,) = receipt["candidates"]
         assert [probe["sign_in"] for probe in checked["probe"]] == ["gateway", "build"]
+
+
+# ---------------------------------------------------------------------------
+# The catalog: a run judges a candidate only from a catalog refreshed in that
+# run, once and before its first capability read. No test reaches the service.
+# ---------------------------------------------------------------------------
+
+CATALOG_NOT_REFRESHED = "The model catalog could not be refreshed."
+
+
+def _catalog_copy(*models):
+    """A copy of the model catalog with a capability row for each of ``models`` and no other."""
+    row = {"reasoning": True, "tool_call": True, "limit": {"context": 200_000, "output": 64_000}}
+    return {"anthropic": {"id": "anthropic", "models": {model: dict(row, id=model) for model in models}}}
+
+
+def _no_held_catalog(monkeypatch, models_dev):
+    """The process holds no copy of the catalog yet; the module's own values come back after the test."""
+    for name, value in (("_models_dev_cache", {}), ("_models_dev_cache_time", 0), ("_models_dev_retry_after", 0)):
+        monkeypatch.setattr(models_dev, name, value)
+
+
+def _recorded(muc, fake, events, *, refreshed):
+    """``fake``'s seams with a refresh that answers ``refreshed``; each refresh and row read goes to ``events``."""
+    seams = fake.seams(muc)
+
+    def refresh_catalog():
+        events.append("refresh")
+        return refreshed
+
+    def capabilities(provider, model):
+        events.append(("capabilities", model))
+        return seams.capabilities(provider, model)
+
+    return replace(seams, capabilities=capabilities, refresh_catalog=refresh_catalog)
+
+
+def test_practice_run_judges_the_catalog_refreshed_in_the_run_not_its_old_copy(world, monkeypatch):
+    from agent import models_dev
+
+    muc = _muc()
+    # The worker's own copy on disk is old: it has no row for the model the role uses now.
+    old, refreshed = _catalog_copy("claude-opus-4-1"), _catalog_copy(OPUS)
+    Path(world.env["HERMES_HOME"], "models_dev_cache.json").write_text(json.dumps(old), encoding="utf-8")
+    _no_held_catalog(monkeypatch, models_dev)
+
+    def refresh_catalog():
+        # The service answered: the refreshed copy is the one the process holds.
+        monkeypatch.setattr(models_dev, "_models_dev_cache", refreshed)
+        return True
+
+    fake = Fake(routes=[(PLANNER, "anthropic", OPUS, "max", "routine")], lists={("anthropic", "gateway"): [OPUS]})
+    # A namespace, not a Seams: on the code before the refresh seam, this test still runs the check and fails.
+    seams = SimpleNamespace(**{**vars(fake.seams(muc)), "capabilities": muc._capability_row,
+                               "refresh_catalog": refresh_catalog})
+
+    receipt = _command(world, seams, "--practice", PLANNER)
+
+    (checked,) = receipt["candidates"]
+    assert (checked["to_model"], checked["result"]) == (OPUS, "passed")
+    assert (receipt["result"], receipt["practice"]) == ("filed", True)
+    assert [row["recommendation_subject_id"] for row in _suggestions(world)] == [_update("anthropic", OPUS, OPUS)]
+
+
+def test_failed_catalog_refresh_files_nothing_and_reads_no_capability_row_and_sends_no_probe(world):
+    muc = _muc()
+    fake = Fake(routes=[(PLANNER, "anthropic", OPUS, "max", "routine")],
+                lists={("anthropic", "gateway"): [OPUS, OPUS_NEW]})
+    events = []
+
+    receipt = _command(world, _recorded(muc, fake, events, refreshed=False))
+
+    assert _suggestions(world) == []
+    assert (receipt["result"], receipt["reason"], receipt["filed"]) == ("nothing_filed", CATALOG_NOT_REFRESHED, None)
+    # No candidate is judged from an old copy: no row is read and no probe is sent.
+    assert events == ["refresh"]
+    assert receipt["candidates"] == [] and fake.probe_calls == []
+    # The receipt keeps its keys and its schema version.
+    assert sorted(receipt) == ["boards_read", "budget", "candidates", "error", "filed", "models", "month",
+                               "practice", "practice_role", "reason", "result", "schema_version", "unread_roles"]
+    assert receipt["schema_version"] == 1
+    # The board tool shows the reason, so it passes the owner text check and names no model, provider or address.
+    reason = receipt["reason"]
+    assert check_owner_text(reason, "planner_prose") == reason
+    for name in (OPUS, OPUS_NEW, "anthropic", "openai", "codex", "claude", "opus", "gpt", "models.dev", "http"):
+        assert name not in reason.lower()
+
+
+def test_two_candidates_refresh_the_catalog_once_before_the_first_capability_read(world):
+    muc = _muc()
+    # The higher candidate has no row, so the lower one is judged too.
+    fake = Fake(routes=[(PLANNER, "anthropic", OPUS, "max", "routine")],
+                lists={("anthropic", "gateway"): [OPUS, OPUS_NEW, OPUS_NEWER]},
+                capabilities={OPUS_NEWER: (None, None)})
+    events = []
+
+    receipt = _command(world, _recorded(muc, fake, events, refreshed=True))
+
+    assert [checked["to_model"] for checked in receipt["candidates"]] == [OPUS_NEWER, OPUS_NEW]
+    assert [checked["result"] for checked in receipt["candidates"]] == ["capability_unknown", "passed"]
+    assert receipt["result"] == "filed"
+    assert events == ["refresh", ("capabilities", OPUS_NEWER), ("capabilities", OPUS),
+                      ("capabilities", OPUS_NEW), ("capabilities", OPUS)]
+
+
+def test_run_with_no_candidate_makes_no_catalog_refresh(world):
+    muc = _muc()
+    fake = Fake(routes=[(PLANNER, "anthropic", OPUS, "max", "routine")], lists={("anthropic", "gateway"): [OPUS]})
+    events = []
+
+    receipt = _command(world, _recorded(muc, fake, events, refreshed=True))
+
+    assert (receipt["result"], receipt["reason"]) == ("nothing_filed", "No newer version was found.")
+    assert receipt["candidates"] == [] and events == []
+
+
+@pytest.mark.parametrize(
+    ("answer", "refreshed"),
+    [(answer, answer != "no-answer") for answer in ("new-data", "not-modified", "no-answer")],
+    ids=["new-data", "not-modified", "no-answer-old-copy-served"],
+)
+def test_default_catalog_refresh_is_the_catalogs_own_forced_fetch(tmp_path, monkeypatch, answer, refreshed):
+    from agent import models_dev
+
+    muc = _muc()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    old, new = _catalog_copy("claude-opus-4-1"), _catalog_copy(OPUS)
+    models_dev._get_cache_path().write_text(json.dumps(old), encoding="utf-8")
+    _no_held_catalog(monkeypatch, models_dev)
+
+    def request(*, conditional=False):
+        # The one request the fetch sends, standing in for the service.
+        if answer == "new-data":
+            return new, ""
+        if answer == "not-modified":
+            raise models_dev._NotModified()
+        raise ConnectionError("the catalog service did not answer")
+
+    forced_fetch, calls, served = models_dev.fetch_models_dev, [], []
+
+    def fetch_models_dev(*args, **kwargs):
+        calls.append((args, kwargs))
+        served.append(forced_fetch(*args, **kwargs))
+        return served[-1]
+
+    monkeypatch.setattr(models_dev, "_fetch_models_dev_from_network", request)
+    monkeypatch.setattr(models_dev, "fetch_models_dev", fetch_models_dev)
+
+    assert muc.default_seams().refresh_catalog() is refreshed
+    assert calls == [((), {"force_refresh": True})]
+    # Not modified and no answer both serve the old copy: only the service's answer tells them apart.
+    assert served == [new if answer == "new-data" else old]
+
+
+def test_default_seams_refresh_is_the_real_forced_fetch_not_the_field_default(monkeypatch):
+    from agent import models_dev
+
+    muc = _muc()
+    calls = []
+
+    def fetch_models_dev(*args, **kwargs):
+        # The stand-in for the forced fetch: the catalog service does not answer.
+        calls.append((args, kwargs))
+        raise ConnectionError("the catalog service did not answer")
+
+    monkeypatch.setattr(models_dev, "fetch_models_dev", fetch_models_dev)
+
+    # The field default would report a fresh catalog and make no call.
+    assert muc.default_seams().refresh_catalog() is False
+    assert calls == [((), {"force_refresh": True})]
+
+
+def test_no_production_code_builds_seams_outside_default_seams():
+    """Holds the owner's decision on the refresh seam's field default until that default is removed."""
+    root = Path(__file__).resolve().parents[2]
+    pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    include = pyproject["tool"]["setuptools"]["packages"]["find"]["include"]
+    # The production packages, then the root's single-file modules as setup.py derives them.
+    files = [path for package in sorted({name.split(".")[0] for name in include})
+             for path in sorted((root / package).rglob("*.py"))]
+    files += [path for path in sorted(root.glob("*.py")) if path.name != "setup.py"]
+    builders, importers = set(), set()
+    for path in files:
+        source = path.read_bytes()
+        if b"Seams" not in source and b"refresh_catalog" not in source:
+            continue
+        name = path.relative_to(root).as_posix()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(source, filename=name)
+        # Each call that builds Seams or passes a refresh seam, with its innermost enclosing function.
+        nodes = [(tree, None)]
+        while nodes:
+            node, function = nodes.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                function = node.name
+            if isinstance(node, ast.Call):
+                callee = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
+                if callee == "Seams" or any(keyword.arg == "refresh_catalog" for keyword in node.keywords):
+                    builders.add((name, function))
+            if isinstance(node, ast.ImportFrom) and any(alias.name == "Seams" for alias in node.names):
+                importers.add(name)
+            nodes.extend((child, function) for child in ast.iter_child_nodes(node))
+
+    assert builders == {("hermes_cli/model_update_check.py", "default_seams")}
+    assert importers <= {"hermes_cli/model_update_check.py"}

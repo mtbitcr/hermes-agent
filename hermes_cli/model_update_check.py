@@ -6,8 +6,9 @@ runs three checks on it, cheapest first:
 
 1. Account: every sign-in a role of that model uses, read in that role's own
    profile, lists the version.
-2. Compatibility, local and free: the capability row supports each role's
-   effort, and the context window is not smaller than the current one's.
+2. Compatibility, free: the capability row, from the catalog refreshed once in
+   this run, supports each role's effort, and the context window is not
+   smaller than the current one's.
 3. Probe: one short coding question per distinct sign-in, with fallbacks
    disabled.
 
@@ -143,6 +144,11 @@ class ProbeReply:
     seconds: Optional[float] = None
 
 
+def _fresh_catalog_for_tests_without_a_refresh_seam() -> bool:
+    """Reports a fresh catalog and fetches nothing; ``Seams.refresh_catalog`` says when it applies."""
+    return True
+
+
 @dataclass(frozen=True)
 class Seams:
     """Everything the check reads from outside; tests pass fakes."""
@@ -154,6 +160,16 @@ class Seams:
     probe: Callable[[str, str, str, str, str], ProbeReply]
     route_revision: Callable[[str], str]
     now: Callable[[], datetime]
+    # Refreshes the catalog that ``capabilities`` reads; True only when the
+    # catalog service answered in this run. The default is the owner's
+    # decision: the board tool's released test file, which this change does
+    # not own, builds Seams with seven fields, and a default that called the
+    # real forced fetch would make those tests use the network or fail. So it
+    # reports a fresh catalog, only for a construction with no refresh seam
+    # in tests. Production builds Seams only in default_seams, which carries
+    # the real forced fetch; tests prove both. A later change by the owner,
+    # which owns that test file, removes this default.
+    refresh_catalog: Callable[[], bool] = _fresh_catalog_for_tests_without_a_refresh_seam
 
 
 @dataclass(frozen=True)
@@ -475,6 +491,26 @@ def _capability_row(provider: str, model: str) -> Capability:
     )
 
 
+def _refresh_catalog() -> bool:
+    """One forced fetch of the catalog that ``_capability_row`` reads; True when the service answered.
+
+    The fetch returns the held copy both when the service confirms it and when
+    the service does not answer, so the answer is read from the module's own
+    marks: an answer (new data or not modified) stamps the copy at its arrival
+    and clears the retry backoff; a failure sets the backoff and leaves the
+    stamp older than this call.
+    """
+    from agent import models_dev
+
+    started = time.time()
+    try:
+        models_dev.fetch_models_dev(force_refresh=True)
+    except Exception as exc:
+        logger.warning("model update check: the model catalog could not be refreshed (%s)", type(exc).__name__)
+        return False
+    return models_dev._models_dev_cache_time >= started and models_dev._models_dev_retry_after == 0
+
+
 def _probe_call(provider: str, model: str, sign_in, effort: str, question: str) -> ProbeReply:
     """One request on this sign-in and model, and nothing else; the caller disables fallbacks.
 
@@ -624,6 +660,7 @@ def default_seams() -> Seams:
         probe=_probe_call,
         route_revision=_route_revision,
         now=lambda: datetime.now(timezone.utc),
+        refresh_catalog=_refresh_catalog,
     )
 
 
@@ -905,8 +942,12 @@ def _compatibility(model: _Model, new: Capability, old: Capability) -> dict:
 
 
 def _check(seams: Seams, model: _Model, to_model: str, accounts: list, listed: dict,
-           blocked: Optional[str]) -> dict:
-    """Run the three checks on one candidate, stopping at the first that fails."""
+           blocked: Optional[str], catalog: dict) -> Optional[dict]:
+    """Run the three checks on one candidate, stopping at the first that fails.
+
+    None when the run's one catalog refresh, made before its first capability
+    read, failed: no candidate is judged from an old copy of the catalog.
+    """
     provider = model.provider
     checked = {
         "provider": provider,
@@ -925,6 +966,10 @@ def _check(seams: Seams, model: _Model, to_model: str, accounts: list, listed: d
     if not all(checked["account"].values()):
         checked["result"] = "not_listed"
         return checked
+    if "refreshed" not in catalog:
+        catalog["refreshed"] = seams.refresh_catalog() is True
+    if not catalog["refreshed"]:
+        return None
     compatibility = _compatibility(model, seams.capabilities(provider, to_model),
                                    seams.capabilities(provider, model.model))
     checked["compatibility"] = compatibility
@@ -1076,6 +1121,7 @@ def _run(seams: Seams, card: _Card, practice_role: Optional[str], receipt: dict)
         receipt["reason"] = "This planning card already filed its one suggestion."
         return
     lists: dict = {}
+    catalog: dict = {}  # the run's one catalog refresh, made before its first capability read
     for model in _models_in_use(routes, roles):
         entry = {"provider": model.provider, "model": model.model, "roles": list(model.roles)}
         receipt["models"].append(entry)
@@ -1105,7 +1151,10 @@ def _run(seams: Seams, card: _Card, practice_role: Optional[str], receipt: dict)
                                        month, practice)
             if blocked is None and not practice and (model.provider, to_model) in approved:
                 blocked = "already_approved"
-            checked = _check(seams, model, to_model, accounts, listed, blocked)
+            checked = _check(seams, model, to_model, accounts, listed, blocked, catalog)
+            if checked is None:
+                receipt["reason"] = "The model catalog could not be refreshed."
+                return
             receipt["candidates"].append(checked)
             if checked["result"] == "passed":
                 filed = _file(card, checked, month, practice)
