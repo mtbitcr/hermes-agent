@@ -1,7 +1,10 @@
 """Tests for the ResponsesApiTransport (Codex)."""
 
+import itertools
 import json
+import os
 import pytest
+from pathlib import Path
 from types import SimpleNamespace
 
 from agent.transports import get_transport
@@ -1687,3 +1690,366 @@ class TestPreflightSlashEnumStrip:
         assert params["properties"]["model_id"].get("enum") == [
             "Qwen/Qwen3.5-0.8B", "plain-id"
         ]
+
+
+# ── The learned effort record on the Codex backend route ─────────────────────────────────────────────────
+# The record is model_efforts.json at the root Hermes home, which is a test's HERMES_HOME. Every assertion is
+# on the final serialized request: the bytes the real OpenAI SDK sends for the built and preflighted kwargs,
+# captured offline by an in-process mock HTTP transport, so no provider is called.
+
+CODEX_BACKEND = "https://chatgpt.com/backend-api/codex"
+_CODEX_ROUTE: dict = {"provider": "openai-codex", "base_url": CODEX_BACKEND, "is_codex_backend": True}
+# Each other Responses route this transport builds requests for.
+_OTHER_RESPONSES_ROUTES = {
+    "openai api": {"provider": "openai", "base_url": "https://api.openai.com/v1"},
+    "custom endpoint": {"provider": "custom", "base_url": "https://responses.example.com/v1"},
+    "github models": {
+        "provider": "copilot", "base_url": "https://models.github.ai/inference", "is_github_responses": True,
+        "github_reasoning_extra": {"effort": "max"},
+    },
+    "xai": {"provider": "xai", "base_url": "https://api.x.ai/v1", "is_xai_responses": True},
+}
+_EVERY_LEVEL = ["none", "low", "medium", "high", "xhigh", "max"]
+NO_EFFORT = "(no effort field)"
+_record_versions = itertools.count(1)
+
+
+def _write_record(models):
+    """Replace the record at the root home atomically, as its writer does; each version gets a modification
+    time of its own, so it is a new file to the reader."""
+    path = Path(os.environ["HERMES_HOME"]) / "model_efforts.json"
+    staged = path.with_name("model_efforts.json.new")
+    staged.write_text(json.dumps({"schema_version": 1, "models": models}), encoding="utf-8")
+    mtime_ns = (1_800_000_000 + next(_record_versions)) * 1_000_000_000
+    os.utime(staged, ns=(mtime_ns, mtime_ns))
+    os.replace(staged, path)
+
+
+def _entry(efforts=(), refused=()):
+    """A valid version-1 entry that accepts ``efforts`` and refuses ``refused``."""
+    return {
+        "efforts": list(efforts), "refused": list(refused),
+        "thinking": {"adaptive": None, "manual": None, "disable": None},
+        "source": "probe", "observed_at": 1795070000,
+    }
+
+
+def _request(transport, model, ask, overrides=None, route=_CODEX_ROUTE, reasoning_config=None):
+    """The final serialized request of a role on ``model`` that asks for ``ask``, or whose reasoning config is
+    ``reasoning_config`` when that is given."""
+    import httpx
+    import openai
+
+    if reasoning_config is None:
+        reasoning_config = {"enabled": True, "effort": ask}
+    kwargs = transport.build_kwargs(
+        model=model, messages=[{"role": "user", "content": "Hi"}], tools=[],
+        reasoning_config=reasoning_config, request_overrides=overrides, **route,
+    )
+    sent = []
+
+    def handler(request):
+        sent.append(request.content)
+        return httpx.Response(400, json={"error": {"message": "offline", "type": "invalid_request_error"}})
+
+    client = openai.OpenAI(
+        api_key="placeholder", base_url=route["base_url"], max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(openai.APIStatusError):
+        client.responses.create(**transport.preflight_kwargs(kwargs))
+    return sent[0]
+
+
+def _reasoning(body):
+    return json.loads(body).get("reasoning")
+
+
+def _effort(body):
+    """The effort a serialized request carries, or NO_EFFORT."""
+    return (_reasoning(body) or {}).get("effort", NO_EFFORT)
+
+
+def _effort_override(form, effort):
+    """A request override that sets ``effort`` in its top-level or in its ``extra_body`` form."""
+    if form == "top-level":
+        return {"reasoning": {"effort": effort, "summary": "detailed"}}
+    return {"extra_body": {"reasoning": {"effort": effort}}}
+
+
+class TestLearnedEffortRecordOnTheCodexRoute:
+    """An entry of the request's final model adds the levels it accepts and removes the levels it refuses,
+    on the Codex backend route only; with no entry the final request is today's, byte for byte."""
+
+    ASKS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "High", "turbo")
+    # The effort main sends for each of ASKS with no record: asked by the role, or by an effort override in
+    # either form (the role then asks for low), which today goes out as given.
+    TODAY = {
+        ("gpt-5.7", "role"): ("none", "low", "low", "medium", "high", "xhigh", "xhigh", "xhigh", "High", "turbo"),
+        ("gpt-5.6", "role"): ("none", "low", "low", "medium", "high", "xhigh", "max", "max", "High", "turbo"),
+        ("openai/gpt-5.6", "role"): ("none", "low", "low", "medium", "high", "xhigh", "max", "max", "High", "turbo"),
+        ("gpt-6-astra", "role"): ("low", "low", "low", "medium", "high", "xhigh", "max", "max", "High", "turbo"),
+        ("gpt-5.7", "top-level"): ASKS,
+        ("gpt-5.7", "extra_body"): ASKS,
+        ("gpt-6-astra", "extra_body"): ASKS,
+    }
+
+    # Points 5 to 8 of the owner rules: the entry of the model, the role's ask, the level sent today with no
+    # record, and the level sent with the entry. By name gpt-5.7 allows none..xhigh, gpt-5.6 none..max and
+    # gpt-6-astra low..max.
+    TABLE = (
+        # model        efforts             refused                                   ask        today     with the entry
+        ("gpt-5.7",     ["max"],           [],                                       "max",     "xhigh",  "max"),
+        ("gpt-5.7",     ["max"],           [],                                       "high",    "high",   "high"),
+        ("gpt-5.7",     [],                [],                                       "max",     "xhigh",  "xhigh"),
+        ("gpt-5.6",     [],                ["max"],                                  "max",     "max",    "xhigh"),
+        ("gpt-5.6",     ["max"],           ["max"],                                  "max",     "max",    "xhigh"),
+        ("gpt-5.6",     [],                ["high", "xhigh"],                        "xhigh",   "xhigh",  "medium"),
+        ("gpt-5.6",     [],                ["high", "xhigh"],                        "max",     "max",    "max"),
+        ("gpt-5.7",     [],                ["low"],                                  "low",     "low",    "none"),
+        ("gpt-5.7",     [],                ["none", "low"],                          "low",     "low",    "medium"),
+        ("gpt-5.7",     [],                ["low", "medium", "high", "xhigh"],       "high",    "high",   "none"),
+        ("gpt-5.7",     [],                _EVERY_LEVEL,                             "high",    "high",   NO_EFFORT),
+        ("gpt-6-astra", [],                [],                                       "none",    "low",    "low"),
+        ("gpt-6-astra", ["none"],          [],                                       "none",    "low",    "none"),
+        ("gpt-6-astra", [],                ["low"],                                  "low",     "low",    "medium"),
+        ("gpt-6-astra", ["none"],          ["low"],                                  "low",     "low",    "none"),
+        ("gpt-5.7",     ["MAX"],           [],                                       "max",     "xhigh",  "max"),
+        ("gpt-5.6",     [],                ["Max"],                                  "max",     "max",    "xhigh"),
+        ("gpt-5.7",     ["max"],           [],                                       "High",    "High",   "high"),
+        ("gpt-5.7",     ["max"],           [],                                       "MAX",     "xhigh",  "max"),
+        ("gpt-5.7",     ["ultra", "minimal"], [],                                    "ultra",   "xhigh",  NO_EFFORT),
+        ("gpt-5.7",     [],                ["turbo"],                                "high",    "high",   "high"),
+        ("gpt-5.7",     [],                [],                                       "turbo",   "turbo",  NO_EFFORT),
+        ("gpt-5.7",     [],                [],                                       "minimal", "low",    NO_EFFORT),
+    )
+
+    def _todays_cases(self, transport):
+        requests = {}
+        for model, form in self.TODAY:
+            for ask in self.ASKS:
+                if form == "role":
+                    requests[model, form, ask] = _request(transport, model, ask)
+                else:
+                    requests[model, form, ask] = _request(transport, model, "low", _effort_override(form, ask))
+        return requests
+
+    def test_no_record_and_no_entry_for_the_final_model_send_todays_request(self, transport):
+        without_record = self._todays_cases(transport)
+        assert {case: _effort(body) for case, body in without_record.items()} == {
+            (model, form, ask): level
+            for (model, form), levels in self.TODAY.items() for ask, level in zip(self.ASKS, levels)
+        }
+
+        # Entries of other ids, and of these ids under other providers, are no entry for these requests.
+        only_max = _entry(efforts=["max"], refused=["none", "low", "medium", "high", "xhigh"])
+        _write_record({
+            "openai:gpt-5.7": only_max,
+            "anthropic:gpt-5.6": only_max,
+            "openai-codex:gpt-5.7-mini": only_max,
+            "openai-codex:gpt-6-astra-mini": only_max,
+            "openai-codex:gpt-5.9": _entry(efforts=["max"]),
+        })
+        assert self._todays_cases(transport) == without_record
+        assert _effort(_request(transport, "gpt-5.9", "max")) == "max"  # the record is in use
+
+    def test_the_selection_table(self, transport):
+        today = [(model, ask, _effort(_request(transport, model, ask))) for model, _, _, ask, _, _ in self.TABLE]
+        assert today == [(model, ask, level) for model, _, _, ask, level, _ in self.TABLE]
+
+        sent = []
+        for model, efforts, refused, ask, _, _ in self.TABLE:
+            _write_record({f"openai-codex:{model}": _entry(efforts, refused)})
+            sent.append((model, efforts, refused, ask, _effort(_request(transport, model, ask))))
+        assert sent == [(model, efforts, refused, ask, level) for model, efforts, refused, ask, _, level in self.TABLE]
+
+    def test_a_learned_max_reaches_the_codex_backend_and_no_other_responses_route(self, transport):
+        def other_routes():
+            return {
+                (name, model, ask): _request(transport, model, ask, route=route)
+                for name, route in _OTHER_RESPONSES_ROUTES.items()
+                for model in ("gpt-5.9", "gpt-6-astra") for ask in ("none", "max")
+            }
+
+        before = other_routes()
+        assert _effort(before["openai api", "gpt-6-astra", "none"]) == "low"  # the Astra guard
+        assert _effort(_request(transport, "gpt-5.9", "max")) == "xhigh"  # a new id: no max by name
+
+        _write_record({
+            "openai-codex:gpt-5.9": _entry(efforts=_EVERY_LEVEL),
+            "openai-codex:gpt-6-astra": _entry(efforts=["none"]),
+        })
+        assert _effort(_request(transport, "gpt-5.9", "max")) == "max"
+        assert _effort(_request(transport, "gpt-6-astra", "none")) == "none"
+        assert other_routes() == before
+
+    @pytest.mark.parametrize(
+        "address", ["https://responses.example.com/v1", "https://api.openai.com/v1"], ids=["custom", "openai-api"]
+    )
+    def test_the_codex_label_on_another_address_reads_no_record(self, transport, monkeypatch, address):
+        import builtins
+
+        from agent.codex_responses_adapter import classify_responses_route
+
+        flags = classify_responses_route(SimpleNamespace(provider="openai-codex", base_url=address))
+        assert flags.is_codex_backend is True  # the provider label alone sets the transport flag
+        route = {"provider": "openai-codex", "base_url": address, "is_codex_backend": flags.is_codex_backend}
+        record, opened, real_open = Path(os.environ["HERMES_HOME"]) / "model_efforts.json", [], builtins.open
+
+        def watched_open(file, *args, **kwargs):
+            if str(file).endswith("model_efforts.json"):
+                opened.append(Path(file))
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", watched_open)
+        asks = (("gpt-5.7", "max"), ("gpt-5.6", "max"), ("gpt-6-astra", "none"))
+        today = {(model, ask): _request(transport, model, ask, route=route) for model, ask in asks}
+        assert [_effort(body) for body in today.values()] == ["xhigh", "max", "low"]
+
+        # On the Codex backend this record changes each of them: max, xhigh and none.
+        _write_record({
+            "openai-codex:gpt-5.7": _entry(efforts=_EVERY_LEVEL),
+            "openai-codex:gpt-5.6": _entry(refused=["max"]),
+            "openai-codex:gpt-6-astra": _entry(efforts=["none"]),
+        })
+        assert {(model, ask): _request(transport, model, ask, route=route) for model, ask in asks} == today
+        assert opened == []
+
+        assert _effort(_request(transport, "gpt-5.7", "max")) == "max"  # the Codex backend reads the record
+        assert opened == [record]
+
+    def test_a_refused_level_is_never_sent(self, transport):
+        _write_record({
+            "openai-codex:gpt-5.6": _entry(refused=["max"]),
+            "openai-codex:gpt-5.7": _entry(refused=["low"]),
+            "openai-codex:gpt-5.8": _entry(refused=["low", "medium", "high", "xhigh", "max"]),
+            "openai-codex:gpt-5.9": _entry(refused=_EVERY_LEVEL),
+        })
+
+        assert _effort(_request(transport, "gpt-5.6", "max")) == "xhigh"
+        assert _effort(_request(transport, "gpt-5.7", "low")) == "none"
+        assert _effort(_request(transport, "gpt-5.8", "high")) == "none"
+        assert _reasoning(_request(transport, "gpt-5.9", "high")) == {"summary": "auto"}
+
+    def test_both_effort_override_forms_carry_the_selected_level(self, transport):
+        top = _effort_override("top-level", "high")
+        nested = _effort_override("extra_body", "high")
+        both = {"reasoning": {"effort": "low", "summary": "detailed"}, "extra_body": {"reasoning": {"effort": "high"}}}
+        _write_record({"openai-codex:gpt-5.7": _entry(refused=["high"])})
+
+        assert _effort(_request(transport, "gpt-5.7", "high")) == "medium"
+        assert _reasoning(_request(transport, "gpt-5.7", "low", top)) == {"effort": "medium", "summary": "detailed"}
+        assert _reasoning(_request(transport, "gpt-5.7", "low", nested)) == {"effort": "medium"}
+        # The SDK sends the extra_body form over the top-level one, so its effort is the ask.
+        assert _reasoning(_request(transport, "gpt-5.7", "low", both)) == {"effort": "medium"}
+        assert top == _effort_override("top-level", "high")  # the caller's overrides stay as they were
+        assert nested == _effort_override("extra_body", "high")
+
+    @pytest.mark.parametrize("form", ["top-level", "extra_body"])
+    def test_a_model_override_takes_the_entry_of_the_final_model(self, transport, form):
+        to_gpt56 = {"model": "gpt-5.6"} if form == "top-level" else {"extra_body": {"model": "gpt-5.6"}}
+        today = _request(transport, "gpt-5.7", "high", to_gpt56)
+        assert json.loads(today)["model"] == "gpt-5.6"
+        assert _effort(today) == "high"
+
+        # From a model with an entry to a model with none: today's request.
+        _write_record({"openai-codex:gpt-5.7": _entry(refused=["high"])})
+        assert _effort(_request(transport, "gpt-5.7", "high")) == "medium"
+        assert _request(transport, "gpt-5.7", "high", to_gpt56) == today
+
+        # From a model with none to a model with an entry: the entry of the final model governs.
+        _write_record({"openai-codex:gpt-5.6": _entry(refused=["high"])})
+        assert _effort(_request(transport, "gpt-5.7", "high")) == "high"
+        assert _effort(_request(transport, "gpt-5.7", "high", to_gpt56)) == "medium"
+
+    def test_an_ask_off_the_route_levels_sends_no_effort_and_a_letter_case_ask_sends_its_level(self, transport):
+        _write_record({"openai-codex:gpt-5.7": _entry(efforts=["max"])})
+
+        assert _reasoning(_request(transport, "gpt-5.7", "turbo")) == {"summary": "auto"}
+        assert _effort(_request(transport, "gpt-5.7", "High")) == "high"
+        for form in ("top-level", "extra_body"):
+            assert _effort(_request(transport, "gpt-5.7", "low", _effort_override(form, "turbo"))) == NO_EFFORT
+            assert _effort(_request(transport, "gpt-5.7", "low", _effort_override(form, "High"))) == "high"
+            assert _effort(_request(transport, "gpt-5.7", "low", _effort_override(form, "MAX"))) == "max"
+
+    def test_an_explicit_none_is_the_ask_for_the_entry_of_the_final_model(self, transport):
+        """Point 2 of the security review sheet: final args with no effort under the explicit none. No entry, an
+        entry that allows none and an entry that allows no level leave today's bytes; an entry that refuses none
+        gets the weakest allowed level."""
+        from hermes_constants import parse_reasoning_effort
+
+        explicit_none = parse_reasoning_effort("none")  # the parser of the command line and of the role's config
+        assert explicit_none == {"enabled": False}
+        cases = {  # the role's model, its request override and its reasoning config
+            "gpt-5.7": ("gpt-5.7", None, explicit_none),
+            "gpt-6-astra": ("gpt-6-astra", None, explicit_none),
+            "one-shot": ("gpt-5.7", None, {"enabled": False, "effort": "none"}),  # the continuation override
+            "to gpt-5.7, top-level": ("gpt-5.6", {"model": "gpt-5.7"}, explicit_none),
+            "to gpt-5.7, extra_body": ("gpt-5.6", {"extra_body": {"model": "gpt-5.7"}}, explicit_none),
+        }
+
+        def send(case):
+            model, overrides, reasoning_config = cases[case]
+            return _request(transport, model, None, overrides, reasoning_config=reasoning_config)
+
+        today = {case: send(case) for case in cases}
+        assert [_reasoning(body) for body in today.values()] == [None] * len(cases)  # no reasoning field
+        todays_bytes = "(today's bytes)"
+
+        def outcome(case):
+            """``todays_bytes``, else the sent reasoning when it is the one field that differs from today's."""
+            body = send(case)
+            if body == today[case]:
+                return todays_bytes
+            others_as_today = {**json.loads(body), "reasoning": None} == {**json.loads(today[case]), "reasoning": None}
+            return _reasoning(body) if others_as_today else json.loads(body)
+
+        rows = (
+            # case                      entry of       efforts   refused           sent with the record
+            ("gpt-5.7",                 "gpt-5.6",     [],       ["none"],         todays_bytes),
+            ("gpt-5.7",                 "gpt-5.7",     ["max"],  [],               todays_bytes),
+            ("gpt-5.7",                 "gpt-5.7",     [],       ["none"],         {"effort": "low"}),
+            ("gpt-5.7",                 "gpt-5.7",     [],       ["none", "low"],  {"effort": "medium"}),
+            ("gpt-5.7",                 "gpt-5.7",     [],       _EVERY_LEVEL,     todays_bytes),
+            ("gpt-6-astra",             "gpt-6-astra", ["max"],  [],               {"effort": "low"}),
+            ("gpt-6-astra",             "gpt-6-astra", ["none"], [],               todays_bytes),
+            ("one-shot",                "gpt-5.7",     [],       ["none"],         {"effort": "low"}),
+            ("to gpt-5.7, top-level",   "gpt-5.6",     [],       ["none"],         todays_bytes),
+            ("to gpt-5.7, top-level",   "gpt-5.7",     [],       ["none"],         {"effort": "low"}),
+            ("to gpt-5.7, extra_body",  "gpt-5.6",     [],       ["none"],         todays_bytes),
+            ("to gpt-5.7, extra_body",  "gpt-5.7",     [],       ["none"],         {"effort": "low"}),
+        )
+        sent = []
+        for case, entry_of, efforts, refused, _ in rows:
+            _write_record({f"openai-codex:{entry_of}": _entry(efforts, refused)})
+            sent.append((case, entry_of, efforts, refused, outcome(case)))
+        assert sent == list(rows)
+
+    @pytest.mark.parametrize("form", ["top-level", "extra_body"])
+    def test_a_summary_only_override_keeps_todays_request_and_its_summary(self, transport, form):
+        """Point 7 of the security review sheet: an override that holds only a summary removes the role's effort
+        today, and an entry adds no effort to it. Under the explicit none an entry that refuses none adds the
+        weakest allowed level beside the summary (point 2)."""
+        from hermes_constants import parse_reasoning_effort
+
+        def summary_only():
+            """A request override that holds only a summary, in its top-level or in its ``extra_body`` form."""
+            override = {"reasoning": {"summary": "detailed"}}
+            return override if form == "top-level" else {"extra_body": override}
+
+        override, explicit_none = summary_only(), parse_reasoning_effort("none")
+        today = _request(transport, "gpt-5.7", "high", override)
+        today_none = _request(transport, "gpt-5.7", None, override, reasoning_config=explicit_none)
+        assert _reasoning(today) == _reasoning(today_none) == {"summary": "detailed"}
+
+        for refused in (["high"], ["none", "high"]):
+            _write_record({"openai-codex:gpt-5.7": _entry(refused=refused)})
+            assert _effort(_request(transport, "gpt-5.7", "high")) == "medium"  # the entry is in use
+            assert _request(transport, "gpt-5.7", "high", override) == today
+
+        _write_record({"openai-codex:gpt-5.7": _entry(refused=["none"])})
+        sent = _reasoning(_request(transport, "gpt-5.7", None, override, reasoning_config=explicit_none))
+        assert sent == {"summary": "detailed", "effort": "low"}
+        _write_record({"openai-codex:gpt-5.6": _entry(refused=["none"])})  # no entry for gpt-5.7
+        assert _request(transport, "gpt-5.7", None, override, reasoning_config=explicit_none) == today_none
+        assert override == summary_only()  # the caller's override stays as it was
