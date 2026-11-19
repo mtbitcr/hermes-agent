@@ -249,6 +249,9 @@ class TestCodexVocabulary:
         import os
         from pathlib import Path
 
+        import httpx
+        import openai
+
         import agent.transports.codex  # noqa: F401
         from agent.reasoning_effort import codex_supported_efforts
         from agent.transports import get_transport
@@ -264,11 +267,25 @@ class TestCodexVocabulary:
         (Path(os.environ["HERMES_HOME"]) / "model_efforts.json").write_text(json.dumps(record), encoding="utf-8")
 
         assert {model: codex_supported_efforts(model) for model in models} == by_name
-        kwargs = get_transport("codex_responses").build_kwargs(
+        transport = get_transport("codex_responses")
+        kwargs = transport.build_kwargs(
             model="gpt-6.3-sol", messages=[{"role": "user", "content": "Hi"}], tools=[], provider="openai-codex",
             base_url="https://chatgpt.com/backend-api/codex", is_codex_backend=True,
             reasoning_config={"enabled": True, "effort": "max"},
         )
+        sent = []
+
+        def capture(request):
+            sent.append(json.loads(request.content))
+            return httpx.Response(400, json={"error": {"message": "offline", "type": "invalid_request_error"}})
+
+        client = openai.OpenAI(
+            api_key="placeholder", base_url="https://chatgpt.com/backend-api/codex", max_retries=0,
+            http_client=httpx.Client(transport=httpx.MockTransport(capture)),
+        )
+        with pytest.raises(openai.APIStatusError):
+            client.responses.create(**transport.preflight_kwargs(kwargs))
+        assert sent[0]["reasoning"]["effort"] == "max"  # the serialized body, after the preflight and the SDK
         assert kwargs["reasoning"]["effort"] == "max"  # the record governs the request; by name it is xhigh
 
 

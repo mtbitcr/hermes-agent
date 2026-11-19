@@ -1880,6 +1880,41 @@ class TestLearnedEffortRecordOnTheCodexRoute:
         assert _effort(_request(transport, "gpt-6-astra", "none")) == "none"
         assert other_routes() == before
 
+    @pytest.mark.parametrize(
+        "address", ["https://responses.example.com/v1", "https://api.openai.com/v1"], ids=["custom", "openai-api"]
+    )
+    def test_the_codex_label_on_another_address_reads_no_record(self, transport, monkeypatch, address):
+        import builtins
+
+        from agent.codex_responses_adapter import classify_responses_route
+
+        flags = classify_responses_route(SimpleNamespace(provider="openai-codex", base_url=address))
+        assert flags.is_codex_backend is True  # the provider label alone sets the transport flag
+        route = {"provider": "openai-codex", "base_url": address, "is_codex_backend": flags.is_codex_backend}
+        record, opened, real_open = Path(os.environ["HERMES_HOME"]) / "model_efforts.json", [], builtins.open
+
+        def watched_open(file, *args, **kwargs):
+            if str(file).endswith("model_efforts.json"):
+                opened.append(Path(file))
+            return real_open(file, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", watched_open)
+        asks = (("gpt-5.7", "max"), ("gpt-5.6", "max"), ("gpt-6-astra", "none"))
+        today = {(model, ask): _request(transport, model, ask, route=route) for model, ask in asks}
+        assert [_effort(body) for body in today.values()] == ["xhigh", "max", "low"]
+
+        # On the Codex backend this record changes each of them: max, xhigh and none.
+        _write_record({
+            "openai-codex:gpt-5.7": _entry(efforts=_EVERY_LEVEL),
+            "openai-codex:gpt-5.6": _entry(refused=["max"]),
+            "openai-codex:gpt-6-astra": _entry(efforts=["none"]),
+        })
+        assert {(model, ask): _request(transport, model, ask, route=route) for model, ask in asks} == today
+        assert opened == []
+
+        assert _effort(_request(transport, "gpt-5.7", "max")) == "max"  # the Codex backend reads the record
+        assert opened == [record]
+
     def test_a_refused_level_is_never_sent(self, transport):
         _write_record({
             "openai-codex:gpt-5.6": _entry(refused=["max"]),

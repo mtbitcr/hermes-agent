@@ -10,6 +10,7 @@ import logging
 import re
 from typing import Any, Callable, Optional
 
+from agent.codex_headers import is_official_codex_base_url
 from agent.model_effort_record import lookup as lookup_learned_effort, select_effort
 from agent.reasoning_effort import (
     CODEX_ASTRA_EFFORTS, CODEX_GPT56_EFFORTS, CODEX_LEGACY_EFFORTS,
@@ -306,7 +307,7 @@ def _filter_learned_effort(kwargs: dict[str, Any], params: dict[str, Any]) -> No
     """Codex backend only, the last change to the effort: the learned record's entry for the final model
     picks the level, written to each effort form of the final args (``reasoning``, ``extra_body.reasoning``)
     on copies; no level drops the ``effort`` key. With no entry the request stays as built."""
-    if params.get("is_codex_backend") is not True:
+    if not (params.get("is_codex_backend") is True and is_official_codex_base_url(str(params.get("base_url") or ""))):
         return
     extra_body = kwargs.get("extra_body")
     if not isinstance(extra_body, dict):
@@ -669,6 +670,9 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs.update(params["request_overrides"])
 
         _sanitize_astra_request_kwargs(kwargs, model, params.get("base_url"))
+        # Last step for the request args this transport builds. A plugin's request or execution middleware runs
+        # after the transport and can change any field, as it can today; no plugin registers one today. When a
+        # plugin with such a middleware is admitted, this filter must move to the call boundary.
         _filter_learned_effort(kwargs, params)
 
         _bound_prompt_cache_key_field(kwargs)

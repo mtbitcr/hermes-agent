@@ -202,29 +202,33 @@ class TestReads:
 
     def _run_two_requests(self, transport, monkeypatch, path, on_first_open=None):
         """Run requests ``first`` and ``second`` for gpt-5.7 at max; ``second`` starts while ``first`` opens
-        the record and holds the fill. Returns (thread names that opened the record, effort per request)."""
-        from agent import model_effort_record
-
+        the record and holds the fill. Returns (thread names that opened the record, effort per request).
+        The reader's lock is watched only from that open on; until then the test sees just the file opens."""
         second_waits = threading.Event()
         opened, sent, threads = [], {}, []
+        real_open = builtins.open
 
         def request(name):
             sent[name] = _sent_effort(transport, "gpt-5.7", "max")
 
         def open_record(file, *args, **kwargs):
-            if Path(file) == path:
+            if str(file) == str(path):
                 opened.append(threading.current_thread().name)
                 if len(opened) == 1:
+                    from agent import model_effort_record  # loaded: its reader is opening the record
+
+                    monkeypatch.setattr(
+                        model_effort_record, "_fill_lock", _WatchedLock(model_effort_record._fill_lock, second_waits)
+                    )
                     if on_first_open:
                         on_first_open()
                     second = threading.Thread(target=request, args=("second",), name="second")
                     threads.append(second)
                     second.start()
                     assert second_waits.wait(timeout=10)  # the second request now waits for this fill
-            return builtins.open(file, *args, **kwargs)
+            return real_open(file, *args, **kwargs)
 
-        monkeypatch.setattr(model_effort_record, "_fill_lock", _WatchedLock(model_effort_record._fill_lock, second_waits))
-        monkeypatch.setattr(model_effort_record, "open", open_record, raising=False)
+        monkeypatch.setattr(builtins, "open", open_record)
         first = threading.Thread(target=request, args=("first",), name="first")
         first.start()
         first.join(timeout=30)
@@ -252,20 +256,19 @@ class TestReads:
         assert opened == ["first"]
 
     def test_one_request_reads_one_snapshot(self, transport, monkeypatch):
-        from agent import model_effort_record
-
         path = _write_record({"openai-codex:gpt-5.7": _entry(refused=["high"])})
         opened = []
+        real_open = builtins.open
 
         def open_then_replace(file, *args, **kwargs):
-            handle = builtins.open(file, *args, **kwargs)
-            if Path(file) == path:
+            handle = real_open(file, *args, **kwargs)
+            if str(file) == str(path):
                 opened.append(file)
                 if len(opened) == 1:  # a new version lands while the first request reads the old one
                     _write_record({"openai-codex:gpt-5.7": _entry(refused=["medium", "high"])}, path)
             return handle
 
-        monkeypatch.setattr(model_effort_record, "open", open_then_replace, raising=False)
+        monkeypatch.setattr(builtins, "open", open_then_replace)
 
         assert _sent_effort(transport, "gpt-5.7", "high") == "medium"
         assert len(opened) == 1
