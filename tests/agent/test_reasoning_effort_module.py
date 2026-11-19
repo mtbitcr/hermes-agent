@@ -194,11 +194,15 @@ class TestCodexVocabulary:
         assert clamp_effort("max", codex_supported_efforts(model)) == "max"
         assert is_astra_model("gpt-6-sol") is False
 
-    @pytest.mark.parametrize("model", ["gpt-6.1-sol", "openai/gpt-6.1-sol", "GPT-6.1-Sol"])
+    @pytest.mark.parametrize(
+        "model",
+        ["gpt-6.1-sol", "openai/gpt-6.1-sol", "GPT-6.1-Sol", "gpt-6.2-sol", "openai/gpt-6.2-sol"],
+    )
     def test_gpt61_sol_keeps_max_and_has_no_disable_level(self, model):
         """GPT-6.1 Sol's model page (2026-09-29) lists low, medium, high, xhigh
         and max, and rejects none and minimal: max stays max, and a disable
-        request floors at low instead of reaching the wire."""
+        request floors at low instead of reaching the wire. GPT-6.2 Sol speaks
+        the same set (OpenAI developer documentation, read 2026-11-19)."""
         from agent.reasoning_effort import codex_supported_efforts, is_astra_model
 
         assert codex_supported_efforts(model) == ("low", "medium", "high", "xhigh", "max")
@@ -206,6 +210,17 @@ class TestCodexVocabulary:
         assert clamp_effort("none", codex_supported_efforts(model)) == "low"
         assert clamp_effort("minimal", codex_supported_efforts(model)) == "low"
         assert is_astra_model(model) is False
+
+    @pytest.mark.parametrize("model", ["gpt-6.2-sol", "openai/gpt-6.2-sol"])
+    def test_gpt62_sol_gets_the_five_levels_with_max_and_no_none(self, model):
+        """GPT-6.2 Sol accepts low, medium, high, xhigh and max and rejects none
+        (OpenAI developer documentation, read 2026-11-19). On the legacy set the
+        monthly model check refused it for a role that runs at max."""
+        from agent.reasoning_effort import codex_supported_efforts
+
+        efforts = codex_supported_efforts(model)
+        assert efforts == ("low", "medium", "high", "xhigh", "max")
+        assert "max" in efforts and "none" not in efforts
 
     @pytest.mark.parametrize(
         "model", ["gpt-5.5", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-6-astra-pro", None]
@@ -217,6 +232,14 @@ class TestCodexVocabulary:
 
         assert codex_supported_efforts(model) is CODEX_LEGACY_EFFORTS
         assert clamp_effort("max", codex_supported_efforts(model)) == "xhigh"
+
+    def test_unlisted_sol_version_keeps_the_legacy_set(self):
+        """An id that no list names keeps the legacy set: the table stays
+        explicit until a later card teaches the platform a new version
+        without a code edit."""
+        from agent.reasoning_effort import CODEX_LEGACY_EFFORTS, codex_supported_efforts
+
+        assert codex_supported_efforts("gpt-6.3-sol") is CODEX_LEGACY_EFFORTS
 
 
 class TestRequestedEffort:

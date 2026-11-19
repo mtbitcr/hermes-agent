@@ -113,3 +113,21 @@ def test_picker_revalidates_cached_astra_and_never_injects_saved_entitlement(mon
 
     live[:] = ["gpt-5.6-sol", model]
     assert model in models.cached_provider_model_ids(provider)
+
+
+@pytest.mark.parametrize("requested,sent", [("max", "max"), ("none", "low")])
+def test_gpt62_sol_reaches_the_wire_as_gpt61_sol_does(requested, sent):
+    """The transport reads the same effort table: GPT-6.2 Sol keeps max (the legacy set sent xhigh)
+    and a disable request floors at low, as for GPT-6.1 Sol."""
+    from agent.transports.codex import ResponsesApiTransport
+
+    params = dict(
+        messages=[{"role": "user", "content": "Hi"}], tools=[], is_codex_backend=True,
+        reasoning_config={"enabled": True, "effort": requested},
+        base_url="https://chatgpt.com/backend-api/codex", provider="openai-codex",
+    )
+    sent_by_model = {
+        model: ResponsesApiTransport().build_kwargs(model=model, **params)["reasoning"]["effort"]
+        for model in ("gpt-6.1-sol", "gpt-6.2-sol")
+    }
+    assert sent_by_model == {"gpt-6.1-sol": sent, "gpt-6.2-sol": sent}
