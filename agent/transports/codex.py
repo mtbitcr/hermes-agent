@@ -10,8 +10,9 @@ import logging
 import re
 from typing import Any, Callable, Optional
 
+from agent.model_effort_record import lookup as lookup_learned_effort, select_effort
 from agent.reasoning_effort import (
-    CODEX_ASTRA_EFFORTS, CODEX_LEGACY_EFFORTS,
+    CODEX_ASTRA_EFFORTS, CODEX_GPT56_EFFORTS, CODEX_LEGACY_EFFORTS,
     XAI_GROK46_EFFORTS, XAI_LEGACY_EFFORTS, clamp_effort, is_astra_model,
     # Same declared vocabulary + shared clamp as the main Codex transport (agent.reasoning_effort):
     # per-model — "max" is gpt-5.6-only, "minimal"/"ultra" always rejected (live-verified, #68365).
@@ -299,6 +300,53 @@ def _sanitize_astra_request_kwargs(kwargs: dict[str, Any], model: Any, base_url:
     include = kwargs.get("include")
     if isinstance(include, list):
         kwargs["include"] = [item for item in include if "logprob" not in str(item).lower()]
+
+
+def _filter_learned_effort(kwargs: dict[str, Any], params: dict[str, Any]) -> None:
+    """Codex backend only, the last change to the effort: the learned record's entry for the final model
+    picks the level, written to each effort form of the final args (``reasoning``, ``extra_body.reasoning``)
+    on copies; no level drops the ``effort`` key. With no entry the request stays as built."""
+    if params.get("is_codex_backend") is not True:
+        return
+    extra_body = kwargs.get("extra_body")
+    if not isinstance(extra_body, dict):
+        extra_body = {}
+    body_form, extra_form = _effort_form(kwargs.get("reasoning")), _effort_form(extra_body.get("reasoning"))
+    if body_form is None and extra_form is None:
+        return
+    # The SDK merges ``extra_body`` over the body, so a model there is the one sent.
+    model = extra_body.get("model", kwargs.get("model"))
+    entry = lookup_learned_effort("openai-codex", model)
+    if entry is None:
+        return
+    overrides = params.get("request_overrides")
+    override_form = _effort_form(overrides.get("reasoning")) if isinstance(overrides, dict) else None
+    if extra_form is not None:
+        asked = extra_form["effort"]
+    elif override_form is not None:
+        asked = override_form["effort"]
+    else:  # the role's ask before the name clamp, as _resolve_reasoning reads it
+        reasoning_config = params.get("reasoning_config")
+        asked = (reasoning_config.get("effort") if isinstance(reasoning_config, dict) else None) or "medium"
+    level = select_effort(asked, codex_supported_efforts(model), entry, CODEX_GPT56_EFFORTS)
+    if body_form is not None:
+        kwargs["reasoning"] = _with_effort(body_form, level)
+    if extra_form is not None:
+        kwargs["extra_body"] = {**extra_body, "reasoning": _with_effort(extra_form, level)}
+
+
+def _effort_form(value: Any) -> Optional[dict[str, Any]]:
+    """``value`` when it is a reasoning dict holding an ``effort`` key."""
+    return value if isinstance(value, dict) and "effort" in value else None
+
+
+def _with_effort(form: dict[str, Any], level: Optional[str]) -> dict[str, Any]:
+    form = dict(form)
+    if level is None:
+        del form["effort"]
+    else:
+        form["effort"] = level
+    return form
 
 
 def _content_cache_key(instructions: str, tools: Optional[list[dict[str, Any]]], scope_id: str = "") -> Optional[str]:
@@ -621,6 +669,7 @@ class ResponsesApiTransport(ProviderTransport):
             kwargs.update(params["request_overrides"])
 
         _sanitize_astra_request_kwargs(kwargs, model, params.get("base_url"))
+        _filter_learned_effort(kwargs, params)
 
         _bound_prompt_cache_key_field(kwargs)
 

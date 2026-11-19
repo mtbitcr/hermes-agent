@@ -241,6 +241,36 @@ class TestCodexVocabulary:
 
         assert codex_supported_efforts("gpt-6.3-sol") is CODEX_LEGACY_EFFORTS
 
+    def test_a_learned_record_leaves_the_name_rule_as_it_is(self):
+        """The learned effort record (model_efforts.json at the root home) teaches the Codex backend
+        request, never this rule: each model gets the same answer by name while the record's entries
+        govern that route's final request."""
+        import json
+        import os
+        from pathlib import Path
+
+        import agent.transports.codex  # noqa: F401
+        from agent.reasoning_effort import codex_supported_efforts
+        from agent.transports import get_transport
+
+        models = ("gpt-5.5", "gpt-5.6", "gpt-6-astra", "gpt-6.2-sol", "gpt-6.3-sol")
+        by_name = {model: codex_supported_efforts(model) for model in models}
+        entry = {
+            "efforts": ["none", "low", "medium", "high", "xhigh", "max"], "refused": [],
+            "thinking": {"adaptive": None, "manual": None, "disable": True},
+            "source": "account_list", "observed_at": 1795070000,
+        }
+        record = {"schema_version": 1, "models": {f"openai-codex:{model}": entry for model in models}}
+        (Path(os.environ["HERMES_HOME"]) / "model_efforts.json").write_text(json.dumps(record), encoding="utf-8")
+
+        assert {model: codex_supported_efforts(model) for model in models} == by_name
+        kwargs = get_transport("codex_responses").build_kwargs(
+            model="gpt-6.3-sol", messages=[{"role": "user", "content": "Hi"}], tools=[], provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex", is_codex_backend=True,
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+        assert kwargs["reasoning"]["effort"] == "max"  # the record governs the request; by name it is xhigh
+
 
 class TestRequestedEffort:
     def test_extracts_effort(self):
