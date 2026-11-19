@@ -108,12 +108,22 @@ def _last_event(root: Path, project) -> int:
         conn.close()
 
 
-def _suggestion(conn, project, label: str, subject: str) -> str:
+def _suggestion(conn, project, label: str, subject: str, kind: str = "skill") -> str:
     return kanban_db.create_recommendation(
-        conn, project_id=project.id, target_profile="worker", recommendation_kind="skill",
+        conn, project_id=project.id, target_profile="worker", recommendation_kind=kind,
         recommendation_subject_id=subject, recommendation_label=label, recommendation_evidence=_EVIDENCE,
         **_PROVENANCE,
     )
+
+
+def _model_update_subject() -> str:
+    """A practice model update subject (the same model twice), as the board of 2026-11-19 held one. The model update
+    module has no subject builder; its own parse_subject must accept the subject."""
+    from hermes_cli import owner_model_updates as updates
+
+    subject = updates._PREFIX + ":".join(("anthropic", "claude-opus-5-5", "claude-opus-5-5", "2026-11"))
+    assert updates.parse_subject(updates._KIND, subject) is not None
+    return subject
 
 
 def _decide(conn, task_id: str, decision: str, reason: str) -> None:
@@ -440,6 +450,32 @@ def test_settled_decisions_are_included(root):
     assert "We have no lawn." in result["text"]
 
 
+def test_only_an_accepted_model_update_suggestion_says_that_it_needs_no_card(root):
+    """Its own Update settles an accepted model update suggestion, so its input item says needs_card false.
+    parse_subject of the model update module alone decides what a model update is: an accepted suggestion of
+    another kind and an accepted one of the same kind with another subject do not say it."""
+    from hermes_cli import owner_model_updates as updates
+
+    subject = _model_update_subject()
+    assert updates.parse_subject("skill", subject) is None
+    assert updates.parse_subject(updates._KIND, "planner-route") is None
+    project = _make(root, "Model Team")
+    with _board(root, project.board_slug) as conn:
+        update = _suggestion(conn, project, "Try the new planner model", subject, kind=updates._KIND)
+        skill = _suggestion(conn, project, "Teach the planner the new model", subject)
+        policy = _suggestion(conn, project, "Keep the planner on one model", "planner-route", kind=updates._KIND)
+        for tid in (update, skill, policy):
+            _decide(conn, tid, "accepted", "The team wants it.")
+
+    result = _record().build_review_input(project, START, None)
+
+    marks = {item["id"]: item.get("needs_card", "absent") for item in result["sources"]["suggestions"]}
+    assert marks == {update: False, skill: "absent", policy: "absent"}
+    assert {item["id"]: item["linked_card"] for item in result["sources"]["suggestions"]} == dict.fromkeys(marks)
+    # The reviewer reads the mark in the input text, once.
+    assert result["text"].count('"needs_card":false') == 1
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # 5. An empty Project
 # ---------------------------------------------------------------------------------------------------------------
@@ -740,7 +776,7 @@ def test_automation_metadata_reads_live_profile_stores_without_repairs_or_unrela
         {"id": "4", "name": "Unlinked work", "enabled": True},
     ]
     (root / "cron").mkdir(exist_ok=True)
-    (root / "cron" / "jobs.json").write_text(json.dumps(jobs if bare_list else {"jobs": jobs}))
+    (root / "cron" / "jobs.json").write_text(json.dumps(jobs if bare_list else {"jobs": jobs}), encoding="utf-8")
     for profile, name in [("helper", "Weekly meeting check"), ("retired", "Retired work")]:
         home = root / "profiles" / profile
         (home / "cron").mkdir(parents=True)

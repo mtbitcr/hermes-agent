@@ -67,11 +67,28 @@ def _review_closures(board, project_id, sources, classification, proposals) -> l
     return checked
 
 
+def needs_no_card(board, project_id, item) -> bool:
+    """Whether a frozen suggestion item needs no card: an accepted model update, which its own Update applies. The
+    input's needs_card mark decides; an item with no mark, as in an input made before the mark, is decided from its
+    board row, and a missing row needs a card."""
+    from hermes_cli.owner_model_updates import parse_subject
+
+    if "needs_card" in item:
+        return item["needs_card"] is False
+    if item.get("decision") != "accepted":
+        return False
+    row = board.execute(
+        "SELECT * FROM tasks WHERE id=? AND project_id=? AND task_kind='recommendation'", (item["id"], project_id),
+    ).fetchone()
+    return row is not None and parse_subject(row["recommendation_kind"], row["recommendation_subject_id"]) is not None
+
+
 def check_plan_suggestions(value, sources, board, registry, project) -> None:
     """The result's plan_suggestions against the frozen input and the live Project board.
 
     Each pair names an add change of the checked plan_proposal and a suggestion of the frozen input that is accepted
-    or pending, has no live closure and no linked card; no suggestion and no change appears twice, and a list without
+    or pending, has no live closure, no linked card and no needs_card false (an accepted model update, which its own
+    Update applies; with no mark, its board row decides); no suggestion and no change appears twice, and a list without
     a plan is refused. A suggestion whose reviewed plan the owner denied is not planned again while the brief history
     holds that pair (origin._denied_plan). The pairs are only the review's proposal: a link is written by the kernel,
     in the owner's exactly approved plan commit.
@@ -97,6 +114,9 @@ def check_plan_suggestions(value, sources, board, registry, project) -> None:
             raise ReviewRefused("review_plan_suggestion_change_invalid")
         if tid not in suggestions:
             raise ReviewRefused("review_plan_suggestion_unknown")
+        # An accepted model update, by the input's mark or, with no mark, its board row: its own Update applies it.
+        if needs_no_card(board, project.id, suggestions[tid]):
+            raise ReviewRefused("review_plan_suggestion_needs_no_card")
         closure = suggestions[tid].get("closure")
         if (suggestions[tid]["decision"] not in ("pending", "accepted") or (closure and closure.get("undone_at") is None)
                 or kanban_db.has_live_recommendation_closure(board, tid)):

@@ -65,7 +65,7 @@ from hermes_cli import kanban_db, owner_project_review_owner_line as owner_steps
 from hermes_cli import owner_project_summary as summary
 from hermes_cli import owner_project_summary_events as events
 from hermes_cli.kanban_recommendation_closure import content_link, delivery_after_undo
-from hermes_cli.owner_project_review_suggestions import _review_closures, check_closure_shapes, check_plan_suggestions
+from hermes_cli.owner_project_review_suggestions import _review_closures, check_closure_shapes, check_plan_suggestions, needs_no_card
 from hermes_cli.sqlite_util import write_txn
 
 logger = logging.getLogger(__name__)
@@ -137,7 +137,8 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
    specification, current_milestone, owner_visible_result, later_milestones, and changes.
    Use the native plan change schema. Each existing task reference must use its input status and event revision.
    This is advice for the Project chat. It grants no approval and changes no work.
-   When the input holds an accepted suggestion with a null linked_card, the review must plan it: plan_proposal holds
+   When the input holds an accepted suggestion with a null linked_card, the review must plan it, but only when its
+   item does not hold needs_card false, which says that it needs no card: plan_proposal holds
    one add change for each such suggestion, and plan_suggestions holds one object for each, with exactly change
    (the index of an add change in changes) and suggestion (its id). When more than three such suggestions exist, the
    review plans three of them, the ones last in the input's suggestions list first (the oldest). It leaves one out only
@@ -360,6 +361,9 @@ def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, s
               and made in tasks and _delivered_match(board, project_id, tid, tasks[made])):
             # An accepted suggestion whose own linked card is delivered, as the worker's evidence names it.
             actual, evidence = "superseded", [f"tasks:{made}"]
+        elif tid in suggestions and needs_no_card(board, project_id, suggestions[tid]):
+            # An accepted model update, by the input's mark or, with no mark, its board row: its own Update settles it.
+            actual, evidence = "superseded", [f"suggestions:{tid}"]
         elif tid in suggestions and suggestions[tid]["decision"] != "pending":
             actual = "answered"
             evidence = [f"suggestions:{tid}"]
