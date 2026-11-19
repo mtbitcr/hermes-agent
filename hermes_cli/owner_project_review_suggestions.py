@@ -71,7 +71,8 @@ def check_plan_suggestions(value, sources, board, registry, project) -> None:
     """The result's plan_suggestions against the frozen input and the live Project board.
 
     Each pair names an add change of the checked plan_proposal and a suggestion of the frozen input that is accepted
-    or pending, has no live closure and no linked card; no suggestion and no change appears twice, and a list without
+    or pending, has no live closure, no linked card and no needs_card false (an accepted model update, which its own
+    Update applies); no suggestion and no change appears twice, and a list without
     a plan is refused. A suggestion whose reviewed plan the owner denied is not planned again while the brief history
     holds that pair (origin._denied_plan). The pairs are only the review's proposal: a link is written by the kernel,
     in the owner's exactly approved plan commit.
@@ -97,6 +98,9 @@ def check_plan_suggestions(value, sources, board, registry, project) -> None:
             raise ReviewRefused("review_plan_suggestion_change_invalid")
         if tid not in suggestions:
             raise ReviewRefused("review_plan_suggestion_unknown")
+        # The input marks an accepted model update: its own Update applies it, so no card is planned for it.
+        if suggestions[tid].get("needs_card") is False:
+            raise ReviewRefused("review_plan_suggestion_needs_no_card")
         closure = suggestions[tid].get("closure")
         if (suggestions[tid]["decision"] not in ("pending", "accepted") or (closure and closure.get("undone_at") is None)
                 or kanban_db.has_live_recommendation_closure(board, tid)):

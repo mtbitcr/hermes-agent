@@ -254,6 +254,8 @@ def _decisions(board, project, ids, cursors, sources, cuts):
 
 
 def _suggestions(board, project, sources, cuts):
+    from hermes_cli.owner_model_updates import parse_subject
+
     rows = list(board.execute(
         "SELECT * FROM tasks WHERE task_kind='recommendation' AND project_id=? "
         "ORDER BY (COALESCE(recommendation_decision,'pending')!='pending'),created_at DESC,id DESC", (project.id,),
@@ -280,6 +282,10 @@ def _suggestions(board, project, sources, cuts):
             (row["id"],),
         ).fetchone()
         item["linked_card"] = made[0] if made else None
+        # An accepted model update needs no card: its own Update applies it. Only parse_subject tells a model update.
+        if (lifecycle["decision"] == "accepted"
+                and parse_subject(row["recommendation_kind"], row["recommendation_subject_id"]) is not None):
+            item["needs_card"] = False
         sources["suggestions"].append(item)
 
 

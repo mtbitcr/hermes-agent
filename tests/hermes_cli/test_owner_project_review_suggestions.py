@@ -8,10 +8,12 @@ from datetime import datetime, timezone
 import pytest
 import yaml
 
-from hermes_cli import kanban_db, owner_project_review as review, owner_workspace, projects_db
+from hermes_cli import kanban_db, owner_model_updates as updates, owner_project_review as review, owner_workspace, projects_db
 from hermes_cli import owner_project_review_record as record, owner_project_summary_events as events
 from tests.hermes_cli.test_owner_project_review_plans import _approved_plan
-from tests.hermes_cli.test_owner_project_review_record import _decide, _suggestion, _written_at, root  # noqa: F401
+from tests.hermes_cli.test_owner_project_review_record import (  # noqa: F401
+    _decide, _model_update_subject, _suggestion, _written_at, root,
+)
 from tests.hermes_cli.test_owner_workspace import _bootstrap_board, _commit_project_plan, _with_approver, ctx  # noqa: F401
 
 NOW = int(datetime(2026, 11, 10, 7, tzinfo=timezone.utc).timestamp())
@@ -20,6 +22,9 @@ HALL = "Book the conference hall"
 HINT = f"Ask Raphael in the Project chat to add {HALL} for your accepted suggestion {ROOM}."
 # A title equivalent to the accepted suggestion's label under the content-link rule of the closures.
 SAME = "Reserve the meeting room"
+# The labels of update_world's two suggestions of the model update kind.
+UPDATE = "Try the new planner model"
+POLICY = "Keep the planner on one model"
 
 
 def _project_board(project):
@@ -34,6 +39,28 @@ def _summary_board():
 def world(root, ctx):
     """One Project with its first daily review open: an accepted suggestion with no card, an accepted one whose
     made-from card is done, a rejected one, and a plan-made card with a newer owner comment."""
+    return _world(root, ctx)
+
+
+@pytest.fixture
+def update_world(root, ctx):
+    """The world above with two more accepted suggestions with no card: the practice model update of 2026-11-19, which
+    the owner's Update settles, and one of the same kind whose subject is no model update."""
+    return _world(root, ctx, _model_policy)
+
+
+def _model_policy(board, project):
+    # Each is accepted by the owner's decision, the step the Update takes before it applies a model update. Of the
+    # two subjects, parse_subject reads only the first as a model update.
+    update = _suggestion(board, project, UPDATE, _model_update_subject(), kind=updates._KIND)
+    policy = _suggestion(board, project, POLICY, "planner-route", kind=updates._KIND)
+    assert updates.parse_subject(updates._KIND, "planner-route") is None
+    _decide(board, update, "accepted", "Try the new model on the planner.")
+    _decide(board, policy, "accepted", "The planner needs one model.")
+    return {"update": update, "policy": policy}
+
+
+def _world(root, ctx, more=None):
     with _written_at(NOW - 86400):
         setup = _bootstrap_board(ctx)
         [booked] = _approved_plan(ctx, setup)["created_task_ids"]
@@ -52,15 +79,16 @@ def world(root, ctx):
         assert kanban_db.complete_task(board, card, summary="Lunch is ordered.")
         target = {"task_id": booked, "expected_status": kanban_db.get_task(board, booked).status,
                   "expected_revision": kanban_db.task_event_revision(board, booked)}
+        extra = more(board, project) if more else {}
     config = {"owner_review": {"enabled": True, "allowlist": [project.id], "closure": True}}
-    (root / "config.yaml").write_text(yaml.safe_dump(config))
+    (root / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
     assert review.review_tick(NOW) == 1
     with projects_db.connect_closing(root / "projects.db") as registry:
         review_task = registry.execute(
             "SELECT open_task_id FROM project_review_state WHERE project_id=?", (project.id,),
         ).fetchone()[0]
     return {"root": root, "project": project, "review_task": review_task, "booked": booked, "target": target,
-            "card": card, "accepted": accepted, "linked": linked, "rejected": rejected}
+            "card": card, "accepted": accepted, "linked": linked, "rejected": rejected, **extra}
 
 
 def _add(title):
@@ -641,3 +669,75 @@ def test_t7_after_its_pair_left_the_brief_history_the_review_gives_the_hint_agai
         brief = registry.execute("SELECT next_step,source_task_id FROM project_review_briefs WHERE project_id=? "
                                  "ORDER BY review_date DESC LIMIT 1", (project.id,)).fetchone()
     assert tuple(brief) == (HINT.replace(HALL, "Reserve the large conference hall"), later)
+
+
+def _update_result(world, *, classes=None, **kwargs):
+    """A review result for update_world: its two suggestions of the model update kind are answered too, unless
+    ``classes`` names their class and evidence."""
+    claims = {tid: ("answered", [f"suggestions:{tid}"]) for tid in (world["update"], world["policy"])}
+    return _result(world, classes={**claims, **(classes or {})}, **kwargs)
+
+
+def test_a_pair_for_an_accepted_model_update_is_refused_with_its_own_code(update_world):
+    """The plan of 2026-11-19: a card to carry the practice model update that the owner's Update applied."""
+    world = update_world
+    plan, pairs = _plan(_add("Move the planner to the new model")), [{"change": 0, "suggestion": world["update"]}]
+    _complete(world, _update_result(world, plan=plan, pairs=pairs))
+
+    with pytest.raises(review.ReviewRefused) as refused:
+        _parse(world)
+
+    assert refused.value.code == "review_plan_suggestion_needs_no_card"
+
+
+def test_a_result_of_2026_11_19_that_leaves_the_applied_model_update_unplanned_is_accepted(update_world):
+    """The result of 2026-11-19 with no pair for the applied model update, and its class from the kernel's evidence:
+    superseded by suggestions:<id>, whose item says needs_card false. Each other accepted suggestion with no linked
+    card keeps its pair. On the base this result was refused with review_class_evidence_required, as the result of
+    that day was, by the class rule at the end of _classify_review: a worker's class must be answered, stale, current
+    or the kernel's own class, and the base's own class for each decided suggestion was answered, with no branch for
+    one that its Update settles."""
+    world = update_world
+    update = world["update"]
+    plan = _plan(_add(HALL), _add("Write down which model the planner keeps"))
+    pairs = [{"change": 0, "suggestion": world["accepted"]}, {"change": 1, "suggestion": world["policy"]}]
+    value = _update_result(world, plan=plan, pairs=pairs, classes={update: ("superseded", [f"suggestions:{update}"])})
+    value["brief"]["what_changed"] = f"The practice model update is applied and needs no card. {ROOM} has no card yet."
+    _complete(world, value)
+
+    result = _parse(world)
+
+    classes = {item["item"]: (item["class"], item["evidence"]) for item in result.classification}
+    assert classes[update] == ("superseded", [f"suggestions:{update}"])
+    for tid in (world["accepted"], world["policy"]):
+        assert classes[tid] == ("answered", [f"suggestions:{tid}"])
+    assert result.source_run_id is not None
+    assert review.review_tick(NOW + 1) == 0
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        stored = registry.execute(
+            "SELECT classification FROM project_review_briefs WHERE project_id=?", (world["project"].id,),
+        ).fetchone()[0]
+    assert [item["class"] for item in json.loads(stored) if item["item"] == update] == ["superseded"]
+
+
+@pytest.mark.parametrize("planned", ["accepted", "policy"], ids=["other_kind", "same_kind_other_subject"])
+def test_each_other_accepted_suggestion_with_no_linked_card_is_planned_as_today(update_world, planned):
+    """Beside an applied model update, an accepted suggestion of another kind and one of the same kind whose subject
+    is no model update keep their pair and its hint."""
+    world = update_world
+    _complete(world, _update_result(world, plan=_plan(), pairs=[{"change": 0, "suggestion": world[planned]}]))
+
+    result = _parse(world)
+
+    assert result.brief["next_step"] == HINT.replace(ROOM, {"accepted": ROOM, "policy": POLICY}[planned])
+    assert result.source_run_id is not None
+
+
+def test_the_instruction_plans_an_accepted_suggestion_only_when_its_item_does_not_say_needs_card_false(world):
+    with _summary_board() as board:
+        body = kanban_db.get_task(board, world["review_task"]).body
+    instruction = " ".join(body.split("<<<BEGIN UNTRUSTED DATA")[0].split())
+
+    [rule] = [sentence for sentence in instruction.split(". ") if "must plan" in sentence]
+    assert "accepted suggestion with a null linked_card" in rule
+    assert "only when its item does not hold needs_card false" in rule
