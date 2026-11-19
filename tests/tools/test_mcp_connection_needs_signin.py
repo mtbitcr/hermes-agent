@@ -303,7 +303,8 @@ async def _mcp_request_redirected_then_refused(
     The SDK's own HTTP client follows the redirect as production's does, and
     drops the Authorization header on a redirect to another origin; only the
     network is fake. Whatever the SDK sends after the refusal (OAuth discovery
-    after a 401, a retry after a 403) fails to connect.
+    after a 401) fails to connect. The SDK retries a 403 only for
+    ``insufficient_scope``, so a plain 403 returns to the caller.
     """
     from tools.mcp_tool import sdk_httpx
 
@@ -324,8 +325,12 @@ async def _mcp_request_redirected_then_refused(
     async with sdk.AsyncClient(
         auth=_provider(), follow_redirects=True, transport=sdk.MockTransport(_network)
     ) as client:
-        with pytest.raises(sdk.ConnectError):
-            await client.post(_URL, json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+        if status == 403:
+            response = await client.post(_URL, json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+            assert response.status_code == 403
+        else:
+            with pytest.raises(sdk.ConnectError):
+                await client.post(_URL, json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
     assert len(refusals) == 1
 
 
