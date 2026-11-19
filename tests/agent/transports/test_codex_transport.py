@@ -1734,14 +1734,17 @@ def _entry(efforts=(), refused=()):
     }
 
 
-def _request(transport, model, ask, overrides=None, route=_CODEX_ROUTE):
-    """The final serialized request of a role on ``model`` that asks for ``ask``."""
+def _request(transport, model, ask, overrides=None, route=_CODEX_ROUTE, reasoning_config=None):
+    """The final serialized request of a role on ``model`` that asks for ``ask``, or whose reasoning config is
+    ``reasoning_config`` when that is given."""
     import httpx
     import openai
 
+    if reasoning_config is None:
+        reasoning_config = {"enabled": True, "effort": ask}
     kwargs = transport.build_kwargs(
         model=model, messages=[{"role": "user", "content": "Hi"}], tools=[],
-        reasoning_config={"enabled": True, "effort": ask}, request_overrides=overrides, **route,
+        reasoning_config=reasoning_config, request_overrides=overrides, **route,
     )
     sent = []
 
@@ -1968,3 +1971,85 @@ class TestLearnedEffortRecordOnTheCodexRoute:
             assert _effort(_request(transport, "gpt-5.7", "low", _effort_override(form, "turbo"))) == NO_EFFORT
             assert _effort(_request(transport, "gpt-5.7", "low", _effort_override(form, "High"))) == "high"
             assert _effort(_request(transport, "gpt-5.7", "low", _effort_override(form, "MAX"))) == "max"
+
+    def test_an_explicit_none_is_the_ask_for_the_entry_of_the_final_model(self, transport):
+        """Point 2 of the security review sheet: final args with no effort under the explicit none. No entry, an
+        entry that allows none and an entry that allows no level leave today's bytes; an entry that refuses none
+        gets the weakest allowed level."""
+        from hermes_constants import parse_reasoning_effort
+
+        explicit_none = parse_reasoning_effort("none")  # the parser of the command line and of the role's config
+        assert explicit_none == {"enabled": False}
+        cases = {  # the role's model, its request override and its reasoning config
+            "gpt-5.7": ("gpt-5.7", None, explicit_none),
+            "gpt-6-astra": ("gpt-6-astra", None, explicit_none),
+            "one-shot": ("gpt-5.7", None, {"enabled": False, "effort": "none"}),  # the continuation override
+            "to gpt-5.7, top-level": ("gpt-5.6", {"model": "gpt-5.7"}, explicit_none),
+            "to gpt-5.7, extra_body": ("gpt-5.6", {"extra_body": {"model": "gpt-5.7"}}, explicit_none),
+        }
+
+        def send(case):
+            model, overrides, reasoning_config = cases[case]
+            return _request(transport, model, None, overrides, reasoning_config=reasoning_config)
+
+        today = {case: send(case) for case in cases}
+        assert [_reasoning(body) for body in today.values()] == [None] * len(cases)  # no reasoning field
+        todays_bytes = "(today's bytes)"
+
+        def outcome(case):
+            """``todays_bytes``, else the sent reasoning when it is the one field that differs from today's."""
+            body = send(case)
+            if body == today[case]:
+                return todays_bytes
+            others_as_today = {**json.loads(body), "reasoning": None} == {**json.loads(today[case]), "reasoning": None}
+            return _reasoning(body) if others_as_today else json.loads(body)
+
+        rows = (
+            # case                      entry of       efforts   refused           sent with the record
+            ("gpt-5.7",                 "gpt-5.6",     [],       ["none"],         todays_bytes),
+            ("gpt-5.7",                 "gpt-5.7",     ["max"],  [],               todays_bytes),
+            ("gpt-5.7",                 "gpt-5.7",     [],       ["none"],         {"effort": "low"}),
+            ("gpt-5.7",                 "gpt-5.7",     [],       ["none", "low"],  {"effort": "medium"}),
+            ("gpt-5.7",                 "gpt-5.7",     [],       _EVERY_LEVEL,     todays_bytes),
+            ("gpt-6-astra",             "gpt-6-astra", ["max"],  [],               {"effort": "low"}),
+            ("gpt-6-astra",             "gpt-6-astra", ["none"], [],               todays_bytes),
+            ("one-shot",                "gpt-5.7",     [],       ["none"],         {"effort": "low"}),
+            ("to gpt-5.7, top-level",   "gpt-5.6",     [],       ["none"],         todays_bytes),
+            ("to gpt-5.7, top-level",   "gpt-5.7",     [],       ["none"],         {"effort": "low"}),
+            ("to gpt-5.7, extra_body",  "gpt-5.6",     [],       ["none"],         todays_bytes),
+            ("to gpt-5.7, extra_body",  "gpt-5.7",     [],       ["none"],         {"effort": "low"}),
+        )
+        sent = []
+        for case, entry_of, efforts, refused, _ in rows:
+            _write_record({f"openai-codex:{entry_of}": _entry(efforts, refused)})
+            sent.append((case, entry_of, efforts, refused, outcome(case)))
+        assert sent == list(rows)
+
+    @pytest.mark.parametrize("form", ["top-level", "extra_body"])
+    def test_a_summary_only_override_keeps_todays_request_and_its_summary(self, transport, form):
+        """Point 7 of the security review sheet: an override that holds only a summary removes the role's effort
+        today, and an entry adds no effort to it. Under the explicit none an entry that refuses none adds the
+        weakest allowed level beside the summary (point 2)."""
+        from hermes_constants import parse_reasoning_effort
+
+        def summary_only():
+            """A request override that holds only a summary, in its top-level or in its ``extra_body`` form."""
+            override = {"reasoning": {"summary": "detailed"}}
+            return override if form == "top-level" else {"extra_body": override}
+
+        override, explicit_none = summary_only(), parse_reasoning_effort("none")
+        today = _request(transport, "gpt-5.7", "high", override)
+        today_none = _request(transport, "gpt-5.7", None, override, reasoning_config=explicit_none)
+        assert _reasoning(today) == _reasoning(today_none) == {"summary": "detailed"}
+
+        for refused in (["high"], ["none", "high"]):
+            _write_record({"openai-codex:gpt-5.7": _entry(refused=refused)})
+            assert _effort(_request(transport, "gpt-5.7", "high")) == "medium"  # the entry is in use
+            assert _request(transport, "gpt-5.7", "high", override) == today
+
+        _write_record({"openai-codex:gpt-5.7": _entry(refused=["none"])})
+        sent = _reasoning(_request(transport, "gpt-5.7", None, override, reasoning_config=explicit_none))
+        assert sent == {"summary": "detailed", "effort": "low"}
+        _write_record({"openai-codex:gpt-5.6": _entry(refused=["none"])})  # no entry for gpt-5.7
+        assert _request(transport, "gpt-5.7", None, override, reasoning_config=explicit_none) == today_none
+        assert override == summary_only()  # the caller's override stays as it was

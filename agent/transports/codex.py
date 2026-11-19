@@ -306,14 +306,18 @@ def _sanitize_astra_request_kwargs(kwargs: dict[str, Any], model: Any, base_url:
 def _filter_learned_effort(kwargs: dict[str, Any], params: dict[str, Any]) -> None:
     """Codex backend only, the last change to the effort: the learned record's entry for the final model
     picks the level, written to each effort form of the final args (``reasoning``, ``extra_body.reasoning``)
-    on copies; no level drops the ``effort`` key. With no entry the request stays as built."""
+    on copies; no level drops the ``effort`` key. With no entry the request stays as built.
+    Final args with no effort change only for the explicit ``none`` of the role or the command line: ``none`` is
+    the ask, and a selected level other than ``none`` goes, on a copy, into the reasoning object the SDK sends.
+    Each other request with no effort stays as built, with no read of the record."""
     if not (params.get("is_codex_backend") is True and is_official_codex_base_url(str(params.get("base_url") or ""))):
         return
     extra_body = kwargs.get("extra_body")
     if not isinstance(extra_body, dict):
         extra_body = {}
     body_form, extra_form = _effort_form(kwargs.get("reasoning")), _effort_form(extra_body.get("reasoning"))
-    if body_form is None and extra_form is None:
+    no_effort = body_form is None and extra_form is None
+    if no_effort and not _asks_no_thinking(params.get("reasoning_config")):
         return
     # The SDK merges ``extra_body`` over the body, so a model there is the one sent.
     model = extra_body.get("model", kwargs.get("model"))
@@ -322,7 +326,9 @@ def _filter_learned_effort(kwargs: dict[str, Any], params: dict[str, Any]) -> No
         return
     overrides = params.get("request_overrides")
     override_form = _effort_form(overrides.get("reasoning")) if isinstance(overrides, dict) else None
-    if extra_form is not None:
+    if no_effort:  # the explicit none, which the build sends with no effort
+        asked = "none"
+    elif extra_form is not None:
         asked = extra_form["effort"]
     elif override_form is not None:
         asked = override_form["effort"]
@@ -330,10 +336,27 @@ def _filter_learned_effort(kwargs: dict[str, Any], params: dict[str, Any]) -> No
         reasoning_config = params.get("reasoning_config")
         asked = (reasoning_config.get("effort") if isinstance(reasoning_config, dict) else None) or "medium"
     level = select_effort(asked, codex_supported_efforts(model), entry, CODEX_GPT56_EFFORTS)
+    if no_effort and level not in (None, "none"):
+        # Into the reasoning object the SDK sends: ``extra_body``'s when it holds one, else the body's.
+        in_extra_body = "reasoning" in extra_body
+        sent = (extra_body if in_extra_body else kwargs).get("reasoning")
+        reasoning = _with_effort(sent if isinstance(sent, dict) else {}, level)
+        if in_extra_body:
+            kwargs["extra_body"] = {**extra_body, "reasoning": reasoning}
+        else:
+            kwargs["reasoning"] = reasoning
     if body_form is not None:
         kwargs["reasoning"] = _with_effort(body_form, level)
     if extra_form is not None:
         kwargs["extra_body"] = {**extra_body, "reasoning": _with_effort(extra_form, level)}
+
+
+def _asks_no_thinking(reasoning_config: Any) -> bool:
+    """The explicit ``none`` of the role or of the command line: ``enabled`` False, or the effort text ``none``."""
+    if not isinstance(reasoning_config, dict):
+        return False
+    effort = reasoning_config.get("effort")
+    return reasoning_config.get("enabled") is False or (isinstance(effort, str) and effort.strip().lower() == "none")
 
 
 def _effort_form(value: Any) -> Optional[dict[str, Any]]:
