@@ -144,6 +144,11 @@ class ProbeReply:
     seconds: Optional[float] = None
 
 
+def _fresh_catalog_for_tests_without_a_refresh_seam() -> bool:
+    """Reports a fresh catalog and fetches nothing; ``Seams.refresh_catalog`` says when it applies."""
+    return True
+
+
 @dataclass(frozen=True)
 class Seams:
     """Everything the check reads from outside; tests pass fakes."""
@@ -156,9 +161,15 @@ class Seams:
     route_revision: Callable[[str], str]
     now: Callable[[], datetime]
     # Refreshes the catalog that ``capabilities`` reads; True only when the
-    # catalog service answered in this run. default_seams gives the catalog's
-    # forced fetch; this default is for fakes, whose rows read no catalog.
-    refresh_catalog: Callable[[], bool] = lambda: True
+    # catalog service answered in this run. The default is the owner's
+    # decision: the board tool's released test file, which this change does
+    # not own, builds Seams with seven fields, and a default that called the
+    # real forced fetch would make those tests use the network or fail. So it
+    # reports a fresh catalog, only for a construction with no refresh seam
+    # in tests. Production builds Seams only in default_seams, which carries
+    # the real forced fetch; tests prove both. A later change by the owner,
+    # which owns that test file, removes this default.
+    refresh_catalog: Callable[[], bool] = _fresh_catalog_for_tests_without_a_refresh_seam
 
 
 @dataclass(frozen=True)

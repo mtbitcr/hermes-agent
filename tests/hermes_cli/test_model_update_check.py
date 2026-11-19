@@ -14,6 +14,7 @@ value exists anywhere in this file.
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import hashlib
 import importlib
@@ -26,6 +27,8 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import tomllib
+import warnings
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1750,7 +1753,9 @@ def test_practice_run_judges_the_catalog_refreshed_in_the_run_not_its_old_copy(w
         return True
 
     fake = Fake(routes=[(PLANNER, "anthropic", OPUS, "max", "routine")], lists={("anthropic", "gateway"): [OPUS]})
-    seams = replace(fake.seams(muc), capabilities=muc._capability_row, refresh_catalog=refresh_catalog)
+    # A namespace, not a Seams: on the code before the refresh seam, this test still runs the check and fails.
+    seams = SimpleNamespace(**{**vars(fake.seams(muc)), "capabilities": muc._capability_row,
+                               "refresh_catalog": refresh_catalog})
 
     receipt = _command(world, seams, "--practice", PLANNER)
 
@@ -1848,3 +1853,57 @@ def test_default_catalog_refresh_is_the_catalogs_own_forced_fetch(tmp_path, monk
     assert calls == [((), {"force_refresh": True})]
     # Not modified and no answer both serve the old copy: only the service's answer tells them apart.
     assert served == [new if answer == "new-data" else old]
+
+
+def test_default_seams_refresh_is_the_real_forced_fetch_not_the_field_default(monkeypatch):
+    from agent import models_dev
+
+    muc = _muc()
+    calls = []
+
+    def fetch_models_dev(*args, **kwargs):
+        # The stand-in for the forced fetch: the catalog service does not answer.
+        calls.append((args, kwargs))
+        raise ConnectionError("the catalog service did not answer")
+
+    monkeypatch.setattr(models_dev, "fetch_models_dev", fetch_models_dev)
+
+    # The field default would report a fresh catalog and make no call.
+    assert muc.default_seams().refresh_catalog() is False
+    assert calls == [((), {"force_refresh": True})]
+
+
+def test_no_production_code_builds_seams_outside_default_seams():
+    """Holds the owner's decision on the refresh seam's field default until that default is removed."""
+    root = Path(__file__).resolve().parents[2]
+    pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    include = pyproject["tool"]["setuptools"]["packages"]["find"]["include"]
+    # The production packages, then the root's single-file modules as setup.py derives them.
+    files = [path for package in sorted({name.split(".")[0] for name in include})
+             for path in sorted((root / package).rglob("*.py"))]
+    files += [path for path in sorted(root.glob("*.py")) if path.name != "setup.py"]
+    builders, importers = set(), set()
+    for path in files:
+        source = path.read_bytes()
+        if b"Seams" not in source and b"refresh_catalog" not in source:
+            continue
+        name = path.relative_to(root).as_posix()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(source, filename=name)
+        # Each call that builds Seams or passes a refresh seam, with its innermost enclosing function.
+        nodes = [(tree, None)]
+        while nodes:
+            node, function = nodes.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                function = node.name
+            if isinstance(node, ast.Call):
+                callee = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
+                if callee == "Seams" or any(keyword.arg == "refresh_catalog" for keyword in node.keywords):
+                    builders.add((name, function))
+            if isinstance(node, ast.ImportFrom) and any(alias.name == "Seams" for alias in node.names):
+                importers.add(name)
+            nodes.extend((child, function) for child in ast.iter_child_nodes(node))
+
+    assert builders == {("hermes_cli/model_update_check.py", "default_seams")}
+    assert importers <= {"hermes_cli/model_update_check.py"}
