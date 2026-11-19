@@ -65,7 +65,7 @@ from hermes_cli import kanban_db, owner_project_review_owner_line as owner_steps
 from hermes_cli import owner_project_summary as summary
 from hermes_cli import owner_project_summary_events as events
 from hermes_cli.kanban_recommendation_closure import content_link, delivery_after_undo
-from hermes_cli.owner_project_review_suggestions import _review_closures, check_closure_shapes, check_plan_suggestions
+from hermes_cli.owner_project_review_suggestions import _review_closures, check_closure_shapes, check_plan_suggestions, needs_no_card
 from hermes_cli.sqlite_util import write_txn
 
 logger = logging.getLogger(__name__)
@@ -361,8 +361,8 @@ def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, s
               and made in tasks and _delivered_match(board, project_id, tid, tasks[made])):
             # An accepted suggestion whose own linked card is delivered, as the worker's evidence names it.
             actual, evidence = "superseded", [f"tasks:{made}"]
-        elif tid in suggestions and suggestions[tid].get("needs_card") is False:
-            # An accepted model update, marked needs_card false in the input: its own Update settles it with no card.
+        elif tid in suggestions and needs_no_card(board, project_id, suggestions[tid]):
+            # An accepted model update, by the input's mark or, with no mark, its board row: its own Update settles it.
             actual, evidence = "superseded", [f"suggestions:{tid}"]
         elif tid in suggestions and suggestions[tid]["decision"] != "pending":
             actual = "answered"

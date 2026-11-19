@@ -733,6 +733,69 @@ def test_each_other_accepted_suggestion_with_no_linked_card_is_planned_as_today(
     assert result.source_run_id is not None
 
 
+def _input_from_before_the_upgrade(world):
+    """Turn the open review task's stored input into one made before the upgrade: the model update item's data line
+    loses its needs_card mark. Only this test rewrites a stored input, to stand for a review queued before the
+    upgrade; the kernel never does."""
+    mark = ',"needs_card":false'
+    with _summary_board() as board:
+        body = kanban_db.get_task(board, world["review_task"]).body
+        assert body.count(mark) == 1
+        with kanban_db.write_txn(board):
+            board.execute("UPDATE tasks SET body=? WHERE id=?", (body.replace(mark, ""), world["review_task"]))
+        old = kanban_db.get_task(board, world["review_task"]).body
+    # The data holds no mark now, and nothing else changed: one line differs, the model update item's, by its mark.
+    assert "needs_card" not in old.split("<<<BEGIN UNTRUSTED DATA", 1)[1]
+    [(marked, unmarked)] = [pair for pair in zip(body.splitlines(), old.splitlines(), strict=True) if pair[0] != pair[1]]
+    item = json.loads(marked[2:])
+    assert item.pop("needs_card") is False and item["id"] == world["update"] and json.loads(unmarked[2:]) == item
+
+
+def test_a_review_queued_before_the_upgrade_refuses_a_pair_for_an_accepted_model_update(update_world):
+    """The plan of 2026-11-19 on an input made before the upgrade, whose model update item holds no needs_card mark:
+    the suggestion's board row, a model update by parse_subject, refuses the pair with its own code."""
+    world = update_world
+    _input_from_before_the_upgrade(world)
+    plan, pairs = _plan(_add("Move the planner to the new model")), [{"change": 0, "suggestion": world["update"]}]
+    _complete(world, _update_result(world, plan=plan, pairs=pairs))
+
+    with pytest.raises(review.ReviewRefused) as refused:
+        _parse(world)
+
+    assert refused.value.code == "review_plan_suggestion_needs_no_card"
+
+
+def test_a_review_queued_before_the_upgrade_accepts_a_result_that_leaves_the_model_update_unplanned(update_world):
+    """The result of 2026-11-19 on an input made before the upgrade: no pair for the applied model update, whose item
+    holds no needs_card mark, and its class superseded by suggestions:<id>, the kernel's class from the suggestion's
+    board row, a model update by parse_subject. Before the change this result was refused with
+    review_class_evidence_required by the class rule at the end of _classify_review: a worker's class must be
+    answered, stale, current or the kernel's own class, and the kernel's own class for the item with no mark was
+    answered."""
+    world = update_world
+    update = world["update"]
+    _input_from_before_the_upgrade(world)
+    plan = _plan(_add(HALL), _add("Write down which model the planner keeps"))
+    pairs = [{"change": 0, "suggestion": world["accepted"]}, {"change": 1, "suggestion": world["policy"]}]
+    value = _update_result(world, plan=plan, pairs=pairs, classes={update: ("superseded", [f"suggestions:{update}"])})
+    value["brief"]["what_changed"] = f"The practice model update is applied and needs no card. {ROOM} has no card yet."
+    _complete(world, value)
+
+    result = _parse(world)
+
+    classes = {item["item"]: (item["class"], item["evidence"]) for item in result.classification}
+    assert classes[update] == ("superseded", [f"suggestions:{update}"])
+    for tid in (world["accepted"], world["policy"]):
+        assert classes[tid] == ("answered", [f"suggestions:{tid}"])
+    assert review.review_tick(NOW + 1) == 0
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        stored = registry.execute(
+            "SELECT classification FROM project_review_briefs WHERE project_id=?", (world["project"].id,),
+        ).fetchone()[0]
+    assert [(item["class"], item["evidence"]) for item in json.loads(stored) if item["item"] == update] == [
+        ("superseded", [f"suggestions:{update}"])]
+
+
 def test_the_instruction_plans_an_accepted_suggestion_only_when_its_item_does_not_say_needs_card_false(world):
     with _summary_board() as board:
         body = kanban_db.get_task(board, world["review_task"]).body
