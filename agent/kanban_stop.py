@@ -6,11 +6,13 @@ Policy-only: return a bounded synthetic nudge so the loop continues instead of e
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
 
 _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+_VERDICT_KANBAN_TOOLS = frozenset({"kanban_review_findings", "kanban_request_changes"})
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
@@ -31,16 +33,32 @@ def _tool_call_name(tc: Any) -> str:
     return str((getattr(fn, "name", "") if fn is not None else getattr(tc, "name", "")) or "")
 
 
+def _verdict_result_succeeded(content: Any) -> bool:
+    """True for the board tools' success form (``{"ok": true, ...}``), not their error form."""
+    # Accepted limit: a verdict result over 100,000 chars is shown as a preview, not complete JSON;
+    # the guard reads no preview text and sends the reminder, as the released version does.
+    try:
+        data = json.loads(content) if isinstance(content, str) else None
+    except ValueError:
+        return False
+    return isinstance(data, dict) and data.get("ok") is True and "error" not in data
+
+
 def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
-    """True if this conversation already invoked a terminal kanban tool."""
+    """True if this conversation already invoked a terminal kanban tool, or a review
+    verdict tool whose tool result is a success (a refused or unanswered verdict is not)."""
     for msg in filter(lambda m: isinstance(m, dict), messages or ()):
         role = msg.get("role")
         if role == "assistant" and any(
             _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS for tc in msg.get("tool_calls") or []
         ):
             return True
-        if role == "tool" and str(msg.get("name") or "") in _TERMINAL_KANBAN_TOOLS:
-            return True
+        if role == "tool":
+            name = str(msg.get("name") or "")
+            if name in _TERMINAL_KANBAN_TOOLS:
+                return True
+            if name in _VERDICT_KANBAN_TOOLS and _verdict_result_succeeded(msg.get("content")):
+                return True
     return False
 
 
