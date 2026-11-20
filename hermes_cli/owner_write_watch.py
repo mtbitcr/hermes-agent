@@ -25,11 +25,10 @@ from __future__ import annotations
 import json
 import os
 import re
-import select
 import sqlite3
 import subprocess
 import sys
-import time
+import tempfile
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -563,34 +562,30 @@ def _http_send(method: str, url: str, body: Optional[Dict[str, Any]], key: str):
 
 def _run_page_check(path: str):
     """``(outcome, page_lines)``: page_lines is the kept lines of the script's standard output."""
-    deadline = time.monotonic() + PAGE_CHECK_TIMEOUT_SECONDS
-    try:
-        proc = subprocess.Popen([path], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    except OSError:
-        return FAIL, None
-    data = b""
-    try:
-        while len(data) < PAGE_CHECK_OUTPUT_BYTES:
-            if not select.select([proc.stdout], [], [], max(0.0, deadline - time.monotonic()))[0]:
-                raise subprocess.TimeoutExpired(path, PAGE_CHECK_TIMEOUT_SECONDS)
-            chunk = os.read(proc.stdout.fileno(), min(4096, PAGE_CHECK_OUTPUT_BYTES - len(data)))
-            if not chunk:
-                break
-            data += chunk
-        proc.stdout.close()
-        returncode = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        return UNKNOWN, None
-    lines = data.decode("utf-8", "replace").split("\n")
-    kept, other = [], 0
-    for line in lines[:-1] if lines[-1] == "" else lines:
+    with tempfile.TemporaryFile() as out:
+        try:
+            proc = subprocess.Popen([path], stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL)
+        except OSError:
+            return FAIL, None
+        try:
+            outcome = PASS if proc.wait(timeout=PAGE_CHECK_TIMEOUT_SECONDS) == 0 else FAIL
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            outcome = UNKNOWN
+        data = os.pread(out.fileno(), PAGE_CHECK_OUTPUT_BYTES + 1, 0)
+    lines = data[:PAGE_CHECK_OUTPUT_BYTES].decode("utf-8", "replace").split("\n")
+    tail = lines.pop()
+    if tail and len(data) <= PAGE_CHECK_OUTPUT_BYTES and outcome != UNKNOWN:
+        lines.append(tail)
+        tail = ""
+    kept, other = [], int(bool(tail))
+    for line in lines:
         if len(kept) < PAGE_CHECK_LINES and _PAGE_LINE.fullmatch(line):
             kept.append(line)
         else:
             other += 1
-    return (PASS if returncode == 0 else FAIL), {"lines": kept, "not_kept": other}
+    return outcome, {"lines": kept, "not_kept": other}
 
 
 _ROUTE_POLICIES_LOADED = False

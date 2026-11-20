@@ -12,7 +12,9 @@ import asyncio
 import http.server
 import json
 import sqlite3
+import subprocess
 import threading
+import time
 import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -1355,3 +1357,43 @@ def test_page_lines_a_silent_pass_holds_no_line(tmp_path):
     _, _, entry = real_page_run(tmp_path, "exit 0\n")
     assert entry["outcome"] == watch.PASS
     assert entry["page_lines"] == {"lines": [], "not_kept": 0}
+
+
+def test_page_lines_a_script_that_writes_past_the_bound_is_not_cut_short(tmp_path):
+    marker = tmp_path / "reached_the_end"
+    body = ("i=0\nwhile [ $i -lt 1500 ]; do echo \"FAIL page_$i 390 check\"; i=$((i+1)); done\n"
+            f"touch {marker}\nexit 1\n")
+    _, _, entry = real_page_run(tmp_path, body)
+    assert marker.exists()
+    assert entry["outcome"] == watch.FAIL
+    assert len(entry["page_lines"]["lines"]) == 20
+
+
+def test_page_lines_a_descendant_holding_the_output_does_not_hide_the_exit_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(watch, "PAGE_CHECK_TIMEOUT_SECONDS", 5)
+    pid_file = tmp_path / "descendant.pid"
+    body = f"echo 'FAIL home 390 check'\nsleep 30 &\necho $! > {pid_file}\nexit 1\n"
+    started = time.monotonic()
+    try:
+        _, _, entry = real_page_run(tmp_path, body)
+    finally:
+        if pid_file.exists():
+            subprocess.run(["kill", pid_file.read_text().strip()], check=False, stderr=subprocess.DEVNULL)
+    assert time.monotonic() - started < 4
+    assert entry["outcome"] == watch.FAIL
+    assert entry["page_lines"] == {"lines": ["FAIL home 390 check"], "not_kept": 0}
+
+
+def test_page_lines_a_timeout_stays_unknown_and_keeps_the_complete_lines(tmp_path, monkeypatch):
+    monkeypatch.setattr(watch, "PAGE_CHECK_TIMEOUT_SECONDS", 1)
+    body = "echo 'FAIL home 390 check'\nprintf 'FAIL half'\nexec sleep 30\n"
+    _, _, entry = real_page_run(tmp_path, body)
+    assert entry["outcome"] == watch.UNKNOWN
+    assert entry["page_lines"] == {"lines": ["FAIL home 390 check"], "not_kept": 1}
+
+
+@pytest.mark.parametrize("rest", ["x" * 3000, "x" * 110 + "=secret"])
+def test_page_lines_a_line_cut_by_the_bound_is_not_kept_and_is_counted(tmp_path, rest):
+    body = f"echo '{'a' * 15884}'\necho 'FAIL {rest}'\nexit 1\n"
+    _, _, entry = real_page_run(tmp_path, body)
+    assert entry["page_lines"] == {"lines": [], "not_kept": 2}
