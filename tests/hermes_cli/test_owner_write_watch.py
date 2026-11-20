@@ -11,8 +11,10 @@ temporary HERMES_HOME: nothing here reaches another host or a production service
 import asyncio
 import http.server
 import json
+import os
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -1282,10 +1284,10 @@ def test_journeys_the_planning_profile_has_no_journeys_result(tmp_path):
     assert outcome.kind == "active"
 
 
-def real_page_run(tmp_path, body, **overrides):
+def real_page_run(tmp_path, body, shebang="#!/bin/sh\n", **overrides):
     """One hourly run with the real _run_page_check on a script the test writes."""
     host = Host(tmp_path)
-    host.page_check.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    host.page_check.write_text(shebang + body, encoding="utf-8")
     host.page_check.chmod(0o755)
     outcome = host.run(run_page_check=None, **overrides)
     checks = json.loads(watch.report_path().read_text(encoding="utf-8"))["checks"]
@@ -1325,22 +1327,53 @@ def test_page_lines_keep_at_most_twenty(tmp_path):
     assert entry["page_lines"]["not_kept"] == 10
 
 
-def test_page_lines_output_past_the_bound_is_not_read_and_the_exit_status_stands(tmp_path, monkeypatch):
-    marker = tmp_path / "reached_the_end"
-    reads = []
-    real_pread = watch.os.pread
+def on_page_check_reads(monkeypatch, handler):
+    """Routes the reads that hermes_cli.owner_write_watch makes through handler(real_read, fd, size)."""
+    real_read = os.read
 
-    def counting_pread(fd, size, offset):
-        data = real_pread(fd, size, offset)
-        reads.append(len(data))
+    def read(fd, size):
+        if sys._getframe(1).f_globals["__name__"] == watch.__name__:
+            return handler(real_read, fd, size)
+        return real_read(fd, size)
+
+    monkeypatch.setattr(watch.os, "read", read)
+
+
+def test_page_lines_output_past_the_bound_is_read_and_dropped_and_the_exit_status_stands(tmp_path, monkeypatch):
+    marker = tmp_path / "reached_the_end"
+    chunks = []
+
+    def recording_read(real_read, fd, size):
+        data = real_read(fd, size)
+        chunks.append(data)
         return data
 
-    monkeypatch.setattr(watch.os, "pread", counting_pread)
+    on_page_check_reads(monkeypatch, recording_read)
     body = f"i=0\nwhile [ $i -lt 1500 ]; do echo \"FAIL page_$i 390 check\"; i=$((i+1)); done\ntouch {marker}\nexit 1\n"
     _, _, entry = real_page_run(tmp_path, body)
-    assert reads and sum(reads) <= 16000
+    written = "".join(f"FAIL page_{i} 390 check\n" for i in range(1500)).encode()
+    assert len(written) > 16000
+    assert b"".join(chunks) == written
+    first = written[:16000]
+    complete = first.count(b"\n")
+    assert entry["page_lines"] == {"lines": [f"FAIL page_{i} 390 check" for i in range(20)],
+                                   "not_kept": complete - 20 + (0 if first.endswith(b"\n") else 1)}
     assert marker.exists()
     assert entry["outcome"] == watch.FAIL
+
+
+def test_page_lines_output_past_the_bound_under_a_file_size_limit_reaches_the_end(tmp_path):
+    marker = tmp_path / "reached_the_end"
+    body = ("import resource\n"
+            "resource.setrlimit(resource.RLIMIT_FSIZE, (4096, 4096))\n"
+            "for i in range(1500):\n"
+            "    print(f'FAIL page_{i} 390 check')\n"
+            f"open({str(marker)!r}, 'w').close()\n"
+            "raise SystemExit(1)\n")
+    _, _, entry = real_page_run(tmp_path, body, shebang=f"#!{sys.executable}\n")
+    assert marker.exists()
+    assert entry["outcome"] == watch.FAIL
+    assert len(entry["page_lines"]["lines"]) == 20
 
 
 def test_page_lines_standard_error_is_not_kept(tmp_path):
@@ -1355,39 +1388,6 @@ def test_page_lines_a_silent_pass_holds_no_line(tmp_path):
     assert entry["page_lines"] == {"lines": [], "not_kept": 0}
 
 
-def test_page_lines_a_script_that_writes_past_the_bound_is_not_cut_short(tmp_path):
-    marker = tmp_path / "reached_the_end"
-    body = ("i=0\nwhile [ $i -lt 1500 ]; do echo \"FAIL page_$i 390 check\"; i=$((i+1)); done\n"
-            f"touch {marker}\nexit 1\n")
-    _, _, entry = real_page_run(tmp_path, body)
-    assert marker.exists()
-    assert entry["outcome"] == watch.FAIL
-    assert len(entry["page_lines"]["lines"]) == 20
-
-
-def test_page_lines_a_descendant_holding_the_output_does_not_hide_the_exit_status(tmp_path, monkeypatch):
-    monkeypatch.setattr(watch, "PAGE_CHECK_TIMEOUT_SECONDS", 5)
-    pid_file = tmp_path / "descendant.pid"
-    body = f"echo 'FAIL home 390 check'\nsleep 30 &\necho $! > {pid_file}\nexit 1\n"
-    started = time.monotonic()
-    try:
-        _, _, entry = real_page_run(tmp_path, body)
-    finally:
-        if pid_file.exists():
-            subprocess.run(["kill", pid_file.read_text().strip()], check=False, stderr=subprocess.DEVNULL)
-    assert time.monotonic() - started < 4
-    assert entry["outcome"] == watch.FAIL
-    assert entry["page_lines"] == {"lines": ["FAIL home 390 check"], "not_kept": 0}
-
-
-def test_page_lines_a_timeout_stays_unknown_and_keeps_the_complete_lines(tmp_path, monkeypatch):
-    monkeypatch.setattr(watch, "PAGE_CHECK_TIMEOUT_SECONDS", 1)
-    body = "echo 'FAIL home 390 check'\nprintf 'FAIL half'\nexec sleep 30\n"
-    _, _, entry = real_page_run(tmp_path, body)
-    assert entry["outcome"] == watch.UNKNOWN
-    assert entry["page_lines"] == {"lines": ["FAIL home 390 check"], "not_kept": 1}
-
-
 @pytest.mark.parametrize("rest", ["x" * 3000, "x" * 110 + "=secret"])
 def test_page_lines_a_line_cut_by_the_bound_is_not_kept_and_is_counted(tmp_path, rest):
     body = f"echo '{'a' * 15884}'\necho 'FAIL {rest}'\nexit 1\n"
@@ -1395,27 +1395,64 @@ def test_page_lines_a_line_cut_by_the_bound_is_not_kept_and_is_counted(tmp_path,
     assert entry["page_lines"] == {"lines": [], "not_kept": 2}
 
 
-def test_page_lines_an_unterminated_tail_is_counted_and_a_descendant_is_not_waited_for(tmp_path):
+@pytest.mark.parametrize("before", ["", "echo 'FAIL home 390 check'\n"])
+def test_page_lines_a_fragment_with_no_end_of_line_is_not_kept_and_is_counted(tmp_path, before):
+    _, _, entry = real_page_run(tmp_path, before + "printf 'FAIL home 390'\nexit 1\n")
+    assert entry["outcome"] == watch.FAIL
+    assert entry["page_lines"] == {"lines": ["FAIL home 390 check"] if before else [], "not_kept": 1}
+
+
+@pytest.mark.parametrize("tail, not_kept", [("", 0), ("printf 'FAIL home 390'\n", 1)])
+def test_page_lines_a_descendant_holding_the_output_is_not_waited_for(tmp_path, tail, not_kept):
+    release = tmp_path / "release"
     pid_file = tmp_path / "descendant.pid"
-    body = ("echo 'FAIL home 390 check'\nprintf 'FAIL home 390'\n"
-            f"(sleep 1; echo ' token=x') &\necho $! > {pid_file}\nexit 1\n")
-    started = time.monotonic()
+    watchdog_fired = threading.Event()
+    # The descendant keeps the standard output open until the test creates the release file.
+    body = ("echo 'FAIL home 390 check'\n" + tail +
+            f"(i=0; while [ ! -e {release} ] && [ $i -lt 1200 ]; do i=$((i+1)); sleep 0.05; done; echo ' token=x') &\n"
+            f"echo $! > {pid_file}\nexit 1\n")
+
+    def fire():
+        watchdog_fired.set()
+        release.touch()
+
+    watchdog = threading.Timer(30, fire)
+    watchdog.start()
     try:
         _, _, entry = real_page_run(tmp_path, body)
+        assert not watchdog_fired.is_set()
+        assert not release.exists()
+        os.kill(int(pid_file.read_text()), 0)
+        assert entry["outcome"] == watch.FAIL
+        assert entry["page_lines"] == {"lines": ["FAIL home 390 check"], "not_kept": not_kept}
     finally:
-        if pid_file.exists():
-            subprocess.run(["kill", pid_file.read_text().strip()], check=False, stderr=subprocess.DEVNULL)
-    assert time.monotonic() - started < 1
-    assert entry["outcome"] == watch.FAIL
+        watchdog.cancel()
+        release.touch()
+
+
+def test_page_lines_a_timeout_stays_unknown_and_keeps_the_complete_lines(tmp_path, monkeypatch):
+    monkeypatch.setattr(watch, "PAGE_CHECK_TIMEOUT_SECONDS", 2)
+    body = "echo 'FAIL home 390 check'\nprintf 'FAIL half'\nexec sleep 60\n"
+    _, _, entry = real_page_run(tmp_path, body)
+    assert entry["outcome"] == watch.UNKNOWN
     assert entry["page_lines"] == {"lines": ["FAIL home 390 check"], "not_kept": 1}
 
 
-def test_page_lines_no_capture_file_runs_the_script_once_and_the_report_is_saved(tmp_path, monkeypatch):
-    def no_temp_file():
-        raise OSError("no space")
+def test_page_lines_no_pipe_runs_the_script_once_and_the_report_is_saved(tmp_path, monkeypatch):
+    real_pipe = watch.os.pipe
+    refused = []
 
-    monkeypatch.setattr(watch.tempfile, "TemporaryFile", no_temp_file)
-    host, outcome, entry = real_page_run(tmp_path, "echo 'FAIL home 390 check'\nexit 1\n")
+    def pipe_once_refused():
+        if not refused:
+            refused.append(True)
+            raise OSError("no pipe")
+        return real_pipe()
+
+    runs = tmp_path / "runs"
+    monkeypatch.setattr(watch.os, "pipe", pipe_once_refused)
+    host, outcome, entry = real_page_run(tmp_path, f"echo run >> {runs}\necho 'FAIL home 390 check'\nexit 1\n")
+    assert refused
+    assert runs.read_text().count("run") == 1
     assert entry["outcome"] == watch.FAIL
     assert "page_lines" not in entry
     assert entry["detail"] == "did not pass"
@@ -1425,11 +1462,14 @@ def test_page_lines_no_capture_file_runs_the_script_once_and_the_report_is_saved
     assert (outcome.kind, outcome.text) == (injected.kind, injected.text)
 
 
-def test_page_lines_a_read_error_keeps_the_outcome_of_the_script(tmp_path, monkeypatch):
-    def failing_pread(fd, size, offset):
+@pytest.mark.parametrize("status, expected", [(0, watch.PASS), (1, watch.FAIL)])
+def test_page_lines_a_read_error_keeps_the_outcome_of_the_script(tmp_path, monkeypatch, status, expected):
+    def failing_read(real_read, fd, size):
         raise OSError("read failed")
 
-    monkeypatch.setattr(watch.os, "pread", failing_pread)
-    _, _, entry = real_page_run(tmp_path, "echo 'FAIL home 390 check'\nexit 1\n")
-    assert entry["outcome"] == watch.FAIL
+    runs = tmp_path / "runs"
+    on_page_check_reads(monkeypatch, failing_read)
+    _, _, entry = real_page_run(tmp_path, f"echo run >> {runs}\necho 'FAIL home 390 check'\nexit {status}\n")
+    assert runs.read_text().count("run") == 1
+    assert entry["outcome"] == expected
     assert "page_lines" not in entry

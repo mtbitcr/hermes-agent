@@ -25,10 +25,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
 import sqlite3
 import subprocess
 import sys
-import tempfile
+import time
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -560,30 +561,48 @@ def _http_send(method: str, url: str, body: Optional[Dict[str, Any]], key: str):
         return response.status_code, None
 
 
+def _read_page_check_output(proc, deadline: float) -> Optional[bytes]:
+    """One loop in the calling thread: keeps the first PAGE_CHECK_OUTPUT_BYTES of the pipe and drops the rest, so the
+    child never blocks. It ends with the direct child (one last read of what is ready), never at the end of the pipe."""
+    data = b""
+    try:
+        while True:
+            ended = proc.poll() is not None
+            if not ended and time.monotonic() >= deadline:
+                return data
+            if select.select([proc.stdout], [], [], 0 if ended else 0.05)[0]:
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    return data
+                data += chunk[:PAGE_CHECK_OUTPUT_BYTES - len(data)]
+            if ended:
+                return data
+    except (OSError, ValueError):
+        return None
+
+
 def _run_page_check(path: str):
-    """``(outcome, page_lines)``: page_lines is the kept lines of the script's standard output."""
-    try:
-        out = tempfile.TemporaryFile()
-    except OSError:
-        out = None
-    try:
+    """``(outcome, page_lines)``: page_lines is the kept lines of the script's standard output, None when none were captured."""
+    for stdout in (subprocess.PIPE, subprocess.DEVNULL):  # no pipe: run the script as before, with no lines
         try:
-            proc = subprocess.Popen([path], stdin=subprocess.DEVNULL, stdout=out or subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen([path], stdin=subprocess.DEVNULL, stdout=stdout, stderr=subprocess.DEVNULL)
+            break
         except OSError:
-            return FAIL, None
+            pass
+    else:
+        return FAIL, None
+    deadline = time.monotonic() + PAGE_CHECK_TIMEOUT_SECONDS
+    try:
+        data = _read_page_check_output(proc, deadline) if proc.stdout else None
         try:
-            outcome = PASS if proc.wait(timeout=PAGE_CHECK_TIMEOUT_SECONDS) == 0 else FAIL
+            outcome = PASS if proc.wait(timeout=max(deadline - time.monotonic(), 0)) == 0 else FAIL
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
             outcome = UNKNOWN
-        data = os.pread(out.fileno(), PAGE_CHECK_OUTPUT_BYTES, 0) if out else None
-    except OSError:
-        return outcome, None
     finally:
-        if out:
-            out.close()
+        if proc.stdout:
+            proc.stdout.close()
     if data is None:
         return outcome, None
     lines = data.decode("utf-8", "replace").split("\n")
