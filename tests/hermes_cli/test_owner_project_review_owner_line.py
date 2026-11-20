@@ -529,7 +529,7 @@ def test_a_linked_name_with_no_row_reads_as_no_head(root):
 def test_a_linked_name_under_two_profiles_defers_only_its_own_project(root, monkeypatch):
     project = _quiet_project(root)
     other = _quiet_project(root, "Other Plan")
-    (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {"enabled": True, "allowlist": [project.id, other.id]}}))
+    (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {"enabled": True, "allowlist": [project.id, other.id]}}), encoding="utf-8")
     monkeypatch.setattr(time, "time", lambda: NOW)
     _turn(root, NAME, "resp_planner", "Use the garden room.", NOW, profile=PLANNER)
     _turn(root, NAME, "resp_default", "Use the front room.", NOW, profile="default")
