@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import os
 import re
-import select
+import selectors
 import sqlite3
 import subprocess
 import sys
@@ -566,18 +566,21 @@ def _read_page_check_output(proc, deadline: float) -> Optional[bytes]:
     child never blocks. It ends with the direct child (one last read of what is ready), never at the end of the pipe."""
     data = b""
     try:
-        while True:
-            ended = proc.poll() is not None
-            if not ended and time.monotonic() >= deadline:
-                return data
-            if select.select([proc.stdout], [], [], 0 if ended else 0.05)[0]:
-                chunk = os.read(proc.stdout.fileno(), 65536)
-                if not chunk:
+        with selectors.DefaultSelector() as selector:  # unlike select.select, no limit on the descriptor number
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            while True:
+                ended = proc.poll() is not None
+                if not ended and time.monotonic() >= deadline:
                     return data
-                data += chunk[:PAGE_CHECK_OUTPUT_BYTES - len(data)]
-            if ended:
-                return data
+                if selector.select(0 if ended else 0.05):
+                    chunk = os.read(proc.stdout.fileno(), 65536)
+                    if not chunk:
+                        return data
+                    data += chunk[:PAGE_CHECK_OUTPUT_BYTES - len(data)]
+                if ended:
+                    return data
     except (OSError, ValueError):
+        proc.stdout.close()  # at once: a child that still writes dies on the closed pipe instead of blocking to the timeout
         return None
 
 

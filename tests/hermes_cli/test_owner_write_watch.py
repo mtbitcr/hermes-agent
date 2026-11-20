@@ -12,13 +12,15 @@ import asyncio
 import http.server
 import json
 import os
+import resource
+import signal
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -1473,3 +1475,80 @@ def test_page_lines_a_read_error_keeps_the_outcome_of_the_script(tmp_path, monke
     assert runs.read_text().count("run") == 1
     assert entry["outcome"] == expected
     assert "page_lines" not in entry
+
+
+@contextmanager
+def hang_watchdog(pid_file, seconds=30):
+    """Only turns a hang into a failed test: after `seconds` it kills the script and sets the event."""
+    fired = threading.Event()
+
+    def fire():
+        fired.set()
+        try:
+            os.kill(int(pid_file.read_text()), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+
+    watchdog = threading.Timer(seconds, fire)
+    watchdog.start()
+    try:
+        yield fired
+    finally:
+        watchdog.cancel()
+
+
+def many_failure_lines_run(tmp_path, monkeypatch):
+    """Real run of a script that fills far more than a pipe buffer with valid lines and exits 7."""
+    monkeypatch.setattr(watch, "PAGE_CHECK_TIMEOUT_SECONDS", 5)
+    pid_file = tmp_path / "script.pid"
+    body = (f"echo $$ > {pid_file}\ni=0\nwhile [ $i -lt 6000 ]; do echo \"FAIL page_$i 390 check\"; i=$((i+1)); done\n"
+            "exit 7\n")
+    with hang_watchdog(pid_file) as fired:
+        started = time.monotonic()
+        result = real_page_run(tmp_path, body)
+        elapsed = time.monotonic() - started
+    assert not fired.is_set()
+    assert elapsed < watch.PAGE_CHECK_TIMEOUT_SECONDS
+    return result
+
+
+def test_page_lines_a_read_error_with_a_chatty_script_still_fails_before_the_timeout(tmp_path, monkeypatch):
+    failed = []
+
+    def first_read_fails(real_read, fd, size):
+        if not failed:
+            failed.append(True)
+            raise OSError("read failed")
+        return real_read(fd, size)
+
+    on_page_check_reads(monkeypatch, first_read_fails)
+    host, outcome, entry = many_failure_lines_run(tmp_path, monkeypatch)
+    assert failed
+    assert entry["outcome"] == watch.FAIL
+    assert entry["detail"] == "did not pass"
+    assert "page_lines" not in entry
+    watch.state_path().unlink()
+    host.clock = START
+    injected = host.run(run_page_check=lambda path: watch.FAIL)
+    assert (outcome.kind, outcome.text) == (injected.kind, injected.text)
+
+
+def test_page_lines_a_pipe_on_a_descriptor_above_1024_keeps_its_lines(tmp_path, monkeypatch):
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and hard < 1300:
+        pytest.skip("the hard limit of open files is below 1300")
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 1300), hard))
+    held = []
+    try:
+        while True:  # fill the descriptor numbers up to 1100 so that the next pipe is created above 1,024
+            held.append(os.open(os.devnull, os.O_RDONLY))
+            if held[-1] >= 1100:
+                break
+        os.close(held.pop())
+        _, _, entry = many_failure_lines_run(tmp_path, monkeypatch)
+    finally:
+        for fd in held:
+            os.close(fd)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    assert entry["outcome"] == watch.FAIL
+    assert entry["page_lines"]["lines"] == [f"FAIL page_{i} 390 check" for i in range(20)]
