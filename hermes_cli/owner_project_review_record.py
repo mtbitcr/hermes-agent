@@ -12,7 +12,7 @@ import sqlite3
 from typing import TypedDict
 
 from hermes_cli import kanban_db, owner_project_summary_events as events, projects_db
-from hermes_cli.owner_project_review_owner_line import linked_chats, waiting_approvals
+from hermes_cli.owner_project_review_owner_line import linked_chats, storing_profile, waiting_approvals
 from hermes_constants import get_default_hermes_root, reset_hermes_home_override, set_hermes_home_override
 
 # This budget covers the normal source windows. Larger records retain explicit cut notices, including their bytes.
@@ -312,7 +312,7 @@ def read_conversation_news(registry, project_id: str) -> tuple[str | None, int |
                 "SELECT c.response_id,r.data IS NOT NULL AS readable,"
                 "CASE WHEN json_valid(r.data) THEN json_extract(r.data,'$.response.created_at') END AS created_at "
                 "FROM conversations c LEFT JOIN responses r ON r.profile=c.profile AND r.response_id=c.response_id "
-                "WHERE c.profile='default' AND c.name=?", (name,),
+                "WHERE c.profile=? AND c.name=?", (storing_profile(conn, name), name),
             ).fetchone()
             if row is not None and not row["readable"]:
                 raise ValueError("linked_conversation_unavailable")
