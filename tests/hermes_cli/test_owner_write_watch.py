@@ -1325,26 +1325,22 @@ def test_page_lines_keep_at_most_twenty(tmp_path):
     assert entry["page_lines"]["not_kept"] == 10
 
 
-def test_page_lines_output_past_the_bound_is_not_read_and_the_exit_status_stands(tmp_path):
-    big = tmp_path / "big.txt"
-    big.write_text("FAIL big 390 check\n" * 1500, encoding="utf-8")
+def test_page_lines_output_past_the_bound_is_not_read_and_the_exit_status_stands(tmp_path, monkeypatch):
+    marker = tmp_path / "reached_the_end"
     reads = []
-    real_read = watch.os.read
+    real_pread = watch.os.pread
 
-    def counting_read(fd, size):
-        data = real_read(fd, size)
+    def counting_pread(fd, size, offset):
+        data = real_pread(fd, size, offset)
         reads.append(len(data))
         return data
 
-    original = watch.os.read
-    watch.os.read = counting_read
-    try:
-        _, outcome, entry = real_page_run(tmp_path, f"cat {big}\nexit 1\n")
-    finally:
-        watch.os.read = original
-    assert sum(reads) <= 16000
+    monkeypatch.setattr(watch.os, "pread", counting_pread)
+    body = f"i=0\nwhile [ $i -lt 1500 ]; do echo \"FAIL page_$i 390 check\"; i=$((i+1)); done\ntouch {marker}\nexit 1\n"
+    _, _, entry = real_page_run(tmp_path, body)
+    assert reads and sum(reads) <= 16000
+    assert marker.exists()
     assert entry["outcome"] == watch.FAIL
-    assert len(entry["page_lines"]["lines"]) == 20
 
 
 def test_page_lines_standard_error_is_not_kept(tmp_path):
@@ -1397,3 +1393,43 @@ def test_page_lines_a_line_cut_by_the_bound_is_not_kept_and_is_counted(tmp_path,
     body = f"echo '{'a' * 15884}'\necho 'FAIL {rest}'\nexit 1\n"
     _, _, entry = real_page_run(tmp_path, body)
     assert entry["page_lines"] == {"lines": [], "not_kept": 2}
+
+
+def test_page_lines_an_unterminated_tail_is_counted_and_a_descendant_is_not_waited_for(tmp_path):
+    pid_file = tmp_path / "descendant.pid"
+    body = ("echo 'FAIL home 390 check'\nprintf 'FAIL home 390'\n"
+            f"(sleep 1; echo ' token=x') &\necho $! > {pid_file}\nexit 1\n")
+    started = time.monotonic()
+    try:
+        _, _, entry = real_page_run(tmp_path, body)
+    finally:
+        if pid_file.exists():
+            subprocess.run(["kill", pid_file.read_text().strip()], check=False, stderr=subprocess.DEVNULL)
+    assert time.monotonic() - started < 1
+    assert entry["outcome"] == watch.FAIL
+    assert entry["page_lines"] == {"lines": ["FAIL home 390 check"], "not_kept": 1}
+
+
+def test_page_lines_no_capture_file_runs_the_script_once_and_the_report_is_saved(tmp_path, monkeypatch):
+    def no_temp_file():
+        raise OSError("no space")
+
+    monkeypatch.setattr(watch.tempfile, "TemporaryFile", no_temp_file)
+    host, outcome, entry = real_page_run(tmp_path, "echo 'FAIL home 390 check'\nexit 1\n")
+    assert entry["outcome"] == watch.FAIL
+    assert "page_lines" not in entry
+    assert entry["detail"] == "did not pass"
+    watch.state_path().unlink()
+    host.clock = START
+    injected = host.run(run_page_check=lambda path: watch.FAIL)
+    assert (outcome.kind, outcome.text) == (injected.kind, injected.text)
+
+
+def test_page_lines_a_read_error_keeps_the_outcome_of_the_script(tmp_path, monkeypatch):
+    def failing_pread(fd, size, offset):
+        raise OSError("read failed")
+
+    monkeypatch.setattr(watch.os, "pread", failing_pread)
+    _, _, entry = real_page_run(tmp_path, "echo 'FAIL home 390 check'\nexit 1\n")
+    assert entry["outcome"] == watch.FAIL
+    assert "page_lines" not in entry

@@ -562,9 +562,14 @@ def _http_send(method: str, url: str, body: Optional[Dict[str, Any]], key: str):
 
 def _run_page_check(path: str):
     """``(outcome, page_lines)``: page_lines is the kept lines of the script's standard output."""
-    with tempfile.TemporaryFile() as out:
+    try:
+        out = tempfile.TemporaryFile()
+    except OSError:
+        out = None
+    try:
         try:
-            proc = subprocess.Popen([path], stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen([path], stdin=subprocess.DEVNULL, stdout=out or subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
         except OSError:
             return FAIL, None
         try:
@@ -573,13 +578,16 @@ def _run_page_check(path: str):
             proc.kill()
             proc.wait()
             outcome = UNKNOWN
-        data = os.pread(out.fileno(), PAGE_CHECK_OUTPUT_BYTES + 1, 0)
-    lines = data[:PAGE_CHECK_OUTPUT_BYTES].decode("utf-8", "replace").split("\n")
-    tail = lines.pop()
-    if tail and len(data) <= PAGE_CHECK_OUTPUT_BYTES and outcome != UNKNOWN:
-        lines.append(tail)
-        tail = ""
-    kept, other = [], int(bool(tail))
+        data = os.pread(out.fileno(), PAGE_CHECK_OUTPUT_BYTES, 0) if out else None
+    except OSError:
+        return outcome, None
+    finally:
+        if out:
+            out.close()
+    if data is None:
+        return outcome, None
+    lines = data.decode("utf-8", "replace").split("\n")
+    kept, other = [], int(bool(lines.pop()))
     for line in lines:
         if len(kept) < PAGE_CHECK_LINES and _PAGE_LINE.fullmatch(line):
             kept.append(line)
