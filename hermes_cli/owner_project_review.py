@@ -133,7 +133,10 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
 7. Propose at most three closures. Each has exactly recommendation_id, card_id, reason, and evidence.
 """ + f"   The reason has at most {_CLOSURE_REASON_LIMIT} characters." + """ Evidence must name suggestions:<id> and tasks:<id> from this input.
    The card must deliver the suggestion in this Project. A proposal cannot decide or close the suggestion.
-8. plan_proposal is null or an object with exactly request_title, summary,
+8. When the input holds an accepted suggestion whose linked_card is a task of this input with the delivery state done or
+   merged, and the suggestion has no live closure, the review must propose its closure with that card. It classifies that
+   suggestion superseded with the evidence suggestions:<id> and tasks:<linked card>.
+9. plan_proposal is null or an object with exactly request_title, summary,
    specification, current_milestone, owner_visible_result, later_milestones, and changes.
    Use the native plan change schema. Each existing task reference must use its input status and event revision.
    This is advice for the Project chat. It grants no approval and changes no work.
@@ -144,7 +147,7 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
    review plans three of them, the ones last in the input's suggestions list first (the oldest). It leaves one out only
    when the kernel refuses its pair in the same run, for example for a plan the owner denied: then it removes that
    pair and keeps each other pair. With no such suggestion, you may add plan_proposal or leave it out.
-9. When Review days start from the start, this is the Project's first review and no review came before it.
+10. When Review days start from the start, this is the Project's first review and no review came before it.
    Do not write last review, previous review, earlier review or prior review. Write so far instead.
 """
 
@@ -357,9 +360,8 @@ def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, s
             actual = "answered"
             evidence = [f"decisions:event:{max(item['event_id'] for item in answers)}"]
         elif (tid in suggestions and suggestions[tid]["decision"] == "accepted" and (made := suggestions[tid].get("linked_card"))
-              and by_item[tid]["class"] == "superseded" and f"tasks:{made}" in by_item[tid]["evidence"]
               and made in tasks and _delivered_match(board, project_id, tid, tasks[made])):
-            # An accepted suggestion whose own linked card is delivered, as the worker's evidence names it.
+            # An accepted suggestion whose own linked card is delivered: the kernel's records settle it, not the review's class.
             actual, evidence = "superseded", [f"tasks:{made}"]
         elif tid in suggestions and needs_no_card(board, project_id, suggestions[tid]):
             # An accepted model update, by the input's mark or, with no mark, its board row: its own Update settles it.

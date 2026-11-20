@@ -90,11 +90,15 @@ def _version(board, suggestion):
     return board.execute("SELECT recommendation_lifecycle_version FROM tasks WHERE id=?", (suggestion,)).fetchone()[0]
 
 
-def _delivered_pair(board, pid, *, subject="meeting-room", label="Book the room", title="Book a room", made_from=False):
+def _delivered_pair(board, pid, *, subject="meeting-room", label="Book the room", title="Book a room", made_from=False,
+                    accepted=False, deliver=True):
     suggestion = _suggestion(board, pid, subject=subject, label=label)
-    lineage = {"made_from_recommendation": suggestion} if made_from else {}
+    if accepted:
+        _decide(board, suggestion)
+    lineage = {"made_from_recommendation": suggestion} if made_from or accepted else {}
     delivered = kb.create_task(board, title=title, project_id=pid, **lineage)
-    assert kb.complete_task(board, delivered, summary="The work is delivered.")
+    if deliver:
+        assert kb.complete_task(board, delivered, summary="The work is delivered.")
     return suggestion, delivered, _version(board, suggestion)
 
 
@@ -637,13 +641,14 @@ _PAIRS = (("meeting-room", "Book the room", "Book a room"), ("meeting-speaker", 
 
 
 def _completed_review(root, monkeypatch, *, closure=True, pairs=1, closed_before=0, edit=None, first_title=None,
-                      made_from=False):
+                      made_from=False, accepted=False, deliver=True):
     """A Project with delivered suggestions, its frozen review task, and the worker's completed result."""
     project = _project(root)
     monkeypatch.setattr(time, "time", lambda: NOW)
     with _board(project) as board:
         made = [_delivered_pair(board, project.id, subject=s, label=label, title=(first_title or title) if n == 0 else title,
-                                made_from=made_from and n == 0) for n, (s, label, title) in enumerate(_PAIRS[:pairs])]
+                                made_from=made_from and n == 0, accepted=accepted and n == 0,
+                                deliver=deliver or n != 0) for n, (s, label, title) in enumerate(_PAIRS[:pairs])]
         closed = [_delivered_pair(board, project.id, subject=f"done-{n}", label=f"Print badge set {n}",
                                   title=f"Print badge set {n}") for n in range(closed_before)]
         for pair in closed:
@@ -1010,6 +1015,78 @@ def test_the_harvest_closes_a_card_made_from_the_suggestion_and_refuses_a_claime
         assert _stored(root, project) == ((None, "2026-11-09", 1), None)
         assert "review_class_evidence_required" in caplog.text
     assert _review_task_status(task_id) == "archived"
+
+
+def _stored_classes(root, project):
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        rows = registry.execute("SELECT classification FROM project_review_briefs WHERE project_id=?", (project.id,)).fetchall()
+    assert len(rows) == 1
+    return {item["item"]: (item["class"], item["evidence"]) for item in json.loads(rows[0][0])}
+
+
+def _gives(cls, refs):
+    def edit(payload, made):
+        payload["classification"][0] = {"item": made[0][0], "class": cls, "evidence": refs(made)}
+    return edit
+
+
+@pytest.mark.parametrize("cls,refs", [
+    pytest.param("answered", lambda made: [f"suggestions:{made[0][0]}"], id="answered"),
+    pytest.param("still actionable", lambda made: [f"suggestions:{made[0][0]}"], id="still_actionable"),
+    pytest.param("superseded", lambda made: [f"suggestions:{made[0][0]}"], id="superseded_by_the_suggestion_only"),
+])
+def test_a_delivered_linked_card_closes_an_accepted_suggestion_whatever_class_the_review_gave(
+    root, monkeypatch, caplog, cls, refs,
+):
+    project, task_id, made = _completed_review(root, monkeypatch, accepted=True, edit=_gives(cls, refs))
+    ((suggestion, delivered, _),) = made
+
+    assert review.review_tick(NOW + 1) == 0
+
+    assert "refused Project" not in caplog.text
+    assert [row[:2] for row in _closures(project)] == [(suggestion, delivered)]
+    assert _stored(root, project)[0] == (None, "2026-11-10", 0)
+    assert _stored_classes(root, project)[suggestion] == ("superseded", [f"tasks:{delivered}"])
+
+
+def test_an_accepted_suggestion_with_a_delivered_linked_card_and_no_proposed_closure_is_superseded_and_not_closed(
+    root, monkeypatch, caplog,
+):
+    def no_closure(payload, made):
+        payload["proposed_closures"] = []
+        _gives("answered", lambda m: [f"suggestions:{m[0][0]}"])(payload, made)
+
+    project, task_id, made = _completed_review(root, monkeypatch, accepted=True, edit=no_closure)
+    ((suggestion, delivered, _),) = made
+
+    assert review.review_tick(NOW + 1) == 0
+
+    assert "refused Project" not in caplog.text
+    assert _closures(project) == []
+    assert _stored_classes(root, project)[suggestion] == ("superseded", [f"tasks:{delivered}"])
+
+
+def test_an_accepted_suggestion_whose_linked_card_is_not_delivered_keeps_today_class_and_refuses_a_closure(
+    root, monkeypatch, caplog,
+):
+    project, task_id, made = _completed_review(
+        root, monkeypatch, accepted=True, deliver=False,
+        edit=_gives("answered", lambda made: [f"suggestions:{made[0][0]}"]),
+    )
+
+    assert review.review_tick(NOW + 1) == 0
+
+    assert _closures(project) == []
+    assert _stored(root, project) == ((None, "2026-11-09", 1), None)
+    assert "refused Project" in caplog.text
+
+
+def test_the_instruction_tells_the_review_to_close_an_accepted_suggestion_with_its_delivered_linked_card():
+    text = " ".join(review.INSTRUCTION.split())
+    assert "accepted suggestion whose linked_card is a task of this input" in text
+    assert "done or merged" in text
+    assert "must propose its closure with that card" in text
+    assert "superseded with the evidence suggestions:<id> and tasks:<linked card>" in text
 
 
 def _child_tick(tmp_path, now, *, kill_in=None):
