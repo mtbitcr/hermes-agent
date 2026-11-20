@@ -74,6 +74,70 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def _verdict_call(name: str) -> dict:
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "1", "type": "function", "function": {"name": name, "arguments": "{}"}}
+        ],
+    }
+
+
+def _verdict_result(name: str, content: str) -> dict:
+    return {"role": "tool", "name": name, "tool_call_id": "1", "content": content}
+
+
+def test_no_nudge_after_successful_review_findings(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    from tools.kanban_tools import _ok
+
+    # Success form of _handle_review_findings: _ok(task_id=tid, **result).
+    messages = [
+        _verdict_call("kanban_review_findings"),
+        _verdict_result("kanban_review_findings", _ok(task_id="t_abc", outcome="approved")),
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_no_nudge_after_successful_request_changes(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    from tools.kanban_tools import _ok
+
+    # Success form of _handle_request_changes.
+    messages = [
+        _verdict_call("kanban_request_changes"),
+        _verdict_result(
+            "kanban_request_changes",
+            _ok(task_id="t_abc", run_id=3, status="ready", implementer="builder"),
+        ),
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_nudge_after_refused_review_findings(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    from tools.kanban_tools import _handle_review_findings
+
+    # Real refusal: this process is not the dispatcher-owned reviewer run.
+    refusal = _handle_review_findings({"findings": []})
+    assert '"error"' in refusal
+    messages = [
+        _verdict_call("kanban_review_findings"),
+        _verdict_result("kanban_review_findings", refusal),
+    ]
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+def test_nudge_after_verdict_call_without_tool_result(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [_verdict_call("kanban_review_findings")]
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
 
 
 
