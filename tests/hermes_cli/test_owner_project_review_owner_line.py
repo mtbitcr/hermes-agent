@@ -15,9 +15,11 @@ import sqlite3
 import time
 
 import pytest
+import yaml
 
 from hermes_cli import kanban_db, owner_project_review as review, projects_db
 from hermes_cli import owner_project_review_record as records, owner_project_summary_events as events
+from hermes_cli.owner_project_review_owner_line import linked_chats, plan_approvals_waiting
 from tests.hermes_cli.test_owner_project_review_result import (  # noqa: F401
     NOW, _complete_review, _frozen_body, _open_review, _owner_turn, _quiet_project, _review_stores, _stale_outcome, root,
 )
@@ -34,6 +36,7 @@ PLAN = "Follow the current plan."
 EARLIER = "Book the room is unchanged since the last review."
 SO_FAR = "Book the room is unchanged so far."
 NAME = "raphael-owner-" + "a" * 32
+PLANNER = "raphael-planner"
 RID = "resp_room_plan_change"
 
 # An actionable Project change proposal, the final reply the Project chat stores as waiting for approval.
@@ -51,11 +54,11 @@ _PROPOSAL = {
 }
 
 
-def _chat(root, name, response_id, *, created_at=NOW):
+def _chat(root, name, response_id, *, created_at=NOW, profile="default"):
     """One Project chat whose final reply is a plan change proposal that waits for the owner's approval."""
     from gateway.platforms.api_server import ResponseStore
 
-    store = ResponseStore(db_path=str(root / "response_store.db"), default_profile="default")
+    store = ResponseStore(db_path=str(root / "response_store.db"), default_profile=profile)
     try:
         store.put(response_id, {
             "response": {"id": response_id, "created_at": created_at},
@@ -415,3 +418,138 @@ def test_a_linked_chat_without_a_response_store_freezes_no_approval_count_and_na
     assert (brief["needs_you"], stored["owner_decision"]) == (ANSWER, ANSWER), brief
     assert (brief["review_date"], brief["quiet"]) == (DAY, False)
     assert not (root / "response_store.db").exists()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# A linked chat is read under the profile that stores it, not under a fixed one.
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _turn(root, name, response_id, words, created_at, profile=PLANNER):
+    """An owner turn of a linked chat, stored under *profile* by the real response store."""
+    from gateway.platforms.api_server import ResponseStore
+
+    store = ResponseStore(db_path=str(root / "response_store.db"), default_profile=profile)
+    try:
+        store.put(response_id, {
+            "response": {"id": response_id, "created_at": created_at},
+            "conversation_history": [
+                {"role": "user", "content": words},
+                {"role": "assistant", "content": json.dumps({
+                    "schema_version": 1, "kind": "question", "message": "The room is recorded.",
+                })},
+            ],
+        })
+        assert store.set_conversation(name, response_id)
+    finally:
+        store._conn.close()
+
+
+def _news(root, project):
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        return records.read_conversation_news(registry, project.id)
+
+
+def _reviewed_once(root, project, task_id):
+    """The review task of *task_id* is completed and harvested on its own day."""
+    _complete_review(task_id, [])
+    assert review.review_tick(NOW + 1) == 0
+    assert _brief(root, project)[0]["quiet"] is False
+
+
+def test_the_news_of_a_chat_stored_under_the_planning_profile_has_its_head_and_time(root):
+    project = _quiet_project(root)
+    _turn(root, NAME, "resp_one", "Use the garden room.", NOW - 100)
+    _link(root, NAME, project.id)
+    cursor, newest = _news(root, project)
+    assert (cursor, newest) == (records._conversation_cursor([(NAME, "resp_one")]), NOW - 100)
+
+    _turn(root, NAME, "resp_two", "Use the front room.", NOW - 50)
+
+    assert _news(root, project) == (records._conversation_cursor([(NAME, "resp_two")]), NOW - 50)
+
+
+def test_the_turns_and_the_waiting_approval_of_a_chat_under_the_planning_profile_are_read(root):
+    project = _quiet_project(root)
+    _chat(root, NAME, RID, profile=PLANNER)
+    _link(root, NAME, project.id)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        ((name, snapshot),) = linked_chats(registry, project.id, root)
+        assert plan_approvals_waiting(registry, project.id) == 1
+    assert (name, snapshot["head_response_id"]) == (NAME, RID)
+    assert [turn["owner"] for turn in snapshot["data"]] == ["Plan the room change."]
+
+
+def test_a_new_owner_message_in_a_chat_under_the_planning_profile_starts_one_review(root, monkeypatch):
+    project = _quiet_project(root)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    _turn(root, NAME, "resp_one", "Use the garden room.", NOW - 86400)
+    _link(root, NAME, project.id)
+    _set_state(root, project, conversation_cursor=_news(root, project)[0])
+    _turn(root, NAME, "resp_two", "Use the front room.", NOW)
+
+    assert review.review_tick(NOW) == 1
+
+    task_id = _open_review(root, project)
+    assert "Use the front room." in _frozen_body(task_id)
+    _reviewed_once(root, project, task_id)
+    assert review.review_tick(NOW + 86400) == 0
+    assert review.review_tick(NOW + 2 * 86400) == 0
+
+
+def test_a_chat_stored_under_the_default_profile_reads_as_before(root):
+    project = _quiet_project(root)
+    _chat(root, NAME, RID, profile="default")
+    _link(root, NAME, project.id)
+    assert _news(root, project) == (records._conversation_cursor([(NAME, RID)]), NOW)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        ((_, snapshot),) = linked_chats(registry, project.id, root)
+        assert plan_approvals_waiting(registry, project.id) == 1
+    assert snapshot["head_response_id"] == RID
+
+
+def test_a_linked_name_with_no_row_reads_as_no_head(root):
+    project = _quiet_project(root)
+    _turn(root, "raphael-owner-" + "b" * 32, "resp_other", "Another chat.", NOW)
+    _link(root, NAME, project.id)
+    assert _news(root, project) == (records._conversation_cursor([(NAME, None)]), None)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        ((_, snapshot),) = linked_chats(registry, project.id, root)
+        assert plan_approvals_waiting(registry, project.id) == 0
+    assert (snapshot["head_response_id"], snapshot["data"]) == (None, [])
+
+
+def test_a_linked_name_under_two_profiles_defers_only_its_own_project(root, monkeypatch):
+    project = _quiet_project(root)
+    other = _quiet_project(root, "Other Plan")
+    (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {"enabled": True, "allowlist": [project.id, other.id]}}))
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    _turn(root, NAME, "resp_planner", "Use the garden room.", NOW, profile=PLANNER)
+    _turn(root, NAME, "resp_default", "Use the front room.", NOW, profile="default")
+    _link(root, NAME, project.id)
+    _comment(other)
+
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        with pytest.raises(ValueError, match="linked_conversation_unavailable"):
+            records.read_conversation_news(registry, project.id)
+        with pytest.raises(ValueError, match="linked_conversation_unavailable"):
+            linked_chats(registry, project.id, root)
+
+    assert review.review_tick(NOW) == 1
+
+    assert _open_review(root, project) is None
+    assert _open_review(root, other) is not None
+
+
+def test_a_state_with_the_old_cursor_gets_one_review_and_then_none_without_a_new_head(root, monkeypatch):
+    project = _quiet_project(root)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    _turn(root, NAME, "resp_one", "Use the garden room.", NOW - 86400)
+    _link(root, NAME, project.id)
+    _set_state(root, project, conversation_cursor=records._conversation_cursor([(NAME, None)]))
+
+    assert review.review_tick(NOW) == 1
+
+    _reviewed_once(root, project, _open_review(root, project))
+    assert review.review_tick(NOW + 86400) == 0
+    assert review.review_tick(NOW + 2 * 86400) == 0
