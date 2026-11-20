@@ -33,6 +33,8 @@ HALL_WORDS = "Book conference hall seating visitors"
 # The labels of update_world's two suggestions of the model update kind.
 UPDATE = "Try the new planner model"
 POLICY = "Keep the planner on one model"
+# A worker profile that a reviewed plan names as an assignee while it exists, and that the tests rename afterwards.
+WORKER = "raphael-builder"
 
 
 def _project_board(project):
@@ -580,6 +582,17 @@ def _two_pair_review(root, ctx, *adds):
     return world, plan
 
 
+def _reviewed_then_renamed(world, *adds):
+    """The harvested review of ``adds``, which name the real worker profile WORKER; the profile is renamed afterwards."""
+    from hermes_cli.profiles import create_profile, profile_exists, rename_profile
+
+    create_profile(WORKER, no_alias=True)
+    plan = _reviewed(world, *adds)
+    rename_profile(WORKER, f"{WORKER}-retired")
+    assert not profile_exists(WORKER)
+    return plan
+
+
 def test_t6_a_changed_plan_with_the_same_add_title_links_its_card_and_keeps_owner_request(world, ctx):
     plan = _reviewed(world)
     before = _links(world)
@@ -708,6 +721,35 @@ def test_t6_a_changed_plan_links_no_card_when_a_stored_prefix_hid_that_the_shown
     assert len(committed["created_task_ids"]) == 1
     assert HALL_WORDS in _work_titles(world)
     assert _links(world) == before
+
+
+def test_t6_a_changed_plan_links_its_card_when_the_paired_add_of_the_review_names_a_renamed_profile(world, ctx):
+    plan = _reviewed_then_renamed(world, {**_add(HALL), "assignee": WORKER})
+    # The harvest accepted the plan while the profile existed: the owner was shown the pair.
+    assert _brief(world)[:2] == (_paired_hint(HALL), world["review_task"])
+    before = _links(world)
+
+    committed = _commit(ctx, world, {**plan, "changes": [_add(HALL)]}, key="renamed-paired-plan")
+
+    [card] = committed["created_task_ids"]
+    assert HALL in _work_titles(world)
+    assert _links(world) == sorted(before + [(card, world["accepted"])])
+    assert _trigger(world, card) == "owner_request"
+
+
+def test_t6_a_changed_plan_links_its_card_when_only_an_unpaired_add_of_the_review_names_a_renamed_profile(world, ctx):
+    unpaired = "Print the name badges"
+    plan = _reviewed_then_renamed(world, _add(HALL), {**_add(unpaired), "assignee": WORKER})
+    # The harvest accepted the plan while the profile existed: the owner was shown the pair and the unpaired add.
+    assert _brief(world)[:2] == (f"{_paired_hint(HALL)[:-1]}; add {unpaired}.", world["review_task"])
+    before = _links(world)
+
+    committed = _commit(ctx, world, {**plan, "changes": [_add(HALL)]}, key="renamed-unpaired-plan")
+
+    [card] = committed["created_task_ids"]
+    assert HALL in _work_titles(world)
+    assert _links(world) == sorted(before + [(card, world["accepted"])])
+    assert _trigger(world, card) == "owner_request"
 
 
 def test_t6_a_changed_plan_waiting_for_its_approval_makes_its_card_when_another_plan_links_the_suggestion_meanwhile(
