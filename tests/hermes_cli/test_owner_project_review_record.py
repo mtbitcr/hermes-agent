@@ -178,7 +178,7 @@ def _brief(root: Path, project, review_date: str, headline: str, classification=
         conn.close()
 
 
-def _conversation(root: Path, project, name: str, turns, linked_at: int = 1) -> None:
+def _conversation(root: Path, project, name: str, turns, linked_at: int = 1, profile: str = OWNER) -> None:
     """One owner conversation in the root's response store, linked to *project* as the plan's link table says."""
     from gateway.platforms.api_server import ResponseStore
 
@@ -189,14 +189,14 @@ def _conversation(root: Path, project, name: str, turns, linked_at: int = 1) -> 
             "role": "assistant",
             "content": json.dumps({"schema_version": 1, "kind": "question", "message": reply}),
         })
-    store = ResponseStore(max_size=10, db_path=str(root / "response_store.db"), default_profile=OWNER)
-    response_id = "resp_" + name[-12:]
+    store = ResponseStore(max_size=10, db_path=str(root / "response_store.db"), default_profile=profile)
+    response_id = "resp_" + profile[-4:] + name[-12:]
     store.put(response_id, {"response": {"id": response_id}, "conversation_history": history})
     assert store.set_conversation(name, response_id) is True
     store._conn.close()
     conn = sqlite3.connect(root / "projects.db")
     try:
-        conn.execute("INSERT INTO project_conversation_links VALUES (?, ?, ?)", (name, project.id, linked_at))
+        conn.execute("INSERT OR IGNORE INTO project_conversation_links VALUES (?, ?, ?)", (name, project.id, linked_at))
         conn.commit()
     finally:
         conn.close()
@@ -1148,3 +1148,28 @@ def test_review_finding_2_the_total_cap_keeps_the_unavailable_automation_notice(
     for cut in result["cuts"]:
         assert record.cut_line(cut) in outside
     _unknown_is_never_a_number(result)
+
+
+def test_the_news_of_a_linked_conversation_is_read_under_the_profile_that_stores_it(root):
+    project, _ids = _rich(root)
+    _future_table(root, _LINKS_SQL)
+    name = "raphael-owner-" + "a" * 32
+    _conversation(root, project, name, [("Hello.", "Hello back.")], profile=PLANNER)
+    heads = [(name, "resp_" + PLANNER[-4:] + name[-12:])]
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        assert _record().read_conversation_news(registry, project.id)[0] == _record()._conversation_cursor(heads)
+    turns = _record().build_review_input(project, START, None)["sources"]["conversation"]
+    assert [turn["owner"] for turn in turns] == ["Hello."]
+
+
+def test_a_linked_conversation_under_two_profiles_is_not_available(root):
+    project, _ids = _rich(root)
+    _future_table(root, _LINKS_SQL)
+    name = "raphael-owner-" + "b" * 32
+    _conversation(root, project, name, [("Hello.", "Hello back.")], profile=PLANNER)
+    _conversation(root, project, name, [("Hello.", "Hello back.")], profile=OWNER)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        with pytest.raises(ValueError, match="linked_conversation_unavailable"):
+            _record().read_conversation_news(registry, project.id)
+    with pytest.raises(ValueError, match="linked_conversation_unavailable"):
+        _record().build_review_input(project, START, None)

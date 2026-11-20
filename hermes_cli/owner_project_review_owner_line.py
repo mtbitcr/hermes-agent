@@ -39,6 +39,15 @@ def owner_projection(conn: sqlite3.Connection, path: Path) -> Any:
     return store
 
 
+def storing_profile(conn: sqlite3.Connection, name: str) -> Optional[str]:
+    """The profile that stores the linked conversation ``name``: the profile of its one row in ``conversations``. None
+    with no row (a chat with no head); rows under more than one profile cannot be read and raise ValueError."""
+    profiles = [row[0] for row in conn.execute("SELECT profile FROM conversations WHERE name=?", (name,))]
+    if len(profiles) > 1:
+        raise ValueError("linked_conversation_unavailable")
+    return profiles[0] if profiles else None
+
+
 def linked_chats(registry: sqlite3.Connection, project_id: str, root: Path) -> Optional[list[tuple[str, dict]]]:
     """The owner snapshot of each chat linked to the Project, from the response store under ``root``.
 
@@ -67,7 +76,7 @@ def linked_chats(registry: sqlite3.Connection, project_id: str, root: Path) -> O
         store = owner_projection(conn, path)
         for name in links:
             try:
-                chats.append((name, store.owner_history_snapshot(name, profile="default")))
+                chats.append((name, store.owner_history_snapshot(name, profile=storing_profile(conn, name))))
             except OwnerAuthorityBroken:
                 # A broken project must defer its review, not abort the shared tick.
                 raise ValueError("linked_conversation_unavailable") from None
