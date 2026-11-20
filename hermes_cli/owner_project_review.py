@@ -429,7 +429,10 @@ def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, s
                     raise ReviewRefused("review_class_evidence_required")
         else:
             raise ReviewRefused("review_class_evidence_required")
-        if by_item[tid]["class"] not in {"answered", "stale", "current", actual}:
+        # The owner accepted the suggestion, so a claim of still actionable is not refused; the kernel's class is stored.
+        accepted_claim = (tid in suggestions and suggestions[tid]["decision"] == "accepted"
+                          and by_item[tid]["class"] == "still actionable")
+        if by_item[tid]["class"] not in {"answered", "stale", "current", actual} and not accepted_claim:
             raise ReviewRefused("review_class_evidence_required")
         if actual is None:
             continue

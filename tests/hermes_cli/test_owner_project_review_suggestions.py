@@ -804,3 +804,75 @@ def test_the_instruction_plans_an_accepted_suggestion_only_when_its_item_does_no
     [rule] = [sentence for sentence in instruction.split(". ") if "must plan" in sentence]
     assert "accepted suggestion with a null linked_card" in rule
     assert "only when its item does not hold needs_card false" in rule
+
+
+def _deferred(board, project):
+    deferred = _suggestion(board, project, "Print the visit badges", "badges")
+    _decide(board, deferred, "deferred", "Not before the visit is confirmed.")
+    return {"deferred": deferred}
+
+
+@pytest.fixture
+def deferred_world(root, ctx):
+    return _world(root, ctx, _deferred)
+
+
+def _stored_classes(world):
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        stored = registry.execute(
+            "SELECT classification FROM project_review_briefs WHERE project_id=?", (world["project"].id,),
+        ).fetchone()[0]
+    return {item["item"]: (item["class"], item["evidence"]) for item in json.loads(stored)}
+
+
+def test_a_planned_accepted_suggestion_called_still_actionable_is_accepted_and_stored_answered(world):
+    """The result of 2026-11-20: the review plans the accepted suggestion and calls it still actionable."""
+    tid = world["accepted"]
+    claim = {tid: ("still actionable", [f"suggestions:{tid}", f"tasks:{world['booked']}"])}
+    _complete(world, _result(world, plan=_plan(), pairs=[{"change": 0, "suggestion": tid}], classes=claim))
+
+    result = _parse(world)
+
+    assert result.brief["next_step"] == HINT
+    assert review.review_tick(NOW + 1) == 0
+    assert _stored_classes(world)[tid] == ("answered", [f"suggestions:{tid}"])
+
+
+def test_an_accepted_model_update_called_still_actionable_is_accepted_and_stored_superseded(update_world):
+    """The result of 2026-11-19: no pair for the applied model update, which the review calls still actionable."""
+    world = update_world
+    update = world["update"]
+    plan = _plan(_add(HALL), _add("Write down which model the planner keeps"))
+    pairs = [{"change": 0, "suggestion": world["accepted"]}, {"change": 1, "suggestion": world["policy"]}]
+    claim = {update: ("still actionable", [f"suggestions:{update}"])}
+    _complete(world, _update_result(world, plan=plan, pairs=pairs, classes=claim))
+
+    result = _parse(world)
+
+    assert result.source_run_id is not None
+    assert review.review_tick(NOW + 1) == 0
+    assert _stored_classes(world)[update] == ("superseded", [f"suggestions:{update}"])
+
+
+@pytest.mark.parametrize("which", ["rejected", "deferred"])
+def test_a_rejected_or_deferred_suggestion_called_still_actionable_is_still_refused(deferred_world, which):
+    world = deferred_world
+    tid = world[which]
+    claims = {world["deferred"]: ("answered", [f"suggestions:{world['deferred']}"]),
+              tid: ("still actionable", [f"suggestions:{tid}"])}
+    _complete(world, _result(world, classes=claims))
+
+    with pytest.raises(review.ReviewRefused) as refused:
+        _parse(world)
+
+    assert refused.value.code == "review_class_evidence_required"
+
+
+def test_an_accepted_suggestion_called_superseded_with_no_checkable_evidence_is_still_refused(world):
+    tid = world["accepted"]
+    _complete(world, _result(world, classes={tid: ("superseded", [f"suggestions:{tid}"])}))
+
+    with pytest.raises(review.ReviewRefused) as refused:
+        _parse(world)
+
+    assert refused.value.code == "review_class_evidence_required"
