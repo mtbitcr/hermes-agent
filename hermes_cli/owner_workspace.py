@@ -6186,10 +6186,10 @@ def _commit_named_inputs(
 def _commit_plan_creations(
     kconn: sqlite3.Connection, changes: list[dict], task_ids: list[str], links: list[tuple[int, str]],
 ) -> None:
-    """The plan commit's ``on_created`` hook: the named inputs, then the made-from links of a proven review.
+    """The plan commit's ``on_created`` hook: the named inputs, then the made-from links of a reviewed plan.
 
     ``links`` pair an add change's index with the accepted suggestion the
-    exactly approved daily review planned it for. Each link is written on
+    daily review planned it for. Each link is written on
     ``kconn`` in the transaction that creates the parked cards: a refused link
     fails the whole plan, like a refused named input, and leaves no card.
     """
@@ -6927,8 +6927,6 @@ def commit_project_plan(
             if recorded_trigger == "scheduled_review":
                 # Read once, before the approval wait: the proven review's pairs link the cards its add changes create.
                 links = confirmed_plan_links(project_id, digest)
-            else:
-                links = changed_plan_links(project_id, normalized_changes)
         kconn = kanban_db.connect(board=board_slug)
         try:
             # Before the scope check, so a boundary inherited from a superseded
@@ -7072,8 +7070,12 @@ def commit_project_plan(
                             current_milestone=current_milestone,
                             later_milestones=normalized_later,
                             board=board_slug,
+                            # A changed plan's links are read here, after the confirmation and in this transaction: a read
+                            # made before the approval wait is stale when the owner answers.
                             on_created=lambda conn, ids: _commit_plan_creations(
-                                conn, normalized_changes, ids, links,
+                                conn, normalized_changes, ids,
+                                changed_plan_links(conn, project_id, normalized_changes)
+                                if recorded_trigger == "owner_request" else links,
                             ),
                         )
 

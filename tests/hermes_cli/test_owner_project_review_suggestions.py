@@ -3,6 +3,8 @@
 import contextlib
 import json
 import sqlite3
+import threading
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -14,7 +16,10 @@ from tests.hermes_cli.test_owner_project_review_plans import _approved_plan
 from tests.hermes_cli.test_owner_project_review_record import (  # noqa: F401
     _decide, _model_update_subject, _suggestion, _written_at, root,
 )
-from tests.hermes_cli.test_owner_workspace import _bootstrap_board, _commit_project_plan, _with_approver, ctx  # noqa: F401
+from tests.hermes_cli.test_owner_workspace import (  # noqa: F401
+    _auto_approve, _bootstrap_board, _commit_project_plan, _with_approver, ctx,
+)
+from tools import approval
 
 NOW = int(datetime(2026, 11, 10, 7, tzinfo=timezone.utc).timestamp())
 ROOM = "Reserve a meeting room"
@@ -163,6 +168,41 @@ def _silence(ctx, world, plan, *, key):
         patch.setattr(owner_workspace, "_confirm", lambda *args, **kwargs: {"approved": False, "reason": "timeout"})
         return _commit_project_plan(ctx, idempotency_key=key, project_id=world["project"].id, trigger="owner_request",
                                     **plan)
+
+
+@contextlib.contextmanager
+def _waiting_plan(ctx, world, plan, *, key):
+    """The owner's normal plan commit held at its real approval; leaving the block is the owner's approval.
+
+    Yields a dict that holds the commit's "result" once the block has ended; an error the commit raised is raised there.
+    """
+    approval.register_gateway_notify(ctx.session, lambda data: None)
+    done = {}
+
+    def commit():
+        try:
+            done["result"] = _commit_project_plan(ctx, idempotency_key=key, project_id=world["project"].id,
+                                                  trigger="owner_request", **plan)
+        except Exception as exc:
+            done["error"] = exc
+
+    thread = threading.Thread(target=commit, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not approval.list_gateway_approvals(ctx.session):
+        assert thread.is_alive() and time.monotonic() < deadline, f"the plan never reached its approval: {done}"
+        time.sleep(0.01)
+    choice = "deny"
+    try:
+        yield done
+        choice = "once"
+    finally:
+        _auto_approve(ctx.session, choice)
+        thread.join(timeout=30)
+        approval.unregister_gateway_notify(ctx.session)
+    assert not thread.is_alive(), "the approved plan did not finish"
+    if "error" in done:
+        raise done["error"]
 
 
 def _links(world):
@@ -624,6 +664,67 @@ def test_t6_an_add_title_that_matches_the_adds_of_two_pairs_links_no_card(root, 
     assert len(committed["created_task_ids"]) == 1
     assert HALL_WORDS in _work_titles(world)
     assert _links(world) == before
+
+
+def test_t6_a_changed_plan_waiting_for_its_approval_makes_its_card_when_another_plan_links_the_suggestion_meanwhile(
+        world, ctx):
+    plan = _reviewed(world)
+    initial = _links(world)
+    other = owner_workspace.OwnerContext(actor="default", profile="default", session="run_owt_other")
+
+    with _waiting_plan(ctx, world, {**plan, "changes": [_add(SAME_HALL)]}, key="waiting-changed-plan") as waiting:
+        [exact] = _commit(other, world, plan, key="exact-room-plan")["created_task_ids"]
+        linked = _links(world)
+
+    assert linked == sorted(initial + [(exact, world["accepted"])])
+    assert len(waiting["result"]["created_task_ids"]) == 1
+    assert SAME_HALL in _work_titles(world)
+    assert _links(world) == linked
+
+
+def test_t6_a_changed_plan_waiting_for_its_approval_links_its_card_to_a_review_accepted_meanwhile(world, ctx):
+    initial = _links(world)
+
+    with _waiting_plan(ctx, world, _plan(_add(SAME_HALL)), key="waiting-changed-plan") as waiting:
+        _reviewed(world)
+
+    [card] = waiting["result"]["created_task_ids"]
+    assert _links(world) == sorted(initial + [(card, world["accepted"])])
+    assert _trigger(world, card) == "owner_request"
+
+
+def test_t6_every_pair_of_the_review_resolves_for_a_changed_plan_on_the_card_connection_in_the_worker_environment(
+        root, ctx):
+    from hermes_cli.owner_project_review_origin import changed_plan_links
+
+    def second(board, project):
+        other = _suggestion(board, project, "Reserve the visitor parking", "parking")
+        _decide(board, other, "accepted", "The visitors drive.")
+        return {"other": other}
+
+    world = _world(root, ctx, second)
+    pairs = [{"change": 0, "suggestion": world["accepted"]}, {"change": 1, "suggestion": world["other"]}]
+    claims = {world["other"]: ("answered", [f"suggestions:{world['other']}"])}
+    _complete(world, _result(world, plan=_plan(_add(HALL), _add("Reserve the visitor parking")), pairs=pairs,
+                             classes=claims))
+    review.review_tick(NOW + 1)
+    # The same two works in other words, the second first.
+    changes, _risk = owner_workspace._normalize_project_changes([_add("Reserve visitor parking"), _add(SAME_HALL)])
+    profile_home = root / "profiles" / "raphael-planner"
+    profile_home.mkdir(parents=True)
+
+    with _project_board(world["project"]) as board, pytest.MonkeyPatch.context() as env:
+        env.setenv("HERMES_HOME", str(profile_home))
+        env.setenv("HERMES_PROFILE", "raphael-planner")
+        env.setenv("HERMES_KANBAN_BOARD", "project-summaries")
+        env.setenv("HERMES_KANBAN_DB", str(kanban_db.kanban_db_path(board="project-summaries")))
+        env.setenv("HERMES_KANBAN_TASK", world["review_task"])
+        assert projects_db.projects_db_path() == profile_home / "projects.db"
+        links = changed_plan_links(board, world["project"].id, changes)
+
+    assert len(links) == len(pairs)
+    assert sorted(links) == sorted([(1, world["accepted"]), (0, world["other"])])
+    assert not (profile_home / "projects.db").exists()
 
 
 def test_t7_a_denied_plan_writes_nothing_and_the_next_review_does_not_propose_it_again(world, ctx):
