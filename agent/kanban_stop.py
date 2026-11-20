@@ -35,6 +35,8 @@ def _tool_call_name(tc: Any) -> str:
 
 def _verdict_result_succeeded(content: Any) -> bool:
     """True for the board tools' success form (``{"ok": true, ...}``), not their error form."""
+    # Accepted limit: a verdict result over 100,000 chars is shown as a preview, not complete JSON;
+    # the guard reads no preview text and sends the reminder, as the released version does.
     try:
         data = json.loads(content) if isinstance(content, str) else None
     except ValueError:
