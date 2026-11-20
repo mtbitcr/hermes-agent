@@ -23,10 +23,13 @@ logged or written.
 from __future__ import annotations
 
 import json
+import os
 import re
+import select
 import sqlite3
 import subprocess
 import sys
+import time
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -46,6 +49,10 @@ REPEAT_AFTER = timedelta(minutes=50)
 REPEAT_OFF = "The hourly repeat is off: if this alert is not delivered, it is not sent again."
 REQUEST_TIMEOUT_SECONDS = 30.0
 PAGE_CHECK_TIMEOUT_SECONDS = 600
+PAGE_CHECK_OUTPUT_BYTES = 16000
+PAGE_CHECK_LINES = 20
+# A page check line is kept only in the fixed form: FAIL <words> or the count line, 200 characters at most.
+_PAGE_LINE = re.compile(r"(?=.{1,200}\Z)(FAIL [A-Za-z0-9 :_()-]*|page check failed: [0-9]+ failure\(s\))")
 # The dashboard serving Connections and Models runs as the default profile; one job runs the
 # indirect signals so a failure there alerts once, not once per profile.
 INDIRECT_PROFILE = "default"
@@ -100,6 +107,7 @@ class Result:
     status: Optional[int] = None
     code: Optional[str] = None
     at: str = ""
+    page_lines: Optional[Dict[str, Any]] = None
 
 
 @dataclass(frozen=True)
@@ -257,7 +265,7 @@ def run(
     profile: Optional[str] = None,
     base: Optional[str] = None,
     send: Optional[Callable[..., Any]] = None,
-    run_page_check: Optional[Callable[[str], str]] = None,
+    run_page_check: Optional[Callable[[str], Any]] = None,
     read_key: Optional[Callable[[], Optional[str]]] = None,
     delivery_state: Optional[Callable[[Dict[str, Any]], str]] = None,
     route_policy: Optional[Callable[[str, str], Any]] = None,
@@ -301,7 +309,8 @@ def run(
     state, kind, text = _decide(previous, results, moment, profile, reader)
     try:
         _write(report_path(), {"profile": profile, "run_at": moment.isoformat(), "state": state["state"],
-                               "checks": [asdict(result) for result in results]})
+                               "checks": [{k: v for k, v in asdict(result).items() if k != "page_lines" or v is not None}
+                                             for result in results]})
         _write(state_path(), state)
     except OSError as exc:
         print(f"owner write watch: state not saved: {type(exc).__name__}", file=sys.stderr)
@@ -329,10 +338,11 @@ def _probe(probe: Probe, base: str, key: str, send: Callable[..., Any], clock) -
     return Result(outcome=outcome, detail=detail, status=status, code=code, at=clock().isoformat(), **fields)
 
 
-def _page_check(path: str, run_page_check: Callable[[str], str], clock) -> Result:
+def _page_check(path: str, run_page_check: Callable[[str], Any], clock) -> Result:
     outcome = run_page_check(path)
+    outcome, page_lines = outcome if isinstance(outcome, tuple) else (outcome, None)
     return Result(_PAGE_CHECK, _PAGE_CHECK_LABEL, outcome if outcome in (PASS, FAIL, UNKNOWN) else FAIL,
-                  detail="did not pass", method="run", path=path, at=clock().isoformat())
+                  detail="did not pass", method="run", path=path, at=clock().isoformat(), page_lines=page_lines)
 
 
 def _journeys(moment: datetime, clock) -> Result:
@@ -551,15 +561,36 @@ def _http_send(method: str, url: str, body: Optional[Dict[str, Any]], key: str):
         return response.status_code, None
 
 
-def _run_page_check(path: str) -> str:
+def _run_page_check(path: str):
+    """``(outcome, page_lines)``: page_lines is the kept lines of the script's standard output."""
+    deadline = time.monotonic() + PAGE_CHECK_TIMEOUT_SECONDS
     try:
-        completed = subprocess.run([path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL, timeout=PAGE_CHECK_TIMEOUT_SECONDS, check=False)
-    except subprocess.TimeoutExpired:
-        return UNKNOWN
+        proc = subprocess.Popen([path], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except OSError:
-        return FAIL
-    return PASS if completed.returncode == 0 else FAIL
+        return FAIL, None
+    data = b""
+    try:
+        while len(data) < PAGE_CHECK_OUTPUT_BYTES:
+            if not select.select([proc.stdout], [], [], max(0.0, deadline - time.monotonic()))[0]:
+                raise subprocess.TimeoutExpired(path, PAGE_CHECK_TIMEOUT_SECONDS)
+            chunk = os.read(proc.stdout.fileno(), min(4096, PAGE_CHECK_OUTPUT_BYTES - len(data)))
+            if not chunk:
+                break
+            data += chunk
+        proc.stdout.close()
+        returncode = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        return UNKNOWN, None
+    lines = data.decode("utf-8", "replace").split("\n")
+    kept, other = [], 0
+    for line in lines[:-1] if lines[-1] == "" else lines:
+        if len(kept) < PAGE_CHECK_LINES and _PAGE_LINE.fullmatch(line):
+            kept.append(line)
+        else:
+            other += 1
+    return (PASS if returncode == 0 else FAIL), {"lines": kept, "not_kept": other}
 
 
 _ROUTE_POLICIES_LOADED = False

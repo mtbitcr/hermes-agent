@@ -1278,3 +1278,80 @@ def test_journeys_the_planning_profile_has_no_journeys_result(tmp_path):
     checks = json.loads(watch.report_path().read_text(encoding="utf-8"))["checks"]
     assert "journeys" not in [check["name"] for check in checks]
     assert outcome.kind == "active"
+
+
+def real_page_run(tmp_path, body, **overrides):
+    """One hourly run with the real _run_page_check on a script the test writes."""
+    host = Host(tmp_path)
+    host.page_check.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    host.page_check.chmod(0o755)
+    outcome = host.run(run_page_check=None, **overrides)
+    checks = json.loads(watch.report_path().read_text(encoding="utf-8"))["checks"]
+    return host, outcome, next(check for check in checks if check["name"] == "page_check")
+
+
+def test_page_lines_two_failures_and_the_count_line_reach_the_report(tmp_path):
+    lines = ["FAIL automations 390 no_overflow", "FAIL models 1280 console_clean",
+             "page check failed: 2 failure(s)"]
+    printed = "".join(f"echo '{line}'\n" for line in lines)
+    host, outcome, entry = real_page_run(tmp_path, printed + "exit 1\n")
+    assert entry["outcome"] == watch.FAIL
+    assert entry["detail"] == "did not pass"
+    assert entry["page_lines"] == {"lines": lines, "not_kept": 0}
+    watch.state_path().unlink()
+    host.clock = START
+    injected = host.run(run_page_check=lambda path: watch.FAIL)
+    assert (outcome.kind, outcome.text) == (injected.kind, injected.text)
+
+
+def test_page_lines_a_line_off_the_fixed_form_is_counted_and_not_kept(tmp_path):
+    body = ("echo 'FAIL home 390 no_overflow'\n"
+            "echo 'FAIL http://127.0.0.1:8642/x'\n"
+            "echo 'FAIL token=abc123'\n"
+            f"echo 'FAIL {'a' * 300}'\n"
+            "echo 'the page said hello'\n"
+            "exit 1\n")
+    _, _, entry = real_page_run(tmp_path, body)
+    assert entry["page_lines"] == {"lines": ["FAIL home 390 no_overflow"], "not_kept": 4}
+    assert "127.0.0.1" not in json.dumps(entry) and "abc123" not in json.dumps(entry)
+
+
+def test_page_lines_keep_at_most_twenty(tmp_path):
+    body = "i=0\nwhile [ $i -lt 30 ]; do echo \"FAIL page_$i 390 check\"; i=$((i+1)); done\nexit 1\n"
+    _, _, entry = real_page_run(tmp_path, body)
+    assert entry["page_lines"]["lines"] == [f"FAIL page_{i} 390 check" for i in range(20)]
+    assert entry["page_lines"]["not_kept"] == 10
+
+
+def test_page_lines_output_past_the_bound_is_not_read_and_the_exit_status_stands(tmp_path):
+    big = tmp_path / "big.txt"
+    big.write_text("FAIL big 390 check\n" * 1500, encoding="utf-8")
+    reads = []
+    real_read = watch.os.read
+
+    def counting_read(fd, size):
+        data = real_read(fd, size)
+        reads.append(len(data))
+        return data
+
+    original = watch.os.read
+    watch.os.read = counting_read
+    try:
+        _, outcome, entry = real_page_run(tmp_path, f"cat {big}\nexit 1\n")
+    finally:
+        watch.os.read = original
+    assert sum(reads) <= 16000
+    assert entry["outcome"] == watch.FAIL
+    assert len(entry["page_lines"]["lines"]) == 20
+
+
+def test_page_lines_standard_error_is_not_kept(tmp_path):
+    _, _, entry = real_page_run(tmp_path, "echo 'FAIL home 390 check' >&2\nexit 1\n")
+    assert entry["outcome"] == watch.FAIL
+    assert entry["page_lines"] == {"lines": [], "not_kept": 0}
+
+
+def test_page_lines_a_silent_pass_holds_no_line(tmp_path):
+    _, _, entry = real_page_run(tmp_path, "exit 0\n")
+    assert entry["outcome"] == watch.PASS
+    assert entry["page_lines"] == {"lines": [], "not_kept": 0}
