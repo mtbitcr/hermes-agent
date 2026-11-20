@@ -134,8 +134,10 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
 """ + f"   The reason has at most {_CLOSURE_REASON_LIMIT} characters." + """ Evidence must name suggestions:<id> and tasks:<id> from this input.
    The card must deliver the suggestion in this Project. A proposal cannot decide or close the suggestion.
 8. When the input holds an accepted suggestion whose linked_card is a task of this input with the delivery state done or
-   merged, and the suggestion has no live closure, the review must propose its closure with that card. It classifies that
-   suggestion superseded with the evidence suggestions:<id> and tasks:<linked card>.
+   merged, and the suggestion has no live closure, the review must propose its closure with that card, within the limit
+   of step 7, before any other closure. It classifies that suggestion superseded with the evidence suggestions:<id> and
+   tasks:<linked card>. After an owner Undo of its closure, it qualifies only when the evidence shows a delivery after
+   the Undo; otherwise the review leaves the proposal out and classifies it as usual.
 9. plan_proposal is null or an object with exactly request_title, summary,
    specification, current_milestone, owner_visible_result, later_milestones, and changes.
    Use the native plan change schema. Each existing task reference must use its input status and event revision.

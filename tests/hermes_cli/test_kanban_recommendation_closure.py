@@ -637,7 +637,7 @@ def _payload(made, *, closed=()):
 
 
 _PAIRS = (("meeting-room", "Book the room", "Book a room"), ("meeting-speaker", "Call the speaker", "Call the speaker"),
-          ("meeting-agenda", "Print the agenda", "Print the agenda"))
+          ("meeting-agenda", "Print the agenda", "Print the agenda"), ("meeting-food", "Order the food", "Order the food"))
 
 
 def _completed_review(root, monkeypatch, *, closure=True, pairs=1, closed_before=0, edit=None, first_title=None,
@@ -647,7 +647,7 @@ def _completed_review(root, monkeypatch, *, closure=True, pairs=1, closed_before
     monkeypatch.setattr(time, "time", lambda: NOW)
     with _board(project) as board:
         made = [_delivered_pair(board, project.id, subject=s, label=label, title=(first_title or title) if n == 0 else title,
-                                made_from=made_from and n == 0, accepted=accepted and n == 0,
+                                made_from=made_from and n == 0, accepted=accepted and (n == 0 or accepted == "all"),
                                 deliver=deliver or n != 0) for n, (s, label, title) in enumerate(_PAIRS[:pairs])]
         closed = [_delivered_pair(board, project.id, subject=f"done-{n}", label=f"Print badge set {n}",
                                   title=f"Print badge set {n}") for n in range(closed_before)]
@@ -1066,7 +1066,7 @@ def test_an_accepted_suggestion_with_a_delivered_linked_card_and_no_proposed_clo
     assert _stored_classes(root, project)[suggestion] == ("superseded", [f"tasks:{delivered}"])
 
 
-def test_an_accepted_suggestion_whose_linked_card_is_not_delivered_keeps_today_class_and_refuses_a_closure(
+def test_an_accepted_suggestion_whose_linked_card_is_not_delivered_refuses_a_proposed_closure_with_its_code(
     root, monkeypatch, caplog,
 ):
     project, task_id, made = _completed_review(
@@ -1078,7 +1078,44 @@ def test_an_accepted_suggestion_whose_linked_card_is_not_delivered_keeps_today_c
 
     assert _closures(project) == []
     assert _stored(root, project) == ((None, "2026-11-09", 1), None)
-    assert "refused Project" in caplog.text
+    assert "refused Project" in caplog.text and "review_closure_evidence_required" in caplog.text
+
+
+def test_an_accepted_suggestion_whose_linked_card_is_not_delivered_keeps_the_answered_class_with_no_closure(
+    root, monkeypatch, caplog,
+):
+    def no_closure(payload, made):
+        payload["proposed_closures"] = []
+        _gives("answered", lambda m: [f"suggestions:{m[0][0]}"])(payload, made)
+
+    project, task_id, made = _completed_review(root, monkeypatch, accepted=True, deliver=False, edit=no_closure)
+    ((suggestion, _card, _),) = made
+
+    assert review.review_tick(NOW + 1) == 0
+
+    assert "refused Project" not in caplog.text
+    assert _closures(project) == []
+    assert _stored_classes(root, project)[suggestion] == ("answered", [f"suggestions:{suggestion}"])
+
+
+@pytest.mark.parametrize("proposals,accepted", [(3, True), (4, False)])
+def test_four_accepted_suggestions_with_delivered_cards_take_three_proposals_and_the_kernel_cap_holds(
+    root, monkeypatch, caplog, proposals, accepted,
+):
+    def trim(payload, made):
+        payload["proposed_closures"] = payload["proposed_closures"][:proposals]
+
+    project, task_id, made = _completed_review(root, monkeypatch, accepted="all", pairs=4, edit=trim)
+
+    assert review.review_tick(NOW + 1) == 0
+
+    if accepted:
+        assert "refused Project" not in caplog.text
+        assert [row[:2] for row in _closures(project)] == sorted(pair[:2] for pair in made[:3])
+        assert {c for c, _ in _stored_classes(root, project).values()} == {"superseded"}
+    else:
+        assert _closures(project) == []
+        assert "review_closure_list_invalid" in caplog.text
 
 
 def test_the_instruction_tells_the_review_to_close_an_accepted_suggestion_with_its_delivered_linked_card():
@@ -1087,6 +1124,9 @@ def test_the_instruction_tells_the_review_to_close_an_accepted_suggestion_with_i
     assert "done or merged" in text
     assert "must propose its closure with that card" in text
     assert "superseded with the evidence suggestions:<id> and tasks:<linked card>" in text
+    assert "within the limit of step 7, before any other closure" in text
+    assert "After an owner Undo of its closure, it qualifies only when the evidence shows a delivery after the Undo" in text
+    assert "otherwise the review leaves the proposal out and classifies it as usual" in text
 
 
 def _child_tick(tmp_path, now, *, kill_in=None):
