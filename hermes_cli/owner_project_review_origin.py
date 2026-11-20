@@ -127,15 +127,18 @@ def changed_plan_links(conn, project_id, changes):
     the cards: while the plan waited, another plan could link a suggestion or a review with the pair could be accepted,
     so a read made before the wait is stale. A pair links when exactly one add change has the title of the pair's add
     change under same_review_work, no other pair has it, and the suggestion is the owner's accepted one of this Project
-    with no linked card and no live closure. A pair that does not pass gets no link, and the plan does not fail.
+    with no linked card and no live closure. Both titles are compared as the owner sees them: the review's add titles
+    pass the same normalization as the approved plan's. A pair that does not pass, or a stored review that does not
+    normalize, gets no link, and the plan does not fail.
     """
     from hermes_cli.kanban_recommendation_closure import has_live_recommendation_closure, same_review_work
 
     try:
         accepted = _accepted_review(project_id)
         pairs = (accepted[4].get("plan_suggestions") or []) if accepted else []
+        shown = owner_workspace._normalize_project_changes(accepted[2]["changes"])[0] if pairs else []
         titles = [c["title"] if c["action"] == "add" else None for c in changes]
-        hits = [[i for i, t in enumerate(titles) if same_review_work(accepted[2]["changes"][pair["change"]]["title"], t)]
+        hits = [[i for i, t in enumerate(titles) if same_review_work(shown[pair["change"]]["title"], t)]
                 for pair in pairs]
         found = [(hit[0], pair["suggestion"]) for hit, pair in zip(hits, pairs)
                  if len(hit) == 1 and sum(hit[0] in other for other in hits) == 1]
@@ -144,7 +147,7 @@ def changed_plan_links(conn, project_id, changes):
             "AND recommendation_decision='accepted'", (sid, project_id)).fetchone() is not None
             and not has_live_recommendation_closure(conn, sid) and conn.execute(
                 "SELECT 1 FROM recommendation_made_from WHERE recommendation_id=?", (sid,)).fetchone() is None]
-    except (KeyError, IndexError, TypeError, ValueError, sqlite3.Error):
+    except (KeyError, IndexError, TypeError, ValueError, sqlite3.Error, owner_workspace.OwnerWorkspaceError):
         logger.debug("Daily review pairs for a changed plan could not be confirmed")
     return []
 

@@ -563,6 +563,23 @@ def _completed(add, **fields):
     return {**add, **fields}
 
 
+def _two_pair_review(root, ctx, *adds):
+    """A world with a second accepted suggestion and its harvested review: the first two adds are paired with the two."""
+
+    def second(board, project):
+        other = _suggestion(board, project, "Reserve the visitor parking", "parking")
+        _decide(board, other, "accepted", "The visitors drive.")
+        return {"other": other}
+
+    world = _world(root, ctx, second)
+    plan = _plan(*adds)
+    pairs = [{"change": 0, "suggestion": world["accepted"]}, {"change": 1, "suggestion": world["other"]}]
+    claims = {world["other"]: ("answered", [f"suggestions:{world['other']}"])}
+    _complete(world, _result(world, plan=plan, pairs=pairs, classes=claims))
+    review.review_tick(NOW + 1)
+    return world, plan
+
+
 def test_t6_a_changed_plan_with_the_same_add_title_links_its_card_and_keeps_owner_request(world, ctx):
     plan = _reviewed(world)
     before = _links(world)
@@ -660,6 +677,33 @@ def test_t6_an_add_title_that_matches_the_adds_of_two_pairs_links_no_card(root, 
     before = _links(world)
 
     committed = _commit(ctx, world, {**plan, "changes": [_add(HALL_WORDS)]}, key="two-pairs-plan")
+
+    assert len(committed["created_task_ids"]) == 1
+    assert HALL_WORDS in _work_titles(world)
+    assert _links(world) == before
+
+
+def test_t6_a_changed_plan_links_its_card_by_the_title_the_review_showed_not_the_stored_prefixed_one(world, ctx):
+    plan = _reviewed(world, _add(f"R09 — {HALL}"))
+    # The owner saw the title without the planner's bookkeeping prefix.
+    assert _brief(world)[:2] == (_paired_hint(HALL), world["review_task"])
+    before = _links(world)
+
+    committed = _commit(ctx, world, {**plan, "changes": [_add(HALL)]}, key="shown-title-plan")
+
+    [card] = committed["created_task_ids"]
+    assert HALL in _work_titles(world)
+    assert _links(world) == sorted(before + [(card, world["accepted"])])
+    assert _trigger(world, card) == "owner_request"
+
+
+def test_t6_a_changed_plan_links_no_card_when_a_stored_prefix_hid_that_the_shown_title_matches_two_pairs(root, ctx):
+    world, plan = _two_pair_review(root, ctx, _add(f"{HALL_WORDS} today"), _add(f"R09 — {HALL_WORDS} soon"))
+    # The two shown titles differ, so the harvest accepts the plan.
+    assert _brief(world)[1] == world["review_task"]
+    before = _links(world)
+
+    committed = _commit(ctx, world, {**plan, "changes": [_add(HALL_WORDS)]}, key="shown-two-pairs-plan")
 
     assert len(committed["created_task_ids"]) == 1
     assert HALL_WORDS in _work_titles(world)
