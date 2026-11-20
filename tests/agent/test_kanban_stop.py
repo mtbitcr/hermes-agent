@@ -88,6 +88,14 @@ def _verdict_result(name: str, content: str) -> dict:
     return {"role": "tool", "name": name, "tool_call_id": "1", "content": content}
 
 
+def _refusal(name: str) -> str:
+    from tools.kanban_tools import _handle_request_changes, _handle_review_findings
+
+    if name == "kanban_request_changes":
+        return _handle_request_changes({})
+    return _handle_review_findings({"findings": []})
+
+
 def test_no_nudge_after_successful_review_findings(clear_kanban_env):
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
     from tools.kanban_tools import _ok
@@ -95,7 +103,10 @@ def test_no_nudge_after_successful_review_findings(clear_kanban_env):
     # Success form of _handle_review_findings: _ok(task_id=tid, **result).
     messages = [
         _verdict_call("kanban_review_findings"),
-        _verdict_result("kanban_review_findings", _ok(task_id="t_abc", outcome="approved")),
+        _verdict_result(
+            "kanban_review_findings",
+            _ok(task_id="t_abc", outcome="passed", re_raised_fingerprints=[]),
+        ),
     ]
     assert session_called_kanban_terminal(messages) is True
     assert build_kanban_stop_nudge(messages=messages) is None
@@ -127,6 +138,37 @@ def test_nudge_after_refused_review_findings(clear_kanban_env):
     messages = [
         _verdict_call("kanban_review_findings"),
         _verdict_result("kanban_review_findings", refusal),
+    ]
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+def test_nudge_after_refused_request_changes(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+
+    # Real refusal: _handle_request_changes rejects a call with no reason.
+    refusal = _refusal("kanban_request_changes")
+    assert '"error"' in refusal
+    messages = [
+        _verdict_call("kanban_request_changes"),
+        _verdict_result("kanban_request_changes", refusal),
+    ]
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+@pytest.mark.parametrize("verdict", ["kanban_review_findings", "kanban_request_changes"])
+def test_nudge_when_heartbeat_success_reuses_refused_verdict_call_id(clear_kanban_env, verdict):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    from tools.kanban_tools import _ok
+
+    # Call ids are unique only within one assistant batch: the heartbeat in a
+    # later batch reuses id "1" and its own success must not read as a verdict.
+    messages = [
+        _verdict_call(verdict),
+        _verdict_result(verdict, _refusal(verdict)),
+        _verdict_call("kanban_heartbeat"),
+        _verdict_result("kanban_heartbeat", _ok(task_id="t_abc", run_id=3)),
     ]
     assert session_called_kanban_terminal(messages) is False
     assert build_kanban_stop_nudge(messages=messages) is not None

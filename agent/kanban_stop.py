@@ -45,26 +45,17 @@ def _verdict_result_succeeded(content: Any) -> bool:
 def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     """True if this conversation already invoked a terminal kanban tool, or a review
     verdict tool whose tool result is a success (a refused or unanswered verdict is not)."""
-    verdict_call_ids: set[str] = set()
     for msg in filter(lambda m: isinstance(m, dict), messages or ()):
         role = msg.get("role")
-        if role == "assistant":
-            calls = msg.get("tool_calls") or []
-            if any(_tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS for tc in calls):
-                return True
-            verdict_call_ids.update(
-                str((tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", "")) or "")
-                for tc in calls
-                if _tool_call_name(tc) in _VERDICT_KANBAN_TOOLS
-            )
+        if role == "assistant" and any(
+            _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS for tc in msg.get("tool_calls") or []
+        ):
+            return True
         if role == "tool":
             name = str(msg.get("name") or "")
             if name in _TERMINAL_KANBAN_TOOLS:
                 return True
-            is_verdict = name in _VERDICT_KANBAN_TOOLS or (
-                str(msg.get("tool_call_id") or "") in verdict_call_ids
-            )
-            if is_verdict and _verdict_result_succeeded(msg.get("content")):
+            if name in _VERDICT_KANBAN_TOOLS and _verdict_result_succeeded(msg.get("content")):
                 return True
     return False
 
