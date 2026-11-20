@@ -481,11 +481,18 @@ def test_the_turns_and_the_waiting_approval_of_a_chat_under_the_planning_profile
 
 
 def test_a_new_owner_message_in_a_chat_under_the_planning_profile_starts_one_review(root, monkeypatch):
+    from hermes_cli import owner_workspace
+
     project = _quiet_project(root)
     monkeypatch.setattr(time, "time", lambda: NOW)
+    with kanban_db.connect_closing(kanban_db.kanban_db_path(board=project.board_slug), board=project.board_slug) as board:
+        card = board.execute("SELECT id FROM tasks WHERE title = ?", ("Book the room",)).fetchone()[0]
+        assert kanban_db.complete_task(board, card, summary="Done.")
+        board_cursor = board.execute("SELECT MAX(id) FROM task_events").fetchone()[0]
+    assert owner_workspace.project_steward_snapshot(project_id=project.id)["execution"]["state"] == "complete"
     _turn(root, NAME, "resp_one", "Use the garden room.", NOW - 86400)
     _link(root, NAME, project.id)
-    _set_state(root, project, conversation_cursor=_news(root, project)[0])
+    _set_state(root, project, event_cursor=board_cursor, conversation_cursor=_news(root, project)[0])
     _turn(root, NAME, "resp_two", "Use the front room.", NOW)
 
     assert review.review_tick(NOW) == 1
