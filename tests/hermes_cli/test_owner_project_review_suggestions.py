@@ -22,6 +22,9 @@ HALL = "Book the conference hall"
 HINT = f"Ask Raphael in the Project chat to add {HALL} for your accepted suggestion {ROOM}."
 # A title equivalent to the accepted suggestion's label under the content-link rule of the closures.
 SAME = "Reserve the meeting room"
+# One more add title of the same work as HALL, and a title with five words of its own for the two-pair case.
+SAME_HALL = "Book a conference hall"
+HALL_WORDS = "Book conference hall seating visitors"
 # The labels of update_world's two suggestions of the model update kind.
 UPDATE = "Try the new planner model"
 POLICY = "Keep the planner on one model"
@@ -507,18 +510,120 @@ def test_t5_a_silence_on_a_same_label_pair_denies_nothing(world, ctx):
     assert project_review_advice_view(project.id) == {"review_date": "2026-11-11", "proposal": plan}
 
 
-def test_t6_a_changed_plan_creates_its_card_and_writes_no_row(world, ctx):
-    plan = _plan()
-    _complete(world, _result(world, plan=plan, pairs=[{"change": 0, "suggestion": world["accepted"]}]))
+def _reviewed(world, *adds, pairs=None):
+    """The harvested review of ``world``: a plan of ``adds`` (default: the hall) paired with its accepted suggestion."""
+    plan = _plan(*adds)
+    _complete(world, _result(world, plan=plan, pairs=pairs or [{"change": 0, "suggestion": world["accepted"]}]))
     review.review_tick(NOW + 1)
+    return plan
+
+
+def _completed(add, **fields):
+    """The same add change as the review's, with the fields the planner completes in the Project chat."""
+    return {**add, **fields}
+
+
+def test_t6_a_changed_plan_with_the_same_add_title_links_its_card_and_keeps_owner_request(world, ctx):
+    plan = _reviewed(world)
     before = _links(world)
 
     committed = _commit(ctx, world, {**plan, "summary": "Book a conference hall for the guests."}, key="changed-room-plan")
 
     [card] = committed["created_task_ids"]
     assert HALL in _work_titles(world)
-    assert _links(world) == before
+    assert _links(world) == sorted(before + [(card, world["accepted"])])
     assert _trigger(world, card) == "owner_request"
+
+
+def test_t6_the_plan_the_planner_completes_in_the_chat_links_its_card_and_the_next_review_sees_the_link(world, ctx):
+    """The case of 2026-11-20: another summary, body and a write scope; the next review cannot plan the card again."""
+    plan = _reviewed(world)
+    before = _links(world)
+    [add] = plan["changes"]
+    changed = {**plan, "summary": "Book a hall; the files are known now.", "changes": [_completed(
+        add, body="Book the hall and confirm the seating.", responsibility="R09", owned_paths=["src/hall"])]}
+
+    (world["root"] / "repo").mkdir()
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        registry.execute("UPDATE projects SET primary_path=? WHERE id=?", (str(world["root"] / "repo"), world["project"].id))
+        registry.commit()
+
+    committed = _commit(ctx, world, changed, key="completed-room-plan")
+
+    [card] = committed["created_task_ids"]
+    assert _links(world) == sorted(before + [(card, world["accepted"])])
+    assert _trigger(world, card) == "owner_request"
+    later = _next_review(world)
+    with _summary_board() as board:
+        sources, _cut = review._frozen_sources(kanban_db.get_task(board, later).body)
+    assert {item["id"]: item.get("linked_card") for item in sources["suggestions"]}[world["accepted"]] == card
+    _complete({**world, "review_task": later}, _result(
+        world, plan=plan, pairs=[{"change": 0, "suggestion": world["accepted"]}]))
+    review.review_tick(NOW + 86401)
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        refusal = registry.execute("SELECT last_refusal FROM project_review_state WHERE project_id=?",
+                                   (world["project"].id,)).fetchone()[0]
+    assert json.loads(refusal)["code"] == "review_plan_suggestion_linked"
+
+
+def test_t6_a_changed_plan_whose_add_title_differs_creates_its_card_and_writes_no_row(world, ctx):
+    plan = _reviewed(world)
+    before = _links(world)
+
+    committed = _commit(ctx, world, {**plan, "changes": [_add("Print the name badges")]}, key="other-title-plan")
+
+    assert len(committed["created_task_ids"]) == 1
+    assert "Print the name badges" in _work_titles(world)
+    assert _links(world) == before
+
+
+def test_t6_two_add_changes_with_the_title_of_one_pair_create_both_cards_and_write_no_row(world, ctx):
+    plan = _reviewed(world)
+    before = _links(world)
+    twin = _completed(_add(SAME_HALL), body="The second booking.")
+
+    committed = _commit(ctx, world, {**plan, "changes": [_add(HALL), twin]}, key="twin-title-plan")
+
+    assert len(committed["created_task_ids"]) == 2
+    assert {HALL, SAME_HALL} <= set(_work_titles(world))
+    assert _links(world) == before
+
+
+def test_t6_a_suggestion_linked_after_the_review_gets_no_row_from_a_changed_plan_and_the_plan_does_not_fail(world, ctx):
+    plan = _reviewed(world)
+    with _project_board(world["project"]) as board:
+        other = kanban_db.create_task(board, title="Hold the meeting room", project_id=world["project"].id,
+                                      made_from_recommendation=world["accepted"])
+    before = _links(world)
+
+    committed = _commit(ctx, world, {**plan, "summary": "Book a conference hall for the guests."}, key="late-link-plan")
+
+    assert len(committed["created_task_ids"]) == 1
+    assert HALL in _work_titles(world)
+    assert (other, world["accepted"]) in before
+    assert _links(world) == before
+
+
+def test_t6_an_add_title_that_matches_the_adds_of_two_pairs_links_no_card(root, ctx):
+    def second(board, project):
+        other = _suggestion(board, project, "Reserve the visitor parking", "parking")
+        _decide(board, other, "accepted", "The visitors drive.")
+        return {"other": other}
+
+    world = _world(root, ctx, second)
+    first, again = _add(f"{HALL_WORDS} today"), _add(f"{HALL_WORDS} soon")
+    plan = {**_plan(first, again)}
+    claims = {world["other"]: ("answered", [f"suggestions:{world['other']}"])}
+    pairs = [{"change": 0, "suggestion": world["accepted"]}, {"change": 1, "suggestion": world["other"]}]
+    _complete(world, _result(world, plan=plan, pairs=pairs, classes=claims))
+    review.review_tick(NOW + 1)
+    before = _links(world)
+
+    committed = _commit(ctx, world, {**plan, "changes": [_add(HALL_WORDS)]}, key="two-pairs-plan")
+
+    assert len(committed["created_task_ids"]) == 1
+    assert HALL_WORDS in _work_titles(world)
+    assert _links(world) == before
 
 
 def test_t7_a_denied_plan_writes_nothing_and_the_next_review_does_not_propose_it_again(world, ctx):

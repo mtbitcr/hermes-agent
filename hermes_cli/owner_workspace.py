@@ -6921,12 +6921,14 @@ def commit_project_plan(
         # Preserve the approved payload and its replay identity. A proven review changes only the audit origin.
         recorded_trigger, links = trigger, []
         if trigger == "owner_request":
-            from hermes_cli.owner_project_review_origin import confirmed_plan_links, confirmed_plan_trigger
+            from hermes_cli.owner_project_review_origin import changed_plan_links, confirmed_plan_links, confirmed_plan_trigger
 
             recorded_trigger = confirmed_plan_trigger(project_id, digest)
             if recorded_trigger == "scheduled_review":
                 # Read once, before the approval wait: the proven review's pairs link the cards its add changes create.
                 links = confirmed_plan_links(project_id, digest)
+            else:
+                links = changed_plan_links(project_id, normalized_changes)
         kconn = kanban_db.connect(board=board_slug)
         try:
             # Before the scope check, so a boundary inherited from a superseded

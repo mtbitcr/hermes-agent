@@ -120,6 +120,35 @@ def confirmed_plan_links(project_id, request_digest):
     return []
 
 
+def changed_plan_links(project_id, changes):
+    """[(index of an add change of the approved plan, suggestion id)] for a plan that differs from the accepted review's.
+
+    A pair links when exactly one add change has the title of the pair's add change under same_review_work, and no other
+    pair has it, and the suggestion is still accepted with no linked card and no live closure. Read only.
+    """
+    from hermes_cli.kanban_recommendation_closure import has_live_recommendation_closure, same_review_work
+
+    try:
+        accepted = _accepted_review(project_id)
+        pairs = (accepted[4].get("plan_suggestions") or []) if accepted else []
+        titles = [c["title"] if c["action"] == "add" else None for c in changes]
+        hits = [[i for i, t in enumerate(titles) if same_review_work(accepted[2]["changes"][pair["change"]]["title"], t)]
+                for pair in pairs]
+        found = [(hit[0], pair["suggestion"]) for hit, pair in zip(hits, pairs)
+                 if len(hit) == 1 and sum(hit[0] in other for other in hits) == 1]
+        if not found:
+            return []
+        with events._read_only(kanban_db.kanban_db_path(board=accepted[0].board_slug)) as board:
+            return [(i, sid) for i, sid in found if board.execute(
+                "SELECT 1 FROM tasks WHERE id=? AND task_kind='recommendation' AND project_id=? AND review_policy='owner' "
+                "AND recommendation_decision='accepted'", (sid, project_id)).fetchone() is not None
+                and not has_live_recommendation_closure(board, sid) and board.execute(
+                    "SELECT 1 FROM recommendation_made_from WHERE recommendation_id=?", (sid,)).fetchone() is None]
+    except (OSError, sqlite3.Error, TypeError, ValueError, KeyError, owner_workspace.OwnerWorkspaceError):
+        logger.debug("Daily review pairs for a changed plan could not be confirmed")
+    return []
+
+
 def _denied_plan(registry, project_id, proposal, suggestions=()):
     """Whether the owner denied this reviewed plan, or a reviewed plan for one of its accepted suggestions.
 
