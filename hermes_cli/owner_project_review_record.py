@@ -162,16 +162,19 @@ def _board_record(board, project, cursors, last_review, sources, cuts):
         key=lambda row: (row["event_revision"], row["id"]), reverse=True,
     )
     (finished,) = _reduce(cuts, "tasks", "limit", [finished], 100)
-    _suggestions(board, project, sources, cuts)
-    # A done card is also kept while it is the linked card of an accepted suggestion with no closure row: the cursor
-    # has passed its events, and a closure needs the card in the input.
-    linked = {item["linked_card"] for item in sources["suggestions"]
-              if item["decision"] == "accepted" and "closure" not in item}
-    linked -= {row["id"] for row in finished}
-    selected = unfinished + finished + [row for row in rows if row["status"] == "done" and row["id"] in linked]
+    selected = unfinished + finished
     ids = {row["id"] for row in selected}
+    # Added after the limit, the done linked card of an accepted suggestion with no closure row joins selected and
+    # selected_ids but not ids, so no owner decision and no class to classify comes with it.
+    linked = {card for (card,) in board.execute(
+        "SELECT (SELECT card_id FROM recommendation_made_from WHERE recommendation_id=t.id "
+        "ORDER BY recorded_at,card_id LIMIT 1) FROM tasks t WHERE t.task_kind='recommendation' AND t.project_id=? "
+        "AND t.recommendation_decision='accepted' "
+        "AND NOT EXISTS (SELECT 1 FROM recommendation_closures WHERE recommendation_id=t.id)", (project.id,),
+    )} if _table(board, "recommendation_made_from") and _table(board, "recommendation_closures") else set()
+    selected += [row for row in rows if row["status"] == "done" and row["id"] in linked and row["id"] not in ids]
     # One JSON parameter carries the selected ids into SQL, whatever their number.
-    selected_ids = json.dumps(sorted(ids))
+    selected_ids = json.dumps(sorted(row["id"] for row in selected))
     parents: dict[str, list[str]] = {}
     children: dict[str, list[str]] = {}
     for parent, child in board.execute(
@@ -223,6 +226,7 @@ def _board_record(board, project, cursors, last_review, sources, cuts):
             (selected_ids,))
     ]], 100)
     _decisions(board, project, ids, cursors, sources, cuts)
+    _suggestions(board, project, sources, cuts)
 
 
 def _decisions(board, project, ids, cursors, sources, cuts):
