@@ -162,7 +162,13 @@ def _board_record(board, project, cursors, last_review, sources, cuts):
         key=lambda row: (row["event_revision"], row["id"]), reverse=True,
     )
     (finished,) = _reduce(cuts, "tasks", "limit", [finished], 100)
-    selected = unfinished + finished
+    _suggestions(board, project, sources, cuts)
+    # A done card is also kept while it is the linked card of an accepted suggestion with no closure row: the cursor
+    # has passed its events, and a closure needs the card in the input.
+    linked = {item["linked_card"] for item in sources["suggestions"]
+              if item["decision"] == "accepted" and "closure" not in item}
+    linked -= {row["id"] for row in finished}
+    selected = unfinished + finished + [row for row in rows if row["status"] == "done" and row["id"] in linked]
     ids = {row["id"] for row in selected}
     # One JSON parameter carries the selected ids into SQL, whatever their number.
     selected_ids = json.dumps(sorted(ids))
@@ -217,7 +223,6 @@ def _board_record(board, project, cursors, last_review, sources, cuts):
             (selected_ids,))
     ]], 100)
     _decisions(board, project, ids, cursors, sources, cuts)
-    _suggestions(board, project, sources, cuts)
 
 
 def _decisions(board, project, ids, cursors, sources, cuts):
