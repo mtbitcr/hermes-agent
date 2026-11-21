@@ -741,6 +741,138 @@ def test_a_wrong_evidence_type_refuses_the_result_and_closes_nothing(root, monke
     assert "refused Project" in caplog.text
 
 
+# Owner facts of 2026-11-21: a proposed closure may name further items of the frozen input beside its two references.
+
+
+def _review_naming(root, monkeypatch, refs, *, cards=1):
+    """The completed review of an accepted suggestion and its delivered card; its closure names refs(suggestion, card, further)."""
+    project = _project(root)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    with _board(project) as board:
+        suggestion = _suggestion(board, project.id)
+        version = _decide(board, suggestion)
+        card = kb.create_task(board, title="Reserve a venue", project_id=project.id, made_from_recommendation=suggestion)
+        assert kb.complete_task(board, card, summary="The venue is reserved.")
+        kb.create_task(board, title="Send the invitations", project_id=project.id)
+        titles = ["Review the delivery"] + [f"Check the delivery {n}" for n in range(1, cards)]
+        further = [kb.create_task(board, title=title, project_id=project.id) for title in titles]
+    _config(root, project, closure=True)
+    assert review.review_tick(NOW) == 1
+    task_id = _open_review(root, project)
+    with kb.connect_closing(kb.kanban_db_path(board="project-summaries"), board="project-summaries") as reviews:
+        sources, _cut = review._frozen_sources(kb.get_task(reviews, task_id).body)
+    assert [(item["decision"], item["linked_card"]) for item in sources["suggestions"]] == [("accepted", card)]
+    assert set(further) <= {item["id"] for item in sources["tasks"]}
+    made = [(suggestion, card, version)]
+    payload = _payload(made)
+    payload["classification"][0]["evidence"] = [f"suggestions:{suggestion}", f"tasks:{card}"]
+    payload["proposed_closures"][0]["evidence"] = refs(suggestion, card, further)
+    _finish_review(task_id, payload)
+    monkeypatch.setattr(time, "time", lambda: NOW + 1)
+    return project, task_id, made
+
+
+def _record_checked_closures(monkeypatch):
+    checked = []
+    check = review._review_closures
+
+    def recorded(*args):
+        checked.append(check(*args))
+        return checked[-1]
+
+    monkeypatch.setattr(review, "_review_closures", recorded)
+    return checked
+
+
+def _assert_refused_and_closed_nothing(root, project, caplog):
+    assert "(review_closure_evidence_required)" in caplog.text
+    assert _closures(project) == []
+    assert _stored(root, project) == ((None, "2026-11-09", 1), None)
+
+
+def test_a_closure_evidence_may_name_further_items_of_the_frozen_input(root, monkeypatch, caplog):
+    project, task_id, made = _review_naming(
+        root, monkeypatch, lambda suggestion, card, further: [f"suggestions:{suggestion}", f"tasks:{card}", f"tasks:{further[0]}"],
+    )
+    ((suggestion, card, _),) = made
+    checked = _record_checked_closures(monkeypatch)
+
+    assert review.review_tick(NOW + 1) == 0
+
+    assert "review_closure_evidence_required" not in caplog.text
+    assert _closures(project) == [(suggestion, card, "2026-11-10", NOW + 1, None)]
+    assert _stored(root, project)[0] == (None, "2026-11-10", 0)
+    # The kernel writes its own two references, whatever else the result named.
+    assert checked and all(
+        [closure["evidence"] for closure in closures] == [[f"suggestions:{suggestion}", f"tasks:{card}"]] for closures in checked
+    )
+
+
+@pytest.mark.parametrize("further", [
+    pytest.param("tasks:t_not_in_the_input", id="unknown_card"),
+    pytest.param("suggestions:t_not_in_the_input", id="unknown_suggestion"),
+    pytest.param("decisions:event:987654", id="unknown_decision"),
+    pytest.param("the review card of the delivery", id="no_reference_at_all"),
+])
+def test_a_closure_evidence_that_names_a_further_reference_outside_the_input_is_refused(root, monkeypatch, caplog, further):
+    project, task_id, made = _review_naming(
+        root, monkeypatch, lambda suggestion, card, _further: [f"suggestions:{suggestion}", f"tasks:{card}", further],
+    )
+
+    assert review.review_tick(NOW + 1) == 0
+
+    _assert_refused_and_closed_nothing(root, project, caplog)
+
+
+@pytest.mark.parametrize(("entries", "accepted"), [(8, True), (9, False)])
+def test_a_closure_evidence_list_holds_at_most_8_entries(root, monkeypatch, caplog, entries, accepted):
+    # Every entry names an item of the input and no two are alike, so the count alone separates 8 from 9.
+    project, task_id, made = _review_naming(
+        root, monkeypatch,
+        lambda suggestion, card, further: [f"suggestions:{suggestion}", f"tasks:{card}"] + [f"tasks:{item}" for item in further[:entries - 2]],
+        cards=7,
+    )
+
+    assert review.review_tick(NOW + 1) == 0
+
+    if accepted:
+        assert "review_closure_evidence_required" not in caplog.text
+        assert [row[:2] for row in _closures(project)] == [made[0][:2]]
+        assert _stored(root, project)[0] == (None, "2026-11-10", 0)
+    else:
+        _assert_refused_and_closed_nothing(root, project, caplog)
+
+
+@pytest.mark.parametrize("refs", [
+    pytest.param(lambda s, c, f: [f"tasks:{c}", f"tasks:{f[0]}"], id="two_cards_and_no_suggestion"),
+    pytest.param(lambda s, c, f: [f"suggestions:{s}", f"tasks:{f[0]}"], id="a_suggestion_and_another_card_but_not_the_delivered_one"),
+    pytest.param(lambda s, c, f: [f"tasks:{c}", f"tasks:{f[0]}", f"tasks:{f[1]}"], id="three_cards_and_no_suggestion"),
+    pytest.param(lambda s, c, f: [f"suggestions:{s}", f"tasks:{f[0]}", f"tasks:{f[1]}"], id="a_suggestion_and_two_other_cards"),
+])
+def test_a_closure_evidence_without_a_required_reference_is_refused_whatever_else_it_names(root, monkeypatch, caplog, refs):
+    project, task_id, made = _review_naming(root, monkeypatch, refs, cards=2)
+
+    assert review.review_tick(NOW + 1) == 0
+
+    _assert_refused_and_closed_nothing(root, project, caplog)
+
+
+@pytest.mark.parametrize("entry", [
+    pytest.param(7, id="number"), pytest.param(None, id="null"),
+    pytest.param({"ref": "tasks:t_any"}, id="object"), pytest.param(["tasks:t_any"], id="list"),
+])
+@pytest.mark.parametrize("place", ["further_entry", "instead_of_the_card"])
+def test_a_closure_evidence_with_a_non_text_entry_is_refused_and_raises_nothing(root, monkeypatch, caplog, entry, place):
+    def refs(suggestion, card, _further):
+        return [f"suggestions:{suggestion}", f"tasks:{card}", entry] if place == "further_entry" else [f"suggestions:{suggestion}", entry]
+
+    project, task_id, made = _review_naming(root, monkeypatch, refs)
+
+    assert review.review_tick(NOW + 1) == 0
+
+    _assert_refused_and_closed_nothing(root, project, caplog)
+
+
 def _owner_turn(root, name, response_id, words, created_at):
     from gateway.platforms.api_server import ResponseStore
 

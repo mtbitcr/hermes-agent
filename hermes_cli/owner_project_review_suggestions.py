@@ -23,6 +23,19 @@ def check_closure_shapes(proposals: Any) -> None:
         _review_texts({"reason": proposal["reason"]}, {"reason": _CLOSURE_REASON_LIMIT}, "", f"proposed_closures[{index}]")
 
 
+def _names_input_items(sources, tid, refs) -> bool:
+    """Whether refs is a list of at most 8 references that each name an item of the frozen input, by the check of the classification evidence."""
+    from hermes_cli.owner_project_review import ReviewRefused, check_claims
+
+    if not isinstance(refs, list) or len(refs) > 8:
+        return False
+    try:
+        check_claims(sources, [{"item": tid, "class": "superseded", "evidence": refs}])
+    except ReviewRefused as refused:
+        return refused.code == "review_class_coverage_invalid"  # the references are checked before coverage, which one claim may miss
+    return True
+
+
 def _review_closures(board, project_id, sources, classification, proposals) -> list[dict]:
     """The result's closures its classification proves. Without a board, a stored review's closures are read again:
     the closure step then checks the live state in its own board transaction."""
@@ -38,9 +51,7 @@ def _review_closures(board, project_id, sources, classification, proposals) -> l
         tid, card_id = proposal["recommendation_id"], proposal["card_id"]
         evidence = [f"suggestions:{tid}", f"tasks:{card_id}"]
         if (tid in seen or tid not in suggestions or card_id not in cards
-                or not isinstance(proposal["evidence"], list) or len(proposal["evidence"]) != 2
-                or not all(isinstance(ref, str) for ref in proposal["evidence"])
-                or set(proposal["evidence"]) != set(evidence)
+                or not _names_input_items(sources, tid, proposal["evidence"]) or not set(evidence) <= set(proposal["evidence"])
                 or classes.get(tid, {}).get("class") != "superseded"
                 or f"tasks:{card_id}" not in classes[tid]["evidence"]
                 # A pending suggestion, or an accepted one whose own linked card is the proposed delivery.
