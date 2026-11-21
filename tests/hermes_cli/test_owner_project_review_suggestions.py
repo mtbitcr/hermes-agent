@@ -1168,3 +1168,92 @@ def test_an_accepted_suggestion_called_superseded_with_no_checkable_evidence_is_
         _parse(world)
 
     assert refused.value.code == "review_class_evidence_required"
+
+
+def _closure(world):
+    """The closure the review proposes for the delivered linked card, with its two required references."""
+    linked, card = world["linked"], world["card"]
+    return {"recommendation_id": linked, "card_id": card, "reason": "Lunch for the guests is ordered.",
+            "evidence": [f"suggestions:{linked}", f"tasks:{card}"]}
+
+
+def _delivered(world, suggestion, card):
+    """What _delivered_match says of the suggestion's linked card, read from the frozen input and the live board."""
+    with _summary_board() as board:
+        sources, _cut = review._frozen_sources(kanban_db.get_task(board, world["review_task"]).body)
+    [frozen] = [item for item in sources["tasks"] if item["id"] == card]
+    with review._review_evidence_board(world["project"].id) as (board, _registry, _project):
+        return review._delivered_match(board, world["project"].id, suggestion, frozen)
+
+
+def _harvested(world):
+    """The tick that harvests the completed result: the code of its refusal, None when the result was accepted."""
+    with _written_at(NOW + 1):
+        assert review.review_tick(NOW + 1) == 0
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        refusal = registry.execute(
+            "SELECT last_refusal FROM project_review_state WHERE project_id=?", (world["project"].id,),
+        ).fetchone()[0]
+    return json.loads(refusal)["code"] if refusal else None
+
+
+def _closure_rows(world):
+    with _project_board(world["project"]) as board:
+        return [tuple(row) for row in board.execute(
+            "SELECT recommendation_id,card_id,card_state,closed_by,review_date FROM recommendation_closures")]
+
+
+def test_the_result_of_0605z_superseded_with_only_the_suggestion_reference_is_accepted_and_closes_the_suggestion(world):
+    """The result of 2026-11-21 06:05Z: superseded with suggestions:<id> alone, which the kernel computed as answered."""
+    linked, card = world["linked"], world["card"]
+    assert _delivered(world, linked, card) == "done"
+    _complete(world, _result(world, classes={linked: ("superseded", [f"suggestions:{linked}"])}, closures=[_closure(world)]))
+
+    assert _harvested(world) is None
+    assert _stored_classes(world)[linked] == ("superseded", [f"tasks:{card}"])
+    assert _closure_rows(world) == [(linked, card, "done", "project-review", "2026-11-10")]
+
+
+def test_a_delivered_linked_card_called_answered_is_stored_superseded_and_its_proposed_closure_is_written(world):
+    linked, card = world["linked"], world["card"]
+    assert _delivered(world, linked, card) == "done"
+    _complete(world, _result(world, classes={linked: ("answered", [f"suggestions:{linked}"])}, closures=[_closure(world)]))
+
+    assert _harvested(world) is None
+    assert _stored_classes(world)[linked] == ("superseded", [f"tasks:{card}"])
+    assert _closure_rows(world) == [(linked, card, "done", "project-review", "2026-11-10")]
+
+
+def test_a_delivered_linked_card_called_answered_with_no_proposed_closure_is_stored_superseded_and_closes_nothing(world):
+    linked, card = world["linked"], world["card"]
+    assert _delivered(world, linked, card) == "done"
+    _complete(world, _result(world, classes={linked: ("answered", [f"suggestions:{linked}"])}))
+
+    assert _harvested(world) is None
+    assert _stored_classes(world)[linked] == ("superseded", [f"tasks:{card}"])
+    assert _closure_rows(world) == []
+
+
+def _open_card(board, project):
+    badges = _suggestion(board, project, "Print the visit badges", "badges")
+    _decide(board, badges, "accepted", "The guests need badges.")
+    card = kanban_db.create_task(board, title="Print the badges for the guests", project_id=project.id,
+                                 made_from_recommendation=badges)
+    return {"badges": badges, "badges_card": card}
+
+
+@pytest.fixture
+def open_card_world(root, ctx):
+    """The world above with one more accepted suggestion whose made-from card is still open, so not delivered."""
+    return _world(root, ctx, _open_card)
+
+
+def test_an_accepted_suggestion_whose_linked_card_is_not_delivered_is_stored_answered_as_today(open_card_world):
+    world = open_card_world
+    badges = world["badges"]
+    assert _delivered(world, badges, world["badges_card"]) is None
+    _complete(world, _result(world, classes={badges: ("answered", [f"suggestions:{badges}"])}))
+
+    assert _harvested(world) is None
+    assert _stored_classes(world)[badges] == ("answered", [f"suggestions:{badges}"])
+    assert _closure_rows(world) == []

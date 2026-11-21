@@ -357,9 +357,8 @@ def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, s
             actual = "answered"
             evidence = [f"decisions:event:{max(item['event_id'] for item in answers)}"]
         elif (tid in suggestions and suggestions[tid]["decision"] == "accepted" and (made := suggestions[tid].get("linked_card"))
-              and by_item[tid]["class"] == "superseded" and f"tasks:{made}" in by_item[tid]["evidence"]
               and made in tasks and _delivered_match(board, project_id, tid, tasks[made])):
-            # An accepted suggestion whose own linked card is delivered, as the worker's evidence names it.
+            # An accepted suggestion whose own linked card is delivered: the kernel's records decide, not the claim.
             actual, evidence = "superseded", [f"tasks:{made}"]
         elif tid in suggestions and needs_no_card(board, project_id, suggestions[tid]):
             # An accepted model update, by the input's mark or, with no mark, its board row: its own Update settles it.
