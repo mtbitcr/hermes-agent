@@ -1173,3 +1173,376 @@ def test_a_linked_conversation_under_two_profiles_is_not_available(root):
             _record().read_conversation_news(registry, project.id)
     with pytest.raises(ValueError, match="linked_conversation_unavailable"):
         _record().build_review_input(project, START, None)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# 11. The delivered card of an open accepted suggestion stays in the input
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _delivered_pair(conn, project) -> tuple[str, str]:
+    """An accepted suggestion and its linked card: made from it by the kernel, then completed."""
+    suggestion = _suggestion(conn, project, "Book the room", "meeting-room")
+    _decide(conn, suggestion, "accepted", "The team wants it.")
+    card = _card(conn, project, "Reserve a venue", made_from_recommendation=suggestion)
+    assert kanban_db.complete_task(conn, card, summary="The venue is reserved.")
+    return suggestion, card
+
+
+def _past_every_event(root: Path, project) -> events.Cursors:
+    return events.Cursors(_last_event(root, project), 0, 0)
+
+
+def _close(conn, suggestion: str, card: str) -> dict:
+    """The kernel's checked closure of the pair; the Vienna day inside ``_written_at`` is 1970-01-01."""
+    version = conn.execute("SELECT recommendation_lifecycle_version FROM tasks WHERE id=?", (suggestion,)).fetchone()[0]
+    with _written_at(5_000):
+        return kanban_db.close_recommendation_delivered(
+            conn, suggestion, card, reason="The venue is reserved.", review_date="1970-01-01",
+            expected_lifecycle_version=version,
+        )
+
+
+def test_the_delivered_card_of_an_open_accepted_suggestion_stays_in_the_input_behind_the_cursor(root):
+    """The accepted review moved the cursor past each event of the card; the suggestion still names it."""
+    project = _make(root, "Delivered Card")
+    with _board(root, project.board_slug) as conn:
+        suggestion, card = _delivered_pair(conn, project)
+        revision = kanban_db.task_event_revision(conn, card)
+    cursors = _past_every_event(root, project)
+    assert cursors.event >= revision
+
+    result = _record().build_review_input(project, cursors, None)
+
+    (item,) = result["sources"]["suggestions"]
+    assert (item["id"], item["decision"], item["linked_card"], "closure" in item) == (
+        suggestion, "accepted", card, False,
+    )
+    tasks = result["sources"]["tasks"]
+    assert [task["id"] for task in tasks] == [card]
+    assert (tasks[0]["status"], tasks[0]["event_revision"], tasks[0]["delivery_state"], tasks[0]["events"]) == (
+        "done", revision, "done", [],
+    )
+
+
+def test_a_closure_of_the_pair_is_accepted_with_the_card_in_the_input_and_refused_without_it(root):
+    from hermes_cli.owner_project_review import ReviewRefused
+    from hermes_cli.owner_project_review_suggestions import _review_closures
+
+    project = _make(root, "Closure Chain")
+    with _board(root, project.board_slug) as conn:
+        suggestion, card = _delivered_pair(conn, project)
+    sources = _record().build_review_input(project, _past_every_event(root, project), None)["sources"]
+    classification = [{"item": suggestion, "class": "superseded", "evidence": [f"tasks:{card}"]}]
+    proposals = [{"recommendation_id": suggestion, "card_id": card, "reason": "The venue is reserved.",
+                  "evidence": [f"suggestions:{suggestion}", f"tasks:{card}"]}]
+
+    (closure,) = _review_closures(None, project.id, sources, classification, proposals)
+
+    assert (closure["recommendation_id"], closure["card_id"], closure["card_state"]) == (suggestion, card, "done")
+    without_card = {**sources, "tasks": [task for task in sources["tasks"] if task["id"] != card]}
+    with pytest.raises(ReviewRefused) as refused:
+        _review_closures(None, project.id, without_card, classification, proposals)
+    assert refused.value.code == "review_closure_evidence_required"
+
+
+@pytest.mark.parametrize("undone", [pytest.param(False, id="live"), pytest.param(True, id="undone")])
+def test_a_suggestion_with_a_closure_row_does_not_keep_its_card_in_the_input(root, undone):
+    """After an Undo only a later delivery lets the kernel close again, and that gives the card a new event."""
+    project = _make(root, "Closed Pair")
+    with _board(root, project.board_slug) as conn:
+        suggestion, card = _delivered_pair(conn, project)
+        closed = _close(conn, suggestion, card)
+        if undone:
+            with _written_at(5_001):
+                assert kanban_db.undo_recommendation_closure(
+                    conn, suggestion, actor=OWNER, reason="The room needs another check.",
+                    expected_closed_at=closed["closed_at"],
+                )["status"] == "undone"
+
+    result = _record().build_review_input(project, _past_every_event(root, project), None)
+
+    (item,) = result["sources"]["suggestions"]
+    assert item["closure"]["card_id"] == card and (item["closure"]["undone_at"] is not None) == undone
+    assert result["sources"]["tasks"] == []
+
+
+@pytest.mark.parametrize(("case", "decision", "linked"), [
+    ("pending", "pending", True), ("rejected", "rejected", True), ("unlinked", "accepted", False),
+    ("archived", "accepted", True),
+])
+def test_a_done_card_stays_out_of_the_input_unless_an_open_accepted_suggestion_links_it(root, case, decision, linked):
+    project = _make(root, "Not Named")
+    with _board(root, project.board_slug) as conn:
+        suggestion = _suggestion(conn, project, "Book the room", "meeting-room")
+        if case in ("unlinked", "archived"):
+            _decide(conn, suggestion, "accepted", "The team wants it.")
+        card = _card(conn, project, "Reserve a venue", **({"made_from_recommendation": suggestion} if linked else {}))
+        assert kanban_db.complete_task(conn, card, summary="The venue is reserved.")
+        if case == "rejected":
+            _decide(conn, suggestion, "rejected", "The team does not want it.")
+        if case == "archived":
+            assert kanban_db.archive_task(conn, card)
+
+    result = _record().build_review_input(project, _past_every_event(root, project), None)
+
+    (item,) = result["sources"]["suggestions"]
+    assert (item["decision"], item["linked_card"], "closure" in item) == (decision, card if linked else None, False)
+    assert result["sources"]["tasks"] == []
+
+
+def test_a_linked_card_with_news_behind_the_cursor_is_in_the_input_once(root):
+    project = _make(root, "News Too")
+    with _board(root, project.board_slug) as conn:
+        suggestion = _suggestion(conn, project, "Book the room", "meeting-room")
+        _decide(conn, suggestion, "accepted", "The team wants it.")
+        card = _card(conn, project, "Reserve a venue", made_from_recommendation=suggestion)
+    cursor = _last_event(root, project)
+    with _board(root, project.board_slug) as conn:
+        assert kanban_db.complete_task(conn, card, summary="The venue is reserved.")
+
+    result = _record().build_review_input(project, events.Cursors(cursor, 0, 0), None)
+
+    (item,) = result["sources"]["suggestions"]
+    assert (item["decision"], item["linked_card"], "closure" in item) == ("accepted", card, False)
+    tasks = result["sources"]["tasks"]
+    assert [task["id"] for task in tasks] == [card]
+    assert tasks[0]["status"] == "done" and tasks[0]["events"]
+    assert all(event["id"] > cursor for event in tasks[0]["events"])
+
+
+def test_the_added_card_has_the_keys_of_every_task_item_and_stays_outside_the_limit(root):
+    project = _make(root, "Beyond The Limit")
+    with _board(root, project.board_slug) as conn:
+        _, card = _delivered_pair(conn, project)
+        _card(conn, project, "Still open")
+    cursor = _last_event(root, project)
+    with _board(root, project.board_slug) as conn:
+        for n in range(102):
+            with _written_at(2_000 + n):
+                assert kanban_db.complete_task(conn, _card(conn, project, f"Done {n:03d}"), summary="Done.")
+
+    result = _record().build_review_input(project, events.Cursors(cursor, 0, 0), None)
+
+    tasks = result["sources"]["tasks"]
+    # The open card, the 100 newest done cards with news, then the linked card, which has none.
+    assert [task["title"] for task in tasks] == [
+        "Still open", *(f"Done {n:03d}" for n in range(101, 1, -1)), "Reserve a venue",
+    ]
+    assert tasks[-1]["id"] == card and tasks[-1]["events"] == []
+    assert {frozenset(task) for task in tasks} == {frozenset(tasks[0])}
+    assert _cut(result, "tasks") == {"source": "tasks", "shown": 100, "total": 102, "reason": "limit"}
+
+
+def test_a_linked_card_with_news_that_the_limit_cuts_is_added_back_after_it(root):
+    project = _make(root, "Cut By The Limit")
+    with _board(root, project.board_slug) as conn:
+        suggestion = _suggestion(conn, project, "Book the room", "meeting-room")
+        _decide(conn, suggestion, "accepted", "The team wants it.")
+        card = _card(conn, project, "Reserve a venue", made_from_recommendation=suggestion)
+    cursor = _last_event(root, project)
+    with _board(root, project.board_slug) as conn:
+        assert kanban_db.complete_task(conn, card, summary="The venue is reserved.")
+        for n in range(101):
+            with _written_at(2_000 + n):
+                assert kanban_db.complete_task(conn, _card(conn, project, f"Done {n:03d}"), summary="Done.")
+
+    result = _record().build_review_input(project, events.Cursors(cursor, 0, 0), None)
+
+    tasks = result["sources"]["tasks"]
+    # The linked card is the oldest of the 102 done cards with news, so the limit cuts it; it comes back after the 100.
+    assert [task["title"] for task in tasks] == [*(f"Done {n:03d}" for n in range(100, 0, -1)), "Reserve a venue"]
+    assert tasks[-1]["id"] == card and tasks[-1]["events"]
+    assert _cut(result, "tasks") == {"source": "tasks", "shown": 100, "total": 102, "reason": "limit"}
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# 12. The card is found in the untrimmed suggestions, and it adds nothing for the review to classify
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _oldest_of_fifty_one(root: Path, project, closure: str | None = None) -> tuple[str, str]:
+    """A delivered pair whose suggestion is the oldest of 51 decided suggestions, so the limit of 50 cuts it."""
+    with _board(root, project.board_slug) as conn:
+        with _written_at(1_000):
+            suggestion, card = _delivered_pair(conn, project)
+        if closure:
+            closed = _close(conn, suggestion, card)
+            if closure == "undone":
+                with _written_at(5_001):
+                    assert kanban_db.undo_recommendation_closure(
+                        conn, suggestion, actor=OWNER, reason="The room needs another check.",
+                        expected_closed_at=closed["closed_at"],
+                    )["status"] == "undone"
+        for n in range(50):
+            with _written_at(2_000 + n):
+                _decide(conn, _suggestion(conn, project, f"Other {n:02d}", f"other-{n:02d}"), "rejected", "Not now.")
+    return suggestion, card
+
+
+def test_the_card_of_an_open_accepted_suggestion_stays_when_the_limit_of_fifty_cuts_the_suggestion(root):
+    project = _make(root, "Fifty One Decided")
+    suggestion, card = _oldest_of_fifty_one(root, project)
+
+    result = _record().build_review_input(project, _past_every_event(root, project), None)
+
+    shown = [item["id"] for item in result["sources"]["suggestions"]]
+    assert len(shown) == 50 and suggestion not in shown
+    assert _cut(result, "suggestions") == {"source": "suggestions", "shown": 50, "total": 51, "reason": "limit"}
+    assert [task["id"] for task in result["sources"]["tasks"]] == [card]
+
+
+@pytest.mark.parametrize("closure", ["live", "undone"])
+def test_a_closure_row_of_a_suggestion_that_the_limit_cuts_keeps_its_card_out_of_the_input(root, closure):
+    project = _make(root, "Closed Beyond The Limit")
+    suggestion, _ = _oldest_of_fifty_one(root, project, closure)
+    with _board(root, project.board_slug) as conn:
+        (undone_at,) = conn.execute(
+            "SELECT undone_at FROM recommendation_closures WHERE recommendation_id=?", (suggestion,),
+        ).fetchone()
+    assert (undone_at is not None) == (closure == "undone")
+
+    result = _record().build_review_input(project, _past_every_event(root, project), None)
+
+    assert suggestion not in [item["id"] for item in result["sources"]["suggestions"]]
+    assert _cut(result, "suggestions") == {"source": "suggestions", "shown": 50, "total": 51, "reason": "limit"}
+    assert result["sources"]["tasks"] == []
+
+
+def test_only_the_card_that_the_suggestion_list_names_is_added_when_a_suggestion_has_two_lineage_rows(root):
+    project = _make(root, "Two Lineage Rows")
+    with _board(root, project.board_slug) as conn:
+        with _written_at(1_000):
+            suggestion, first = _delivered_pair(conn, project)
+            second = _card(conn, project, "Reserve a second venue")
+            assert kanban_db.complete_task(conn, second, summary="The second venue is reserved.")
+        # The kernel writes one lineage row per suggestion; a later second row must not change the card that is named.
+        conn.execute(
+            "INSERT INTO recommendation_made_from (card_id,recommendation_id,recorded_at) VALUES (?,?,2000)",
+            (second, suggestion),
+        )
+        conn.commit()
+
+    result = _record().build_review_input(project, _past_every_event(root, project), None)
+
+    (item,) = result["sources"]["suggestions"]
+    assert item["linked_card"] == first
+    assert [task["id"] for task in result["sources"]["tasks"]] == [first]
+
+
+def test_a_board_without_the_lineage_table_reads_without_error_and_adds_no_card(root):
+    project = _make(root, "Before Lineage")
+    with _board(root, project.board_slug) as conn:
+        _delivered_pair(conn, project)
+        conn.execute("DROP TABLE recommendation_made_from")
+        conn.commit()
+
+    result = _record().build_review_input(project, _past_every_event(root, project), None)
+
+    (item,) = result["sources"]["suggestions"]
+    assert (item["decision"], item["linked_card"]) == ("accepted", None)
+    assert result["sources"]["tasks"] == []
+
+
+def test_the_card_that_comes_back_after_the_limit_adds_no_decision_and_no_class_to_classify(root):
+    """The added card is a task item only: the review classifies the same items as on a record without it."""
+    from hermes_cli.owner_project_review import check_claims
+
+    project = _make(root, "Asked And Answered")
+    with _board(root, project.board_slug) as conn:
+        suggestion = _suggestion(conn, project, "Book the room", "meeting-room")
+        _decide(conn, suggestion, "accepted", "The team wants it.")
+        card = _card(conn, project, "Reserve a venue", made_from_recommendation=suggestion)
+    cursor = _last_event(root, project)
+    with _board(root, project.board_slug) as conn:
+        assert kanban_db.block_task(conn, card, reason="Which room?", kind="needs_input")
+        assert kanban_db.unblock_task(conn, card)
+        assert kanban_db.complete_task(conn, card, summary="The venue is reserved.")
+        for n in range(101):
+            with _written_at(2_000 + n):
+                assert kanban_db.complete_task(conn, _card(conn, project, f"Done {n:03d}"), summary="Done.")
+
+    sources = _record().build_review_input(project, events.Cursors(cursor, 0, 0), None)["sources"]
+
+    assert len(sources["tasks"]) == 101 and sources["tasks"][-1]["id"] == card
+    assert [row for row in sources["decisions"] if row.get("task_id") == card] == []
+    claims = [{"item": suggestion, "class": "superseded", "evidence": [f"suggestions:{suggestion}"]}]
+    expected, _, _ = check_claims(sources, claims)
+    assert expected == {suggestion}
+
+
+def test_the_added_card_has_its_links_and_its_run_read_like_every_task_item(root):
+    project = _make(root, "Links And Runs")
+    with _board(root, project.board_slug) as conn:
+        suggestion = _suggestion(conn, project, "Book the room", "meeting-room")
+        _decide(conn, suggestion, "accepted", "The team wants it.")
+        parent = _card(conn, project, "Find a venue")
+        card = _card(conn, project, "Reserve a venue", parents=[parent], made_from_recommendation=suggestion)
+        assert kanban_db.complete_task(conn, parent, summary="A venue is found.")
+        assert kanban_db.complete_task(conn, card, summary="The venue is reserved.")
+
+    result = _record().build_review_input(project, _past_every_event(root, project), None)
+
+    (task,) = result["sources"]["tasks"]
+    assert (task["id"], task["parents"], task["children"]) == (card, [parent], [])
+    assert [run["task_id"] for run in result["sources"]["runs"]] == [card]
+
+
+def test_both_limits_act_together_and_the_cumulative_notice_counts_each_card_once(root):
+    """A linked card without news is added after the limit of 100; the total cap then cuts the tasks."""
+    project = _make(root, "Both Limits")
+    with _board(root, project.board_slug) as conn:
+        _, card = _delivered_pair(conn, project)
+        _card(conn, project, "Still open")
+    cursor = _last_event(root, project)
+    with _board(root, project.board_slug) as conn:
+        for n in range(102):
+            with _written_at(2_000 + n):
+                assert kanban_db.complete_task(conn, _card(conn, project, f"Done {n:03d}"), summary="Done.")
+    cursors = events.Cursors(cursor, 0, 0)
+    record = _record()
+    limit = {"source": "tasks", "shown": 100, "total": 102, "reason": "limit"}
+
+    full = record.build_review_input(project, cursors, None)
+
+    # The open card, the 100 newest done cards with news, then the linked card: 102 rows of 104 distinct cards.
+    assert len(full["sources"]["tasks"]) == 102 and full["sources"]["tasks"][-1]["id"] == card
+    assert _cut(full, "tasks") == limit
+    for cap in range(full["size"] - 1, 4_000, -1_000):
+        result = record.build_review_input(project, cursors, None, max_bytes=cap)
+        cut = _cut(result, "tasks", "total_cap")
+        if cut is None:
+            continue
+        kept = len(result["sources"]["tasks"])
+        assert (cut["shown"], cut["total"]) == (kept, 104)
+        assert f"Left out: {104 - kept} of 104 tasks." in result["text"]
+        assert _cut(result, "tasks", "limit") == limit
+        break
+    else:
+        pytest.fail("no cap cut the tasks")
+
+
+def test_a_restored_card_that_the_limit_counted_is_counted_once_in_the_cumulative_notice(root):
+    """The limit cuts the linked card, the oldest done card with news; it is added back and the cap counts it once."""
+    project = _make(root, "Counted Once")
+    with _board(root, project.board_slug) as conn:
+        _, card = _delivered_pair(conn, project)
+        _card(conn, project, "Still open")
+        for n in range(101):
+            with _written_at(2_000 + n):
+                assert kanban_db.complete_task(conn, _card(conn, project, f"Done {n:03d}"), summary="Done.")
+    record = _record()
+    limit = {"source": "tasks", "shown": 100, "total": 102, "reason": "limit"}
+
+    full = record.build_review_input(project, START, None)
+
+    # The open card, the 100 newest done cards, then the restored linked card: 102 rows of 103 distinct cards.
+    assert len(full["sources"]["tasks"]) == 102 and full["sources"]["tasks"][-1]["id"] == card
+    assert _cut(full, "tasks", "limit") == limit
+
+    result = record.build_review_input(project, START, None, max_bytes=7_650)
+
+    assert len(result["sources"]["tasks"]) == 29
+    assert _cut(result, "tasks", "total_cap") == {"source": "tasks", "shown": 29, "total": 103, "reason": "total_cap"}
+    assert "Left out: 74 of 103 tasks." in result["text"]
+    assert _cut(result, "tasks", "limit") == limit
