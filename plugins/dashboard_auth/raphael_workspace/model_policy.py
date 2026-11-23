@@ -1367,7 +1367,9 @@ def project_oauth_payload(payload: Mapping[str, Any]) -> dict:
     return {"providers": providers}
 
 
-def _admitted_models_for(profile: Optional[str], provider: str) -> set:
+def _admitted_models_for(
+    profile: Optional[str], provider: str, updates: tuple[dict, ...]
+) -> set[str]:
     """Model ids ``profile`` may run on ``provider``, across every task class.
 
     With no profile named (a generic availability read) this stays the whole
@@ -1375,19 +1377,19 @@ def _admitted_models_for(profile: Optional[str], provider: str) -> set:
     """
     key = str(profile or "").strip()
     if not key:
-        updates = _model_updates()
         return {
             _apply_model_updates(assignment, updates)[0].model
             for assignment in _ASSIGNMENTS.values()
             if assignment.provider == provider
         }
     try:
-        base = assignment_for(key, provider)
+        base = _matrix_assignment(key, provider)
     except ValueError:
         return set()
-    models = {base.model}
+    models = {_apply_model_updates(base, updates)[0].model}
     for tier in _EXECUTION_TIERS:
-        models.add(task_assignment_for(key, provider, tier).model)
+        route = _matrix_task_assignment(key, provider, tier)
+        models.add(_apply_model_updates(route, updates)[0].model)
     return models
 
 
@@ -1417,8 +1419,10 @@ def project_options_payload(
     an OpenAI builder, a Claude verifier — cannot be surfaced as a selectable
     option by a reader that only looks at the model list.
     """
+    # An owner undo can replace the record while this response is built.
+    updates = _model_updates()
     admitted = {
-        provider: _admitted_models_for(profile, provider)
+        provider: _admitted_models_for(profile, provider, updates)
         for provider in admitted_provider_ids()
     }
     rows = []
@@ -1444,14 +1448,12 @@ def project_options_payload(
             base_assignment = _ASSIGNMENTS.get((str(profile or ""), provider))
             task_routes = None
             if base_assignment is not None:
-                # The selector and the model write use the same approved version.
-                base_assignment = assignment_for(base_assignment.profile, provider)
-                task_routes = {
-                    tier: _assignment_payload(
-                        task_assignment_for(base_assignment.profile, provider, tier)
-                    )
-                    for tier in sorted(_EXECUTION_TIERS)
-                }
+                base_assignment, _ = _apply_model_updates(base_assignment, updates)
+                task_routes = {}
+                for tier in sorted(_EXECUTION_TIERS):
+                    route = _matrix_task_assignment(base_assignment.profile, provider, tier)
+                    assignment, _ = _apply_model_updates(route, updates)
+                    task_routes[tier] = _assignment_payload(assignment)
             rows.append({
                 "slug": provider,
                 "authenticated": raw.get("authenticated") is True,

@@ -214,6 +214,38 @@ def test_planner_switch_offers_the_approved_openai_version():
         assert option["task_routes"][tier] == option["assignment"]
 
 
+def test_options_response_uses_one_model_update_snapshot_during_undo(monkeypatch):
+    provider, from_model, to_model = _SOL
+    update = _entry(_SOL)
+    model_policy.apply_model_update_record(update)
+    native = {
+        "providers": [{
+            "slug": provider,
+            "authenticated": True,
+            "models": [from_model, to_model],
+        }],
+    }
+    assignment_payload = model_policy._assignment_payload
+    undone = False
+
+    def payload_during_undo(assignment):
+        nonlocal undone
+        # The owner can undo the update while the response renders a task route.
+        if not undone:
+            undone = True
+            model_policy.apply_model_update_record({**update, "state": "rolled_back"})
+        return assignment_payload(assignment)
+
+    monkeypatch.setattr(model_policy, "_assignment_payload", payload_during_undo)
+
+    for expected_model in (to_model, from_model):
+        (option,) = project_options_payload(native, profile="raphael-planner")["providers"]
+        assert option["models"] == [expected_model]
+        assert option["assignment"]["model"] == expected_model
+        for tier in _TIERS:
+            assert option["task_routes"][tier] == option["assignment"]
+
+
 # ---------------------------------------------------------------------------
 # Locks: the old route keeps verifying and can never be minted again
 # ---------------------------------------------------------------------------
