@@ -1444,6 +1444,8 @@ def project_options_payload(
             base_assignment = _ASSIGNMENTS.get((str(profile or ""), provider))
             task_routes = None
             if base_assignment is not None:
+                # The selector and the model write use the same approved version.
+                base_assignment = assignment_for(base_assignment.profile, provider)
                 task_routes = {
                     tier: _assignment_payload(
                         task_assignment_for(base_assignment.profile, provider, tier)

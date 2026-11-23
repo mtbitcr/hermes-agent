@@ -195,6 +195,25 @@ def test_options_projection_offers_to_model_in_place_of_from_model():
     assert _offered(None) == ["claude-opus-6", "claude-sonnet-5-5"]
 
 
+def test_planner_switch_offers_the_approved_openai_version():
+    provider, _from_model, to_model = _SOL
+    model_policy.apply_model_update_record(_entry(_SOL))
+    native = {
+        "providers": [{
+            "slug": provider,
+            "authenticated": True,
+            "models": [to_model],
+        }],
+    }
+
+    (option,) = project_options_payload(native, profile="raphael-planner")["providers"]
+
+    assert option["models"] == [to_model]
+    assert option["assignment"]["model"] == to_model
+    for tier in _TIERS:
+        assert option["task_routes"][tier] == option["assignment"]
+
+
 # ---------------------------------------------------------------------------
 # Locks: the old route keeps verifying and can never be minted again
 # ---------------------------------------------------------------------------
