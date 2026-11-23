@@ -1520,3 +1520,29 @@ def test_both_limits_act_together_and_the_cumulative_notice_counts_each_card_onc
         break
     else:
         pytest.fail("no cap cut the tasks")
+
+
+def test_a_restored_card_that_the_limit_counted_is_counted_once_in_the_cumulative_notice(root):
+    """The limit cuts the linked card, the oldest done card with news; it is added back and the cap counts it once."""
+    project = _make(root, "Counted Once")
+    with _board(root, project.board_slug) as conn:
+        _, card = _delivered_pair(conn, project)
+        _card(conn, project, "Still open")
+        for n in range(101):
+            with _written_at(2_000 + n):
+                assert kanban_db.complete_task(conn, _card(conn, project, f"Done {n:03d}"), summary="Done.")
+    record = _record()
+    limit = {"source": "tasks", "shown": 100, "total": 102, "reason": "limit"}
+
+    full = record.build_review_input(project, START, None)
+
+    # The open card, the 100 newest done cards, then the restored linked card: 102 rows of 103 distinct cards.
+    assert len(full["sources"]["tasks"]) == 102 and full["sources"]["tasks"][-1]["id"] == card
+    assert _cut(full, "tasks", "limit") == limit
+
+    result = record.build_review_input(project, START, None, max_bytes=7_650)
+
+    assert len(result["sources"]["tasks"]) == 29
+    assert _cut(result, "tasks", "total_cap") == {"source": "tasks", "shown": 29, "total": 103, "reason": "total_cap"}
+    assert "Left out: 74 of 103 tasks." in result["text"]
+    assert _cut(result, "tasks", "limit") == limit

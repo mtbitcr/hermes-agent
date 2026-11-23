@@ -161,11 +161,11 @@ def _board_record(board, project, cursors, last_review, sources, cuts):
         (row for row in rows if row["status"] in ("done", "archived") and row["event_revision"] > cursors.event),
         key=lambda row: (row["event_revision"], row["id"]), reverse=True,
     )
+    task_total = len(unfinished) + len(finished)
     (finished,) = _reduce(cuts, "tasks", "limit", [finished], 100)
     selected = unfinished + finished
     ids = {row["id"] for row in selected}
-    # Added after the limit, the done linked card of an accepted suggestion with no closure row joins selected and
-    # selected_ids but not ids, so no owner decision and no class to classify comes with it.
+    # Restored after the limit: the card joins selected but not ids, so no owner decision and no class comes with it.
     linked = {card for (card,) in board.execute(
         "SELECT (SELECT card_id FROM recommendation_made_from WHERE recommendation_id=t.id "
         "ORDER BY recorded_at,card_id LIMIT 1) FROM tasks t WHERE t.task_kind='recommendation' AND t.project_id=? "
@@ -227,6 +227,8 @@ def _board_record(board, project, cursors, last_review, sources, cuts):
     ]], 100)
     _decisions(board, project, ids, cursors, sources, cuts)
     _suggestions(board, project, sources, cuts)
+    # A restored card with news is already in task_total, counted before the limit; one without news is added here.
+    return task_total + sum(row["event_revision"] <= cursors.event and row["id"] not in ids for row in selected)
 
 
 def _decisions(board, project, ids, cursors, sources, cuts):
@@ -470,7 +472,7 @@ def _cut_last_review(reviews: list, cuts: list[Cut], size: int, cap: int) -> int
     return size
 
 
-def _freeze(sources, cuts, max_bytes: int | None = None) -> ReviewInput:
+def _freeze(sources, cuts, max_bytes: int | None = None, *, task_total: int | None = None) -> ReviewInput:
     cap = TOTAL_INPUT_CAP_BYTES if max_bytes is None else max_bytes
     if isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0:
         raise ValueError("the review input requires a positive byte cap")
@@ -500,15 +502,16 @@ def _freeze(sources, cuts, max_bytes: int | None = None) -> ReviewInput:
             break
         tail = source == "conversation"  # the oldest turns go first; elsewhere the last rows are the oldest
         count, data = len(rows[source]), sum(row[2] for row in rows[source])
+        total = task_total if source == "tasks" else None
         rest, keep, after = size - section(source, count, data), count, size
         floor = 1 if source == "earlier_reviews" and required else 0
         while keep > floor and after > cap:
             keep -= 1
             data -= rows[source][count - 1 - keep if tail else keep][2]
-            notice = cut_line(_cut_record(cuts, source, "total_cap", keep, count))
+            notice = cut_line(_cut_record(cuts, source, "total_cap", keep, count, total))
             after = rest + section(source, keep, data) + len(notice.encode("utf-8")) + 1
         if keep < count:
-            (rows[source],) = _reduce(cuts, source, "total_cap", [rows[source]], keep, tail=tail)
+            (rows[source],) = _reduce(cuts, source, "total_cap", [rows[source]], keep, tail=tail, total=total)
             size = after
         if floor and size > cap:
             size = _cut_last_review(rows["earlier_reviews"], cuts, size, cap)
@@ -581,6 +584,7 @@ def build_review_input(
     sources["project"] = [{"id": project.id, "name": project.name}, {"field": "description", "text": project.description}]
     cuts: list[Cut] = []
     decision_cursor = None
+    task_total = None
     token = set_hermes_home_override(str(root))
     try:
         conversation_cursor, approvals = _registry_record(root, project, last_review, sources, cuts)
@@ -595,7 +599,7 @@ def build_review_input(
             path = events._board_path(project.board_slug)
             if path.exists():
                 with events._read_only(path) as board:
-                    _board_record(board, project, cursors, last_review, sources, cuts)
+                    task_total = _board_record(board, project, cursors, last_review, sources, cuts)
                     # The whole live set from the same snapshot; the total cap may shorten only its rows in the record.
                     decision_cursor = review._decision_cursor(review._owner_decisions(board, project.id))
             else:
@@ -614,7 +618,7 @@ def build_review_input(
         sources["activity"] = [{"material": batch.material, "urgent": batch.urgent, "merges": merges, "releases": releases}]
     finally:
         reset_hermes_home_override(token)
-    result = _freeze(sources, cuts, max_bytes)
+    result = _freeze(sources, cuts, max_bytes, task_total=task_total)
     result["conversation_cursor"] = conversation_cursor
     result["decision_cursor"] = decision_cursor
     result["plan_approvals"] = approvals
