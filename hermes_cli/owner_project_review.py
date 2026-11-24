@@ -105,6 +105,14 @@ _WINDOW = re.compile(r"^Review days: from ([0-9]{4}-[0-9]{2}-[0-9]{2}|the start)
 
 _BRIEF_LIMITS = {"headline": 120, "what_changed": 400, "next_step": 240, "needs_you": 160}
 _CLOSURE_REASON_LIMIT = 300
+# Step 7's rule for a required closure; a review task published with the closure setting off leaves it out.
+_CLOSURE_RULE = """\
+   When the input holds an accepted suggestion with no live closure whose linked_card is a task of this input with a
+   non-null delivery_state, the review must propose its closure with that card. After the owner's Undo, which the
+   suggestion's closure shows with undone_at, only a delivery recorded later qualifies: a completed or delivery_merged
+   event in that task's events after undone_at. When more than three such suggestions exist, the review proposes
+   three of them.
+"""
 
 INSTRUCTION = """\
 Review one Project for its owner. Use no tool except kanban_show and kanban_complete.
@@ -133,9 +141,7 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
 7. Propose at most three closures. Each has exactly recommendation_id, card_id, reason, and evidence.
 """ + f"   The reason has at most {_CLOSURE_REASON_LIMIT} characters." + """ Evidence must name suggestions:<id> and tasks:<id> from this input.
    The card must deliver the suggestion in this Project. A proposal cannot decide or close the suggestion.
-   When the input holds an accepted suggestion with no live closure whose linked_card is a task of this input with a
-   non-null delivery_state, the review must propose its closure with that card. When more than three such suggestions
-   exist, the review proposes three of them.
+""" + _CLOSURE_RULE + """\
 8. plan_proposal is null or an object with exactly request_title, summary,
    specification, current_milestone, owner_visible_result, later_milestones, and changes.
    Use the native plan change schema. Each existing task reference must use its input status and event revision.
@@ -1703,13 +1709,13 @@ def _wait_order(news: _News, review_day: str) -> tuple:
 
 def _task_body(last_reviewed_date: Optional[str], review_day: str, covered: events.Cursors, frozen: str,
                conversation_cursor: Optional[str] = None, decision_cursor: Optional[str] = None,
-               refusal_line: str = "", plan_approvals: Optional[int] = None) -> str:
+               refusal_line: str = "", plan_approvals: Optional[int] = None, *, closure: bool = False) -> str:
     """The instruction, the line that tells why the day's last review was refused, the days the review covers, and last
-    the line that names the events it covers."""
+    the line that names the events it covers. With ``closure`` off the instruction holds no required closure."""
     from hermes_cli.owner_project_review_proposals import proposal_schema
 
     return (
-        INSTRUCTION
+        (INSTRUCTION if closure else INSTRUCTION.replace(_CLOSURE_RULE, ""))
         + "\nPlan proposal schema: "
         + json.dumps(proposal_schema(limit=_BRIEF_LIMITS["next_step"]), ensure_ascii=True, separators=(",", ":"))
         + (f"\n{refusal_line}" if refusal_line else "")
@@ -1770,7 +1776,7 @@ def _open_review_task(
         title=TITLE_PREFIX + project.name,
         body=_task_body(state["last_reviewed_date"], review_day, batch.cursors, frozen["text"], frozen["conversation_cursor"],
                         frozen["decision_cursor"], "" if _again(state, review_day) else refusal_line(state, review_day),
-                        frozen["plan_approvals"]),
+                        frozen["plan_approvals"], closure=read_settings().closure),
         assignee=summary.PLANNING_ROLE,
         created_by=CREATED_BY,
         workspace_kind="scratch",

@@ -1198,8 +1198,13 @@ def _delivered(world, suggestion, card):
 
 def _harvested(world):
     """The tick that harvests the completed result: the code of its refusal, None when the result was accepted."""
-    with _written_at(NOW + 1):
-        assert review.review_tick(NOW + 1) == 0
+    return _harvested_at(world, NOW + 1)
+
+
+def _harvested_at(world, now):
+    """The same, by the tick at ``now``: the harvest of a later review or retry."""
+    with _written_at(now):
+        assert review.review_tick(now) == 0
     with projects_db.connect_closing(world["root"] / "projects.db") as registry:
         refusal = registry.execute(
             "SELECT last_refusal FROM project_review_state WHERE project_id=?", (world["project"].id,),
@@ -1269,8 +1274,9 @@ def _open_card(board, project):
 
 @pytest.fixture
 def open_card_world(root, ctx):
-    """The world above with one more accepted suggestion whose made-from card is still open, so not delivered."""
-    return _world(root, ctx, _open_card)
+    """The world above with one more accepted suggestion whose made-from card is still open, so not delivered. The
+    closure setting is on and the catering card stays unfinished too, so no pair needs a closure."""
+    return _world(root, ctx, _open_card, closure=True, link_delivered=False)
 
 
 def test_an_accepted_suggestion_whose_linked_card_is_not_delivered_is_stored_answered_as_today(open_card_world):
@@ -1307,7 +1313,7 @@ def test_the_failing_run_answered_with_no_closure_for_its_eligible_pair_is_refus
     assert _closure_rows(world) == []
     # The existing retry path: the next run of the same day is told what was missing.
     line = "Your last result for this date was refused: " + refusal_sentences(MISSING, {})
-    assert "proposed_closures is missing a required closure." in line
+    assert "proposed_closures is missing a closure that the task instructions required." in line
     assert line in _retry_body(world).splitlines()
 
 
@@ -1455,3 +1461,138 @@ def test_a_stored_result_with_no_closure_for_its_eligible_pair_is_read_and_finis
         ).fetchone()) == (0, None)
     assert (_brief(world), _stored_classes(world)) == stored
     assert _closure_rows(world) == []
+
+
+# What the published instruction says of an eligible pair's closure, and of a delivery after the owner's Undo.
+MUST_PROPOSE = "must propose its closure"
+AFTER_UNDO = "a completed or delivery_merged event in that task's events after undone_at"
+
+
+def _published(task):
+    with _summary_board() as board:
+        return kanban_db.get_task(board, task).body
+
+
+def _instruction(body):
+    """The instruction part of a published task body, ahead of its data, on one line."""
+    return " ".join(body.split("<<<BEGIN UNTRUSTED DATA")[0].split())
+
+
+def test_with_closure_on_the_published_review_requires_the_closure_and_says_what_qualifies_after_an_undo(closure_world):
+    instruction = _instruction(_published(closure_world["review_task"]))
+
+    assert MUST_PROPOSE in instruction
+    assert AFTER_UNDO in instruction
+
+
+def test_with_closure_off_the_published_review_requires_no_closure(world):
+    instruction = _instruction(_published(world["review_task"]))
+
+    assert "must propose" not in instruction
+    assert AFTER_UNDO not in instruction
+    assert "Propose at most three closures." in instruction
+
+
+def test_a_missing_closure_refusal_does_not_require_a_closure_of_the_retry_once_the_owner_turns_closure_off(
+    closure_world,
+):
+    world = closure_world
+    linked = world["linked"]
+    claims = {linked: ("answered", [f"suggestions:{linked}"])}
+    _complete(world, _result(world, classes=claims))
+    assert _harvested(world) == MISSING
+    config = {"owner_review": {"enabled": True, "allowlist": [world["project"].id], "closure": False}}
+    (world["root"] / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    body = _retry_body(world)
+    line = "Your last result for this date was refused: " + refusal_sentences(MISSING, {})
+    assert "must propose" not in _instruction(body)
+    assert line in body.splitlines()
+    # The retry reason defers to the instructions of the task that reads it.
+    assert "If these task instructions require closures" in line
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        [retry] = registry.execute(
+            "SELECT open_task_id FROM project_review_state WHERE project_id=?", (world["project"].id,),
+        ).fetchone()
+    _complete({**world, "review_task": retry}, _result(world, classes=claims))
+
+    assert _harvested_at(world, NOW + 2 + 3600) is None
+    assert _briefs(world) == 1
+    assert _closure_rows(world) == []
+
+
+def _closed_then_undone(world):
+    """The first review closes the catering suggestion with its done card; the owner then undoes that closure."""
+    linked, card = world["linked"], world["card"]
+    _complete(world, _result(world, classes={linked: ("answered", [f"suggestions:{linked}"])}, closures=[_closure(world)]))
+    assert _harvested(world) is None
+    assert _closure_rows(world) == [(linked, card, "done", "project-review", "2026-11-10")]
+    with _written_at(NOW + 2), _project_board(world["project"]) as board:
+        [closed_at] = board.execute(
+            "SELECT closed_at FROM recommendation_closures WHERE recommendation_id=?", (linked,),
+        ).fetchone()
+        assert kanban_db.undo_recommendation_closure(
+            board, linked, actor="default", reason="The lunch order needs a check.", expected_closed_at=closed_at,
+        )["status"] == "undone"
+
+
+def _frozen_pair(world, task):
+    """The catering suggestion and its card as the frozen input of ``task`` holds them."""
+    sources, _cut = review._frozen_sources(_published(task))
+    [suggestion] = [item for item in sources["suggestions"] if item["id"] == world["linked"]]
+    [card] = [item for item in sources["tasks"] if item["id"] == world["card"]]
+    return suggestion, card
+
+
+def _live_closures(world):
+    with _project_board(world["project"]) as board:
+        return board.execute("SELECT COUNT(*) FROM recommendation_closures WHERE undone_at IS NULL").fetchone()[0]
+
+
+@pytest.mark.parametrize(("proposed", "refusal"), [(False, None), (True, "review_closure_evidence_required")],
+                         ids=["empty_list", "one_closure"])
+def test_after_the_owners_undo_with_no_newer_delivery_the_next_review_needs_no_closure_of_the_still_done_card(
+    closure_world, proposed, refusal,
+):
+    """The probe of the review: the owner undoes the closure and only comments on the still-done card."""
+    world = closure_world
+    linked, card = world["linked"], world["card"]
+    _closed_then_undone(world)
+    with _written_at(NOW + 3), _project_board(world["project"]) as board:
+        kanban_db.add_comment(board, card, "default", "The caterer confirmed the order.")
+    later = _next_review(world)
+
+    suggestion, frozen_card = _frozen_pair(world, later)
+    assert (suggestion["decision"], suggestion["closure"]["undone_at"], frozen_card["delivery_state"]) == (
+        "accepted", NOW + 2, "done")
+    assert AFTER_UNDO in _instruction(_published(later))
+    _complete({**world, "review_task": later}, _result(
+        world, classes={linked: ("answered", [f"suggestions:{linked}"])}, closures=[_closure(world)] if proposed else ()))
+
+    assert _harvested_at(world, NOW + 86401) == refusal
+    # The day's brief is stored next to the first day's only when the result is accepted.
+    assert _briefs(world) == (2 if refusal is None else 1)
+    assert _live_closures(world) == 0
+
+
+@pytest.mark.parametrize(("proposed", "refusal"), [(False, MISSING), (True, None)], ids=["empty_list", "one_closure"])
+def test_after_the_owners_undo_a_newer_delivery_of_the_card_requires_its_closure_again(closure_world, proposed, refusal):
+    world = closure_world
+    linked, card = world["linked"], world["card"]
+    _closed_then_undone(world)
+    # The card is reopened and done again: a completed event follows the Undo.
+    with _written_at(NOW + 3), _project_board(world["project"]) as board:
+        with kanban_db.write_txn(board):
+            board.execute("UPDATE tasks SET status='ready' WHERE id=?", (card,))
+        assert kanban_db.complete_task(board, card, summary="Lunch is ordered again.")
+    later = _next_review(world)
+
+    suggestion, frozen_card = _frozen_pair(world, later)
+    assert "completed" in [event["kind"] for event in frozen_card["events"]
+                           if event["at"] > suggestion["closure"]["undone_at"]]
+    _complete({**world, "review_task": later}, _result(
+        world, classes={linked: ("answered", [f"suggestions:{linked}"])}, closures=[_closure(world)] if proposed else ()))
+
+    assert _harvested_at(world, NOW + 86401) == refusal
+    assert _closure_rows(world) == [(linked, card, "done", "project-review", "2026-11-10" if refusal else "2026-11-11")]
+    assert _live_closures(world) == (0 if refusal else 1)

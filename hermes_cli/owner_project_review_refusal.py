@@ -41,8 +41,8 @@ _SENTENCES = {
         "Each proposed closure must hold exactly recommendation_id, card_id, reason and evidence, with text ids."
     ),
     "review_delivered_closure_missing": (
-        "proposed_closures is missing a required closure. Propose one for each accepted suggestion whose linked card in "
-        "the input delivered it, up to three."
+        "proposed_closures is missing a closure that the task instructions required. If these task instructions require "
+        "closures, propose each one they require, up to three."
     ),
     "portfolio_result_keys_invalid": "portfolio_review must hold exactly conflicts, priorities and shared_blockers.",
     "portfolio_result_list_invalid": "Each list of the result must be a list within the task instructions' limit.",
