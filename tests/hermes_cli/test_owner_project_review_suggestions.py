@@ -12,6 +12,7 @@ import yaml
 
 from hermes_cli import kanban_db, owner_model_updates as updates, owner_project_review as review, owner_workspace, projects_db
 from hermes_cli import owner_project_review_record as record, owner_project_summary_events as events
+from hermes_cli.owner_project_review_refusal import refusal_sentences
 from tests.hermes_cli.test_owner_project_review_plans import _approved_plan
 from tests.hermes_cli.test_owner_project_review_record import (  # noqa: F401
     _decide, _model_update_subject, _suggestion, _written_at, root,
@@ -70,7 +71,14 @@ def _model_policy(board, project):
     return {"update": update, "policy": policy}
 
 
-def _world(root, ctx, more=None):
+@pytest.fixture
+def closure_world(root, ctx):
+    """The world above with the owner_review.closure setting on: the made-from card of "Arrange the catering" is a done
+    task of the frozen input, so the suggestion and that card are an eligible pair."""
+    return _world(root, ctx, closure=True)
+
+
+def _world(root, ctx, more=None, *, closure=False, link_delivered=True):
     with _written_at(NOW - 86400):
         setup = _bootstrap_board(ctx)
         [booked] = _approved_plan(ctx, setup)["created_task_ids"]
@@ -86,11 +94,12 @@ def _world(root, ctx, more=None):
         _decide(board, rejected, "rejected", "The visit is short.")
         card = kanban_db.create_task(board, title="Order lunch for the guests", project_id=project.id,
                                      made_from_recommendation=linked)
-        assert kanban_db.complete_task(board, card, summary="Lunch is ordered.")
+        if link_delivered:
+            assert kanban_db.complete_task(board, card, summary="Lunch is ordered.")
         target = {"task_id": booked, "expected_status": kanban_db.get_task(board, booked).status,
                   "expected_revision": kanban_db.task_event_revision(board, booked)}
         extra = more(board, project) if more else {}
-    config = {"owner_review": {"enabled": True, "allowlist": [project.id], "closure": True}}
+    config = {"owner_review": {"enabled": True, "allowlist": [project.id], "closure": closure}}
     (root / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
     assert review.review_tick(NOW) == 1
     with projects_db.connect_closing(root / "projects.db") as registry:
@@ -434,7 +443,8 @@ def test_t3_the_instruction_requires_planning_an_accepted_suggestion_with_a_null
     assert "refuses" in instruction
 
 
-def test_t4_a_delivered_linked_card_settles_its_accepted_suggestion_and_the_review_closes_it(world):
+def test_t4_a_delivered_linked_card_settles_its_accepted_suggestion_and_the_review_closes_it(closure_world):
+    world = closure_world
     linked, card = world["linked"], world["card"]
     proposal = {"recommendation_id": linked, "card_id": card, "reason": "Lunch for the guests is ordered.",
                 "evidence": [f"suggestions:{linked}", f"tasks:{card}"]}
@@ -1203,8 +1213,21 @@ def _closure_rows(world):
             "SELECT recommendation_id,card_id,card_state,closed_by,review_date FROM recommendation_closures")]
 
 
-def test_the_result_of_0605z_superseded_with_only_the_suggestion_reference_is_accepted_and_closes_the_suggestion(world):
+def _briefs(world):
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        return registry.execute(
+            "SELECT COUNT(*) FROM project_review_briefs WHERE project_id=?", (world["project"].id,),
+        ).fetchone()[0]
+
+
+# The refusal of a result that leaves out the closure of an eligible pair: an accepted suggestion whose linked card of
+# the frozen input passes every check of the review's closures.
+MISSING = "review_delivered_closure_missing"
+
+
+def test_the_result_of_0605z_superseded_with_only_the_suggestion_reference_is_accepted_and_closes_the_suggestion(closure_world):
     """The result of 2026-11-21 06:05Z: superseded with suggestions:<id> alone, which the kernel computed as answered."""
+    world = closure_world
     linked, card = world["linked"], world["card"]
     assert _delivered(world, linked, card) == "done"
     _complete(world, _result(world, classes={linked: ("superseded", [f"suggestions:{linked}"])}, closures=[_closure(world)]))
@@ -1214,7 +1237,8 @@ def test_the_result_of_0605z_superseded_with_only_the_suggestion_reference_is_ac
     assert _closure_rows(world) == [(linked, card, "done", "project-review", "2026-11-10")]
 
 
-def test_a_delivered_linked_card_called_answered_is_stored_superseded_and_its_proposed_closure_is_written(world):
+def test_a_delivered_linked_card_called_answered_is_stored_superseded_and_its_proposed_closure_is_written(closure_world):
+    world = closure_world
     linked, card = world["linked"], world["card"]
     assert _delivered(world, linked, card) == "done"
     _complete(world, _result(world, classes={linked: ("answered", [f"suggestions:{linked}"])}, closures=[_closure(world)]))
@@ -1224,13 +1248,14 @@ def test_a_delivered_linked_card_called_answered_is_stored_superseded_and_its_pr
     assert _closure_rows(world) == [(linked, card, "done", "project-review", "2026-11-10")]
 
 
-def test_a_delivered_linked_card_called_answered_with_no_proposed_closure_is_stored_superseded_and_closes_nothing(world):
+def test_a_delivered_linked_card_called_answered_with_no_proposed_closure_is_refused_while_closure_is_on(closure_world):
+    world = closure_world
     linked, card = world["linked"], world["card"]
     assert _delivered(world, linked, card) == "done"
     _complete(world, _result(world, classes={linked: ("answered", [f"suggestions:{linked}"])}))
 
-    assert _harvested(world) is None
-    assert _stored_classes(world)[linked] == ("superseded", [f"tasks:{card}"])
+    assert _harvested(world) == MISSING
+    assert _briefs(world) == 0
     assert _closure_rows(world) == []
 
 
@@ -1256,4 +1281,177 @@ def test_an_accepted_suggestion_whose_linked_card_is_not_delivered_is_stored_ans
 
     assert _harvested(world) is None
     assert _stored_classes(world)[badges] == ("answered", [f"suggestions:{badges}"])
+    assert _closure_rows(world) == []
+
+
+def _retry_body(world):
+    """The task body of the same day's retry, which the tick opens an hour after a refusal."""
+    with _written_at(NOW + 1 + 3600):
+        assert review.review_tick(NOW + 1 + 3600) == 1
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        [task_id] = registry.execute(
+            "SELECT open_task_id FROM project_review_state WHERE project_id=?", (world["project"].id,),
+        ).fetchone()
+    with _summary_board() as board:
+        return kanban_db.get_task(board, task_id).body
+
+
+def test_the_failing_run_answered_with_no_closure_for_its_eligible_pair_is_refused_with_the_retry_reason(closure_world):
+    """The run of owner fact 1: closure on, one eligible pair, the class answered and an empty closure list."""
+    world = closure_world
+    linked, card = world["linked"], world["card"]
+    assert _delivered(world, linked, card) == "done"
+    _complete(world, _result(world, classes={linked: ("answered", [f"suggestions:{linked}"])}))
+
+    assert _harvested(world) == MISSING
+    assert _closure_rows(world) == []
+    # The existing retry path: the next run of the same day is told what was missing.
+    line = "Your last result for this date was refused: " + refusal_sentences(MISSING, {})
+    assert "proposed_closures is missing a required closure." in line
+    assert line in _retry_body(world).splitlines()
+
+
+def test_the_same_run_with_one_valid_closure_for_its_eligible_pair_is_accepted_and_the_kernel_writes_the_row(closure_world):
+    world = closure_world
+    linked, card = world["linked"], world["card"]
+    _complete(world, _result(world, classes={linked: ("answered", [f"suggestions:{linked}"])}, closures=[_closure(world)]))
+
+    assert _harvested(world) is None
+    assert _briefs(world) == 1
+    assert _closure_rows(world) == [(linked, card, "done", "project-review", "2026-11-10")]
+
+
+def test_an_unfinished_linked_card_makes_no_eligible_pair_so_an_empty_closure_list_is_accepted(root, ctx):
+    world = _world(root, ctx, closure=True, link_delivered=False)
+    linked, card = world["linked"], world["card"]
+    assert _delivered(world, linked, card) is None
+    _complete(world, _result(world))
+
+    assert _harvested(world) is None
+    assert _stored_classes(world)[linked] == ("answered", [f"suggestions:{linked}"])
+    assert _closure_rows(world) == []
+
+
+def _card_of_another_project(board, _project):
+    # The kernel records no made-from link across Projects, so the done card moves to another Project afterwards.
+    [(card,)] = board.execute("SELECT card_id FROM recommendation_made_from").fetchall()
+    with kanban_db.write_txn(board):
+        board.execute("UPDATE tasks SET project_id=? WHERE id=?", ("p_garden_plan", card))
+    return {}
+
+
+def test_a_linked_card_of_another_project_makes_no_eligible_pair_so_an_empty_closure_list_is_accepted(root, ctx):
+    world = _world(root, ctx, _card_of_another_project, closure=True)
+    linked, card = world["linked"], world["card"]
+    with _summary_board() as board:
+        sources, _cut = review._frozen_sources(kanban_db.get_task(board, world["review_task"]).body)
+    assert [item["linked_card"] for item in sources["suggestions"] if item["id"] == linked] == [card]
+    assert card not in {item["id"] for item in sources["tasks"]}
+    _complete(world, _result(world))
+
+    assert _harvested(world) is None
+    assert _stored_classes(world)[linked] == ("answered", [f"suggestions:{linked}"])
+    assert _closure_rows(world) == []
+
+
+@pytest.mark.parametrize("proposed", [False, True], ids=["empty_list", "one_valid_closure"])
+def test_a_result_made_stale_by_a_close_since_the_freeze_is_handled_by_the_stale_rule_and_writes_no_closure(
+    closure_world, proposed,
+):
+    world = closure_world
+    linked, card = world["linked"], world["card"]
+    _complete(world, _result(world, classes={linked: ("answered", [f"suggestions:{linked}"])},
+                             closures=[_closure(world)] if proposed else ()))
+    # Another gateway's review closes the pair after the freeze: the suggestion's audit revision moves.
+    with _written_at(NOW), _project_board(world["project"]) as board:
+        row = board.execute("SELECT * FROM tasks WHERE id=?", (linked,)).fetchone()
+        assert kanban_db.close_recommendation_delivered(
+            board, linked, card, reason="Lunch is ordered.", review_date="2026-11-10",
+            expected_lifecycle_version=kanban_db.recommendation_lifecycle_snapshot(row)["lifecycle_version"],
+        )["status"] == "closed"
+
+    # The existing stale rule: no failure, no refusal and no brief; one further review of the day opens.
+    with _written_at(NOW + 1):
+        assert review.review_tick(NOW + 1) == 1
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        assert tuple(registry.execute(
+            "SELECT failures,last_refusal FROM project_review_state WHERE project_id=?", (world["project"].id,),
+        ).fetchone()) == (0, None)
+    assert _briefs(world) == 0
+    # Only the other review's closure: the stale result wrote none.
+    with _project_board(world["project"]) as board:
+        assert [tuple(row) for row in board.execute(
+            "SELECT recommendation_id,reason,closed_at FROM recommendation_closures")] == [(linked, "Lunch is ordered.", NOW)]
+
+
+def _more_delivered_links(board, project):
+    """Three more accepted suggestions, each with its made-from card done: four eligible pairs with the catering one."""
+    links = []
+    for label, subject, title in (("Print the program", "program", "Print the visit program"),
+                                  ("Book the bus", "bus", "Book a bus for the guests"),
+                                  ("Set up the tables", "tables", "Set up the lunch tables")):
+        tid = _suggestion(board, project, label, subject)
+        _decide(board, tid, "accepted", "The visit needs it.")
+        card = kanban_db.create_task(board, title=title, project_id=project.id, made_from_recommendation=tid)
+        assert kanban_db.complete_task(board, card, summary="It is done.")
+        links.append((tid, card))
+    return {"links": links}
+
+
+@pytest.mark.parametrize(("proposed", "refusal"), [(3, None), (2, MISSING)], ids=["three", "two"])
+def test_with_four_eligible_pairs_three_valid_closures_are_accepted_and_two_are_refused(root, ctx, proposed, refusal):
+    world = _world(root, ctx, _more_delivered_links, closure=True)
+    pairs = [(world["linked"], world["card"]), *world["links"]]
+    assert [_delivered(world, tid, card) for tid, card in pairs] == ["done"] * 4
+    # Any three of the four meet the rule: these leave out the catering pair.
+    chosen = pairs[1:1 + proposed]
+    closures = [{"recommendation_id": tid, "card_id": card, "reason": "The linked work is done.",
+                 "evidence": [f"suggestions:{tid}", f"tasks:{card}"]} for tid, card in chosen]
+    claims = {tid: ("answered", [f"suggestions:{tid}"]) for tid, _card in world["links"]}
+    _complete(world, _result(world, classes=claims, closures=closures))
+
+    assert _harvested(world) == refusal
+    written = [(tid, card, "done", "project-review", "2026-11-10") for tid, card in chosen]
+    assert sorted(_closure_rows(world)) == (sorted(written) if refusal is None else [])
+
+
+def test_with_closure_off_an_eligible_pair_needs_no_closure_and_an_empty_closure_list_is_accepted(world):
+    linked, card = world["linked"], world["card"]
+    assert _delivered(world, linked, card) == "done"
+    _complete(world, _result(world, classes={linked: ("answered", [f"suggestions:{linked}"])}))
+
+    assert _harvested(world) is None
+    assert _stored_classes(world)[linked] == ("superseded", [f"tasks:{card}"])
+    assert _closure_rows(world) == []
+
+
+def _busy(*_args, **_kwargs):
+    raise sqlite3.OperationalError("database is locked")
+
+
+def test_a_stored_result_with_no_closure_for_its_eligible_pair_is_read_and_finished_as_today(world):
+    """The shape of owner fact 1, stored while the closure setting was off; a busy board cut its finish short. With the
+    setting on, the next tick finishes it through the existing read path: no refusal and no closure, its texts stay."""
+    linked, card = world["linked"], world["card"]
+    _complete(world, _result(world, classes={linked: ("answered", [f"suggestions:{linked}"])}))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(kanban_db, "archive_task", _busy)
+        assert _harvested(world) is None
+    stored = (_brief(world), _stored_classes(world))
+    assert stored[1][linked] == ("superseded", [f"tasks:{card}"])
+    with _summary_board() as board:
+        assert kanban_db.get_task(board, world["review_task"]).status == "done"
+    config = {"owner_review": {"enabled": True, "allowlist": [world["project"].id], "closure": True}}
+    (world["root"] / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    with _written_at(NOW + 2):
+        assert review.review_tick(NOW + 2) == 0
+
+    with _summary_board() as board:
+        assert kanban_db.get_task(board, world["review_task"]).status == "archived"
+    with projects_db.connect_closing(world["root"] / "projects.db") as registry:
+        assert tuple(registry.execute(
+            "SELECT failures,last_refusal FROM project_review_state WHERE project_id=?", (world["project"].id,),
+        ).fetchone()) == (0, None)
+    assert (_brief(world), _stored_classes(world)) == stored
     assert _closure_rows(world) == []

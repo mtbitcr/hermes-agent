@@ -7,12 +7,14 @@ from typing import Any
 
 from hermes_cli import kanban_db
 
+_MAX_CLOSURE_PROPOSALS = 3
+
 
 def check_closure_shapes(proposals: Any) -> None:
     """The closure list size, each proposal's keys and its reason text, without the evidence only the harvest checks."""
     from hermes_cli.owner_project_review import _CLOSURE_REASON_LIMIT, ReviewRefused, _review_texts
 
-    if not isinstance(proposals, list) or len(proposals) > 3:
+    if not isinstance(proposals, list) or len(proposals) > _MAX_CLOSURE_PROPOSALS:
         raise ReviewRefused("review_closure_list_invalid")
     for index, proposal in enumerate(proposals):
         if (not isinstance(proposal, dict)
@@ -76,6 +78,30 @@ def _review_closures(board, project_id, sources, classification, proposals) -> l
         checked.append({"recommendation_id": tid, "card_id": card_id, "reason": reason,
                         "evidence": evidence, "card_state": delivery_state, "expected_lifecycle_version": lifecycle["lifecycle_version"]})
     return checked
+
+
+def check_required_closures(board, project_id, sources, classification, closures) -> None:
+    """Refuse a result that leaves out a required closure. An eligible pair is an accepted suggestion of the frozen input
+    and its linked card whose closure passes every check of _review_closures; the result's checked closures must hold
+    one for each, or for as many as the cap allows."""
+    from hermes_cli.owner_project_review import ReviewRefused
+
+    eligible = set()
+    for item in sources["suggestions"]:
+        if item["decision"] != "accepted" or not item.get("linked_card"):
+            continue
+        # The closure the review must propose for this pair, checked as a proposed one is.
+        required = {"recommendation_id": item["id"], "card_id": item["linked_card"],
+                    "reason": "The linked card delivered this suggestion.",
+                    "evidence": [f"suggestions:{item['id']}", f"tasks:{item['linked_card']}"]}
+        try:
+            _review_closures(board, project_id, sources, classification, [required])
+        except ReviewRefused:
+            continue
+        eligible.add(item["id"])
+    proposed = {closure["recommendation_id"] for closure in closures}
+    if len(eligible & proposed) < min(len(eligible), _MAX_CLOSURE_PROPOSALS):
+        raise ReviewRefused("review_delivered_closure_missing")
 
 
 def needs_no_card(board, project_id, item) -> bool:

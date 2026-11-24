@@ -65,7 +65,7 @@ from hermes_cli import kanban_db, owner_project_review_owner_line as owner_steps
 from hermes_cli import owner_project_summary as summary
 from hermes_cli import owner_project_summary_events as events
 from hermes_cli.kanban_recommendation_closure import content_link, delivery_after_undo
-from hermes_cli.owner_project_review_suggestions import _review_closures, check_closure_shapes, check_plan_suggestions, needs_no_card
+from hermes_cli.owner_project_review_suggestions import _review_closures, check_closure_shapes, check_plan_suggestions, check_required_closures, needs_no_card
 from hermes_cli.sqlite_util import write_txn
 
 logger = logging.getLogger(__name__)
@@ -133,6 +133,9 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
 7. Propose at most three closures. Each has exactly recommendation_id, card_id, reason, and evidence.
 """ + f"   The reason has at most {_CLOSURE_REASON_LIMIT} characters." + """ Evidence must name suggestions:<id> and tasks:<id> from this input.
    The card must deliver the suggestion in this Project. A proposal cannot decide or close the suggestion.
+   When the input holds an accepted suggestion with no live closure whose linked_card is a task of this input with a
+   non-null delivery_state, the review must propose its closure with that card. When more than three such suggestions
+   exist, the review proposes three of them.
 8. plan_proposal is null or an object with exactly request_title, summary,
    specification, current_milestone, owner_visible_result, later_milestones, and changes.
    Use the native plan change schema. Each existing task reference must use its input status and event revision.
@@ -699,12 +702,13 @@ def _open_work_missing(registry: sqlite3.Connection, board: sqlite3.Connection, 
 @contextlib.contextmanager
 def _check_review_decisions(
     registry: sqlite3.Connection, project: projects_db.Project, sources: dict[str, list[dict]], frozen_cursor: str,
-    classification: list[dict], frozen_approvals: Optional[int] = None,
+    classification: list[dict], frozen_approvals: Optional[int] = None, closures: Optional[list[dict]] = None,
 ):
     """The protected section of a review's commit: the final read of the live owner decisions, then the commit.
 
     A live set that differs from the frozen one makes the result stale. A result that leaves out an open item of the
-    last accepted review, which no recorded event settled, is refused. Either way nothing is written.
+    last accepted review, which no recorded event settled, is refused; with ``closures`` (the closure setting on), so is
+    one that leaves out a required closure. Either way nothing is written.
     """
     frozen = {item["task_id"]: item for item in sources["decisions"] if item.get("type") == "wait"}
     decision_ids = {item["task_id"] for item in sources["decisions"] if item.get("task_id")}
@@ -741,6 +745,9 @@ def _check_review_decisions(
                 # Owner rule of 2026-11-11, point 1: input trimming alone never settles work.
                 if _open_work_missing(registry, board, project.id, classification):
                     raise ReviewRefused("review_open_work_missing")
+                # After the stale checks above, so a stale result stays stale and only a current one is refused.
+                if closures is not None:
+                    check_required_closures(board, project.id, sources, classification, closures)
         except (sqlite3.OperationalError, OSError):
             # A busy or unreadable board is no verdict on the result: the harvest keeps it for a later tick.
             raise
@@ -764,7 +771,8 @@ def _store_review_result(registry, project_id, task, result, now, closure=False)
     ready_work = _ready_work(project)
     # Owner rule of 2026-11-11, points 5 to 7: the final read and the commit hold one protected section. This is the
     # one writer of a review's texts and day; the quiet day uses the same section.
-    with _check_review_decisions(registry, project, result.sources, decision_cursor, result.classification, approvals):
+    with _check_review_decisions(registry, project, result.sources, decision_cursor, result.classification, approvals,
+                                 result.proposed_closures if closure else None):
         changed = registry.execute(
             "UPDATE project_review_state SET open_task_id=NULL,open_review_date=NULL,failures=0,"
             "last_reviewed_date=?,last_reviewed_at=?,last_brief_date=?,updated_at=?,"
