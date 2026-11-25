@@ -345,7 +345,8 @@ def check_claims(sources: dict[str, list[dict]], claims: Any) -> tuple[set, dict
 
 
 def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, stale_days: int,
-                     board: sqlite3.Connection, project_id: str, plan_changes: dict[str, str]) -> list[dict]:
+                     board: sqlite3.Connection, project_id: str, plan_changes: dict[str, str],
+                     frozen: Any = ()) -> list[dict]:
     expected, by_item, _references = check_claims(sources, claims)
     suggestions = {item["id"]: item for item in sources["suggestions"]}
     decisions = sources["decisions"]
@@ -364,8 +365,9 @@ def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, s
             actual = "answered"
             evidence = [f"decisions:event:{max(item['event_id'] for item in answers)}"]
         elif (tid in suggestions and suggestions[tid]["decision"] == "accepted" and (made := suggestions[tid].get("linked_card"))
-              and made in tasks and _delivered_match(board, project_id, tid, tasks[made])):
+              and made in tasks and ((tid, made) in frozen or _delivered_match(board, project_id, tid, tasks[made]))):
             # An accepted suggestion whose own linked card is delivered: the kernel's records decide, not the claim.
+            # Owner rule 4: a required pair whose proof changed since the freeze is judged as at the freeze.
             actual, evidence = "superseded", [f"tasks:{made}"]
         elif tid in suggestions and needs_no_card(board, project_id, suggestions[tid]):
             # An accepted model update, by the input's mark or, with no mark, its board row: its own Update settles it.
@@ -516,19 +518,20 @@ def parse_review_result(
         decisions = _owner_decisions(project_board, project_id)
         if _decision_cursor(decisions) != _frozen_decision_cursor(task.body):
             raise ReviewStale("review_decision_state_changed")
-        # Owner rule 3, case two: ahead of the classes, which read the same live proof, so a required proposal whose
-        # proof changed since the publication is stale, not the worker's fault.
-        if closure_rule_published(task.body):
-            check_required_proof_current(project_board, project_id, sources, value["proposed_closures"])
+        # Owner rule 3, case two, and owner rule 4: a required proposal whose proof changed since the publication is
+        # judged on its frozen proof, so each other entry keeps its own refusal; the fenced read makes it stale.
+        changed = (check_required_proof_current(project_board, project_id, sources, value["proposed_closures"])
+                   if closure_rule_published(task.body) else {})
         plan_changes = verified_supersessions(
             registry, project, events._board_path(project.board_slug), sources.get("proposals", []),
             max_bytes=TOTAL_INPUT_CAP_BYTES,
         )
         classification = _classify_review(
             sources, value["classification"], now=now, stale_days=stale_days, board=project_board, project_id=project_id,
-            plan_changes=plan_changes,
+            plan_changes=plan_changes, frozen=changed,
         )
-        closures = _review_closures(project_board, project_id, sources, classification, value["proposed_closures"])
+        closures = _review_closures(project_board, project_id, sources, classification, value["proposed_closures"],
+                                    changed)
         from hermes_cli.owner_project_review_proposals import proposal_hint
 
         try:
@@ -718,7 +721,8 @@ def _check_review_decisions(
     A live set that differs from the frozen one makes the result stale. A result that leaves out an open item of the
     last accepted review, which no recorded event settled, is refused; with ``closures`` (the closure setting on), so is
     one that leaves out a required closure. Either way nothing is written. ``published`` holds the result's checked
-    closures when its task published the closure rule, whatever the live setting (owner rule 3).
+    closures when its task published the closure rule, whatever the live setting (owner rule 3); a required one whose
+    proof changed makes the result stale after those refusals (owner rule 4).
     """
     frozen = {item["task_id"]: item for item in sources["decisions"] if item.get("type") == "wait"}
     decision_ids = {item["task_id"] for item in sources["decisions"] if item.get("task_id")}
@@ -753,15 +757,18 @@ def _check_review_decisions(
                             or kanban_db.task_event_revision(board, item["id"]) != item.get("event_revision")):
                         raise ReviewStale("review_recommendation_state_changed")
                 # Owner rule 3, case two: the final read judges the required proposals on the same proof as the parse.
-                if published is not None:
-                    check_required_proof_current(board, project.id, sources, published, checked=True)
+                changed = {} if published is None else check_required_proof_current(
+                    board, project.id, sources, published, checked=True)
                 # Owner rule of 2026-11-11, point 1: input trimming alone never settles work.
                 if _open_work_missing(registry, board, project.id, classification):
                     raise ReviewRefused("review_open_work_missing")
                 # After the stale checks above, so a stale result stays stale and only a current one is refused.
                 if closures is not None:
                     check_required_closures(board, project.id, sources, classification, closures,
-                                            published=published is not None)
+                                            published=published is not None, frozen=changed)
+                # Owner rule 4: a changed required proof makes the result stale only after every ordinary check.
+                if changed:
+                    raise ReviewStale(next(iter(changed.values())))
         except (sqlite3.OperationalError, OSError):
             # A busy or unreadable board is no verdict on the result: the harvest keeps it for a later tick.
             raise

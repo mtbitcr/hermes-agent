@@ -2,7 +2,9 @@
 
 import contextlib
 import json
+import os
 import sqlite3
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -1957,3 +1959,163 @@ def test_owner_rule_2_point_5_new_event_on_the_linked_card_after_publication_cou
     with _written_at(NOW), _project_board(world["project"]) as board:
         kanban_db.add_comment(board, world["card"], "default", "The caterer confirmed the order.")
     _point_5_tick(world)
+
+
+def _handed_over(world, monkeypatch, value):
+    """The worker completes the published review through the registered kanban_complete tool, under the environment
+    the dispatcher injects (the pattern of test_owner_review_handover), and the hand-over accepts the result."""
+    import model_tools
+    import tools.kanban_tools  # noqa: F401
+
+    with _summary_board() as board:
+        task = kanban_db.claim_task(board, world["review_task"])
+    assert task is not None and task.status == "running"
+    (world["root"] / "profiles" / task.assignee).mkdir(parents=True, exist_ok=True)
+    workspace = world["root"].parent / f"workspace-{task.id}"
+    workspace.mkdir(exist_ok=True)
+    captured = {}
+
+    class _Proc:
+        pid = 4242
+
+    def _popen(cmd, *args, **kwargs):
+        kwargs["stdout"].close()  # the worker log the dispatcher opened for the child
+        captured["env"] = dict(kwargs["env"])
+        return _Proc()
+
+    with monkeypatch.context() as worker:
+        worker.setattr(kanban_db, "_resolve_hermes_argv", lambda: ["hermes"])
+        worker.setattr(subprocess, "Popen", _popen)
+        assert kanban_db._default_spawn(task, str(workspace), board="project-summaries") == 4242
+        env = captured["env"]
+        assert env["HERMES_KANBAN_TASK"] == task.id and env["HERMES_KANBAN_BOARD"] == "project-summaries"
+        for key in set(os.environ) - set(env):
+            worker.delenv(key)
+        for key, setting in env.items():
+            if os.environ.get(key) != setting:
+                worker.setenv(key, setting)
+        done = json.loads(model_tools.handle_function_call(
+            "kanban_complete", {"summary": "Reviewed the visit.", "metadata": {"project_review": value}}))
+    assert done.get("ok") is True, done
+
+
+def _commented(world):
+    """One normal comment on the still-done linked card of the catering pair, after the hand-over."""
+    with _written_at(NOW), _project_board(world["project"]) as board:
+        kanban_db.add_comment(board, world["card"], "default", "The caterer confirmed the order.")
+        assert kanban_db.get_task(board, world["card"]).status == "done"
+    assert _delivered(world, world["linked"], world["card"]) is None
+
+
+def _second_pair(board, project):
+    """A second eligible pair besides the catering one, and an unchanged done card with no Project assignment."""
+    tid = _suggestion(board, project, "Print the program", "program")
+    _decide(board, tid, "accepted", "The visit needs it.")
+    card = kanban_db.create_task(board, title="Print the visit program", project_id=project.id,
+                                 made_from_recommendation=tid)
+    assert kanban_db.complete_task(board, card, summary="It is done.")
+    return {"second": (tid, card), **_unassigned_done_card(board, project)}
+
+
+def _proposal(tid, card, evidence=None):
+    return {"recommendation_id": tid, "card_id": card, "reason": "The linked work is done.",
+            "evidence": evidence or [f"suggestions:{tid}", f"tasks:{card}"]}
+
+
+FAULTS = {"unassigned_done_card": "review_closure_evidence_required",
+          "missing_evidence": "review_closure_evidence_required",
+          "duplicate": "review_closure_evidence_required",
+          "unproved_class": "review_class_evidence_required"}
+
+
+def _mixed_result(world, fault):
+    """The valid required proposal of the catering pair, then the second pair, with one independent fault of an
+    unchanged entry: the refusal of main."""
+    (tid, card), accepted = world["second"], world["accepted"]
+    claims = {tid: ("answered", [f"suggestions:{tid}"])}
+    closures = {
+        "unassigned_done_card": [_proposal(tid, card), _proposal(accepted, world["unassigned"])],
+        "missing_evidence": [_proposal(tid, card, [f"suggestions:{tid}"])],
+        "duplicate": [_proposal(tid, card), _proposal(tid, card)],
+        "unproved_class": [_proposal(tid, card)],
+    }[fault]
+    if fault == "unproved_class":
+        claims[accepted] = ("superseded", [f"suggestions:{accepted}"])
+    return _result(world, classes=claims, closures=[_closure(world), *closures])
+
+
+def _refused_once(world, caplog, code):
+    """The harvest records the refusal's reason and one counted failure, and stores no brief and no closure."""
+    assert _harvested(world) == code
+    assert "stale result" not in caplog.text
+    assert (_failures(world), _briefs(world), _closure_rows(world)) == (1, 0, [])
+
+
+@pytest.mark.parametrize("fault", list(FAULTS))
+def test_owner_rule_4_a_changed_required_proof_keeps_the_independent_refusal_of_a_mixed_result(
+    root, ctx, monkeypatch, caplog, fault,
+):
+    """Owner rule 4: the proof of the required pair changed after the publication, and an unchanged entry of the same
+    result is wrong. The ordinary validation comes first, so the result keeps that refusal and its counted failure."""
+    world = _world(root, ctx, _second_pair, closure=True)
+    _handed_over(world, monkeypatch, _mixed_result(world, fault))
+    _commented(world)
+
+    _refused_once(world, caplog, FAULTS[fault])
+
+
+@pytest.mark.parametrize("fault", list(FAULTS))
+def test_owner_rule_4_the_unchanged_control_of_each_mixed_result_is_refused_as_on_main(
+    root, ctx, monkeypatch, caplog, fault,
+):
+    world = _world(root, ctx, _second_pair, closure=True)
+    _handed_over(world, monkeypatch, _mixed_result(world, fault))
+
+    _refused_once(world, caplog, FAULTS[fault])
+
+
+def test_owner_rule_4_a_changed_required_proof_alone_is_stale_with_no_counted_failure(closure_world, monkeypatch, caplog):
+    world = closure_world
+    linked = world["linked"]
+    _handed_over(world, monkeypatch, _result(world, classes={linked: ("answered", [f"suggestions:{linked}"])},
+                                             closures=[_closure(world)]))
+    _commented(world)
+
+    _stale_then_further_review(world, caplog, "review_delivery_state_changed")
+
+
+def test_owner_rule_4_the_unchanged_valid_result_stores_one_brief_and_writes_one_closure(closure_world, monkeypatch):
+    world = closure_world
+    linked, card = world["linked"], world["card"]
+    _handed_over(world, monkeypatch, _result(world, classes={linked: ("answered", [f"suggestions:{linked}"])},
+                                             closures=[_closure(world)]))
+
+    assert _harvested(world) is None
+    assert (_failures(world), _briefs(world)) == (0, 1)
+    assert _closure_rows(world) == [(linked, card, "done", "project-review", "2026-11-10")]
+
+
+def test_owner_rule_4_the_fenced_reads_missing_closure_refusal_keeps_its_reason_when_the_required_proof_changed(
+    root, ctx, monkeypatch, caplog,
+):
+    """The changed pair counts as eligible and proposed, as at the freeze; the unchanged second pair is left out."""
+    world = _world(root, ctx, _second_pair, closure=True)
+    tid, _card = world["second"]
+    _handed_over(world, monkeypatch, _result(world, classes={tid: ("answered", [f"suggestions:{tid}"])},
+                                             closures=[_closure(world)]))
+    _commented(world)
+
+    _refused_once(world, caplog, MISSING)
+
+
+def test_owner_rule_4_a_changed_required_proof_within_the_cap_of_three_is_stale_and_not_a_missing_closure(
+    root, ctx, monkeypatch, caplog,
+):
+    """Four eligible pairs: the result proposes the changed catering pair and two unchanged ones, the cap of three."""
+    world = _world(root, ctx, _more_delivered_links, closure=True)
+    claims = {tid: ("answered", [f"suggestions:{tid}"]) for tid, _card in world["links"]}
+    closures = [_closure(world), *(_proposal(tid, card) for tid, card in world["links"][:2])]
+    _handed_over(world, monkeypatch, _result(world, classes=claims, closures=closures))
+    _commented(world)
+
+    _stale_then_further_review(world, caplog, "review_delivery_state_changed")
