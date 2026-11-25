@@ -65,7 +65,7 @@ from hermes_cli import kanban_db, owner_project_review_owner_line as owner_steps
 from hermes_cli import owner_project_summary as summary
 from hermes_cli import owner_project_summary_events as events
 from hermes_cli.kanban_recommendation_closure import content_link, delivery_after_undo
-from hermes_cli.owner_project_review_suggestions import _review_closures, check_closure_shapes, check_plan_suggestions, check_required_closures, needs_no_card
+from hermes_cli.owner_project_review_suggestions import _review_closures, check_closure_proof_current, check_closure_shapes, check_plan_suggestions, check_required_closures, needs_no_card
 from hermes_cli.sqlite_util import write_txn
 
 logger = logging.getLogger(__name__)
@@ -503,7 +503,7 @@ def _review_payload(board: sqlite3.Connection, task_id: str, project_id: str):
 
 
 def parse_review_result(
-    board: sqlite3.Connection, task_id: str, *, project_id: str, now: int, stale_days: int,
+    board: sqlite3.Connection, task_id: str, *, project_id: str, now: int, stale_days: int, closure: bool = False,
 ) -> ReviewResult:
     """Validate the latest completed review run before any result reaches a Project store."""
     from hermes_cli.owner_project_review_record import TOTAL_INPUT_CAP_BYTES
@@ -516,6 +516,9 @@ def parse_review_result(
         decisions = _owner_decisions(project_board, project_id)
         if _decision_cursor(decisions) != _frozen_decision_cursor(task.body):
             raise ReviewStale("review_decision_state_changed")
+        # Owner rule 2 of 2026-11-25: ahead of the classes, which read the same live proof, so a task or a pair proof
+        # changed since the publication is stale, not the worker's fault.
+        check_closure_proof_current(project_board, project_id, task.body, sources, value["proposed_closures"], closure)
         plan_changes = verified_supersessions(
             registry, project, events._board_path(project.board_slug), sources.get("proposals", []),
             max_bytes=TOTAL_INPUT_CAP_BYTES,
@@ -751,6 +754,8 @@ def _check_review_decisions(
                     raise ReviewRefused("review_open_work_missing")
                 # After the stale checks above, so a stale result stays stale and only a current one is refused.
                 if closures is not None:
+                    # Owner rule 2, point 1: the final read is judged on the same pair proof as the harvest.
+                    check_closure_proof_current(board, project.id, None, sources, closures, True)
                     check_required_closures(board, project.id, sources, classification, closures)
         except (sqlite3.OperationalError, OSError):
             # A busy or unreadable board is no verdict on the result: the harvest keeps it for a later tick.
@@ -1442,7 +1447,8 @@ def _harvest_one(
     try:
         # Another gateway stored this result already: only its finish is left, never a second judgement.
         if task is None or task.status != "done" or not _review_result_stored(registry, project_id, task):
-            result = parse_review_result(board, task_id, project_id=project_id, now=now, stale_days=settings.stale_days)
+            result = parse_review_result(board, task_id, project_id=project_id, now=now, stale_days=settings.stale_days,
+                                         closure=settings.closure)
             if (not _store_review_result(registry, project_id, task, result, now, closure=settings.closure)
                     and not _review_result_stored(registry, project_id, task)):
                 _retire(registry, board, project_id, task_id, now)

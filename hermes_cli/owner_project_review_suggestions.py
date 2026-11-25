@@ -80,6 +80,42 @@ def _review_closures(board, project_id, sources, classification, proposals) -> l
     return checked
 
 
+def check_closure_proof_current(board, project_id, body, sources, proposals, closure) -> None:
+    """Owner rule 2 of 2026-11-25: a failure for a missing or refused required closure is counted only for a task that
+    published the closure rule and a pair whose proof is the one frozen; each other difference is stale.
+
+    The pairs are each well-formed proposal whose card held a delivery at the freeze and, with ``closure`` on, each pair
+    the published rule requires. Without ``body`` (the commit's final read) the rule is not read again. Malformed
+    entries are left to _review_closures, and every closure write still needs the live proof."""
+    from hermes_cli.owner_project_review import _CLOSURE_RULE, ReviewStale
+    from hermes_cli.owner_project_review_record import card_delivery_state
+
+    # Point 3: a setting switched on after the publication; only the kernel's instruction, ahead of the data, counts.
+    if closure and body is not None and _CLOSURE_RULE not in body.partition("<<<BEGIN UNTRUSTED DATA")[0]:
+        raise ReviewStale("review_closure_rule_unpublished")
+    suggestions = {item["id"]: item for item in sources["suggestions"]}
+    cards = {item["id"]: item for item in sources["tasks"]}
+    pairs = [(proposal.get("recommendation_id"), proposal.get("card_id"))
+             for proposal in (proposals if isinstance(proposals, list) else []) if isinstance(proposal, dict)]
+    if closure:
+        # Owner rule 1: no closure is required of a suggestion whose input item holds one.
+        pairs += [(item["id"], item.get("linked_card")) for item in sources["suggestions"]
+                  if item["decision"] == "accepted" and not item.get("closure")]
+    for tid, card_id in pairs:
+        if (not isinstance(tid, str) or not isinstance(card_id, str) or tid not in suggestions or card_id not in cards
+                or cards[card_id].get("delivery_state") is None):
+            continue
+        row = board.execute(
+            "SELECT status FROM tasks WHERE id=? AND project_id=? AND task_kind='work'", (card_id, project_id),
+        ).fetchone()
+        if (row is None or kanban_db.task_event_revision(board, card_id) != cards[card_id].get("event_revision")
+                or card_delivery_state(board, card_id, row["status"]) != cards[card_id]["delivery_state"]):
+            raise ReviewStale("review_delivery_state_changed")
+        # The decision cursor covers only pending suggestions: an accepted one's close or Undo moves only its revision.
+        if kanban_db.task_event_revision(board, tid) != suggestions[tid].get("event_revision"):
+            raise ReviewStale("review_recommendation_state_changed")
+
+
 def check_required_closures(board, project_id, sources, classification, closures) -> None:
     """Refuse a result that leaves out a required closure. An eligible pair is an accepted suggestion of the frozen input
     with no closure, live or undone, and its linked card whose closure passes every check of _review_closures; the
