@@ -65,7 +65,7 @@ from hermes_cli import kanban_db, owner_project_review_owner_line as owner_steps
 from hermes_cli import owner_project_summary as summary
 from hermes_cli import owner_project_summary_events as events
 from hermes_cli.kanban_recommendation_closure import content_link, delivery_after_undo
-from hermes_cli.owner_project_review_suggestions import _review_closures, check_closure_shapes, check_plan_suggestions, needs_no_card
+from hermes_cli.owner_project_review_suggestions import _review_closures, check_closure_shapes, check_plan_suggestions, check_required_closures, check_required_proof_current, closure_rule_published, needs_no_card
 from hermes_cli.sqlite_util import write_txn
 
 logger = logging.getLogger(__name__)
@@ -105,6 +105,12 @@ _WINDOW = re.compile(r"^Review days: from ([0-9]{4}-[0-9]{2}-[0-9]{2}|the start)
 
 _BRIEF_LIMITS = {"headline": 120, "what_changed": 400, "next_step": 240, "needs_you": 160}
 _CLOSURE_REASON_LIMIT = 300
+# Step 7's rule for a required closure; a review task published with the closure setting off leaves it out.
+_CLOSURE_RULE = """\
+   When the input holds an accepted suggestion with no closure whose linked_card is a task of this input with a
+   non-null delivery_state, the review must propose its closure with that card. When more than three such suggestions
+   exist, the review proposes three of them.
+"""
 
 INSTRUCTION = """\
 Review one Project for its owner. Use no tool except kanban_show and kanban_complete.
@@ -133,6 +139,7 @@ Review one Project for its owner. Use no tool except kanban_show and kanban_comp
 7. Propose at most three closures. Each has exactly recommendation_id, card_id, reason, and evidence.
 """ + f"   The reason has at most {_CLOSURE_REASON_LIMIT} characters." + """ Evidence must name suggestions:<id> and tasks:<id> from this input.
    The card must deliver the suggestion in this Project. A proposal cannot decide or close the suggestion.
+""" + _CLOSURE_RULE + """\
 8. plan_proposal is null or an object with exactly request_title, summary,
    specification, current_milestone, owner_visible_result, later_milestones, and changes.
    Use the native plan change schema. Each existing task reference must use its input status and event revision.
@@ -338,7 +345,8 @@ def check_claims(sources: dict[str, list[dict]], claims: Any) -> tuple[set, dict
 
 
 def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, stale_days: int,
-                     board: sqlite3.Connection, project_id: str, plan_changes: dict[str, str]) -> list[dict]:
+                     board: sqlite3.Connection, project_id: str, plan_changes: dict[str, str],
+                     frozen: Any = ()) -> list[dict]:
     expected, by_item, _references = check_claims(sources, claims)
     suggestions = {item["id"]: item for item in sources["suggestions"]}
     decisions = sources["decisions"]
@@ -357,8 +365,9 @@ def _classify_review(sources: dict[str, list[dict]], claims: Any, *, now: int, s
             actual = "answered"
             evidence = [f"decisions:event:{max(item['event_id'] for item in answers)}"]
         elif (tid in suggestions and suggestions[tid]["decision"] == "accepted" and (made := suggestions[tid].get("linked_card"))
-              and made in tasks and _delivered_match(board, project_id, tid, tasks[made])):
+              and made in tasks and ((tid, made) in frozen or _delivered_match(board, project_id, tid, tasks[made]))):
             # An accepted suggestion whose own linked card is delivered: the kernel's records decide, not the claim.
+            # Owner rule 4: a required pair whose proof changed since the freeze is judged as at the freeze.
             actual, evidence = "superseded", [f"tasks:{made}"]
         elif tid in suggestions and needs_no_card(board, project_id, suggestions[tid]):
             # An accepted model update, by the input's mark or, with no mark, its board row: its own Update settles it.
@@ -509,15 +518,20 @@ def parse_review_result(
         decisions = _owner_decisions(project_board, project_id)
         if _decision_cursor(decisions) != _frozen_decision_cursor(task.body):
             raise ReviewStale("review_decision_state_changed")
+        # Owner rule 3, case two, and owner rule 4: a required proposal whose proof changed since the publication is
+        # judged on its frozen proof, so each other entry keeps its own refusal; the fenced read makes it stale.
+        changed = (check_required_proof_current(project_board, project_id, sources, value["proposed_closures"])
+                   if closure_rule_published(task.body) else {})
         plan_changes = verified_supersessions(
             registry, project, events._board_path(project.board_slug), sources.get("proposals", []),
             max_bytes=TOTAL_INPUT_CAP_BYTES,
         )
         classification = _classify_review(
             sources, value["classification"], now=now, stale_days=stale_days, board=project_board, project_id=project_id,
-            plan_changes=plan_changes,
+            plan_changes=plan_changes, frozen=changed,
         )
-        closures = _review_closures(project_board, project_id, sources, classification, value["proposed_closures"])
+        closures = _review_closures(project_board, project_id, sources, classification, value["proposed_closures"],
+                                    changed)
         from hermes_cli.owner_project_review_proposals import proposal_hint
 
         try:
@@ -699,12 +713,16 @@ def _open_work_missing(registry: sqlite3.Connection, board: sqlite3.Connection, 
 @contextlib.contextmanager
 def _check_review_decisions(
     registry: sqlite3.Connection, project: projects_db.Project, sources: dict[str, list[dict]], frozen_cursor: str,
-    classification: list[dict], frozen_approvals: Optional[int] = None,
+    classification: list[dict], frozen_approvals: Optional[int] = None, closures: Optional[list[dict]] = None,
+    published: Optional[list[dict]] = None,
 ):
     """The protected section of a review's commit: the final read of the live owner decisions, then the commit.
 
     A live set that differs from the frozen one makes the result stale. A result that leaves out an open item of the
-    last accepted review, which no recorded event settled, is refused. Either way nothing is written.
+    last accepted review, which no recorded event settled, is refused; with ``closures`` (the closure setting on), so is
+    one that leaves out a required closure. Either way nothing is written. ``published`` holds the result's checked
+    closures when its task published the closure rule, whatever the live setting (owner rule 3); a required one whose
+    proof changed makes the result stale after those refusals (owner rule 4).
     """
     frozen = {item["task_id"]: item for item in sources["decisions"] if item.get("type") == "wait"}
     decision_ids = {item["task_id"] for item in sources["decisions"] if item.get("task_id")}
@@ -738,9 +756,19 @@ def _check_review_decisions(
                     if (any(lifecycle[key] != item.get(key) for key in lifecycle)
                             or kanban_db.task_event_revision(board, item["id"]) != item.get("event_revision")):
                         raise ReviewStale("review_recommendation_state_changed")
+                # Owner rule 3, case two: the final read judges the required proposals on the same proof as the parse.
+                changed = {} if published is None else check_required_proof_current(
+                    board, project.id, sources, published, checked=True)
                 # Owner rule of 2026-11-11, point 1: input trimming alone never settles work.
                 if _open_work_missing(registry, board, project.id, classification):
                     raise ReviewRefused("review_open_work_missing")
+                # After the stale checks above, so a stale result stays stale and only a current one is refused.
+                if closures is not None:
+                    check_required_closures(board, project.id, sources, classification, closures,
+                                            published=published is not None, frozen=changed)
+                # Owner rule 4: a changed required proof makes the result stale only after every ordinary check.
+                if changed:
+                    raise ReviewStale(next(iter(changed.values())))
         except (sqlite3.OperationalError, OSError):
             # A busy or unreadable board is no verdict on the result: the harvest keeps it for a later tick.
             raise
@@ -764,7 +792,10 @@ def _store_review_result(registry, project_id, task, result, now, closure=False)
     ready_work = _ready_work(project)
     # Owner rule of 2026-11-11, points 5 to 7: the final read and the commit hold one protected section. This is the
     # one writer of a review's texts and day; the quiet day uses the same section.
-    with _check_review_decisions(registry, project, result.sources, decision_cursor, result.classification, approvals):
+    # Owner rule 3: the rule the task published reaches the final read apart from the live closure setting.
+    with _check_review_decisions(registry, project, result.sources, decision_cursor, result.classification, approvals,
+                                 result.proposed_closures if closure else None,
+                                 published=result.proposed_closures if closure_rule_published(task.body) else None):
         changed = registry.execute(
             "UPDATE project_review_state SET open_task_id=NULL,open_review_date=NULL,failures=0,"
             "last_reviewed_date=?,last_reviewed_at=?,last_brief_date=?,updated_at=?,"
@@ -1695,13 +1726,13 @@ def _wait_order(news: _News, review_day: str) -> tuple:
 
 def _task_body(last_reviewed_date: Optional[str], review_day: str, covered: events.Cursors, frozen: str,
                conversation_cursor: Optional[str] = None, decision_cursor: Optional[str] = None,
-               refusal_line: str = "", plan_approvals: Optional[int] = None) -> str:
+               refusal_line: str = "", plan_approvals: Optional[int] = None, *, closure: bool = False) -> str:
     """The instruction, the line that tells why the day's last review was refused, the days the review covers, and last
-    the line that names the events it covers."""
+    the line that names the events it covers. With ``closure`` off the instruction holds no required closure."""
     from hermes_cli.owner_project_review_proposals import proposal_schema
 
     return (
-        INSTRUCTION
+        (INSTRUCTION if closure else INSTRUCTION.replace(_CLOSURE_RULE, ""))
         + "\nPlan proposal schema: "
         + json.dumps(proposal_schema(limit=_BRIEF_LIMITS["next_step"]), ensure_ascii=True, separators=(",", ":"))
         + (f"\n{refusal_line}" if refusal_line else "")
@@ -1762,7 +1793,7 @@ def _open_review_task(
         title=TITLE_PREFIX + project.name,
         body=_task_body(state["last_reviewed_date"], review_day, batch.cursors, frozen["text"], frozen["conversation_cursor"],
                         frozen["decision_cursor"], "" if _again(state, review_day) else refusal_line(state, review_day),
-                        frozen["plan_approvals"]),
+                        frozen["plan_approvals"], closure=read_settings().closure),
         assignee=summary.PLANNING_ROLE,
         created_by=CREATED_BY,
         workspace_kind="scratch",

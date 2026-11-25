@@ -40,6 +40,10 @@ _SENTENCES = {
     "review_closure_keys_invalid": (
         "Each proposed closure must hold exactly recommendation_id, card_id, reason and evidence, with text ids."
     ),
+    "review_delivered_closure_missing": (
+        "proposed_closures is missing a closure that the task instructions required. If these task instructions require "
+        "closures, propose each one they require, up to three."
+    ),
     "portfolio_result_keys_invalid": "portfolio_review must hold exactly conflicts, priorities and shared_blockers.",
     "portfolio_result_list_invalid": "Each list of the result must be a list within the task instructions' limit.",
     "portfolio_result_text_invalid": "A line of the result is empty, too long, not plain owner text or has no Project name.",
