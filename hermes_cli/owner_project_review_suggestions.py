@@ -80,47 +80,66 @@ def _review_closures(board, project_id, sources, classification, proposals) -> l
     return checked
 
 
-def check_closure_proof_current(board, project_id, body, sources, proposals, closure) -> None:
-    """Owner rule 2 of 2026-11-25: a failure for a missing or refused required closure is counted only for a task that
-    published the closure rule and a pair whose proof is the one frozen; each other difference is stale.
+def closure_rule_published(body) -> bool:
+    """Owner rule 3: whether the review task published step 7's rule sentence. Only the kernel's instruction, ahead of
+    the data, counts."""
+    from hermes_cli.owner_project_review import _CLOSURE_RULE
 
-    The pairs are each well-formed proposal whose card held a delivery at the freeze and, with ``closure`` on, each pair
-    the published rule requires. Without ``body`` (the commit's final read) the rule is not read again. Malformed
-    entries are left to _review_closures, and every closure write still needs the live proof."""
-    from hermes_cli.owner_project_review import _CLOSURE_RULE, ReviewStale
+    return _CLOSURE_RULE in (body or "").partition("<<<BEGIN UNTRUSTED DATA")[0]
+
+
+def check_required_proof_current(board, project_id, sources, proposals, *, checked=False) -> None:
+    """Owner rule 3, case two: the result's required proposal of a published rule whose pair's proof changed since the
+    freeze is stale, not the worker's fault. Each other proposal, and each pair not proposed, keeps the existing checks.
+
+    A raw proposal is the required one when the list passes its shape check, its pair is one the rule sentence requires
+    of the frozen input, its suggestion appears once and its evidence passes the frozen checks of _review_closures;
+    ``checked`` closures passed those checks at the parse and are selected by their pair."""
+    from hermes_cli.owner_project_review import ReviewRefused, ReviewStale
     from hermes_cli.owner_project_review_record import card_delivery_state
 
-    # Point 3: a setting switched on after the publication; only the kernel's instruction, ahead of the data, counts.
-    if closure and body is not None and _CLOSURE_RULE not in body.partition("<<<BEGIN UNTRUSTED DATA")[0]:
-        raise ReviewStale("review_closure_rule_unpublished")
     suggestions = {item["id"]: item for item in sources["suggestions"]}
     cards = {item["id"]: item for item in sources["tasks"]}
-    pairs = [(proposal.get("recommendation_id"), proposal.get("card_id"))
-             for proposal in (proposals if isinstance(proposals, list) else []) if isinstance(proposal, dict)]
-    if closure:
-        # Owner rule 1: no closure is required of a suggestion whose input item holds one.
-        pairs += [(item["id"], item.get("linked_card")) for item in sources["suggestions"]
-                  if item["decision"] == "accepted" and not item.get("closure")]
-    for tid, card_id in pairs:
-        if (not isinstance(tid, str) or not isinstance(card_id, str) or tid not in suggestions or card_id not in cards
-                or cards[card_id].get("delivery_state") is None):
+    # The rule sentence's pairs; owner rule 1: no closure is required of a suggestion whose input item holds one.
+    required = {(item["id"], item["linked_card"]) for item in sources["suggestions"]
+                if item["decision"] == "accepted" and not item.get("closure") and item.get("linked_card") in cards
+                and cards[item["linked_card"]].get("delivery_state") is not None}
+    if not checked:
+        try:
+            check_closure_shapes(proposals)
+        except ReviewRefused:
+            return
+    tids = [proposal["recommendation_id"] for proposal in proposals]
+    for proposal in proposals:
+        tid, card_id = proposal["recommendation_id"], proposal["card_id"]
+        if (tid, card_id) not in required or tids.count(tid) != 1:
             continue
+        if not checked:
+            try:
+                # The class the kernel gives a required pair at the freeze.
+                _review_closures(None, project_id, sources,
+                                 [{"item": tid, "class": "superseded", "evidence": [f"tasks:{card_id}"]}], [proposal])
+            except ReviewRefused:
+                continue
+        # The decision cursor covers only pending suggestions: an accepted one's close or Undo moves only its revision.
+        if kanban_db.task_event_revision(board, tid) != suggestions[tid].get("event_revision"):
+            raise ReviewStale("review_recommendation_state_changed")
+        # The frozen reader's own row scope, so an unchanged card with no Project is not called changed.
         row = board.execute(
-            "SELECT status FROM tasks WHERE id=? AND project_id=? AND task_kind='work'", (card_id, project_id),
+            "SELECT status FROM tasks WHERE id=? AND task_kind='work' AND (project_id=? OR project_id IS NULL)",
+            (card_id, project_id),
         ).fetchone()
         if (row is None or kanban_db.task_event_revision(board, card_id) != cards[card_id].get("event_revision")
                 or card_delivery_state(board, card_id, row["status"]) != cards[card_id]["delivery_state"]):
             raise ReviewStale("review_delivery_state_changed")
-        # The decision cursor covers only pending suggestions: an accepted one's close or Undo moves only its revision.
-        if kanban_db.task_event_revision(board, tid) != suggestions[tid].get("event_revision"):
-            raise ReviewStale("review_recommendation_state_changed")
 
 
-def check_required_closures(board, project_id, sources, classification, closures) -> None:
+def check_required_closures(board, project_id, sources, classification, closures, *, published=True) -> None:
     """Refuse a result that leaves out a required closure. An eligible pair is an accepted suggestion of the frozen input
     with no closure, live or undone, and its linked card whose closure passes every check of _review_closures; the
-    result's checked closures must hold one for each, or for as many as the cap allows."""
-    from hermes_cli.owner_project_review import ReviewRefused
+    result's checked closures must hold one for each, or for as many as the cap allows. Owner rule 3, case one: when
+    the task did not publish the rule (``published`` false), that missing closure makes the result stale instead."""
+    from hermes_cli.owner_project_review import ReviewRefused, ReviewStale
 
     eligible = set()
     for item in sources["suggestions"]:
@@ -138,6 +157,8 @@ def check_required_closures(board, project_id, sources, classification, closures
         eligible.add(item["id"])
     proposed = {closure["recommendation_id"] for closure in closures}
     if len(eligible & proposed) < min(len(eligible), _MAX_CLOSURE_PROPOSALS):
+        if not published:
+            raise ReviewStale("review_closure_rule_unpublished")
         raise ReviewRefused("review_delivered_closure_missing")
 
 

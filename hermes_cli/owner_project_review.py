@@ -65,7 +65,7 @@ from hermes_cli import kanban_db, owner_project_review_owner_line as owner_steps
 from hermes_cli import owner_project_summary as summary
 from hermes_cli import owner_project_summary_events as events
 from hermes_cli.kanban_recommendation_closure import content_link, delivery_after_undo
-from hermes_cli.owner_project_review_suggestions import _review_closures, check_closure_proof_current, check_closure_shapes, check_plan_suggestions, check_required_closures, needs_no_card
+from hermes_cli.owner_project_review_suggestions import _review_closures, check_closure_shapes, check_plan_suggestions, check_required_closures, check_required_proof_current, closure_rule_published, needs_no_card
 from hermes_cli.sqlite_util import write_txn
 
 logger = logging.getLogger(__name__)
@@ -503,7 +503,7 @@ def _review_payload(board: sqlite3.Connection, task_id: str, project_id: str):
 
 
 def parse_review_result(
-    board: sqlite3.Connection, task_id: str, *, project_id: str, now: int, stale_days: int, closure: bool = False,
+    board: sqlite3.Connection, task_id: str, *, project_id: str, now: int, stale_days: int,
 ) -> ReviewResult:
     """Validate the latest completed review run before any result reaches a Project store."""
     from hermes_cli.owner_project_review_record import TOTAL_INPUT_CAP_BYTES
@@ -516,9 +516,10 @@ def parse_review_result(
         decisions = _owner_decisions(project_board, project_id)
         if _decision_cursor(decisions) != _frozen_decision_cursor(task.body):
             raise ReviewStale("review_decision_state_changed")
-        # Owner rule 2 of 2026-11-25: ahead of the classes, which read the same live proof, so a task or a pair proof
-        # changed since the publication is stale, not the worker's fault.
-        check_closure_proof_current(project_board, project_id, task.body, sources, value["proposed_closures"], closure)
+        # Owner rule 3, case two: ahead of the classes, which read the same live proof, so a required proposal whose
+        # proof changed since the publication is stale, not the worker's fault.
+        if closure_rule_published(task.body):
+            check_required_proof_current(project_board, project_id, sources, value["proposed_closures"])
         plan_changes = verified_supersessions(
             registry, project, events._board_path(project.board_slug), sources.get("proposals", []),
             max_bytes=TOTAL_INPUT_CAP_BYTES,
@@ -710,12 +711,14 @@ def _open_work_missing(registry: sqlite3.Connection, board: sqlite3.Connection, 
 def _check_review_decisions(
     registry: sqlite3.Connection, project: projects_db.Project, sources: dict[str, list[dict]], frozen_cursor: str,
     classification: list[dict], frozen_approvals: Optional[int] = None, closures: Optional[list[dict]] = None,
+    published: Optional[list[dict]] = None,
 ):
     """The protected section of a review's commit: the final read of the live owner decisions, then the commit.
 
     A live set that differs from the frozen one makes the result stale. A result that leaves out an open item of the
     last accepted review, which no recorded event settled, is refused; with ``closures`` (the closure setting on), so is
-    one that leaves out a required closure. Either way nothing is written.
+    one that leaves out a required closure. Either way nothing is written. ``published`` holds the result's checked
+    closures when its task published the closure rule, whatever the live setting (owner rule 3).
     """
     frozen = {item["task_id"]: item for item in sources["decisions"] if item.get("type") == "wait"}
     decision_ids = {item["task_id"] for item in sources["decisions"] if item.get("task_id")}
@@ -749,14 +752,16 @@ def _check_review_decisions(
                     if (any(lifecycle[key] != item.get(key) for key in lifecycle)
                             or kanban_db.task_event_revision(board, item["id"]) != item.get("event_revision")):
                         raise ReviewStale("review_recommendation_state_changed")
+                # Owner rule 3, case two: the final read judges the required proposals on the same proof as the parse.
+                if published is not None:
+                    check_required_proof_current(board, project.id, sources, published, checked=True)
                 # Owner rule of 2026-11-11, point 1: input trimming alone never settles work.
                 if _open_work_missing(registry, board, project.id, classification):
                     raise ReviewRefused("review_open_work_missing")
                 # After the stale checks above, so a stale result stays stale and only a current one is refused.
                 if closures is not None:
-                    # Owner rule 2, point 1: the final read is judged on the same pair proof as the harvest.
-                    check_closure_proof_current(board, project.id, None, sources, closures, True)
-                    check_required_closures(board, project.id, sources, classification, closures)
+                    check_required_closures(board, project.id, sources, classification, closures,
+                                            published=published is not None)
         except (sqlite3.OperationalError, OSError):
             # A busy or unreadable board is no verdict on the result: the harvest keeps it for a later tick.
             raise
@@ -780,8 +785,10 @@ def _store_review_result(registry, project_id, task, result, now, closure=False)
     ready_work = _ready_work(project)
     # Owner rule of 2026-11-11, points 5 to 7: the final read and the commit hold one protected section. This is the
     # one writer of a review's texts and day; the quiet day uses the same section.
+    # Owner rule 3: the rule the task published reaches the final read apart from the live closure setting.
     with _check_review_decisions(registry, project, result.sources, decision_cursor, result.classification, approvals,
-                                 result.proposed_closures if closure else None):
+                                 result.proposed_closures if closure else None,
+                                 published=result.proposed_closures if closure_rule_published(task.body) else None):
         changed = registry.execute(
             "UPDATE project_review_state SET open_task_id=NULL,open_review_date=NULL,failures=0,"
             "last_reviewed_date=?,last_reviewed_at=?,last_brief_date=?,updated_at=?,"
@@ -1447,8 +1454,7 @@ def _harvest_one(
     try:
         # Another gateway stored this result already: only its finish is left, never a second judgement.
         if task is None or task.status != "done" or not _review_result_stored(registry, project_id, task):
-            result = parse_review_result(board, task_id, project_id=project_id, now=now, stale_days=settings.stale_days,
-                                         closure=settings.closure)
+            result = parse_review_result(board, task_id, project_id=project_id, now=now, stale_days=settings.stale_days)
             if (not _store_review_result(registry, project_id, task, result, now, closure=settings.closure)
                     and not _review_result_stored(registry, project_id, task)):
                 _retire(registry, board, project_id, task_id, now)
