@@ -227,6 +227,7 @@ def test_no_builder_lane_leaves_the_claude_family(tier):
     for model, effort in (
         ("gpt-5.6-terra", "max"),
         ("gpt-6.1-sol", "max"),
+        ("gpt-6.2-sol", "max"),
         ("gpt-6-sol", "max"),
         ("gpt-6-astra", "xhigh"),
     ):
@@ -241,6 +242,43 @@ def test_no_builder_lane_leaves_the_claude_family(tier):
     )
     assert model_policy.mint_policy_lock(
         "raphael-builder", "anthropic", "claude-opus-5-5", "max", "deep",
+    ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")
+
+
+def test_openai_deep_worker_requires_an_exact_task_lock():
+    """The alternate Worker route requires the deep tier."""
+    role = "raphael-claude-worker"
+    approved_tier = "deep"
+    with pytest.raises(ValueError):
+        assignment_for(role, "openai-codex")
+    for tier in ("routine", "deep"):
+        if tier == approved_tier:
+            lane = task_assignment_for(role, "openai-codex", tier)
+            assert (lane.model, lane.reasoning_effort) == ("gpt-6.2-sol", "max")
+            assert model_policy.mint_policy_lock(
+                role, "openai-codex", lane.model, lane.reasoning_effort, tier,
+            ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")
+        else:
+            with pytest.raises(ValueError):
+                task_assignment_for(role, "openai-codex", tier)
+            with pytest.raises(ValueError):
+                model_policy.mint_policy_lock(role, "openai-codex", "gpt-6.2-sol", "max", tier)
+        for model, effort in (
+            ("gpt-5.6-terra", "max"),
+            ("gpt-6.1-sol", "max"),
+            ("gpt-6-sol", "max"),
+            ("gpt-6-astra", "xhigh"),
+            ("gpt-6.2-sol", "high"),
+        ):
+            with pytest.raises(ValueError):
+                model_policy.mint_policy_lock(role, "openai-codex", model, effort, tier)
+
+    deep = task_assignment_for(role, "anthropic", "deep")
+    assert (deep.provider, deep.model, deep.reasoning_effort) == (
+        "anthropic", "claude-opus-5-5", "max",
+    )
+    assert model_policy.mint_policy_lock(
+        role, deep.provider, deep.model, deep.reasoning_effort, "deep",
     ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")
 
 
