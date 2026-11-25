@@ -902,6 +902,19 @@ def _merge_app(conn, label: str):
     return ledger.record_merge(conn, **_merge_args(label, pr_url=APP_PR), on_main=True)
 
 
+# A batch's readback before card 1. A batch that stores no owner app versions still reads back exactly so.
+_PLATFORM_READBACK = frozenset({
+    "batch_id", "state", "version", "tier", "digest", "members", "created_at", "decided_at", "decided_by",
+    "decision_ref", "shown_digest", "prev", "new", "outcome", "outcome_at", "recovery_attempts",
+})
+
+
+def _stored_app_versions(conn, batch) -> tuple:
+    """The batch's APP_PREV and APP_NEW as its row in release_batches stores them."""
+    row = conn.execute("SELECT app_prev, app_new FROM release_batches WHERE id = ?", (batch["batch_id"],))
+    return tuple(row.fetchone())
+
+
 def test_a_batch_of_both_parts_begins_only_with_new_the_platform_member_and_app_new_the_owner_app_member(
     open_ledger,
 ):
@@ -1022,7 +1035,9 @@ def test_an_older_store_is_upgraded_keeping_every_row(open_ledger, older_store):
     columns = [row["name"] for row in conn.execute("PRAGMA table_info(release_batches)")]
     kept_columns = older["release_batches"][0]
     assert (columns[: len(kept_columns)], columns[-2:]) == (kept_columns, ["app_prev", "app_new"])
-    assert {(batch["app_prev"], batch["app_new"]) for batch in ledger.list_batches(conn)} == {(None, None)}
+    batches = ledger.list_batches(conn)
+    assert {_stored_app_versions(conn, batch) for batch in batches} == {(None, None)}
+    assert {frozenset(batch) for batch in batches} == {_PLATFORM_READBACK}
     # Running the upgrade again, as every later opening does, changes no row and no table.
     upgraded = (_store_rows(conn), _schema(conn))
     again = open_ledger()
@@ -1050,7 +1065,7 @@ def test_last_released_app_names_the_app_new_of_the_last_batch_with_a_released_o
             ledger.begin_release(conn, platform_only["batch_id"], prev=_commit("a"), new=_commit("c"), **versions)
     assert _store_rows(conn) == before
     began = _begin(conn, platform_only, prev=_commit("a"))
-    assert (began["app_prev"], began["app_new"]) == (None, None)
+    assert (_stored_app_versions(conn, began), set(began)) == ((None, None), _PLATFORM_READBACK)
     _finish(conn, began, "released")
     assert (ledger.last_released(conn), ledger.last_released_app(conn)) == (_commit("c"), _commit("b"))
 
@@ -1098,7 +1113,9 @@ def test_settle_leaves_owner_app_members_waiting(open_ledger):
     assert asked == [_commit("a"), _commit("c")]  # never asked about an owner app change
     released, waiting = settled["released"], settled["waiting"]
     assert (released["state"], _commits(released)) == ("released", [_commit("a"), _commit("c")])
-    assert (released["new"], released["app_prev"], released["app_new"]) == (_commit("c"), None, None)
+    assert (released["new"], _stored_app_versions(conn, released), set(released)) == (
+        _commit("c"), (None, None), _PLATFORM_READBACK,
+    )
     assert (waiting["state"], _commits(waiting)) == ("open", [_commit("b"), _commit("d")])
     assert [member["position"] for member in waiting["members"]] == [1, 2]
     assert (ledger.last_released(conn), ledger.last_released_app(conn)) == (_commit("c"), None)
@@ -1110,3 +1127,108 @@ def test_settle_leaves_owner_app_members_waiting(open_ledger):
     }
     assert _store_rows(conn) == before
     assert asked == [_commit("a"), _commit("c")]
+
+
+@pytest.mark.parametrize("platform_part", (True, False), ids=("both-parts", "owner-app-only"))
+def test_begin_release_refuses_an_app_prev_other_than_the_last_released_app_new(open_ledger, platform_part):
+    conn = open_ledger()
+    _merge(conn, "a")
+    first = _decide(conn, _merge_app(conn, "b")["batch"], "accepted")
+    began = ledger.begin_release(
+        conn, first["batch_id"], prev=LIVE, new=_commit("a"), app_prev=APP_LIVE, app_new=_commit("b")
+    )
+    _finish(conn, began, "released")
+    _finish(conn, _begin(conn, _accepted(conn, "c"), prev=_commit("a")), "released")  # platform changes only
+    assert (ledger.last_released(conn), ledger.last_released_app(conn)) == (_commit("c"), _commit("b"))
+    if platform_part:
+        _merge(conn, "d")
+    batch_id = _decide(conn, _merge_app(conn, "e")["batch"], "accepted")["batch_id"]
+    versions = {"prev": _commit("c"), "new": _commit("d" if platform_part else "c"), "app_new": _commit("e")}
+
+    def readback_and_events():
+        [readback] = [batch for batch in ledger.list_batches(conn) if batch["batch_id"] == batch_id]
+        events = conn.execute("SELECT * FROM release_events WHERE batch_id = ? ORDER BY id", (batch_id,))
+        return readback, [tuple(event) for event in events]
+
+    (readback, events), rows = readback_and_events(), _store_rows(conn)
+    assert readback["state"] == "accepted"
+    # NEW and APP_NEW are right, but APP_PREV is what the owner app ran before its last released part.
+    with pytest.raises(ValueError):
+        ledger.begin_release(conn, batch_id, app_prev=APP_LIVE, **versions)
+    assert (readback_and_events(), _store_rows(conn)) == ((readback, events), rows)
+
+    releasing = ledger.begin_release(conn, batch_id, app_prev=_commit("b"), **versions)
+
+    assert releasing["state"] == "releasing"
+    assert (releasing["app_prev"], releasing["app_new"]) == (_commit("b"), _commit("e"))
+
+
+def test_last_released_app_reads_an_older_store_opened_read_only_before_its_upgrade(root):
+    path = ledger.ledger_path()
+
+    def read_only() -> sqlite3.Connection:
+        """Open the store as the release status reads it: read-only, never through connect(), which upgrades."""
+        store = sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro", uri=True, isolation_level=None)
+        store.row_factory = sqlite3.Row
+        return store
+
+    # A database without the batch table is no release record: both readers fail on it alike.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sqlite3.connect(path).close()
+    store = read_only()
+    try:
+        failures = []
+        for read in (ledger.last_released, ledger.last_released_app):
+            with pytest.raises(sqlite3.OperationalError) as failed:
+                read(store)
+            failures.append(str(failed.value))
+        assert failures == ["no such table: release_batches"] * 2
+    finally:
+        store.close()
+
+    older = _platform_only_store(path)
+    stored = path.read_bytes()
+    store = read_only()
+    try:
+        assert ledger.last_released(store) == _commit("a")
+        assert ledger.last_released_app(store) is None  # no owner app part was ever released
+        # Every batch reads back as before card 1, the waiting one with an owner app change too.
+        assert {frozenset(batch) for batch in ledger.list_batches(store)} == {_PLATFORM_READBACK}
+        # Not upgraded: every table keeps its columns and its rows.
+        for name, (columns, rows) in older.items():
+            kept = store.execute(f"SELECT * FROM {name}")
+            assert ([column[0] for column in kept.description], [tuple(row) for row in kept]) == (columns, rows)
+    finally:
+        store.close()
+    assert path.read_bytes() == stored
+
+
+@pytest.mark.parametrize("outcome", ("restored", "refused"))
+def test_only_a_batch_that_stores_owner_app_versions_reads_them_back(open_ledger, outcome):
+    conn = open_ledger()
+    merged = _merge(conn, "a")["batch"]
+    accepted = _decide(conn, merged, "accepted")
+    began = _begin(conn, accepted)
+    released = _finish(conn, began, "released")
+    # A batch of platform changes only stores no owner app version and reads back as before card 1.
+    assert _stored_app_versions(conn, released) == (None, None)
+    readbacks = (merged, accepted, began, released, *ledger.list_batches(conn))
+    assert [set(batch) for batch in readbacks] == [_PLATFORM_READBACK] * 5
+
+    # A batch with an owner app part stores its versions when its release begins; folded, it keeps them.
+    _merge(conn, "b")
+    both = _decide(conn, _merge_app(conn, "c")["batch"], "accepted")
+    assert set(both) == _PLATFORM_READBACK
+    began = ledger.begin_release(
+        conn, both["batch_id"], prev=_commit("a"), new=_commit("b"), app_prev=APP_LIVE, app_new=_commit("c")
+    )
+    folded = _finish(conn, began, outcome)
+    assert folded["state"] == "folded"
+    assert _stored_app_versions(conn, folded) == (APP_LIVE, _commit("c"))
+    for batch in (began, folded, ledger.list_batches(conn)[1]):
+        assert set(batch) == _PLATFORM_READBACK | {"app_prev", "app_new"}
+        assert (batch["app_prev"], batch["app_new"]) == (APP_LIVE, _commit("c"))
+    # Its changes wait again, in a batch that stores none.
+    [waiting] = _waiting(conn)
+    assert (_commits(waiting), _stored_app_versions(conn, waiting)) == ([_commit("b"), _commit("c")], (None, None))
+    assert set(waiting) == _PLATFORM_READBACK

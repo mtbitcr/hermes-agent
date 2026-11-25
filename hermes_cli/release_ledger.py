@@ -342,14 +342,15 @@ def begin_release(
     head while no batch was ever released. ``new`` is the merge commit of the
     batch's last platform member; a batch without platform members leaves the
     platform as it is, and its ``new`` is ``prev``. A batch with an owner app
-    part also takes ``app_prev``, what the owner app runs
-    (:func:`last_released_app`, or the running container's revision label while
-    no owner app part was ever released), and ``app_new``, the merge commit of
-    its last owner app member (owner app release plan D-2); a batch without one
-    takes neither. So the release ships the whole list the owner accepted. One
-    release runs at a time: while any batch is releasing, or failed and not yet
-    recovered, none begins. Anything else raises ``ValueError`` and writes
-    nothing.
+    part also takes ``app_prev``, what the owner app runs, and ``app_new``, the
+    merge commit of its last owner app member (owner app release plan D-2); a
+    batch without one takes neither. Once an owner app part was released,
+    ``app_prev`` must be :func:`last_released_app`; until then it is the
+    running container's revision label, which only the caller can read, so any
+    well-formed commit id is taken. So the release ships the whole list the
+    owner accepted. One release runs at a time: while any batch is releasing,
+    or failed and not yet recovered, none begins. Anything else raises
+    ``ValueError`` and writes nothing.
 
     Returns the batch read back, now releasing.
     """
@@ -386,6 +387,9 @@ def begin_release(
         live = last_released(conn)
         if live is not None and prev != live:
             raise ValueError("prev must be the NEW of the last released batch")
+        live_app = last_released_app(conn) if app else None
+        if live_app is not None and app_prev != live_app:
+            raise ValueError("app_prev must be the APP_NEW of the last released owner app part")
         conn.execute(
             "UPDATE release_batches SET state = 'releasing', prev = ?, new = ?, app_prev = ?, app_new = ? "
             "WHERE id = ?",
@@ -471,10 +475,15 @@ def last_released_app(conn: sqlite3.Connection) -> Optional[str]:
     """APP_NEW of the batch whose owner app part was released last: what the
     owner app runs, and the next owner app part's APP_PREV (owner app release
     plan D-2). A released batch released its owner app part with it.
-    ``None`` while no owner app part was ever released; APP_PREV is then the
-    running container's revision label. The order is that of the events, never
-    of the clock."""
+    ``None`` while no owner app part was ever released, as in a store made
+    before the owner app part and read before :func:`connect` upgraded it;
+    APP_PREV is then the running container's revision label. A store without
+    the batch table fails as :func:`last_released` does. The order is that of
+    the events, never of the clock."""
     _own_store(conn)
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(release_batches)")}
+    if columns and "app_new" not in columns:
+        return None
     row = conn.execute(
         "SELECT app_new FROM release_batches JOIN release_events ON batch_id = release_batches.id "
         "WHERE state = 'released' AND kind = 'release_finished' AND app_new IS NOT NULL "
@@ -772,7 +781,7 @@ def _snapshot(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
                 "SELECT * FROM release_members WHERE batch_id = ? ORDER BY position", (batch_id,)
             ).fetchall()
         ]
-    return {
+    readback = {
         "batch_id": row["id"],
         "state": row["state"],
         "version": row["version"],
@@ -786,13 +795,16 @@ def _snapshot(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
         "shown_digest": row["shown_digest"],
         "prev": row["prev"],
         "new": row["new"],
-        # A store not yet upgraded, read without connect() as the release status does, has neither.
-        "app_prev": row["app_prev"] if "app_prev" in row.keys() else None,
-        "app_new": row["app_new"] if "app_new" in row.keys() else None,
         "outcome": row["outcome"],
         "outcome_at": row["outcome_at"],
         "recovery_attempts": row["recovery_attempts"],
     }
+    # Only a batch whose owner app part began its release stores APP_PREV and APP_NEW. Every other
+    # batch, and every batch of a store not yet upgraded (read without connect(), as the release
+    # status does), reads back as before the owner app part.
+    if all(name in row.keys() and row[name] is not None for name in ("app_prev", "app_new")):
+        readback.update(app_prev=row["app_prev"], app_new=row["app_new"])
+    return readback
 
 
 def _upgrade_first_schema(conn: sqlite3.Connection) -> None:
