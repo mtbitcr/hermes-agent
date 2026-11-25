@@ -107,11 +107,9 @@ _BRIEF_LIMITS = {"headline": 120, "what_changed": 400, "next_step": 240, "needs_
 _CLOSURE_REASON_LIMIT = 300
 # Step 7's rule for a required closure; a review task published with the closure setting off leaves it out.
 _CLOSURE_RULE = """\
-   When the input holds an accepted suggestion with no live closure whose linked_card is a task of this input with a
-   non-null delivery_state, the review must propose its closure with that card. After the owner's Undo, which the
-   suggestion's closure shows with undone_at, only a delivery recorded later qualifies: a completed or delivery_merged
-   event in that task's events after undone_at. When more than three such suggestions exist, the review proposes
-   three of them.
+   When the input holds an accepted suggestion with no closure whose linked_card is a task of this input with a
+   non-null delivery_state, the review must propose its closure with that card. When more than three such suggestions
+   exist, the review proposes three of them.
 """
 
 INSTRUCTION = """\

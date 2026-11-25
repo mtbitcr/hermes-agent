@@ -12,6 +12,7 @@ import yaml
 
 from hermes_cli import kanban_db, owner_model_updates as updates, owner_project_review as review, owner_workspace, projects_db
 from hermes_cli import owner_project_review_record as record, owner_project_summary_events as events
+from hermes_cli.kanban_recommendation_closure import delivery_after_undo
 from hermes_cli.owner_project_review_refusal import refusal_sentences
 from tests.hermes_cli.test_owner_project_review_plans import _approved_plan
 from tests.hermes_cli.test_owner_project_review_record import (  # noqa: F401
@@ -1463,9 +1464,8 @@ def test_a_stored_result_with_no_closure_for_its_eligible_pair_is_read_and_finis
     assert _closure_rows(world) == []
 
 
-# What the published instruction says of an eligible pair's closure, and of a delivery after the owner's Undo.
+# What the published instruction says of an eligible pair's closure. Owner rule 1: it says nothing of the owner's Undo.
 MUST_PROPOSE = "must propose its closure"
-AFTER_UNDO = "a completed or delivery_merged event in that task's events after undone_at"
 
 
 def _published(task):
@@ -1478,18 +1478,21 @@ def _instruction(body):
     return " ".join(body.split("<<<BEGIN UNTRUSTED DATA")[0].split())
 
 
-def test_with_closure_on_the_published_review_requires_the_closure_and_says_what_qualifies_after_an_undo(closure_world):
+def test_with_closure_on_the_published_review_requires_the_closure_of_a_suggestion_with_no_closure_and_names_no_undo(
+    closure_world,
+):
     instruction = _instruction(_published(closure_world["review_task"]))
 
     assert MUST_PROPOSE in instruction
-    assert AFTER_UNDO in instruction
+    assert "an accepted suggestion with no closure whose linked_card" in instruction
+    assert "undo" not in instruction.lower()
 
 
 def test_with_closure_off_the_published_review_requires_no_closure(world):
     instruction = _instruction(_published(world["review_task"]))
 
     assert "must propose" not in instruction
-    assert AFTER_UNDO not in instruction
+    assert "undo" not in instruction.lower()
     assert "Propose at most three closures." in instruction
 
 
@@ -1565,7 +1568,7 @@ def test_after_the_owners_undo_with_no_newer_delivery_the_next_review_needs_no_c
     suggestion, frozen_card = _frozen_pair(world, later)
     assert (suggestion["decision"], suggestion["closure"]["undone_at"], frozen_card["delivery_state"]) == (
         "accepted", NOW + 2, "done")
-    assert AFTER_UNDO in _instruction(_published(later))
+    assert "undo" not in _instruction(_published(later)).lower()
     _complete({**world, "review_task": later}, _result(
         world, classes={linked: ("answered", [f"suggestions:{linked}"])}, closures=[_closure(world)] if proposed else ()))
 
@@ -1575,8 +1578,12 @@ def test_after_the_owners_undo_with_no_newer_delivery_the_next_review_needs_no_c
     assert _live_closures(world) == 0
 
 
-@pytest.mark.parametrize(("proposed", "refusal"), [(False, MISSING), (True, None)], ids=["empty_list", "one_closure"])
-def test_after_the_owners_undo_a_newer_delivery_of_the_card_requires_its_closure_again(closure_world, proposed, refusal):
+@pytest.mark.parametrize("proposed", [False, True], ids=["empty_list", "one_closure"])
+def test_after_the_owners_undo_a_newer_delivery_of_the_card_requires_no_closure_and_a_valid_one_is_still_written(
+    closure_world, proposed,
+):
+    """Owner rule 1: the undone closure row leaves the suggestion out of the required closures; the existing checks
+    still accept a proposed one."""
     world = closure_world
     linked, card = world["linked"], world["card"]
     _closed_then_undone(world)
@@ -1593,6 +1600,63 @@ def test_after_the_owners_undo_a_newer_delivery_of_the_card_requires_its_closure
     _complete({**world, "review_task": later}, _result(
         world, classes={linked: ("answered", [f"suggestions:{linked}"])}, closures=[_closure(world)] if proposed else ()))
 
-    assert _harvested_at(world, NOW + 86401) == refusal
-    assert _closure_rows(world) == [(linked, card, "done", "project-review", "2026-11-10" if refusal else "2026-11-11")]
-    assert _live_closures(world) == (0 if refusal else 1)
+    assert _harvested_at(world, NOW + 86401) is None
+    assert _closure_rows(world) == [(linked, card, "done", "project-review", "2026-11-11" if proposed else "2026-11-10")]
+    assert _live_closures(world) == (1 if proposed else 0)
+
+
+def _accepted_with_no_closure(world, later):
+    """The published review ``later`` requires a closure and says nothing of Undo; its result with no proposal for the
+    undone pair is accepted: no refusal, the day's brief is stored, and no new closure."""
+    linked, card = world["linked"], world["card"]
+    instruction = _instruction(_published(later))
+    assert MUST_PROPOSE in instruction
+    assert "undo" not in instruction.lower()
+    _complete({**world, "review_task": later}, _result(world, classes={linked: ("answered", [f"suggestions:{linked}"])}))
+
+    assert _harvested_at(world, NOW + 86401) is None
+    assert _briefs(world) == 2
+    assert _live_closures(world) == 0
+    assert _closure_rows(world) == [(linked, card, "done", "project-review", "2026-11-10")]
+
+
+def test_after_the_owners_undo_a_delivery_in_the_second_of_the_undo_requires_no_closure(closure_world):
+    """Owner rule 1, first case of its proof: the card is done again in the same second as the Undo."""
+    world = closure_world
+    linked, card = world["linked"], world["card"]
+    _closed_then_undone(world)
+    with _written_at(NOW + 2), _project_board(world["project"]) as board:
+        with kanban_db.write_txn(board):
+            board.execute("UPDATE tasks SET status='ready' WHERE id=?", (card,))
+        assert kanban_db.complete_task(board, card, summary="Lunch is ordered again.")
+    later = _next_review(world)
+
+    suggestion, frozen_card = _frozen_pair(world, later)
+    assert (suggestion["decision"], suggestion["closure"]["undone_at"], frozen_card["delivery_state"]) == (
+        "accepted", NOW + 2, "done")
+    assert [event["at"] for event in frozen_card["events"] if event["kind"] == "completed"] == [NOW + 2]
+    _accepted_with_no_closure(world, later)
+
+
+def test_after_the_owners_undo_a_delivery_left_out_of_the_inputs_events_requires_no_closure(closure_world):
+    """Owner rule 1, second case of its proof: twenty comments come first in the card's events of the next input."""
+    world = closure_world
+    linked, card = world["linked"], world["card"]
+    _closed_then_undone(world)
+    with _written_at(NOW + 3), _project_board(world["project"]) as board:
+        for check in range(1, 21):
+            kanban_db.add_comment(board, card, "default", f"Lunch order check {check}.")
+        with kanban_db.write_txn(board):
+            board.execute("UPDATE tasks SET status='ready' WHERE id=?", (card,))
+        assert kanban_db.complete_task(board, card, summary="Lunch is ordered again.")
+    later = _next_review(world)
+
+    suggestion, frozen_card = _frozen_pair(world, later)
+    assert (suggestion["decision"], suggestion["closure"]["undone_at"], frozen_card["delivery_state"]) == (
+        "accepted", NOW + 2, "done")
+    # The reader keeps 20 events of the card past the Project's event cursor: the comments, not the completion.
+    assert [event["kind"] for event in frozen_card["events"]] == ["commented"] * 20
+    # The live board holds that completion after the Undo, in the event order the kernel reads.
+    with _project_board(world["project"]) as board:
+        assert delivery_after_undo(board, linked, card)
+    _accepted_with_no_closure(world, later)

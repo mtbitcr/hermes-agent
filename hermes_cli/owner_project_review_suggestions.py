@@ -82,13 +82,14 @@ def _review_closures(board, project_id, sources, classification, proposals) -> l
 
 def check_required_closures(board, project_id, sources, classification, closures) -> None:
     """Refuse a result that leaves out a required closure. An eligible pair is an accepted suggestion of the frozen input
-    and its linked card whose closure passes every check of _review_closures; the result's checked closures must hold
-    one for each, or for as many as the cap allows."""
+    with no closure, live or undone, and its linked card whose closure passes every check of _review_closures; the
+    result's checked closures must hold one for each, or for as many as the cap allows."""
     from hermes_cli.owner_project_review import ReviewRefused
 
     eligible = set()
     for item in sources["suggestions"]:
-        if item["decision"] != "accepted" or not item.get("linked_card"):
+        # Owner rule of 2026-11-25: after the owner's Undo a proposal stays possible, but none is required.
+        if item["decision"] != "accepted" or not item.get("linked_card") or item.get("closure"):
             continue
         # The closure the review must propose for this pair, checked as a proposed one is.
         required = {"recommendation_id": item["id"], "card_id": item["linked_card"],
