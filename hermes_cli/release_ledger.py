@@ -21,6 +21,13 @@ release command, such as the manual emergency release, is settled instead: the
 waiting changes the running commit contains are recorded released in a batch of
 their own, and a waiting batch left without changes is folded.
 
+A batch has a platform part, the changes whose pull request is in
+mtbitcr/hermes-agent, and an owner app part, those in mtbitcr/raphael-workspace;
+the part is read from the pull request and never stored. A batch with an owner
+app part also stores the owner app's APP_PREV and APP_NEW beside PREV and NEW.
+Only platform changes are settled outside the release command (owner app
+release plan, card 1).
+
 Nothing calls this module yet: the merge-step call, the release command, the
 Decisions page and the reminder job belong to later cards.
 """
@@ -57,6 +64,9 @@ _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _PR_URL_RE = re.compile(
     r"https://github\.com/mtbitcr/(?:hermes-agent|raphael-workspace)/pull/[1-9][0-9]*"
 )
+# A change whose pull request is in the owner app's repository is in its batch's owner app part,
+# every other change in its platform part (owner app release plan D-1).
+_APP_PR_URL_PREFIX = "https://github.com/mtbitcr/raphael-workspace/pull/"
 # Card ids and page references are lowercase non-secret identifiers, as in kanban.
 _IDENTIFIER_RE = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,199}")
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
@@ -96,7 +106,9 @@ _SCHEMA = (
         new TEXT,
         outcome TEXT CHECK (outcome IN ('released', 'restored', 'refused', 'failed')),
         outcome_at INTEGER,
-        recovery_attempts INTEGER NOT NULL DEFAULT 0
+        recovery_attempts INTEGER NOT NULL DEFAULT 0,
+        app_prev TEXT,
+        app_new TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS release_members (
         batch_id INTEGER NOT NULL REFERENCES release_batches(id),
@@ -140,7 +152,7 @@ def ledger_path() -> Path:
 
 def connect() -> sqlite3.Connection:
     """Open the release store, creating the file and its tables on first use and
-    upgrading a store the first build made.
+    upgrading a store an earlier build made.
 
     ``isolation_level=None`` because every write runs inside the kanban
     ``write_txn`` boundary (BEGIN IMMEDIATE with busy retries). Foreign keys
@@ -315,15 +327,29 @@ def decide_release(
         return decided
 
 
-def begin_release(conn: sqlite3.Connection, batch_id: int, *, prev: str, new: str) -> dict[str, Any]:
-    """Mark an accepted batch releasing and store its release's two versions (S-B).
+def begin_release(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    *,
+    prev: str,
+    new: str,
+    app_prev: Optional[str] = None,
+    app_new: Optional[str] = None,
+) -> dict[str, Any]:
+    """Mark an accepted batch releasing and store its release's versions (S-B).
 
     ``prev`` is what the host runs: :func:`last_released`, or the checkout's
     head while no batch was ever released. ``new`` is the merge commit of the
-    batch's last member, so the release ships the whole list the owner
-    accepted. One release runs at a time: while any batch is releasing, or
-    failed and not yet recovered, none begins. Anything else raises
-    ``ValueError`` and writes nothing.
+    batch's last platform member; a batch without platform members leaves the
+    platform as it is, and its ``new`` is ``prev``. A batch with an owner app
+    part also takes ``app_prev``, what the owner app runs
+    (:func:`last_released_app`, or the running container's revision label while
+    no owner app part was ever released), and ``app_new``, the merge commit of
+    its last owner app member (owner app release plan D-2); a batch without one
+    takes neither. So the release ships the whole list the owner accepted. One
+    release runs at a time: while any batch is releasing, or failed and not yet
+    recovered, none begins. Anything else raises ``ValueError`` and writes
+    nothing.
 
     Returns the batch read back, now releasing.
     """
@@ -331,6 +357,9 @@ def begin_release(conn: sqlite3.Connection, batch_id: int, *, prev: str, new: st
     _require_batch_id(batch_id)
     for name, value in (("prev", prev), ("new", new)):
         _require(value, _COMMIT_RE, f"{name} must be a 40-character lowercase hex commit id")
+    for name, value in (("app_prev", app_prev), ("app_new", app_new)):
+        if value is not None:
+            _require(value, _COMMIT_RE, f"{name} must be a 40-character lowercase hex commit id")
 
     with write_txn(conn):
         current = _snapshot(conn, batch_id)
@@ -339,14 +368,28 @@ def begin_release(conn: sqlite3.Connection, batch_id: int, *, prev: str, new: st
         unfinished = conn.execute(f"SELECT id FROM release_batches WHERE {_UNFINISHED_SQL}").fetchone()
         if unfinished is not None:
             raise ValueError(f"release batch {unfinished['id']} has not finished its release")
-        if not current["members"] or new != current["members"][-1]["merge_commit"]:
+        if not current["members"]:
             raise ValueError("new must be the merge commit of the batch's last member")
+        platform, app = _parts(current["members"])
+        if not app and new != platform[-1]["merge_commit"]:
+            raise ValueError("new must be the merge commit of the batch's last member")
+        if app and platform and new != platform[-1]["merge_commit"]:
+            raise ValueError("new must be the merge commit of the batch's last platform member")
+        if app and not platform and new != prev:
+            raise ValueError("new must be prev: the batch has no platform member")
+        if not app and (app_prev is not None or app_new is not None):
+            raise ValueError("a batch without an owner app part takes no app_prev and no app_new")
+        if app and app_prev is None:
+            raise ValueError("a batch with an owner app part takes app_prev")
+        if app and app_new != app[-1]["merge_commit"]:
+            raise ValueError("app_new must be the merge commit of the batch's last owner app member")
         live = last_released(conn)
         if live is not None and prev != live:
             raise ValueError("prev must be the NEW of the last released batch")
         conn.execute(
-            "UPDATE release_batches SET state = 'releasing', prev = ?, new = ? WHERE id = ?",
-            (prev, new, batch_id),
+            "UPDATE release_batches SET state = 'releasing', prev = ?, new = ?, app_prev = ?, app_new = ? "
+            "WHERE id = ?",
+            (prev, new, app_prev, app_new, batch_id),
         )
         _record_event(conn, batch_id, "release_began", {"prev": prev, "new": new}, int(time.time()))
         return _snapshot(conn, batch_id)
@@ -424,6 +467,22 @@ def last_released(conn: sqlite3.Connection) -> Optional[str]:
     return None if row is None else row["new"]
 
 
+def last_released_app(conn: sqlite3.Connection) -> Optional[str]:
+    """APP_NEW of the batch whose owner app part was released last: what the
+    owner app runs, and the next owner app part's APP_PREV (owner app release
+    plan D-2). A released batch released its owner app part with it.
+    ``None`` while no owner app part was ever released; APP_PREV is then the
+    running container's revision label. The order is that of the events, never
+    of the clock."""
+    _own_store(conn)
+    row = conn.execute(
+        "SELECT app_new FROM release_batches JOIN release_events ON batch_id = release_batches.id "
+        "WHERE state = 'released' AND kind = 'release_finished' AND app_new IS NOT NULL "
+        "ORDER BY release_events.id DESC LIMIT 1"
+    ).fetchone()
+    return None if row is None else row["app_new"]
+
+
 def settle_outside_release(
     conn: sqlite3.Connection, *, running: str, contains: Callable[[str, str], bool]
 ) -> dict[str, Any]:
@@ -431,14 +490,16 @@ def settle_outside_release(
     release: the host now runs ``running`` (finding 156).
 
     ``contains(a, b)`` is the guards' ancestry check, true when commit ``a`` is on the history
-    of ``b``. In one write transaction, every waiting change that ``running`` contains moves, in
-    merge order, into a new batch recorded released, with PREV the NEW of :func:`last_released`
-    (``None`` while no batch was ever released), NEW ``running`` and a ``release_finished``
-    event marked ``outside``; :func:`last_released` then names ``running``. The changes it does
-    not contain stay in the waiting batch, whose version rises, so a decision on the list shown
-    before is stale; a waiting batch left without changes is folded. While any batch is
-    releasing, or failed and not yet recovered, this raises ``ValueError`` and writes nothing,
-    and nothing is written when ``running`` contains no waiting change.
+    of ``b``. In one write transaction, every waiting platform change that ``running`` contains
+    moves, in merge order, into a new batch recorded released, with PREV the NEW of
+    :func:`last_released` (``None`` while no batch was ever released), NEW ``running`` and a
+    ``release_finished`` event marked ``outside``; :func:`last_released` then names ``running``.
+    ``running`` is a platform commit, so owner app changes are never settled (owner app release
+    plan card 1). The changes not settled stay in the waiting batch, whose version rises, so a
+    decision on the list shown before is stale; a waiting batch left without changes is folded.
+    While any batch is releasing, or failed and not yet recovered, this raises ``ValueError``
+    and writes nothing, and nothing is written when ``running`` contains no waiting platform
+    change.
 
     Returns the ``released`` batch read back, ``None`` when nothing was settled, and the
     ``waiting`` one, ``None`` when no change waits.
@@ -453,7 +514,8 @@ def settle_outside_release(
         row = conn.execute(f"SELECT id FROM release_batches WHERE {_WAITING_SQL}").fetchone()
         waiting = None if row is None else _snapshot(conn, row["id"])
         members = [] if waiting is None else waiting["members"]
-        settled = [member for member in members if contains(member["merge_commit"], running)]
+        platform, _ = _parts(members)
+        settled = [member for member in platform if contains(member["merge_commit"], running)]
         if not settled:
             return {"released": None, "waiting": waiting}
         now = int(time.time())
@@ -674,6 +736,13 @@ def _member(row: sqlite3.Row) -> dict[str, Any]:
     return member
 
 
+def _parts(members: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """A batch's platform part and owner app part, each in merge order (owner app release plan D-1)."""
+    platform = [member for member in members if not member["pr_url"].startswith(_APP_PR_URL_PREFIX)]
+    app = [member for member in members if member["pr_url"].startswith(_APP_PR_URL_PREFIX)]
+    return platform, app
+
+
 @contextlib.contextmanager
 def _read_txn(conn: sqlite3.Connection) -> Iterator[None]:
     """Run a readback's reads in one SQLite read transaction, so they see one
@@ -717,6 +786,9 @@ def _snapshot(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
         "shown_digest": row["shown_digest"],
         "prev": row["prev"],
         "new": row["new"],
+        # A store not yet upgraded, read without connect() as the release status does, has neither.
+        "app_prev": row["app_prev"] if "app_prev" in row.keys() else None,
+        "app_new": row["app_new"] if "app_new" in row.keys() else None,
         "outcome": row["outcome"],
         "outcome_at": row["outcome_at"],
         "recovery_attempts": row["recovery_attempts"],
@@ -724,16 +796,24 @@ def _snapshot(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
 
 
 def _upgrade_first_schema(conn: sqlite3.Connection) -> None:
-    """Bring a store the first build made up to this schema, keeping every row.
+    """Bring a store an earlier build made up to this schema, keeping every row.
 
-    SQLite cannot change a CHECK, so the batches are copied aside and their
-    table is made anew under the name the members and events refer to. It is
-    never renamed: a rename opens the temporary database, which
+    A store made before the owner app part (owner app release plan card 1) gets
+    the empty APP_PREV and APP_NEW columns, added last. For a store the first
+    build made, SQLite cannot change a CHECK, so the batches are copied aside
+    and their table is made anew under the name the members and events refer
+    to. It is never renamed: a rename opens the temporary database, which
     :func:`_own_store` refuses. Runs inside :func:`connect`'s first
-    transaction, before foreign keys are on.
+    transaction, before foreign keys are on; a store already upgraded is left
+    as it is.
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(release_batches)")}
-    if not columns or "outcome" in columns:
+    if not columns:
+        return
+    if "outcome" in columns:
+        for column in ("app_prev", "app_new"):
+            if column not in columns:
+                conn.execute(f"ALTER TABLE release_batches ADD COLUMN {column} TEXT")
         return
     conn.execute("CREATE TABLE release_batches_first AS SELECT * FROM release_batches")
     conn.execute("DROP TABLE release_batches")
