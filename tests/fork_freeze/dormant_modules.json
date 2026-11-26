@@ -31,6 +31,7 @@
   "hermes_cli/kanban_output.py": "444a24b9003d8a8c272638e83fd87b6dbf8feaa756e2271030d2a3dc891d7dbd",
   "hermes_cli/kanban_parser.py": "365a78f8ea5d3406fefb9cd0b2c02e01daf19a0683cc3309945db498acc1ac6c",
   "hermes_cli/kanban_pr_acceptance_store.py": "ca60c348f262fbc6f0725f56b464e0a36f8da7d5bf922062cacb03ba033e7157",
+  "hermes_cli/kanban_scope_patch.py": "0bb58b15a2636dd9841d817247c97fd6e29f4118896c683b8b3245b236d3df36",
   "hermes_cli/kanban_transfer.py": "047547ba44b256fdd7ef2db23a7a727f8f39a52159220ae57868bb08b21846b3",
   "hermes_cli/local_runtime/hf_browse.py": "7fded4fa026f5049ee55105cfe94d516c232ca2d8456b205f3750e47a248f9be",
   "hermes_cli/observability/relay_runtime.py": "c8e741e5fd37a2fbd43b23ffacad72d13283248d9c589bde41fa5cd80a8f416e",
