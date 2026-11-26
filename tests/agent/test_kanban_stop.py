@@ -337,6 +337,13 @@ def test_publisher_form_one_reads_as_success(clear_kanban_env, monkeypatch, tmp_
     # The same replaced form of another tool's result is no verdict.
     other = [_verdict_call("kanban_heartbeat"), _verdict_result("kanban_heartbeat", replaced)]
     assert build_kanban_stop_nudge(messages=other) is not None
+    # Tagged block with a success-looking preview and closing tag, but no saved-output line.
+    lines = replaced.split("\n")
+    no_path = "\n".join(ln for ln in lines if not ln.startswith("Full output saved to:"))
+    assert no_path != replaced and no_path.startswith(PERSISTED_OUTPUT_TAG)
+    missing = [_verdict_call(verdict), _verdict_result(verdict, no_path)]
+    assert session_called_kanban_terminal(missing) is False
+    assert build_kanban_stop_nudge(messages=missing) is not None
 
 
 @pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
@@ -359,6 +366,18 @@ def test_publisher_form_two_reads_as_success(clear_kanban_env, monkeypatch, tmp_
     assert build_kanban_stop_nudge(messages=other) is not None
 
 
+@pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
+def test_nudge_when_form_two_notice_is_cut_off_or_followed_by_text(clear_kanban_env, verdict):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    texts = [
+        _SUCCESS_START + "\n[Truncated: tool response was",
+        _SUCCESS_START + "\n\n[Truncated: tool response was",
+        _form_two(_SUCCESS_START) + "\nunrelated text",
+        _form_two(_SUCCESS_START) + "\n",
+    ]
+    for text in texts:
+        assert _nudge_for(verdict, text) is not None, text
+    assert _nudge_for(verdict, _form_two(_SUCCESS_START)) is None
 
 
 

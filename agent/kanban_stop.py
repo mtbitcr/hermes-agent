@@ -20,8 +20,18 @@ _VERDICT_KANBAN_TOOLS = frozenset({"kanban_review_findings", "kanban_request_cha
 _DEFAULT_MAX_ATTEMPTS = 2
 
 _SUCCESS_START = '{"ok": true'
-_PREVIEW_LINE = re.compile(r"^Preview \(first \d+ chars\):\n", re.MULTILINE)
-_TRUNCATED_LINE = "\n[Truncated: tool response was"
+_FORM_ONE_HEAD = re.compile(
+    re.escape(PERSISTED_OUTPUT_TAG) + r"\n"
+    r"(?:(?!Full output saved to: )[^\n]+\n)*"
+    r"Full output saved to: \S[^\n]*\n"
+    r"(?:[^\n]+\n)*"
+    r"\nPreview \(first \d+ chars\):\n"
+)
+_FORM_ONE_END = "\n" + PERSISTED_OUTPUT_CLOSING_TAG
+_FORM_TWO_NOTICE = re.compile(
+    r"\n\n\[Truncated: tool response was \d{1,3}(?:,\d{3})* chars\. "
+    r"Full output could not be saved to sandbox\.\]\Z"
+)
 
 
 def kanban_stop_nudge_enabled() -> bool:
@@ -41,17 +51,14 @@ def _tool_call_name(tc: Any) -> str:
 
 
 def _replaced_result_starts_with_success(content: str) -> bool:
-    """True when ``content`` is a result the tool publisher replaced with a preview (form one:
-    tagged block with a ``Preview (first N chars):`` line; form two: result start, then a
-    ``[Truncated: tool response was`` line) and the result's first characters are a success."""
-    if content.startswith(PERSISTED_OUTPUT_TAG):
-        preview = _PREVIEW_LINE.search(content)
-        return (
-            content.endswith(PERSISTED_OUTPUT_CLOSING_TAG)
-            and preview is not None
-            and content.startswith(_SUCCESS_START, preview.end())
-        )
-    return content.startswith(_SUCCESS_START) and _TRUNCATED_LINE in content
+    """True when ``content`` is a result the tool publisher replaced with a preview and the
+    result's first characters are a success. Form one: tagged block with a saved-output line,
+    then ``Preview (first N chars):`` after a blank line, ending with the closing tag. Form two:
+    result start, then the publisher's truncation notice as the very end of the text."""
+    head = _FORM_ONE_HEAD.match(content)
+    if head is not None:
+        return content.endswith(_FORM_ONE_END) and content.startswith(_SUCCESS_START, head.end())
+    return content.startswith(_SUCCESS_START) and _FORM_TWO_NOTICE.search(content) is not None
 
 
 def _verdict_result_succeeded(content: Any) -> bool:
