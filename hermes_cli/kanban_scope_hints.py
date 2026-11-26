@@ -24,8 +24,8 @@ owned paths that match one of five rules:
    Family not resolved: one row for the test file itself, with the line of the call ("saved
    example not resolved"), and no example file. Only a file the main scan would also read is
    listed (it, and where it resolves, are inside the repository, not owned and not in
-   ``SKIP_DIRS``; a family folder is checked the same way before it is read), once, as its own
-   row (rules ``(5,)``, no keys) right after the file's own row when it has one, which is never
+   ``SKIP_DIRS``; a family folder is checked the same way before it is read), one row per call
+   and file, as its own row (rules ``(5,)``, no keys) right after the file's own row when it has one, which is never
    rewritten. The count of rule 5 counts each of these rows.
 
 An owned folder owns every file in it, for every rule; ``.`` owns the whole repository
@@ -238,13 +238,13 @@ def _safe_component(name: str) -> bool:
     return not (PurePosixPath(name).is_absolute() or PureWindowsPath(name).drive)
 
 
-def _saved_examples(root: Path, trees: Iterable[tuple[str, ast.Module]], scan_target) -> tuple[dict[str, bool], list[tuple[str, int]]]:
+def _saved_examples(root: Path, trees: Iterable[tuple[str, ast.Module]], scan_target) -> tuple[list[tuple[str, bool]], list[tuple[str, int]]]:
     """What the ``owner_payload_example`` calls of *trees* (test file path, syntax tree) read: the
-    saved example files, as path relative to *root* -> whether it is listed only as "every example
-    of the family"; and, for each call whose family is not resolved, the test file and the line of
+    saved example rows, one per call and file, as (path relative to *root*, whether it is listed
+    only as "every example of the family"); and, for each call whose family is not resolved, the test file and the line of
     the call. *scan_target(path, follow)* is the scan's own test of a file: the path it really is,
     or ``None`` when the scan would skip it (outside the repository, owned, in a skipped folder)."""
-    found: dict[str, bool] = {}
+    found: list[tuple[str, bool]] = []
     unresolved: list[tuple[str, int]] = []
     for rel_test, tree in trees:
         literals = _module_literals(tree)
@@ -281,8 +281,7 @@ def _saved_examples(root: Path, trees: Iterable[tuple[str, ast.Module]], scan_ta
                 files = sorted(folder.glob("*.json"))
             for file in files:
                 if scan_target(file, True) is not None:
-                    rel = file.relative_to(root).as_posix()
-                    found[rel] = False if kind is not None else found.get(rel, True)
+                    found.append((file.relative_to(root).as_posix(), kind is None))
     return found, unresolved
 
 
@@ -391,7 +390,7 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
     hints.extend(Hint(rel, (), (), True) for rel in sorted(helpers))
     listed = {h.path for h in hints}
     saved, unresolved = _saved_examples(root, [(rel, tree) for rel, tree in example_trees.items() if rel in listed], scan_target)
-    hints.extend(Hint(rel, (5,), (), False, every) for rel, every in saved.items())
+    hints.extend(Hint(rel, (5,), (), False, every) for rel, every in saved)
     hints.extend(Hint(rel, (5,), (), False, False, line) for rel, line in unresolved)
     keyed = {h.path for h in hints if 4 in h.rules}
     hints.sort(key=lambda h: (h.path not in keyed, h.path, h.imports_pinning_test, h.rules == (5,)))

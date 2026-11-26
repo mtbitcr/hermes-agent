@@ -501,22 +501,45 @@ def test_record_kind_that_is_not_a_literal_lists_every_json_file_of_that_family(
     }
 
 
-def test_a_literal_reading_wins_over_the_family_folder_and_a_file_is_listed_once(saved_repo):
+def _saved_lines(report) -> list[str]:
+    return sorted(line for line in hints.format_report(report) if line.startswith(SAVED))
+
+
+def test_repeated_exact_calls_give_one_row_per_call(saved_repo):
+    _write(saved_repo / "tests" / "test_lit.py",
+           "import hermes_cli.widget\n\n"
+           "def test_a(owner_payload_example):\n"
+           "    owner_payload_example('fam', 'one', {})\n    owner_payload_example('fam', 'one', {})\n")
+    report = hints.find_hints(saved_repo, [OWNED])
+    assert _saved_lines(report) == [f"{SAVED}/fam/one.json\t{SAVED_LABEL}"] * 2
+    assert report.counts[5] == 2
+
+
+def test_repeated_family_only_calls_give_one_row_per_call_and_file(saved_repo):
+    _write(saved_repo / "tests" / "test_loop.py",
+           "import hermes_cli.widget\n\nFAMILY = 'fam'\n\n"
+           "def test_a(owner_payload_example, answers):\n"
+           "    a = {k: owner_payload_example(FAMILY, k, v) for k, v in answers.items()}\n"
+           "    b = {k: owner_payload_example(FAMILY, k, v) for k, v in answers.items()}\n")
+    report = hints.find_hints(saved_repo, [OWNED])
+    assert _saved_lines(report) == [f"{SAVED}/fam/one.json\t{FAMILY_LABEL}"] * 2 + [
+        f"{SAVED}/fam/two.json\t{FAMILY_LABEL}"] * 2
+    assert report.counts[5] == 4
+
+
+def test_an_exact_row_never_replaces_a_family_only_row_of_the_same_path(saved_repo):
     _write(saved_repo / "tests" / "test_loop.py",
            "import hermes_cli.widget\n\n"
            "def test_a(owner_payload_example, answers):\n"
            "    owner_payload_example('fam', 'one', {})\n"
            "    return {k: owner_payload_example('fam', k, a) for k, a in answers.items()}\n")
-    _write(saved_repo / "tests" / "test_lit.py",
-           "import hermes_cli.widget\n\n"
-           "def test_a(owner_payload_example):\n"
-           "    owner_payload_example('fam', 'one', {})\n    owner_payload_example('fam', 'two', {})\n")
     report = hints.find_hints(saved_repo, [OWNED])
-    assert _saved_rows(report) == {
-        f"{SAVED}/fam/one.json": SAVED_LABEL,
-        f"{SAVED}/fam/two.json": SAVED_LABEL,
-    }
-    assert [p for p in _paths(report) if p.startswith(SAVED)] == [f"{SAVED}/fam/one.json", f"{SAVED}/fam/two.json"]
+    assert _saved_lines(report) == [
+        f"{SAVED}/fam/one.json\t{SAVED_LABEL}",
+        f"{SAVED}/fam/one.json\t{FAMILY_LABEL}",
+        f"{SAVED}/fam/two.json\t{FAMILY_LABEL}",
+    ]
+    assert report.counts[5] == 3
 
 
 def test_family_that_is_not_a_literal_lists_nothing(saved_repo):
