@@ -380,6 +380,96 @@ def test_nudge_when_form_two_notice_is_cut_off_or_followed_by_text(clear_kanban_
     assert _nudge_for(verdict, _form_two(_SUCCESS_START)) is None
 
 
+def _real_form_one(monkeypatch, home) -> str:
+    from tools.tool_result_storage import PERSISTED_OUTPUT_TAG
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    replaced = _publish(_long_success(), "kanban_review_findings")
+    assert replaced.startswith(PERSISTED_OUTPUT_TAG)
+    return replaced
+
+
+def _real_form_two(monkeypatch, tmp_path) -> str:
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("x")
+    monkeypatch.setenv("HERMES_HOME", str(blocker))
+    replaced = _publish(_long_success(), "kanban_review_findings")
+    assert "\n\n[Truncated: tool response was" in replaced
+    return replaced
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
+def test_publisher_form_one_with_blank_line_in_saved_path_reads_as_success(
+    clear_kanban_env, monkeypatch, tmp_path, verdict
+):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    replaced = _real_form_one(monkeypatch, tmp_path / "home\n\nx")
+    saved_line = next(ln for ln in replaced.split("Full output saved to: ")[1:2])
+    assert saved_line.startswith(str(tmp_path / "home\n\nx"))
+    assert "home\n\nx" in replaced
+    messages = [_verdict_call(verdict), _verdict_result(verdict, replaced)]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+    other = [_verdict_call("kanban_heartbeat"), _verdict_result("kanban_heartbeat", replaced)]
+    assert build_kanban_stop_nudge(messages=other) is not None
+
+
+@pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
+def test_nudge_when_form_one_declared_count_does_not_match_preview(
+    clear_kanban_env, monkeypatch, tmp_path, verdict
+):
+    import re
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    replaced = _real_form_one(monkeypatch, tmp_path / "home")
+    declared = int(re.search(r"Preview \(first (\d+) chars\)", replaced).group(1))
+    assert "\n...\n" in replaced
+    assert _nudge_for(verdict, replaced) is None
+
+    def with_count(text: str) -> str:
+        return replaced.replace(f"Preview (first {declared} chars)", f"Preview (first {text} chars)")
+
+    for wrong in ("1", "0", str(declared - 1), str(declared + 1), str(declared + 5), f"0{declared}", "\u0661\u0662"):
+        assert _nudge_for(verdict, with_count(wrong)) is not None, wrong
+    # The ellipsis is outside the count and optional (the publisher omits it when nothing is cut).
+    no_ellipsis = replaced.replace("\n...\n", "\n", 1)
+    assert _nudge_for(verdict, no_ellipsis) is None
+    assert _nudge_for(verdict, no_ellipsis.replace(f"first {declared} chars", f"first {declared + 1} chars")) is not None
+    # Extra text between the preview and the closing tag is not the ellipsis.
+    assert _nudge_for(verdict, replaced.replace("\n...\n", "\n..\n", 1)) is not None
+    assert _nudge_for(verdict, replaced.replace("\n...\n", "\n...x\n", 1)) is not None
+
+
+@pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
+def test_nudge_when_form_two_claimed_count_is_impossible(clear_kanban_env, monkeypatch, tmp_path, verdict):
+    import re
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    replaced = _real_form_two(monkeypatch, tmp_path)
+    count = re.search(r"tool response was (\S+) chars", replaced).group(1)
+    preview_len = replaced.index("\n\n[Truncated: tool response was")
+    assert _nudge_for(verdict, replaced) is None
+
+    def with_count(text: str) -> str:
+        return replaced.replace(f"was {count} chars", f"was {text} chars")
+
+    assert _nudge_for(verdict, with_count(f"{preview_len:,}")) is None
+    for wrong in (
+        "1",
+        f"{preview_len - 1:,}",
+        count.replace(",", ""),
+        f"0{count}",
+        f"+{count}",
+        f" {count}",
+        f"-{count}",
+        "0",
+        "",
+        "\u0661" + count[1:],
+    ):
+        assert _nudge_for(verdict, with_count(wrong)) is not None, wrong
+
+
 
 # ── Integration: agent nudge + dispatcher bounded retry ──────────────
 # These tests verify the two layers compose correctly: the agent-side

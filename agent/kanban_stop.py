@@ -23,13 +23,14 @@ _SUCCESS_START = '{"ok": true'
 _FORM_ONE_HEAD = re.compile(
     re.escape(PERSISTED_OUTPUT_TAG) + r"\n"
     r"(?:(?!Full output saved to: )[^\n]+\n)*"
-    r"Full output saved to: \S[^\n]*\n"
-    r"(?:[^\n]+\n)*"
-    r"\nPreview \(first \d+ chars\):\n"
+    r"Full output saved to: .+?"
+    r"\n\nPreview \(first (?P<count>[0-9]+) chars\):\n",
+    re.DOTALL,
 )
 _FORM_ONE_END = "\n" + PERSISTED_OUTPUT_CLOSING_TAG
+_FORM_ONE_ELLIPSIS = "\n..."
 _FORM_TWO_NOTICE = re.compile(
-    r"\n\n\[Truncated: tool response was \d{1,3}(?:,\d{3})* chars\. "
+    r"\n\n\[Truncated: tool response was (?P<count>[1-9][0-9]{0,2}(?:,[0-9]{3})*) chars\. "
     r"Full output could not be saved to sandbox\.\]\Z"
 )
 
@@ -52,13 +53,29 @@ def _tool_call_name(tc: Any) -> str:
 
 def _replaced_result_starts_with_success(content: str) -> bool:
     """True when ``content`` is a result the tool publisher replaced with a preview and the
-    result's first characters are a success. Form one: tagged block with a saved-output line,
-    then ``Preview (first N chars):`` after a blank line, ending with the closing tag. Form two:
-    result start, then the publisher's truncation notice as the very end of the text."""
+    result's first characters are a success. Form one: tagged block with a saved-output line
+    (the path is opaque and may hold newlines), then ``Preview (first N chars):`` after a blank
+    line, the N-char preview, an optional ``...`` line and the closing tag. Form two: result
+    start, then the publisher's truncation notice as the very end of the text, with an original
+    count that is at least the preview length."""
     head = _FORM_ONE_HEAD.match(content)
     if head is not None:
-        return content.endswith(_FORM_ONE_END) and content.startswith(_SUCCESS_START, head.end())
-    return content.startswith(_SUCCESS_START) and _FORM_TWO_NOTICE.search(content) is not None
+        tail = content[head.end():]
+        if not tail.endswith(_FORM_ONE_END):
+            return False
+        body = tail[: -len(_FORM_ONE_END)]
+        if head["count"] == str(len(body)):
+            preview = body
+        elif body.endswith(_FORM_ONE_ELLIPSIS) and head["count"] == str(len(body) - len(_FORM_ONE_ELLIPSIS)):
+            preview = body[: -len(_FORM_ONE_ELLIPSIS)]
+        else:
+            return False
+        return preview.startswith(_SUCCESS_START)
+    notice = _FORM_TWO_NOTICE.search(content)
+    if notice is None:
+        return False
+    preview = content[: notice.start()]
+    return int(notice["count"].replace(",", "")) >= len(preview) and preview.startswith(_SUCCESS_START)
 
 
 def _verdict_result_succeeded(content: Any) -> bool:
