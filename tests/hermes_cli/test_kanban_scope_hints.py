@@ -122,6 +122,53 @@ def test_test_file_importing_owned_module_is_listed_and_unrelated_one_is_not(rep
     assert "tests/test_unrelated.py" not in printed
 
 
+HELPER_LABEL = "rule 1 (test imports a pinning test)"
+
+
+@pytest.fixture
+def helper_repo(tmp_path):
+    """tests/a.py pins the owned module; b imports a; c imports b; d imports both."""
+    root = tmp_path / "helper_repo"
+    _write(root / ".git" / "config", "")
+    _write(root / OWNED, "def build():\n    return 1\n")
+    _write(root / "tests" / "__init__.py", "")
+    _write(root / "tests" / "a.py", "import hermes_cli.widget\n\ndef helper():\n    return 1\n")
+    _write(root / "tests" / "b.py", "from tests.a import helper\n\ndef test_b():\n    helper()\n")
+    _write(root / "tests" / "c.py", "from tests import b\n")
+    _write(root / "tests" / "d.py", "import hermes_cli.widget\nfrom tests.a import helper\n")
+    return root
+
+
+def _lines(report) -> dict[str, str]:
+    return {line.split("\t")[0]: line.split("\t")[1] for line in hints.format_report(report) if "\t" in line}
+
+
+def test_test_importing_a_pinning_test_is_listed_with_its_own_label(helper_repo):
+    report = hints.find_hints(helper_repo, [OWNED])
+    lines = _lines(report)
+    assert lines["tests/a.py"] == "rule 1 (test imports owned module)"
+    assert lines["tests/b.py"] == HELPER_LABEL
+
+
+def test_helper_step_is_one_step_only(helper_repo):
+    assert "tests/c.py" not in _paths(hints.find_hints(helper_repo, [OWNED]))
+
+
+def test_file_already_listed_directly_is_not_listed_twice(helper_repo):
+    report = hints.find_hints(helper_repo, [OWNED])
+    assert _paths(report).count("tests/d.py") == 1
+    assert _lines(report)["tests/d.py"] == "rule 1 (test imports owned module)"
+    assert _lines(report)["tests/a.py"] == "rule 1 (test imports owned module)"
+
+
+def test_output_without_a_test_helper_is_unchanged(repo):
+    report = hints.find_hints(repo, [OWNED], [KEY])
+    assert HELPER_LABEL not in "\n".join(hints.format_report(report))
+    assert not any(getattr(h, "imports_pinning_test", False) for h in report.hints)
+    assert report.counts == {1: 2, 2: 2, 3: 2, 4: 3}
+    assert _lines(report)["tests/test_pin_plain.py"] == "rule 1 (test imports owned module)"
+
+
 def test_module_importing_name_from_owned_module_is_listed_as_reader(repo):
     report = hints.find_hints(repo, [OWNED])
     rules = _rules(report)
@@ -368,3 +415,21 @@ def test_owned_directory_the_search_cannot_list_is_named_and_counted():
     out = run.stdout.splitlines()
     assert [line for line in out if line.startswith("unreadable")] == ["unreadable\tlocked/"]
     assert [line for line in out if line.startswith("# unreadable")] == ["# unreadable: 1"]
+
+
+def test_helper_with_a_key_hit_keeps_its_rule_4_row_and_the_counts(helper_repo):
+    _write(helper_repo / "tests" / "b.py", f'from tests.a import helper\nK = "{KEY}"\n')
+    report = hints.find_hints(helper_repo, [OWNED], [KEY])
+    rows = [line for line in hints.format_report(report) if line.startswith("tests/b.py\t")]
+    assert rows == [f'tests/b.py\trule 4 (quoted key: "{KEY}")', f"tests/b.py\t{HELPER_LABEL}"]
+    assert [h.rules for h in report.hints if h.path == "tests/b.py"] == [(4,), ()]
+    assert report.counts == {1: 2, 2: 0, 3: 0, 4: 1}
+
+
+def test_helper_naming_the_owned_path_keeps_its_rule_3_row_and_the_counts(helper_repo):
+    _write(helper_repo / "tests" / "b.py", f'from tests.a import helper\nP = "{OWNED}"\n')
+    report = hints.find_hints(helper_repo, [OWNED])
+    rows = [line for line in hints.format_report(report) if line.startswith("tests/b.py\t")]
+    assert rows == ["tests/b.py\trule 3 (names owned path)", f"tests/b.py\t{HELPER_LABEL}"]
+    assert [h.rules for h in report.hints if h.path == "tests/b.py"] == [(3,), ()]
+    assert report.counts == {1: 2, 2: 0, 3: 1, 4: 0}
