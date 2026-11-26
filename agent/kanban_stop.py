@@ -8,13 +8,20 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Iterable, Optional
+
+from tools.tool_result_storage import PERSISTED_OUTPUT_CLOSING_TAG, PERSISTED_OUTPUT_TAG
 
 
 _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 _VERDICT_KANBAN_TOOLS = frozenset({"kanban_review_findings", "kanban_request_changes"})
 
 _DEFAULT_MAX_ATTEMPTS = 2
+
+_SUCCESS_START = '{"ok": true'
+_PREVIEW_LINE = re.compile(r"^Preview \(first \d+ chars\):\n", re.MULTILINE)
+_TRUNCATED_LINE = "\n[Truncated: tool response was"
 
 
 def kanban_stop_nudge_enabled() -> bool:
@@ -33,14 +40,28 @@ def _tool_call_name(tc: Any) -> str:
     return str((getattr(fn, "name", "") if fn is not None else getattr(tc, "name", "")) or "")
 
 
+def _replaced_result_starts_with_success(content: str) -> bool:
+    """True when ``content`` is a result the tool publisher replaced with a preview (form one:
+    tagged block with a ``Preview (first N chars):`` line; form two: result start, then a
+    ``[Truncated: tool response was`` line) and the result's first characters are a success."""
+    if content.startswith(PERSISTED_OUTPUT_TAG):
+        preview = _PREVIEW_LINE.search(content)
+        return (
+            content.endswith(PERSISTED_OUTPUT_CLOSING_TAG)
+            and preview is not None
+            and content.startswith(_SUCCESS_START, preview.end())
+        )
+    return content.startswith(_SUCCESS_START) and _TRUNCATED_LINE in content
+
+
 def _verdict_result_succeeded(content: Any) -> bool:
-    """True for the board tools' success form (``{"ok": true, ...}``), not their error form."""
-    # Accepted limit: a verdict result over 100,000 chars is shown as a preview, not complete JSON;
-    # the guard reads no preview text and sends the reminder, as the released version does.
+    """True for the board tools' success form (``{"ok": true, ...}``), not their error form.
+    A result over 100,000 chars is replaced by the tool publisher with a preview, which is not
+    complete JSON; it counts as a success when the replaced form starts with the success form."""
     try:
         data = json.loads(content) if isinstance(content, str) else None
     except ValueError:
-        return False
+        return isinstance(content, str) and _replaced_result_starts_with_success(content)
     return isinstance(data, dict) and data.get("ok") is True and "error" not in data
 
 
