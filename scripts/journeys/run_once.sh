@@ -141,10 +141,10 @@ START_EPOCH=$(date +%s)
 store_result() {
   local outcome=$1 step=$2 reason=$3 earlier=${4-} finished=${5-}
   {
-    printf 'result=%s\nstep=%s\nreason=%s\nstarted=%s\n' "$outcome" "$step" "$reason" "$STARTED"
-    if [[ -n $JOURNEY ]]; then printf 'journey=%s\n' "$JOURNEY"; fi
-    if [[ $outcome != started ]]; then printf 'finished=%s\n' "${finished:-$(now)}"; fi
-    if [[ -n $earlier ]]; then printf 'earlier_step=%s\n' "$earlier"; fi
+    printf 'result=%s\nstep=%s\nreason=%s\nstarted=%s\n' "$outcome" "$step" "$reason" "$STARTED" &&
+      if [[ -n $JOURNEY ]]; then printf 'journey=%s\n' "$JOURNEY"; fi &&
+      if [[ $outcome != started ]]; then printf 'finished=%s\n' "${finished:-$(now)}"; fi &&
+      if [[ -n $earlier ]]; then printf 'earlier_step=%s\n' "$earlier"; fi
   } > "$RESULT.new" 2> /dev/null && mv -f "$RESULT.new" "$RESULT" 2> /dev/null && return 0
   rm -f "$RESULT.new"
   return 1

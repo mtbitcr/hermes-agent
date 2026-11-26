@@ -979,6 +979,19 @@ def test_the_file_is_not_written_when_the_failed_result_could_not_be_stored(box)
     assert done.stderr.splitlines() == ["run_once: the result file could not be stored"]
 
 
+def test_a_result_whose_writes_all_fail_for_lack_of_room_leaves_the_started_record_as_a_plain_file(box):
+    done = _fail_reset_of_3(box, make_link={"reset 3": [str(box.run_dir / "result.new"), "/dev/full"]})
+
+    result = box.run_dir / "result"
+    assert result.is_file() and not result.is_symlink()
+    lines = result.read_text(encoding="utf-8").splitlines()
+    assert lines[:3] == ["result=started", "step=none", "reason=the run has started and has not ended"]
+    assert len(lines) == 4 and re.fullmatch(r"started=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", lines[3])
+    assert not (box.run_dir / "result.new").exists() and not (box.run_dir / "result.new").is_symlink()
+    assert box.told() == [f"Journeys failed at step reset for journey 3: {REASONS['reset']}. The result file could not be stored."]
+    assert done.returncode == 1
+
+
 def test_a_write_failure_after_a_successful_open_is_reported_even_when_the_body_is_empty(box):
     box.answer(
         elapsed_after={"reset first": 118 * 60}, make_link={"reset first": [str(box.run_dir / KEPT), "/dev/full"]},
