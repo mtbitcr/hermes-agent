@@ -77,12 +77,17 @@ def counter(key):
 
 
 def record(label, extra=None):
+    global last
+    last = label
     entry = {"call": label, "argv": [name, *args], "stdin": stdin, "env": extra or {}}
     with open(log, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry) + "\n")
     after = answers.get("elapsed_after", {}).get(label)
     if after is not None:
         (top / "clock").write_text(str(BASE + after))
+    folder = answers.get("make_folder", {}).get(label)
+    if folder is not None:
+        Path(folder).mkdir(parents=True)
 
 
 def current_journey():
@@ -91,6 +96,9 @@ def current_journey():
 
 
 def noise(rc):
+    if last in answers.get("output", {}):
+        sys.stdout.write(answers["output"][last] + "\n")
+        sys.stdout.flush()
     sys.stdout.write("leak: %s %s\n" % (answers["secret"], answers["page"]))
     sys.stderr.write("leak: %s %s\n" % (answers["secret"], answers["page"]))
     sys.exit(rc)
@@ -111,7 +119,8 @@ if name == "sleep":
     record("sleep")
     sys.exit(0)
 if name == "hermes":
-    record("hermes")
+    kept = Path(os.environ["HERMES_HOME"]) / "journeys" / "failed-step.log"
+    record("hermes", {"kept": str(kept.exists())})
     sys.exit(answers["hermes_rc"])
 if name == "curl":
     record("local curl")
@@ -139,6 +148,7 @@ if name == "ssh":
         label = "ssh other"
     record(label)
     rc = answers["rc"].get(label, 0)
+    sys.stderr.write(answers.get("stderr", {}).get(label, ""))
     if label.startswith("proxy"):
         sys.stdout.write(answers["proxy"] if rc == 0 else "")
         sys.exit(rc)
@@ -153,6 +163,11 @@ sys.exit("stand-in: unknown name " + name)
 '''
 
 TOOLS = ("bash", "flock", "rm", "mkdir", "dirname", "mv")
+# Stands in for mv: it logs, for each rename, whether the failed-step file was already there, then renames.
+MV_WRAPPER = """#!/bin/sh
+if [ -e "$HERMES_HOME/journeys/failed-step.log" ]; then echo present >> "{log}"; else echo absent >> "{log}"; fi
+exec "{real}" "$@"
+"""
 
 
 def _proxy_facts() -> tuple[str, str]:
@@ -224,6 +239,9 @@ class Sandbox:
             self._wrapper(self.bin / name)
         for name in TOOLS:
             (self.bin / name).symlink_to(shutil.which(name))
+        (self.bin / "mv").unlink()
+        (self.bin / "mv").write_text(MV_WRAPPER.format(log=top / "mv.log", real=shutil.which("mv")), encoding="utf-8")
+        (self.bin / "mv").chmod(0o755)
         for name in ("isolation_check.sh", "refresh_stack.sh"):
             self._wrapper(self.scripts / name)
         shutil.copy2(PROXY_SOURCE, self.scripts / "synthetic_proxy.py")
@@ -272,6 +290,10 @@ class Sandbox:
 
     def told(self) -> list[str]:
         return [call["stdin"] for call in self.calls() if call["call"] == "hermes"]
+
+    def renames(self) -> list[str]:
+        log = self.top / "mv.log"
+        return log.read_text().split() if log.exists() else []
 
     def result(self) -> dict[str, str]:
         text = (self.run_dir / "result").read_text(encoding="utf-8")
@@ -576,3 +598,233 @@ def test_the_stuck_point_of_the_hourly_check_is_the_run_limit_plus_600_seconds()
 
     assert limit == 7200
     assert stuck == limit + 600
+
+
+# ------------------------------------------------------------------- the last lines of a failed step
+
+KEPT = "failed-step.log"
+LEAK = f"leak: {SECRET} {GOOD_PAGE}"  # what every stand-in command writes to its output and to its errors
+
+
+def _kept(box: Sandbox) -> list[str]:
+    return (box.run_dir / KEPT).read_text(encoding="utf-8").splitlines()
+
+
+def _fail_reset_of_3(box: Sandbox, **answers) -> subprocess.CompletedProcess[str]:
+    box.answer(rc={"reset 3": 7}, **answers)
+    return box.run()
+
+
+def _rows(first: int, last: int) -> str:
+    return "\n".join(f"row {i}" for i in range(first, last + 1))
+
+
+def test_a_failed_reset_of_a_journey_keeps_the_step_the_journey_and_the_last_lines_of_that_command(box):
+    done = _fail_reset_of_3(box, output={"reset 3": "first line\nsecond line"})
+
+    assert done.returncode == 1
+    lines = _kept(box)
+    assert lines[0] == "step=reset" and lines[1] == "journey=3"
+    assert lines[2] == "started=" + box.result()["started"]
+    assert re.fullmatch(r"finished=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", lines[3])
+    assert lines[3] == "finished=" + box.result()["finished"]
+    assert lines[4:] == ["first line", "second line", LEAK, LEAK]  # its errors are kept with its output
+
+
+def test_a_failed_step_without_a_journey_has_no_journey_line(box):
+    box.answer(rc={"reset first": 7}, output={"reset first": "boom"})
+
+    assert box.run().returncode == 1
+
+    lines = _kept(box)
+    assert [line.split("=")[0] for line in lines[:3]] == ["step", "started", "finished"] and lines[0] == "step=reset"
+    assert lines[3:] == ["boom", LEAK, LEAK]
+
+
+@pytest.mark.parametrize(
+    ("step", "label"),
+    [("refresh", "refresh"), ("isolation", "isolation server2"), ("isolation", "isolation server1"),
+     ("seed", "seed 3"), ("journeys", "journey 3")],
+)
+def test_each_failed_command_step_keeps_the_output_of_its_newest_command(box, step, label):
+    box.answer(rc={label: 7}, output={label: "NEWEST-" + label})
+
+    assert box.run().returncode == 1
+
+    lines = _kept(box)
+    assert lines[0] == "step=" + step
+    assert ("journey=3" in lines[:2]) == (step in {"seed", "journeys"})
+    assert lines[-3:] == ["NEWEST-" + label, LEAK, LEAK]
+
+
+def test_a_failed_owner_app_step_keeps_the_last_page_and_the_errors_but_decides_from_the_page_only(box):
+    box.answer(page="<html>Something went wrong</html>", stderr={"app 3": "curl-error-line\n"})
+
+    assert box.run().returncode == 1
+
+    lines = _kept(box)
+    assert lines[0] == "step=owner-app" and lines[1] == "journey=3"
+    assert lines[4:] == ["<html>Something went wrong</html>", "curl-error-line"]
+
+
+def test_the_errors_of_the_proxy_check_are_kept_but_never_decide_it(box):
+    box.answer(proxy='{"keys":[]}', stderr={"proxy 3": f'"kid":"{KID}"\n'})
+
+    assert box.run().returncode == 1
+
+    assert box.result()["step"] == "proxy"
+    assert _kept(box)[4:] == ['{"keys":[]}', f'"kid":"{KID}"']
+
+
+def test_a_proxy_step_that_ran_no_command_keeps_none_of_an_earlier_step_output(box):
+    (box.scripts / "synthetic_proxy.py").write_text("", encoding="utf-8")  # no issuer and no key id to look for
+    box.answer(output={"reset 3": "OUTPUT-OF-THE-RESET"})
+
+    assert box.run().returncode == 1
+
+    assert box.result()["step"] == "proxy"
+    assert _kept(box) == [
+        "step=proxy", "journey=3", "started=" + box.result()["started"], "finished=" + box.result()["finished"],
+    ]
+
+
+def test_an_output_of_more_than_40_lines_keeps_the_last_40(box):
+    _fail_reset_of_3(box, output={"reset 3": _rows(1, 100)})
+
+    body = _kept(box)[4:]
+    assert body == [*[f"row {i}" for i in range(63, 101)], LEAK, LEAK]
+    assert len(body) == 40
+
+
+def test_an_output_of_exactly_40_lines_is_kept_in_full_and_one_more_line_drops_the_first(box):
+    _fail_reset_of_3(box, output={"reset 3": _rows(1, 38)})
+    assert _kept(box)[4:] == [*[f"row {i}" for i in range(1, 39)], LEAK, LEAK]
+
+    (box.top / "reset.count").unlink()
+    _fail_reset_of_3(box, output={"reset 3": _rows(1, 39)})
+    assert _kept(box)[4:] == [*[f"row {i}" for i in range(2, 40)], LEAK, LEAK]
+
+
+def test_a_line_of_more_than_400_characters_is_cut_at_400(box):
+    _fail_reset_of_3(box, output={"reset 3": "a" * 399 + "\n" + "b" * 400 + "\n" + "c" * 401 + "\n" + "d" * 1000})
+
+    body = _kept(box)[4:]
+    assert body[:4] == ["a" * 399, "b" * 400, "c" * 400, "d" * 400]
+    assert max(len(line) for line in body) == 400
+
+
+def test_the_file_is_private_mode_600(box):
+    _fail_reset_of_3(box, output={"reset 3": "x"})
+
+    assert (box.run_dir / KEPT).stat().st_mode & 0o777 == 0o600
+
+
+def test_a_passed_run_leaves_no_file(box):
+    done = box.run()
+
+    assert done.returncode == 0
+    assert sorted(path.name for path in box.run_dir.iterdir()) == ["result", "run.lock"]
+
+
+def test_a_file_of_an_earlier_failed_run_is_gone_after_a_passed_run(box):
+    _fail_reset_of_3(box, output={"reset 3": "x"})
+    assert (box.run_dir / KEPT).exists()
+    box.answer()
+    (box.top / "reset.count").unlink()
+
+    assert box.run().returncode == 0
+
+    assert not (box.run_dir / KEPT).exists()
+
+
+def test_the_file_is_removed_at_the_start_of_a_run_that_stops_before_any_command(box):
+    _fail_reset_of_3(box, output={"reset 3": "x"})
+    box.answer()
+
+    assert box.run(JOURNEY_PAGE_TEXT=None).returncode == 1
+
+    assert box.result()["step"] == "config"
+    assert not (box.run_dir / KEPT).exists()
+
+
+def test_the_next_failed_run_replaces_the_file(box):
+    _fail_reset_of_3(box, output={"reset 3": "FIRST-RUN-LINE"})
+    (box.top / "reset.count").unlink()
+    box.answer(rc={"seed 5": 7}, output={"seed 5": "SECOND-RUN-LINE"})
+
+    assert box.run().returncode == 1
+
+    lines = _kept(box)
+    assert lines[:2] == ["step=seed", "journey=5"]
+    assert "SECOND-RUN-LINE" in lines and "FIRST-RUN-LINE" not in lines
+    assert sorted(path.name for path in box.run_dir.iterdir()) == [KEPT, "result", "run.lock"]
+
+
+def test_a_step_that_ran_no_command_keeps_no_file(box):
+    box.answer(elapsed_after={"reset first": 118 * 60})
+
+    assert box.run().returncode == 1
+
+    assert box.result()["step"] == "time"
+    assert not (box.run_dir / KEPT).exists()
+
+
+def test_the_file_is_written_after_the_result_and_before_the_owner_line_in_place_with_no_rename(box):
+    _fail_reset_of_3(box, output={"reset 3": "x"})
+
+    assert box.renames() == ["absent", "absent"]  # the started result and the failed result: no third rename
+    assert box.call("hermes")["env"] == {"kept": "True"}  # the owner line follows the file
+    assert box.result()["result"] == "failed"
+    assert sorted(path.name for path in box.run_dir.iterdir()) == [KEPT, "result", "run.lock"]
+
+
+def test_the_renames_of_a_failed_run_are_the_same_as_those_of_a_run_without_the_file(box):
+    box.answer(rc={"reset last": 7})
+
+    assert box.run().returncode == 1
+
+    assert box.renames() == ["absent", "absent"]
+    assert box.result()["step"] == "reset" and "journey" not in box.result()
+
+
+def test_the_result_file_and_the_owner_line_of_a_failed_run_are_as_without_the_file(box):
+    secret_lines = "\n".join(f"SENTINEL-{i}" for i in range(5))
+
+    done = _fail_reset_of_3(box, output={"reset 3": secret_lines})
+
+    assert done.returncode == 1
+    text = (box.run_dir / "result").read_text(encoding="utf-8")
+    assert re.fullmatch(
+        r"result=failed\nstep=reset\nreason=the stack reset failed\nstarted=\S+Z\njourney=3\nfinished=\S+Z\n", text,
+    )
+    assert box.told() == [f"Journeys failed at step reset for journey 3: {REASONS['reset']}."]
+    everything = text + "".join(box.told())
+    assert "SENTINEL" not in everything and SECRET not in everything and GOOD_PAGE not in everything
+    assert (done.stdout, done.stderr) == ("", "")
+
+
+def test_a_run_folder_in_which_the_file_cannot_be_written_ends_the_run_with_the_result_of_today(box):
+    done = _fail_reset_of_3(box, output={"reset 3": "x"}, make_folder={"reset 3": str(box.run_dir / KEPT)})
+
+    assert done.returncode == 1
+    assert box.names()[-2:] == ["reset 3", "hermes"]
+    assert box.told() == [f"Journeys failed at step reset for journey 3: {REASONS['reset']}."]
+    result = box.result()
+    assert (result["result"], result["step"], result["journey"], result["reason"]) == (
+        "failed", "reset", "3", REASONS["reset"],
+    )
+    assert (box.run_dir / KEPT).is_dir()
+    assert len(done.stderr.splitlines()) == 1
+    assert SECRET not in done.stderr and GOOD_PAGE not in done.stderr and done.stdout == ""
+
+
+def test_a_file_that_cannot_be_removed_at_the_start_does_not_change_the_result_of_a_passing_run(box):
+    box.run_dir.mkdir()
+    (box.run_dir / KEPT).mkdir()
+    (box.run_dir / KEPT / "inner").write_text("x")  # rm -f cannot remove a folder that has something in it
+
+    done = box.run()
+
+    assert done.returncode == 0
+    assert box.result()["result"] == "passed" and box.told() == ["Journeys passed."]
+    assert len(done.stderr.splitlines()) == 1

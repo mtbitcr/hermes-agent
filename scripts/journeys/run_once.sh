@@ -27,7 +27,12 @@
 # journey=<n>. Then one owner line. A result or an owner
 # line that cannot be stored or sent is its own failed step (result, notify), never retried; "passed" is
 # only ever sent after "passed" was stored. Exit 0 only for a pass that was stored and told.
-# Output of every step is dropped: the result holds a fixed reason, never a value or the page's text.
+# Of each step that runs a command, the runner holds the output (standard output and errors) of the newest
+# command. When such a step fails, the last 40 lines of it (each cut at 400 characters) go, under four header
+# lines, to one private file, RUN_DIR/failed-step.log, written in place (no temporary file, no rename) after the
+# result is stored and before the owner line; the next run removes it at its start, so it describes the newest
+# run and a passing run leaves none. It stays on Server 1: it is never sent or printed. The result still holds a
+# fixed reason only, never a value or the page's text.
 #
 # Settings, set by the operator in the unit's environment (start.sh passes them on) unless noted:
 #   HERMES_HOME                Server 1 platform home: the run folder is HERMES_HOME/journeys (lock and result),
@@ -53,6 +58,9 @@ export LC_ALL=C TZ=UTC
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 RUN_DIR=${HERMES_HOME:-$HOME/.hermes}/journeys
 RESULT=$RUN_DIR/result
+FAILED_STEP_LOG=$RUN_DIR/failed-step.log
+KEPT_LINES=40
+KEPT_WIDTH=400
 PROXY_SOURCE=$HERE/synthetic_proxy.py
 RUNNER_ENV=${JOURNEY_RUNNER_ENV:-$HOME/.hermes/journeys/runner.env}
 S2_DIR=${JOURNEY_S2_SCRIPTS_DIR:-/home/raphael-runner/raphael-journeys}
@@ -96,7 +104,10 @@ flock -n 9 || {
   exit 1
 }
 
+rm -f "$FAILED_STEP_LOG" 2> /dev/null || echo "run_once: the file of the earlier failed step could not be removed" >&2
+
 JOURNEY=""
+HELD=""
 now() { printf '%(%Y-%m-%dT%H:%M:%SZ)T' -1; }
 STARTED=$(now)
 START_EPOCH=$(date +%s)
@@ -113,6 +124,22 @@ store_result() {
   } > "$RESULT.new" 2> /dev/null && mv -f "$RESULT.new" "$RESULT" 2> /dev/null && return 0
   rm -f "$RESULT.new"
   return 1
+}
+
+# keep_failed_step STEP: the last lines of the held output, written in place. A failure here changes nothing
+# else about the run.
+keep_failed_step() {
+  local -a lines=()
+  local line first=0
+  if [[ -n $HELD ]]; then mapfile -t lines <<< "$HELD"; fi
+  if ((${#lines[@]} > KEPT_LINES)); then first=$((${#lines[@]} - KEPT_LINES)); fi
+  {
+    printf 'step=%s\n' "$1"
+    if [[ -n $JOURNEY ]]; then printf 'journey=%s\n' "$JOURNEY"; fi
+    printf 'started=%s\nfinished=%s\n' "$STARTED" "$(now)"
+    for line in "${lines[@]:first}"; do printf '%s\n' "${line:0:KEPT_WIDTH}"; done
+  } 2> /dev/null > "$FAILED_STEP_LOG" && return 0
+  echo "run_once: the output of the failed step could not be kept" >&2
 }
 
 tell() {
@@ -139,6 +166,9 @@ finish() {
     elif [[ $step != result ]]; then
       line="$line The result file could not be stored."
     fi
+  fi
+  if [[ $outcome == failed ]]; then
+    case $step in refresh | reset | isolation | seed | proxy | owner-app | journeys) keep_failed_step "$step" ;; esac
   fi
   if ! tell "$line"; then
     echo "run_once: the owner was not told" >&2
@@ -188,36 +218,48 @@ store_result started none "the run has started and has not ended" || finish fail
     read_runner_env
 } || finish failed config
 
-# remote COMMAND: one command on Server 2 through the runner identity; its output is dropped.
-remote() { ssh "$JOURNEY_RUNNER_SSH" "$1" > /dev/null 2>&1 < /dev/null; }
-# remote_answer COMMAND: the same, with the command's standard output kept (its errors are dropped).
-remote_answer() { ssh "$JOURNEY_RUNNER_SSH" "$1" 2> /dev/null < /dev/null; }
+# remote COMMAND: one command on Server 2 through the runner identity; its output is held (HELD), not shown.
+remote() { HELD=$(ssh "$JOURNEY_RUNNER_SSH" "$1" 2>&1 < /dev/null); }
+# remote_answer COMMAND: the same, with the command's standard output also set apart as ANSWER, which alone is
+# checked; HELD gets the standard output, then the errors. The trailer tells the two apart: output length, status.
+remote_answer() {
+  local raw trailer size status held out errors
+  raw=$({ out=$(ssh "$JOURNEY_RUNNER_SSH" "$1" 2>&3 < /dev/null); status=$?; printf '%s\n%s %s' "$out" "${#out}" "$status"; } 3>&1)
+  trailer=${raw##*$'\n'}
+  size=${trailer% *} status=${trailer#* }
+  held=${raw%$'\n'*}
+  if ((size)); then ANSWER=${held: -size}; else ANSWER=""; fi
+  errors=${held:0:${#held}-size}
+  while [[ $errors == *$'\n' ]]; do errors=${errors%$'\n'}; done
+  HELD=$ANSWER${ANSWER:+${errors:+$'\n'}}$errors
+  return "$status"
+}
 
-JOURNEY_RUNNER_SSH=$JOURNEY_RUNNER_SSH JOURNEY_S2_SCRIPTS_DIR=$S2_DIR \
-  "$HERE/refresh_stack.sh" > /dev/null 2>&1 < /dev/null || finish failed refresh
+HELD=$(JOURNEY_RUNNER_SSH=$JOURNEY_RUNNER_SSH JOURNEY_S2_SCRIPTS_DIR=$S2_DIR \
+  "$HERE/refresh_stack.sh" 2>&1 < /dev/null) || finish failed refresh
 
 remote "cd '$S2_DIR' && ./reset_stack.sh" || finish failed reset
 
 remote "cd '$S2_DIR' && JOURNEY_PRODUCTION_ORIGIN='$ORIGIN' ./isolation_check.sh server2" || finish failed isolation
-"$HERE/isolation_check.sh" server1 > /dev/null 2>&1 < /dev/null || finish failed isolation
+HELD=$("$HERE/isolation_check.sh" server1 2>&1 < /dev/null) || finish failed isolation
 
 # What a healthy sign-in proxy answers: its key list, with the key id that its source names.
 proxy_answers() {
-  local line issuer="" kid="" body
+  local line issuer="" kid=""
+  HELD=""
   while IFS= read -r line; do
     if [[ $line =~ ^ISSUER\ =\ \"([^\"]*)\"$ ]]; then issuer=${BASH_REMATCH[1]}; fi
     if [[ $line =~ ^KID\ =\ \"([^\"]*)\"$ ]]; then kid=${BASH_REMATCH[1]}; fi
   done < "$PROXY_SOURCE" || return 1
   [[ $issuer =~ $HTTPS_RE && -n $kid ]] || return 1
-  body=$(remote_answer "docker exec '$CONTAINER' curl --disable --silent --fail --max-time 20 '${issuer%/}/cdn-cgi/access/certs'") || return 1
-  [[ $body == *"\"kid\":\"$kid\""* ]]
+  remote_answer "docker exec '$CONTAINER' curl --disable --silent --fail --max-time 20 '${issuer%/}/cdn-cgi/access/certs'" || return 1
+  [[ $ANSWER == *"\"kid\":\"$kid\""* ]]
 }
 
 # The page text is checked, not only the status: a broken stack answers 200 with a failure banner.
 owner_app_shows_its_text() {
-  local page
-  page=$(remote_answer "docker exec '$CONTAINER' curl --disable --silent --fail --location --max-redirs 3 --max-time 10 '$BASE_URL'") || return 1
-  [[ $page == *"$JOURNEY_PAGE_TEXT"* ]]
+  remote_answer "docker exec '$CONTAINER' curl --disable --silent --fail --location --max-redirs 3 --max-time 10 '$BASE_URL'" || return 1
+  [[ $ANSWER == *"$JOURNEY_PAGE_TEXT"* ]]
 }
 
 # reserve_minutes N: what journey N needs from its start to its end, the sum of its fixed step reserves.

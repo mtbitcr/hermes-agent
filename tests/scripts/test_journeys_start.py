@@ -653,6 +653,7 @@ FAILURES = {
 # A failure in the loop names its journey; the first journey is 3, and every case here fails in it.
 # The resets before the first journey and after the last one belong to no journey.
 LOOP_STEPS = ("reset", "seed", "proxy", "owner-app", "journeys")
+COMMAND_STEPS = ("refresh", "isolation", *LOOP_STEPS)
 NO_JOURNEY = ("reset-first", "reset-first-ssh-down", "reset-last", "reset-last-ssh-down")
 
 
@@ -679,7 +680,9 @@ def test_a_failed_step_ends_the_run_with_its_name_and_reason_and_runs_no_later_s
     result = box.result()
     assert (result["result"], result["step"], result["reason"]) == ("failed", step, REASONS[step])
     assert re.fullmatch(TIME_RE, result["started"]) and re.fullmatch(TIME_RE, result["finished"])
-    assert sorted(path.name for path in box.run_dir.iterdir()) == ["result", "run.lock"]
+    # A step that ran a command also leaves failed-step.log; config and time ran none.
+    kept = ["failed-step.log"] if step in COMMAND_STEPS else []
+    assert sorted(path.name for path in box.run_dir.iterdir()) == [*kept, "result", "run.lock"]
     named = " for journey 3" if step in LOOP_STEPS and case not in NO_JOURNEY else ""
     assert result.get("journey") == ("3" if named else None)
     assert box.told() == [f"Journeys failed at step {step}{named}: {REASONS[step]}."]
@@ -719,7 +722,7 @@ def test_the_new_result_replaces_the_old_one(box):
     assert box.run(RUN_ONCE).returncode != 0
 
     assert box.result()["result"] == "failed"
-    assert sorted(path.name for path in box.run_dir.iterdir()) == ["result", "run.lock"]
+    assert sorted(path.name for path in box.run_dir.iterdir()) == ["failed-step.log", "result", "run.lock"]
 
 
 # --------------------------------------------------------------------------- the started result
