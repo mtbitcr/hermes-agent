@@ -8,13 +8,40 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Iterable, Optional
+
+# The guard takes the two tags from tools/tool_result_storage.py, which names only those two,
+# and holds its own copy of the texts of the forms.
+from tools.tool_result_storage import PERSISTED_OUTPUT_CLOSING_TAG, PERSISTED_OUTPUT_TAG
 
 
 _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 _VERDICT_KANBAN_TOOLS = frozenset({"kanban_review_findings", "kanban_request_changes"})
 
 _DEFAULT_MAX_ATTEMPTS = 2
+
+_SUCCESS_START = '{"ok": true'
+# Accepted limit a: a saved result whose saved path holds a line like the preview line (a line of
+# the form 'Preview (first N chars):') still gets the reminder. The owner accepted this limit on
+# 2026-11-26. It ends when the publisher (tools/tool_result_storage.py) gives its format under names.
+# Accepted limit b: an empty saved path can suppress the reminder, because the path part of the
+# pattern (non-greedy, DOTALL) then spans the following header text. The owner accepted this limit
+# on 2026-11-26. It ends when the
+# publisher (tools/tool_result_storage.py) gives its format under names.
+_FORM_ONE_HEAD = re.compile(
+    re.escape(PERSISTED_OUTPUT_TAG) + r"\n"
+    r"(?:(?!Full output saved to: )[^\n]+\n)*"
+    r"Full output saved to: .+?"
+    r"\n\nPreview \(first (?P<count>[0-9]+) chars\):\n",
+    re.DOTALL,
+)
+_FORM_ONE_END = "\n" + PERSISTED_OUTPUT_CLOSING_TAG
+_FORM_ONE_ELLIPSIS = "\n..."
+_FORM_TWO_NOTICE = re.compile(
+    r"\n\n\[Truncated: tool response was (?P<count>[1-9][0-9]{0,2}(?:,[0-9]{3})*) chars\. "
+    r"Full output could not be saved to sandbox\.\]\Z"
+)
 
 
 def kanban_stop_nudge_enabled() -> bool:
@@ -33,14 +60,44 @@ def _tool_call_name(tc: Any) -> str:
     return str((getattr(fn, "name", "") if fn is not None else getattr(tc, "name", "")) or "")
 
 
+def _replaced_result_starts_with_success(content: str) -> bool:
+    """True when ``content`` is a result the tool publisher replaced with a preview and the
+    result's first characters are a success. Form one: tagged block with a saved-output line
+    (the path is opaque and may hold newlines), then ``Preview (first N chars):`` after a blank
+    line, the N-char preview, an optional ``...`` line and the closing tag. Form two: result
+    start, then the publisher's truncation notice as the very end of the text, with an original
+    count that is at least the preview length."""
+    head = _FORM_ONE_HEAD.match(content)
+    if head is not None:
+        tail = content[head.end():]
+        if not tail.endswith(_FORM_ONE_END):
+            return False
+        body = tail[: -len(_FORM_ONE_END)]
+        if head["count"] == str(len(body)):
+            preview = body
+        elif body.endswith(_FORM_ONE_ELLIPSIS) and head["count"] == str(len(body) - len(_FORM_ONE_ELLIPSIS)):
+            preview = body[: -len(_FORM_ONE_ELLIPSIS)]
+        else:
+            return False
+        return preview.startswith(_SUCCESS_START)
+    notice = _FORM_TWO_NOTICE.search(content)
+    if notice is None:
+        return False
+    preview = content[: notice.start()]
+    # Accepted limit c: an impossible inline character count in a malformed result can suppress
+    # the reminder. The owner accepted this limit on 2026-11-26. It ends when the publisher
+    # (tools/tool_result_storage.py) gives its format under names.
+    return int(notice["count"].replace(",", "")) >= len(preview) and preview.startswith(_SUCCESS_START)
+
+
 def _verdict_result_succeeded(content: Any) -> bool:
-    """True for the board tools' success form (``{"ok": true, ...}``), not their error form."""
-    # Accepted limit: a verdict result over 100,000 chars is shown as a preview, not complete JSON;
-    # the guard reads no preview text and sends the reminder, as the released version does.
+    """True for the board tools' success form (``{"ok": true, ...}``), not their error form.
+    A result over 100,000 chars is replaced by the tool publisher with a preview, which is not
+    complete JSON; it counts as a success when the replaced form starts with the success form."""
     try:
         data = json.loads(content) if isinstance(content, str) else None
     except ValueError:
-        return False
+        return isinstance(content, str) and _replaced_result_starts_with_success(content)
     return isinstance(data, dict) and data.get("ok") is True and "error" not in data
 
 
