@@ -1272,6 +1272,34 @@ def _sandbox_env(secret: str) -> dict:
     return {"ANTHROPIC_API_KEY": PLACEHOLDER_TOKEN}
 
 
+def _uses_claude_route(task: Any) -> bool:
+    # Never decide from the provider override alone: it is free text that can
+    # name an alias of Anthropic and is rewritten while a card runs. Only the
+    # digest-bound pin the dispatcher validates says which provider a card was
+    # approved for.
+    if not str(task.model_policy_lock or "").strip():
+        # No pin: the legacy card keeps the machine main gives it.
+        return True
+    route_error = _kanban().policy_lock_error(
+        task.model_policy_lock,
+        task.assignee,
+        task.provider_override,
+        task.model_override,
+        task.reasoning_effort,
+        task.execution_tier,
+    )
+    if route_error:
+        # A pin that is present but fails is never the same as no pin.
+        raise SandboxDispatchError(
+            "this task's pinned model route does not verify, so no build "
+            "machine was started. Ask the operator to approve the task's "
+            "route again.",
+            code="route_pin_invalid",
+        )
+    # A valid pin carries an exact provider id, so an alias cannot match.
+    return (task.provider_override or "").strip() == "anthropic"
+
+
 def _route_env(task: Any, ctx: _WorkerContext) -> dict:
     """The model route the kernel pinned for this task, as Claude Code reads it.
 
@@ -1281,13 +1309,16 @@ def _route_env(task: Any, ctx: _WorkerContext) -> dict:
     worker-authored text or this process's environment — so the worker cannot
     choose the model it runs on.
 
-    A task that pins no model gets neither variable. A pinned model with no
-    pinned effort takes the effort of the route the model policy admits for
+    A task pinned to another provider, or to no model, gets neither variable.
+    A pinned model with no pinned effort takes the effort the policy admits for
     the task's own assignee, provider and tier. An effort Claude Code does not
     accept is withheld and the reason logged; the model still passes. Neither
     value is a credential, so the placeholder from :func:`_sandbox_env` stays
     the only credential-shaped value in the env.
     """
+    # Hermes runs non-Claude inference on the host. The machine runs local tools.
+    if not _uses_claude_route(task):
+        return {}
     model = (task.model_override or "").strip()
     if not model:
         return {}
@@ -1498,6 +1529,21 @@ def _receipt_still_holds(
     except Exception:
         return "retire"
     return "ok"
+
+
+def _receipt_has_credential_vault(receipt: Any) -> bool:
+    """Whether the machine was created with a credential vault, by its receipt.
+
+    An ordinary card's provider override can be changed while its run is live
+    (``set_model_override`` takes effect at the next dispatch), so the task row
+    must never decide the sign-in handling of the run that already exists. Only
+    the policy recorded at creation does; anything but a literal ``True``
+    counts as no vault.
+    """
+    if not isinstance(receipt, dict):
+        return False
+    policy = receipt.get("policy")
+    return isinstance(policy, dict) and policy.get("credential_vault") is True
 
 
 def _verify_recorded_sandbox(
@@ -2050,11 +2096,6 @@ def _provision(
     orphan_recorded = False
     provisioned = False
     try:
-        secret = (
-            _prepare_host_credential()
-            if ctx.profile == WORKER_PROFILE
-            else None
-        )
         archive, source_digest = _package_source(source, staging)
 
         # The creation intent is durable BEFORE the machine exists, outside
@@ -2062,6 +2103,12 @@ def _provision(
         # stamped with — the only way a machine created during a crash can
         # be recognised afterwards. Fails closed: no intent, no machine.
         task = _resolve_task(ctx)
+        claude_route = _uses_claude_route(task)
+        secret = (
+            _prepare_host_credential()
+            if ctx.profile == WORKER_PROFILE and claude_route
+            else None
+        )
         project = str(getattr(task, "project_id", "") or "")
         kb = _kanban()
         try:
@@ -2562,7 +2609,9 @@ def maintain_sandbox_lease(tool_name: str = "", args: Optional[dict] = None, **_
                 remaining = (expiry - datetime.now(timezone.utc)).total_seconds()
                 if remaining < 2 * SANDBOX_MIN_REMAINING_SECONDS:
                     _resolve_task(ctx, build_machine_tool=False)
-                    if ctx.profile == WORKER_PROFILE:
+                    if ctx.profile == WORKER_PROFILE and _receipt_has_credential_vault(
+                        record.get("receipt")
+                    ):
                         secret = _prepare_host_credential()
                         credentials, _bindings = _vault_payload(sdk, secret)
                         sandbox.credential_vault.patch(credentials={"replace": credentials})
