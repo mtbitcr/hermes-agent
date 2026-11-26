@@ -2404,6 +2404,124 @@ def test_openai_deep_worker_renews_without_claude_sign_in(openai_deep_worker, sd
     assert not vault_updates
 
 
+@pytest.mark.parametrize("alias", ["claude", "claude-code"])
+def test_a_card_on_a_supported_alias_of_the_first_provider_gets_the_machine_of_today(
+    host, sdk, alias
+):
+    _pin_route(host, model="claude-sonnet-5", provider=alias, effort="high")
+
+    out = _provision()
+
+    assert out["policy"]["credential_vault"] is True
+    box = FakeSandbox.created[-1]
+    proxy = box.create_kwargs["credential_proxy"]
+    assert proxy is not None and proxy.enabled is True
+    assert box.create_kwargs["env"] == {
+        "ANTHROPIC_API_KEY": sd.PLACEHOLDER_TOKEN,
+        "ANTHROPIC_MODEL": "claude-sonnet-5",
+        "CLAUDE_CODE_EFFORT_LEVEL": "high",
+    }
+    (call,) = box.vault_calls
+    (credential,) = call["credentials"]
+    assert credential.source.value == REAL_SECRET
+
+
+def _move_to_openai_codex_with_the_writer(host):
+    with kb.connect_closing() as conn:
+        assert kb.set_model_override(
+            conn, host.task_id, "gpt-5-codex", provider="openai-codex",
+        )
+
+
+def _move_to_anthropic_in_sql(host):
+    # The supported writer refuses a locked card, so the row is edited directly.
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET provider_override=? WHERE id=?",
+            ("anthropic", host.task_id),
+        )
+        conn.commit()
+
+
+@pytest.mark.parametrize(
+    ("card", "move_provider", "host_credential", "vault_refreshes"),
+    [
+        pytest.param(
+            "host", _move_to_openai_codex_with_the_writer, REAL_SECRET, 1,
+            id="ordinary-card-with-vault-moved-to-openai-codex",
+        ),
+        pytest.param(
+            "openai_deep_worker", _move_to_anthropic_in_sql, "", 0,
+            id="credential-free-card-moved-to-anthropic",
+        ),
+    ],
+)
+def test_a_change_of_the_provider_override_of_a_running_card_does_not_change_the_sign_in_handling_of_its_current_run(
+    request, sdk, monkeypatch, card, move_provider, host_credential, vault_refreshes
+):
+    host = request.getfixturevalue(card)
+    _provision()
+    box = FakeSandbox.created[-1]
+    move_provider(host)
+    monkeypatch.setattr(sd, "_resolve_host_credential", lambda: host_credential)
+    box.expires_in_seconds = 120
+    renewals = []
+    vault_updates = []
+    box.renew = lambda timeout: renewals.append(timeout.total_seconds())
+    box.credential_vault.patch = lambda **kwargs: vault_updates.append(kwargs)
+
+    result = sd.maintain_sandbox_lease(
+        tool_name="mcp_opensandbox_agent_factory_sandbox_command_run",
+        args={"sandbox_id": box.id},
+    )
+
+    assert result is None, result
+    assert renewals == [sd.SANDBOX_TIMEOUT_SECONDS]
+    assert len(vault_updates) == vault_refreshes
+
+
+def test_a_route_pin_that_does_not_validate_is_refused_before_any_machine_exists(
+    openai_deep_worker, sdk, monkeypatch, caplog
+):
+    host = openai_deep_worker
+    with kb.connect_closing() as conn:
+        lock = kb.get_task(conn, host.task_id).model_policy_lock
+        conn.execute(
+            "UPDATE tasks SET model_override=? WHERE id=?",
+            ("gpt-6.2-sol-edited", host.task_id),
+        )
+        conn.commit()
+    credential_reads = []
+    monkeypatch.setattr(
+        sd, "_prepare_host_credential",
+        lambda: credential_reads.append(True) or REAL_SECRET,
+    )
+    intents = []
+    record_intent = kb.record_kernel_creation
+    monkeypatch.setattr(
+        kb, "record_kernel_creation",
+        lambda *args, **kwargs: intents.append(kwargs) or record_intent(*args, **kwargs),
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        out = _provision()
+
+    assert "error" in out
+    assert lock not in json.dumps(out)
+    assert lock not in caplog.text
+    assert not FakeSandbox.created
+    assert credential_reads == []
+    assert intents == []
+    events = [
+        json.loads(record.message.split(": ", 1)[1])
+        for record in caplog.records
+        if record.message.startswith("raphael sandbox dispatch: {")
+    ]
+    failures = [event for event in events if event.get("outcome") == "failed"]
+    assert [event["reason"] for event in failures] == ["route_pin_invalid"]
+    assert _reservation(host)["state"] == "released"
+
+
 def test_verification_role_gets_same_scoped_sandbox_without_coding_credentials(host, sdk, monkeypatch):
     monkeypatch.setenv("HERMES_PROFILE", "raphael-verifier")
     with kb.connect_closing() as conn:
