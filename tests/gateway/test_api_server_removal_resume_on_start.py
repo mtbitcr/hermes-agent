@@ -282,6 +282,11 @@ def test_removal_resume_stalls_on_indeterminate_sweep_then_recovers(monkeypatch)
         lambda: kanban_db.get_removal_phase_record(slug).phase
         == kanban_db.RemovalPhase.DONE
     ), "the removal never completed once the sweep could be read"
+    assert _wait_until(
+        lambda: (op := _owner_op()) is not None
+        and op["applied_at"] is not None
+        and op["completed_at"] is not None
+    ), "the owner operation never recorded applied_at and completed_at"
     phase_rec = kanban_db.get_removal_phase_record(slug)
     op = _owner_op()
     assert phase_rec.outcome == "archived", phase_rec.outcome
