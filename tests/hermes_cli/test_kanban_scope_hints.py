@@ -415,3 +415,22 @@ def test_owned_directory_the_search_cannot_list_is_named_and_counted():
     out = run.stdout.splitlines()
     assert [line for line in out if line.startswith("unreadable")] == ["unreadable\tlocked/"]
     assert [line for line in out if line.startswith("# unreadable")] == ["# unreadable: 1"]
+
+
+def test_helper_with_a_key_hit_keeps_its_rule_4_row_and_the_counts(helper_repo):
+    _write(helper_repo / "tests" / "b.py", f'from tests.a import helper\nK = "{KEY}"\n')
+    report = hints.find_hints(helper_repo, [OWNED], [KEY])
+    assert _lines(report)["tests/b.py"] == f'rule 4 (quoted key: "{KEY}")'
+    assert _rules(report)["tests/b.py"] == (4,)
+    assert _paths(report).count("tests/b.py") == 1
+    assert report.counts == {1: 2, 2: 0, 3: 0, 4: 1}
+    assert not any(h.imports_pinning_test for h in report.hints)
+
+
+def test_helper_naming_the_owned_path_keeps_its_rule_3_row_and_the_counts(helper_repo):
+    _write(helper_repo / "tests" / "b.py", f'from tests.a import helper\nP = "{OWNED}"\n')
+    report = hints.find_hints(helper_repo, [OWNED])
+    assert _lines(report)["tests/b.py"] == "rule 3 (names owned path)"
+    assert _rules(report)["tests/b.py"] == (3,)
+    assert report.counts == {1: 2, 2: 0, 3: 1, 4: 0}
+    assert HELPER_LABEL not in "\n".join(hints.format_report(report))

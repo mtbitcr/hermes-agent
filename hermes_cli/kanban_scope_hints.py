@@ -7,7 +7,8 @@ owned paths that match one of four rules:
 
 1. a Python file under ``tests/`` that imports a module in the owned paths; one step
    further, a test that imports a module of a test file listed by this rule (it has no
-   rule number of its own and is not counted: ``Hint.imports_pinning_test``);
+   rule number of its own and is not counted: ``Hint.imports_pinning_test``; it is added
+   only for a file with no row of its own, an existing row is never rewritten);
 2. any other Python file that imports a name from such a module;
 3. a file that names an owned file path;
 4. for each key, a file that contains that exact key in single or double quotes.
@@ -31,7 +32,7 @@ import codecs
 import mmap
 import os
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
@@ -244,7 +245,6 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
 
     pinning = {_module_name(h.path) for h in hints if 1 in h.rules}
     helpers = {rel for rel, names in test_imports.items() if pinning & names}
-    hints = [replace(h, imports_pinning_test=h.path in helpers) for h in hints]
     hints.extend(Hint(rel, (), (), True) for rel in sorted(helpers - {h.path for h in hints}))
     hints.sort(key=lambda h: (4 not in h.rules, h.path))
     counts = {rule: sum(rule in h.rules for h in hints) for rule in RULE_NAMES}
