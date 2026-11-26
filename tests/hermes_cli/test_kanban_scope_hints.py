@@ -815,7 +815,10 @@ SECOND_BINDINGS = {
 }
 
 
-@pytest.mark.parametrize("binding", SECOND_BINDINGS)
+@pytest.mark.parametrize("binding", [
+    pytest.param(name, marks=pytest.mark.skipif(sys.version_info < (3, 12), reason="type parameters need Python 3.12"))
+    if name == "type parameter" else name
+    for name in SECOND_BINDINGS])
 def test_a_second_binding_of_any_kind_leaves_the_name_not_resolved(saved_repo, binding):
     source = ("FAMILY = 'fam'\n" + SECOND_BINDINGS[binding].format(n="FAMILY")
               + "\ndef test_a(owner_payload_example):\n    owner_payload_example(FAMILY, 'one', {})\n")
@@ -933,3 +936,68 @@ def test_a_test_file_that_is_not_listed_gets_no_not_resolved_row(saved_repo):
     report = hints.find_hints(saved_repo, [OWNED])
     assert not any(NOT_RESOLVED in line for line in hints.format_report(report))
     assert report.counts[5] == 0
+
+
+def test_a_wildcard_import_makes_a_plain_name_not_resolved_but_not_a_literal(saved_repo):
+    source = ("FAMILY = 'fam'\nfrom pkg.extras import *\n\ndef t(owner_payload_example):\n"
+              "    owner_payload_example(FAMILY, 'one', {})\n")
+    report, lines = _rule_5_rows(saved_repo, source)
+    assert lines == [_at(source)]
+    assert report.counts[5] == 1
+    assert not [h for h in report.hints if h.path.startswith(SAVED)]
+    source = ("FAMILY = 'fam'\nfrom pkg.extras import *\n\ndef t(owner_payload_example):\n"
+              "    owner_payload_example('fam', 'one', {})\n")
+    report, lines = _rule_5_rows(saved_repo, source)
+    assert lines == [f"{SAVED}/fam/one.json\t{SAVED_LABEL}"]
+
+
+def test_keywords_resolve_both_inputs_next_to_a_starred_expansion(saved_repo):
+    source = ("def t(owner_payload_example):\n"
+              "    owner_payload_example(*(), family='fam', record_kind='one', payload={})\n")
+    _, lines = _rule_5_rows(saved_repo, source)
+    assert lines == [f"{SAVED}/fam/one.json\t{SAVED_LABEL}"]
+    source = ("def t(owner_payload_example):\n"
+              "    owner_payload_example('fam', *(), record_kind='one', payload={})\n")
+    report, lines = _rule_5_rows(saved_repo, source)
+    assert lines == [f"{SAVED}/fam/one.json\t{SAVED_LABEL}"]
+    assert report.counts[5] == 1
+
+
+def test_a_slot_after_a_starred_expansion_or_in_a_double_star_is_not_resolved(saved_repo):
+    source = "def t(owner_payload_example):\n    owner_payload_example(*(), 'fam', 'one', {})\n"
+    _, lines = _rule_5_rows(saved_repo, source)
+    assert lines == [_at(source)]
+    source = "def t(owner_payload_example):\n    owner_payload_example('fam', *(), 'one', {})\n"
+    _, lines = _rule_5_rows(saved_repo, source)
+    assert _saved_only(lines) == FAMILY_ROWS and _not_resolved(lines) == []
+    source = "def t(owner_payload_example):\n    owner_payload_example('fam', **{'record_kind': 'one'})\n"
+    _, lines = _rule_5_rows(saved_repo, source)
+    assert _saved_only(lines) == FAMILY_ROWS and _not_resolved(lines) == []
+    source = "def t(owner_payload_example):\n    owner_payload_example(**{'family': 'fam'}, record_kind='one')\n"
+    _, lines = _rule_5_rows(saved_repo, source)
+    assert lines == [_at(source)]
+
+
+def test_a_slot_given_by_a_keyword_and_by_the_positional_prefix_is_not_resolved(saved_repo):
+    source = "def t(owner_payload_example):\n    owner_payload_example('fam', family='other', record_kind='one')\n"
+    _, lines = _rule_5_rows(saved_repo, source)
+    assert lines == [_at(source)]
+    source = "def t(owner_payload_example):\n    owner_payload_example('fam', 'one', record_kind='two')\n"
+    _, lines = _rule_5_rows(saved_repo, source)
+    assert _saved_only(lines) == FAMILY_ROWS and _not_resolved(lines) == []
+
+
+def test_two_unresolved_calls_on_one_line_give_two_rows_and_a_count_of_two(saved_repo):
+    source = "def t(owner_payload_example, f):\n    owner_payload_example(f, 'one', {}); owner_payload_example(f, 'two', {})\n"
+    report, lines = _rule_5_rows(saved_repo, source)
+    assert lines == [_at(source)] * 2
+    assert report.counts[5] == 2
+    assert "# rule 5 (saved example): 2" in hints.format_report(report)
+
+
+def test_a_fixture_name_that_python_normalizes_is_read(saved_repo):
+    source = ("def t(ｏwner_payload_example):\n    ｏwner_payload_example('fam', 'one', {})\n")
+    assert "owner_payload_example" not in source
+    report, lines = _rule_5_rows(saved_repo, source)
+    assert lines == [f"{SAVED}/fam/one.json\t{SAVED_LABEL}"]
+    assert report.counts[5] == 1

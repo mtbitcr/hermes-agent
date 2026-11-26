@@ -184,6 +184,14 @@ def _examine(path: Path, want_text: bool, path_pattern: re.Pattern | None, key_n
     return "ok", text, names_path, matched
 
 
+_NAMING_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler, ast.MatchAs, ast.MatchStar,
+                 *(getattr(ast, n) for n in ("TypeVar", "ParamSpec", "TypeVarTuple") if hasattr(ast, n)))
+
+
+def _call_name(call: ast.Call) -> str | None:
+    return call.func.id if isinstance(call.func, ast.Name) else getattr(call.func, "attr", None)
+
+
 def _binding_counts(tree: ast.Module) -> Counter[str]:
     """How many times the whole file binds each name, in every scope, with no scope rule: an
     assignment, annotated assignment, augmented assignment, named expression, parameter, loop,
@@ -200,8 +208,7 @@ def _binding_counts(tree: ast.Module) -> Counter[str]:
             counts.update(a.asname or a.name.split(".")[0] for a in node.names if a.name != "*")
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
             counts.update(node.names)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler,
-                               ast.MatchAs, ast.MatchStar, ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple)):
+        elif isinstance(node, _NAMING_NODES):
             if node.name:
                 counts[node.name] += 1
         elif isinstance(node, ast.MatchMapping) and node.rest:
@@ -210,9 +217,12 @@ def _binding_counts(tree: ast.Module) -> Counter[str]:
 
 
 def _module_literals(tree: ast.Module) -> dict[str, str]:
-    """The names that the whole file binds once, by a module-level assignment of a string literal."""
-    counts = _binding_counts(tree)
+    """The names that the whole file binds once, by a module-level assignment of a string literal.
+    A wildcard import makes that unprovable, so then no name is resolved."""
     literals: dict[str, str] = {}
+    if any(isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names) for n in ast.walk(tree)):
+        return literals
+    counts = _binding_counts(tree)
     for node in tree.body:
         targets, value = (node.targets, node.value) if isinstance(node, ast.Assign) else (
             ([node.target], node.value) if isinstance(node, ast.AnnAssign) else ([], None))
@@ -244,15 +254,17 @@ def _saved_examples(root: Path, trees: Iterable[tuple[str, ast.Module]], scan_ta
                 return node.value
             return literals.get(node.id) if isinstance(node, ast.Name) else None
 
-        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
-                 and (n.func.id if isinstance(n.func, ast.Name) else getattr(n.func, "attr", None)) == EXAMPLE_CALL]
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and _call_name(n) == EXAMPLE_CALL]
         for call in sorted(calls, key=lambda n: (n.lineno, n.col_offset)):
-            given = {k.arg: k.value for k in call.keywords}
-            given.update(zip(("family", "record_kind"), call.args))
-            family, kind = resolved(given.get("family")), resolved(given.get("record_kind"))
+            prefix = call.args[:next((i for i, a in enumerate(call.args) if isinstance(a, ast.Starred)), len(call.args))]
+
+            def slot(name: str, index: int) -> str | None:
+                given = prefix[index:index + 1] + [k.value for k in call.keywords if k.arg == name]
+                return resolved(given[0]) if len(given) == 1 else None
+
+            family, kind = slot("family", 0), slot("record_kind", 1)
             if family is None:
-                if (rel_test, call.lineno) not in unresolved:
-                    unresolved.append((rel_test, call.lineno))
+                unresolved.append((rel_test, call.lineno))
                 continue
             if not all(_safe_component(n) for n in (family, kind) if n is not None):
                 continue
@@ -346,8 +358,6 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
             except (SyntaxError, ValueError, RecursionError):
                 tree = None
             is_test = rel.split("/")[0] == "tests"
-            if is_test and tree is not None and EXAMPLE_CALL in text:
-                example_trees[rel] = tree
             directory = rel.split("/")[:-1]
             imports_seen: set[str] = set()
             for node in ast.walk(tree) if tree is not None else ():
@@ -361,6 +371,8 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
                     if not is_test and is_owned_module(base):
                         rules.add(2)
                 else:
+                    if is_test and isinstance(node, ast.Call) and _call_name(node) == EXAMPLE_CALL:
+                        example_trees[rel] = tree
                     continue
                 imports_seen.update(imported)
                 if is_test and any(is_owned_module(name) for name in imported):
