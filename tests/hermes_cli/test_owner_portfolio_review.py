@@ -265,6 +265,103 @@ def test_a_complete_project_with_an_owner_step_and_no_review_of_the_day_does_not
         assert projects_db.get_project_review_brief(registry, done.id) is None
 
 
+def _complete_project_with_news(root):
+    """The waiting pair and a complete Project with an owner step and news, so it gets a review task of the day."""
+    project, other = _waiting_pair(root)
+    done = _complete_project(root, "Design Loop")
+    _portfolio_on(root, project, other, done)
+    _news(done)
+    return project, other, done
+
+
+def _finish_complete_review(done):
+    """Store the review of the complete Project; it classifies the pending suggestion, the one owner step its review covers."""
+    with _project_board(done) as board:
+        tasks = [row[0] for row in board.execute("SELECT id FROM tasks WHERE task_kind!='work' ORDER BY created_at,id")]
+    payload = {"project_review": {**VALID_REVIEW["project_review"], "classification": [
+        {"item": task, "class": "still actionable", "evidence": [f"suggestions:{task}"]} for task in tasks
+    ]}}
+    _finish_project_review(done, payload)
+
+
+def _open_task_id(root, project):
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        return registry.execute(
+            "SELECT open_task_id FROM project_review_state WHERE project_id=?", (project.id,),
+        ).fetchone()[0]
+
+
+def test_a_complete_project_with_an_open_review_task_holds_the_portfolio_back_until_its_review_is_stored(root):
+    project, other, done = _complete_project_with_news(root)
+
+    assert review.review_tick(NOW) == 1
+    assert _open_task_id(root, done) is not None
+    assert review.review_tick(NOW + 1) == 0
+    assert _portfolio_keys() == []
+
+    _finish_complete_review(done)
+    assert review.review_tick(NOW + 2) == 1
+
+    assert _open_task_id(root, done) is None
+    assert _portfolio_keys() == ["project-review:portfolio:2026-11-09:0"]
+    [record] = [item for item in _frozen(_portfolio_body())["projects"] if item["name"] == "Design Loop"]
+    assert record["review_state"] == "reviewed"
+    assert record["owner_steps"] == {"answers": 0, "suggestions": 1, "plan_approvals": 0}
+
+
+def test_a_complete_project_with_an_open_review_task_does_not_hold_the_portfolio_back_after_two_hours(root):
+    project, other, done = _complete_project_with_news(root)
+    assert review.review_tick(NOW) == 1
+    open_task = _open_task_id(root, done)
+    assert open_task is not None
+
+    assert review.review_tick(NOW + 7199) == 0
+    assert _portfolio_keys() == []
+    assert review.review_tick(NOW + 7200) == 1
+
+    review_key = f"project-review:{done.id}:2026-11-09:0"
+    with _summaries() as board:
+        keys = sorted(row[0] for row in board.execute("SELECT idempotency_key FROM tasks WHERE created_by='project-review'"))
+    assert keys == sorted([review_key, "project-review:portfolio:2026-11-09:0"])
+    assert _open_task_id(root, done) == open_task
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        # The input and its texts are what _input writes for this Project; the daily cap counts the one review and one portfolio.
+        assert _frozen(_portfolio_body()) == portfolio._input(registry, [project, other], "2026-11-09", NOW + 7200, [done])
+        assert review.budget(registry, "2026-11-09") == (1, 1)
+    [record] = [item for item in _frozen(_portfolio_body())["projects"] if item["name"] == "Design Loop"]
+    assert record["review_state"] == "not reviewed today"
+    assert record["owner_steps"] == {"answers": 0, "suggestions": 1, "plan_approvals": 0}
+
+
+def test_a_complete_project_with_a_review_task_still_open_from_the_day_before_does_not_hold_the_portfolio_back(root):
+    project, other, done = _complete_project_with_news(root)
+    assert review.review_tick(NOW) == 1
+    open_task = _open_task_id(root, done)
+    assert open_task is not None
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        registry.execute("UPDATE project_review_state SET open_review_date='2026-11-08' WHERE project_id=?", (done.id,))
+        registry.commit()
+
+    assert review.review_tick(NOW + 1) == 1
+
+    assert _portfolio_keys() == ["project-review:portfolio:2026-11-09:0"]
+    assert _open_task_id(root, done) == open_task
+
+
+def test_the_readiness_check_creates_no_state_row_for_a_complete_project(root):
+    project, other = _waiting_pair(root)
+    done = _complete_project(root, "Design Loop")
+    _portfolio_on(root, project, other, done)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        registry.execute("DELETE FROM project_review_state WHERE project_id=?", (done.id,))
+        registry.commit()
+        settings = review.read_settings()
+        assert portfolio._ready(registry, [], "2026-11-09", settings, NOW, [done]) is True
+        assert registry.execute(
+            "SELECT COUNT(*) FROM project_review_state WHERE project_id=?", (done.id,),
+        ).fetchone()[0] == 0
+
+
 def test_a_late_portfolio_result_keeps_its_original_day_before_the_next_review_hour(root):
     project, other = _waiting_pair(root)
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {
