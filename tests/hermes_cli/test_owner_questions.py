@@ -184,8 +184,8 @@ def test_the_review_limit_choices_pass_the_owner_text_policy_unchanged():
 
 
 def test_the_review_limit_choices_pass_the_module_s_own_choice_check():
-    """S2 and S3: each fixed choice is exactly one sentence by the same check
-    a worker's choice must pass."""
+    """S2 and S3: each fixed choice passes the same check a worker's choice
+    must pass."""
     for n, sentence in enumerate(oq.REVIEW_LIMIT_CHOICES, start=1):
         assert oq._plain_text(
             sentence, f"the sentence of choice {n}", limit=oq.MAX_CHOICE_LENGTH, sentence=True,
@@ -307,80 +307,6 @@ def test_a_question_of_500_code_points_and_a_choice_of_160_are_accepted(board):
     assert blocked.payload["reason"] == question
 
 
-ONE_SENTENCE_CHOICES = {
-    "an English sentence": "Build the short form first.",
-    "a Japanese sentence": "短いフォームを作ります。",
-    "a decimal number": "Use 2.5 times the spacing.",
-    "initials at the end": "Launch the page in the U.S.",
-    "the first review limit choice": oq.REVIEW_LIMIT_CHOICES[0],
-    "the second review limit choice": oq.REVIEW_LIMIT_CHOICES[1],
-    # A point inside a number or of an abbreviation, an ellipsis before a
-    # lowercase letter, and a quotation or bracket that closes inside the
-    # sentence end no sentence.
-    "a title before a name": "Ask Dr. Lee to review the form.",
-    "a dotted abbreviation before a lowercase letter": "Use the U.S. spelling.",
-    "a lead-in inside brackets": "Use the examples (e.g. the short form).",
-    "a quotation that closes after a question mark": "Set the banner to “Ready?” before posting.",
-    "a quotation that closes after a full stop": "Set the banner to “Done.” before posting.",
-    "a quotation that closes before a comma": "Ask “Is it ready?”, then build the form.",
-    "a bracket that closes after an exclamation mark": (
-        "Build the short form (the long one can wait!) first."
-    ),
-    "two titles before names": "Ask Mr. Smith and Mrs. Jones to sign the form.",
-    "the lead-in vs.": "Compare plan A vs. plan B first.",
-    "p.m. before a lowercase letter": "Ship it by 5 p.m. on Friday.",
-    "a dotted abbreviation before a noun": "Ask the U.S. office to review the form.",
-    "etc. before a lowercase letter": "Bring the forms, pens, etc. to the review.",
-    "No. before a digit": "Use form No. 2 for the review.",
-    "No. glued to a digit": "Use form No.2 for the review.",
-    "three points before a lowercase letter": "Wait for the review... then build the form.",
-    "an ellipsis before a lowercase letter": "Wait for the review… then build the form.",
-    "a version number": "Use version 2.5.1 of the form.",
-    "a semicolon": "Build the short form; then build the long one.",
-    "a question": "Is the short form enough?",
-    "a straight quotation that closes after a question mark": (
-        'Set the banner to "Ready?" before posting.'
-    ),
-    # The policy refuses the corner brackets 「」, so curly quotes stand in.
-    "a Japanese quotation that closes after a question mark, before と": (
-        "“準備はいいですか？”と聞きます。"
-    ),
-    "a Japanese quotation that closes after a question mark, before って": (
-        "“準備はいいですか？”って聞きます。"
-    ),
-    "a Japanese quotation that closes after a full stop, before と": "“はい。”と言います。",
-    "a Japanese quotation that closes after a question mark, before を": (
-        "“保存しますか？”を表示します。"
-    ),
-    "the title Mx. before a name": "Ask Mx. Lee to sign the form.",
-    "the title Mt. before a name": "Climb Mt. Fuji first.",
-    "a dotted abbreviation before a hyphen": "Use the U.S.-based server.",
-    "a month before a date": "Ship it by Jan. 5 at noon.",
-    "et al. before a lowercase letter": "Ask Lee et al. to review it.",
-    # The Greek question mark looks like a semicolon, so it is written as an escape.
-    "a Greek question": "Είναι έτοιμη η φόρμα\u037e",
-}
-
-
-@pytest.mark.parametrize("case", sorted(ONE_SENTENCE_CHOICES))
-def test_a_choice_of_one_sentence_is_declared_and_stored_as_given(board, case):
-    """S2: a choice of one sentence, in any script, with a decimal number, an
-    abbreviation, an ellipsis, an inline quotation or a final mark, passes the
-    owner text policy unchanged and is not taken for two sentences or none."""
-    task_id, run_id = _running_card(board)
-    sentence = ONE_SENTENCE_CHOICES[case]
-    assert check_owner_text(sentence, "planner_prose") == sentence
-
-    _declare(board, task_id, run_id, "question", QUESTION, [{"n": 1, "sentence": sentence}], "optional")
-
-    (payload,) = _declared_payloads(board, task_id)
-    assert payload["choices"] == [{"n": 1, "sentence": sentence}]
-    assert kb.get_task(board, task_id).status == "blocked"
-    assert oq.current_questions(board, [task_id]) == {
-        task_id: (_blocked_event_ids(board, task_id)[-1], payload),
-    }
-
-
 # ---------------------------------------------------------------------------
 # Card P1 test (b): each refused text writes nothing.
 # ---------------------------------------------------------------------------
@@ -406,30 +332,6 @@ REFUSED_TEXTS = {
         "question", "Should Raphael ask GPT-5 to write the page?", _choices(2), "optional",
     ),
     "501 code points": lambda task_id: ("question", _question_of(501), _choices(2), "optional"),
-    "two sentences in a choice": lambda task_id: (
-        "question", QUESTION, _with_choice("Use the short form. Then add a title."), "optional",
-    ),
-    # Two sentences with no space between them, or after a mark that is not ASCII.
-    "two sentences in a choice, joined by an exclamation mark": lambda task_id: (
-        "question", QUESTION, _with_choice("Build the short form!Then build the long form."),
-        "optional",
-    ),
-    "two Japanese sentences in a choice": lambda task_id: (
-        "question", QUESTION, _with_choice("短いフォームを作ります。次に長いフォームを作ります。"),
-        "optional",
-    ),
-    "two sentences in a choice, after a full-width question mark": lambda task_id: (
-        "question", QUESTION, _with_choice("短いフォームでいいですか？次に長いフォームを作ります。"),
-        "optional",
-    ),
-    "two sentences in a choice, a question mark before a lowercase letter": lambda task_id: (
-        "question", QUESTION, _with_choice("Is the short form enough?then build the long form."),
-        "optional",
-    ),
-    "two sentences in a choice, a full stop before an uppercase letter": lambda task_id: (
-        "question", QUESTION, _with_choice("Build the short form.I will check it later."),
-        "optional",
-    ),
     "5 choices": lambda task_id: ("question", QUESTION, _choices(5), "optional"),
     "0 choices with words optional": lambda task_id: ("question", QUESTION, [], "optional"),
 }
@@ -453,70 +355,50 @@ def test_card_p1_b_a_refused_text_writes_nothing(board, fired_hooks, case):
     assert oq.current_questions(board, [task_id]) == {}
 
 
-# Choices of two sentences, glued to a numeral or to opening punctuation or not,
-# and choices of no sentence at all (S2). Each passes the owner text policy
-# unchanged, so the sentence rule alone refuses it.
-NOT_ONE_SENTENCE_CHOICES = {
-    "a full stop glued to a numeral": "Use the short form.2 people can review it.",
-    "an exclamation mark glued to a numeral": "Try the short form!2 people can review it.",
-    "an exclamation mark glued to an opening bracket": (
-        "Try the short form!(The longer form can wait.)"
-    ),
-    "a question mark glued to an opening quote": "Is the form ready?“Yes, it is.”",
-    "a question mark alone": "?",
-    "three points alone": "...",
-    "two marks alone": "!?",
-    "an ellipsis alone": "…",
-    "a full stop glued to an opening bracket": "Use the short form.(The long form can wait.)",
-    "a full stop glued to an opening quote": "Use the short form.“Then add a title.”",
-    "a full stop before a numeral": "Use the short form. 2 people can review it.",
-    # The policy refuses "form.then" as a host name, so "form.a" stands in.
-    "a full stop glued to a lowercase letter": "Use the short form.a title comes next.",
-    "a full stop before a lowercase letter": "Use the short form. then add a title.",
-    "an exclamation mark before a lowercase letter": "Use the short form! then add a title.",
-    "three points before a capital": "Wait for the review... Then build the form.",
-    "a bracket that closes after a full stop, before a capital": (
-        "Build the short form (it is faster.) Then build the long one."
-    ),
-    "a single capital letter before a capital": "Pick option A. It costs less.",
-    "a dotted abbreviation before a capital": "Ship the form to the U.S. Then sign it.",
-    "etc. before a capital": "Bring the forms, pens, etc. Then sign them.",
-    "no. before a capital": "Answer no. Then stop the work.",
-    # The policy refuses "form。Th" as a host name, so "form。A" stands in.
-    "an ideographic full stop in English": "Build the short form。A title comes next.",
-    # The policy refuses the corner brackets 「」, so curly quotes stand in.
-    "a Japanese quotation that closes after a full stop, then more text": "“はい。”次に進みます。",
-    "a dotted abbreviation glued to a numeral": "Ship the form to the U.S.2 people can review it.",
-    "a bracket that nothing opened, before a lowercase letter": (
-        "Use the short form.) then add a title."
-    ),
-    "a straight quote glued after a question mark that opens a sentence": (
-        'Is the form ready?"Yes, it is."'
-    ),
-    "a title before a numeral": "Ask the Dr.2 people can review it.",
-    "a title before an opening bracket": "Ask the Dr.(The long form can wait.)",
-    "a Japanese quotation that closes after a question mark, then more text": (
-        "“準備はいいですか？”次に進みます。"
-    ),
-    "etc. before a numeral": "Bring the forms, pens, etc. 2 people can review it.",
-    "etc. glued to a lowercase letter": "Bring the forms, pens, etc.a title comes next.",
-    # The Greek question mark looks like a semicolon, so it is written as an escape.
-    "a Greek question mark before a capital": "Είναι έτοιμη η φόρμα\u037e Ναι, είναι.",
-}
+# The rule for a choice, as the owner decided it (S2): one line of 1 to 160
+# code points that passes the owner text policy unchanged and holds a letter
+# or a digit; its sentences are not counted. Each text below passes the owner
+# text policy unchanged, so the one property its test is about decides alone.
 
 
-@pytest.mark.parametrize("case", sorted(NOT_ONE_SENTENCE_CHOICES))
-def test_card_p1_b_a_choice_of_two_sentences_or_none_writes_nothing(board, fired_hooks, case):
-    """Card P1 test (b), S2: a choice of two sentences, or of no sentence, is
-    refused with a plain error and nothing is written, though the owner text
-    policy lets it through unchanged."""
-    sentence = NOT_ONE_SENTENCE_CHOICES[case]
+def test_a_choice_of_160_code_points_is_stored_unchanged_and_one_of_161_is_refused(
+    board, fired_hooks,
+):
+    """S2: a choice of 161 code points is refused and nothing is written; the
+    same choice one code point shorter, 160, is then stored unchanged."""
+    longest, too_long = _sentence_of(160), _sentence_of(161)
+    assert (len(longest), len(too_long)) == (160, 161)
+    for sentence in (longest, too_long):
+        assert check_owner_text(sentence, "planner_prose") == sentence
+    task_id, run_id = _running_card(board)
+    store = fired_hooks.store = _store_file(board)
+    before = _observed_state(store, task_id)
+
+    with pytest.raises(ValueError, match="choice 2 must be"):
+        _declare(board, task_id, run_id, "question", QUESTION, _with_choice(too_long), "optional")
+
+    assert _observed_state(store, task_id) == before
+    assert before["status"] == "running" and before["declarations"] == 0
+    assert board.in_transaction is False
+    assert fired_hooks.fired == []
+    assert oq.current_questions(board, [task_id]) == {}
+
+    _declare(board, task_id, run_id, "question", QUESTION, _with_choice(longest), "optional")
+
+    (payload,) = _declared_payloads(board, task_id)
+    assert payload["choices"] == _with_choice(longest)
+
+
+def test_a_choice_with_a_line_break_is_refused_with_nothing_written(board, fired_hooks):
+    """S2: a choice is one line; the two sentences one line may hold are
+    refused across two lines, and nothing is written."""
+    sentence = "Use the short form.\nThen add a title."
     assert check_owner_text(sentence, "planner_prose") == sentence
     task_id, run_id = _running_card(board)
     store = fired_hooks.store = _store_file(board)
     before = _observed_state(store, task_id)
 
-    with pytest.raises(ValueError, match="choice 2 must be exactly one sentence"):
+    with pytest.raises(ValueError, match="choice 2 must be"):
         _declare(board, task_id, run_id, "question", QUESTION, _with_choice(sentence), "optional")
 
     assert _observed_state(store, task_id) == before
@@ -524,6 +406,68 @@ def test_card_p1_b_a_choice_of_two_sentences_or_none_writes_nothing(board, fired
     assert board.in_transaction is False
     assert fired_hooks.fired == []
     assert oq.current_questions(board, [task_id]) == {}
+
+
+def test_a_choice_of_two_short_sentences_on_one_line_is_stored_byte_for_byte(board):
+    """S2: the platform does not count the sentences of a choice, so two short
+    sentences on one line are stored exactly as given, and the card waits."""
+    sentence = "Use the short form. Then add a title."
+    assert check_owner_text(sentence, "planner_prose") == sentence
+    task_id, run_id = _running_card(board)
+
+    _declare(board, task_id, run_id, "question", QUESTION, _with_choice(sentence), "optional")
+
+    (payload,) = _declared_payloads(board, task_id)
+    assert payload["choices"] == _with_choice(sentence)
+    assert payload["choices"][1]["sentence"].encode("utf-8") == sentence.encode("utf-8")
+    assert kb.get_task(board, task_id).status == "blocked"
+    assert oq.current_questions(board, [task_id]) == {
+        task_id: (_blocked_event_ids(board, task_id)[-1], payload),
+    }
+
+
+# Choices of marks alone, with no letter and no digit (S2).
+MARKS_ONLY_CHOICES = {
+    "a question mark alone": "?",
+    "three points alone": "...",
+    "two marks alone": "!?",
+    "an ellipsis alone": "…",
+}
+
+
+@pytest.mark.parametrize("case", sorted(MARKS_ONLY_CHOICES))
+def test_a_choice_of_marks_only_is_refused_with_nothing_written(board, fired_hooks, case):
+    """S2: a choice that holds no letter and no digit is refused with a plain
+    error and nothing is written, though the owner text policy lets it through
+    unchanged."""
+    sentence = MARKS_ONLY_CHOICES[case]
+    assert check_owner_text(sentence, "planner_prose") == sentence
+    task_id, run_id = _running_card(board)
+    store = fired_hooks.store = _store_file(board)
+    before = _observed_state(store, task_id)
+
+    with pytest.raises(ValueError, match="choice 2 must be"):
+        _declare(board, task_id, run_id, "question", QUESTION, _with_choice(sentence), "optional")
+
+    assert _observed_state(store, task_id) == before
+    assert before["status"] == "running" and before["declarations"] == 0
+    assert board.in_transaction is False
+    assert fired_hooks.fired == []
+    assert oq.current_questions(board, [task_id]) == {}
+
+
+def test_a_choice_of_digits_and_no_letter_is_stored_unchanged(board):
+    """S2: a choice is marks alone only when it holds no letter and no digit,
+    so a choice of digits with no letter is stored as given."""
+    sentence = "10:30"
+    assert check_owner_text(sentence, "planner_prose") == sentence
+    assert not any(char.isalpha() for char in sentence)
+    task_id, run_id = _running_card(board)
+
+    _declare(board, task_id, run_id, "question", QUESTION, _with_choice(sentence), "optional")
+
+    (payload,) = _declared_payloads(board, task_id)
+    assert payload["choices"] == _with_choice(sentence)
 
 
 # The other limits S1 and S2 set, and the stops only the reader serves (S4, S5).
