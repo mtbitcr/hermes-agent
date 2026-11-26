@@ -7,8 +7,8 @@ owned paths that match one of four rules:
 
 1. a Python file under ``tests/`` that imports a module in the owned paths; one step
    further, a test that imports a module of a test file listed by this rule (it has no
-   rule number of its own and is not counted: ``Hint.imports_pinning_test``; it is added
-   only for a file with no row of its own, an existing row is never rewritten);
+   rule number of its own and is not counted: ``Hint.imports_pinning_test``; it is a
+   separate row, placed after the file's own row when it has one, which is never rewritten);
 2. any other Python file that imports a name from such a module;
 3. a file that names an owned file path;
 4. for each key, a file that contains that exact key in single or double quotes.
@@ -245,8 +245,9 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
 
     pinning = {_module_name(h.path) for h in hints if 1 in h.rules}
     helpers = {rel for rel, names in test_imports.items() if pinning & names}
-    hints.extend(Hint(rel, (), (), True) for rel in sorted(helpers - {h.path for h in hints}))
-    hints.sort(key=lambda h: (4 not in h.rules, h.path))
+    hints.extend(Hint(rel, (), (), True) for rel in sorted(helpers))
+    keyed = {h.path for h in hints if 4 in h.rules}
+    hints.sort(key=lambda h: (h.path not in keyed, h.path, h.imports_pinning_test))
     counts = {rule: sum(rule in h.rules for h in hints) for rule in RULE_NAMES}
     return Report(tuple(hints), counts, tuple(sorted({*unreadable, *unlistable})))
 
