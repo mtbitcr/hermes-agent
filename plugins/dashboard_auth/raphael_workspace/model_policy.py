@@ -130,12 +130,6 @@ _ASSIGNMENTS = {
     ("raphael-builder", "anthropic"): _assignment(
         "raphael-builder", "anthropic", "claude-sonnet-5-5", "Claude Sonnet 5.5", "max"
     ),
-    # There is deliberately NO builder route on the OpenAI family. The builder
-    # integrates verified work and operates infrastructure, so its deep lane is
-    # high-risk coding, and high-risk coding may mint only Claude Opus 5.5 / max
-    # (see _DEEP_ROUTES). Admitting an OpenAI builder assignment would make
-    # ``task_assignment_for(builder, openai-codex, 'deep')`` fall through to
-    # that provider's base route, which is not a qualified deep coding lane.
     ("raphael-verifier", "openai-codex"): _assignment(
         "raphael-verifier", "openai-codex", "gpt-6.1-sol", "GPT-6.1 Sol", "max"
     ),
@@ -154,11 +148,17 @@ _ASSIGNMENTS = {
     ),
 }
 
-# Deep work is the only place a task route may differ from the role's base
-# assignment, and only on the (profile, provider) pairs declared here. Every
-# other deep request resolves to its admitted base route. A deep route is
-# reachable only where ``_ASSIGNMENTS`` already admits the pair, so this table
-# can never admit a lane on its own.
+# A role-wide entry would also admit other task tiers.
+# Each alternate route requires a lock for its exact role and tier.
+# A role-wide model update names a provider and a model, never these routes, so it never moves them.
+_TASK_ONLY_ROUTES = {
+    ("raphael-claude-worker", "openai-codex", "deep"): _assignment(
+        "raphael-claude-worker", "openai-codex", "gpt-6.2-sol", "GPT-6.2 Sol", "max",
+    ),
+}
+
+# Deep overrides require a role-wide assignment. Without an override, deep
+# work uses the role-wide route.
 _CLAUDE_DEEP_PROFILES = frozenset({
     "raphael-planner",
     "raphael-business",
@@ -230,7 +230,12 @@ def _matrix_task_assignment(
 ) -> ModelAssignment:
     """The hard-coded task route, before any owner-approved model update."""
     tier = normalize_execution_tier(execution_tier)
-    base = _matrix_assignment(profile, provider)
+    profile_id = str(profile or "").strip()
+    provider_id = str(provider or "").strip()
+    task_route = _TASK_ONLY_ROUTES.get((profile_id, provider_id, tier))
+    if task_route is not None:
+        return task_route
+    base = _matrix_assignment(profile_id, provider_id)
     if tier == "deep":
         deep = _DEEP_ROUTES.get((base.profile, base.provider))
         if deep is not None:
@@ -246,13 +251,16 @@ def task_assignment_for(
     The planner may classify work as ``routine`` or ``deep`` but never chooses a
     provider, model id, or effort.  Deep Claude planning, business, coding, and
     delivery work moves to the currently qualified Opus lane (see
-    ``_DEEP_ROUTES``).  Every other provider choice, OpenAI verification
-    included, retains its admitted profile assignment until that provider has
-    a separately qualified deep lane.
+    ``_DEEP_ROUTES``). A task-only route admits just the listed tier and is
+    returned exactly as qualified, never moved by a model update. Other tasks
+    use their admitted profile assignment.
     """
-    return _apply_model_updates(
-        _matrix_task_assignment(profile, provider, execution_tier), _model_updates()
-    )[0]
+    tier = normalize_execution_tier(execution_tier)
+    key = (str(profile or "").strip(), str(provider or "").strip(), tier)
+    route = _matrix_task_assignment(*key)
+    if key in _TASK_ONLY_ROUTES:
+        return route
+    return _apply_model_updates(route, _model_updates())[0]
 
 
 def validate_runtime_assignment(
@@ -280,9 +288,11 @@ def validate_runtime_assignment(
     lock, be configured, or start new work. A fallback-capable run, a route
     the lineage never admitted for this exact role/provider, an unknown pair,
     an incomplete route and every never-admissible value are still refused.
+    A receipt without a task lock needs a role-wide route.
     """
     if disable_fallbacks is not True:
         raise ValueError("unadmitted Raphael model assignment")
+    _matrix_assignment(profile, provider)
     candidates = {
         task_assignment_for(profile, provider, "routine"),
         task_assignment_for(profile, provider, "deep"),
@@ -585,11 +595,12 @@ def _route_authority_error(
     :func:`_apply_model_updates`).  Only lock validation passes it; minting
     always requires the current route.
 
-    ``admit_pinned_effort`` additionally accepts the route's own model at
-    every effort a card can be pinned at by its risk tier (high next to max,
-    so max also on a lane whose base effort is high). Only a card's seal
-    passes it; a role's configured route and an unpinned run's history stay
-    exactly the base route.
+    A task-only route is its qualified entry alone: a role-wide model update
+    never moves it, so the update history admits no other model for it.
+
+    ``admit_pinned_effort`` accepts each risk-tier effort for a role-wide route.
+    A task-only route accepts the effort in its qualified assignment.
+    A role's configured route and an unpinned run's history use the base effort.
 
     Both together, which only seal validation (:func:`policy_lock_error`)
     passes, also accept ``_SUPERSEDED_PINNED_ROUTES`` for this exact
@@ -618,18 +629,25 @@ def _route_authority_error(
             "policy-locked route names no admitted authority for "
             f"{assignee!r}/{provider!r}/{execution_tier or None!r}"
         )
-    # One read of the update record answers both the current route and the
-    # models it ran before an owner-approved update moved it.
-    expected, updated_from = _apply_model_updates(route, _model_updates())
+    # A task-only route is exactly its qualified entry: a role-wide update never
+    # moves it and leaves no earlier model for it. Any other route reads the
+    # update record once, for both its current route and the models it ran
+    # before an owner-approved update moved it.
+    task_only = (assignee, provider, execution_tier) in _TASK_ONLY_ROUTES
+    if task_only:
+        expected, updated_from = route, frozenset()
+    else:
+        expected, updated_from = _apply_model_updates(route, _model_updates())
     admitted = {(expected.model, expected.reasoning_effort)}
-    if admit_pinned_effort:
+    use_pinned_efforts = admit_pinned_effort and not task_only
+    if use_pinned_efforts:
         admitted |= {(expected.model, effort) for effort in PINNED_EFFORTS}
     if admit_superseded:
         admitted |= _SUPERSEDED_ROUTES.get(
             (expected.profile, expected.provider, execution_tier), frozenset()
         )
         admitted |= {(model, expected.reasoning_effort) for model in updated_from}
-    if admit_superseded and admit_pinned_effort:
+    if admit_superseded and use_pinned_efforts:
         admitted |= _SUPERSEDED_PINNED_ROUTES.get(
             (expected.profile, expected.provider, execution_tier), frozenset()
         )
@@ -1173,7 +1191,7 @@ def _apply_model_updates(
 
 
 def _matrix_routes():
-    """Every hard-coded route: each role's base route and each deep lane."""
+    """Routes that the role-wide model update flow manages."""
     yield from _ASSIGNMENTS.values()
     for (profile, provider), deep in _DEEP_ROUTES.items():
         yield _assignment(profile, provider, *deep)
@@ -1368,7 +1386,7 @@ def project_oauth_payload(payload: Mapping[str, Any]) -> dict:
 
 
 def _admitted_models_for(profile: Optional[str], provider: str) -> set:
-    """Model ids ``profile`` may run on ``provider``, across every task class.
+    """Model ids selectable through a role-wide provider assignment.
 
     With no profile named (a generic availability read) this stays the whole
     provider-wide admitted set, exactly as before.
@@ -1410,12 +1428,8 @@ def project_options_payload(
 ) -> dict:
     """Project native availability plus Hermes' canonical role policy.
 
-    When a ``profile`` is named the exposed model list is narrowed to the ids
-    THAT role may actually run on each provider (its base route plus the route
-    of every execution tier). A role with no admitted assignment for a provider
-    therefore offers no models at all, so a lane this policy does not admit —
-    an OpenAI builder, a Claude verifier — cannot be surfaced as a selectable
-    option by a reader that only looks at the model list.
+    For a named profile, selectable models come from role-wide assignments
+    and their task tiers. A task-only provider needs a task lock.
     """
     admitted = {
         provider: _admitted_models_for(profile, provider)

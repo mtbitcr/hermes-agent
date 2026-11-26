@@ -227,6 +227,7 @@ def test_no_builder_lane_leaves_the_claude_family(tier):
     for model, effort in (
         ("gpt-5.6-terra", "max"),
         ("gpt-6.1-sol", "max"),
+        ("gpt-6.2-sol", "max"),
         ("gpt-6-sol", "max"),
         ("gpt-6-astra", "xhigh"),
     ):
@@ -242,6 +243,112 @@ def test_no_builder_lane_leaves_the_claude_family(tier):
     assert model_policy.mint_policy_lock(
         "raphael-builder", "anthropic", "claude-opus-5-5", "max", "deep",
     ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")
+
+
+def test_openai_deep_worker_requires_an_exact_task_lock():
+    """The alternate Worker route requires the deep tier."""
+    role = "raphael-claude-worker"
+    approved_tier = "deep"
+    with pytest.raises(ValueError):
+        assignment_for(role, "openai-codex")
+    for tier in ("routine", "deep"):
+        if tier == approved_tier:
+            lane = task_assignment_for(role, "openai-codex", tier)
+            assert (lane.model, lane.reasoning_effort) == ("gpt-6.2-sol", "max")
+            assert model_policy.mint_policy_lock(
+                role, "openai-codex", lane.model, lane.reasoning_effort, tier,
+            ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")
+        else:
+            with pytest.raises(ValueError):
+                task_assignment_for(role, "openai-codex", tier)
+            with pytest.raises(ValueError):
+                model_policy.mint_policy_lock(role, "openai-codex", "gpt-6.2-sol", "max", tier)
+        for model, effort in (
+            ("gpt-5.6-terra", "max"),
+            ("gpt-6.1-sol", "max"),
+            ("gpt-6-sol", "max"),
+            ("gpt-6-astra", "xhigh"),
+            ("gpt-6.2-sol", "high"),
+        ):
+            with pytest.raises(ValueError):
+                model_policy.mint_policy_lock(role, "openai-codex", model, effort, tier)
+
+    deep = task_assignment_for(role, "anthropic", "deep")
+    assert (deep.provider, deep.model, deep.reasoning_effort) == (
+        "anthropic", "claude-opus-5-5", "max",
+    )
+    assert model_policy.mint_policy_lock(
+        role, deep.provider, deep.model, deep.reasoning_effort, "deep",
+    ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")
+
+
+def test_role_wide_model_update_does_not_move_the_task_only_route():
+    """A role-wide update that shares the task-only model leaves that route alone.
+
+    An update names a provider and a model, never the task route, so the
+    route, its one mintable lock and the locks it admits stay as qualified.
+    """
+    role, provider, tier = "raphael-claude-worker", "openai-codex", "deep"
+    model, effort = "gpt-6.2-sol", "max"
+    route = (role, provider, model, effort, tier)
+    updates = [
+        ("gpt-6.1-sol", "gpt-6.2-sol"),
+        ("gpt-6.2-sol", "gpt-6.3-sol"),  # starts from the task-only model
+        ("gpt-6.3-sol", "gpt-6.4-sol"),  # a follow-on update
+    ]
+    decisions = [
+        {
+            "provider": provider,
+            "from_model": from_model,
+            "to_model": to_model,
+            "decision_ref": f"decision-{number}",
+            "approved_at": "2026-11-26T09:00:00Z",
+            "state": "active",
+        }
+        for number, (from_model, to_model) in enumerate(updates, start=1)
+    ]
+
+    # No role-wide route runs the task-only model, so no update can start from it yet.
+    with pytest.raises(ValueError):
+        model_policy.apply_model_update_record(decisions[1])
+    lane = task_assignment_for(role, provider, tier)
+    assert (lane.model, lane.reasoning_effort) == (model, effort)
+    lock = model_policy.mint_policy_lock(*route)
+
+    for count, decision in enumerate(decisions, start=1):
+        model_policy.apply_model_update_record(decision)
+        step = f"after {decision['from_model']} -> {decision['to_model']}"
+
+        assert task_assignment_for(role, provider, tier) == lane, step
+        assert model_policy.mint_policy_lock(*route) == lock, step
+        assert model_policy.policy_lock_error(lock, *route) is None, step
+        recorded = [d["to_model"] for d in decisions[:count]]
+        for successor in [name for name in recorded if name != model]:
+            moved = (role, provider, successor, effort, tier)
+            with pytest.raises(ValueError):
+                model_policy.mint_policy_lock(*moved)
+            assert model_policy.policy_lock_error(_sealed(*moved), *moved) is not None, step
+
+        # The update still moves every role-wide route that ran its from-model.
+        for verifier in (
+            assignment_for("raphael-verifier", provider),
+            task_assignment_for("raphael-verifier", provider, tier),
+        ):
+            assert (verifier.model, verifier.reasoning_effort) == (
+                decision["to_model"], "max",
+            ), step
+
+    for claude in (
+        assignment_for(role, "anthropic"),
+        task_assignment_for(role, "anthropic", "routine"),
+    ):
+        assert (claude.model, claude.reasoning_effort) == ("claude-sonnet-5-5", "max")
+    deep = task_assignment_for(role, "anthropic", "deep")
+    assert (deep.model, deep.reasoning_effort) == ("claude-opus-5-5", "max")
+    with pytest.raises(ValueError):
+        assignment_for(role, provider)
+    with pytest.raises(ValueError):
+        task_assignment_for(role, provider, "routine")
 
 
 @pytest.mark.parametrize("tier", ["routine", "deep"])
