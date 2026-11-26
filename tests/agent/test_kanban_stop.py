@@ -181,6 +181,293 @@ def test_nudge_after_verdict_call_without_tool_result(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is not None
 
 
+# ── Verdict results the tool publisher replaced with a preview ───────
+
+_VERDICT_TOOLS = ["kanban_review_findings", "kanban_request_changes"]
+_SUCCESS_START = '{"ok": true, "task_id": "t_abc", "re_raised_fingerprints": ["f1", "f2"'
+_ERROR_START = '{"error": "kanban_review_findings: refused", "detail": "x'
+
+
+def _form_one(start: str) -> str:
+    from tools.tool_result_storage import PERSISTED_OUTPUT_CLOSING_TAG, PERSISTED_OUTPUT_TAG
+
+    return (
+        f"{PERSISTED_OUTPUT_TAG}\n"
+        "This tool result was too large (150,000 characters, 146.5 KB).\n"
+        "Full output saved to: /tmp/spill/1.txt\n"
+        "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+        f"Preview (first {len(start)} chars):\n"
+        f"{start}\n...\n{PERSISTED_OUTPUT_CLOSING_TAG}"
+    )
+
+
+def _form_two(start: str) -> str:
+    return (
+        f"{start}\n\n[Truncated: tool response was 150,000 chars. "
+        "Full output could not be saved to sandbox.]"
+    )
+
+
+_FORMS = [pytest.param(_form_one, id="form-one"), pytest.param(_form_two, id="form-two")]
+
+
+def _nudge_for(name: str, content: str):
+    return build_kanban_stop_nudge(messages=[_verdict_call(name), _verdict_result(name, content)])
+
+
+@pytest.mark.parametrize("form", _FORMS)
+@pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
+def test_no_nudge_when_replaced_verdict_result_starts_with_success(clear_kanban_env, verdict, form):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [_verdict_call(verdict), _verdict_result(verdict, form(_SUCCESS_START))]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+@pytest.mark.parametrize("form", _FORMS)
+@pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
+def test_nudge_when_replaced_verdict_result_starts_with_error(clear_kanban_env, verdict, form):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [_verdict_call(verdict), _verdict_result(verdict, form(_ERROR_START))]
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+@pytest.mark.parametrize("form", _FORMS)
+def test_nudge_when_replaced_result_is_of_a_non_verdict_tool(clear_kanban_env, form):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    for tool in ("kanban_heartbeat", "terminal"):
+        messages = [_verdict_call(tool), _verdict_result(tool, form(_SUCCESS_START))]
+        assert session_called_kanban_terminal(messages) is False
+        assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+@pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
+def test_nudge_when_success_start_has_neither_form(clear_kanban_env, verdict):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    from tools.tool_result_storage import PERSISTED_OUTPUT_CLOSING_TAG, PERSISTED_OUTPUT_TAG
+
+    texts = [
+        _SUCCESS_START,
+        _SUCCESS_START + "\n...",
+        # Form one pieces missing or in the wrong place.
+        f"{PERSISTED_OUTPUT_TAG}\nFull output saved to: /tmp/x\n{_SUCCESS_START}\n{PERSISTED_OUTPUT_CLOSING_TAG}",
+        _form_one(_SUCCESS_START).replace(PERSISTED_OUTPUT_CLOSING_TAG, ""),
+        _form_one(_SUCCESS_START).replace(PERSISTED_OUTPUT_TAG, "", 1),
+        # Form two marker missing, or success start not first.
+        _SUCCESS_START + "\n\nTruncated: tool response was 150,000 chars.",
+        "note\n" + _form_two(_SUCCESS_START),
+        "x " + _SUCCESS_START + "\n[Truncated: tool response was 1 chars.]",
+    ]
+    for text in texts:
+        assert _nudge_for(verdict, text) is not None, text
+
+
+@pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
+def test_nudge_when_form_one_preview_does_not_start_with_success(clear_kanban_env, verdict):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    # Success text sits in the header, not at the start of the preview.
+    text = _form_one(_ERROR_START).replace("Full output saved to: /tmp/spill/1.txt", _SUCCESS_START)
+    assert _nudge_for(verdict, text) is not None
+
+
+@pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
+def test_complete_verdict_results_read_as_before(clear_kanban_env, verdict):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    assert _nudge_for(verdict, '{"ok": true, "task_id": "t_abc"}') is None
+    assert _nudge_for(verdict, '{"ok": true, "error": "x"}') is not None
+    assert _nudge_for(verdict, _refusal(verdict)) is not None
+    assert _nudge_for(verdict, "") is not None
+    assert build_kanban_stop_nudge(messages=[_verdict_call(verdict)]) is not None
+
+
+@pytest.mark.parametrize("form", _FORMS)
+@pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
+def test_guard_opens_no_saved_file_or_board_store(clear_kanban_env, monkeypatch, tmp_path, verdict, form):
+    import builtins
+    import io
+    import pathlib
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("guard must not open files or the board store")
+
+    monkeypatch.setattr(builtins, "open", _forbidden)
+    monkeypatch.setattr(io, "open", _forbidden)
+    for attr in ("open", "read_text", "read_bytes"):
+        monkeypatch.setattr(pathlib.Path, attr, _forbidden)
+    monkeypatch.setattr("sqlite3.connect", _forbidden)
+
+    saved = tmp_path / "1.txt"
+    content = form(_SUCCESS_START).replace("/tmp/spill/1.txt", str(saved))
+    assert _nudge_for(verdict, content) is None
+    assert _nudge_for(verdict, form(_ERROR_START)) is not None
+    assert not saved.exists()
+
+
+def _publish(content: str, tool_name: str):
+    from tools.tool_result_storage import maybe_persist_tool_result
+
+    return maybe_persist_tool_result(content, tool_name, "call_1")
+
+
+def _long_success() -> str:
+    import json
+
+    return json.dumps(
+        {"ok": True, "task_id": "t_abc", "re_raised_fingerprints": [f"fp{i:06d}" for i in range(12000)]}
+    )
+
+
+@pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
+def test_publisher_form_one_reads_as_success(clear_kanban_env, monkeypatch, tmp_path, verdict):
+    from tools.tool_result_storage import PERSISTED_OUTPUT_TAG
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    full = _long_success()
+    assert len(full) > 100_000
+    replaced = _publish(full, verdict)
+    assert replaced.startswith(PERSISTED_OUTPUT_TAG)
+    assert replaced != full
+    messages = [_verdict_call(verdict), _verdict_result(verdict, replaced)]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+    # The same replaced form of another tool's result is no verdict.
+    other = [_verdict_call("kanban_heartbeat"), _verdict_result("kanban_heartbeat", replaced)]
+    assert build_kanban_stop_nudge(messages=other) is not None
+    # Tagged block with a success-looking preview and closing tag, but no saved-output line.
+    lines = replaced.split("\n")
+    no_path = "\n".join(ln for ln in lines if not ln.startswith("Full output saved to:"))
+    assert no_path != replaced and no_path.startswith(PERSISTED_OUTPUT_TAG)
+    missing = [_verdict_call(verdict), _verdict_result(verdict, no_path)]
+    assert session_called_kanban_terminal(missing) is False
+    assert build_kanban_stop_nudge(messages=missing) is not None
+
+
+@pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
+def test_publisher_form_two_reads_as_success(clear_kanban_env, monkeypatch, tmp_path, verdict):
+    from tools.tool_result_storage import PERSISTED_OUTPUT_TAG
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    # HERMES_HOME is a file, so the publisher cannot create its spillover folder.
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("x")
+    monkeypatch.setenv("HERMES_HOME", str(blocker))
+    full = _long_success()
+    replaced = _publish(full, verdict)
+    assert PERSISTED_OUTPUT_TAG not in replaced
+    assert "\n[Truncated: tool response was" in replaced
+    messages = [_verdict_call(verdict), _verdict_result(verdict, replaced)]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+    other = [_verdict_call("kanban_heartbeat"), _verdict_result("kanban_heartbeat", replaced)]
+    assert build_kanban_stop_nudge(messages=other) is not None
+
+
+@pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
+def test_nudge_when_form_two_notice_is_cut_off_or_followed_by_text(clear_kanban_env, verdict):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    texts = [
+        _SUCCESS_START + "\n[Truncated: tool response was",
+        _SUCCESS_START + "\n\n[Truncated: tool response was",
+        _form_two(_SUCCESS_START) + "\nunrelated text",
+        _form_two(_SUCCESS_START) + "\n",
+    ]
+    for text in texts:
+        assert _nudge_for(verdict, text) is not None, text
+    assert _nudge_for(verdict, _form_two(_SUCCESS_START)) is None
+
+
+def _real_form_one(monkeypatch, home) -> str:
+    from tools.tool_result_storage import PERSISTED_OUTPUT_TAG
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    replaced = _publish(_long_success(), "kanban_review_findings")
+    assert replaced.startswith(PERSISTED_OUTPUT_TAG)
+    return replaced
+
+
+def _real_form_two(monkeypatch, tmp_path) -> str:
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("x")
+    monkeypatch.setenv("HERMES_HOME", str(blocker))
+    replaced = _publish(_long_success(), "kanban_review_findings")
+    assert "\n\n[Truncated: tool response was" in replaced
+    return replaced
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
+def test_publisher_form_one_with_blank_line_in_saved_path_reads_as_success(
+    clear_kanban_env, monkeypatch, tmp_path, verdict
+):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    replaced = _real_form_one(monkeypatch, tmp_path / "home\n\nx")
+    saved_line = next(ln for ln in replaced.split("Full output saved to: ")[1:2])
+    assert saved_line.startswith(str(tmp_path / "home\n\nx"))
+    assert "home\n\nx" in replaced
+    messages = [_verdict_call(verdict), _verdict_result(verdict, replaced)]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+    other = [_verdict_call("kanban_heartbeat"), _verdict_result("kanban_heartbeat", replaced)]
+    assert build_kanban_stop_nudge(messages=other) is not None
+
+
+@pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
+def test_nudge_when_form_one_declared_count_does_not_match_preview(
+    clear_kanban_env, monkeypatch, tmp_path, verdict
+):
+    import re
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    replaced = _real_form_one(monkeypatch, tmp_path / "home")
+    declared = int(re.search(r"Preview \(first (\d+) chars\)", replaced).group(1))
+    assert "\n...\n" in replaced
+    assert _nudge_for(verdict, replaced) is None
+
+    def with_count(text: str) -> str:
+        return replaced.replace(f"Preview (first {declared} chars)", f"Preview (first {text} chars)")
+
+    for wrong in ("1", "0", str(declared - 1), str(declared + 1), str(declared + 5), f"0{declared}", "\u0661\u0662"):
+        assert _nudge_for(verdict, with_count(wrong)) is not None, wrong
+    # The ellipsis is outside the count and optional (the publisher omits it when nothing is cut).
+    no_ellipsis = replaced.replace("\n...\n", "\n", 1)
+    assert _nudge_for(verdict, no_ellipsis) is None
+    assert _nudge_for(verdict, no_ellipsis.replace(f"first {declared} chars", f"first {declared + 1} chars")) is not None
+    # Extra text between the preview and the closing tag is not the ellipsis.
+    assert _nudge_for(verdict, replaced.replace("\n...\n", "\n..\n", 1)) is not None
+    assert _nudge_for(verdict, replaced.replace("\n...\n", "\n...x\n", 1)) is not None
+
+
+@pytest.mark.parametrize("verdict", _VERDICT_TOOLS)
+def test_nudge_when_form_two_claimed_count_is_impossible(clear_kanban_env, monkeypatch, tmp_path, verdict):
+    import re
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    replaced = _real_form_two(monkeypatch, tmp_path)
+    count = re.search(r"tool response was (\S+) chars", replaced).group(1)
+    preview_len = replaced.index("\n\n[Truncated: tool response was")
+    assert _nudge_for(verdict, replaced) is None
+
+    def with_count(text: str) -> str:
+        return replaced.replace(f"was {count} chars", f"was {text} chars")
+
+    assert _nudge_for(verdict, with_count(f"{preview_len:,}")) is None
+    for wrong in (
+        "1",
+        f"{preview_len - 1:,}",
+        count.replace(",", ""),
+        f"0{count}",
+        f"+{count}",
+        f" {count}",
+        f"-{count}",
+        "0",
+        "",
+        "\u0661" + count[1:],
+    ):
+        assert _nudge_for(verdict, with_count(wrong)) is not None, wrong
 
 
 
