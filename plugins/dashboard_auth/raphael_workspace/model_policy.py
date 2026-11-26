@@ -150,6 +150,7 @@ _ASSIGNMENTS = {
 
 # A role-wide entry would also admit other task tiers.
 # Each alternate route requires a lock for its exact role and tier.
+# A role-wide model update names a provider and a model, never these routes, so it never moves them.
 _TASK_ONLY_ROUTES = {
     ("raphael-claude-worker", "openai-codex", "deep"): _assignment(
         "raphael-claude-worker", "openai-codex", "gpt-6.2-sol", "GPT-6.2 Sol", "max",
@@ -250,12 +251,16 @@ def task_assignment_for(
     The planner may classify work as ``routine`` or ``deep`` but never chooses a
     provider, model id, or effort.  Deep Claude planning, business, coding, and
     delivery work moves to the currently qualified Opus lane (see
-    ``_DEEP_ROUTES``). A task-only route admits just the listed tier. Other
-    tasks use their admitted profile assignment.
+    ``_DEEP_ROUTES``). A task-only route admits just the listed tier and is
+    returned exactly as qualified, never moved by a model update. Other tasks
+    use their admitted profile assignment.
     """
-    return _apply_model_updates(
-        _matrix_task_assignment(profile, provider, execution_tier), _model_updates()
-    )[0]
+    tier = normalize_execution_tier(execution_tier)
+    key = (str(profile or "").strip(), str(provider or "").strip(), tier)
+    route = _matrix_task_assignment(*key)
+    if key in _TASK_ONLY_ROUTES:
+        return route
+    return _apply_model_updates(route, _model_updates())[0]
 
 
 def validate_runtime_assignment(
@@ -590,6 +595,9 @@ def _route_authority_error(
     :func:`_apply_model_updates`).  Only lock validation passes it; minting
     always requires the current route.
 
+    A task-only route is its qualified entry alone: a role-wide model update
+    never moves it, so the update history admits no other model for it.
+
     ``admit_pinned_effort`` accepts each risk-tier effort for a role-wide route.
     A task-only route accepts the effort in its qualified assignment.
     A role's configured route and an unpinned run's history use the base effort.
@@ -621,14 +629,17 @@ def _route_authority_error(
             "policy-locked route names no admitted authority for "
             f"{assignee!r}/{provider!r}/{execution_tier or None!r}"
         )
-    # One read of the update record answers both the current route and the
-    # models it ran before an owner-approved update moved it.
-    expected, updated_from = _apply_model_updates(route, _model_updates())
+    # A task-only route is exactly its qualified entry: a role-wide update never
+    # moves it and leaves no earlier model for it. Any other route reads the
+    # update record once, for both its current route and the models it ran
+    # before an owner-approved update moved it.
+    task_only = (assignee, provider, execution_tier) in _TASK_ONLY_ROUTES
+    if task_only:
+        expected, updated_from = route, frozenset()
+    else:
+        expected, updated_from = _apply_model_updates(route, _model_updates())
     admitted = {(expected.model, expected.reasoning_effort)}
-    use_pinned_efforts = (
-        admit_pinned_effort
-        and (assignee, provider, execution_tier) not in _TASK_ONLY_ROUTES
-    )
+    use_pinned_efforts = admit_pinned_effort and not task_only
     if use_pinned_efforts:
         admitted |= {(expected.model, effort) for effort in PINNED_EFFORTS}
     if admit_superseded:
