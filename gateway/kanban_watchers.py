@@ -70,7 +70,13 @@ def _kanban_dispatch_allowed() -> bool:
         from agent.estop import check_paused
     except ImportError:
         return True
-    return not check_paused("kanban", logger)
+    if check_paused("kanban", logger):
+        return False
+    try:  # The owner journeys of a release hold new work too; an error counts as no hold.
+        from hermes_cli import journeys_hold
+        return not journeys_hold.state(time.time())["active"]
+    except Exception:
+        return True
 
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
