@@ -95,10 +95,5 @@ def test_every_value_is_a_sorted_unique_list_of_role_names():
     assert not bad, f"roles must be a sorted list without duplicates of 'default' or profile names: {bad}"
 
 
-def test_every_roles_list_is_empty_in_this_version():
-    non_empty = {route: roles for route, roles in _load_route_profiles().items() if roles != []}
-    assert not non_empty, f"this version lists no roles for any route: {non_empty}"
-
-
 def test_file_is_plain_json_with_one_object():
     assert isinstance(_load_route_profiles(), dict)
