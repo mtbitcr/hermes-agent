@@ -17,10 +17,10 @@ now. Nothing here is shown to the owner.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from typing import Any
 
-from hermes_cli.owner_design_choices import _SENTENCE_END
 from hermes_cli.owner_text import check_owner_text
 
 # The object tag and version of the declaration payload (S1).
@@ -42,19 +42,46 @@ REVIEW_LIMIT_CHOICES = (
     "Repair it once more with the reviewer's corrections.",
     "Stop this work and release nothing.",
 )
+# A sentence mark, or a run of them, with any closing quotes or brackets after
+# it, then what follows it on the line: any space, and the next two characters.
+# The ASCII marks and the common marks of other scripts, after which the next
+# sentence needs no space (S2).
+_SENTENCE_MARK = re.compile(
+    r"([.!?。！？．｡‼⁇⁈⁉؟۔।॥።။։]+)[\"')\]’”」』）】]*(?=(\s*)(\S?)(.?))"
+)
+
+
+def _two_sentences(text: str) -> bool:
+    """Whether a second sentence starts after a sentence mark in *text*.
+
+    It does when whitespace and more text follow the mark, as in a design
+    option sentence; when any text follows a mark that is not ASCII
+    ("。次に"); when a letter follows "!" or "?" directly ("form!Then"); and
+    when an uppercase letter follows "." directly and something other than
+    "." follows that letter ("form.I will", unlike "U.S." or "Ph.D."). A mark
+    at the very end, or the point in "2.5", starts nothing.
+    """
+    for marks, space, after, then in _SENTENCE_MARK.findall(text):
+        if after and (
+            space
+            or not marks.isascii()
+            or (marks[-1] in "!?" and after.isalpha())
+            or (marks[-1] == "." and after.isupper() and then not in ("", "."))
+        ):
+            return True
+    return False
 
 
 def _plain_text(value: Any, what: str, *, limit: int, sentence: bool) -> str:
     """*value* when it is 1 to *limit* code points of plain owner text.
 
-    With *sentence*, it must also be exactly one sentence on one line, as a
-    design option sentence is (S2).
+    With *sentence*, it must also be exactly one sentence on one line (S2).
     """
     if (
         not isinstance(value, str)
         or not value.strip()
         or len(value) > limit
-        or (sentence and (value.splitlines() != [value] or _SENTENCE_END.search(value)))
+        or (sentence and (value.splitlines() != [value] or _two_sentences(value)))
         or check_owner_text(value, "planner_prose") != value
     ):
         shape = "exactly one sentence of " if sentence else ""
@@ -116,7 +143,7 @@ def declare_owner_question(
     words: Any,
     *,
     board: str,
-    expected_run_id: int | None,
+    expected_run_id: int,
 ) -> None:
     """Record the worker's question on *task_id* and hold the card for the owner.
 
@@ -124,18 +151,27 @@ def declare_owner_question(
     write transaction on *conn*: *question*, *choices* and *words* are checked
     by S2 and S3; one ``owner_question_declared`` event is written; and the
     card is held ``needs_input`` with the question as its reason through
-    ``_block_task_within_txn``, so with *expected_run_id* it must still be
-    that run. ``kanban_task_blocked`` fires once the transaction committed, as
-    ``block_task`` fires it.
+    ``_block_task_within_txn``, only while *expected_run_id* is still the
+    card's current run. ``kanban_task_blocked`` fires once the transaction
+    committed, as ``block_task`` fires it.
 
-    *stop* is "question" or "review_limit"; *choices* is a list of 0 to 4
-    ``{"n", "sentence"}`` numbered from 1 in order; *words* is "optional" or
-    "required". A card held now cannot declare; once it was resumed it may
-    declare again. A refused text or shape, or a card that cannot be held,
-    raises ``ValueError`` with a plain message, and then nothing was written.
+    *expected_run_id* is required: the worker's run id from its dispatcher, a
+    whole number of at least 1. Anything else, None or a bool included, is
+    refused before the transaction opens, so a card that no worker claimed, or
+    that a newer run claimed, is never held. *stop* is "question" or
+    "review_limit"; *choices* is a list of 0 to 4 ``{"n", "sentence"}``
+    numbered from 1 in order; *words* is "optional" or "required". A card held
+    now cannot declare; once it was resumed it may declare again. A refused
+    run id, text or shape, or a card that cannot be held, raises
+    ``ValueError`` with a plain message, and then nothing was written.
     """
     from hermes_cli import kanban_db
 
+    if type(expected_run_id) is not int or expected_run_id < 1:
+        raise ValueError(
+            "the worker's run id is required: the whole number of at least 1 "
+            "its dispatcher gave it"
+        )
     with kanban_db.write_txn(conn):
         payload = _declaration(stop, question, choices, words)
         kanban_db._append_event(conn, task_id, DECLARED_EVENT, payload)
@@ -146,7 +182,7 @@ def declare_owner_question(
         if blocked is None:
             raise ValueError(
                 f"task {task_id!r} cannot wait for the owner's answer: it is not "
-                "running or ready, or this is no longer its current run"
+                "running, or this run is not its current run"
             )
     kanban_db._fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
@@ -175,31 +211,42 @@ def current_questions(
     Each entry is ``(id of that blocked event, payload as declared)``: the
     stop reference is computed from that id (S6), and the reader checks the
     payload again before it shows it (S2). Batched: a few queries for all of
-    *task_ids* together, never one per card.
+    *task_ids* together, never one per card. They all read one snapshot, so
+    a resume, claim or declaration that commits meanwhile never mixes two
+    states: inside a transaction the caller holds already, which stays open;
+    otherwise inside a read transaction opened and ended here, so a read-only
+    connection serves too.
     """
     from hermes_cli import kanban_db
 
-    held = [
-        task_id for task_id, wait in kanban_db.task_owner_waits(conn, task_ids).items()
-        if wait["kind"] == "needs_input"
-    ]
-    if not held:
-        return {}
-    declared: dict[str, dict] = {}
-    hold: dict[str, tuple[int, dict]] = {}
-    newest: dict[str, int] = {}
-    for task_id, event_id, kind, payload in conn.execute(
-        "SELECT task_id, id, kind, payload FROM task_events WHERE kind IN (?, 'blocked') "
-        "AND task_id IN (" + ", ".join("?" for _ in held) + ") ORDER BY id",
-        (DECLARED_EVENT, *held),
-    ).fetchall():
-        task_id = str(task_id)
-        if kind == DECLARED_EVENT:
-            declared[task_id] = json.loads(payload)
-            continue
-        newest[task_id] = int(event_id)
-        if task_id in declared:
-            hold[task_id] = (int(event_id), declared.pop(task_id))
+    own_transaction = not conn.in_transaction
+    if own_transaction:
+        conn.execute("BEGIN")
+    try:
+        held = [
+            task_id for task_id, wait in kanban_db.task_owner_waits(conn, task_ids).items()
+            if wait["kind"] == "needs_input"
+        ]
+        if not held:
+            return {}
+        declared: dict[str, dict] = {}
+        hold: dict[str, tuple[int, dict]] = {}
+        newest: dict[str, int] = {}
+        for task_id, event_id, kind, payload in conn.execute(
+            "SELECT task_id, id, kind, payload FROM task_events WHERE kind IN (?, 'blocked') "
+            "AND task_id IN (" + ", ".join("?" for _ in held) + ") ORDER BY id",
+            (DECLARED_EVENT, *held),
+        ).fetchall():
+            task_id = str(task_id)
+            if kind == DECLARED_EVENT:
+                declared[task_id] = json.loads(payload)
+                continue
+            newest[task_id] = int(event_id)
+            if task_id in declared:
+                hold[task_id] = (int(event_id), declared.pop(task_id))
+    finally:
+        if own_transaction and conn.in_transaction:
+            conn.execute("ROLLBACK")  # a read keeps nothing
     return {
         task_id: current for task_id, current in hold.items() if current[0] == newest[task_id]
     }

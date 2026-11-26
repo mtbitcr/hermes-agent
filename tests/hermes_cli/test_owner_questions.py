@@ -298,6 +298,34 @@ def test_a_question_of_500_code_points_and_a_choice_of_160_are_accepted(board):
     assert blocked.payload["reason"] == question
 
 
+ONE_SENTENCE_CHOICES = {
+    "an English sentence": "Build the short form first.",
+    "a Japanese sentence": "短いフォームを作ります。",
+    "a decimal number": "Use 2.5 times the spacing.",
+    "initials at the end": "Launch the page in the U.S.",
+    "the first review limit choice": oq.REVIEW_LIMIT_CHOICES[0],
+    "the second review limit choice": oq.REVIEW_LIMIT_CHOICES[1],
+}
+
+
+@pytest.mark.parametrize("case", sorted(ONE_SENTENCE_CHOICES))
+def test_a_choice_of_one_sentence_is_declared_and_stored_as_given(board, case):
+    """S2: a choice of one sentence, in any script, with a decimal number,
+    initials or a final mark, is not taken for two sentences."""
+    task_id, run_id = _running_card(board)
+    sentence = ONE_SENTENCE_CHOICES[case]
+    assert check_owner_text(sentence, "planner_prose") == sentence
+
+    _declare(board, task_id, run_id, "question", QUESTION, [{"n": 1, "sentence": sentence}], "optional")
+
+    (payload,) = _declared_payloads(board, task_id)
+    assert payload["choices"] == [{"n": 1, "sentence": sentence}]
+    assert kb.get_task(board, task_id).status == "blocked"
+    assert oq.current_questions(board, [task_id]) == {
+        task_id: (_blocked_event_ids(board, task_id)[-1], payload),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Card P1 test (b): each refused text writes nothing.
 # ---------------------------------------------------------------------------
@@ -325,6 +353,27 @@ REFUSED_TEXTS = {
     "501 code points": lambda task_id: ("question", _question_of(501), _choices(2), "optional"),
     "two sentences in a choice": lambda task_id: (
         "question", QUESTION, _with_choice("Use the short form. Then add a title."), "optional",
+    ),
+    # Two sentences with no space between them, or after a mark that is not ASCII.
+    "two sentences in a choice, joined by an exclamation mark": lambda task_id: (
+        "question", QUESTION, _with_choice("Build the short form!Then build the long form."),
+        "optional",
+    ),
+    "two Japanese sentences in a choice": lambda task_id: (
+        "question", QUESTION, _with_choice("短いフォームを作ります。次に長いフォームを作ります。"),
+        "optional",
+    ),
+    "two sentences in a choice, after a full-width question mark": lambda task_id: (
+        "question", QUESTION, _with_choice("短いフォームでいいですか？次に長いフォームを作ります。"),
+        "optional",
+    ),
+    "two sentences in a choice, a question mark before a lowercase letter": lambda task_id: (
+        "question", QUESTION, _with_choice("Is the short form enough?then build the long form."),
+        "optional",
+    ),
+    "two sentences in a choice, a full stop before an uppercase letter": lambda task_id: (
+        "question", QUESTION, _with_choice("Build the short form.I will check it later."),
+        "optional",
     ),
     "5 choices": lambda task_id: ("question", QUESTION, _choices(5), "optional"),
     "0 choices with words optional": lambda task_id: ("question", QUESTION, [], "optional"),
@@ -551,6 +600,69 @@ def test_current_questions_reads_many_cards_at_once_and_only_current_questions(b
     assert oq.current_questions(board, []) == {}
 
 
+def test_current_questions_reads_the_held_cards_and_their_events_in_one_snapshot(
+    board, monkeypatch,
+):
+    """Card P1 ``current_questions``: the wait check and the event lookup read
+    one snapshot. Between the two, A is resumed, and B is resumed, claimed
+    again and declares a question; the read still returns the one state it
+    began in. It joins a transaction the caller holds and leaves it open, and
+    it ends the one it opened itself.
+
+    The test puts its board in WAL mode first: the interleaving needs a writer
+    that can commit while the reader holds its snapshot, which only WAL allows.
+    In rollback-journal mode the reader's open read transaction blocks that
+    commit, so the read is consistent by locking."""
+    # The writer must be able to commit while the reader holds its snapshot.
+    assert board.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    store = _store_file(board)
+    a, a_run = _running_card(board, "sign up page")
+    _declare(board, a, a_run, "question", QUESTION, _choices(2), "optional")
+    b, b_run = _running_card(board, "price page")
+    assert kb.block_task(
+        board, b, reason=PLAIN_STOP, kind="needs_input", expected_run_id=b_run,
+    ) is True
+    only_a = {a: (_blocked_event_ids(board, a)[-1], _declared_payloads(board, a)[-1])}
+    # A read-only connection to the board, opened as the owner pages open one.
+    reader = sqlite3.connect(Path(store).as_uri() + "?mode=ro", uri=True)
+    reader.row_factory = sqlite3.Row
+    reader.execute("PRAGMA query_only = ON")
+    try:
+        reader.execute("BEGIN")
+        assert oq.current_questions(reader, [a, b]) == only_a
+        assert reader.in_transaction is True
+        reader.execute("ROLLBACK")
+        with kb.write_txn(board):
+            assert oq.current_questions(board, [a, b]) == only_a
+            assert board.in_transaction is True
+        assert oq.current_questions(reader, [a, b]) == only_a
+        assert reader.in_transaction is False
+
+        real_task_owner_waits = kb.task_owner_waits
+        b_runs = []
+
+        def wait_check_then_lifecycle(conn, task_ids):
+            waits = real_task_owner_waits(conn, task_ids)
+            if conn is reader and not b_runs:
+                assert kb.unblock_task(board, a) is True
+                b_runs.append(_resumed_and_claimed(board, b))
+                _declare(
+                    board, b, b_runs[0], "question",
+                    "Which price page should Raphael build first?", _choices(3), "optional",
+                )
+            return waits
+
+        monkeypatch.setattr(kb, "task_owner_waits", wait_check_then_lifecycle)
+        assert oq.current_questions(reader, [a, b]) == only_a
+        assert b_runs and reader.in_transaction is False
+        assert oq.current_questions(reader, [a, b]) == {
+            b: (_blocked_event_ids(board, b)[-1], _declared_payloads(board, b)[-1]),
+        }
+        assert _declared_payloads(board, b)[-1] != only_a[a][1]
+    finally:
+        reader.close()
+
+
 # ---------------------------------------------------------------------------
 # Card P1 test (e): only the worker's current run may declare.
 # ---------------------------------------------------------------------------
@@ -581,4 +693,97 @@ def test_card_p1_e_a_run_that_is_no_longer_current_writes_nothing(board, fired_h
     assert before["declarations"] == 0
     assert board.in_transaction is False
     assert fired_hooks.fired == fired_before
+    assert oq.current_questions(board, [task_id]) == {}
+
+
+def _card_and_runs(store_file: str, task_id: str) -> tuple[list, list]:
+    """The card's row and every run of it, as a second, read-only connection sees them."""
+    observer = sqlite3.connect(Path(store_file).as_uri() + "?mode=ro", uri=True)
+    try:
+        return (
+            observer.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchall(),
+            observer.execute(
+                "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (task_id,),
+            ).fetchall(),
+        )
+    finally:
+        observer.close()
+
+
+def test_no_run_id_on_a_card_a_newer_run_claimed_writes_nothing(board, fired_hooks):
+    """Card P1: a declaration must name the worker's run. Without a run id it
+    is refused before anything is written, so the newer run of a card that was
+    resumed and claimed again stays its current run, and stays open."""
+    task_id, first_run = _running_card(board)
+    assert kb.block_task(
+        board, task_id, reason=PLAIN_STOP, kind="needs_input", expected_run_id=first_run,
+    ) is True
+    newer_run = _resumed_and_claimed(board, task_id)
+    store = fired_hooks.store = _store_file(board)
+    before, rows = _observed_state(store, task_id), _card_and_runs(store, task_id)
+    fired_before = list(fired_hooks.fired)
+
+    with pytest.raises(ValueError, match="run id is required"):
+        _declare(board, task_id, None, "question", QUESTION, _choices(2), "optional")
+
+    assert _card_and_runs(store, task_id) == rows
+    assert _observed_state(store, task_id) == before
+    assert _observe(store, "SELECT current_run_id FROM tasks WHERE id = ?", task_id) == newer_run
+    assert _observe(store, "SELECT ended_at FROM task_runs WHERE id = ?", newer_run) is None
+    assert before["status"] == "running" and before["open_runs"] == 1
+    assert before["declarations"] == 0 and len(_blocked_event_ids(board, task_id)) == 1
+    assert board.in_transaction is False
+    assert fired_hooks.fired == fired_before
+    assert oq.current_questions(board, [task_id]) == {}
+
+
+@pytest.mark.parametrize("run", ["no run id", "the run id of another card"])
+def test_a_ready_card_no_worker_claimed_cannot_declare(board, fired_hooks, run):
+    """Card P1: a ready card has no current run, so no run may hold it. Without
+    a run id the call is refused; with one, the hold's current run compare
+    refuses it and the event is rolled back. Nothing is written."""
+    _, other_run = _running_card(board, "price page")
+    task_id = kb.create_task(board, title="sign up page", assignee="builder")
+    store = fired_hooks.store = _store_file(board)
+    before, rows = _observed_state(store, task_id), _card_and_runs(store, task_id)
+
+    with pytest.raises(ValueError):
+        _declare(
+            board, task_id, None if run == "no run id" else other_run,
+            "question", QUESTION, _choices(2), "optional",
+        )
+
+    assert _card_and_runs(store, task_id) == rows
+    assert _observed_state(store, task_id) == before
+    assert before["status"] == "ready" and before["open_runs"] == 0
+    assert _observe(store, "SELECT current_run_id FROM tasks WHERE id = ?", task_id) is None
+    assert before["declarations"] == 0 and _blocked_event_ids(board, task_id) == []
+    assert board.in_transaction is False
+    assert fired_hooks.fired == []
+    assert oq.current_questions(board, [task_id]) == {}
+
+
+@pytest.mark.parametrize(
+    "run_id", [True, False, 0, -1, "1", 1.0], ids=["True", "False", "0", "-1", "'1'", "1.0"],
+)
+def test_a_run_id_that_is_not_a_whole_number_of_at_least_1_writes_nothing(
+    board, fired_hooks, run_id,
+):
+    """Card P1: the run id is a whole number of at least 1. True, "1" and 1.0
+    would name run 1 in SQL, and False, 0 and -1 no run; each is refused
+    before anything is written."""
+    task_id, current_run = _running_card(board)
+    assert current_run == 1
+    store = fired_hooks.store = _store_file(board)
+    before, rows = _observed_state(store, task_id), _card_and_runs(store, task_id)
+
+    with pytest.raises(ValueError, match="run id is required"):
+        _declare(board, task_id, run_id, "question", QUESTION, _choices(2), "optional")
+
+    assert _card_and_runs(store, task_id) == rows
+    assert _observed_state(store, task_id) == before
+    assert before["status"] == "running" and before["open_runs"] == 1
+    assert before["declarations"] == 0
+    assert board.in_transaction is False
+    assert fired_hooks.fired == []
     assert oq.current_questions(board, [task_id]) == {}
