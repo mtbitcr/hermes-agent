@@ -147,16 +147,10 @@ def _read_raw_config_root() -> Any:
 def _resolve_api_server_allowed_routes() -> "tuple[str, list[str]]":
     """Resolve ``gateway.api_server.allowed_routes`` for the CURRENT profile.
 
-    Returns ``(mode, patterns)``:
-      - ``(_ROUTES_UNRESTRICTED, [])`` — no config at all (missing/blank
-        file), key omitted/``None``, OR the intentionally-supported empty
-        list/tuple. No gating.
-      - ``(_ROUTES_DENY_ALL, [])`` — an explicit malformed falsey value
-        (``False``, ``0``, ``{}``, ``""``), any other malformed type/entry,
-        a non-mapping YAML root (list/scalar/``null``), or a config-load
-        failure. Only ``/health`` is reachable.
-      - ``(_ROUTES_ALLOWLIST, patterns)`` — a non-empty string (single
-        pattern) or list/tuple of non-empty strings.
+    Returns ``(mode, patterns)``: ``(_ROUTES_DENY_ALL, [])`` on a config-load
+    failure (only ``/health`` is reachable), else the classification of the
+    parsed root by ``_classify_allowed_routes()``, which lives with the three
+    modes in gateway/platforms/api_server_route_list.py.
 
     Uses ``_read_raw_config_root()`` (profile-aware via ``get_config_path()``
     → ``get_hermes_home()``, which the profile-prefix middleware has already
@@ -167,62 +161,13 @@ def _resolve_api_server_allowed_routes() -> "tuple[str, list[str]]":
     distinguishable from "key simply not present" and denied closed, per
     contract.
     """
+    from gateway.platforms.api_server_route_list import _classify_allowed_routes
+
     try:
         raw = _read_raw_config_root()
     except Exception:
         return (_ROUTES_DENY_ALL, [])
-    if raw is _CONFIG_ROOT_ABSENT:
-        # No config file / no YAML content — nothing configured, not malformed.
-        return (_ROUTES_UNRESTRICTED, [])
-    if not isinstance(raw, dict):
-        # Parsed fine, but the root is a list/scalar/None — malformed config,
-        # never "unconfigured".
-        return (_ROUTES_DENY_ALL, [])
-
-    gateway_cfg = raw.get("gateway")
-    if gateway_cfg is None:
-        return (_ROUTES_UNRESTRICTED, [])
-    if not isinstance(gateway_cfg, dict):
-        return (_ROUTES_DENY_ALL, [])
-
-    api_server_cfg = gateway_cfg.get("api_server")
-    if api_server_cfg is None:
-        return (_ROUTES_UNRESTRICTED, [])
-    if not isinstance(api_server_cfg, dict):
-        return (_ROUTES_DENY_ALL, [])
-
-    if "allowed_routes" not in api_server_cfg:
-        return (_ROUTES_UNRESTRICTED, [])
-    value = api_server_cfg["allowed_routes"]
-
-    if value is None:
-        return (_ROUTES_UNRESTRICTED, [])
-    if isinstance(value, bool):
-        # bool is an int subclass — check before the general int/str/etc.
-        # fallthrough so True/False both land here (True is not a valid
-        # list/string either — malformed, deny-all).
-        return (_ROUTES_DENY_ALL, [])
-    if isinstance(value, (list, tuple)):
-        if len(value) == 0:
-            return (_ROUTES_UNRESTRICTED, [])
-        patterns: list[str] = []
-        for entry in value:
-            if not isinstance(entry, str) or not entry.strip():
-                return (_ROUTES_DENY_ALL, [])
-            normalized = _normalize_api_route_rule(entry)
-            if normalized is None:
-                return (_ROUTES_DENY_ALL, [])
-            patterns.append(normalized)
-        return (_ROUTES_ALLOWLIST, patterns)
-    if isinstance(value, str):
-        if value == "":
-            return (_ROUTES_DENY_ALL, [])
-        normalized = _normalize_api_route_rule(value)
-        if normalized is None:
-            return (_ROUTES_DENY_ALL, [])
-        return (_ROUTES_ALLOWLIST, [normalized])
-    # int (incl. 0), float, dict (incl. {}), or any other type: malformed.
-    return (_ROUTES_DENY_ALL, [])
+    return _classify_allowed_routes(raw)
 
 
 def _owner_workspace_toolset_enabled(user_config: dict) -> bool:
