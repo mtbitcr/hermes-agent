@@ -5,7 +5,10 @@ or reads them before the card is created. Given a repository root, the owned pat
 optionally the keys the card will change, ``find_hints`` lists the files outside the
 owned paths that match one of four rules:
 
-1. a Python file under ``tests/`` that imports a module in the owned paths;
+1. a Python file under ``tests/`` that imports a module in the owned paths; one step
+   further, a test that imports a module of a test file listed by this rule (it has no
+   rule number of its own and is not counted: ``Hint.imports_pinning_test``; it is a
+   separate row, placed after the file's own row when it has one, which is never rewritten);
 2. any other Python file that imports a name from such a module;
 3. a file that names an owned file path;
 4. for each key, a file that contains that exact key in single or double quotes.
@@ -51,6 +54,7 @@ class Hint:
     path: str
     rules: tuple[int, ...]
     keys: tuple[str, ...] = ()
+    imports_pinning_test: bool = False
 
 
 @dataclass(frozen=True)
@@ -184,6 +188,7 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
         return name in modules or any(name == p or name.startswith(p + ".") for p in module_prefixes)
 
     hints: list[Hint] = []
+    test_imports: dict[str, set[str]] = {}
     unreadable: list[str] = []
     for path in _walk_files(root, root, unlistable):
         rel = path.relative_to(root).as_posix()
@@ -213,6 +218,7 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
                 tree = None
             is_test = rel.split("/")[0] == "tests"
             directory = rel.split("/")[:-1]
+            imports_seen: set[str] = set()
             for node in ast.walk(tree) if tree is not None else ():
                 if isinstance(node, ast.Import):
                     imported = [alias.name for alias in node.names]
@@ -225,8 +231,11 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
                         rules.add(2)
                 else:
                     continue
+                imports_seen.update(imported)
                 if is_test and any(is_owned_module(name) for name in imported):
                     rules.add(1)
+            if is_test and 1 not in rules:
+                test_imports[rel] = imports_seen
         if names_path:
             rules.add(3)
         if matched_keys:
@@ -234,7 +243,11 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
         if rules:
             hints.append(Hint(rel, tuple(sorted(rules)), matched_keys))
 
-    hints.sort(key=lambda h: (4 not in h.rules, h.path))
+    pinning = {_module_name(h.path) for h in hints if 1 in h.rules}
+    helpers = {rel for rel, names in test_imports.items() if pinning & names}
+    hints.extend(Hint(rel, (), (), True) for rel in sorted(helpers))
+    keyed = {h.path for h in hints if 4 in h.rules}
+    hints.sort(key=lambda h: (h.path not in keyed, h.path, h.imports_pinning_test))
     counts = {rule: sum(rule in h.rules for h in hints) for rule in RULE_NAMES}
     return Report(tuple(hints), counts, tuple(sorted({*unreadable, *unlistable})))
 
@@ -246,7 +259,7 @@ def format_report(report: Report) -> list[str]:
     ``# unreadable: N`` line."""
     lines = []
     for hint in report.hints:
-        labels = []
+        labels = ["rule 1 (test imports a pinning test)"] if hint.imports_pinning_test else []
         for rule in hint.rules:
             detail = ": " + ", ".join(f'"{k}"' for k in hint.keys) if rule == 4 else ""
             labels.append(f"rule {rule} ({RULE_NAMES[rule]}{detail})")
