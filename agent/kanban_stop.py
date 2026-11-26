@@ -11,6 +11,8 @@ import os
 import re
 from typing import Any, Iterable, Optional
 
+# The guard takes the two tags from tools/tool_result_storage.py, which names only those two,
+# and holds its own copy of the texts of the forms.
 from tools.tool_result_storage import PERSISTED_OUTPUT_CLOSING_TAG, PERSISTED_OUTPUT_TAG
 
 
@@ -20,6 +22,13 @@ _VERDICT_KANBAN_TOOLS = frozenset({"kanban_review_findings", "kanban_request_cha
 _DEFAULT_MAX_ATTEMPTS = 2
 
 _SUCCESS_START = '{"ok": true'
+# Accepted limit a: a saved result whose saved path holds a line like the preview line (a line of
+# the form 'Preview (first N chars):') still gets the reminder. The owner accepted this limit on
+# 2026-11-26. It ends when the publisher (tools/tool_result_storage.py) gives its format under names.
+# Accepted limit b: an empty saved path can suppress the reminder, because the path part of the
+# pattern (non-greedy, DOTALL) then spans the following header text. The owner accepted this limit
+# on 2026-11-26. It ends when the
+# publisher (tools/tool_result_storage.py) gives its format under names.
 _FORM_ONE_HEAD = re.compile(
     re.escape(PERSISTED_OUTPUT_TAG) + r"\n"
     r"(?:(?!Full output saved to: )[^\n]+\n)*"
@@ -75,6 +84,9 @@ def _replaced_result_starts_with_success(content: str) -> bool:
     if notice is None:
         return False
     preview = content[: notice.start()]
+    # Accepted limit c: an impossible inline character count in a malformed result can suppress
+    # the reminder. The owner accepted this limit on 2026-11-26. It ends when the publisher
+    # (tools/tool_result_storage.py) gives its format under names.
     return int(notice["count"].replace(",", "")) >= len(preview) and preview.startswith(_SUCCESS_START)
 
 
