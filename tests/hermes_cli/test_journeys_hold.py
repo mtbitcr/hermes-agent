@@ -245,6 +245,31 @@ def test_an_unreadable_or_unknown_record_never_holds(home, damage):
     assert journeys_hold.state(end + MINUTE) == NO_HOLD
 
 
+def test_a_busy_record_gives_no_hold_without_waiting(home, monkeypatch):
+    # The dispatcher asks the rule on the gateway event loop: a record that a
+    # writer holds gives no hold at once and is never waited for.
+    end = _release()
+    assert journeys_hold.state(end + MINUTE) == _starting(end + 10 * MINUTE)
+
+    real_connect = sqlite3.connect
+    busy_timeouts = []
+
+    def _spy(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        busy_timeouts.append(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        return conn
+
+    writer = sqlite3.connect(release_ledger.ledger_path(), isolation_level=None)
+    try:
+        writer.execute("BEGIN EXCLUSIVE")  # the record keeps a rollback journal: no reader gets in
+        with monkeypatch.context() as patch:
+            patch.setattr(journeys_hold.sqlite3, "connect", _spy)
+            assert journeys_hold.state(end + MINUTE) == NO_HOLD
+    finally:
+        writer.close()
+    assert busy_timeouts == [0]
+
+
 def test_a_start_time_later_than_now_never_holds_from_line_b(home):
     _result(home, "started", NOW + MINUTE)
     assert journeys_hold.state(NOW) == NO_HOLD

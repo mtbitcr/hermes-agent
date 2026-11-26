@@ -81,7 +81,7 @@ def state(now: float) -> dict[str, Any]:
             f"{release_ledger.ledger_path().absolute().as_uri()}?mode=ro",
             uri=True,
             isolation_level=None,
-            timeout=1.0,
+            timeout=0.0,  # asked on the gateway event loop: a busy record gives no hold at once, never a wait
         )
         try:
             row = conn.execute(
