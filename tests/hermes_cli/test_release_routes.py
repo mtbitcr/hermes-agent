@@ -604,6 +604,53 @@ def test_an_added_entry_outside_condition_f_refuses():
 
 
 @pytest.mark.parametrize(
+    ("entry", "change"),
+    [
+        pytest.param(
+            "GET /café", RouteChange(BUILDER, (RUNS,), ()), id="letter-change-adds-another-entry"
+        ),
+        pytest.param(
+            "GET /café",
+            RouteChange(BUILDER, (), (MODELS,)),
+            id="letter-change-removes-another-entry",
+        ),
+        pytest.param(
+            "GET /café",
+            RouteChange(BUILDER, (), ("GET /café",)),
+            id="letter-change-removes-that-entry",
+        ),
+        pytest.param(
+            "GET /v1/runs/١",
+            RouteChange(BUILDER, (RUNS,), ()),
+            id="digit-change-adds-another-entry",
+        ),
+    ],
+)
+def test_an_entry_with_a_letter_or_a_digit_outside_ascii_refuses(monkeypatch, entry, change):
+    # Owner addition points 8 and 14: in condition f a letter is one of A to Z and a to z, and a
+    # digit one of 0 to 9. The gateway reads such an entry, but the text is not in the plain form,
+    # whichever entry the change is for.
+    text = f"gateway:\n  api_server:\n    allowed_routes:\n      - {MODELS}\n      - {entry}\n"
+    text = text.encode()
+    assert gateway_view(text) == (_ROUTES_ALLOWLIST, [MODELS, entry])
+
+    reason = _refused_before_any_edit(monkeypatch, text, change)
+
+    assert reason == (
+        f"the config of role {BUILDER} is not in the plain form: condition f does not hold: "
+        "the entry on line 5 holds a character other than letters, digits, spaces and "
+        "/ _ . { } * -"
+    )
+    prev = route_file({route: [BUILDER] for route in change.remove})
+    new = route_file({route: [BUILDER] for route in change.add})
+    with pytest.raises(RoutePlanError) as refused:
+        plan_routes(prev, new, {BUILDER: text})
+    assert refused.value.reason == (
+        f"the change for role {BUILDER} does not apply to its config: {reason}"
+    )
+
+
+@pytest.mark.parametrize(
     "text",
     [
         pytest.param(config([MODELS, REJECT]), id="list"),
@@ -641,6 +688,43 @@ def test_a_change_that_would_leave_no_entry_refuses(text, change):
     assert refused.value.reason == (
         f"the change for role {BUILDER} would leave its route list with no entry, "
         "which would open every route"
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "reason"),
+    [
+        pytest.param(
+            b"gateway:\n  api_server:\n    allowed_routes: GET /v1/models\n",
+            f"the config of role {BUILDER} is not in the plain form: condition d does not hold: "
+            "no direct child line of 'api_server:' is 'allowed_routes:' with nothing after the "
+            "colon",
+            id="d-one-text-in-place-of-a-list",
+        ),
+        pytest.param(
+            b"gateway:\r\n  api_server:\r\n    allowed_routes:\r\n      - GET /v1/models\r\n",
+            f"the config of role {BUILDER} is not in the plain form: condition a does not hold: "
+            "the text holds a carriage return",
+            id="a-carriage-returns",
+        ),
+        pytest.param(
+            config([MODELS]),
+            f"the change for role {BUILDER} would leave its route list with no entry, "
+            "which would open every route",
+            id="plain",
+        ),
+    ],
+)
+def test_the_plain_form_is_checked_before_a_change_that_would_leave_no_entry(
+    monkeypatch, text, reason
+):
+    # Owner addition point 11 (first review finding 5): removing the only entry names the first
+    # condition of the plain form that does not hold; only a text in the plain form gets the
+    # refusal for a list with no entry. Both come before any edit.
+    assert gateway_view(text) == (_ROUTES_ALLOWLIST, [MODELS])
+
+    assert _refused_before_any_edit(monkeypatch, text, RouteChange(BUILDER, (), (MODELS,))) == (
+        reason
     )
 
 
@@ -700,7 +784,303 @@ def test_the_rewrite_never_touches_any_key_outside_the_route_list():
     assert new == old
 
 
+# A key at the indent of the entries right after them, that starts with a dash: no dash line.
+_KEYS_THAT_START_WITH_A_DASH = [
+    pytest.param(
+        b"gateway:\n  api_server:\n    allowed_routes:\n    - GET /v1/models\n    -mode: off\n"
+        b"    port: 8642\n",
+        id="-mode",
+    ),
+    pytest.param(
+        b"gateway:\n  api_server:\n    allowed_routes:\n    - GET /v1/models\n    -2: off\n"
+        b"    port: 8642\n",
+        id="-2",
+    ),
+]
+
+
+@pytest.mark.parametrize("text", _KEYS_THAT_START_WITH_A_DASH)
+def test_a_key_that_starts_with_a_dash_after_the_list_stays_as_it_is(text):
+    # A dash line is a dash followed by a space or by the end of the line (owner addition point
+    # 11, first review finding 4), so this key is the first line that does not belong to the list.
+    assert gateway_view(text) == (_ROUTES_ALLOWLIST, [MODELS])
+
+    rewritten = apply_routes(text, RouteChange(BUILDER, add=(RUNS,), remove=()))
+
+    assert rewritten == text.replace(
+        b"    - GET /v1/models\n", b"    - GET /v1/models\n    - POST /v1/runs\n"
+    )
+    assert gateway_view(rewritten) == (_ROUTES_ALLOWLIST, [MODELS, RUNS])
+    plan = plan_routes(route_file({}), route_file({RUNS: [BUILDER]}), {BUILDER: text})
+    assert plan == RoutePlan(changes=(RouteChange(BUILDER, (RUNS,), ()),), notes=())
+
+
+# Anchors, aliases and merge keys beside the path of the route list, none of them on it.
+_ANCHORS_BESIDE_THE_PATH = b"""\
+defaults: &defaults
+  timeout: 30
+model:
+  <<: *defaults
+  default: anthropic/claude-sonnet-5
+gateway:
+  api_server:
+    port: &port 8642
+    allowed_routes:
+      - GET /v1/models
+      - POST /v1/owner-workspace/decisions/{decision_ref}/reject
+    cors_origins: &origins
+      - http://localhost:5173
+  telegram:
+    <<: *defaults
+    port: *port
+    origins: *origins
+"""
+
+
+def test_a_text_with_anchors_and_aliases_beside_the_path_is_rewritten():
+    # Owner addition points 9 and 13: the text meets conditions a to i, so it is in the plain form
+    # whatever it holds beside the path; each byte outside the entry lines stays.
+    change = RouteChange(BUILDER, add=(ACCEPT,), remove=(REJECT,))
+
+    rewritten = apply_routes(_ANCHORS_BESIDE_THE_PATH, change)
+
+    assert rewritten == _ANCHORS_BESIDE_THE_PATH.replace(
+        b"      - POST /v1/owner-workspace/decisions/{decision_ref}/reject\n",
+        b"      - POST /v1/owner-workspace/decisions/{decision_ref}/accept\n",
+    )
+    assert gateway_view(rewritten) == (_ROUTES_ALLOWLIST, [MODELS, ACCEPT])
+    old, new = yaml.safe_load(_ANCHORS_BESIDE_THE_PATH), yaml.safe_load(rewritten)
+    del old["gateway"]["api_server"]["allowed_routes"]
+    del new["gateway"]["api_server"]["allowed_routes"]
+    assert new == old
+    prev, new_file = route_file({REJECT: [BUILDER]}), route_file({ACCEPT: [BUILDER]})
+    plan = plan_routes(prev, new_file, {BUILDER: _ANCHORS_BESIDE_THE_PATH})
+    assert plan == RoutePlan(changes=(change,), notes=())
+
+
 # --- texts outside the plain form (facts points 10 to 13, 25 and 26) -----------------------------
+
+# Condition i (owner addition points 4 to 6): conditions a to h hold for each text and the gateway
+# reads each as an allowlist, but the events of the parser do not agree with the lines. The words
+# are what the reason says the parser shows. The first seven are the texts of addition point 12.
+_CONDITION_I = [
+    pytest.param(
+        b"""\
+gateway:
+  api_server:
+    "allowed_routes":
+      - POST /v1/runs
+    allowed_routes:
+      - GET /v1/models
+""",
+        "the parser shows a second key 'allowed_routes' under 'api_server'",
+        id="i-a-quoted-allowed_routes-before-the-plain-one",
+    ),
+    pytest.param(
+        b"""\
+gateway:
+  api_server:
+    allowed_routes:
+      - GET /v1/models
+  "api_server":
+    allowed_routes:
+      - GET /v1/models
+""",
+        "the parser shows a second key 'api_server' under 'gateway'",
+        id="i-a-quoted-api_server-beside-the-plain-one",
+    ),
+    pytest.param(
+        b"""\
+gateway:
+  api_server:
+    allowed_routes:
+      - GET /v1/models
+"gateway":
+  api_server:
+    allowed_routes:
+      - GET /v1/models
+""",
+        "the parser shows a second key 'gateway' in the root mapping",
+        id="i-a-second-gateway-key-that-is-quoted",
+    ),
+    pytest.param(
+        b"""\
+gateway:
+  &shared
+  api_server:
+    allowed_routes:
+      - GET /v1/models
+copy: *shared
+""",
+        "the parser shows an anchor &shared on the value of 'gateway'",
+        id="i-an-anchor-on-a-line-of-its-own-under-gateway",
+    ),
+    pytest.param(
+        b"""\
+gateway:
+  api_server:
+    &shared
+    allowed_routes:
+      - GET /v1/models
+  copy: *shared
+""",
+        "the parser shows an anchor &shared on the value of 'api_server'",
+        id="i-an-anchor-on-a-line-of-its-own-under-api_server",
+    ),
+    pytest.param(
+        b"""\
+gateway:
+  !!map
+  api_server:
+    allowed_routes:
+      - GET /v1/models
+""",
+        "the parser shows a tag 'tag:yaml.org,2002:map' on the value of 'gateway'",
+        id="i-a-tag-map-on-a-line-of-its-own",
+    ),
+    pytest.param(
+        b"""\
+&root
+gateway:
+  api_server:
+    allowed_routes:
+      - GET /v1/models
+""",
+        "the parser shows an anchor &root on the root",
+        id="i-an-anchor-on-the-root-mapping",
+    ),
+    # More forms of the first review: the duplicates in the other order, other spellings of a
+    # path key, a look-alike list in a quoted value, and the tags on the other two mappings.
+    pytest.param(
+        b"""\
+gateway:
+  api_server:
+    allowed_routes:
+      - GET /v1/models
+    "allowed_routes":
+      - GET /v1/models
+""",
+        "the parser shows a second key 'allowed_routes' under 'api_server'",
+        id="i-a-quoted-allowed_routes-after-the-plain-one",
+    ),
+    pytest.param(
+        b"""\
+gateway:
+  "api_server":
+    port: 8642
+  api_server:
+    allowed_routes:
+      - GET /v1/models
+""",
+        "the parser shows a second key 'api_server' under 'gateway'",
+        id="i-a-quoted-api_server-before-the-plain-one",
+    ),
+    pytest.param(
+        b"""\
+"gateway":
+  telegram:
+    enabled: false
+gateway:
+  api_server:
+    allowed_routes:
+      - GET /v1/models
+""",
+        "the parser shows a second key 'gateway' in the root mapping",
+        id="i-a-quoted-gateway-key-before-the-plain-one",
+    ),
+    pytest.param(
+        b"""\
+gateway:  # the old one
+  telegram:
+    enabled: false
+gateway:
+  api_server:
+    allowed_routes:
+      - GET /v1/models
+""",
+        "the parser shows a second key 'gateway' in the root mapping",
+        id="i-a-gateway-key-with-a-comment-before-the-plain-one",
+    ),
+    pytest.param(
+        b"""\
+? gateway
+gateway:
+  api_server:
+    allowed_routes:
+      - GET /v1/models
+""",
+        "the parser shows a second key 'gateway' in the root mapping",
+        id="i-an-explicit-gateway-key",
+    ),
+    pytest.param(
+        b"""\
+name: &name gateway
+*name : off
+gateway:
+  api_server:
+    allowed_routes:
+      - GET /v1/models
+""",
+        "the parser shows a second key 'gateway' in the root mapping",
+        id="i-an-alias-key-that-stands-for-gateway",
+    ),
+    pytest.param(
+        # The parser ends a line at a next-line character (U+0085) too, so this comment line
+        # holds a key for it.
+        "# the old gateway\u0085gateway:\n"
+        "gateway:\n  api_server:\n    allowed_routes:\n      - GET /v1/models\n".encode(),
+        "the parser shows a second key 'gateway' in the root mapping",
+        id="i-a-gateway-key-after-a-next-line-character-in-a-comment",
+    ),
+    pytest.param(
+        b"""\
+note: "
+gateway:
+  api_server:
+    allowed_routes:
+      - GET /v1/models
+"
+gateway: {api_server: {allowed_routes: [GET /v1/models]}}
+""",
+        "the parser shows the key 'gateway' on line 7, not on line 2",
+        id="i-a-look-alike-list-in-a-quoted-value",
+    ),
+    pytest.param(
+        b"""\
+<<: {gateway: {api_server: {allowed_routes: [GET /v1/models]}}}
+note: "
+gateway:
+  api_server:
+    allowed_routes:
+      - GET /v1/models
+"
+""",
+        "the parser shows no key 'gateway' in the root mapping",
+        id="i-a-merged-gateway-key-and-a-look-alike-list",
+    ),
+    pytest.param(
+        b"""\
+gateway:
+  api_server:
+    !!map
+    allowed_routes:
+      - GET /v1/models
+""",
+        "the parser shows a tag 'tag:yaml.org,2002:map' on the value of 'api_server'",
+        id="i-a-tag-map-on-a-line-of-its-own-under-api_server",
+    ),
+    pytest.param(
+        b"""\
+!!map
+gateway:
+  api_server:
+    allowed_routes:
+      - GET /v1/models
+""",
+        "the parser shows a tag 'tag:yaml.org,2002:map' on the root",
+        id="i-a-tag-on-the-root-mapping",
+    ),
+]
 
 # Each text below breaks one condition of the plain form, and the gateway reads each as an
 # allowlist. The id names the condition and, where there is one, the example of facts point 12.
@@ -965,6 +1345,33 @@ gateway:
         "g",
         id="g-comment-line-between-two-entries-at-the-key-indent",
     ),
+    # A dash alone on its line starts an item too (first review finding 4).
+    pytest.param(
+        b"""\
+gateway:
+  api_server:
+    allowed_routes:
+    - GET /v1/models
+
+    -
+      POST /v1/runs
+""",
+        "g",
+        id="g-a-dash-alone-after-a-blank-line-at-the-key-indent",
+    ),
+    pytest.param(
+        b"""\
+gateway:
+  api_server:
+    allowed_routes:
+    - GET /v1/models
+    # c
+    -
+      POST /v1/runs
+""",
+        "g",
+        id="g-a-dash-alone-after-a-comment-line-at-the-key-indent",
+    ),
     # h. The lines and the gateway agree: here the gateway reads the last of two keys that are
     # equal once read, and the lines see only the plain one.
     pytest.param(
@@ -979,6 +1386,8 @@ gateway:
         "h",
         id="h-a-quoted-twin-of-the-list-key",
     ),
+    # i. The events of the parser agree with the lines (owner addition point 4).
+    *(pytest.param(case.values[0], "i", id=case.id) for case in _CONDITION_I),
 ]
 
 
@@ -1020,6 +1429,20 @@ def test_a_text_outside_the_plain_form_refuses_before_any_edit(monkeypatch, text
     assert plan == RoutePlan(changes=(RouteChange(REVIEWER, (ACCEPT,), ()),), notes=())
 
 
+@pytest.mark.parametrize(("text", "words"), _CONDITION_I)
+def test_condition_i_names_what_the_parser_shows(monkeypatch, text, words):
+    # Owner addition points 4, 6 and 12: the gateway reads the list of the entry lines and
+    # conditions a to h hold, but the parser shows another definition of a key of the path, or an
+    # anchor or a tag on the path. The refusal comes before any edit.
+    assert gateway_view(text) == (_ROUTES_ALLOWLIST, [MODELS])
+
+    reason = _refused_before_any_edit(monkeypatch, text, RouteChange(BUILDER, (ACCEPT,), ()))
+
+    assert reason == (
+        f"the config of role {BUILDER} is not in the plain form: condition i does not hold: {words}"
+    )
+
+
 def test_a_second_document_refuses(monkeypatch):
     # The gateway reads no list from a text of two documents: it denies all, and so do both
     # functions when they would change the list.
@@ -1047,6 +1470,57 @@ def test_lines_the_gateway_reads_otherwise_refuse(monkeypatch):
     assert reason == (
         f"the config of role {BUILDER} is not in the plain form: condition h does not hold: "
         "the gateway reads another list than the entry lines"
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "words"),
+    [
+        pytest.param(
+            b"gateway:\n  api_server:\n    allowed_routes:\n      - GET /v1/models\n"
+            b"  telegram: [unclosed\n",
+            "the parser cannot read the text",
+            id="a-text-the-parser-cannot-read",
+        ),
+        pytest.param(
+            config([MODELS]) + b"---\nother: 1\n",
+            "the parser shows 2 documents",
+            id="two-documents",
+        ),
+    ],
+)
+def test_a_text_the_parser_does_not_read_as_one_document_fails_condition_i(
+    monkeypatch, text, words
+):
+    # Owner addition point 5. The gateway denies all for these texts, so apply_routes refuses them
+    # before it reads lines; with the gateway's reading patched to a list, conditions a to h hold
+    # and condition i refuses them on its own.
+    assert gateway_view(text) == (_ROUTES_DENY_ALL, [])
+    monkeypatch.setattr(release_routes, "_route_list", lambda _text: (_ROUTES_ALLOWLIST, [MODELS]))
+
+    reason = _refused_before_any_edit(monkeypatch, text, RouteChange(BUILDER, (ACCEPT,), ()))
+
+    assert reason == (
+        f"the config of role {BUILDER} is not in the plain form: condition i does not hold: {words}"
+    )
+
+
+def test_an_item_that_is_not_on_an_entry_line_refuses(monkeypatch):
+    # The parser ends a line at a next-line character (U+0085) too, so the comment line holds a
+    # second item that the lines do not show. The gateway reads both; with its reading patched to
+    # the entry lines, conditions a to h hold and condition i names the item.
+    text = (
+        "gateway:\n  api_server:\n    allowed_routes:\n      - GET /v1/models\n"
+        "      # c\u0085      - POST /v1/runs\n"
+    ).encode()
+    assert gateway_view(text) == (_ROUTES_ALLOWLIST, [MODELS, RUNS])
+    monkeypatch.setattr(release_routes, "_route_list", lambda _text: (_ROUTES_ALLOWLIST, [MODELS]))
+
+    reason = _refused_before_any_edit(monkeypatch, text, RouteChange(BUILDER, (ACCEPT,), ()))
+
+    assert reason == (
+        f"the config of role {BUILDER} is not in the plain form: condition i does not hold: "
+        "the parser shows an item on line 5, which is not an entry line"
     )
 
 
@@ -1338,6 +1812,21 @@ _CALLS = (
         (
             b"shared: &r\n  - GET /v1/models\ngateway:\n  api_server:\n    allowed_routes: *r\n",
             RouteChange(BUILDER, add=(RUNS,), remove=()),
+        ),
+    ),
+    *(
+        ("apply", (text.values[0], RouteChange(BUILDER, add=(RUNS,), remove=())))
+        for text in _KEYS_THAT_START_WITH_A_DASH
+    ),
+    (
+        "apply",
+        (_ANCHORS_BESIDE_THE_PATH, RouteChange(BUILDER, add=(ACCEPT,), remove=(REJECT,))),
+    ),
+    (
+        "apply",
+        (
+            b"gateway:\n  api_server:\n    allowed_routes: GET /v1/models\n",
+            RouteChange(BUILDER, add=(), remove=(MODELS,)),
         ),
     ),
 )

@@ -11,15 +11,18 @@ _classify_allowed_routes. plan_routes applies each change it plans to the same c
 plan holds only changes that apply.
 
 The rewrite reads the text by lines and edits one written form, the plain form of the owner facts
-for this card (point 10): a UTF-8 text with no carriage return that ends with a line feed; one line
-`gateway:`, one direct child line `api_server:` of it and one direct child line `allowed_routes:`
-of that, each with nothing after the colon; right after it, one entry line or more ("- " and the
-entry, all at one indent, not less deep than the key), whose entries hold only letters, digits,
-spaces and / _ . { } * -; after the last of them, no line that belongs to the list; and the
-gateway reading the same entries from the text. Each other text is refused before any edit, with
-the first condition it breaks. The edit takes out the lines of the removed entries and puts a line
-for each added entry after the last entry line. The result is checked: every byte outside the
-entry lines is the input's, and the gateway reads the planned list from it.
+for this card (point 10, and condition i of their addition): a UTF-8 text with no carriage return
+that ends with a line feed; one line `gateway:`, one direct child line `api_server:` of it and one
+direct child line `allowed_routes:` of that, each with nothing after the colon; right after it, one
+entry line or more ("- " and the entry, all at one indent, not less deep than the key), whose
+entries hold only the ASCII letters and digits, spaces and / _ . { } * -; after the last of them,
+no line that belongs to the list; the gateway reading the same entries from the text; and the
+events of the parser the gateway reads with agreeing with these lines: one document, each key of
+the path exactly once in its block mapping, plain and on its line, a block sequence with one plain
+item on each entry line, and no anchor or tag on any of them. Each other text is refused before any
+edit, with the first condition it breaks. The edit takes out the lines of the removed entries and
+puts a line for each added entry after the last entry line. The result is checked: every byte
+outside the entry lines is the input's, and the gateway reads the planned list from it.
 
 Both functions only compute. Their result depends only on their arguments; they read no file and
 no environment, make no network or process call and change no global state, and everything they
@@ -35,6 +38,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+import yaml
+
 from gateway.platforms.api_server import (
     _CONFIG_ROOT_ABSENT,
     _ROUTES_ALLOWLIST,
@@ -43,7 +48,7 @@ from gateway.platforms.api_server import (
     _route_matches_any,
 )
 from gateway.platforms.api_server_route_list import _classify_allowed_routes
-from utils import fast_safe_load
+from utils import _fast_yaml_loader, fast_safe_load
 
 # Why an entry is left as it is, as the owner line shows it.
 NOT_SERVED_HERE = "not served here"
@@ -321,9 +326,145 @@ def _entry_fault(entry: str) -> str | None:
     return None
 
 
+def _is_dash_line(line: str) -> bool:
+    # After the indent, a dash followed by a space or by the end of the line (owner addition
+    # point 11).
+    content = line.lstrip(" ")
+    return content == "-" or content.startswith("- ")
+
+
+# Condition i: the keys of the path, each with the mapping that holds it.
+_PATH = (
+    ("gateway", "in the root mapping"),
+    ("api_server", "under 'gateway'"),
+    ("allowed_routes", "under 'api_server'"),
+)
+
+
+def _line(text: str, event: yaml.Event) -> int:
+    # The line, counted from 0 as the lines of the plain form are, that `event` starts on. The
+    # parser also ends a line at a next-line, line or paragraph separator; these lines do not.
+    return text.count("\n", 0, event.start_mark.index)
+
+
+def _node_end(events: list[yaml.Event], index: int) -> int:
+    # The index of the first event after the node that starts at events[index].
+    depth = 0
+    while True:
+        if isinstance(events[index], yaml.CollectionStartEvent):
+            depth += 1
+        elif isinstance(events[index], yaml.CollectionEndEvent):
+            depth -= 1
+        index += 1
+        if depth == 0:
+            return index
+
+
+def _nodes(events: list[yaml.Event], start: int) -> list[int]:
+    # The indexes of the nodes in the collection that starts at events[start], in order; in a
+    # mapping, each key is followed by its value.
+    nodes = []
+    index = start + 1
+    while not isinstance(events[index], yaml.CollectionEndEvent):
+        nodes.append(index)
+        index = _node_end(events, index)
+    return nodes
+
+
+def _key_value(events: list[yaml.Event], index: int) -> str | None:
+    # The value of the key at events[index] when the key is a scalar or an alias of one.
+    event = events[index]
+    if isinstance(event, yaml.AliasEvent):
+        event = next(
+            (
+                earlier
+                for earlier in reversed(events[:index])
+                if isinstance(earlier, (yaml.ScalarEvent, yaml.CollectionStartEvent))
+                and earlier.anchor == event.anchor
+            ),
+            None,
+        )
+    return event.value if isinstance(event, yaml.ScalarEvent) else None
+
+
+def _properties_fault(event: yaml.NodeEvent, name: str) -> str | None:
+    if event.anchor is not None:
+        return f"the parser shows an anchor &{event.anchor} on {name}"
+    if event.tag is not None:
+        return f"the parser shows a tag {event.tag!r} on {name}"
+    return None
+
+
+def _collection_fault(event: yaml.Event, kind: type, name: str) -> str | None:
+    # Whether the node `event` starts is a block collection of `kind` with no anchor and no tag;
+    # a block collection is one that is not in flow style.
+    if not isinstance(event, kind) or event.flow_style:
+        shape = "mapping" if kind is yaml.MappingStartEvent else "sequence"
+        return f"the parser shows that {name} is not a block {shape}"
+    return _properties_fault(event, name)
+
+
+def _parser_fault(decoded: str, key_lines: list[int], entry_lines: range) -> str | None:
+    # What the events of the parser show against the lines of the plain form (condition i of the
+    # owner addition, point 4), or None when they agree. `key_lines` are the lines of conditions b,
+    # c and d, `entry_lines` the entry lines. The parser is the gateway's own; it skips a byte
+    # order mark and counts no position for it, so the text is read without one.
+    text = decoded.removeprefix("\ufeff")
+    try:
+        events = list(yaml.parse(text, Loader=_fast_yaml_loader))
+    except yaml.YAMLError:
+        return "the parser cannot read the text"
+    documents = sum(isinstance(event, yaml.DocumentStartEvent) for event in events)
+    if documents != 1:
+        return f"the parser shows {documents} documents"
+    node, name = 2, "the root"
+    for (key, where), key_line in zip(_PATH, key_lines):
+        fault = _collection_fault(events[node], yaml.MappingStartEvent, name)
+        if fault is not None:
+            return fault
+        found = [index for index in _nodes(events, node)[::2] if _key_value(events, index) == key]
+        if len(found) != 1:
+            return f"the parser shows {'a second' if found else 'no'} key {key!r} {where}"
+        event = events[found[0]]
+        if not isinstance(event, yaml.ScalarEvent) or event.style:
+            return f"the parser shows that the key {key!r} is not plain"
+        fault = _properties_fault(event, f"the key {key!r}")
+        if fault is not None:
+            return fault
+        if _line(text, event) != key_line:
+            return (
+                f"the parser shows the key {key!r} on line {_line(text, event) + 1}, not on "
+                f"line {key_line + 1}"
+            )
+        node, name = _node_end(events, found[0]), f"the value of {key!r}"
+    fault = _collection_fault(events[node], yaml.SequenceStartEvent, name)
+    if fault is not None:
+        return fault
+    items = _nodes(events, node)
+    item_lines = [_line(text, events[index]) for index in items]
+    for line in item_lines:
+        if line not in entry_lines:
+            return f"the parser shows an item on line {line + 1}, which is not an entry line"
+    for line in entry_lines:
+        if item_lines.count(line) != 1:
+            return (
+                f"the parser shows {'a second' if line in item_lines else 'no'} item on the "
+                f"entry line {line + 1}"
+            )
+    for index, line in zip(items, item_lines):
+        event = events[index]
+        if not isinstance(event, yaml.ScalarEvent) or event.style:
+            return f"the parser shows that the item on line {line + 1} is not plain"
+        fault = _properties_fault(event, f"the item on line {line + 1}")
+        if fault is not None:
+            return fault
+    return None
+
+
 def _plain_list(text: bytes, role: str) -> _PlainList:
-    # The route list of `text` when the text is in the plain form (owner facts point 10);
-    # otherwise RoutePlanError, naming the first condition that does not hold.
+    # The route list of `text` when the text is in the plain form (owner facts point 10 and
+    # condition i of their addition); otherwise RoutePlanError, naming the first condition that
+    # does not hold.
     try:
         decoded = text.decode("utf-8")
     except UnicodeDecodeError:
@@ -341,6 +482,7 @@ def _plain_list(text: bytes, role: str) -> _PlainList:
             f"{_how_many(found)} line of the text is 'gateway:' with no indent and nothing "
             "after the colon",
         )
+    path = [found[0]]
     found = [
         index for index in _children(lines, found[0]) if lines[index].lstrip(" ") == "api_server:"
     ]
@@ -351,6 +493,7 @@ def _plain_list(text: bytes, role: str) -> _PlainList:
             f"{_how_many(found)} direct child line of 'gateway:' is 'api_server:' with nothing "
             "after the colon",
         )
+    path.append(found[0])
     found = [
         index
         for index in _children(lines, found[0])
@@ -364,6 +507,7 @@ def _plain_list(text: bytes, role: str) -> _PlainList:
             "nothing after the colon",
         )
     key = found[0]
+    path.append(key)
     first = end = key + 1
     while end < len(lines) and lines[end].lstrip(" ").startswith("- "):
         end += 1
@@ -387,11 +531,7 @@ def _plain_list(text: bytes, role: str) -> _PlainList:
             "g",
             f"line {after + 1}, after the last entry line, is deeper than 'allowed_routes:'",
         )
-    if (
-        after is not None
-        and _indent(lines[after]) == indent
-        and lines[after].lstrip(" ").startswith("-")
-    ):
+    if after is not None and _indent(lines[after]) == indent and _is_dash_line(lines[after]):
         raise _not_plain(
             role,
             "g",
@@ -403,6 +543,9 @@ def _plain_list(text: bytes, role: str) -> _PlainList:
         [_normalize_api_route_rule(entry) for entry in entries],
     ):
         raise _not_plain(role, "h", "the gateway reads another list than the entry lines")
+    fault = _parser_fault(decoded, path, range(first, end))
+    if fault is not None:
+        raise _not_plain(role, "i", fault)
     raw = text.split(b"\n")
     start = sum(len(line) + 1 for line in raw[:first])
     return _PlainList(start, start + sum(len(line) + 1 for line in raw[first:end]), indent, entries)
@@ -449,13 +592,13 @@ def apply_routes(text: bytes, change: RouteChange) -> bytes:
     nothing is left to add or remove, `text` itself is returned, so a change applied twice adds
     nothing twice.
 
-    Raises RoutePlanError, before any edit, for a change whose entries are not exact route rules
-    or that both adds and removes an entry, for a list that is not in allowlist mode, for a change
-    that would leave the list with no entry, for a text that is not in the plain form (naming the
-    first condition that does not hold) and for an added entry that the plain form cannot hold;
-    and after the edit, unless every byte outside the entry lines is the input's and the gateway's
-    reading of the result is allowlist mode with exactly the old patterns, without the removed
-    entries and with the added ones at the end.
+    Raises RoutePlanError, before any edit and in this order, for a change whose entries are not
+    exact route rules or that both adds and removes an entry, for a list that is not in allowlist
+    mode, for a text that is not in the plain form (naming the first condition that does not
+    hold), for a change that would leave the list with no entry and for an added entry that the
+    plain form cannot hold; and after the edit, unless every byte outside the entry lines is the
+    input's and the gateway's reading of the result is allowlist mode with exactly the old
+    patterns, without the removed entries and with the added ones at the end.
     """
     role = change.role
     for entry in (*change.add, *change.remove):
@@ -474,6 +617,7 @@ def apply_routes(text: bytes, change: RouteChange) -> bytes:
     add = [entry for entry in dict.fromkeys(change.add) if entry not in old]
     if not add and not any(entry in old for entry in change.remove):
         return text
+    plain = _plain_list(text, role)
     planned = [entry for entry in old if entry not in change.remove] + add
     if not planned:
         # An empty list means "not limited".
@@ -481,7 +625,6 @@ def apply_routes(text: bytes, change: RouteChange) -> bytes:
             f"the change for role {role} would leave its route list with no entry, "
             "which would open every route"
         )
-    plain = _plain_list(text, role)
     for entry in add:
         if _entry_fault(entry) is not None:
             raise RoutePlanError(
