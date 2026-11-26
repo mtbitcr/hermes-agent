@@ -8,6 +8,15 @@
       "outcome": "released",
       "outcome_at": 1790000000,
       "outcome_text": "It was released.",
+      "parts": {
+        "owner_app": [],
+        "platform": [
+          "Show the release decision",
+          "Keep the owner page fast"
+        ]
+      },
+      "parts_sentence": "These changes update Raphael's platform.",
+      "released_parts_sentence": "Raphael's platform now runs these changes.",
       "state": "released",
       "status": "Released.",
       "titles": [
