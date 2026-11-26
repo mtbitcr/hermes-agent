@@ -2351,6 +2351,59 @@ def test_artifact_round_trip_moves_real_bytes_without_model_text(host, sdk):
     assert box.files.read_bytes(imported["path"]) == data
 
 
+@pytest.fixture
+def openai_deep_worker(host):
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    role = sd.WORKER_PROFILE
+    provider = "openai-codex"
+    tier = "deep"
+    route = model_policy.task_assignment_for(role, provider, tier)
+    lock = model_policy.mint_policy_lock(
+        role, provider, route.model, route.reasoning_effort, tier,
+    )
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET owned_paths=?, model_override=?, provider_override=?, "
+            "reasoning_effort=?, execution_tier=?, model_policy_lock=?, requires_review=1 "
+            "WHERE id=?",
+            ('["app.py"]', route.model, provider, route.reasoning_effort, tier, lock, host.task_id),
+        )
+    return host
+
+
+def test_openai_deep_worker_provisions_without_claude_sign_in(openai_deep_worker, sdk, monkeypatch):
+    monkeypatch.setattr(sd, "_resolve_host_credential", lambda: "")
+
+    out = _provision()
+
+    assert out["ownership_scope"] == ["app.py"]
+    box = FakeSandbox.created[-1]
+    assert box.create_kwargs["env"] == {}
+    assert box.create_kwargs["credential_proxy"] is None
+    assert not box.vault_calls
+
+
+def test_openai_deep_worker_renews_without_claude_sign_in(openai_deep_worker, sdk, monkeypatch):
+    _provision()
+    box = FakeSandbox.created[-1]
+    box.expires_in_seconds = 120
+    renewals = []
+    vault_updates = []
+    box.renew = lambda timeout: renewals.append(timeout.total_seconds())
+    box.credential_vault.patch = lambda **kwargs: vault_updates.append(kwargs)
+    monkeypatch.setattr(sd, "_resolve_host_credential", lambda: "")
+
+    result = sd.maintain_sandbox_lease(
+        tool_name="mcp_opensandbox_agent_factory_sandbox_command_run",
+        args={"sandbox_id": box.id},
+    )
+
+    assert result is None, result
+    assert renewals == [sd.SANDBOX_TIMEOUT_SECONDS]
+    assert not vault_updates
+
+
 def test_verification_role_gets_same_scoped_sandbox_without_coding_credentials(host, sdk, monkeypatch):
     monkeypatch.setenv("HERMES_PROFILE", "raphael-verifier")
     with kb.connect_closing() as conn:
