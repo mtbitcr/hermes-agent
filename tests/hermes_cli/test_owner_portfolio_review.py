@@ -333,6 +333,35 @@ def test_a_complete_project_with_an_open_review_task_does_not_hold_the_portfolio
     assert record["owner_steps"] == {"answers": 0, "suggestions": 1, "plan_approvals": 0}
 
 
+def test_a_complete_project_with_a_review_task_still_open_from_the_day_before_does_not_hold_the_portfolio_back(root):
+    project, other, done = _complete_project_with_news(root)
+    assert review.review_tick(NOW) == 1
+    open_task = _open_task_id(root, done)
+    assert open_task is not None
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        registry.execute("UPDATE project_review_state SET open_review_date='2026-11-08' WHERE project_id=?", (done.id,))
+        registry.commit()
+
+    assert review.review_tick(NOW + 1) == 1
+
+    assert _portfolio_keys() == ["project-review:portfolio:2026-11-09:0"]
+    assert _open_task_id(root, done) == open_task
+
+
+def test_the_readiness_check_creates_no_state_row_for_a_complete_project(root):
+    project, other = _waiting_pair(root)
+    done = _complete_project(root, "Design Loop")
+    _portfolio_on(root, project, other, done)
+    with projects_db.connect_closing(root / "projects.db") as registry:
+        registry.execute("DELETE FROM project_review_state WHERE project_id=?", (done.id,))
+        registry.commit()
+        settings = review.read_settings()
+        assert portfolio._ready(registry, [], "2026-11-09", settings, NOW, [done]) is True
+        assert registry.execute(
+            "SELECT COUNT(*) FROM project_review_state WHERE project_id=?", (done.id,),
+        ).fetchone()[0] == 0
+
+
 def test_a_late_portfolio_result_keeps_its_original_day_before_the_next_review_hour(root):
     project, other = _waiting_pair(root)
     (root / "config.yaml").write_text(yaml.safe_dump({"owner_review": {

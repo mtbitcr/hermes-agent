@@ -150,9 +150,13 @@ def _ready(registry, projects, day, settings, now, complete=()):
         failed = state["failures"] > 0 and review.vienna_date(state["updated_at"]) == day
         if state["open_task_id"] is not None or not (failed or capped):
             return False
-    # A complete Project holds the wait only while its review task is open; without news it has none.
+    # A complete Project holds the wait only while its state row holds a review task open for this day; a read never
+    # creates a row.
     for project in complete:
-        if review._state_row(registry, project.id, now)["open_task_id"] is not None:
+        if registry.execute(
+            "SELECT 1 FROM project_review_state WHERE project_id=? AND open_task_id IS NOT NULL AND open_review_date=?",
+            (project.id, day),
+        ).fetchone() is not None:
             return False
     return True
 
@@ -249,7 +253,8 @@ def _portfolio_tick(registry, settings, now, *, room):
     if room < 1 or review.budget(registry, day)[1] >= settings.portfolio_cap:
         return 0
     # A Project whose approved work is complete is active only to "finish" a review (review._active). It joins on a day
-    # when it holds an owner step (_input); _ready waits for it only while its review task is open (open_task_id).
+    # when it holds an owner step (_input); _ready waits for it only while its state row holds an open review task
+    # (open_task_id) of this day (open_review_date); a task still open from an earlier day does not hold it back.
     projects, complete = [], []
     for project in projects_db.list_projects(registry):
         if review._allowed(registry, settings, project.id):
