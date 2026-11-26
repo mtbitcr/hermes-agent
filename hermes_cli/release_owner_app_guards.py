@@ -3,8 +3,9 @@
 A batch's owner app part replaces the running owner app container with one made from APP_NEW's
 image. These are the owner app forms of G1 to G5 and of G8's room for the build (plan section 2),
 asked as release_guards.prepare asks the platform's guards: in prepare and again, fresh, just
-before the owner app cutover, each with its rule in plain words, so a refusal shows why. The Pins
-here are the owner app part's: `prev` is APP_PREV and `new` is APP_NEW.
+before the owner app cutover, each with its rule in plain words, so a refusal shows why. A guard
+whose host value cannot be read fails, and the guards after it are still asked. The Pins here
+are the owner app part's: `prev` is APP_PREV and `new` is APP_NEW.
 
 The guards only read: every OwnerAppReader method is a read, and no guard starts, stops, replaces,
 writes or repairs anything. Nothing calls this module yet; the release step that asks it belongs
@@ -87,6 +88,9 @@ def _room_for_the_build(
     # newest snapshot's size, the environment's full size and G8's own margin. Only Docker's free
     # space counts, no older snapshot's room, since whether Docker's storage shares the snapshots'
     # filesystem is open (plan question Q2). Without the environment's size the need is unknown.
+    # A reserve below zero would hand the build part of G8's own need, so it fails.
+    if build_reserve_bytes < 0:
+        return False
     environment = reader.environment_snapshot_bytes()
     if environment is None:
         return False
@@ -135,10 +139,29 @@ GUARDS: tuple[tuple[str, str, AppGuardCheck], ...] = (
         "the free space on Docker's storage is at least G8's own need plus the build reserve:"
         " G8's own need is the size of the newest state snapshot plus the full size of the"
         f" platform environment plus {MIN_FREE_DISK_BYTES // 1024**3} GiB; with no state snapshot,"
-        " the newest counts as 0 bytes, and an environment that is not found fails",
+        " the newest counts as 0 bytes, and an environment that is not found fails; a build"
+        " reserve below zero fails",
         _room_for_the_build,
     ),
 )
+
+
+def _holds(
+    check: AppGuardCheck,
+    reader: OwnerAppReader,
+    pins: Pins,
+    merges: Sequence[RecordedMerge],
+    build_reserve_bytes: int,
+) -> bool:
+    # A guard whose host value cannot be read, say because the read timed out, fails, as the
+    # platform's G12 fails an environment whose lock cannot be read; the pass goes on to the next
+    # guard. Nothing of the error is kept, since it may name a host (decision D-10). A
+    # process-control exception, such as KeyboardInterrupt, is not an Exception: it still stops
+    # the pass.
+    try:
+        return check(reader, pins, merges, build_reserve_bytes)
+    except Exception:
+        return False
 
 
 def prepare(
@@ -152,12 +175,13 @@ def prepare(
 
     As in release_guards.prepare, a failing guard does not stop the pass, so one refusal names
     every guard that failed; the release asks the same pass again, fresh, just before the owner
-    app cutover. `merges` are the owner app part's recorded merges, with what review saw.
+    app cutover. A guard whose host value cannot be read fails, and the pass goes on to the next
+    guard. `merges` are the owner app part's recorded merges, with what review saw.
     `build_reserve_bytes` is the room the owner app build may take on Docker's storage: its
     number is the owner's to set (plan question Q2), so the caller passes it rather than this
-    module guessing it.
+    module guessing it. A reserve below zero fails G8.
     """
     return tuple(
-        GuardResult(guard, rule, check(reader, pins, merges, build_reserve_bytes))
+        GuardResult(guard, rule, _holds(check, reader, pins, merges, build_reserve_bytes))
         for guard, rule, check in GUARDS
     )

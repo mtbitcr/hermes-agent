@@ -7,11 +7,12 @@ copy or disk is read and nothing on any server changes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from subprocess import SubprocessError
 
 import pytest
 
 from hermes_cli.release_guards import MIN_FREE_DISK_BYTES, Pins, RecordedMerge
-from hermes_cli.release_owner_app_guards import prepare
+from hermes_cli.release_owner_app_guards import GUARDS, prepare
 
 GiB = 1024**3
 APP_PREV = "app-prev-sha"
@@ -21,6 +22,11 @@ APP_NEW = "app-second-merge-sha"
 APP_PREV_IMAGE = f"raphael-workspace:{APP_PREV}"
 PAGE_CHECK_LOCK = "tools/page-check/package-lock.json"
 ALL_GUARDS = ["G1", "G2", "G3", "G4", "G5", "G8"]
+# Each guard's fixed rule, in the order the pass asks them.
+RULES = [rule for _guard, rule, _check in GUARDS]
+# What a read that cannot be done might say. None of it may reach a result: it is no rule, and it
+# may name a host (decision D-10).
+UNREADABLE = "no answer from 192.0.2.10 within 30 s"
 
 NEWEST_SNAPSHOT = 13 * GiB
 ENVIRONMENT = 2 * GiB
@@ -172,8 +178,19 @@ def failing_everywhere() -> FakeAppHost:
     )
 
 
-def ask(host: FakeAppHost):
-    return prepare(host, PINS, MERGES, build_reserve_bytes=RESERVE)
+def unreadable(host: FakeAppHost, name: str, error: BaseException) -> FakeAppHost:
+    """``host`` with one read that cannot be done: it is recorded, then raises ``error``."""
+
+    def raising(*args):
+        host.reads.append((name, *args))
+        raise error
+
+    setattr(host, name, raising)
+    return host
+
+
+def ask(host: FakeAppHost, build_reserve_bytes: int = RESERVE):
+    return prepare(host, PINS, MERGES, build_reserve_bytes=build_reserve_bytes)
 
 
 def failed(results) -> list[str]:
@@ -231,13 +248,71 @@ def test_one_pass_names_every_failed_guard():
     assert host.actions == []
 
 
+def test_an_unreadable_guard_fails_and_the_pass_still_names_every_failed_guard():
+    # The fenced read of main times out, the page check's lock changed, and Docker's storage is a
+    # byte short.
+    host = unreadable(
+        FakeAppHost(changed={PAGE_CHECK_LOCK}, docker_free=G8_NEED + RESERVE - 1),
+        "on_main",
+        TimeoutError(UNREADABLE),
+    )
+
+    results = ask(host)
+
+    assert [(result.guard, result.ok) for result in results] == [
+        ("G1", True), ("G2", False), ("G3", True), ("G4", True), ("G5", False), ("G8", False)
+    ]
+    # Each result states its guard's fixed rule, and nothing of the error.
+    assert [result.rule for result in results] == RULES
+    assert UNREADABLE not in repr(results) and "TimeoutError" not in repr(results)
+    assert host.actions == []
+
+
+@pytest.mark.parametrize(
+    "guard, name, error",
+    [
+        ("G1", "running_image", OSError(UNREADABLE)),
+        ("G2", "on_main", TimeoutError(UNREADABLE)),
+        # G3 and G4 are the platform's own checks, reading through the same reader.
+        ("G3", "commit_tree", SubprocessError(UNREADABLE)),
+        ("G4", "is_ancestor", SubprocessError(UNREADABLE)),
+        ("G5", "changed_paths", SubprocessError(UNREADABLE)),
+        # The last read of the pass: a failure there keeps every verdict before it.
+        ("G8", "docker_free_bytes", OSError(UNREADABLE)),
+    ],
+    ids=ALL_GUARDS,
+)
+def test_a_guard_whose_host_value_cannot_be_read_fails_alone(guard, name, error):
+    host = unreadable(FakeAppHost(), name, error)
+
+    results = ask(host)
+
+    assert [result.guard for result in results] == ALL_GUARDS
+    assert failed(results) == [guard]
+    assert [result.rule for result in results] == RULES
+    assert host.actions == []
+
+
+@pytest.mark.parametrize("stop", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_a_process_control_exception_still_stops_the_pass(stop):
+    host = unreadable(FakeAppHost(), "on_main", stop())
+
+    with pytest.raises(stop):
+        ask(host)
+
+    # The pass stopped at G2's read: no guard after it was asked.
+    assert host.reads[-1] == ("on_main", APP_NEW)
+    assert host.actions == []
+
+
 def test_the_guards_only_read():
     ready, refusing = FakeAppHost(), failing_everywhere()
 
     ask(ready)
     ask(refusing)
 
-    # Both hosts were read, and neither was asked anything but a read.
+    # Both hosts were read, and neither was asked anything but a read. A call that is not a read
+    # is recorded in ``actions`` before it is refused, so the pass cannot hide it as a refusal.
     assert ready.reads and refusing.reads
     assert ready.actions == refusing.actions == []
 
@@ -252,24 +327,36 @@ def test_each_guard_states_its_rule_whether_it_passes_or_fails():
 
 
 @pytest.mark.parametrize(
-    "snapshot_sizes, docker_free, holds",
+    "snapshot_sizes, docker_free, build_reserve_bytes, holds",
     [
-        ({"release-1": 20 * GiB, "release-2": NEWEST_SNAPSHOT}, G8_NEED + RESERVE, True),
-        ({"release-1": 20 * GiB, "release-2": NEWEST_SNAPSHOT}, G8_NEED + RESERVE - 1, False),
-        ({}, ENVIRONMENT + MIN_FREE_DISK_BYTES + RESERVE, True),
-        ({}, ENVIRONMENT + MIN_FREE_DISK_BYTES + RESERVE - 1, False),
+        ({"release-1": 20 * GiB, "release-2": NEWEST_SNAPSHOT}, G8_NEED + RESERVE, RESERVE, True),
+        (
+            {"release-1": 20 * GiB, "release-2": NEWEST_SNAPSHOT},
+            G8_NEED + RESERVE - 1,
+            RESERVE,
+            False,
+        ),
+        ({}, ENVIRONMENT + MIN_FREE_DISK_BYTES + RESERVE, RESERVE, True),
+        ({}, ENVIRONMENT + MIN_FREE_DISK_BYTES + RESERVE - 1, RESERVE, False),
+        # With no reserve, G8's own need alone must be free.
+        ({"release-1": NEWEST_SNAPSHOT}, G8_NEED, 0, True),
+        ({"release-1": NEWEST_SNAPSHOT}, G8_NEED - 1, 0, False),
+        # A reserve below zero fails: it may not take back any of G8's own need.
+        ({"release-1": NEWEST_SNAPSHOT}, G8_NEED, -1, False),
+        ({"release-1": NEWEST_SNAPSHOT}, G8_NEED - 1, -1, False),
     ],
     ids=["newest-snapshot-just-fits", "newest-snapshot-a-byte-short", "no-snapshot-just-fits",
-         "no-snapshot-a-byte-short"],
+         "no-snapshot-a-byte-short", "zero-reserve-just-fits", "zero-reserve-a-byte-short",
+         "reserve-below-zero-with-g8s-own-need-free", "reserve-below-zero-a-byte-short"],
 )
 def test_g8_keeps_g8s_own_need_and_the_build_reserve_free_on_dockers_storage(
-    snapshot_sizes, docker_free, holds
+    snapshot_sizes, docker_free, build_reserve_bytes, holds
 ):
     # The newest state snapshot is the last one; with none, it counts as 0 bytes. An older one is
     # not counted as room: Docker's storage may be another disk (plan question Q2).
     host = FakeAppHost(snapshot_sizes=snapshot_sizes, docker_free=docker_free)
 
-    results = ask(host)
+    results = ask(host, build_reserve_bytes)
 
     assert failed(results) == ([] if holds else ["G8"])
 
