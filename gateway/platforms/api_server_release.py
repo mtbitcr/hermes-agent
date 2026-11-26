@@ -76,6 +76,21 @@ _ANSWERS = {
     "could_not_start": "The release could not start.",
     "another_release": "Another release is at work.",
 }
+# What the parts of a batch are said to update before Accept, and to run after the release, keyed
+# (has a platform part, has an owner app part). A batch with no part at all has no words.
+_PARTS_BEFORE = {
+    (True, False): "These changes update Raphael's platform.",
+    (False, True): "These changes update your Raphael app. It restarts once, is checked, rehearses the way back,"
+    " and goes forward again.",
+    (True, True): "These changes update Raphael's platform first, then your Raphael app."
+    " If either part fails, both go back.",
+}
+_PARTS_AFTER = {
+    (True, False): "Raphael's platform now runs these changes.",
+    (False, True): "Your Raphael app now runs these changes.",
+    (True, True): "Raphael's platform and your Raphael app now run these changes.",
+}
+_BOTH_WENT_BACK = "Both parts went back."
 _CHANGED = "The waiting batch changed after it was shown. Nothing was recorded; here is the new list."
 # The batches an answer is under way for in this gateway: the one reservation before its action.
 _RESERVED: set[int] = set()
@@ -300,6 +315,8 @@ def _waiting(batch: dict[str, Any]) -> dict[str, Any]:
         "version": batch["version"],
         "digest": batch["digest"],
         "actions": ["accept"] if batch["state"] == "deferred" else ["accept", "defer"],
+        "parts": _part_titles(batch),
+        "parts_sentence": _PARTS_BEFORE.get(_has_parts(batch), ""),
     }
 
 
@@ -308,6 +325,7 @@ def _release(batch: dict[str, Any], busy: Optional[list[tuple[str, str]]]) -> di
 
     running = None if busy is None else any(unit == release_unit.unit_name(batch["batch_id"]) for unit, _ in busy)
     titles = [owner_title(member["title"]) for member in batch["members"]]
+    has_parts = _has_parts(batch)
     return {
         "batch_id": batch["batch_id"],
         "state": batch["state"],
@@ -322,7 +340,45 @@ def _release(batch: dict[str, Any], busy: Optional[list[tuple[str, str]]]) -> di
         "outcome_at": batch["outcome_at"] if batch["state"] in ("released", "folded") else None,
         # Start again: an accepted release that could not start, or one that stopped midway.
         "actions": ["start"] if busy == [] and batch["state"] in _STARTABLE else [],
+        "parts": _part_titles(batch),
+        "parts_sentence": _PARTS_BEFORE.get(has_parts, ""),
+        "released_parts_sentence": _released_parts_sentence(batch, has_parts),
     }
+
+
+def _part_titles(batch: dict[str, Any]) -> dict[str, list[str]]:
+    """The titles of the platform part and of the owner app part, as the member repositories split them."""
+    from hermes_cli.owner_workspace import owner_title
+
+    platform, app = release_ledger._parts(batch["members"])
+    return {
+        "platform": [owner_title(member["title"]) for member in platform],
+        "owner_app": [owner_title(member["title"]) for member in app],
+    }
+
+
+def _has_parts(batch: dict[str, Any]) -> tuple[bool, bool]:
+    """Whether the batch has a platform part and an owner app part.
+
+    A batch that went back (folded) keeps no members, so its parts are read from the versions its release
+    stored: a platform part moved PREV to a NEW that differs (without one NEW is PREV), and an owner app part
+    stored APP_PREV and APP_NEW. Any other batch reads them from its members.
+    """
+    if batch["state"] == "folded":
+        platform = batch["prev"] is not None and batch["new"] is not None and batch["prev"] != batch["new"]
+        return platform, "app_new" in batch
+    platform, app = release_ledger._parts(batch["members"])
+    return bool(platform), bool(app)
+
+
+def _released_parts_sentence(batch: dict[str, Any], has_parts: tuple[bool, bool]) -> str:
+    """What now runs the changes once released; for a batch that went back with both parts, its outcome
+    sentence and one more. Every other case has no words of its own."""
+    if batch["state"] == "released":
+        return _PARTS_AFTER.get(has_parts, "")
+    if batch["outcome"] == "restored" and has_parts == (True, True):
+        return f"{_OUTCOMES['restored']} {_BOTH_WENT_BACK}"
+    return ""
 
 
 def _batch_id(request: web.Request) -> Optional[int]:
