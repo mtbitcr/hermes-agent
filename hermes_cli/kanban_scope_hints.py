@@ -378,6 +378,15 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
                     rules.add(1)
             if is_test and 1 not in rules:
                 test_imports[rel] = imports_seen
+            if is_test and tree is None and text.startswith("\ufeff"):
+                try:
+                    bomless = ast.parse(text[1:])
+                except (SyntaxError, ValueError, RecursionError):
+                    bomless = None
+                if bomless is not None and any(
+                    isinstance(node, ast.Call) and _call_name(node) == EXAMPLE_CALL for node in ast.walk(bomless)
+                ):
+                    example_trees[rel] = bomless
         if names_path:
             rules.add(3)
         if matched_keys:

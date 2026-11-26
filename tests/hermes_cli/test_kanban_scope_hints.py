@@ -1024,3 +1024,25 @@ def test_a_fixture_name_that_python_normalizes_is_read(saved_repo):
     report, lines = _rule_5_rows(saved_repo, source)
     assert lines == [f"{SAVED}/fam/one.json\t{SAVED_LABEL}"]
     assert report.counts[5] == 1
+
+
+def test_a_listed_test_file_with_a_byte_order_mark_keeps_its_rule_5_row(tmp_path, capsys):
+    script = _load_script()
+    source = (f"# {OWNED}\n\n"
+              "def test_a(owner_payload_example):\n"
+              "    owner_payload_example('fam', 'one', {})\n")
+    results = {}
+    for name, prefix in (("plain", b""), ("bom", b"\xef\xbb\xbf")):
+        root = tmp_path / name
+        _write(root / ".git" / "config", "")
+        _write(root / OWNED, "def build():\n    return 1\n")
+        _write(root / SAVED / "fam" / "one.json", "{}\n")
+        target = root / "tests" / "test_lit.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(prefix + source.encode("utf-8"))
+        assert script.main(["--root", str(root), "--owned", OWNED]) == 0
+        results[name] = capsys.readouterr().out.splitlines()
+    assert results["bom"] == results["plain"]
+    assert "tests/test_lit.py\trule 3 (names owned path)" in results["bom"]
+    assert f"{SAVED}/fam/one.json\t{SAVED_LABEL}" in results["bom"]
+    assert "# rule 5 (saved example): 1" in results["bom"]
