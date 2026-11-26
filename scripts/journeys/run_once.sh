@@ -28,8 +28,9 @@
 # line that cannot be stored or sent is its own failed step (result, notify), never retried; "passed" is
 # only ever sent after "passed" was stored. Exit 0 only for a pass that was stored and told.
 # Of each step that runs a command, the runner holds the output (standard output and errors, in the order they
-# came) of the newest command. When a step fails and its result is stored, the last 40 lines of it (each cut at
-# 400 characters; none for config and time, which run no command), under the header lines, go to one private
+# came, every byte) of the newest command, in a private folder outside RUN_DIR that goes with the run. When a step
+# fails and its result is stored, the last 40 lines of it (each cut at 400 characters; none for config, time and
+# result, which run no command: their file holds the header lines only), under the header lines, go to one private
 # file, RUN_DIR/failed-step.log, written in place (no temporary file, no rename) before the owner line; the next
 # run removes it at its start, so it describes the newest run and a passing run leaves none. It stays on
 # Server 1: it is never sent or printed. The result still holds a fixed reason only, never a value or the page's
@@ -107,8 +108,17 @@ flock -n 9 || {
 
 rm -f "$FAILED_STEP_LOG" 2> /dev/null || echo "run_once: the file of the earlier failed step could not be removed" >&2
 
+# The output of a command is held in a file of this folder (a variable cannot hold every byte); it goes with the run.
+HOLD_DIR=${TMPDIR:-/tmp}/run_once.$$.$RANDOM
+mkdir -m 700 "$HOLD_DIR" 2> /dev/null || {
+  echo "run_once: the folder for the held output cannot be used" >&2
+  exit 1
+}
+trap 'rm -rf "$HOLD_DIR"' EXIT
+HELD_FILE=$HOLD_DIR/held
+ANSWER_FILE=$HOLD_DIR/answer
+
 JOURNEY=""
-HELD=""
 now() { printf '%(%Y-%m-%dT%H:%M:%SZ)T' -1; }
 STARTED=$(now)
 START_EPOCH=$(date +%s)
@@ -127,22 +137,44 @@ store_result() {
   return 1
 }
 
-# write_failed_step_log STEP FINISHED: the header lines, then the last lines of the held output, each cut by
-# character. Any write that fails fails the whole.
+# write_failed_step_log STEP FINISHED BODY: the header lines, then (BODY 1) the last lines of the held output, each
+# cut by character. A NUL byte is a character of its own: the held file is read in pieces between NULs (ptxt, with
+# pnul 1 where a NUL follows the piece and 0 where a line ends). Any write that fails fails the whole.
 write_failed_step_log() {
-  local LC_ALL=C.UTF-8 line first=0
-  local -a lines=()
-  if [[ -n $HELD ]]; then mapfile -t lines <<< "${HELD%$'\n'}"; fi
-  if ((${#lines[@]} > KEPT_LINES)); then first=$((${#lines[@]} - KEPT_LINES)); fi
+  local LC_ALL=C.UTF-8 seg nul more=1 n=0 i k first=0 ends=0 left take
+  local -a ptxt=() pnul=() parts=()
   printf 'step=%s\n' "$1" || return 1
   if [[ -n $JOURNEY ]]; then printf 'journey=%s\n' "$JOURNEY" || return 1; fi
   printf 'started=%s\nfinished=%s\n' "$STARTED" "$2" || return 1
-  for line in "${lines[@]:first}"; do printf '%s\n' "${line:0:KEPT_WIDTH}" || return 1; done
+  [[ $3 == 1 ]] || return 0
+  while ((more)); do
+    IFS= read -r -d '' seg && nul=1 || { nul=0 more=0; }
+    mapfile -t parts <<< "$seg"
+    for ((k = 0; k < ${#parts[@]} - 1; k++)); do ptxt[n]=${parts[k]} pnul[n]=0 n=$((n + 1)); done
+    ptxt[n]=${parts[-1]} pnul[n]=$nul n=$((n + 1))
+  done < "$HELD_FILE" 2> /dev/null
+  if ((n > 0)) && [[ ${pnul[n - 1]} == 0 && -z ${ptxt[n - 1]} ]]; then n=$((n - 1)); fi
+  for ((i = n - 1; i >= 0; i--)); do
+    if [[ ${pnul[i]} == 0 || $i -eq $((n - 1)) ]] && ((++ends > KEPT_LINES)); then first=$((i + 1)); break; fi
+  done
+  left=$KEPT_WIDTH
+  for ((i = first; i < n; i++)); do
+    take=${ptxt[i]:0:left}
+    printf '%s' "$take" || return 1
+    left=$((left - ${#take}))
+    if [[ ${pnul[i]} == 1 ]]; then
+      if ((left > 0)); then printf '\0' || return 1; left=$((left - 1)); fi
+      if ((i == n - 1)); then printf '\n' || return 1; fi
+    else
+      printf '\n' || return 1
+      left=$KEPT_WIDTH
+    fi
+  done
 }
 
-# keep_failed_step STEP FINISHED: written in place. A failure here changes nothing else about the run.
+# keep_failed_step STEP FINISHED BODY: written in place. A failure here changes nothing else about the run.
 keep_failed_step() {
-  write_failed_step_log "$1" "$2" 2> /dev/null > "$FAILED_STEP_LOG" && return 0
+  write_failed_step_log "$1" "$2" "$3" 2> /dev/null > "$FAILED_STEP_LOG" && return 0
   echo "run_once: the output of the failed step could not be kept" >&2
 }
 
@@ -174,8 +206,8 @@ finish() {
   fi
   if ((stored)) && [[ $outcome == failed ]]; then
     case $step in
-      config | time) HELD="" ;;& # no command ran in these steps: the file holds its header lines only
-      config | time | refresh | reset | isolation | seed | proxy | owner-app | journeys) keep_failed_step "$step" "$finished" ;;
+      config | time | result) keep_failed_step "$step" "$finished" 0 ;; # no command ran: the header lines only
+      refresh | reset | isolation | seed | proxy | owner-app | journeys) keep_failed_step "$step" "$finished" 1 ;;
     esac
   fi
   if ! tell "$line"; then
@@ -226,37 +258,40 @@ store_result started none "the run has started and has not ended" || finish fail
     read_runner_env
 } || finish failed config
 
-# hold COMMAND [ARG...]: runs the command with no input; its output (standard output and errors together, in the
-# order they came) is held in HELD, whole, with its trailing empty lines. The status is the command's.
+# hold COMMAND [ARG...]: runs the command with no input; its output (standard output and errors on one open file,
+# so in the order they came, every byte) is held in HELD_FILE. The status is the command's.
 hold() {
-  local raw
-  { raw=$({ "$@" 2>&1 < /dev/null; printf 'x%s' "$?"; }); } 2> /dev/null
-  HELD=${raw%x*}
-  return "${raw##*x}"
+  { "$@" > "$HELD_FILE" 2>&1 < /dev/null; } 2> /dev/null
 }
-# remote COMMAND: one command on Server 2 through the runner identity; its output is held (HELD), not shown.
+# remote COMMAND: one command on Server 2 through the runner identity; its output is held, not shown.
 remote() { hold ssh "$JOURNEY_RUNNER_SSH" "$1"; }
-# tag_lines TAG: each line of the input, one line each, with TAG in front.
-tag_lines() {
-  local line
-  while IFS= read -r line || [[ -n $line ]]; do printf '%s%s\n' "$1" "$line"; done
+# copy_stdout: the standard output of a command, chunk by chunk as it comes, to the answer (standard output of this
+# function) and to the held output (fd 5), so that it joins the errors, which go there directly, in order.
+copy_stdout() {
+  local chunk rc
+  while :; do
+    IFS= read -r -t 0.02 -N 65536 chunk
+    rc=$?
+    printf '%s' "$chunk"
+    printf '%s' "$chunk" >&5
+    ((rc == 1)) && break
+  done
 }
 # remote_answer COMMAND: the same, with the command's standard output also set apart as ANSWER, which alone is
-# checked; HELD gets both streams in the order they came. Each line is tagged with its stream (O, E) on the way,
-# and the status follows as a line of its own (S).
+# checked (as the answer of a command substitution: no trailing newline); the held output gets both streams in the
+# order they came.
 remote_answer() {
-  local raw item status=1
-  local -a tagged=()
-  ANSWER="" HELD=""
-  { raw=$({ ssh "$JOURNEY_RUNNER_SSH" "$1" 2> >(tag_lines E) > >(tag_lines O) < /dev/null; printf 'S%s\n' "$?"; }); } 2> /dev/null
-  mapfile -t tagged <<< "$raw"
-  for item in "${tagged[@]}"; do
-    case $item in
-      O*) ANSWER+=${item:1}$'\n' HELD+=${item:1}$'\n' ;;
-      E*) HELD+=${item:1}$'\n' ;;
-      S*) status=${item:1} ;;
-    esac
-  done
+  local status
+  ANSWER=""
+  : > "$HELD_FILE"
+  {
+    coproc COPY { copy_stdout 5>> "$HELD_FILE"; } > "$ANSWER_FILE"
+    ssh "$JOURNEY_RUNNER_SSH" "$1" >&"${COPY[1]}" 2>> "$HELD_FILE" < /dev/null
+    status=$?
+    exec {COPY[1]}>&-
+    wait "$COPY_PID"
+    ANSWER=$(< "$ANSWER_FILE")
+  } 2> /dev/null
   return "$status"
 }
 
@@ -270,7 +305,7 @@ hold "$HERE/isolation_check.sh" server1 || finish failed isolation
 # What a healthy sign-in proxy answers: its key list, with the key id that its source names.
 proxy_answers() {
   local line issuer="" kid=""
-  HELD=""
+  : > "$HELD_FILE"
   while IFS= read -r line; do
     if [[ $line =~ ^ISSUER\ =\ \"([^\"]*)\"$ ]]; then issuer=${BASH_REMATCH[1]}; fi
     if [[ $line =~ ^KID\ =\ \"([^\"]*)\"$ ]]; then kid=${BASH_REMATCH[1]}; fi

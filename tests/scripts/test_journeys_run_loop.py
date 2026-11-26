@@ -98,6 +98,11 @@ def current_journey():
     return ORDER[int((top / "reset.count").read_text()) - 2]
 
 
+def held_size():
+    root = os.environ.get("TMPDIR", "")
+    return sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(root) for f in fs)
+
+
 def noise(rc):
     if last in answers.get("exact", {}):
         sys.stdout.write(answers["exact"][last])
@@ -155,20 +160,34 @@ if name == "ssh":
         label = "ssh other"
     record(label)
     rc = answers["rc"].get(label, 0)
-    sys.stderr.write(answers.get("stderr", {}).get(label, ""))
-    sys.stderr.flush()
-    if answers.get("stderr", {}).get(label):
-        time.sleep(0.15)  # the errors reach the runner before the answer: the order of the two streams is fixed
+    errors = answers.get("stderr", {}).get(label, "")
     if label.startswith("proxy"):
-        sys.stdout.write(answers["proxy"] if rc == 0 else "")
-        sys.exit(rc)
-    if label.startswith("app"):
+        answer = answers["proxy"] if rc == 0 else ""
+    elif label.startswith("app"):
         followed = " --location " in command and " --max-redirs 3 " in command
         # the owner app root answers a 307 to /projects: the page text is only seen by a call that follows it
         redirected = answers.get("redirect") and not followed
-        sys.stdout.write("Temporary Redirect: /projects" if redirected else answers["page"] if rc == 0 else "")
-        sys.exit(rc)
-    noise(rc)
+        answer = "Temporary Redirect: /projects" if redirected else answers["page"] if rc == 0 else ""
+    else:
+        sys.stderr.write(errors)
+        sys.stderr.flush()
+        noise(rc)
+    if label in answers.get("stdout_first", []):
+        before = held_size()
+        sys.stdout.write(answer)
+        sys.stdout.flush()
+        # a runner that copies the answer on its way keeps the order only if the copy is made before the errors come
+        give_up = time.monotonic() + 10  # a runner that keeps nothing there must fail the test, not hang it
+        while held_size() - before < 2 * len(answer.encode()) and time.monotonic() < give_up:
+            pass
+        sys.stderr.write(errors)
+        sys.stderr.flush()
+    else:
+        sys.stderr.write(errors)
+        sys.stderr.flush()
+        sys.stdout.write(answer)
+        sys.stdout.flush()
+    sys.exit(rc)
 sys.exit("stand-in: unknown name " + name)
 '''
 
@@ -242,7 +261,8 @@ class Sandbox:
         self.home = top / "hermes-home"
         self.run_dir = self.home / "journeys"
         self.runner_env = top / "runner.env"
-        for folder in (self.home, self.bin, self.scripts):
+        self.tmp = top / "tmp"
+        for folder in (self.home, self.bin, self.scripts, self.tmp):
             folder.mkdir()
         (top / "stand_in.py").write_text(STAND_IN, encoding="utf-8")
         for name in ("ssh", "date", "curl", "hermes", "sleep", "systemd-run", "systemctl"):
@@ -276,7 +296,7 @@ class Sandbox:
         env = {
             "PATH": str(self.bin), "HOME": str(self.top), "HERMES_HOME": str(self.home),
             "JOURNEY_PAGE_TEXT": PAGE_TEXT, "JOURNEY_RUNNER_SSH": RUNNER,
-            "JOURNEY_RUNNER_ENV": str(self.runner_env),
+            "JOURNEY_RUNNER_ENV": str(self.runner_env), "TMPDIR": str(self.tmp),
         }
         for name, value in changes.items():
             if value is None:
@@ -883,13 +903,13 @@ def test_trailing_empty_lines_of_a_failed_command_stay_in_the_kept_tail(box):
     assert _kept(box)[3:] == ["first", "last", "", ""]
 
 
-def test_a_failed_command_that_prints_a_null_byte_makes_no_diagnostic_on_the_runner_errors(box):
+def test_a_failed_command_that_prints_a_null_byte_keeps_the_byte_and_makes_no_diagnostic_on_the_runner_errors(box):
     box.answer(rc={"refresh": 7}, exact={"refresh": "before\x00after\n"})
 
     done = box.run()
 
     assert (done.returncode, done.stdout, done.stderr) == (1, "", "")
-    assert _kept(box)[3:] == ["beforeafter"]
+    assert _stored_body(box) == b"before\x00after\n"
 
 
 def test_trailing_empty_lines_of_a_failed_remote_command_stay_in_the_kept_tail(box):
@@ -984,3 +1004,138 @@ def test_a_write_failure_after_a_successful_open_is_reported_for_a_body_too(box)
     assert done.returncode == 1
     assert box.result()["step"] == "reset"
     assert done.stderr.splitlines() == ["run_once: the output of the failed step could not be kept"]
+
+
+# ------------------------------------------------------------------ round 2: order, parity, result step, NUL
+
+
+def _stored_body(box: Sandbox) -> bytes:
+    return (box.run_dir / KEPT).read_bytes().split(b"\n", 3)[3]  # the three header lines of a step with no journey
+
+
+@pytest.mark.parametrize("label", ["proxy 3", "app 3"])
+def test_an_early_stderr_fragment_before_41_stdout_rows_is_the_oldest_of_the_combined_output(box, label):
+    rows = "".join(f"row {i}\n" for i in range(1, 42))
+    answers = {"proxy": rows} if label.startswith("proxy") else {"page": rows}
+    box.answer(stderr={label: "early fragment"}, **answers)
+
+    assert box.run().returncode == 1
+
+    assert _kept(box)[4:] == [f"row {i}" for i in range(2, 42)]  # row 1 carries the fragment and drops out
+    assert box.result()["step"] == label.split()[0].replace("app", "owner-app")
+    assert list(box.tmp.iterdir()) == []
+
+
+@pytest.mark.parametrize("label", ["proxy 3", "app 3"])
+def test_a_stderr_fragment_after_41_stdout_rows_is_the_newest_of_the_combined_output(box, label):
+    rows = "".join(f"row {i}\n" for i in range(1, 42))
+    answers = {"proxy": rows} if label.startswith("proxy") else {"page": rows}
+    box.answer(stderr={label: "late fragment"}, stdout_first=[label], **answers)
+
+    assert box.run().returncode == 1
+
+    assert _kept(box)[4:] == [*[f"row {i}" for i in range(3, 42)], "late fragment"]
+
+
+@pytest.mark.parametrize("label", ["proxy 3", "app 3"])
+@pytest.mark.parametrize("stdout_first", [False, True])
+def test_partial_lines_of_both_streams_join_in_the_order_they_came(box, label, stdout_first):
+    answers = {"proxy": "out one\nout part"} if label.startswith("proxy") else {"page": "out one\nout part"}
+    box.answer(stderr={label: "err part|err end"}, stdout_first=[label] if stdout_first else [], **answers)
+
+    assert box.run().returncode == 1
+
+    expected = ["out one", "out parterr part|err end"] if stdout_first else ["err part|err endout one", "out part"]
+    assert _kept(box)[4:] == expected
+
+
+def test_the_stderr_of_the_proxy_check_is_still_never_part_of_the_decision_when_it_comes_after_the_answer(box):
+    box.answer(proxy='{"keys":[]}', stderr={"proxy 3": f'"kid":"{KID}"'}, stdout_first=["proxy 3"])
+
+    assert box.run().returncode == 1
+
+    assert box.result()["step"] == "proxy"
+
+
+PARITY = [
+    ("READY\n", "READY", "owner-app"),
+    ("READY\n", "READY\n", "owner-app"),
+    ("READY\n", "READY\n\n\n", "owner-app"),
+    ("READY\n", "READY\nmore", "passed"),
+    ("READY", "READY\n", "passed"),
+    ("READY", "READY\n\n\n", "passed"),
+]
+
+
+@pytest.mark.parametrize(("phrase", "page", "end"), PARITY)
+def test_the_owner_app_decision_strips_all_trailing_newlines_of_the_answer_as_before(box, phrase, page, end):
+    box.answer(page=page)
+
+    done = box.run(JOURNEY_PAGE_TEXT=phrase)
+
+    assert box.result()["step" if end != "passed" else "result"] == end
+    assert done.returncode == (0 if end == "passed" else 1)
+
+
+def test_the_kept_page_keeps_its_trailing_newlines_though_the_decision_strips_them(box):
+    box.answer(page="page\n\n")
+
+    assert box.run(JOURNEY_PAGE_TEXT="absent").returncode == 1
+
+    assert _kept(box)[4:] == ["page", ""]
+
+
+FIRST_RENAME_REFUSED_MV = """#!/bin/sh
+n=0
+if [ -f "{count}" ]; then read -r n < "{count}"; fi
+n=$((n + 1))
+echo "$n" > "{count}"
+if [ "$n" -eq 1 ]; then exit 1; fi
+exec "{real}" "$@"
+"""
+
+
+def test_a_failed_first_result_write_with_a_stored_terminal_result_keeps_a_header_only_file(box):
+    mv = box.bin / "mv"
+    mv.unlink()
+    mv.write_text(FIRST_RENAME_REFUSED_MV.format(real=shutil.which("mv"), count=box.top / "mv.count"), encoding="utf-8")
+    mv.chmod(0o755)
+
+    done = box.run()
+
+    assert done.returncode == 1
+    result = box.result()
+    assert (result["result"], result["step"], result["reason"]) == ("failed", "result", "the result file could not be stored")
+    assert box.names() == ["hermes"] and box.call("hermes")["env"] == {"kept": "True"}
+    assert box.told() == [f"Journeys failed at step result: the result file could not be stored."]
+    assert _kept(box) == ["step=result", "started=" + result["started"], "finished=" + result["finished"]]
+    assert (box.run_dir / KEPT).stat().st_mode & 0o777 == 0o600
+    assert (done.stdout, done.stderr) == ("", "")
+
+
+def test_a_null_byte_in_a_remote_command_is_kept_and_counts_as_one_character_of_the_cut(box):
+    line = "a" * 397 + "\x00\u00e9" * 3 + "\n"
+    box.answer(rc={"reset first": 7}, exact={"reset first": "x\x00y\n" + line})
+
+    done = box.run()
+
+    assert (done.returncode, done.stdout, done.stderr) == (1, "", "")
+    assert _stored_body(box) == b"x\x00y\n" + ("a" * 397 + "\x00\u00e9\x00").encode() + b"\n"
+
+
+def test_a_null_byte_as_the_last_byte_of_the_output_is_kept(box):
+    box.answer(rc={"refresh": 7}, exact={"refresh": "one\ntwo\x00"})
+
+    assert box.run().returncode == 1
+
+    assert _stored_body(box) == b"one\ntwo\x00\n"
+
+
+def test_no_file_of_the_runner_is_left_beside_the_result_or_in_the_temporary_folder(box):
+    _fail_reset_of_3(box, output={"reset 3": "x"})
+    assert list(box.tmp.iterdir()) == []
+
+    (box.top / "reset.count").unlink()
+    box.answer()
+    assert box.run().returncode == 0
+    assert list(box.tmp.iterdir()) == [] and sorted(p.name for p in box.run_dir.iterdir()) == ["result", "run.lock"]
