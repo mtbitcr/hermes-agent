@@ -174,7 +174,7 @@ async def test_a_batch_that_went_back_takes_its_parts_from_its_stored_versions(r
 
     # The folded batch kept no member: only its stored PREV, NEW, APP_PREV and APP_NEW name its parts.
     assert (release["titles"], release["count"]) == ([], 0)
-    assert release["parts"] == {"platform": [], "owner_app": []}
+    assert release["parts"] == {"platform": True, "owner_app": True}
     assert release["parts_sentence"] == BEFORE["both"]
     assert release["released_parts_sentence"] == WENT_BACK
     # Today's waiting batch holds the changes of both parts and says nothing different about the release.
@@ -191,6 +191,7 @@ async def test_a_stored_platform_only_batch_that_went_back_is_not_read_as_both_f
     view = await _view()
 
     assert view["waiting"]["parts_sentence"] == BEFORE["both"]
+    assert view["release"]["parts"] == {"platform": True, "owner_app": False}
     assert view["release"]["parts_sentence"] == BEFORE["platform"]
     assert view["release"]["released_parts_sentence"] == ""
 
@@ -199,6 +200,7 @@ async def test_a_stored_platform_only_batch_that_went_back_is_not_read_as_both_f
 async def test_a_stored_owner_app_only_batch_that_went_back_is_read_from_its_stored_versions(root):
     release = await _release_of("owner_app", "restored")
 
+    assert release["parts"] == {"platform": False, "owner_app": True}
     assert release["parts_sentence"] == BEFORE["owner_app"]
     assert release["released_parts_sentence"] == ""
 
@@ -235,10 +237,13 @@ async def test_every_key_and_value_of_today_stays_beside_the_new_keys(root):
         "parts", "parts_sentence",
     }
 
-    release = await _release_of("both", "restored")
+    folded = _accepted(_batch("both"))
+    _begin_parts(folded)
+    ended = _ledger(ledger.finish_release, folded["batch_id"], outcome="restored")
+    release = (await _view())["release"]
     new_keys = {"parts", "parts_sentence", "released_parts_sentence"}
     assert {key: release[key] for key in release if key not in new_keys} == {
-        "batch_id": release["batch_id"],
+        "batch_id": folded["batch_id"],
         "state": "folded",
         "status": "Ended without being released.",
         "unit_running": False,
@@ -247,7 +252,7 @@ async def test_every_key_and_value_of_today_stays_beside_the_new_keys(root):
         "outcome_text": "It was rolled back. Its changes went back to the waiting batch.",
         "titles": [],
         "count": 0,
-        "outcome_at": release["outcome_at"],
+        "outcome_at": ended["outcome_at"],
         "actions": [],
     }
     assert type(release["outcome_at"]) is int

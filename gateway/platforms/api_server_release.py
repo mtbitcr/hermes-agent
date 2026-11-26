@@ -340,10 +340,17 @@ def _release(batch: dict[str, Any], busy: Optional[list[tuple[str, str]]]) -> di
         "outcome_at": batch["outcome_at"] if batch["state"] in ("released", "folded") else None,
         # Start again: an accepted release that could not start, or one that stopped midway.
         "actions": ["start"] if busy == [] and batch["state"] in _STARTABLE else [],
-        "parts": _part_titles(batch),
+        "parts": _parts_view(batch, has_parts),
         "parts_sentence": _PARTS_BEFORE.get(has_parts, ""),
         "released_parts_sentence": _released_parts_sentence(batch, has_parts),
     }
+
+
+def _parts_view(batch: dict[str, Any], has_parts: tuple[bool, bool]) -> dict[str, Any]:
+    """The parts of a release: titles per part, or for a batch that went back one boolean per part."""
+    if batch["state"] == "folded":
+        return {"platform": has_parts[0], "owner_app": has_parts[1]}
+    return _part_titles(batch)
 
 
 def _part_titles(batch: dict[str, Any]) -> dict[str, list[str]]:

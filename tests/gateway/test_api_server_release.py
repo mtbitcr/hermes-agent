@@ -701,7 +701,7 @@ async def test_a_read_leaves_the_database_file_itself_byte_for_byte_unchanged(ro
 RELEASE_KEYS = {
     "batch_id", "state", "status", "unit_running", "unit", "outcome", "outcome_text", "actions",
 }
-NEW_KEYS = {"titles", "count", "outcome_at", "parts", "parts_sentence", "released_parts_sentence"}
+NEW_KEYS = {"titles", "count", "outcome_at"}
 
 
 async def _release_after(batch: dict, outcome: str | None, *, begin: bool = True) -> dict:
@@ -778,7 +778,7 @@ async def test_the_release_object_keeps_every_existing_key_and_value(root):
     batch = _merge("a", "Show the release decision")
     release = await _release_after(batch, "released")
 
-    assert set(release) == RELEASE_KEYS | NEW_KEYS
+    assert set(release) == RELEASE_KEYS | NEW_KEYS | {"parts", "parts_sentence", "released_parts_sentence"}
     assert {key: release[key] for key in RELEASE_KEYS} == {
         "batch_id": batch["batch_id"],
         "state": "released",
