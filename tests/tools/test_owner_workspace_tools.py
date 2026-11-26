@@ -749,6 +749,35 @@ class TestFieldDelegation:
             "task_id": "t1", "reason": "capability gap resolved",
         }
 
+    def test_task_retry_keeps_the_bound_route(self, monkeypatch, trusted_ctx):
+        monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
+        kernel = _RecordingKernel()
+        monkeypatch.setattr(owt._kernel, "retry_task", kernel)
+        payload = {
+            "idempotency_key": "r1", "project_id": "p1", "task_id": "t1",
+            "reason": "Continue the stopped work.", "route_token": "a" * 64,
+        }
+
+        owt._handle_task_retry(payload)
+
+        assert kernel.calls == [(trusted_ctx, payload)]
+
+    def test_task_retry_reports_the_checked_refusal(self, monkeypatch, trusted_ctx):
+        monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
+        reason = "This role needs a valid sign-in for the selected provider."
+        kernel = _RecordingKernel(
+            return_value={"ok": False, "error": "not_retryable", "reason": reason},
+        )
+        monkeypatch.setattr(owt._kernel, "retry_task", kernel)
+
+        payload = json.loads(owt._handle_task_retry({
+            "idempotency_key": "r1", "project_id": "p1", "task_id": "t1",
+            "reason": "Continue the stopped work.", "route_token": "a" * 64,
+        }))
+
+        assert payload["error"] == reason
+        assert payload["code"] == "not_retryable"
+
     def test_task_retry_result_is_returned_verbatim_as_json(self, monkeypatch, trusted_ctx):
         monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
         result = {

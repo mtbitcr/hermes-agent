@@ -193,11 +193,13 @@ def _as_worker(monkeypatch, env: dict):
         yield
 
 
-def _retry(owner: ow.OwnerContext, project: dict, task_id: str, key: str) -> dict:
+def _retry(
+    owner: ow.OwnerContext, project: dict, task_id: str, key: str, *, route_token: str | None = None,
+) -> dict:
     """The owner's retry, bound to an owner run the way the API server mints it."""
     payload = ow.canonical_owner_retry_payload(
         idempotency_key=key, project_id=project["project_id"],
-        task_id=task_id, reason=REASON,
+        task_id=task_id, reason=REASON, route_token=route_token,
     )
     ctx = ow.OwnerContext(
         actor=owner.actor, profile=owner.profile, session=owner.session,
@@ -214,7 +216,7 @@ def _retry(owner: ow.OwnerContext, project: dict, task_id: str, key: str) -> dic
         patch.setattr(ow, "_confirm", lambda *_args, **_kwargs: {"approved": True})
         return ow.retry_task(
             ctx, idempotency_key=key, project_id=project["project_id"],
-            task_id=task_id, reason=REASON,
+            task_id=task_id, reason=REASON, route_token=route_token,
         )
 
 
@@ -274,6 +276,80 @@ def test_a_retry_makes_a_held_ready_card_spawnable_on_the_next_tick(root, owner,
         assert kb.get_task(conn, task_id).status == "ready"
         assert kb.check_respawn_guard(conn, task_id) is None
         _result, spawned = _tick(conn, board, {task_id: 4203})
+        assert spawned == [task_id]
+
+
+def test_deep_worker_retry_requires_a_fresh_choice_after_a_card_change(root, owner, clock, monkeypatch):
+    from hermes_cli import owner_retry_route
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    import sqlite3
+
+    profile_home = Path(os.environ["HERMES_HOME"])
+    with monkeypatch.context() as shared_root:
+        shared_root.setenv("HERMES_HOME", str(root))
+        project = _project(owner, "Deep Worker Retry")
+        with contextlib.closing(sqlite3.connect(root / "projects.db")) as source:
+            with contextlib.closing(sqlite3.connect(profile_home / "projects.db")) as target:
+                source.backup(target)
+    board = project["board"]
+    role = "raphael-claude-worker"
+    (root / "profiles" / role).mkdir()
+    assignment = model_policy.task_assignment_for(role, "anthropic", "deep")
+    lock = model_policy.mint_policy_lock(
+        role, "anthropic", assignment.model, assignment.reasoning_effort, "deep",
+    )
+    with _board(board) as conn:
+        task_id = kb.create_task(
+            conn, title="Draft the placeholder brief", assignee=role,
+            project_id=project["project_id"], provider_override="anthropic",
+            model_override=assignment.model, reasoning_effort=assignment.reasoning_effort,
+            execution_tier="deep", model_policy_lock=lock, requires_review=True,
+        )
+        held = _held(conn, board, task_id, 4211)
+    clock["t"] = held.ended_at + 60
+    monkeypatch.setenv("HERMES_OPENAI_RETRY_TASK_ID", task_id)
+    monkeypatch.setattr(owner_retry_route, "openai_ready", lambda _role: True)
+
+    def read_choice():
+        snapshot = ow.read_project_snapshot(owner, project["slug"], provider_wait=True)
+        return next(
+            task["retry_route"]
+            for column in snapshot["columns"] for task in column["tasks"] if task["id"] == task_id
+        )
+
+    env = _steward_env(root, board)
+    with _as_worker(monkeypatch, env):
+        old_choice = read_choice()
+
+    with _board(board) as conn:
+        earlier_revision = kb.task_event_revision(conn, task_id)
+        kb.add_comment(conn, task_id, "owner", "Update the brief instructions.")
+        assert kb.task_event_revision(conn, task_id) > earlier_revision
+
+    with _as_worker(monkeypatch, env):
+        stale = _retry(owner, project, task_id, "retry-stale", route_token=old_choice["token"])
+    assert stale["ok"] is False, stale
+
+    with _board(board) as conn:
+        assert kb.get_task(conn, task_id).provider_override == "anthropic"
+        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+        assert not _events(conn, task_id, "owner_retry")
+
+    with _as_worker(monkeypatch, env):
+        fresh = read_choice()
+        assert fresh["token"] != old_choice["token"]
+        accepted = _retry(owner, project, task_id, "retry-fresh", route_token=fresh["token"])
+    assert accepted["ok"] is True, accepted
+
+    with _board(board) as conn:
+        [event] = _events(conn, task_id, "owner_retry")
+        assert event.run_id == held.id
+        assert kb.get_run(conn, held.id).outcome == "rate_limited"
+        task = kb.get_task(conn, task_id)
+        assert task.provider_override == "openai-codex"
+        assert task.requires_review
+        _result, spawned = _tick(conn, board, {task_id: 4212})
         assert spawned == [task_id]
 
 

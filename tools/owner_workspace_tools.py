@@ -306,13 +306,21 @@ def _handle_task_retry(args: dict, **kw) -> str:
     """
     try:
         ctx = resolve_owner_context()
+        # The gateway binds the selected route to the owner run.
+        # Pass it to the kernel so it can verify the same payload.
+        route = {"route_token": args["route_token"]} if "route_token" in args else {}
         result = _kernel.retry_task(
             ctx,
             idempotency_key=args.get("idempotency_key"),
             project_id=args.get("project_id"),
             task_id=args.get("task_id"),
             reason=args.get("reason"),
+            **route,
         )
+        if result.get("ok") is False and result.get("error") == "not_retryable":
+            # The kernel checks this reason against the owner-text policy.
+            # The native run reads its failure message from the error field.
+            return tool_error(result["reason"], code="not_retryable")
         return _ok(result)
     except OwnerWorkspaceError as e:
         return _refused("owner_task_retry", e)

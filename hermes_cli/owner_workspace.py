@@ -88,7 +88,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from hermes_cli import kanban_db, projects_db
+from hermes_cli import kanban_db, owner_retry_route, projects_db
 from hermes_cli.kanban_risk_tier import (
     highest_risk_tier,
     parse_risk_tier,
@@ -285,6 +285,7 @@ def canonical_owner_retry_payload(
     project_id: Any,
     task_id: Any,
     reason: Any,
+    route_token: str | None = None,
 ) -> dict:
     """The ONE canonical form of a retry payload, for BOTH sides of the digest.
 
@@ -303,12 +304,17 @@ def canonical_owner_retry_payload(
     from which exact request the owner's run authorized, and folding it in here
     would make the authority digest unreproducible by the run that minted it.
     """
-    return {
+    payload = {
         "idempotency_key": _require_str(idempotency_key, "idempotency_key"),
         "project_id": str(project_id).strip() if project_id is not None else "",
         "task_id": str(task_id).strip() if task_id is not None else "",
         "reason": str(reason).strip() if reason is not None else "",
     }
+    if route_token is not None:
+        if not isinstance(route_token, str) or re.fullmatch(r"[0-9a-f]{64}", route_token) is None:
+            raise OwnerWorkspaceError("invalid_argument", "invalid retry route token")
+        payload["route_token"] = route_token
+    return payload
 
 
 def _require_owner_run_authority(
@@ -3389,8 +3395,9 @@ def _owner_project_run_projection(
 
 def _owner_run_retry_reasons(
     conn: sqlite3.Connection, run_ids: list,
+    *, previous_pins: dict[int, OwnerTaskRoutePin] | None = None,
 ) -> dict[int, str]:
-    """Map each of ``run_ids`` that an owner retried to the reason they gave.
+    """Read the latest owner reason. Include prior pins when the caller needs them.
 
     The binding is the ``owner_retry`` event's own ``run_id``, which
     :func:`kanban_db.unblock_task` copies from the very event that recorded
@@ -3417,9 +3424,15 @@ def _owner_run_retry_reasons(
             payload = json.loads(row["payload"]) if row["payload"] else None
         except (json.JSONDecodeError, TypeError):
             payload = None
-        reason = payload.get("reason") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        run_id = int(row["run_id"])
+        reason = payload.get("reason")
         if isinstance(reason, str) and reason.strip():
-            reasons[int(row["run_id"])] = reason
+            reasons[run_id] = reason
+        if previous_pins is not None and "previous_route" in payload and run_id not in previous_pins:
+            # The ended run keeps its old lock after the card gets a new one.
+            previous_pins[run_id] = owner_task_route_pin(payload["previous_route"]) or OwnerTaskRoutePin(valid=False)
     return reasons
 
 
@@ -3789,6 +3802,8 @@ def read_project_snapshot(
     )
     conn = _open_read_only_sqlite(board_path, label="kanban.db")
     try:
+        # Read each card and its event revision from one SQLite snapshot.
+        conn.execute("BEGIN")
         task_rows = conn.execute(
             "SELECT * FROM tasks WHERE project_id = ? AND task_kind = 'work' "
             "AND status != 'archived' ORDER BY priority DESC, created_at ASC, id ASC LIMIT ?",
@@ -3859,6 +3874,10 @@ def read_project_snapshot(
         )
         for task_id in provider_waits:
             stopped_work[task_id] = _OWNER_STOPPED_WORK_PROVIDER_WAIT
+        retry_candidates = _owner_provider_held_runs(conn, [
+            task.id for task in tasks
+            if task.id in provider_waits and task.id == os.environ.get("HERMES_OPENAI_RETRY_TASK_ID")
+        ])
         delivering = set()
         if delivery_state:
             from hermes_cli.kanban_delivery import unfinished_delivery_task_ids
@@ -3895,6 +3914,13 @@ def read_project_snapshot(
                 "parent_ids": parent_map[task.id],
                 "child_ids": child_map[task.id],
             })
+            held = retry_candidates.get(task.id)
+            if held is not None and held["id"] == provider_waits[task.id][0]:
+                offer = owner_retry_route.offer(
+                    task, held, revision=state["revision"] if state else 0,
+                )
+                if offer is not None:
+                    columns[task.status][-1]["retry_route"] = offer.view()
             if owner_waiting and task.id in owner_waits:
                 wait = owner_waits[task.id]
                 columns[task.status][-1]["owner_wait"] = {
@@ -3941,8 +3967,10 @@ def read_project_snapshot(
         # reason is looked up by that exact run id — never by task-and-time
         # proximity, which would hand one attempt's reason to another. A run
         # nobody retried resolves to nothing and says nothing.
+        previous_pins: dict[int, OwnerTaskRoutePin] = {}
         retry_reasons = _owner_run_retry_reasons(
             conn, [row["id"] for row in run_rows[:_OWNER_PROJECT_MAX_RUNS]],
+            previous_pins=previous_pins,
         )
         # The list is globally newest-first, so the first row carrying a given
         # exact task id is that task's newest run and every later row for the
@@ -3998,7 +4026,7 @@ def read_project_snapshot(
                 _owner_project_run_projection(
                     run,
                     row["task_title"],
-                    task_pin=owner_task_route_pin(row),
+                    task_pin=previous_pins.get(run.id) or owner_task_route_pin(row),
                     has_newer_run=run_task_id in task_ids_with_newer_run,
                     retry_origin=retry_origins.get(
                         run.id, kanban_db.RETRY_ORIGIN_UNATTRIBUTED
@@ -7749,32 +7777,43 @@ def _provider_held_run(conn: sqlite3.Connection, task_id: str) -> Optional[sqlit
 
 
 def _retry_provider_wait(
-    conn: sqlite3.Connection, task_id: str, *, owner_retry: dict,
-) -> Optional[sqlite3.Row]:
-    """Record the owner's retry against the run a card waits on; the card keeps its status.
-
-    The card must still be waiting inside this transaction; the ``owner_retry``
-    event, bound to that run, is then the only write, and it is what ends the
-    run's hold (``kanban_db.check_respawn_guard``). Returns the held run, or
-    None having written nothing.
-    """
+    conn: sqlite3.Connection, task_id: str, *, project_id: str, owner_retry: dict,
+    route_token: str | None = None,
+) -> str | None:
+    """Record the retry and any approved route change. Return a reason for refusal."""
     with kanban_db.write_txn(conn):
         held = _provider_held_run(conn, task_id)
         if held is None:
-            return None
+            return "This work changed while you were confirming, so nothing was retried."
+        if route_token is not None:
+            task = kanban_db.get_task(conn, task_id)
+            offer = (
+                owner_retry_route.offer(
+                    task, held, revision=kanban_db.task_event_revision(conn, task_id),
+                )
+                if task and task.project_id == project_id
+                else None
+            )
+            if (
+                offer is None
+                or offer.token != route_token
+                or kanban_db.check_respawn_guard(conn, task_id) != "rate_limit_cooldown"
+            ):
+                return "This retry choice is no longer available. Reload this Project and check the work."
+            if not owner_retry_route.openai_ready(offer.previous["assignee"]):
+                return "This role needs a valid sign-in for the selected provider. This work is still waiting."
+            owner_retry_route.repin(conn, task_id, offer, int(held["id"]))
+            owner_retry = {**owner_retry, "previous_route": offer.previous}
         kanban_db._append_event(
             conn, task_id, kanban_db.OWNER_RETRY_EVENT_KIND,
             {
-                "reason": owner_retry.get("reason"),
-                "actor": owner_retry.get("actor"),
-                "profile": owner_retry.get("profile"),
-                "idempotency_key": owner_retry.get("idempotency_key"),
+                **owner_retry,
                 "stopped_because": _OWNER_STOPPED_WORK_PROVIDER_WAIT,
                 "status": held["status"],
             },
             run_id=int(held["id"]),
         )
-    return held
+    return None
 
 
 def retry_task(
@@ -7784,6 +7823,7 @@ def retry_task(
     project_id: str,
     task_id: str,
     reason: str,
+    route_token: str | None = None,
 ) -> dict:
     """Try stopped work again, on the owner's stated reason.
 
@@ -7808,8 +7848,8 @@ def retry_task(
 
     It also accepts a ready or review card whose latest ended run the AI
     provider limited (``rate_limited``). That card keeps its status: the
-    ``owner_retry`` event, bound to that run, is the only board write, and it
-    ends that run's hold (``kanban_db.check_respawn_guard``). The owner's
+    ``owner_retry`` event, bound to that run, ends its hold. An approved
+    alternate route changes the next run's lock in the same transaction. The owner's
     process never writes any profile's credential pool: the card's own worker,
     when it next starts, clears its own pool's limit for the provider it is
     about to use (``kanban_db.owner_retried_provider_limit``).
@@ -7860,6 +7900,7 @@ def retry_task(
             project_id=project_id,
             task_id=task_id,
             reason=reason,
+            route_token=route_token,
         ),
     )
 
@@ -7882,6 +7923,8 @@ def retry_task(
         )
 
     payload = {"project_id": project_id, "task_id": task_id, "reason": reason}
+    if route_token is not None:
+        payload["route_token"] = route_token
     digest = _digest(payload)
 
     pconn = projects_db.connect()
@@ -7909,7 +7952,7 @@ def retry_task(
 
         approval = _confirm(
             ctx, operation=operation, digest=digest,
-            description=f"Try {owner_title(task.title)!r} again",
+            description=f"Try {owner_title(task.title)!r} again" + (" with OpenAI" if route_token else ""),
         )
         if not approval.get("approved"):
             result = {"ok": False, "error": "confirmation_denied", "reason": approval.get("reason")}
@@ -7966,25 +8009,21 @@ def retry_task(
                             evidence = kanban_db.stopped_work_retry_evidence(
                                 kconn, task_id,
                             )
-                            if (
+                            if route_token is not None or (
                                 evidence is None
                                 and _provider_held_run(kconn, task_id) is not None
                             ):
-                                held = _retry_provider_wait(
-                                    kconn, task_id,
+                                refusal = _retry_provider_wait(
+                                    kconn, task_id, project_id=project_id,
                                     owner_retry={
                                         "reason": reason,
                                         "actor": ctx.actor,
                                         "profile": ctx.profile,
                                         "idempotency_key": idempotency_key,
                                     },
+                                    route_token=route_token,
                                 )
-                                if held is None:
-                                    refusal = (
-                                        "This work changed while you were "
-                                        "confirming, so nothing was retried."
-                                    )
-                                else:
+                                if refusal is None:
                                     retried = kanban_db.committed_owner_retry_event(
                                         kconn, task_id,
                                         actor=ctx.actor, profile=ctx.profile,
