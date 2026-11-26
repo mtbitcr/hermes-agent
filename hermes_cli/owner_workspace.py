@@ -2920,6 +2920,8 @@ OWNER_PROJECT_REVIEW_ADVICE_CAPABILITY = "project_review_advice_v1"
 OWNER_INPUT_UPLOAD_CAPABILITY = "owner_input_upload_v1"
 # The same for a designer card's pictured options (card 2 of the design options plan): ``design_options`` and ``recent_design_choices``.
 DESIGN_OPTIONS_CAPABILITY = "design_options_v1"
+# The reader token that gates ``question`` on the Decisions list (owner answer plan, S10).
+OWNER_ANSWER_CAPABILITY = "owner_answer_v1"
 _OWNER_STOPPED_WORK_PROVIDER_WAIT = "provider_wait"
 _OWNER_PROVIDER_WAITING_SUMMARY = (
     "Waiting for the AI provider. Work resumes by itself after {time} UTC."
@@ -4254,7 +4256,7 @@ _SUGGESTION_FALLBACK_TITLE = "A suggested capability change"
 
 def list_owner_decisions(
     ctx: OwnerContext, *, owner_waiting: bool = False, owner_input_upload: bool = False, design_options: bool = False,
-    closed_suggestions: bool = False, model_update: bool = False,
+    closed_suggestions: bool = False, model_update: bool = False, owner_answer: bool = False,
 ) -> dict:
     """Project pending native gates into one owner-safe read-only inbox.
 
@@ -4288,6 +4290,13 @@ def list_owner_decisions(
     ``OWNER_CLOSED_SUGGESTIONS_CAPABILITY``. A suggestion with a live checked
     closure then leaves the pending window and the list carries ``closed``,
     the newest 20 closures the owner can undo.
+
+    ``owner_answer`` is set only for a reader that named
+    ``OWNER_ANSWER_CAPABILITY``. Each owner-input item of a work card that
+    waits on the owner now, with no missing named input and no design
+    options, then carries ``question`` (see
+    :func:`hermes_cli.owner_questions.decision_questions`). Every other
+    item, and every item for another reader, is unchanged.
     """
     from hermes_cli.owner_recommendation_closures import live_closure_filter, recent_closed_suggestions
 
@@ -4318,6 +4327,7 @@ def list_owner_decisions(
         waits: dict[str, dict] = {}
         missing: dict[str, list[dict]] = {}
         options: dict[str, dict] = {}
+        questions: dict[str, dict] = {}
         conn = _open_read_only_sqlite(board_path, label="kanban.db")
         try:
             columns = {
@@ -4382,6 +4392,18 @@ def list_owner_decisions(
                 recent = recent_design_choices(conn, project, recent)
             if closed_suggestions:
                 closed = recent_closed_suggestions(conn, ctx, project, closed)
+            if owner_answer:
+                from hermes_cli.owner_questions import decision_questions
+
+                window = [
+                    str(row["id"]) for row in rows[:_OWNER_DECISIONS_LIMIT]
+                    if str(row["task_kind"]) == "work"
+                ]
+                # Upload and design choice stops keep their own routes (S4).
+                own_route = {*decision_missing_inputs(conn, window), *decision_design_options(conn, window)}
+                questions = decision_questions(
+                    conn, [task_id for task_id in window if task_id not in own_route], ctx,
+                )
         except sqlite3.Error as exc:
             raise OwnerWorkspaceError(
                 "snapshot_unavailable", "the Project decisions could not be read"
@@ -4472,6 +4494,8 @@ def list_owner_decisions(
                 decisions[-1]["missing_inputs"] = missing[str(row["id"])]
             if kind == "owner_input" and str(row["id"]) in options:
                 decisions[-1]["design_options"] = options[str(row["id"])]
+            if kind == "owner_input" and str(row["id"]) in questions:
+                decisions[-1]["question"] = questions[str(row["id"])]
 
     authority_order = {"owner_input": 0, "capability": 1}
     decisions.sort(
