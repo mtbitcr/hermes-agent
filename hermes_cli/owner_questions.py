@@ -42,46 +42,159 @@ REVIEW_LIMIT_CHOICES = (
     "Repair it once more with the reviewer's corrections.",
     "Stop this work and release nothing.",
 )
-# A sentence mark, or a run of them, with any closing quotes or brackets after
-# it, then what follows it on the line: any space, and the next two characters.
-# The ASCII marks and the common marks of other scripts, after which the next
-# sentence needs no space (S2).
-_SENTENCE_MARK = re.compile(
-    r"([.!?。！？．｡‼⁇⁈⁉؟۔।॥።။։]+)[\"')\]’”」』）】]*(?=(\s*)(\S?)(.?))"
+# The sentence rule of a choice (S2); :func:`_one_sentence` explains it.
+# The marks that end a sentence: the ASCII marks, the ellipsis, and the full
+# stops and question or exclamation marks of other scripts. The Greek question
+# mark looks like a semicolon, so it is written as an escape.
+_MARKS = ".!?…。！？．｡‼⁇⁈⁉؟۔।॥።။։\u037e"
+# Each quote or bracket that can close right after a mark, with the one that
+# opens it. A straight quote opens and closes alike.
+_OPENERS = {
+    "”": "“", "’": "‘", ")": "(", "]": "[", "」": "「", "』": "『", "）": "（", "】": "【",
+    '"': '"', "'": "'",
+}
+# A run of marks, with the closing quotes or brackets in it or right after it.
+_SENTENCE_END = re.compile(
+    "[" + re.escape(_MARKS) + "][" + re.escape(_MARKS + "".join(_OPENERS)) + "]*"
 )
+# The punctuation a sentence goes on with: a comma, a semicolon, a colon, a
+# hyphen or a dash.
+_JOINERS = ",;:-–—"
+# The Japanese particles that join a quotation to its sentence: と and って
+# quote it, を makes it the object. No word starts with を.
+_PARTICLES = ("と", "って", "を")
+# A dotted abbreviation: two or more groups of one or two letters, each with
+# its point, as in U.S., e.g., a.m. or Ph.D.
+_DOTTED = re.compile(r"(?<![\w.])(?:[^\W\d_]{1,2}\.){2,}")
+# The word right before a point, with any points inside it, as "etc" or "e.g".
+_WORD = re.compile(r"(?<![\w.])[^\W\d_]+(?:\.[^\W\d_]+)*\Z")
+# Titles before a name and lead-ins, whose point ends no sentence.
+_TITLES = {"Dr", "Mr", "Mrs", "Ms", "Mx", "Prof", "St", "Mt"}
+_LEAD_INS = {"e.g", "i.e", "vs", "cf", "approx", "incl"}
+# Number lead-ins and months, whose point ends no sentence before a digit.
+_NUMBER_LEAD_INS = {
+    "No", "p", "pp", "Fig", "Vol",
+    "Jan", "Feb", "Mar", "Apr", "Jun", "Jul", "Aug", "Sep", "Sept", "Oct", "Nov", "Dec",
+}
+# Abbreviations that can end a sentence, as every dotted one can; "al" is
+# that of et al.
+_CAN_END = {"etc", "al", "Inc", "Ltd", "Co", "Corp", "Jr", "Sr"}
 
 
-def _two_sentences(text: str) -> bool:
-    """Whether a second sentence starts after a sentence mark in *text*.
+def _one_sentence(text: str) -> bool:
+    """Whether *text* is exactly one sentence: the S2 rule for a choice.
 
-    It does when whitespace and more text follow the mark, as in a design
-    option sentence; when any text follows a mark that is not ASCII
-    ("。次に"); when a letter follows "!" or "?" directly ("form!Then"); and
-    when an uppercase letter follows "." directly and something other than
-    "." follows that letter ("form.I will", unlike "U.S." or "Ph.D."). A mark
-    at the very end, or the point in "2.5", starts nothing.
+    A sentence holds at least one letter, of any script; marks, digits or
+    spaces alone are no sentence. A sentence ends at a run of the marks
+    . ! ? … or the full stops and question or exclamation marks of other
+    scripts, with the quotes or brackets that close right after the marks. A
+    quote or bracket closes there only if the text opened it before; a
+    straight quote, only if the same quote came before. Any text after an end
+    starts a second sentence, glued to the end or not, unless one of these
+    holds:
+
+    - the end is a point inside a number, as in 2.5 or 2.5.1, or before one,
+      as in .5;
+    - it is a point inside a dotted abbreviation, as in U.S., e.g., a.m. or
+      Ph.D.;
+    - it is the point of a title (Dr. Mr. Mrs. Ms. Mx. Prof. St. Mt.) before
+      a name, that is before a letter, or of a lead-in (e.g. i.e. vs. cf.
+      approx. incl.);
+    - it is the point of a number lead-in or a month (No. p. pp. Fig. Vol.
+      Jan. Feb. Mar. Apr. Jun. Jul. Aug. Sep. Sept. Oct. Nov. Dec.) before a
+      digit;
+    - it is the last point of an abbreviation that can end a sentence (etc.
+      et al. Inc. Ltd. Co. Corp. Jr. Sr. and every dotted one), before a
+      space and a lowercase letter, or before , ; : a hyphen or a dash;
+    - it is an ellipsis (… or three points or more) before a lowercase letter;
+    - a quote or bracket closes there, as in “Ready?” or (wait!), and a
+      lowercase letter, , ; : a hyphen or a dash comes next, or a Japanese
+      particle that joins the quotation to its sentence, と, って or を,
+      comes right after it, as in “準備はいいですか？”と聞きます。.
+
+    Abbreviations count only as written here, so "ms." or "no." is no title
+    and no number lead-in; a lead-in may also start with a capital, but
+    "VS." is no lead-in.
+
+    Where the rule cannot tell an abbreviation from the end of a sentence,
+    it refuses: an abbreviation that can end a sentence, as U.S. or etc.,
+    before a capital or a numeral, glued or not ("U.S. Then", "etc. 2",
+    "U.S.2"); a single capital letter before a capital ("option A. It");
+    and a closing quote before a letter of a caseless script other than
+    those particles (“はい。”次に進みます。). S2 prefers a refusal, which the
+    worker rewrites with nothing written, to a second sentence stored. Only
+    a title before a capital and と right after a quotation are read the
+    other way, as one sentence, since a name and the quoting particle are
+    what usually follow them. A semicolon never ends a sentence, as in
+    English, even where Greek text uses it as a question mark; the separate
+    Greek question mark character (U+037E) does.
     """
-    for marks, space, after, then in _SENTENCE_MARK.findall(text):
-        if after and (
-            space
-            or not marks.isascii()
-            or (marks[-1] in "!?" and after.isalpha())
-            or (marks[-1] == "." and after.isupper() and then not in ("", "."))
-        ):
-            return True
+    if not any(char.isalpha() for char in text):
+        return False
+    for end in _SENTENCE_END.finditer(text):
+        start, stop = end.span()
+        # The end stops before a quote or bracket that nothing opened.
+        stop = next(
+            (
+                at for at in range(start + 1, stop)
+                if text[at] in _OPENERS and _OPENERS[text[at]] not in text[:at]
+            ),
+            stop,
+        )
+        if text[stop:].strip() and not _goes_on(text, start, stop):
+            return False
+    return True
+
+
+def _goes_on(text: str, start: int, stop: int) -> bool:
+    """Whether the sentence goes on after its end ``text[start:stop]``, which
+    more text follows, by the exceptions of :func:`_one_sentence`."""
+    run, rest = text[start:stop], text[stop:]
+    after = rest.lstrip()
+    follows, spaced = after[0], len(after) < len(rest)
+    if any(char in _OPENERS for char in run):
+        return (
+            follows.islower()
+            or follows in _JOINERS
+            or (not spaced and after.startswith(_PARTICLES))
+        )
+    if set(run) <= set(".…") and (len(run) >= 3 or "…" in run):
+        return follows.islower()
+    if run != ".":
+        return False
+    before = text[start - 1] if start else " "
+    if follows.isdigit() and not spaced and (before.isdigit() or before.isspace()):
+        return True
+    dotted = next(
+        (match for match in _DOTTED.finditer(text) if match.start() < start < match.end()),
+        None,
+    )
+    if dotted and start < dotted.end() - 1:
+        return True
+    word = _WORD.search(text[:start])
+    word = word.group() if word else ""
+    if word in _TITLES:
+        return follows.isalpha()
+    if word[:1].lower() + word[1:] in _LEAD_INS:
+        return True
+    if word in _NUMBER_LEAD_INS:
+        return follows.isdigit()
+    if word in _CAN_END or dotted:
+        return (spaced and follows.islower()) or follows in _JOINERS
     return False
 
 
 def _plain_text(value: Any, what: str, *, limit: int, sentence: bool) -> str:
     """*value* when it is 1 to *limit* code points of plain owner text.
 
+    It must hold a letter: marks, digits or spaces alone are not plain words.
     With *sentence*, it must also be exactly one sentence on one line (S2).
     """
     if (
         not isinstance(value, str)
-        or not value.strip()
+        or not any(char.isalpha() for char in value)
         or len(value) > limit
-        or (sentence and (value.splitlines() != [value] or _two_sentences(value)))
+        or (sentence and (value.splitlines() != [value] or not _one_sentence(value)))
         or check_owner_text(value, "planner_prose") != value
     ):
         shape = "exactly one sentence of " if sentence else ""
