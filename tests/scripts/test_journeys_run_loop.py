@@ -47,6 +47,7 @@ LIMIT_MINUTES = 118
 
 REASONS = {
     "refresh": "the stack could not be brought to the released versions",
+    "isolation": "the isolation check failed",
     "time": "the run's time ran out before the next journey",
     "reset": "the stack reset failed",
     "seed": "the seed failed",
@@ -85,6 +86,10 @@ def record(label, extra=None):
     after = answers.get("elapsed_after", {}).get(label)
     if after is not None:
         (top / "clock").write_text(str(BASE + after))
+    if answers.get("break_held") == label:
+        for held_dir in Path(os.environ["TMPDIR"]).glob("run_once.*"):
+            (held_dir / "held").unlink(missing_ok=True)
+            (held_dir / "held").mkdir()
     folder = answers.get("make_folder", {}).get(label)
     if folder is not None:
         Path(folder).mkdir(parents=True)
@@ -96,11 +101,6 @@ def record(label, extra=None):
 def current_journey():
     # reset 1 is the run's first reset, before any journey; journey k follows reset k + 1
     return ORDER[int((top / "reset.count").read_text()) - 2]
-
-
-def held_size():
-    root = os.environ.get("TMPDIR", "")
-    return sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(root) for f in fs)
 
 
 def noise(rc):
@@ -173,13 +173,9 @@ if name == "ssh":
         sys.stderr.flush()
         noise(rc)
     if label in answers.get("stdout_first", []):
-        before = held_size()
         sys.stdout.write(answer)
         sys.stdout.flush()
-        # a runner that copies the answer on its way keeps the order only if the copy is made before the errors come
-        give_up = time.monotonic() + 10  # a runner that keeps nothing there must fail the test, not hang it
-        while held_size() - before < 2 * len(answer.encode()) and time.monotonic() < give_up:
-            pass
+        time.sleep(0.2)  # the errors come well after the answer
         sys.stderr.write(errors)
         sys.stderr.flush()
     else:
@@ -687,7 +683,7 @@ def test_each_failed_command_step_keeps_the_output_of_its_newest_command(box, st
     assert lines[-3:] == ["NEWEST-" + label, LEAK, LEAK]
 
 
-def test_a_failed_owner_app_step_keeps_the_errors_and_the_last_page_in_order_but_decides_from_the_page_only(box):
+def test_a_failed_owner_app_step_keeps_the_errors_then_the_last_page_but_decides_from_the_page_only(box):
     box.answer(page="<html>Something went wrong</html>", stderr={"app 3": "curl-error-line\n"})
 
     assert box.run().returncode == 1
@@ -697,7 +693,7 @@ def test_a_failed_owner_app_step_keeps_the_errors_and_the_last_page_in_order_but
     assert lines[4:] == ["curl-error-line", "<html>Something went wrong</html>"]
 
 
-def test_the_errors_of_the_proxy_check_are_kept_in_order_but_never_decide_it(box):
+def test_the_errors_of_the_proxy_check_are_kept_before_the_answer_but_never_decide_it(box):
     box.answer(proxy='{"keys":[]}', stderr={"proxy 3": f'"kid":"{KID}"\n'})
 
     assert box.run().returncode == 1
@@ -1027,26 +1023,55 @@ def test_an_early_stderr_fragment_before_41_stdout_rows_is_the_oldest_of_the_com
 
 
 @pytest.mark.parametrize("label", ["proxy 3", "app 3"])
-def test_a_stderr_fragment_after_41_stdout_rows_is_the_newest_of_the_combined_output(box, label):
+def test_a_stderr_fragment_of_a_check_comes_before_the_answer_even_when_the_answer_was_written_first(box, label):
     rows = "".join(f"row {i}\n" for i in range(1, 42))
     answers = {"proxy": rows} if label.startswith("proxy") else {"page": rows}
     box.answer(stderr={label: "late fragment"}, stdout_first=[label], **answers)
 
     assert box.run().returncode == 1
 
-    assert _kept(box)[4:] == [*[f"row {i}" for i in range(3, 42)], "late fragment"]
+    assert _kept(box)[4:] == [f"row {i}" for i in range(2, 42)]  # the fragment joins row 1, which drops out
 
 
 @pytest.mark.parametrize("label", ["proxy 3", "app 3"])
 @pytest.mark.parametrize("stdout_first", [False, True])
-def test_partial_lines_of_both_streams_join_in_the_order_they_came(box, label, stdout_first):
+def test_the_log_of_a_check_holds_the_errors_first_and_then_the_answer_whichever_stream_wrote_first(
+    box, label, stdout_first,
+):
     answers = {"proxy": "out one\nout part"} if label.startswith("proxy") else {"page": "out one\nout part"}
-    box.answer(stderr={label: "err part|err end"}, stdout_first=[label] if stdout_first else [], **answers)
+    box.answer(stderr={label: "err one\nerr two\n"}, stdout_first=[label] if stdout_first else [], **answers)
 
     assert box.run().returncode == 1
 
-    expected = ["out one", "out parterr part|err end"] if stdout_first else ["err part|err endout one", "out part"]
-    assert _kept(box)[4:] == expected
+    assert _kept(box)[4:] == ["err one", "err two", "out one", "out part"]
+
+
+@pytest.mark.parametrize("label", ["proxy 3", "app 3"])
+def test_partial_lines_of_the_errors_and_the_answer_of_a_check_join_with_the_errors_first(box, label):
+    answers = {"proxy": "out one\nout part"} if label.startswith("proxy") else {"page": "out one\nout part"}
+    box.answer(stderr={label: "err part|err end"}, stdout_first=[label], **answers)
+
+    assert box.run().returncode == 1
+
+    assert _kept(box)[4:] == ["err part|err endout one", "out part"]
+
+
+@pytest.mark.parametrize("label", ["proxy 3", "app 3"])
+def test_a_null_byte_in_the_answer_of_a_check_is_not_kept_and_makes_no_diagnostic(box, label):
+    answers = {"proxy": '{"keys":[]}\x00X\n'} if label.startswith("proxy") else {"page": "bad\x00page\n"}
+    box.answer(**answers)
+
+    done = box.run()
+
+    assert (done.returncode, done.stdout, done.stderr) == (1, "", "")
+    assert b"\x00" not in (box.run_dir / KEPT).read_bytes()
+    assert _kept(box)[4:] == (['{"keys":[]}X'] if label.startswith("proxy") else ["badpage"])
+
+
+def test_a_null_byte_in_the_page_is_dropped_before_the_decision_as_before(box):
+    box.answer(page="<html>Owner\x00 workspace</html>")
+
+    assert box.run().returncode == 0
 
 
 def test_the_stderr_of_the_proxy_check_is_still_never_part_of_the_decision_when_it_comes_after_the_answer(box):
@@ -1077,12 +1102,12 @@ def test_the_owner_app_decision_strips_all_trailing_newlines_of_the_answer_as_be
     assert done.returncode == (0 if end == "passed" else 1)
 
 
-def test_the_kept_page_keeps_its_trailing_newlines_though_the_decision_strips_them(box):
+def test_the_kept_page_is_the_answer_as_the_check_read_it_without_its_trailing_newlines(box):
     box.answer(page="page\n\n")
 
     assert box.run(JOURNEY_PAGE_TEXT="absent").returncode == 1
 
-    assert _kept(box)[4:] == ["page", ""]
+    assert _kept(box)[4:] == ["page"]  # a command substitution strips the trailing line feeds; the log holds what was read
 
 
 FIRST_RENAME_REFUSED_MV = """#!/bin/sh
@@ -1139,3 +1164,150 @@ def test_no_file_of_the_runner_is_left_beside_the_result_or_in_the_temporary_fol
     box.answer()
     assert box.run().returncode == 0
     assert list(box.tmp.iterdir()) == [] and sorted(p.name for p in box.run_dir.iterdir()) == ["result", "run.lock"]
+
+
+# ------------------------------------------------ the repair: the held output is best-effort, never part of the run
+
+CAPTURE_WARNING = "run_once: the output of the steps cannot be held; a failed step keeps its header lines only"
+
+MKDIR_WITH_HELD_AS_FOLDER = """#!/bin/sh
+case $1 in -m) "{real}" "$@" && "{real}" "$3/held" ;; *) exec "{real}" "$@" ;; esac
+"""
+
+# name: (answers, failed step, journey line); each is failed in a run with a usable folder and in one without
+FAILING = {
+    "refresh": ({"rc": {"refresh": 7}}, "refresh", None),
+    "first-reset": ({"rc": {"reset first": 7}}, "reset", None),
+    "reset": ({"rc": {"reset 3": 7}}, "reset", "3"),
+    "isolation-server1": ({"rc": {"isolation server1": 7}}, "isolation", None),
+    "seed": ({"rc": {"seed 3": 7}}, "seed", "3"),
+    "proxy-answer": ({"proxy": '{"keys":[]}', "stderr": {"proxy 3": f'"kid":"{KID}"\n'}}, "proxy", "3"),
+    "proxy-status": ({"rc": {"proxy 3": 22}}, "proxy", "3"),
+    "owner-app-answer": ({"page": "<html>Something went wrong</html>", "stderr": {"app 3": "curl-error\n"}}, "owner-app", "3"),
+    "journeys": ({"rc": {"journey 3": 7}}, "journeys", "3"),
+}
+
+
+def _control(box: Sandbox, **answers) -> tuple[Sandbox, subprocess.CompletedProcess[str]]:
+    """The same run in a sandbox of its own, with the folder of the held output usable."""
+    (box.top / "control").mkdir()
+    control = Sandbox(box.top / "control")
+    control.answer(**answers)
+    return control, control.run()
+
+
+def _folder_is_unusable(box: Sandbox, answers: dict | None = None, **env: str) -> subprocess.CompletedProcess[str]:
+    box.answer(**(answers or {}))
+    return box.run(TMPDIR="/dev/null", **env)
+
+
+def _file_cannot_be_opened(box: Sandbox, answers: dict | None = None, **env: str) -> subprocess.CompletedProcess[str]:
+    """The folder is made, and the held file in it is a folder, so that no open of it can succeed."""
+    mkdir = box.bin / "mkdir"
+    mkdir.unlink()
+    mkdir.write_text(MKDIR_WITH_HELD_AS_FOLDER.format(real=shutil.which("mkdir")), encoding="utf-8")
+    mkdir.chmod(0o755)
+    box.answer(**(answers or {}))
+    return box.run(**env)
+
+
+UNUSABLE = {"no-folder": _folder_is_unusable, "unopenable-file": _file_cannot_be_opened}
+
+
+def _facts(box: Sandbox) -> dict[str, str]:
+    return {key: value for key, value in box.result().items() if key not in ("started", "finished")}
+
+
+def _is_the_run_of_the_main_branch(box, done, control, good) -> None:
+    assert done.returncode == good.returncode and done.stdout == good.stdout == ""
+    assert box.calls() == control.calls()  # each original command ran once, in the same order, with the same words
+    assert _facts(box) == _facts(control)
+    assert box.told() == control.told()
+    assert box.renames() == control.renames()
+    assert good.stderr == ""
+    assert done.stderr == CAPTURE_WARNING + "\n"  # one line for the run, not one for each command
+    assert list(box.tmp.iterdir()) == []
+
+
+@pytest.mark.parametrize("unusable", UNUSABLE)
+def test_a_passing_run_goes_on_as_on_the_main_branch_when_the_held_output_cannot_be_held(box, unusable):
+    control, good = _control(box)
+    assert good.returncode == 0
+
+    done = UNUSABLE[unusable](box)
+
+    _is_the_run_of_the_main_branch(box, done, control, good)
+    assert box.names() == [*PREFIX, *loop_calls(), "reset last", "hermes"]
+    assert box.result()["result"] == "passed" and box.told() == ["Journeys passed."]
+    assert not (box.run_dir / KEPT).exists()
+
+
+# each is run once for each way that the held output can be unavailable; the owner-app one waits out its 120 seconds
+UNUSABLE_AND_FAILING = [
+    (unusable, name) for unusable in UNUSABLE
+    for name in ("refresh", "first-reset", "reset", "isolation-server1", "seed", "proxy-answer", "proxy-status",
+                 "owner-app-answer", "journeys")
+]
+
+
+@pytest.mark.parametrize(("unusable", "name"), UNUSABLE_AND_FAILING)
+def test_a_failing_run_ends_as_on_the_main_branch_with_a_header_only_file_when_the_held_output_cannot_be_held(
+    box, unusable, name,
+):
+    answers, step, journey = FAILING[name]
+    control, good = _control(box, **answers)
+    assert good.returncode == 1
+
+    done = UNUSABLE[unusable](box, answers)
+
+    _is_the_run_of_the_main_branch(box, done, control, good)
+    result = box.result()
+    assert (result["result"], result["step"], result["reason"]) == ("failed", step, REASONS[step])
+    assert result.get("journey") == journey
+    assert box.told() == [f"Journeys failed at step {step}{' for journey ' + journey if journey else ''}: {REASONS[step]}."]
+    assert box.call("hermes")["env"] == {"kept": "True"}  # the header-only file is there before the owner line
+    assert box.renames() == ["absent", "absent"]
+    assert _kept(box) == [
+        f"step={step}", *([f"journey={journey}"] if journey else []),
+        "started=" + result["started"], "finished=" + result["finished"],
+    ]
+    assert (box.run_dir / KEPT).stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("unusable", UNUSABLE)
+@pytest.mark.parametrize(("phrase", "page", "end"), [PARITY[2], PARITY[5]])
+def test_the_owner_app_decides_as_before_when_the_held_output_cannot_be_held(box, unusable, phrase, page, end):
+    done = UNUSABLE[unusable](box, {"page": page}, JOURNEY_PAGE_TEXT=phrase)
+
+    assert box.result()["step" if end != "passed" else "result"] == end
+    assert done.returncode == (0 if end == "passed" else 1)
+    assert done.stderr == CAPTURE_WARNING + "\n"
+
+
+def test_a_held_file_that_breaks_in_the_middle_of_a_passing_run_does_not_change_the_run(box):
+    control, good = _control(box)
+
+    box.answer(break_held="reset first")
+    done = box.run()
+
+    _is_the_run_of_the_main_branch(box, done, control, good)
+    assert box.result()["result"] == "passed" and not (box.run_dir / KEPT).exists()
+
+
+@pytest.mark.parametrize("name", ["proxy-answer", "journeys"])
+def test_a_held_file_that_breaks_in_the_middle_of_a_failing_run_leaves_a_header_only_file_with_none_of_the_earlier_output(
+    box, name,
+):
+    answers, step, journey = FAILING[name]
+    answers = {**answers, "output": {"reset 3": "OUTPUT-OF-THE-RESET", "journey 3": "OUTPUT-OF-THE-JOURNEY"}}
+    control, good = _control(box, **answers)
+
+    box.answer(break_held="reset 3", **answers)
+    done = box.run()
+
+    _is_the_run_of_the_main_branch(box, done, control, good)
+    result = box.result()
+    assert (result["step"], result["journey"]) == (step, journey)
+    assert _kept(box) == [
+        f"step={step}", f"journey={journey}", "started=" + result["started"], "finished=" + result["finished"],
+    ]

@@ -27,14 +27,18 @@
 # journey=<n>. Then one owner line. A result or an owner
 # line that cannot be stored or sent is its own failed step (result, notify), never retried; "passed" is
 # only ever sent after "passed" was stored. Exit 0 only for a pass that was stored and told.
-# Of each step that runs a command, the runner holds the output (standard output and errors, in the order they
-# came, every byte) of the newest command, in a private folder outside RUN_DIR that goes with the run. When a step
-# fails and its result is stored, the last 40 lines of it (each cut at 400 characters; none for config, time and
-# result, which run no command: their file holds the header lines only), under the header lines, go to one private
-# file, RUN_DIR/failed-step.log, written in place (no temporary file, no rename) before the owner line; the next
-# run removes it at its start, so it describes the newest run and a passing run leaves none. It stays on
-# Server 1: it is never sent or printed. The result still holds a fixed reason only, never a value or the page's
-# text.
+# Of each step that runs a command, the runner holds the output of the newest command, in a private folder outside
+# RUN_DIR that goes with the run: for the steps proxy and owner-app the errors first, then the answer that the check
+# read (so the log does not show the order of the two streams, and a NUL byte of the answer is not kept); for each
+# other step standard output and errors together, in the order they came, every byte. When a step fails and its
+# result is stored, the last 40 lines of it (each cut at 400 characters; none for config, time and result, which run
+# no command: their file holds the header lines only), under the header lines, go to one private file,
+# RUN_DIR/failed-step.log, written in place (no temporary file, no rename) before the owner line; the next run
+# removes it at its start, so it describes the newest run and a passing run leaves none. It stays on Server 1: it
+# is never sent or printed. The result still holds a fixed reason only, never a value or the page's text.
+# Holding is best-effort: when the folder cannot be made or the held file cannot be opened, the runner prints one
+# line to its standard error, runs every command once with its output dropped, decides as it always did, and a
+# failed step leaves a file of the header lines only.
 #
 # Settings, set by the operator in the unit's environment (start.sh passes them on) unless noted:
 #   HERMES_HOME                Server 1 platform home: the run folder is HERMES_HOME/journeys (lock and result),
@@ -108,15 +112,24 @@ flock -n 9 || {
 
 rm -f "$FAILED_STEP_LOG" 2> /dev/null || echo "run_once: the file of the earlier failed step could not be removed" >&2
 
+# capture_off: the output of the steps is not held from here on; the run goes on. One line for the whole run.
+CAPTURE=1 CAPTURE_WARNED=0 HFD=""
+capture_off() {
+  CAPTURE=0
+  if ((!CAPTURE_WARNED)); then
+    CAPTURE_WARNED=1
+    echo "run_once: the output of the steps cannot be held; a failed step keeps its header lines only" >&2
+  fi
+}
+
 # The output of a command is held in a file of this folder (a variable cannot hold every byte); it goes with the run.
 HOLD_DIR=${TMPDIR:-/tmp}/run_once.$$.$RANDOM
-mkdir -m 700 "$HOLD_DIR" 2> /dev/null || {
-  echo "run_once: the folder for the held output cannot be used" >&2
-  exit 1
-}
-trap 'rm -rf "$HOLD_DIR"' EXIT
 HELD_FILE=$HOLD_DIR/held
-ANSWER_FILE=$HOLD_DIR/answer
+if mkdir -m 700 "$HOLD_DIR" 2> /dev/null; then
+  trap 'rm -rf "$HOLD_DIR"' EXIT
+else
+  capture_off
+fi
 
 JOURNEY=""
 now() { printf '%(%Y-%m-%dT%H:%M:%SZ)T' -1; }
@@ -207,7 +220,7 @@ finish() {
   if ((stored)) && [[ $outcome == failed ]]; then
     case $step in
       config | time | result) keep_failed_step "$step" "$finished" 0 ;; # no command ran: the header lines only
-      refresh | reset | isolation | seed | proxy | owner-app | journeys) keep_failed_step "$step" "$finished" 1 ;;
+      refresh | reset | isolation | seed | proxy | owner-app | journeys) keep_failed_step "$step" "$finished" "$CAPTURE" ;;
     esac
   fi
   if ! tell "$line"; then
@@ -258,40 +271,47 @@ store_result started none "the run has started and has not ended" || finish fail
     read_runner_env
 } || finish failed config
 
+# open_held: opens HELD_FILE empty on the descriptor HFD; false when holding is off or the open fails (a redirect that
+# fails on a command would keep the command from running, so the open is made here, before it).
+open_held() {
+  ((CAPTURE)) || return 1
+  { exec {HFD}> "$HELD_FILE"; } 2> /dev/null && return 0
+  capture_off
+  return 1
+}
 # hold COMMAND [ARG...]: runs the command with no input; its output (standard output and errors on one open file,
-# so in the order they came, every byte) is held in HELD_FILE. The status is the command's.
+# so in the order they came, every byte) is held in HELD_FILE, or, when it cannot be held, dropped. The status is the
+# command's.
 hold() {
-  { "$@" > "$HELD_FILE" 2>&1 < /dev/null; } 2> /dev/null
+  local status
+  if open_held; then
+    { "$@" >&"$HFD" 2>&1 < /dev/null {HFD}>&-; } 2> /dev/null
+    status=$?
+    exec {HFD}>&-
+  else
+    { "$@" > /dev/null 2>&1 < /dev/null; } 2> /dev/null
+    status=$?
+  fi
+  return "$status"
 }
 # remote COMMAND: one command on Server 2 through the runner identity; its output is held, not shown.
 remote() { hold ssh "$JOURNEY_RUNNER_SSH" "$1"; }
-# copy_stdout: the standard output of a command, chunk by chunk as it comes, to the answer (standard output of this
-# function) and to the held output (fd 5), so that it joins the errors, which go there directly, in order.
-copy_stdout() {
-  local chunk rc
-  while :; do
-    IFS= read -r -t 0.02 -N 65536 chunk
-    rc=$?
-    printf '%s' "$chunk"
-    printf '%s' "$chunk" >&5
-    ((rc == 1)) && break
-  done
-}
-# remote_answer COMMAND: the same, with the command's standard output also set apart as ANSWER, which alone is
-# checked (as the answer of a command substitution: no trailing newline); the held output gets both streams in the
-# order they came.
+# remote_answer COMMAND: the answer is read as a command substitution reads it (standard output alone, no input, no
+# NUL byte, no trailing line feed); the errors go to the held output, and when the command has ended the answer is
+# added to it, as it was read.
 remote_answer() {
   local status
   ANSWER=""
-  : > "$HELD_FILE"
-  {
-    coproc COPY { copy_stdout 5>> "$HELD_FILE"; } > "$ANSWER_FILE"
-    ssh "$JOURNEY_RUNNER_SSH" "$1" >&"${COPY[1]}" 2>> "$HELD_FILE" < /dev/null
-    status=$?
-    exec {COPY[1]}>&-
-    wait "$COPY_PID"
-    ANSWER=$(< "$ANSWER_FILE")
-  } 2> /dev/null
+  if open_held; then
+    {
+      ANSWER=$(ssh "$JOURNEY_RUNNER_SSH" "$1" 2>&"$HFD" < /dev/null {HFD}>&-)
+      status=$?
+      printf '%s' "$ANSWER" >&"$HFD"
+    } 2> /dev/null
+    exec {HFD}>&-
+  else
+    { ANSWER=$(ssh "$JOURNEY_RUNNER_SSH" "$1" 2> /dev/null < /dev/null); status=$?; } 2> /dev/null
+  fi
   return "$status"
 }
 
@@ -305,7 +325,7 @@ hold "$HERE/isolation_check.sh" server1 || finish failed isolation
 # What a healthy sign-in proxy answers: its key list, with the key id that its source names.
 proxy_answers() {
   local line issuer="" kid=""
-  : > "$HELD_FILE"
+  if ((CAPTURE)) && ! { : > "$HELD_FILE"; } 2> /dev/null; then capture_off; fi
   while IFS= read -r line; do
     if [[ $line =~ ^ISSUER\ =\ \"([^\"]*)\"$ ]]; then issuer=${BASH_REMATCH[1]}; fi
     if [[ $line =~ ^KID\ =\ \"([^\"]*)\"$ ]]; then kid=${BASH_REMATCH[1]}; fi
