@@ -221,6 +221,15 @@ async def test_release_decision_lists_the_waiting_batch_in_plain_words(root):
         "version": batch["version"],
         "digest": batch["digest"],
         "actions": ["accept", "defer"],
+        "parts": {
+            "platform": [
+                "Show the release decision",
+                "Keep the owner page fast",
+                "This piece of work has a title Raphael cannot show here.",
+            ],
+            "owner_app": [],
+        },
+        "parts_sentence": "These changes update Raphael's platform.",
     }
     assert body["release"] is None
     hidden = [str(root), "github.com", "t_0badc0de", "1a2b3c4d5e", "start.py"]
@@ -769,7 +778,7 @@ async def test_the_release_object_keeps_every_existing_key_and_value(root):
     batch = _merge("a", "Show the release decision")
     release = await _release_after(batch, "released")
 
-    assert set(release) == RELEASE_KEYS | NEW_KEYS
+    assert set(release) == RELEASE_KEYS | NEW_KEYS | {"parts", "parts_sentence", "released_parts_sentence"}
     assert {key: release[key] for key in RELEASE_KEYS} == {
         "batch_id": batch["batch_id"],
         "state": "released",
@@ -780,3 +789,6 @@ async def test_the_release_object_keeps_every_existing_key_and_value(root):
         "outcome_text": "It was released.",
         "actions": [],
     }
+    assert release["parts"] == {"platform": ["Show the release decision"], "owner_app": []}
+    assert release["parts_sentence"] == "These changes update Raphael's platform."
+    assert release["released_parts_sentence"] == "Raphael's platform now runs these changes."
