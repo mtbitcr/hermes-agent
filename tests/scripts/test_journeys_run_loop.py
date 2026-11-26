@@ -56,7 +56,7 @@ REASONS = {
 }
 
 STAND_IN = r'''
-import json, os, sys
+import json, os, sys, time
 from pathlib import Path
 
 top = Path(__file__).parent
@@ -88,6 +88,9 @@ def record(label, extra=None):
     folder = answers.get("make_folder", {}).get(label)
     if folder is not None:
         Path(folder).mkdir(parents=True)
+    link = answers.get("make_link", {}).get(label)
+    if link is not None:
+        Path(link[0]).symlink_to(link[1])
 
 
 def current_journey():
@@ -96,6 +99,10 @@ def current_journey():
 
 
 def noise(rc):
+    if last in answers.get("exact", {}):
+        sys.stdout.write(answers["exact"][last])
+        sys.stdout.flush()
+        sys.exit(rc)
     if last in answers.get("output", {}):
         sys.stdout.write(answers["output"][last] + "\n")
         sys.stdout.flush()
@@ -149,6 +156,9 @@ if name == "ssh":
     record(label)
     rc = answers["rc"].get(label, 0)
     sys.stderr.write(answers.get("stderr", {}).get(label, ""))
+    sys.stderr.flush()
+    if answers.get("stderr", {}).get(label):
+        time.sleep(0.15)  # the errors reach the runner before the answer: the order of the two streams is fixed
     if label.startswith("proxy"):
         sys.stdout.write(answers["proxy"] if rc == 0 else "")
         sys.exit(rc)
@@ -657,23 +667,23 @@ def test_each_failed_command_step_keeps_the_output_of_its_newest_command(box, st
     assert lines[-3:] == ["NEWEST-" + label, LEAK, LEAK]
 
 
-def test_a_failed_owner_app_step_keeps_the_last_page_and_the_errors_but_decides_from_the_page_only(box):
+def test_a_failed_owner_app_step_keeps_the_errors_and_the_last_page_in_order_but_decides_from_the_page_only(box):
     box.answer(page="<html>Something went wrong</html>", stderr={"app 3": "curl-error-line\n"})
 
     assert box.run().returncode == 1
 
     lines = _kept(box)
     assert lines[0] == "step=owner-app" and lines[1] == "journey=3"
-    assert lines[4:] == ["<html>Something went wrong</html>", "curl-error-line"]
+    assert lines[4:] == ["curl-error-line", "<html>Something went wrong</html>"]
 
 
-def test_the_errors_of_the_proxy_check_are_kept_but_never_decide_it(box):
+def test_the_errors_of_the_proxy_check_are_kept_in_order_but_never_decide_it(box):
     box.answer(proxy='{"keys":[]}', stderr={"proxy 3": f'"kid":"{KID}"\n'})
 
     assert box.run().returncode == 1
 
     assert box.result()["step"] == "proxy"
-    assert _kept(box)[4:] == ['{"keys":[]}', f'"kid":"{KID}"']
+    assert _kept(box)[4:] == [f'"kid":"{KID}"', '{"keys":[]}']
 
 
 def test_a_proxy_step_that_ran_no_command_keeps_none_of_an_earlier_step_output(box):
@@ -737,14 +747,14 @@ def test_a_file_of_an_earlier_failed_run_is_gone_after_a_passed_run(box):
     assert not (box.run_dir / KEPT).exists()
 
 
-def test_the_file_is_removed_at_the_start_of_a_run_that_stops_before_any_command(box):
-    _fail_reset_of_3(box, output={"reset 3": "x"})
+def test_the_file_of_an_earlier_run_is_replaced_by_a_header_only_file_when_the_config_step_fails(box):
+    _fail_reset_of_3(box, output={"reset 3": "EARLIER-RUN-LINE"})
     box.answer()
 
     assert box.run(JOURNEY_PAGE_TEXT=None).returncode == 1
 
     assert box.result()["step"] == "config"
-    assert not (box.run_dir / KEPT).exists()
+    assert _kept(box) == ["step=config", "started=" + box.result()["started"], "finished=" + box.result()["finished"]]
 
 
 def test_the_next_failed_run_replaces_the_file(box):
@@ -760,13 +770,15 @@ def test_the_next_failed_run_replaces_the_file(box):
     assert sorted(path.name for path in box.run_dir.iterdir()) == [KEPT, "result", "run.lock"]
 
 
-def test_a_step_that_ran_no_command_keeps_no_file(box):
-    box.answer(elapsed_after={"reset first": 118 * 60})
+def test_a_step_that_ran_no_command_keeps_a_file_of_its_header_lines_only(box):
+    box.answer(elapsed_after={"reset first": 118 * 60}, output={"reset first": "OUTPUT-OF-THE-RESET"})
 
     assert box.run().returncode == 1
 
     assert box.result()["step"] == "time"
-    assert not (box.run_dir / KEPT).exists()
+    assert _kept(box) == [
+        "step=time", "journey=3", "started=" + box.result()["started"], "finished=" + box.result()["finished"],
+    ]
 
 
 def test_the_file_is_written_after_the_result_and_before_the_owner_line_in_place_with_no_rename(box):
@@ -828,3 +840,147 @@ def test_a_file_that_cannot_be_removed_at_the_start_does_not_change_the_result_o
     assert done.returncode == 0
     assert box.result()["result"] == "passed" and box.told() == ["Journeys passed."]
     assert len(done.stderr.splitlines()) == 1
+
+
+# ------------------------------------------------------------------------ the review round: the held output
+
+
+def test_the_newest_stdout_line_after_an_early_stderr_burst_stays_in_the_kept_tail_of_the_proxy_check(box):
+    burst = "".join(f"early error {i}\n" for i in range(1, 41))
+    box.answer(proxy='{"keys":[]}', stderr={"proxy 3": burst})
+
+    assert box.run().returncode == 1
+
+    body = _kept(box)[4:]
+    assert body == [*[f"early error {i}" for i in range(2, 41)], '{"keys":[]}']
+    assert box.result()["step"] == "proxy"
+    assert "curl --disable --silent --fail --max-time 20" in box.call("proxy 3")["argv"][-1]
+
+
+def test_the_newest_stdout_line_after_an_early_stderr_burst_stays_in_the_kept_tail_of_the_owner_app_check(box):
+    burst = "".join(f"early error {i}\n" for i in range(1, 41))
+    box.answer(page="<html>Something went wrong</html>", stderr={"app 3": burst})
+
+    assert box.run().returncode == 1
+
+    assert _kept(box)[4:] == [*[f"early error {i}" for i in range(2, 41)], "<html>Something went wrong</html>"]
+
+
+def test_a_failed_exit_status_of_a_check_still_fails_the_step_when_the_answer_looks_right(box):
+    box.answer(rc={"proxy 3": 22})
+
+    assert box.run().returncode == 1
+
+    assert box.result()["step"] == "proxy"
+    assert _kept(box)[:2] == ["step=proxy", "journey=3"]
+
+
+def test_trailing_empty_lines_of_a_failed_command_stay_in_the_kept_tail(box):
+    box.answer(rc={"refresh": 7}, exact={"refresh": "first\nlast\n\n\n"})
+
+    assert box.run().returncode == 1
+
+    assert _kept(box)[3:] == ["first", "last", "", ""]
+
+
+def test_a_failed_command_that_prints_a_null_byte_makes_no_diagnostic_on_the_runner_errors(box):
+    box.answer(rc={"refresh": 7}, exact={"refresh": "before\x00after\n"})
+
+    done = box.run()
+
+    assert (done.returncode, done.stdout, done.stderr) == (1, "", "")
+    assert _kept(box)[3:] == ["beforeafter"]
+
+
+def test_trailing_empty_lines_of_a_failed_remote_command_stay_in_the_kept_tail(box):
+    box.answer(rc={"reset first": 7}, exact={"reset first": "one\n\n"})
+
+    assert box.run().returncode == 1
+
+    assert _kept(box)[3:] == ["one", ""]
+
+
+def test_the_cut_at_400_counts_characters_and_never_leaves_half_of_one(box):
+    box.answer(rc={"refresh": 7}, exact={"refresh": "a" * 399 + "\u00e9X\n" + "\u00e9" * 401 + "\n"})
+
+    assert box.run().returncode == 1
+
+    body = _kept(box)[3:]
+    assert body == ["a" * 399 + "\u00e9", "\u00e9" * 400]
+
+
+def test_the_locale_of_the_checks_stays_byte_wise_when_a_line_is_cut(box):
+    box.answer(page="<html>Something went wrong \u00e9</html>")
+
+    assert box.run().returncode == 1
+
+    assert box.result()["step"] == "owner-app"
+    assert _kept(box)[4:] == ["<html>Something went wrong \u00e9</html>"]
+
+
+TWO_CLOCK_MV = """#!/bin/sh
+"{real}" "$@" || exit $?
+for last; do :; done
+read -r first < "$last"
+case $first in result=failed) "{python}" -c "import time; time.sleep(1.2)" ;; esac
+"""
+
+SECOND_RENAME_REFUSED_MV = """#!/bin/sh
+n=0
+if [ -f "{count}" ]; then read -r n < "{count}"; fi
+n=$((n + 1))
+echo "$n" > "{count}"
+if [ "$n" -eq 2 ]; then exit 1; fi
+exec "{real}" "$@"
+"""
+
+
+def test_the_file_and_the_result_hold_the_same_finished_time_when_the_clock_moves_between_the_two_writes(box):
+    mv = box.bin / "mv"
+    mv.unlink()
+    mv.write_text(TWO_CLOCK_MV.format(real=shutil.which("mv"), python=sys.executable), encoding="utf-8")
+    mv.chmod(0o755)
+
+    _fail_reset_of_3(box, output={"reset 3": "x"})
+
+    assert _kept(box)[3] == "finished=" + box.result()["finished"]
+
+
+def test_the_file_is_not_written_when_the_failed_result_could_not_be_stored(box):
+    mv = box.bin / "mv"
+    mv.unlink()
+    mv.write_text(
+        SECOND_RENAME_REFUSED_MV.format(real=shutil.which("mv"), count=box.top / "mv.count"), encoding="utf-8",
+    )
+    mv.chmod(0o755)
+
+    done = _fail_reset_of_3(box, output={"reset 3": "x"})
+
+    assert done.returncode == 1
+    assert box.result()["result"] == "started"
+    assert not (box.run_dir / KEPT).exists()
+    assert box.told() == [f"Journeys failed at step reset for journey 3: {REASONS['reset']}. The result file could not be stored."]
+    assert done.stderr.splitlines() == ["run_once: the result file could not be stored"]
+
+
+def test_a_write_failure_after_a_successful_open_is_reported_even_when_the_body_is_empty(box):
+    box.answer(
+        elapsed_after={"reset first": 118 * 60}, make_link={"reset first": [str(box.run_dir / KEPT), "/dev/full"]},
+    )
+
+    done = box.run()
+
+    assert done.returncode == 1
+    assert box.result()["step"] == "time"
+    assert done.stderr.splitlines() == ["run_once: the output of the failed step could not be kept"]
+    assert box.told() == [f"Journeys failed at step time for journey 3: {REASONS['time']}."]
+
+
+def test_a_write_failure_after_a_successful_open_is_reported_for_a_body_too(box):
+    done = _fail_reset_of_3(
+        box, output={"reset 3": "x"}, make_link={"reset 3": [str(box.run_dir / KEPT), "/dev/full"]},
+    )
+
+    assert done.returncode == 1
+    assert box.result()["step"] == "reset"
+    assert done.stderr.splitlines() == ["run_once: the output of the failed step could not be kept"]

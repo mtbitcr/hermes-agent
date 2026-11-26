@@ -27,12 +27,13 @@
 # journey=<n>. Then one owner line. A result or an owner
 # line that cannot be stored or sent is its own failed step (result, notify), never retried; "passed" is
 # only ever sent after "passed" was stored. Exit 0 only for a pass that was stored and told.
-# Of each step that runs a command, the runner holds the output (standard output and errors) of the newest
-# command. When such a step fails, the last 40 lines of it (each cut at 400 characters) go, under four header
-# lines, to one private file, RUN_DIR/failed-step.log, written in place (no temporary file, no rename) after the
-# result is stored and before the owner line; the next run removes it at its start, so it describes the newest
-# run and a passing run leaves none. It stays on Server 1: it is never sent or printed. The result still holds a
-# fixed reason only, never a value or the page's text.
+# Of each step that runs a command, the runner holds the output (standard output and errors, in the order they
+# came) of the newest command. When a step fails and its result is stored, the last 40 lines of it (each cut at
+# 400 characters; none for config and time, which run no command), under the header lines, go to one private
+# file, RUN_DIR/failed-step.log, written in place (no temporary file, no rename) before the owner line; the next
+# run removes it at its start, so it describes the newest run and a passing run leaves none. It stays on
+# Server 1: it is never sent or printed. The result still holds a fixed reason only, never a value or the page's
+# text.
 #
 # Settings, set by the operator in the unit's environment (start.sh passes them on) unless noted:
 #   HERMES_HOME                Server 1 platform home: the run folder is HERMES_HOME/journeys (lock and result),
@@ -112,33 +113,36 @@ now() { printf '%(%Y-%m-%dT%H:%M:%SZ)T' -1; }
 STARTED=$(now)
 START_EPOCH=$(date +%s)
 
-# store_result OUTCOME STEP REASON [EARLIER_STEP]: the whole result file, written beside the old one and
+# store_result OUTCOME STEP REASON [EARLIER_STEP [FINISHED]]: the whole result file, written beside the old one and
 # moved over it, so that a reader sees the old file or the new one, never half of either.
 store_result() {
-  local outcome=$1 step=$2 reason=$3 earlier=${4-}
+  local outcome=$1 step=$2 reason=$3 earlier=${4-} finished=${5-}
   {
     printf 'result=%s\nstep=%s\nreason=%s\nstarted=%s\n' "$outcome" "$step" "$reason" "$STARTED"
     if [[ -n $JOURNEY ]]; then printf 'journey=%s\n' "$JOURNEY"; fi
-    if [[ $outcome != started ]]; then printf 'finished=%s\n' "$(now)"; fi
+    if [[ $outcome != started ]]; then printf 'finished=%s\n' "${finished:-$(now)}"; fi
     if [[ -n $earlier ]]; then printf 'earlier_step=%s\n' "$earlier"; fi
   } > "$RESULT.new" 2> /dev/null && mv -f "$RESULT.new" "$RESULT" 2> /dev/null && return 0
   rm -f "$RESULT.new"
   return 1
 }
 
-# keep_failed_step STEP: the last lines of the held output, written in place. A failure here changes nothing
-# else about the run.
-keep_failed_step() {
+# write_failed_step_log STEP FINISHED: the header lines, then the last lines of the held output, each cut by
+# character. Any write that fails fails the whole.
+write_failed_step_log() {
+  local LC_ALL=C.UTF-8 line first=0
   local -a lines=()
-  local line first=0
-  if [[ -n $HELD ]]; then mapfile -t lines <<< "$HELD"; fi
+  if [[ -n $HELD ]]; then mapfile -t lines <<< "${HELD%$'\n'}"; fi
   if ((${#lines[@]} > KEPT_LINES)); then first=$((${#lines[@]} - KEPT_LINES)); fi
-  {
-    printf 'step=%s\n' "$1"
-    if [[ -n $JOURNEY ]]; then printf 'journey=%s\n' "$JOURNEY"; fi
-    printf 'started=%s\nfinished=%s\n' "$STARTED" "$(now)"
-    for line in "${lines[@]:first}"; do printf '%s\n' "${line:0:KEPT_WIDTH}"; done
-  } 2> /dev/null > "$FAILED_STEP_LOG" && return 0
+  printf 'step=%s\n' "$1" || return 1
+  if [[ -n $JOURNEY ]]; then printf 'journey=%s\n' "$JOURNEY" || return 1; fi
+  printf 'started=%s\nfinished=%s\n' "$STARTED" "$2" || return 1
+  for line in "${lines[@]:first}"; do printf '%s\n' "${line:0:KEPT_WIDTH}" || return 1; done
+}
+
+# keep_failed_step STEP FINISHED: written in place. A failure here changes nothing else about the run.
+keep_failed_step() {
+  write_failed_step_log "$1" "$2" 2> /dev/null > "$FAILED_STEP_LOG" && return 0
   echo "run_once: the output of the failed step could not be kept" >&2
 }
 
@@ -148,7 +152,8 @@ tell() {
 
 # finish OUTCOME STEP: the terminal result, then the one owner line; the exit status follows what happened.
 finish() {
-  local outcome=$1 step=$2 reason line stored=1 earlier=""
+  local outcome=$1 step=$2 reason line stored=1 earlier="" finished
+  finished=$(now)
   if [[ $outcome == passed ]]; then
     reason="all steps passed"
     line="Journeys passed."
@@ -156,7 +161,7 @@ finish() {
     reason=$(reason_for "$step")
     line="Journeys failed at step $step${JOURNEY:+ for journey $JOURNEY}: $reason."
   fi
-  if ! store_result "$outcome" "$step" "$reason"; then
+  if ! store_result "$outcome" "$step" "$reason" "" "$finished"; then
     echo "run_once: the result file could not be stored" >&2
     stored=0
     if [[ $outcome == passed ]]; then
@@ -167,8 +172,11 @@ finish() {
       line="$line The result file could not be stored."
     fi
   fi
-  if [[ $outcome == failed ]]; then
-    case $step in refresh | reset | isolation | seed | proxy | owner-app | journeys) keep_failed_step "$step" ;; esac
+  if ((stored)) && [[ $outcome == failed ]]; then
+    case $step in
+      config | time) HELD="" ;;& # no command ran in these steps: the file holds its header lines only
+      config | time | refresh | reset | isolation | seed | proxy | owner-app | journeys) keep_failed_step "$step" "$finished" ;;
+    esac
   fi
   if ! tell "$line"; then
     echo "run_once: the owner was not told" >&2
@@ -218,30 +226,46 @@ store_result started none "the run has started and has not ended" || finish fail
     read_runner_env
 } || finish failed config
 
+# hold COMMAND [ARG...]: runs the command with no input; its output (standard output and errors together, in the
+# order they came) is held in HELD, whole, with its trailing empty lines. The status is the command's.
+hold() {
+  local raw
+  { raw=$({ "$@" 2>&1 < /dev/null; printf 'x%s' "$?"; }); } 2> /dev/null
+  HELD=${raw%x*}
+  return "${raw##*x}"
+}
 # remote COMMAND: one command on Server 2 through the runner identity; its output is held (HELD), not shown.
-remote() { HELD=$(ssh "$JOURNEY_RUNNER_SSH" "$1" 2>&1 < /dev/null); }
+remote() { hold ssh "$JOURNEY_RUNNER_SSH" "$1"; }
+# tag_lines TAG: each line of the input, one line each, with TAG in front.
+tag_lines() {
+  local line
+  while IFS= read -r line || [[ -n $line ]]; do printf '%s%s\n' "$1" "$line"; done
+}
 # remote_answer COMMAND: the same, with the command's standard output also set apart as ANSWER, which alone is
-# checked; HELD gets the standard output, then the errors. The trailer tells the two apart: output length, status.
+# checked; HELD gets both streams in the order they came. Each line is tagged with its stream (O, E) on the way,
+# and the status follows as a line of its own (S).
 remote_answer() {
-  local raw trailer size status held out errors
-  raw=$({ out=$(ssh "$JOURNEY_RUNNER_SSH" "$1" 2>&3 < /dev/null); status=$?; printf '%s\n%s %s' "$out" "${#out}" "$status"; } 3>&1)
-  trailer=${raw##*$'\n'}
-  size=${trailer% *} status=${trailer#* }
-  held=${raw%$'\n'*}
-  if ((size)); then ANSWER=${held: -size}; else ANSWER=""; fi
-  errors=${held:0:${#held}-size}
-  while [[ $errors == *$'\n' ]]; do errors=${errors%$'\n'}; done
-  HELD=$ANSWER${ANSWER:+${errors:+$'\n'}}$errors
+  local raw item status=1
+  local -a tagged=()
+  ANSWER="" HELD=""
+  { raw=$({ ssh "$JOURNEY_RUNNER_SSH" "$1" 2> >(tag_lines E) > >(tag_lines O) < /dev/null; printf 'S%s\n' "$?"; }); } 2> /dev/null
+  mapfile -t tagged <<< "$raw"
+  for item in "${tagged[@]}"; do
+    case $item in
+      O*) ANSWER+=${item:1}$'\n' HELD+=${item:1}$'\n' ;;
+      E*) HELD+=${item:1}$'\n' ;;
+      S*) status=${item:1} ;;
+    esac
+  done
   return "$status"
 }
 
-HELD=$(JOURNEY_RUNNER_SSH=$JOURNEY_RUNNER_SSH JOURNEY_S2_SCRIPTS_DIR=$S2_DIR \
-  "$HERE/refresh_stack.sh" 2>&1 < /dev/null) || finish failed refresh
+JOURNEY_RUNNER_SSH=$JOURNEY_RUNNER_SSH JOURNEY_S2_SCRIPTS_DIR=$S2_DIR hold "$HERE/refresh_stack.sh" || finish failed refresh
 
 remote "cd '$S2_DIR' && ./reset_stack.sh" || finish failed reset
 
 remote "cd '$S2_DIR' && JOURNEY_PRODUCTION_ORIGIN='$ORIGIN' ./isolation_check.sh server2" || finish failed isolation
-HELD=$("$HERE/isolation_check.sh" server1 2>&1 < /dev/null) || finish failed isolation
+hold "$HERE/isolation_check.sh" server1 || finish failed isolation
 
 # What a healthy sign-in proxy answers: its key list, with the key id that its source names.
 proxy_answers() {
