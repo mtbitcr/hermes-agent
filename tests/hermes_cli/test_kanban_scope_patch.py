@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import hashlib
 import os
+import runpy
 import subprocess
+import types
 from pathlib import Path
 
 import pytest
 
-from hermes_cli import kanban_scope_patch as scope_patch
+_MODULE_PATH = Path(__file__).resolve().parents[2] / "hermes_cli" / "kanban_scope_patch.py"
+scope_patch = types.SimpleNamespace(**runpy.run_path(str(_MODULE_PATH)))
 
 
 def _git(root: Path, *args: str) -> str:
