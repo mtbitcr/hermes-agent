@@ -15,8 +15,19 @@ import copy
 import dataclasses
 import hashlib
 import json
+import threading
+from urllib.parse import quote
 
 import pytest
+import yaml
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from gateway.config import PlatformConfig
+from gateway.platforms.api_server import APIServerAdapter
+from hermes_cli import owner_named_inputs as oni
+from hermes_cli.config import get_config_path
+from hermes_constants import get_hermes_home
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import owner_questions as oq
@@ -119,15 +130,16 @@ def test_without_the_token_the_list_equals_todays_on_the_whole_body(owner):
     with _board(project) as conn:
         plain = _stopped(conn, project, "Plain stop")
         asked = _asked(conn, project, "Asked stop")
-        capability = _stopped(conn, project, "Capability stop", kind="capability", reason=_PLAIN)
     for flags in ({}, {"owner_waiting": True}):
         today = ow.list_owner_decisions(owner, **flags)
         answered = ow.list_owner_decisions(owner, owner_answer=True, **flags)
         assert "question" not in _json(today)
         stripped = copy.deepcopy(answered)
-        for item in stripped["data"]:
-            item.pop("question", None)
-        # Same items, same order, same words, with only ``question`` set apart.
+        for item, plain_item in zip(stripped["data"], today["data"]):
+            if item.pop("question", None) is not None:
+                # Its time is when the stop began, not the card's own (finding 2).
+                item["created_at"] = plain_item["created_at"]
+        # Same items, same order, same words, with only ``question`` and its time set apart.
         assert _json(stripped) == _json(today)
         assert [item["decision_ref"] for item in answered["data"]] == [
             item["decision_ref"] for item in today["data"]
@@ -144,10 +156,6 @@ def test_without_the_token_the_list_equals_todays_on_the_whole_body(owner):
     }
     assert _item(owner, project, plain) == expected
     assert _item(owner, project, asked)["reason"] == _FIXED
-    # A capability stop joins the list only for owner_waiting_v1, as before.
-    assert ow._owner_decision_ref(owner, authority="task", native_id=capability) not in [
-        item["decision_ref"] for item in ow.list_owner_decisions(owner, owner_answer=True)["data"]
-    ]
 
 
 def test_a_declared_question_is_served_with_its_choices_and_stop_ref(owner):
@@ -315,3 +323,223 @@ def test_many_stopped_cards_each_get_their_own_stop_ref(owner):
     assert {item["title"] for item in served} == {f"Stop {n}" for n in range(6)}
     assert all(item["question"]["stop"] == "plain" for item in served)
     assert len({item["question"]["stop_ref"] for item in served}) == len(ids)
+
+
+# The served route: the repair of the four review findings of card P2.
+
+_OLD = "Raphael cannot reach the placeholder calendar yet."
+_PRICES = b"sku,price\nA,1\n"
+_LATER = 600
+
+
+@pytest.fixture
+def served(monkeypatch) -> ow.OwnerContext:
+    monkeypatch.setattr("gateway.run._hermes_home", get_hermes_home())
+    path = get_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump({"gateway": {"api_server": {"owner_workspace": {"enabled": True}}}}), encoding="utf-8",
+    )
+    return ow.resolve_owner_context()
+
+
+def _app() -> web.Application:
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+    app = web.Application()
+    for method, path, handler in adapter._http_route_table():
+        if method == "GET" and path == "/v1/owner-workspace/decisions":
+            app.router.add_route(method, path, handler)
+    return app
+
+
+async def _served(*tokens: str) -> list[dict]:
+    """The Decisions list the route serves for one ``capabilities`` parameter."""
+    url = "/v1/owner-workspace/decisions"
+    if tokens:
+        url += "?capabilities=" + quote(",".join(tokens), safe=",")
+    async with TestClient(TestServer(_app())) as client:
+        response = await client.get(url)
+        assert response.status == 200, await response.text()
+        return (await response.json())["data"]
+
+
+def _served_item(data: list[dict], owner, task_id: str) -> dict | None:
+    ref = ow._owner_decision_ref(owner, authority="task", native_id=task_id)
+    return next((item for item in data if item["decision_ref"] == ref), None)
+
+
+def _event_time(conn, event_id: int) -> int:
+    return int(conn.execute("SELECT created_at FROM task_events WHERE id = ?", (event_id,)).fetchone()[0])
+
+
+def _shift(conn, sql: str, *params) -> None:
+    with kb.write_txn(conn):
+        conn.execute(sql, params)
+
+
+@pytest.mark.asyncio
+async def test_a_current_capability_stop_is_served_with_only_owner_answer_v1(served):
+    owner = served
+    project = _project(owner)
+    with _board(project) as conn:
+        capability = _stopped(conn, project, "Capability stop", kind="capability", reason=_PLAIN)
+        event_id = _newest_blocked(conn, capability)
+        _shift(conn, "UPDATE tasks SET created_at = created_at - ? WHERE id = ?", _LATER, capability)
+        stopped_at = _event_time(conn, event_id)
+    item = _served_item(await _served("owner_answer_v1"), owner, capability)
+    assert item is not None
+    assert item["kind"] == "owner_input"
+    assert item["reason"] == _FIXED
+    assert item["created_at"] == ow._owner_timestamp(stopped_at)
+    assert item["question"] == {
+        "object": "hermes.owner_workspace.owner_question",
+        "stop": "plain",
+        "stop_ref": _stop_ref(owner, capability, event_id),
+        "text": _PLAIN,
+        "choices": [],
+        "words": "required",
+        "words_limit": 1000,
+    }
+    # Without the answer token a capability stop still joins only for owner_waiting_v1.
+    for tokens in ((), ("owner_input_upload_v1",), ("design_options_v1",)):
+        assert _served_item(await _served(*tokens), owner, capability) is None
+    waiting = _served_item(await _served("owner_waiting_v1"), owner, capability)
+    assert waiting is not None and "question" not in waiting and waiting["reason"] == _PLAIN
+
+
+@pytest.mark.asyncio
+async def test_created_at_of_a_question_is_when_the_stop_began_for_owner_answer_v1_alone(served):
+    owner = served
+    project = _project(owner)
+    with _board(project) as conn:
+        plain = _stopped(conn, project, "Plain stop")
+        asked = _asked(conn, project, "Asked stop")
+        stops = {task_id: _newest_blocked(conn, task_id) for task_id in (plain, asked)}
+        for task_id in stops:
+            _shift(conn, "UPDATE tasks SET created_at = created_at - ? WHERE id = ?", _LATER, task_id)
+        began = {task_id: _event_time(conn, event_id) for task_id, event_id in stops.items()}
+        created = {
+            task_id: int(conn.execute("SELECT created_at FROM tasks WHERE id = ?", (task_id,)).fetchone()[0])
+            for task_id in stops
+        }
+    for task_id in stops:
+        assert created[task_id] != began[task_id]
+        answered = _served_item(await _served("owner_answer_v1"), owner, task_id)
+        assert answered["created_at"] == ow._owner_timestamp(began[task_id])
+        both = _served_item(await _served("owner_answer_v1", "owner_waiting_v1"), owner, task_id)
+        assert both["created_at"] == ow._owner_timestamp(began[task_id])
+        # The legacy paths keep their own times.
+        assert _served_item(await _served(), owner, task_id)["created_at"] == ow._owner_timestamp(created[task_id])
+        waiting = _served_item(await _served("owner_waiting_v1"), owner, task_id)
+        assert waiting["created_at"] == ow._owner_timestamp(began[task_id])
+    # An item with no question keeps the card's creation time.
+    with _board(project) as conn:
+        row = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ?", (asked, oq.DECLARED_EVENT),
+        ).fetchone()
+        payload = json.loads(row["payload"])
+        payload["question"] = f"Should Raphael edit {_PATH} first?"
+        _shift(conn, "UPDATE task_events SET payload = ? WHERE id = ?", json.dumps(payload), row["id"])
+    unasked = _served_item(await _served("owner_answer_v1"), owner, asked)
+    assert "question" not in unasked
+    assert unasked["created_at"] == ow._owner_timestamp(created[asked])
+
+
+@pytest.mark.asyncio
+async def test_a_new_question_after_the_last_named_input_is_served(served):
+    owner = served
+    project = _project(owner)
+    with _board(project) as conn:
+        card, _run = _running(conn, project, "Needs a file")
+        kb._append_event(conn, card, "named_inputs_declared", {
+            "inputs": [{"n": 1, "name": "price list", "type": "csv", "file": "price-list.csv"}],
+        })
+        assert kb.block_task(conn, card, reason=_PLAIN, kind="needs_input") is True
+    both = ("owner_answer_v1", "owner_input_upload_v1")
+    held = _served_item(await _served(*both), owner, card)
+    assert [entry["n"] for entry in held["missing_inputs"]] == [1] and "question" not in held
+    with _board(project) as conn:
+        assert oni.accept_upload(conn, card, 1, _PRICES, "text/csv", board=project["board"]) == "released"
+        claimed = kb.claim_task(conn, card)
+        assert claimed is not None
+        oq.declare_owner_question(
+            conn, card, "question", _QUESTION, copy.deepcopy(_CHOICES), "optional",
+            board=project["board"], expected_run_id=claimed.current_run_id,
+        )
+        event_id = _newest_blocked(conn, card)
+        assert oni.missing_inputs(conn, card) == []
+    for tokens in (("owner_answer_v1",), both, ("owner_answer_v1", "design_options_v1")):
+        item = _served_item(await _served(*tokens), owner, card)
+        assert item["question"]["stop"] == "question"
+        assert item["question"]["text"] == _QUESTION
+        assert item["question"]["stop_ref"] == _stop_ref(owner, card, event_id)
+    # The upload fields the reader already got stay as they were.
+    assert _served_item(await _served(*both), owner, card)["missing_inputs"] == []
+    assert "missing_inputs" not in _served_item(await _served("owner_answer_v1"), owner, card)
+
+
+@pytest.mark.asyncio
+async def test_one_item_never_mixes_two_stops_when_the_card_stops_again_between_reads(served, monkeypatch):
+    owner = served
+    project = _project(owner)
+    with _board(project) as conn:
+        card = _stopped(conn, project, "Plain stop", reason=_OLD)
+        old_event = _newest_blocked(conn, card)
+        _shift(conn, "UPDATE task_events SET created_at = created_at - ? WHERE id = ?", _LATER, old_event)
+        old_at = _event_time(conn, old_event)
+    fired: list[threading.Thread] = []
+    failures: list[BaseException] = []
+    real = ow.decision_missing_inputs
+
+    def resume_claim_declare() -> None:
+        try:
+            with _board(project) as other:
+                assert kb.unblock_task(other, card) is True
+                claimed = kb.claim_task(other, card)
+                assert claimed is not None
+                oq.declare_owner_question(
+                    other, card, "question", _QUESTION, copy.deepcopy(_CHOICES), "optional",
+                    board=project["board"], expected_run_id=claimed.current_run_id,
+                )
+        except BaseException as exc:  # reported by the test thread
+            failures.append(exc)
+
+    def stops_again(conn, task_ids):
+        if not fired:
+            # Another connection commits between two reads of the request. Under a rollback
+            # journal that commit waits for the request's read to end, so it runs on its own
+            # thread: a read that is not one snapshot has seen it by the time this returns.
+            writer = threading.Thread(target=resume_claim_declare)
+            fired.append(writer)
+            writer.start()
+            writer.join(timeout=3)
+        return real(conn, task_ids)
+
+    monkeypatch.setattr(ow, "decision_missing_inputs", stops_again)
+    tokens = ("owner_answer_v1", "owner_waiting_v1")
+    item = _served_item(await _served(*tokens), owner, card)
+    assert len(fired) == 1
+    fired[0].join(timeout=60)
+    assert not fired[0].is_alive() and failures == []
+    with _board(project) as conn:
+        new_event = _newest_blocked(conn, card)
+        new_at = _event_time(conn, new_event)
+    assert new_event != old_event and new_at != old_at
+    old = {
+        "reason": _OLD, "text": _OLD, "stop": "plain", "stop_ref": _stop_ref(owner, card, old_event),
+        "created_at": ow._owner_timestamp(old_at),
+    }
+    new = {
+        "reason": _QUESTION, "text": _QUESTION, "stop": "question", "stop_ref": _stop_ref(owner, card, new_event),
+        "created_at": ow._owner_timestamp(new_at),
+    }
+    seen = {
+        "reason": item["reason"], "text": item["question"]["text"], "stop": item["question"]["stop"],
+        "stop_ref": item["question"]["stop_ref"], "created_at": item["created_at"],
+    }
+    assert seen in (old, new)
+    # The next read sees the new stop whole.
+    item = _served_item(await _served(*tokens), owner, card)
+    assert (item["reason"], item["question"]["text"], item["question"]["stop_ref"]) == (
+        new["reason"], new["text"], new["stop_ref"],
+    )

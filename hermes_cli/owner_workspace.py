@@ -4295,8 +4295,11 @@ def list_owner_decisions(
     ``OWNER_ANSWER_CAPABILITY``. Each owner-input item of a work card that
     waits on the owner now, with no missing named input and no design
     options, then carries ``question`` (see
-    :func:`hermes_cli.owner_questions.decision_questions`). Every other
-    item, and every item for another reader, is unchanged.
+    :func:`hermes_cli.owner_questions.decision_questions`), and a current
+    capability stop joins as owner input as it does for ``owner_waiting``. The
+    item's ``created_at`` is when that stop began. All reads of the request
+    share one snapshot. Every other item, and every item for another reader,
+    is unchanged.
     """
     from hermes_cli.owner_recommendation_closures import live_closure_filter, recent_closed_suggestions
 
@@ -4330,6 +4333,9 @@ def list_owner_decisions(
         questions: dict[str, dict] = {}
         conn = _open_read_only_sqlite(board_path, label="kanban.db")
         try:
+            if owner_answer:
+                # One snapshot for every read below, so an item never mixes two stops.
+                conn.execute("BEGIN")
             columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
             }
@@ -4357,7 +4363,7 @@ def list_owner_decisions(
                 "ORDER BY created_at DESC, id ASC LIMIT ?",
                 (project_id, _OWNER_DECISIONS_LIMIT + 1),
             ).fetchall()
-            if owner_waiting:
+            if owner_waiting or owner_answer:
                 # Unbounded on purpose: only the CURRENT capability stops
                 # join, so the window below can be exact only if every
                 # candidate is read before the filter.
@@ -4400,7 +4406,8 @@ def list_owner_decisions(
                     if str(row["task_kind"]) == "work"
                 ]
                 # Upload and design choice stops keep their own routes (S4).
-                own_route = {*decision_missing_inputs(conn, window), *decision_design_options(conn, window)}
+                pending_upload = {task_id for task_id, left in decision_missing_inputs(conn, window).items() if left}
+                own_route = {*pending_upload, *decision_design_options(conn, window)}
                 questions = decision_questions(
                     conn, [task_id for task_id in window if task_id not in own_route], ctx,
                 )
@@ -4467,7 +4474,7 @@ def list_owner_decisions(
                 kind = "owner_input"
                 title = owner_title(row["title"])
                 reason = "Raphael needs your answer before this work can continue."
-            elif owner_waiting and row["block_kind"] == "capability":
+            elif (owner_waiting or owner_answer) and row["block_kind"] == "capability":
                 authority = "task"
                 kind = "owner_input"
                 title = owner_title(row["title"])
@@ -4496,6 +4503,7 @@ def list_owner_decisions(
                 decisions[-1]["design_options"] = options[str(row["id"])]
             if kind == "owner_input" and str(row["id"]) in questions:
                 decisions[-1]["question"] = questions[str(row["id"])]
+                decisions[-1]["created_at"] = _owner_timestamp(waits[str(row["id"])]["since"])
 
     authority_order = {"owner_input": 0, "capability": 1}
     decisions.sort(
