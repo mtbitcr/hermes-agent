@@ -778,6 +778,22 @@ class TestFieldDelegation:
         assert payload["error"] == reason
         assert payload["code"] == "not_retryable"
 
+    def test_task_retry_without_a_route_returns_the_refusal_verbatim(self, monkeypatch, trusted_ctx):
+        monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
+        result = {
+            "ok": False, "error": "not_retryable",
+            "reason": "This work changed while you were confirming, so nothing was retried.",
+        }
+        monkeypatch.setattr(owt._kernel, "retry_task", _RecordingKernel(return_value=result))
+
+        out = owt._handle_task_retry({
+            "idempotency_key": "r1", "project_id": "p1",
+            "task_id": "t1", "reason": "Continue the stopped work.",
+        })
+
+        assert out == owt._ok(result)
+        assert "code" not in json.loads(out)
+
     def test_task_retry_result_is_returned_verbatim_as_json(self, monkeypatch, trusted_ctx):
         monkeypatch.setattr(owt, "resolve_owner_context", lambda: trusted_ctx)
         result = {

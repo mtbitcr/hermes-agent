@@ -317,7 +317,7 @@ def _handle_task_retry(args: dict, **kw) -> str:
             reason=args.get("reason"),
             **route,
         )
-        if result.get("ok") is False and result.get("error") == "not_retryable":
+        if route and result.get("ok") is False and result.get("error") == "not_retryable":
             # The kernel checks this reason against the owner-text policy.
             # The native run reads its failure message from the error field.
             return tool_error(result["reason"], code="not_retryable")

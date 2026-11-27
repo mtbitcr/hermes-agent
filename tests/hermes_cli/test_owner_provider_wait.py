@@ -353,6 +353,113 @@ def test_deep_worker_retry_requires_a_fresh_choice_after_a_card_change(root, own
         assert spawned == [task_id]
 
 
+@pytest.mark.parametrize("repinned_between", [False, True], ids=["two_stops", "repinned_between"])
+def test_after_an_alternate_route_retry_each_earlier_stop_keeps_the_receipt_its_route_history_proves(
+    repinned_between, root, owner, clock, monkeypatch,
+):
+    from hermes_cli import owner_retry_route
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    import sqlite3
+
+    profile_home = Path(os.environ["HERMES_HOME"])
+    with monkeypatch.context() as shared_root:
+        shared_root.setenv("HERMES_HOME", str(root))
+        project = _project(owner, "Deep Worker Receipts")
+        with contextlib.closing(sqlite3.connect(root / "projects.db")) as source:
+            with contextlib.closing(sqlite3.connect(profile_home / "projects.db")) as target:
+                source.backup(target)
+    board = project["board"]
+    role = "raphael-claude-worker"
+    (root / "profiles" / role).mkdir()
+
+    def approved(profile: str) -> dict:
+        assignment = model_policy.task_assignment_for(profile, "anthropic", "deep")
+        return {
+            "assignee": profile, "provider": "anthropic", "model": assignment.model,
+            "reasoning_effort": assignment.reasoning_effort, "execution_tier": "deep",
+            "model_policy_lock": model_policy.mint_policy_lock(
+                profile, "anthropic", assignment.model, assignment.reasoning_effort, "deep",
+            ),
+        }
+
+    route = approved(role)
+    receipt = {
+        "schema_version": 3, "engine": "hermes", "profile": role, "provider": "anthropic",
+        "model": route["model"], "reasoning_effort": route["reasoning_effort"],
+        "route_evidence": "session-row",
+        "cost": {"state": "estimated", "currency": "USD", "scope": "dominant-main-route", "amount": 0.25},
+    }
+    monkeypatch.setattr(
+        kb, "_trusted_runtime_receipt",
+        lambda session_id, _profile: dict(receipt) if session_id == _SESSION else None,
+    )
+
+    def stop(conn, task_id: str, pid: int):
+        """The dispatcher spawns the card; its worker links its session and stops at the limit."""
+        _result, spawned = _tick(conn, board, {task_id: pid})
+        assert spawned == [task_id]
+        run_id = kb.get_task(conn, task_id).current_run_id
+        assert kb.heartbeat_worker(conn, task_id, expected_run_id=run_id, session_id=_SESSION)
+        kb._record_worker_exit(pid, kb.KANBAN_RATE_LIMIT_EXIT_CODE << 8)
+        kb.detect_crashed_workers(conn)
+        run = kb.get_run(conn, run_id)
+        assert run.outcome == "rate_limited"
+        assert kanban_provider_stops._recorded_for(run.metadata) == (True, "anthropic")
+        assert kb.get_task(conn, task_id).status == "ready"
+        return run
+
+    with _board(board) as conn:
+        task_id = kb.create_task(
+            conn, title="Draft the placeholder brief", assignee=role,
+            project_id=project["project_id"], provider_override="anthropic",
+            model_override=route["model"], reasoning_effort=route["reasoning_effort"],
+            execution_tier="deep", model_policy_lock=route["model_policy_lock"],
+            requires_review=True,
+        )
+        first = stop(conn, task_id, 4221)
+        if repinned_between:
+            # The card moves to another role and back: the same route again, but
+            # its history records two route changes after the first attempt.
+            for profile in ("raphael-builder", role):
+                assert kb.assign_task(conn, task_id, profile, approved_route=approved(profile))
+            assert len(_events(conn, task_id, "model_route_repinned")) == 2
+        # The cooldown ends and the dispatcher tries the original route again.
+        clock["t"] = _resume_at(first) + 1
+        second = stop(conn, task_id, 4222)
+    clock["t"] = second.ended_at + 60
+    monkeypatch.setenv("HERMES_OPENAI_RETRY_TASK_ID", task_id)
+    monkeypatch.setattr(owner_retry_route, "openai_ready", lambda _role: True)
+    env = _steward_env(root, board)
+
+    def read():
+        snapshot = ow.read_project_snapshot(owner, project["slug"], provider_wait=True)
+        receipts = [
+            (run["receipt"]["runtime"]["state"], run["receipt"]["cost"]["state"])
+            for run in snapshot["runs"]
+        ]
+        return snapshot, receipts
+
+    with _as_worker(monkeypatch, env):
+        snapshot, before = read()
+        choice = next(
+            task["retry_route"]
+            for column in snapshot["columns"] for task in column["tasks"] if task["id"] == task_id
+        )
+        accepted = _retry(owner, project, task_id, "retry-alternate", route_token=choice["token"])
+        assert accepted["ok"] is True, accepted
+        _snapshot, after = read()
+
+    with _board(board) as conn:
+        assert kb.get_task(conn, task_id).provider_override == "openai-codex"
+        [event] = _events(conn, task_id, "owner_retry")
+        assert event.run_id == second.id
+    known = ("known", "estimated")
+    # Newest first: the stop the owner retried, then the attempt before it.
+    assert before == [known, known]
+    assert after == [known, ("unknown", "unknown") if repinned_between else known]
+
+
 def test_a_retry_while_the_limit_holds_leaves_the_card_waiting_with_a_new_reset_and_no_breaker_trip(
     root, owner, clock, monkeypatch,
 ):
