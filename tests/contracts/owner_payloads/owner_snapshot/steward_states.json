@@ -248,5 +248,41 @@
       "progress": false,
       "stale_candidates": false
     }
+  },
+  {
+    "active_work": [
+      {
+        "state": "Ready",
+        "title": "Draft the agenda"
+      }
+    ],
+    "counts": {
+      "awaiting_review": 0,
+      "completed_in_window": 0,
+      "needs_attention": 0,
+      "open": 1
+    },
+    "decisions_needed": [],
+    "execution": {
+      "paused": false,
+      "state": "working",
+      "summary": "Raphael is waiting for the checks after a release to end before it starts new work."
+    },
+    "generated_at": "2026-09-21T14:13:20Z",
+    "lookback_days": 7,
+    "needs_attention": [],
+    "progress": [],
+    "project": {
+      "name": "Waiting For Checks Pilot"
+    },
+    "schema_version": 2,
+    "stale_candidates": [],
+    "truncated": {
+      "active_work": false,
+      "decisions_needed": false,
+      "needs_attention": false,
+      "progress": false,
+      "stale_candidates": false
+    }
   }
 ]

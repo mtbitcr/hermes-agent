@@ -152,6 +152,7 @@ CLOSED_VOCABULARIES = (
         "Raphael needs your answer before the plan can continue.",
         "Raphael found a problem and is preparing the safest next step.",
         "Raphael is coordinating the approved milestone.",
+        "Raphael is waiting for the checks after a release to end before it starts new work.",
         "This Project was deleted. Its retained copy can be restored.",
         "This Project was deleted.",
     })),

@@ -5721,6 +5721,16 @@ def project_steward_snapshot(
     elif live_work:
         execution_state = "working"
         execution_summary = "Raphael is coordinating the approved milestone."
+        try:
+            from hermes_cli import journeys_hold
+
+            if journeys_hold.state(now)["active"]:
+                execution_summary = (
+                    "Raphael is waiting for the checks after a release to end "
+                    "before it starts new work."
+                )
+        except Exception:
+            pass
     else:
         # Only dormant work remains: it waits for the owner's next approval.
         execution_state = "waiting_for_approval"

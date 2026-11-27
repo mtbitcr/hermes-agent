@@ -23,7 +23,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
-from hermes_cli import kanban_db, owner_workspace as ow, projects_db
+from hermes_cli import journeys_hold, kanban_db, owner_workspace as ow, projects_db
 from hermes_constants import get_hermes_home
 from tests.contracts import conftest as contract
 from tests.gateway.test_api_server_owner_suggestion_decisions import (  # noqa: F401  (owner is a fixture)
@@ -199,12 +199,13 @@ async def test_the_steward_examples_carry_every_steward_state(
 ):
     projects = {name: _project(owner, f"{name.title()} Pilot") for name in (
         "fresh", "working", "complete", "paused", "finishing", "attention", "waiting",
+        "waiting for checks",
     )}
-    for name in ("working", "attention", "waiting"):
+    for name in ("working", "attention", "waiting", "waiting for checks"):
         kanban_db.write_board_dispatch_state(projects[name]["board"], dispatch_enabled=True)
     _gave_up_task(projects["attention"]["board"], projects["attention"]["project_id"],
                   "Print the handouts")
-    for name in ("working", "complete", "paused", "finishing"):
+    for name in ("working", "complete", "paused", "finishing", "waiting for checks"):
         _task(projects[name]["board"], projects[name], "Draft the agenda")
     with contextlib.closing(kanban_db.connect(board=projects["complete"]["board"])) as conn:
         [done] = [task.id for task in kanban_db.list_tasks(conn)
@@ -235,10 +236,15 @@ async def test_the_steward_examples_carry_every_steward_state(
         thread.join(timeout=60)
 
     async with TestClient(TestServer(_app())) as client:
-        live = [
-            (await _snapshot(client, _slug(owner, project), V1))["body"]["data"]["steward"]
-            for project in projects.values()
-        ]
+        live = []
+        for name, project in projects.items():
+            # Only the eighth Project is read while the journeys hold is active.
+            held = {"active": True, "reason": "running", "latest_end": 4_000_000_000}
+            with (patch.object(journeys_hold, "state", return_value=held)
+                  if name == "waiting for checks" else contextlib.nullcontext()):
+                live.append(
+                    (await _snapshot(client, _slug(owner, project), V1))["body"]["data"]["steward"]
+                )
         deleted = await _snapshot(client, deleted_slug, V1)
         permanent = await _snapshot(client, permanent_slug, V1)
 
