@@ -19,9 +19,11 @@ import tempfile
 from pathlib import Path
 
 from hermes_cli.kanban_db import kanban_home
-from hermes_cli.kanban_delivery_github import GitHubTransport, GitHubTransportError, _git_base_env, _is_sha, _run_git
+from hermes_cli.kanban_delivery_github import (
+    _COMMIT_REPOSITORY, GitHubTransport, GitHubTransportError, _git_base_env, _is_sha, _run_git,
+)
 
-REPOSITORY = "mtbitcr/raphael-workspace"  # the owner app, the one repository this module reads
+REPOSITORY = _COMMIT_REPOSITORY  # the owner app, the one repository this module reads: the transport's own binding
 STEP = "release_source"  # the transport's read-only step: contents read and nothing else
 
 

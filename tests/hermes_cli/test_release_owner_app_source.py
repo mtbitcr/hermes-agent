@@ -14,11 +14,12 @@ from pathlib import Path
 import pytest
 
 from tests.hermes_cli.test_kanban_delivery_github import (  # noqa: F401  (github is a fixture)
-    BASIC, DUMMY, TOKEN, _carries, _files_text, _git, _module, _new_key, _pem, _record_git, _record_mkdtemp,
-    _subcommand, _transport_module, github,
+    BASIC, DUMMY, SAMPLE, TOKEN, _block_sockets, _carries, _files_text, _git, _module, _new_key, _pem, _record_git,
+    _record_mkdtemp, _subcommand, _transport_module, github,
 )
 
 OWNER_APP = "mtbitcr/raphael-workspace"
+PLATFORM = "mtbitcr/hermes-agent"  # the platform repository, of which the step reads nothing
 CONTENTS_READ = {"contents": "read"}
 OWNER_APP_TOKEN = {"repositories": ["raphael-workspace"], "permissions": CONTENTS_READ}
 KEY = Path("secrets") / "github-app" / "raphael-agent-factory.pem"  # under the platform root, where the App key is
@@ -367,3 +368,62 @@ def test_a_commit_the_owner_app_does_not_hold_is_refused_and_leaves_no_folder(gi
     assert _refs(_expected_copy(host["root"])) == []
     for path, text in _files_text(tmp_path).items():
         assert TOKEN not in text and BASIC not in text, path
+
+
+@pytest.mark.parametrize("repository", [OWNER_APP, PLATFORM])
+def test_the_release_source_step_makes_no_rest_call_on_any_repository(github, monkeypatch, repository):
+    """The step's one operation is the exact fetch of one owner app commit. A branch head and every allowlisted call,
+    each with sample values and its required query, are refused before any token or socket, on the owner app and on
+    the platform repository alike."""
+    mod = _transport_module(monkeypatch, github)
+    opened = _block_sockets(monkeypatch)
+    transport = mod.GitHubTransport("release_source", repository, key_path=github["key_file"])
+
+    with pytest.raises(mod.GitHubTransportError) as refused:
+        transport.branch_head("card-1")
+    assert refused.value.reason == "step_not_permitted"
+    for entry in mod.REST_ALLOWLIST:
+        with pytest.raises(mod.GitHubTransportError) as refused:
+            transport.request(entry.method, entry.template.format(**{**SAMPLE, "repo": repository}),
+                              query={k: SAMPLE[k] for k in entry.required_query})
+        # Each allowlisted call passes its route and query, then meets the step; the App's own token call is no route.
+        assert refused.value.reason == ("step_not_permitted" if entry.permission else "endpoint_not_allowed"), entry
+
+    assert github["token_requests"] == [] and github["jwts"] == [] and github["calls"] == [] and opened == []
+
+
+def test_the_release_source_step_fetches_no_commit_of_another_repository(github, monkeypatch, tmp_path):
+    """Bound to the platform repository, whose copy on the origin holds the same commit, the step's commit fetch is
+    refused before any token, private folder or git: it fetches from the owner app alone."""
+    host = _release_host(github, monkeypatch, tmp_path)
+    mod, merge = host["mod"], host["commits"]["merge"]
+    _git("clone", "-q", "--bare", str(host["bare"]), str(host["bare"].parent / "hermes-agent.git"))
+    copy = tmp_path / "copy.git"
+    _git("init", "-q", "--bare", str(copy))
+    calls, made = _record_git(monkeypatch), _record_mkdtemp(monkeypatch)
+
+    with pytest.raises(mod.GitHubTransportError) as refused:
+        mod.GitHubTransport("release_source", PLATFORM, key_path=github["key_file"]).fetch_commit(copy, merge)
+    assert refused.value.reason == "step_not_permitted"
+
+    assert github["token_requests"] == [] and github["jwts"] == [] and calls == [] and made == []
+    assert _refs(copy) == []
+
+
+def test_the_release_source_step_pushes_nothing(github, monkeypatch, tmp_path):
+    """Nor does the step push: a leased push of an owner app commit to its own branch is refused before any token, git
+    or folder, though a checkout holding the commit is there."""
+    host = _release_host(github, monkeypatch, tmp_path)
+    mod, commits = host["mod"], host["commits"]
+    checkout = tmp_path / "checkout"
+    _git("clone", "-q", "-b", "main", str(host["bare"]), str(checkout))
+    refs = _refs(host["bare"])
+    calls, made = _record_git(monkeypatch), _record_mkdtemp(monkeypatch)
+    transport = mod.GitHubTransport("release_source", OWNER_APP, key_path=github["key_file"])
+
+    with pytest.raises(mod.GitHubTransportError) as refused:
+        transport.push(checkout, "card", commits["later"], expected=commits["card"])
+    assert refused.value.reason == "step_not_permitted"
+
+    assert github["token_requests"] == [] and calls == [] and made == []
+    assert _refs(host["bare"]) == refs  # no branch moved on the origin
