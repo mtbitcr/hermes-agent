@@ -582,3 +582,71 @@ KANBAN_OFFER_DESIGN_OPTIONS_SCHEMA = {
         "required": ["question", "options"],
     },
 }
+
+# Built without ``_schema``: no ``board`` and no ``task_id``. The question is
+# always asked on the worker's own current task, on that task's own board
+# (tools.kanban_ask_owner).
+KANBAN_ASK_OWNER_SCHEMA = {
+    "name": "kanban_ask_owner",
+    "description": (
+        "Ask the owner one question when you cannot go on without the "
+        "owner's answer. Write in plain words for an owner who is not a "
+        "programmer, and name no file path, no card id and no model name. "
+        "The question has at most 500 characters. Give at most 4 choices, "
+        "each one line of at most 160 characters. At a review round limit, "
+        "use the stop review_limit, with the summary of the corrections as "
+        "the question. On success your task is held for the owner's "
+        "answer, so end the turn."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "question": _prop("string", (
+                "The question for the owner, in plain words, of at most 500 "
+                "characters (e.g. 'Should the page show prices with or "
+                "without tax?')."
+            )),
+            "choices": {
+                "type": "array",
+                "description": (
+                    "The choices the owner picks from, in the order the owner "
+                    "should see them: at most 4 choices. Each choice has "
+                    "exactly the two fields n and sentence."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "n": {
+                            "type": "integer",
+                            "description": "The number of the choice: 1 for the first, 2 for the second, and so on.",
+                        },
+                        "sentence": _prop("string", (
+                            "What the choice is, in plain words: one line of "
+                            "at most 160 characters."
+                        )),
+                    },
+                    "required": ["n", "sentence"],
+                },
+            },
+            "words": {
+                "type": "string",
+                "enum": ["optional", "required"],
+                "description": (
+                    "Whether the owner's answer may hold words of the "
+                    "owner's own ('optional') or must hold them ('required')."
+                ),
+            },
+            "stop": {
+                "type": "string",
+                "enum": ["question", "review_limit"],
+                "description": (
+                    "'question' (the default, when you leave it out) is your "
+                    "own question. 'review_limit' is for a review round "
+                    "limit: give the summary of the corrections as the "
+                    "question."
+                ),
+            },
+        },
+        "required": ["question", "choices", "words"],
+    },
+}
