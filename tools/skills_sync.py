@@ -537,9 +537,10 @@ def sync_skills(quiet: bool = False) -> dict:
         print("  (profile opted out of bundled skills via .no-bundled-skills — seeding essential skills only)")
     bundled_dir = _get_bundled_dir()
     if not bundled_dir.exists():
-        return {"copied": [], "updated": [], "skipped": 0, "user_modified": [], "cleaned": [],
+        from tools.skills_sync_roles import sync_role_skills  # the role pass runs after the general one
+        return sync_role_skills({"copied": [], "updated": [], "skipped": 0, "user_modified": [], "cleaned": [],
                 "suppressed": [], "total_bundled": 0, "not_seeded_by_marker": 0,
-                "optional_provenance_backfilled": [], "kept": [], "refused": []}
+                "optional_provenance_backfilled": [], "kept": [], "refused": []}, quiet)
     _skills_dir().mkdir(parents=True, exist_ok=True)
     all_bundled = _discover_bundled_skills(bundled_dir)
     suppressed = _read_suppressed_names()
@@ -582,7 +583,8 @@ def sync_skills(quiet: bool = False) -> dict:
         _compute_relative_dest(src, bundled_dir).parent
         for name, src in bundled_skills if name in ESSENTIAL_SKILLS} if marked else None)
     _store_manifest(st.manifest)
-    return {
+    from tools.skills_sync_roles import sync_role_skills  # the role pass runs after the general one
+    return sync_role_skills({
         "copied": st.copied, "updated": st.updated, "skipped": st.skipped, "user_modified": st.user_modified,
         "cleaned": cleaned, "suppressed": st.suppressed, "relocated": st.relocated,
         # What the role may be seeded with: a marked role, only the essentials in the catalog.
@@ -594,7 +596,7 @@ def sync_skills(quiet: bool = False) -> dict:
         "optional_provenance_backfilled": [],
         "shadowed_by_external": st.shadowed_by_external,
         "kept": st.kept, "refused": st.refused,
-        "skipped_opt_out": marked}  # lets callers report "opted out", not a normal sync
+        "skipped_opt_out": marked}, quiet)  # lets callers report "opted out", not a normal sync
 
 
 def _rmtree_writable(path: Path) -> None:
