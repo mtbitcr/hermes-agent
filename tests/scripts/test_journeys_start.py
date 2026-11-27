@@ -194,7 +194,7 @@ if name == "curl":
 sys.exit("stand-in: unknown name " + name)
 '''
 
-TOOLS = ("bash", "flock", "rm", "mkdir", "dirname", "date")
+TOOLS = ("bash", "flock", "rm", "mkdir", "dirname", "date", "tail", "cut")
 
 
 def _issuer_and_kid() -> tuple[str, str]:
@@ -679,7 +679,8 @@ def test_a_failed_step_ends_the_run_with_its_name_and_reason_and_runs_no_later_s
     result = box.result()
     assert (result["result"], result["step"], result["reason"]) == ("failed", step, REASONS[step])
     assert re.fullmatch(TIME_RE, result["started"]) and re.fullmatch(TIME_RE, result["finished"])
-    assert sorted(path.name for path in box.run_dir.iterdir()) == ["result", "run.lock"]
+    # Every failed run leaves failed-step.log beside the result and the lock, config and time included.
+    assert sorted(path.name for path in box.run_dir.iterdir()) == ["failed-step.log", "result", "run.lock"]
     named = " for journey 3" if step in LOOP_STEPS and case not in NO_JOURNEY else ""
     assert result.get("journey") == ("3" if named else None)
     assert box.told() == [f"Journeys failed at step {step}{named}: {REASONS[step]}."]
@@ -719,7 +720,7 @@ def test_the_new_result_replaces_the_old_one(box):
     assert box.run(RUN_ONCE).returncode != 0
 
     assert box.result()["result"] == "failed"
-    assert sorted(path.name for path in box.run_dir.iterdir()) == ["result", "run.lock"]
+    assert sorted(path.name for path in box.run_dir.iterdir()) == ["failed-step.log", "result", "run.lock"]
 
 
 # --------------------------------------------------------------------------- the started result
