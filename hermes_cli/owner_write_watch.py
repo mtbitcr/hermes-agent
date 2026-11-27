@@ -42,6 +42,7 @@ PASS, FAIL, UNKNOWN = "pass", "fail", "unknown"
 OK, FAILING = "ok", "failing"
 STATE_FILE = "owner_write_watch_state.json"
 REPORT_FILE = "owner_write_watch_report.json"
+LAST_FAILURE_FILE = "owner_write_watch_last_failure.json"
 GAP = timedelta(hours=2)
 # A failed announcement prints again at most once an hour; the margin absorbs scheduler jitter.
 REPEAT_AFTER = timedelta(minutes=50)
@@ -49,6 +50,8 @@ REPEAT_AFTER = timedelta(minutes=50)
 REPEAT_OFF = "The hourly repeat is off: if this alert is not delivered, it is not sent again."
 REQUEST_TIMEOUT_SECONDS = 30.0
 PAGE_CHECK_TIMEOUT_SECONDS = 600
+PAGE_CHECK_RETRY_WAIT_SECONDS = 30
+PAGE_CHECK_RETRY_MIN_SECONDS = 120
 PAGE_CHECK_OUTPUT_BYTES = 16000
 PAGE_CHECK_LINES = 20
 # A page check line is kept only in the fixed form: FAIL <words> or the count line, 200 characters at most.
@@ -108,6 +111,7 @@ class Result:
     code: Optional[str] = None
     at: str = ""
     page_lines: Optional[Dict[str, Any]] = None
+    page_tries: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass(frozen=True)
@@ -232,6 +236,10 @@ def report_path() -> Path:
     return get_hermes_home() / REPORT_FILE
 
 
+def last_failure_path() -> Path:
+    return report_path().with_name(LAST_FAILURE_FILE)
+
+
 def format_time(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -302,19 +310,25 @@ def run(
     moment = clock()
     results = [_probe(probe, base, key, send or _http_send, clock) for probe in probes]
     if indirect:
-        results.append(_page_check(page_check, run_page_check or _run_page_check, clock))
+        results.append(_page_check(page_check, run_page_check, clock))
         results.extend(_wiring(route_policy or _deployed_route_policy, clock))
         results.append(_journeys(moment, clock))
     reader = delivery_state or (lambda announced: _previous_delivery(announced, job_id))
     state, kind, text = _decide(previous, results, moment, profile, reader)
     try:
-        _write(report_path(), {"profile": profile, "run_at": moment.isoformat(), "state": state["state"],
-                               "checks": [{k: v for k, v in asdict(result).items() if k != "page_lines" or v is not None}
-                                             for result in results]})
+        report = {"profile": profile, "run_at": moment.isoformat(), "state": state["state"],
+                  "checks": [{k: v for k, v in asdict(result).items() if k not in ("page_lines", "page_tries") or v is not None}
+                             for result in results]}
+        _write(report_path(), report)
         _write(state_path(), state)
     except OSError as exc:
         print(f"owner write watch: state not saved: {type(exc).__name__}", file=sys.stderr)
         return Outcome(1, kind, text)
+    if any(result.outcome == FAIL or any(t["outcome"] == FAIL for t in result.page_tries or ()) for result in results):
+        try:
+            _write(last_failure_path(), report)
+        except OSError as exc:
+            print(f"owner write watch: last failure report not saved: {type(exc).__name__}", file=sys.stderr)
     return Outcome(0, kind, text)
 
 
@@ -338,11 +352,31 @@ def _probe(probe: Probe, base: str, key: str, send: Callable[..., Any], clock) -
     return Result(outcome=outcome, detail=detail, status=status, code=code, at=clock().isoformat(), **fields)
 
 
-def _page_check(path: str, run_page_check: Callable[[str], Any], clock) -> Result:
-    outcome = run_page_check(path)
-    outcome, page_lines = outcome if isinstance(outcome, tuple) else (outcome, None)
-    return Result(_PAGE_CHECK, _PAGE_CHECK_LABEL, outcome if outcome in (PASS, FAIL, UNKNOWN) else FAIL,
-                  detail="did not pass", method="run", path=path, at=clock().isoformat(), page_lines=page_lines)
+class _RetryDeadline(float):
+    """The shared deadline as the second try gets it: each launch of its script needs PAGE_CHECK_RETRY_MIN_SECONDS left."""
+
+
+def _page_check(path: str, run_page_check: Optional[Callable[[str], Any]], clock) -> Result:
+    deadline = time.monotonic() + PAGE_CHECK_TIMEOUT_SECONDS  # one absolute limit for both tries and their waits
+
+    def attempt(limit):
+        outcome = run_page_check(path) if run_page_check else _run_page_check(path, limit)
+        if outcome is None and not run_page_check:  # no launch was allowed
+            return None
+        outcome, page_lines = outcome if isinstance(outcome, tuple) else (outcome, None)
+        return outcome if outcome in (PASS, FAIL, UNKNOWN) else FAIL, page_lines
+
+    tries = [attempt(deadline)]
+    if tries[0][0] == FAIL and deadline - time.monotonic() - PAGE_CHECK_RETRY_WAIT_SECONDS >= PAGE_CHECK_RETRY_MIN_SECONDS:
+        time.sleep(PAGE_CHECK_RETRY_WAIT_SECONDS)
+        if deadline - time.monotonic() >= PAGE_CHECK_RETRY_MIN_SECONDS:  # the sleep may have woken late
+            second = attempt(_RetryDeadline(deadline))
+            if second:
+                tries.append(second)
+    outcome, page_lines = tries[-1]
+    return Result(_PAGE_CHECK, _PAGE_CHECK_LABEL, outcome, detail="did not pass", method="run", path=path,
+                  at=clock().isoformat(), page_lines=page_lines,
+                  page_tries=[{"outcome": o, "page_lines": lines} for o, lines in tries])
 
 
 def _journeys(moment: datetime, clock) -> Result:
@@ -569,9 +603,9 @@ def _read_page_check_output(proc, deadline: float) -> Optional[bytes]:
         with selectors.DefaultSelector() as selector:  # unlike select.select, no limit on the descriptor number
             selector.register(proc.stdout, selectors.EVENT_READ)
             while True:
-                ended = proc.poll() is not None
-                if not ended and time.monotonic() >= deadline:
+                if time.monotonic() >= deadline:
                     return data
+                ended = proc.poll() is not None
                 if selector.select(0 if ended else 0.05):
                     chunk = os.read(proc.stdout.fileno(), 65536)
                     if not chunk:
@@ -584,9 +618,14 @@ def _read_page_check_output(proc, deadline: float) -> Optional[bytes]:
         return None
 
 
-def _run_page_check(path: str):
-    """``(outcome, page_lines)``: page_lines is the kept lines of the script's standard output, None when none were captured."""
+def _run_page_check(path: str, deadline: float):
+    """``(outcome, page_lines)``: page_lines is the kept lines of the script's standard output, None when none were captured.
+    ``deadline`` is the absolute time.monotonic() limit, taken before the first launch."""
+    floor = PAGE_CHECK_RETRY_MIN_SECONDS if isinstance(deadline, _RetryDeadline) else 0
     for stdout in (subprocess.PIPE, subprocess.DEVNULL):  # no pipe: run the script as before, with no lines
+        left = deadline - time.monotonic()
+        if left <= 0 or left < floor:  # every launch, the fallback too, needs its time
+            return None if floor else (UNKNOWN, None)
         try:
             proc = subprocess.Popen([path], stdin=subprocess.DEVNULL, stdout=stdout, stderr=subprocess.DEVNULL)
             break
@@ -594,11 +633,13 @@ def _run_page_check(path: str):
             pass
     else:
         return FAIL, None
-    deadline = time.monotonic() + PAGE_CHECK_TIMEOUT_SECONDS
     try:
         data = _read_page_check_output(proc, deadline) if proc.stdout else None
         try:
-            outcome = PASS if proc.wait(timeout=max(deadline - time.monotonic(), 0)) == 0 else FAIL
+            left = deadline - time.monotonic()
+            if left <= 0:  # an exit first seen after the deadline decides nothing
+                raise subprocess.TimeoutExpired(path, 0)
+            outcome = PASS if proc.wait(timeout=left) == 0 else FAIL
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()

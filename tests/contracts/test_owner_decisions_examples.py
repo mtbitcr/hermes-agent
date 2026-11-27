@@ -10,13 +10,16 @@ for the owner's approval. The list read with ``owner_input_upload_v1`` holds a
 card the real apply path declared and the claim held for the owner's files
 (card C2 of the named inputs plan). The design choice examples come from
 ``POST /v1/owner-workspace/decisions/{ref}/choose/{n}`` and the list read
-with ``design_options_v1`` (card 2 of the design options plan). What is
+with ``design_options_v1`` (card 2 of the design options plan). The list read
+with ``owner_answer_v1`` holds the question of each stopped card (card P2 of
+the owner answer plan). What is
 asserted is described in tests/contracts/conftest.py.
 """
 
 from __future__ import annotations
 
 import contextlib
+import re
 from unittest.mock import patch
 
 import pytest
@@ -28,7 +31,7 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     _resolve_owner_workspace_run_context,
 )
-from hermes_cli import kanban_db, owner_named_inputs as oni, owner_workspace as ow, release_ledger
+from hermes_cli import kanban_db, owner_named_inputs as oni, owner_questions as oq, owner_workspace as ow, release_ledger
 from plugins.dashboard_auth.raphael_workspace import model_policy
 from tests.contracts import conftest as contract
 from tests.gateway.test_api_server_owner_choices import _designer_card, _ref
@@ -225,6 +228,101 @@ async def test_the_decision_list_read_with_owner_input_upload_names_the_missing_
             "n": 1, "name": "price list",
             "type_label": oni.TYPE_LABELS["csv"], "max_bytes": oni.MAX_INPUT_BYTES,
         }]
+
+
+@pytest.mark.asyncio
+async def test_the_decision_list_read_with_owner_answer_serves_the_question_of_each_stopped_card(
+    owner, owner_payload_example,
+):
+    """Card P2 of the owner answer plan: the list read with ``owner_answer_v1``
+    holds a worker's own question, a review limit stop and a plain stop, each
+    with its ``question``; the same list read without the token is today's."""
+    project = _project(owner, "Sign Up Pages")
+    with contextlib.closing(kanban_db.connect(board=project["board"])) as conn:
+        asked, limit, plain = (
+            kanban_db.create_task(conn, title=title, assignee="default", project_id=project["project_id"])
+            for title in ("Choose the form", "Fix the form", "Pick the colour")
+        )
+        for task_id, stop, question, choices, words in (
+            (asked, "question", "Which sign up page should Raphael build first?", [
+                {"n": 1, "sentence": "Build the short form with one field."},
+                {"n": 2, "sentence": "Build the long form with every field."},
+            ], "optional"),
+            (limit, "review_limit", "The reviewer asked for a shorter form.", [], "optional"),
+        ):
+            claimed = kanban_db.claim_task(conn, task_id)
+            assert claimed is not None
+            oq.declare_owner_question(
+                conn, task_id, stop, question, choices, words,
+                board=project["board"], expected_run_id=claimed.current_run_id,
+            )
+        assert kanban_db.claim_task(conn, plain) is not None
+        assert kanban_db.block_task(
+            conn, plain, reason="Which colour do you want for the button?", kind="needs_input",
+        )
+        # The clock is not controlled, so each card gets its own fixed creation
+        # time and a later, distinct stop time (the time of its blocked event).
+        created_at = {asked: 1_700_000_000, limit: 1_700_001_000, plain: 1_700_002_000}
+        stopped_at = {asked: 1_700_100_000, limit: 1_700_101_000, plain: 1_700_102_000}
+        for task_id in created_at:
+            conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (created_at[task_id], task_id))
+            changed = conn.execute(
+                "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'blocked'",
+                (stopped_at[task_id], task_id),
+            ).rowcount
+            assert changed == 1
+        conn.commit()
+    iso = {
+        task_id: ow._owner_timestamp(moment)
+        for task_id, moment in {**{f"c{k}": v for k, v in created_at.items()}, **stopped_at}.items()
+    }
+    expected_stop = {"Choose the form": iso[asked], "Fix the form": iso[limit], "Pick the colour": iso[plain]}
+    expected_created = {
+        "Choose the form": iso[f"c{asked}"], "Fix the form": iso[f"c{limit}"], "Pick the colour": iso[f"c{plain}"],
+    }
+    assert len(set(expected_stop.values()) | set(expected_created.values())) == 6
+    _adapter, app = _app()
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/v1/owner-workspace/decisions", params={"capabilities": "owner_answer_v1"})
+        live = {"status": resp.status, "body": await resp.json()}
+        today = await _list(client)
+
+    saved = owner_payload_example(FAMILY, "decision_list_owner_answer", live)
+
+    assert "question" not in str(today)
+    # The opted-in item's created_at is when the stop began; the no-token item
+    # keeps the card's creation time. Only that and the question may differ.
+    assert {item["title"]: item["created_at"] for item in live["body"]["data"]} == expected_stop
+    assert {item["title"]: item["created_at"] for item in today["body"]["data"]} == expected_created
+
+    def _without(body: dict, *dropped: str) -> dict:
+        return {**body, "data": [
+            {key: value for key, value in item.items() if key not in dropped} for item in body["data"]
+        ]}
+
+    assert _without(live["body"], "question", "created_at") == _without(today["body"], "created_at")
+    for answer in (live, saved):
+        assert answer["status"] == 200
+        items = {item["title"]: item for item in answer["body"]["data"]}
+        assert set(items) == {"Choose the form", "Fix the form", "Pick the colour"}
+        assert {title: item["created_at"] for title, item in items.items()} != expected_created
+        questions = {title: item["question"] for title, item in items.items()}
+        assert {title: question["stop"] for title, question in questions.items()} == {
+            "Choose the form": "question", "Fix the form": "review_limit", "Pick the colour": "plain",
+        }
+        for question in questions.values():
+            assert set(question) == {"object", "stop", "stop_ref", "text", "choices", "words", "words_limit"}
+            assert question["object"] == "hermes.owner_workspace.owner_question"
+            assert re.fullmatch(r"stop_[0-9a-f]{32}", question["stop_ref"])
+            assert question["words_limit"] == 1000
+        assert len({question["stop_ref"] for question in questions.values()}) == 3
+        assert [choice["n"] for choice in questions["Choose the form"]["choices"]] == [1, 2]
+        assert questions["Choose the form"]["words"] == "optional"
+        assert questions["Fix the form"]["choices"][1] == {"n": 2, "sentence": "Stop this work and release nothing."}
+        assert questions["Pick the colour"]["words"] == "required"
+        assert questions["Pick the colour"]["choices"] == []
+        assert questions["Pick the colour"]["text"] == "Which colour do you want for the button?"
+        assert items["Pick the colour"]["reason"] == "Raphael needs your answer before this work can continue."
 
 
 @pytest.mark.asyncio

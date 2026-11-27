@@ -1,0 +1,84 @@
+{
+  "body": {
+    "data": [
+      {
+        "authority": "task",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_2ee3d445ac7178ed5ee231e781515086",
+        "kind": "owner_input",
+        "project_name": "Sign Up Pages",
+        "project_slug": "sign-up-pages",
+        "question": {
+          "choices": [
+            {
+              "n": 1,
+              "sentence": "Build the short form with one field."
+            },
+            {
+              "n": 2,
+              "sentence": "Build the long form with every field."
+            }
+          ],
+          "object": "hermes.owner_workspace.owner_question",
+          "stop": "question",
+          "stop_ref": "stop_909a65611a98dede032f214e23e9a8f9",
+          "text": "Which sign up page should Raphael build first?",
+          "words": "optional",
+          "words_limit": 1000
+        },
+        "reason": "Raphael needs your answer before this work can continue.",
+        "title": "Choose the form"
+      },
+      {
+        "authority": "task",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_d7e601c69c0034ec1330e1042e849a4d",
+        "kind": "owner_input",
+        "project_name": "Sign Up Pages",
+        "project_slug": "sign-up-pages",
+        "question": {
+          "choices": [
+            {
+              "n": 1,
+              "sentence": "Repair it once more with the reviewer's corrections."
+            },
+            {
+              "n": 2,
+              "sentence": "Stop this work and release nothing."
+            }
+          ],
+          "object": "hermes.owner_workspace.owner_question",
+          "stop": "review_limit",
+          "stop_ref": "stop_87d9f740f4fc4460109fc5b6ce0b0cf9",
+          "text": "The reviewer asked for a shorter form.",
+          "words": "optional",
+          "words_limit": 1000
+        },
+        "reason": "Raphael needs your answer before this work can continue.",
+        "title": "Fix the form"
+      },
+      {
+        "authority": "task",
+        "created_at": "2026-09-21T14:13:20Z",
+        "decision_ref": "decision_e48936278a00be70bf154e13ae421af6",
+        "kind": "owner_input",
+        "project_name": "Sign Up Pages",
+        "project_slug": "sign-up-pages",
+        "question": {
+          "choices": [],
+          "object": "hermes.owner_workspace.owner_question",
+          "stop": "plain",
+          "stop_ref": "stop_90da2006bda2b715b432752aa4b5baa5",
+          "text": "Which colour do you want for the button?",
+          "words": "required",
+          "words_limit": 1000
+        },
+        "reason": "Raphael needs your answer before this work can continue.",
+        "title": "Pick the colour"
+      }
+    ],
+    "object": "hermes.owner_workspace.decision_list",
+    "truncated": false
+  },
+  "status": 200
+}

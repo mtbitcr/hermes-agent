@@ -152,6 +152,7 @@ CLOSED_VOCABULARIES = (
         "Raphael needs your answer before the plan can continue.",
         "Raphael found a problem and is preparing the safest next step.",
         "Raphael is coordinating the approved milestone.",
+        "Raphael is waiting for the checks after a release to end before it starts new work.",
         "This Project was deleted. Its retained copy can be restored.",
         "This Project was deleted.",
     })),
@@ -281,7 +282,15 @@ CLOSED_VOCABULARIES = (
         "hermes.owner_workspace.release_decision",
         # api_server_owner_closures.py returns this object after a fenced Undo.
         "hermes.owner_workspace.closure_undo",
+        # owner_questions.py OBJECT, the ``question`` of an owner-input item read with owner_answer_v1.
+        "hermes.owner_workspace.owner_question",
     })),
+    # owner_questions.py decision_questions: the stops it serves; "stopped_briefly" (S5) is a later card's.
+    ("owner_decisions", (_DECISION_LIST, "data", "kind=owner_input", "question", "stop"),
+     frozenset({"question", "review_limit", "plain"})),
+    # owner_questions.py WORDS
+    ("owner_decisions", (_DECISION_LIST, "data", "kind=owner_input", "question", "words"),
+     frozenset({"optional", "required"})),
     # owner_workspace.py:3906, :3914, :3919; api_server.py:13240
     ("owner_decisions", (_DECISION_LIST, "data", "kind"),
      frozenset({"capability", "owner_input", "run_approval"})),
