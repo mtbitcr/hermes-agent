@@ -17,7 +17,7 @@ Do these six things, in this order, and nothing else.
 
 4. Collect the tool's JSON result and the diff of the owned paths, `/workspace/baseline` against `/workspace/task`, written to one file inside `/workspace/task`.
 5. Attach that diff as a new attachment of the same run with the platform's artifact tool, `raphael_sandbox_artifact`, in the `export` direction, giving the file's absolute path and its SHA-256.
-6. Complete with `kanban_complete`, setting its patch attachment to that attachment's id, before iteration 100 or two hours after the first launch, whichever comes first, whether or not the tool finished everything, with one line saying what is missing. Only a completion makes the kernel apply the patch and hand the card to its reviewer; a review request alone leaves the branch without the change.
+6. Complete with `kanban_complete`, setting its patch attachment to that attachment's id, before iteration 100 or two hours after the first launch, whichever comes first, whether or not the tool finished everything, with one line saying what is missing. Only a completion makes the kernel apply the patch and hand the card to its reviewer; a review request alone leaves the branch without the change. Before the completion, export `/workspace/task/POINT_TABLE.md` as one more attachment of the same run with the call of step 5, and name its attachment id in the completion metadata as `point_table`; when the file does not exist, set `point_table` to `none`.
 
 Run no tests and no self-review, and never edit the owned files: the coding tool runs only the focused tests it wrote, and the wider gate is continuous integration and the independent reviews.
 
@@ -35,6 +35,12 @@ Make every tool call one command, under 300 characters, with no raw line break o
 - Add "Each check you report means no failure caused by this change; continuous integration judges the whole suite."
 - Add "Add a command, file or flag only when this prompt names it with its reason." and copy the card's new-parts list after it.
 - When the change adds or touches a kernel tool that resolves a store path (a board, the project registry, an attachment), add: "Write one test under the exact environment the dispatcher injects into a worker: `HERMES_KANBAN_DB` and `HERMES_KANBAN_BOARD` pinned to the worker's own board, `HERMES_KANBAN_TASK` set, and `HERMES_HOME` pointing at a profile home under the root. From there the tool must still reach every other board and the root registry. Its production proof is read against an independent count."
+- Add "Before the handover, write `/workspace/task/POINT_TABLE.md`: each numbered point of the facts file and of the card's acceptance, each with the name of the test that holds it or 'not held: <reason>'. A test that holds the opposite of a point is a defect to fix before the handover."
+- Add "For each new input or read, write a focused test for each case that applies: negative, zero, empty, missing, a read that raises, a write that fails after a successful open, multibyte and NUL text, and a record stored by the previous version. List each case that does not apply in the point table."
+
+## When the card needs the owner
+
+When the card cannot go on without a decision of the owner, do not complete and do not guess. That is the case when the card or its facts file says that the build stops, when two rules of the card contradict each other, or when a file outside the owned paths must change. First write the technical detail, such as the name of the test or of the file, as a comment on the card. Then call `kanban_ask_owner` one time: the question in plain words for an owner who is not a programmer, with what stopped the work; at most four choices, each one line that says what happens next; no file path, no card id and no model name in the question or in a choice. The call holds the card for the owner, so end the turn after it. Use `kanban_block` only for a stop that is not a question to the owner.
 
 ## Pitfalls seen on the build machine
 
