@@ -19,6 +19,12 @@ checkout's remote-tracking ref, with no credential.
 
 A clone of main (GitHubTransport.clone_main) fetches main the same way into a fresh copy, then clones that
 copy into a missing or empty folder, with no credential, and names the repository on GitHub as its origin.
+
+A fetch of one commit (GitHubTransport.fetch_commit) runs the same way: the git that carries the credential fetches
+that commit alone, named by its 40 hex digits, into a fresh copy, and the commit goes on from that copy into a bare
+repository's one ref, with no credential. That exact fetch of one owner app commit is the release_source step's one
+operation, and no other step's: the step makes no REST call, fetches no main and reads no other repository. One
+transport fetches one commit, the first it is asked for, so its one token serves that commit alone.
 """
 from __future__ import annotations
 
@@ -63,6 +69,12 @@ _MAIN_TRACKING = "refs/remotes/origin/main"
 # The origin a clone names: the bound repository on GitHub, never the copy it was made from, a test's
 # GIT_ORIGIN or a credential.
 _CLONE_ORIGIN = "https://github.com/{repository}.git"
+# A commit fetch writes one ref in the bare repository it fills: the commit fetched, its history with it.
+_FETCHED = "refs/heads/fetched"
+# The one step that fetches a commit by its name (fetch_commit), and so the one step that fetches no main.
+_COMMIT_STEP = "release_source"
+# The one repository that step reads, the owner app: a fetch_commit bound to any other is refused before any token.
+_COMMIT_REPOSITORY = "mtbitcr/raphael-workspace"
 
 # Callers name a step, never a permission map, so these are the only token requests there are.
 # On GitHub write includes read, and every token gets metadata read without asking.
@@ -75,6 +87,11 @@ STEP_PERMISSIONS = MappingProxyType({
     # The first commit of an empty repository (repo_bootstrap), owner decision D2: the only step that may
     # write workflows, so publish and merge can never change the workflow file it writes.
     "bootstrap": MappingProxyType({"contents": "write", "workflows": "write"}),
+    # The release host's fetch of one exact owner app commit (owner app release plan card 2, the owner's answer to
+    # Q1): contents read and nothing more. That fetch (fetch_commit, which no other step may make) is the step's one
+    # operation, and one transport makes it for one commit: it makes no REST call, not even a branch head, fetches no
+    # main and reads no other repository.
+    "release_source": MappingProxyType({"contents": "read"}),
 })
 
 _COMPONENT = r"[A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?"
@@ -328,6 +345,7 @@ class GitHubTransport:
             get_default_hermes_root() / "secrets" / "github-app" / "raphael-agent-factory.pem")
         self._routes = [(e, _path_pattern(e.template, repository)) for e in REST_ALLOWLIST if e.permission]
         self._token: str | None = None
+        self._commit: str | None = None  # the one commit fetch_commit serves, bound at its first call
 
     def request(self, method: str, path: str, *, query=None, body=None) -> dict:
         """Call one allowlisted endpoint. Returns {"status", "data"}, where data holds the fixed
@@ -342,8 +360,8 @@ class GitHubTransport:
         if not set(endpoint.required_query) <= values.keys() or not all(
                 key in endpoint.query and re.fullmatch(endpoint.query[key], value) for key, value in values.items()):
             raise GitHubTransportError("query_not_allowed")
-        if not _holds(self._permissions, endpoint.permission):
-            raise GitHubTransportError("step_not_permitted")
+        if self.step == _COMMIT_STEP or not _holds(self._permissions, endpoint.permission):
+            raise GitHubTransportError("step_not_permitted")  # release_source's one operation is fetch_commit
         if endpoint.body is not None and not endpoint.body(body):
             raise GitHubTransportError("body_not_allowed")
         target = f"{path}?{urlencode(values)}" if values else path
@@ -411,7 +429,7 @@ class GitHubTransport:
         working tree never move. As in a push, the git that carries the credential runs in a fresh bare
         repository in a private temporary directory, here seeded with the checkout's HEAD so only the newer
         history travels, and the commit goes on into the checkout from that copy with no credential."""
-        if not _holds(self._permissions, ("contents", "read")):
+        if self.step == _COMMIT_STEP or not _holds(self._permissions, ("contents", "read")):
             raise GitHubTransportError("step_not_permitted")
         url, scheme = self._push_url()  # the source, fixed before any credential exists
         checkout = os.path.abspath(checkout)
@@ -456,7 +474,7 @@ class GitHubTransport:
         credential. fetch_main cannot do this, as it needs the HEAD a fresh clone does not have yet. As there,
         the git that carries the credential fetches main alone into a fresh bare repository in a private
         temporary directory, and the clone is made from that copy with no credential."""
-        if not _holds(self._permissions, ("contents", "read")):
+        if self.step == _COMMIT_STEP or not _holds(self._permissions, ("contents", "read")):
             raise GitHubTransportError("step_not_permitted")
         url, scheme = self._push_url()  # the source, fixed before any credential exists
         target = os.path.abspath(target)
@@ -505,6 +523,60 @@ class GitHubTransport:
                     raise GitHubTransportError("clone_failed")
         finally:
             shutil.rmtree(home, ignore_errors=True)  # the copy, the history fetched into it and the config
+        return sha
+
+    def fetch_commit(self, copy: str | Path, sha: str) -> str:
+        """Fetch the one commit `sha`, named by its 40 lowercase hex digits, into the bare repository at `copy` as its
+        one ref, with the commit's history and nothing else, and return it: no short, symbolic or relative name
+        reaches a git. Only the release_source step fetches this way, the release host's fetch of one exact owner app
+        commit. As in fetch_main, the git that carries the credential runs in a fresh bare repository in a private
+        temporary directory, and the commit goes on into `copy` from that repository with no credential."""
+        if self.step != _COMMIT_STEP or self.repository != _COMMIT_REPOSITORY:
+            raise GitHubTransportError("step_not_permitted")  # the owner app's commits alone: before any token or git
+        if not _is_sha(sha):
+            raise GitHubTransportError("bad_commit")  # before any token, folder or git exists
+        if self._commit is None:
+            self._commit = sha  # bound before any credential exists, and kept though this fetch fails
+        elif self._commit != sha:
+            raise GitHubTransportError("step_not_permitted")  # one credential, one commit: another needs a transport
+        url, scheme = self._push_url()  # the source, fixed before any credential exists
+        copy = os.path.abspath(copy)
+        try:
+            home = tempfile.mkdtemp(prefix="hermes-delivery-commit-")  # mode 0700, for this one fetch
+        except OSError:
+            raise GitHubTransportError("fetch_failed") from None
+        try:
+            env = _git_base_env(home)
+            repository = os.path.join(home, "commit.git")
+            try:
+                Path(env["GIT_CONFIG_GLOBAL"]).touch(exist_ok=False)  # the global configuration: empty
+            except OSError:
+                raise GitHubTransportError("fetch_failed") from None
+            bare = _run_git(["git", "--git-dir", copy, "rev-parse", "--is-bare-repository"], env)
+            if bare is None or bare.returncode != 0 or bare.stdout.strip() != b"true":
+                raise GitHubTransportError("fetch_failed")  # no bare repository at `copy`: before any credential exists
+            init = _run_git(["git", "init", "--bare", "--quiet", "--template=", repository], env)
+            if init is None or init.returncode != 0:
+                raise GitHubTransportError("fetch_failed")
+            # Only GIT_ORIGIN's own protocol, one URL and one refspec, this commit alone by its name, and no tag,
+            # FETCH_HEAD or maintenance run beside it.
+            argv = ["git", "-c", "protocol.allow=never", "-c", f"protocol.{scheme}.allow=always",
+                    "--git-dir", repository, "fetch", "--no-tags", "--no-write-fetch-head", "--no-auto-maintenance",
+                    url, f"{sha}:{_FETCHED}"]
+            fetched = _run_git(argv, self._git_env(_git_base_env(home)))  # the token is minted here
+            if fetched is None or fetched.returncode != 0:
+                raise GitHubTransportError("fetch_failed")
+            # Into the copy from that repository, with no credential: only the file protocol, this one commit into
+            # its one ref, and no tag, prune, FETCH_HEAD, submodule fetch or maintenance run.
+            copied = _run_git(["git", "-c", "protocol.allow=never", "-c", "protocol.file.allow=always",
+                               "--git-dir", copy, "fetch", "--no-tags", "--no-prune", "--no-write-fetch-head",
+                               "--no-recurse-submodules", "--no-auto-maintenance", repository, f"+{sha}:{_FETCHED}"],
+                              env)
+            held = _run_git(["git", "--git-dir", copy, "rev-parse", "--verify", f"{_FETCHED}^{{commit}}"], env)
+            if copied is None or copied.returncode != 0 or _commit_of(held) != sha:
+                raise GitHubTransportError("fetch_failed")
+        finally:
+            shutil.rmtree(home, ignore_errors=True)  # the fetch's repository, the history in it and the config
         return sha
 
     def _installation_token(self) -> str:
