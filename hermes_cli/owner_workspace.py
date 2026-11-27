@@ -3440,52 +3440,18 @@ def _owner_run_previous_pins(
 ) -> dict[int, OwnerTaskRoutePin]:
     """Map each run that started before its card's route switch to the pin it can prove.
 
-    A run starts at its first bound event; its switch is the card's earliest
-    later ``owner_retry`` that records a ``previous_route``. That route is the
-    run's own only when the card's route history records no other change in
-    between: the switch's own repin, bound to the same held run, is written
-    just before it. Anything else is unproven and reads as unknown. A run with
-    no later switch is absent and keeps its card's current pin.
+    The switch keeps that pin for each such run while the card's history is
+    still complete (:func:`owner_retry_route.keep_run_pins`), in a table that
+    event cleanup never prunes, so cleanup changes no answer. A kept pin is
+    checked as a card's own; an unproven or missing one reads as unknown, never
+    as a later pin. A run after its card's latest switch is absent and keeps
+    its card's current pin.
     """
-    slots = ",".join("?" for _ in run_ids)
-    history: dict[str, list] = {}
-    for event in conn.execute(
-        "SELECT id, task_id, run_id, kind, payload FROM task_events WHERE task_id IN "
-        f"(SELECT task_id FROM task_runs WHERE id IN ({slots})) "
-        "AND kind IN (?, ?, ?, ?) ORDER BY id ASC",
-        (*run_ids, kanban_db.OWNER_RETRY_EVENT_KIND,
-         "model_route_pinned", "model_route_repinned", "model_route_unapproved"),
-    ):
-        history.setdefault(event["task_id"], []).append(event)
-    pins: dict[int, OwnerTaskRoutePin] = {}
-    for run in conn.execute(
-        "SELECT r.id AS id, r.task_id AS task_id, MIN(e.id) AS start FROM task_runs r "
-        "JOIN task_events e ON e.run_id = r.id AND e.task_id = r.task_id "
-        f"WHERE r.id IN ({slots}) GROUP BY r.id",
-        tuple(run_ids),
-    ):
-        changes = []
-        for event in history.get(run["task_id"], ()):
-            if event["id"] <= run["start"]:
-                continue
-            if event["kind"] != kanban_db.OWNER_RETRY_EVENT_KIND:
-                changes.append(event)
-                continue
-            try:
-                payload = json.loads(event["payload"]) if event["payload"] else None
-            except (json.JSONDecodeError, TypeError):
-                payload = None
-            if not isinstance(payload, dict) or "previous_route" not in payload:
-                continue
-            if changes and (changes[-1]["kind"], changes[-1]["run_id"]) == (
-                "model_route_repinned", event["run_id"],
-            ):
-                changes.pop()
-            pins[int(run["id"])] = (
-                None if changes else owner_task_route_pin(payload["previous_route"])
-            ) or OwnerTaskRoutePin(valid=False)
-            break
-    return pins
+    return {
+        run_id: (owner_task_route_pin(row) if row is not None else None)
+        or OwnerTaskRoutePin(valid=False)
+        for run_id, row in owner_retry_route.kept_run_pins(conn, run_ids).items()
+    }
 
 
 def _select_owner_project_task_rows(
@@ -7854,6 +7820,7 @@ def _retry_provider_wait(
                 return "This retry choice is no longer available. Reload this Project and check the work."
             if not owner_retry_route.openai_ready(offer.previous["assignee"]):
                 return "This role needs a valid sign-in for the selected provider. This work is still waiting."
+            owner_retry_route.keep_run_pins(conn, task_id, offer, int(held["id"]))
             owner_retry_route.repin(conn, task_id, offer, int(held["id"]))
             owner_retry = {**owner_retry, "previous_route": offer.previous}
         kanban_db._append_event(
