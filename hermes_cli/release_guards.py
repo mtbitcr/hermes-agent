@@ -1,4 +1,4 @@
-"""Release guards G1 to G12, asked of the release host through an adapter.
+"""Release guards G1 to G13, asked of the release host through an adapter.
 
 Today these guards live only in the per-release wrapper script on the release server. Here they
 keep what they mean but become checks over `HostReader`, so one pass serves both prepare mode
@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
+
+from hermes_cli.release_routes import RoutePlan
 
 LOCK_FILE = "uv.lock"
 PROJECT_MANIFEST = "pyproject.toml"
@@ -125,6 +127,11 @@ class HostReader(Protocol):
         environment check compares; empty when it holds them all. Raises when the comparison
         cannot be read."""
 
+    def route_plan(self, prev: str, new: str, *, from_snapshot: bool = False) -> RoutePlan:
+        """What the release changes in the route list of each role the gateway serves here, made
+        from the route file at `prev` and at `new` and each role's config.yaml, live or, with
+        `from_snapshot`, in the named configuration snapshot. Raises when it cannot be made."""
+
 
 GuardCheck = Callable[[HostReader, Pins, Sequence[RecordedMerge]], bool]
 
@@ -185,6 +192,19 @@ def _environment_holds_lock(host: HostReader, pins: Pins, merges: Sequence[Recor
         return not host.environment_lock_differences()
     except Exception:
         return False
+
+
+def _route_entries_can_be_planned(
+    host: HostReader, pins: Pins, merges: Sequence[RecordedMerge]
+) -> bool:
+    # Card 4 of the route plan: the plan is made and dropped, and no route list is written yet.
+    # One that cannot be made fails, and its reason stays out of the verdict, since it can come
+    # from a config.yaml.
+    try:
+        host.route_plan(pins.prev, pins.new)
+    except Exception:
+        return False
+    return True
 
 
 GUARDS: tuple[tuple[str, str, GuardCheck], ...] = (
@@ -257,6 +277,11 @@ GUARDS: tuple[tuple[str, str, GuardCheck], ...] = (
         "the platform environment holds every package that the checkout's lock names for this"
         " host, with the sync extras, at its locked version",
         _environment_holds_lock,
+    ),
+    (
+        "G13",
+        "the route entries that this release adds or removes can be planned",
+        _route_entries_can_be_planned,
     ),
 )
 

@@ -27,6 +27,7 @@ import yaml
 from hermes_cli import release_ledger as ledger
 from hermes_cli.release_guards import GUARDS
 from hermes_cli.release_host import LiveHostReader
+from hermes_cli.release_routes import RoutePlan, RoutePlanError
 
 
 def _commit(label: str) -> str:
@@ -169,6 +170,8 @@ class FakeHost:
     live_environment: bool = False
     # What G12's comparison of the platform environment with the checkout's lock finds.
     unlocked: tuple[str, ...] = ()
+    # G13's route plan, or the exception raised when it cannot be made.
+    routes: RoutePlan | Exception = RoutePlan((), ())
     built: list[dict] = field(default_factory=list)
     chains: list[tuple[str, str]] = field(default_factory=list)
     asked: list[str] = field(default_factory=list)
@@ -241,6 +244,11 @@ class FakeHost:
 
     def environment_lock_differences(self):
         return self.unlocked
+
+    def route_plan(self, prev, new, *, from_snapshot=False):
+        if isinstance(self.routes, Exception):
+            raise self.routes
+        return self.routes
 
     def open_native_runs(self):
         if not self.runs_readable:
@@ -564,6 +572,7 @@ def test_prepare_runs_every_guard_and_writes_nothing(root, tmp_path, monkeypatch
     assert release_cmd.prepare() == 0
     out = capsys.readouterr().out
     assert f"Batch {batch['batch_id']}: PREV {PREV}, NEW {NEW}" in out
+    assert [guard for guard, _rule, _check in GUARDS] == [f"G{number}" for number in range(1, 14)]
     for guard, rule, _check in GUARDS:
         assert f"{guard} passed: {rule}" in out
     # S-E: both live adapters are built from the settings, with explicit keywords only.
@@ -659,6 +668,39 @@ def test_prepare_names_at_most_ten_packages_the_environment_does_not_hold(
     lines = capsys.readouterr().out.splitlines()
     named = lines[next(n for n, line in enumerate(lines) if line.startswith("G12 ")) + 1]
     assert named == "    Not as locked: " + "; ".join(unlocked[:3]) + "."
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RoutePlanError("the list of the role default denies all routes"),
+        OSError("the config.yaml of the role coder could not be read"),
+    ],
+    ids=["plan-cannot-be-made", "read-fails"],
+)
+def test_prepare_refuses_a_route_plan_that_cannot_be_made_with_the_rule_alone(
+    root, tmp_path, monkeypatch, capsys, caplog, error
+):
+    """G13: a release whose route entries cannot be planned is refused before anything runs. The
+    refusal prints the rule of G13 and nothing of the exception, whose text may come from a
+    config.yaml; nothing is written and no move is asked."""
+    host = FakeHost(routes=error)
+    release_cmd = _command(monkeypatch, host)
+    _accepted_batch(NEW)
+    before = _files(tmp_path)
+
+    assert release_cmd.prepare() != 0
+
+    out = capsys.readouterr().out
+    assert _g_verdicts(out) == {
+        guard: "failed:" if guard == "G13" else "passed:" for guard, _, _ in GUARDS
+    }
+    lines = out.splitlines()
+    assert "G13 failed: the route entries that this release adds or removes can be planned" in lines
+    assert f"Refused: 1 of {len(GUARDS)} release guards failed." in lines
+    assert str(error) not in out + caplog.text
+    assert type(error).__name__ not in out + caplog.text
+    assert (_files(tmp_path), host.asked) == (before, [])
 
 
 def test_prepare_refuses_under_a_profile_home(root, tmp_path, monkeypatch, capsys):

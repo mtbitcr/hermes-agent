@@ -78,6 +78,11 @@ class GitHost:
     def named_config_snapshot(self):
         return {}
 
+    def route_plan(self, prev, new, *, from_snapshot=False):
+        from hermes_cli.release_routes import RoutePlan
+
+        return RoutePlan((), ())
+
 
 @pytest.fixture
 def history(tmp_path):
