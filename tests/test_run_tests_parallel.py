@@ -460,3 +460,28 @@ def test_drive_letter_colon_is_not_a_path_separator(tmp_path: Path) -> None:
         f"drive letter split off as a phantom root:\n{proc.stdout}"
     )
     assert "Discovered 1 test files" in proc.stdout, proc.stdout
+
+
+def test_file_timeout_default_is_600_seconds(monkeypatch) -> None:
+    """With no HERMES_TEST_FILE_TIMEOUT set, ``--file-timeout`` defaults to 600s."""
+    import argparse
+    import importlib.util
+
+    monkeypatch.delenv("HERMES_TEST_FILE_TIMEOUT", raising=False)
+    runner = Path(__file__).resolve().parent.parent / "scripts" / "run_tests_parallel.py"
+    spec = importlib.util.spec_from_file_location("run_tests_parallel", runner)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    captured: list[argparse.ArgumentParser] = []
+
+    def _capture(self, *_args, **_kwargs):
+        captured.append(self)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(sys, "argv", ["run_tests_parallel.py"])
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", _capture)
+    with pytest.raises(SystemExit):
+        mod.main()
+
+    assert captured[0].get_default("file_timeout") == 600.0
