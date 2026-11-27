@@ -212,6 +212,11 @@ class FakeHost:
             if self.installed.get(name) != version
         )
 
+    def route_plan(self, prev, new, *, from_snapshot=False):
+        from hermes_cli.release_routes import RoutePlan
+
+        return RoutePlan((), ())
+
     def environment_matches_lock(self):
         try:
             return not self.environment_differences()

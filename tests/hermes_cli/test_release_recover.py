@@ -131,6 +131,11 @@ class FakeHost:
     def named_config_snapshot(self):
         return dict(self.saved)
 
+    def route_plan(self, prev, new, *, from_snapshot=False):
+        from hermes_cli.release_routes import RoutePlan
+
+        return RoutePlan((), ())
+
     def stop_units(self, units):
         self.calls.append("stop")
         if self.modules_at_stop is None:

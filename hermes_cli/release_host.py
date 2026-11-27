@@ -9,7 +9,9 @@
 - what the platform environment does not hold of the checkout's lock, compared as the readback
   compares it (G12);
 - the open runs on every board;
-- digests of the configuration set (S-D), live and in the named configuration snapshot (S-C).
+- digests of the configuration set (S-D), live and in the named configuration snapshot (S-C);
+- the route plan of card 4 (G13), from the route file at PREV and at NEW and each served role's
+  config.yaml.
 
 Every method only reads. Moving the checkout, fetching objects and taking or restoring snapshots
 are actions, and they belong to card 3. Reading also leaves nothing behind, which is what lets
@@ -56,6 +58,7 @@ from hermes_cli.managed_uv import resolve_uv
 from hermes_cli.profiles import profiles_to_serve
 from hermes_cli.release_guards import OpenRun
 from hermes_cli.release_host_actions import SYNC_EXTRAS, lock_differences
+from hermes_cli.release_routes import RoutePlan, RoutePlanError, plan_routes
 from hermes_cli.release_runner import EnvironmentUnreadable
 from hermes_cli.update_receipt import collect_fleet_versions
 from hermes_constants import get_default_hermes_root
@@ -336,6 +339,26 @@ class LiveHostReader:
             if path.name in CONFIG_FILES
         }
         return _digests(files)
+
+    def route_plan(self, prev: str, new: str, *, from_snapshot: bool = False) -> RoutePlan:
+        path = "gateway/platforms/api_server_route_profiles.json"
+        texts = []
+        for commit in (prev, new):
+            # git show exits 128 for a path the commit does not hold as for a read that fails;
+            # ls-tree lists nothing for the first and fails for the second.
+            held = self._git("ls-tree", "--name-only", "--end-of-options", commit, path).stdout
+            texts.append(self._git("show", "--end-of-options", f"{commit}:{path}").stdout if held else None)
+        prev_file, new_file = texts
+        if new_file is None:
+            raise RoutePlanError(f"NEW holds no {path}")
+        root = self._require_root(get_default_hermes_root())
+        # The roles of live_config(), each read live, or where named_config_snapshot() reads it.
+        base = self.snapshot_root / "config" / self.snapshot_name if from_snapshot else root
+        configs = {}
+        for profile, home in profiles_to_serve(multiplex=True):
+            config = base / (home / "config.yaml").relative_to(root)
+            configs[profile] = config.read_bytes() if config.is_file() else None
+        return plan_routes(prev_file, new_file, configs)
 
     def _git(self, *argv: str, accept: Collection[int] = (0,)) -> subprocess.CompletedProcess:
         # An empty GIT_ALLOW_PROTOCOL allows no transport. In a partial clone, a read that needs a

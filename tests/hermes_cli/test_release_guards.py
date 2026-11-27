@@ -1,4 +1,4 @@
-"""T28 and T29: the release guards G1 to G12 in prepare mode, and a release refusing on each.
+"""T28 and T29: the release guards G1 to G13 in prepare mode, and a release refusing on each.
 
 Every test drives the guards through FakeHost, an in-memory release host, so no real host
 command runs.
@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from hermes_cli.release_guards import GATEWAY_UNIT, OpenRun, Pins, RecordedMerge, prepare
+from hermes_cli.release_routes import RouteChange, RoutePlan, RoutePlanError
 from hermes_cli.release_runner import EnvironmentUnreadable, run_release
 
 GiB = 1024**3
@@ -20,7 +21,7 @@ NEW = "second-merge-sha"
 # A change merged after Accept: origin main has moved past NEW.
 LATER = "later-merge-sha"
 CHECKOUT = "/srv/hermes/checkout"
-ALL_GUARDS = [f"G{number}" for number in range(1, 13)]
+ALL_GUARDS = [f"G{number}" for number in range(1, 14)]
 G5_RULE = (
     "the lock file and the project manifest are unchanged, or the release can sync the"
     " environment: lock or manifest changes need the environment sync, which needs uv in the"
@@ -100,6 +101,10 @@ class FakeHost:
     # G12: each package the checkout's lock names that the environment does not hold at its
     # locked version; an exception when the comparison cannot be read.
     unlocked: tuple[str, ...] | Exception = ()
+    # G13: the route plan; an exception when it cannot be made. Each ask is noted as
+    # (prev, new, from_snapshot).
+    routes: RoutePlan | Exception = RoutePlan((), ())
+    route_asks: list[tuple[str, str, bool]] = field(default_factory=list)
     writes: list[tuple] = field(default_factory=list)
 
     def checkout_head(self):
@@ -172,6 +177,12 @@ class FakeHost:
         if isinstance(self.unlocked, Exception):
             raise self.unlocked
         return self.unlocked
+
+    def route_plan(self, prev, new, *, from_snapshot=False):
+        self.route_asks.append((prev, new, from_snapshot))
+        if isinstance(self.routes, Exception):
+            raise self.routes
+        return self.routes
 
     # Neither prepare mode nor a refused release may reach any of these.
     def stop_units(self, units):
@@ -456,6 +467,17 @@ def test_the_fresh_guards_refuse_a_release_that_cannot_sync_before_the_first_sto
             "G12-comparison-cannot-be-read",
             unlocked=EnvironmentUnreadable("the installed list could not be read"),
         ),
+        # The route plan cannot be made, or a read it needs fails: either way G13 refuses.
+        refusal(
+            "G13",
+            "G13-route-plan-cannot-be-made",
+            routes=RoutePlanError("the list of the role default denies all routes"),
+        ),
+        refusal(
+            "G13",
+            "G13-route-plan-cannot-be-read",
+            routes=OSError("the config.yaml of the role coder could not be read"),
+        ),
     ],
 )
 def test_each_guard_refuses(guard, merges, host_setup):
@@ -467,4 +489,26 @@ def test_each_guard_refuses(guard, merges, host_setup):
     assert [result.guard for result in results if not result.ok] == [guard]
     # The release unit re-runs every guard fresh and refuses before cutover, writing nothing.
     assert (release.outcome, release.steps) == ("refused", ("guards",))
+    assert host.writes == []
+
+
+@pytest.mark.parametrize(
+    "routes",
+    [
+        RoutePlan((), ()),
+        RoutePlan((RouteChange("default", add=("POST /v1/runs",), remove=()),), ()),
+    ],
+    ids=["empty-plan", "one-added-entry"],
+)
+def test_g13_holds_whenever_the_route_plan_is_made(routes):
+    host = FakeHost(routes=routes)
+
+    results = prepare(host, PINS, MERGES)
+
+    assert [(result.guard, result.ok) for result in results] == [
+        (guard, True) for guard in ALL_GUARDS
+    ]
+    # G13 asks for the plan from PREV to NEW over the live configuration, and only asks: the
+    # plan is made and dropped, so no line of a route list is written.
+    assert host.route_asks == [(PREV, NEW, False)]
     assert host.writes == []

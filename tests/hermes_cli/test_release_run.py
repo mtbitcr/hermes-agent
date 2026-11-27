@@ -146,6 +146,11 @@ class FakeHost:
         self.note("G12")
         return self.unlocked
 
+    def route_plan(self, prev, new, *, from_snapshot=False):
+        from hermes_cli.release_routes import RoutePlan
+
+        return RoutePlan((), ())
+
     def fetch(self, commit):
         self.note("fetch")
 
@@ -196,6 +201,7 @@ class Boundary:
         if args[0] == "checkout":
             self.head = args[-1]
             self.moves.append(f"checkout {self.head}")
+        route_file = "gateway/platforms/api_server_route_profiles.json"
         return self._done({
             ("rev-parse", "--verify", "HEAD"): self.head,
             ("status", "--porcelain", "--untracked-files=normal"): "",
@@ -207,6 +213,11 @@ class Boundary:
             ("rev-parse", "--show-toplevel"): CHECKOUT,
             ("fetch", "--no-tags", "origin", NEW): "",
             ("checkout", "--detach", "--no-overwrite-ignore", NEW): "",
+            # G13's reads: both commits hold the route file, alike and with no route: an empty plan.
+            ("ls-tree", "--name-only", PREV, route_file): f"{route_file}\n",
+            ("ls-tree", "--name-only", NEW, route_file): f"{route_file}\n",
+            ("show", f"{PREV}:{route_file}"): "{}",
+            ("show", f"{NEW}:{route_file}"): "{}",
         }[args])
 
     def _systemctl(self, verb, *rest):
