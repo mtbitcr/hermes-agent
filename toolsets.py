@@ -92,6 +92,7 @@ _HERMES_CORE_TOOLS = [
     "kanban_recommend",
     # Same narrow gate, on the worker's own card (see _check_design_options_mode).
     "kanban_offer_design_options",
+    "kanban_ask_owner",
     # Narrower still: the worker of a model update check card only
     # (tools/model_update_check_tool.py). Core, so Tool Search never folds it.
     "kanban_model_update_check",
@@ -435,6 +436,7 @@ TOOLSETS = {
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
             "kanban_recommend",
             "kanban_offer_design_options",
+            "kanban_ask_owner",
         ],
         "includes": [],
     },
