@@ -271,6 +271,8 @@ def hold_on_activation(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]
     with :data:`HOLD_SENTENCE` by the same call, so no run is made. Returns
     the arguments of ``kanban_task_blocked``, which ``activate_owner_work``
     fires once its transaction has committed, or None when nothing is held.
+    The board is the one of *conn*, because the activation opens its connection
+    on the Project's board without making that board current.
     """
     from hermes_cli import kanban_db
 
@@ -293,7 +295,7 @@ def hold_on_activation(conn: sqlite3.Connection, task_id: str) -> dict[str, Any]
         return None
     return {
         "task_id": task_id,
-        "board": kanban_db.get_current_board(),
+        "board": kanban_db._board_slug_for_connection(conn),
         "assignee": blocked["assignee"],
         "run_id": blocked["run_id"],
         "reason": HOLD_SENTENCE,

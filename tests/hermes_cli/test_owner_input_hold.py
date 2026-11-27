@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -61,6 +62,31 @@ _DECISION_KEYS = {
 _DECISIONS = "/v1/owner-workspace/decisions"
 
 
+def _seen_on_named_board(board, task_id: str):
+    """(status, number of 'blocked' events) of the card in the store of *board*.
+
+    Read through a second, read-only connection. None when no board is named
+    (never the current one), the store cannot be read or it holds no such card.
+    It never raises: a hook that raises is swallowed and hides the failure.
+    """
+    if not board:
+        return None
+    try:
+        store = str(kb.kanban_db_path(board=board))
+        if not _observe(store, "SELECT COUNT(*) FROM tasks WHERE id = ?", task_id):
+            return None
+        return (
+            _observe(store, "SELECT status FROM tasks WHERE id = ?", task_id),
+            _observe(
+                store,
+                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'blocked'",
+                task_id,
+            ),
+        )
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+
+
 @pytest.fixture
 def fired_hooks():
     """Each kanban_task_blocked and kanban_task_claimed call, in order.
@@ -69,15 +95,19 @@ def fired_hooks():
     tests/hermes_cli/test_kanban_lifecycle_hooks.py does. Each entry also holds
     the card's status as a second, read-only connection to ``store`` (set by
     the test) saw it while the hook ran: a hook fired inside the transaction
-    would still see the card as it was before.
+    would still see the card as it was before. ``on_named_board`` lists, call
+    for call, what :func:`_seen_on_named_board` read on the board the call names.
     """
     manager = get_plugin_manager()
     saved = {name: list(callbacks) for name, callbacks in manager._hooks.items()}
-    seen = SimpleNamespace(store=None, fired=[])
+    seen = SimpleNamespace(store=None, fired=[], on_named_board=[])
 
     def capture(hook: str, fields: dict) -> None:
         status = _observe(
             seen.store, "SELECT status FROM tasks WHERE id = ?", fields["task_id"],
+        )
+        seen.on_named_board.append(
+            _seen_on_named_board(fields.get("board"), fields["task_id"])
         )
         # The manager adds its telemetry marker to every hook; keep only what
         # the caller passed.
@@ -663,6 +693,8 @@ def test_claim_still_holds_a_card_missing_an_input(ctx, fired_hooks):
 
 def test_activation_hook_fires_once_per_held_card_after_commit(ctx, fired_hooks):
     setup = _bootstrap_board(ctx)
+    # The approval opens the Project's board without making it the current one.
+    assert setup["board"] != kb.get_current_board()
     with contextlib.closing(kb.connect(board=setup["board"])) as conn:
         fired_hooks.store = _store_file(conn)
         first = _parked(conn, setup["project_id"], _PRICE_LIST)
@@ -686,14 +718,15 @@ def test_activation_hook_fires_once_per_held_card_after_commit(ctx, fired_hooks)
         ) == [first, plain, second]
         assignee = kb.get_task(conn, first).assignee
     # Once for each held card, after the commit: another connection already
-    # saw it blocked.
+    # saw it blocked. A reader of the board each call names finds that block, once.
+    assert fired_hooks.on_named_board == [("blocked", 1), ("blocked", 1)]
     assert fired_hooks.fired == [
         (
             "kanban_task_blocked",
             {
                 "task_id": task_id,
                 "profile_name": get_active_profile_name(),
-                "board": kb.get_current_board(),
+                "board": setup["board"],
                 "assignee": assignee,
                 "run_id": None,
                 "reason": oni.HOLD_SENTENCE,
