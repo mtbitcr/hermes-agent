@@ -21,7 +21,9 @@ health check: until then the move only stops it and renames it, to the backup na
 and to the kept name in the others, so that one container runs at a time. When the container that
 takes its place does not start or does not pass its health check, the move takes that one away,
 gives the last working container its name back, starts it, checks its health and raises
-`PutBack`. Which move runs when, the readback after each and when the backup goes belong to the
+`PutBack`. Taking it away is safe to retry: the move reads the name again after a refusal, waits a
+bounded time for a removal docker has under way, and renames away one docker does not remove.
+Which move runs when, the readback after each and when the backup goes belong to the
 runner of the owner app part.
 
 Every docker call is one argument list through `_docker`, and no value of the environment is ever
@@ -29,8 +31,9 @@ an argument (D-10). Docker run reads the environment on its standard input, as a
 for the proxy settings: it gives each proxy name with --env, without a value, so that docker's
 client adds no proxy setting of its own, and takes the old container's values from the
 environment it runs with, or the new image's for a name the old container gives no value. An
-action raises when docker refuses it, naming only the docker command
-and its exit, as what docker writes may carry the container's environment. The readbacks answer
+action raises when docker refuses it or its client does not launch, naming only the docker command
+and its exit, or the launch's error number, as what docker writes may carry the container's
+environment; a move takes either way alike. The readbacks answer
 False instead, as the runner's protocol asks. Health is read inside the container, so the adapter
 holds no network address.
 
@@ -58,6 +61,9 @@ BACKUP_SUFFIX = "-rollback"
 # A move keeps the last working container, stopped, under the container's name with this after
 # it, until the container that takes its place passed its health check.
 KEPT_SUFFIX = "-last-working"
+# A stopped container a move takes off a name and docker does not remove goes under the container's
+# name with this and the short Id of that container after it, for the owner to remove.
+UNREMOVED_SUFFIX = "-unremoved-"
 # The helper's grace before docker stop kills the old container.
 STOP_SECONDS = 30
 
@@ -126,9 +132,9 @@ class OwnerAppHost:
     another process finds it; while a backup is there, docker refuses a forward's rename, before
     anything stops. Images are full image names, as the helper takes them. The other moves keep
     the last working container under the name with "-last-working" after it until the container
-    that takes its place passed its health check; one left there, as when docker refuses its
-    removal at the end of a move, makes the next such move's rename refuse, before anything stops,
-    until the owner removes it.
+    that takes its place passed its health check; one left there stopped, as when docker refuses
+    its removal at the end of a move, the next such move takes away first, before anything stops
+    (`_park`), never removing it before the container under the name passed its health check.
     """
 
     def __init__(self, *, container: str, label: str) -> None:
@@ -180,7 +186,7 @@ class OwnerAppHost:
             _docker("stop", "--time", str(STOP_SECONDS), self.kept)
             _docker(*arguments, input=env_file, env=env)
 
-        _docker("rename", self.container, self.kept)
+        self._park()
         self._take_place(self.kept, True, make)
         _docker("rm", "-f", self.kept)
 
@@ -224,9 +230,38 @@ class OwnerAppHost:
             if backup["State"].get("Status") != "running":
                 _docker("start", self.container)
 
-        _docker("rename", self.container, self.kept)
+        self._park()
         self._take_place(self.kept, False, start_backup)
         _docker("rm", "-f", self.kept)
+
+    def _park(self) -> None:
+        """The container under the name renamed to the kept name, before anything stops. When
+        docker refuses that and a container that does not run is left under the kept name, as
+        when docker refused its removal at the end of a move or a put-back failed, that one goes
+        first. It is neither the container under the name nor the backup. It is removed only once
+        the container under the name passed its health check, as that one then replaced it and
+        passed; else, or when docker refuses its removal, it is renamed away, with
+        `UNREMOVED_SUFFIX` and its short Id after the name, for the owner to remove. With no such
+        container there, or a running one, the refusal is raised, before anything changes."""
+        try:
+            _docker("rename", self.container, self.kept)
+            return
+        except _Refused as refused:
+            failure = refused
+        left = _find(self.kept)
+        if left is None or left["State"].get("Running") or left["State"].get("Status") == "running":
+            raise failure
+        removed = False
+        if self._passes():
+            try:
+                _docker("rm", "-f", self.kept)
+                removed = True
+            except _Refused:
+                pass
+        if not removed:
+            away = self.container + UNREMOVED_SUFFIX + str(left.get("Id", ""))[:12]
+            _docker("rename", self.kept, away)
+        _docker("rename", self.container, self.kept)
 
     def _take_place(self, kept: str, made: bool, steps: Callable[[], object]) -> None:
         """`steps` bring the container that takes the place of the last working one, kept stopped
@@ -245,19 +280,47 @@ class OwnerAppHost:
             raise PutBack(failure)
 
     def _put_back(self, kept: str, made: bool) -> None:
-        """The container under the name, if any, taken away, and the last working container given
-        the name back from `kept`, started and checked. A refused step or a failed check raises
-        here, not `PutBack`: the last working container is then not back."""
-        if _find(self.container) is not None:
-            if made:
-                _docker("rm", "-f", self.container)
-            else:
-                _docker("stop", "--time", str(STOP_SECONDS), self.container)
-                _docker("rename", self.container, self.backup)
+        """The container under the name, if any, taken away (`_clear`), and the last working
+        container given the name back from `kept`, started and checked. A refused step or a failed
+        check raises here, not `PutBack`: the last working container is then not back."""
+        self._clear(made)
         _docker("rename", kept, self.container)
         _docker("start", self.container)
         if not self._passes():
             raise RuntimeError("the last working container, put back, failed its health check")
+
+    def _clear(self, made: bool) -> None:
+        """The name freed of the container that took the place, if one has it: removed when the
+        move made it, else stopped and renamed back to the backup name. After a refusal the name
+        is read again, up to the runner's number of readback attempts, as far apart (`_wait`), so
+        that this is safe to retry: no container under the name frees it; a removal docker has
+        under way is waited for; and a container the move made that docker did not remove is
+        stopped and renamed away, with `UNREMOVED_SUFFIX` and its short Id after the name. A
+        container under the name with another Id is left alone. A name still taken then raises."""
+        taking = None
+        for attempt in range(READBACK_ATTEMPTS):
+            if attempt:
+                _wait(READBACK_INTERVAL_SECONDS)
+            try:
+                record = _find(self.container)
+                if record is None:
+                    return
+                if taking is None:
+                    taking = str(record.get("Id", ""))
+                elif record.get("Id", "") != taking:
+                    break
+                if attempt and record["State"].get("Status") == "removing":
+                    continue
+                if made and not attempt:
+                    _docker("rm", "-f", self.container)
+                else:
+                    _docker("stop", "--time", str(STOP_SECONDS), self.container)
+                    away = self.container + UNREMOVED_SUFFIX + taking[:12] if made else self.backup
+                    _docker("rename", self.container, away)
+                return
+            except _Refused:
+                pass
+        raise RuntimeError("the name is still taken, so the last working container is not back")
 
     def _passes(self) -> bool:
         """A move's health check of the container under the name: `health_ok`, read up to the
@@ -308,11 +371,12 @@ class OwnerAppHost:
 
 
 class _Refused(RuntimeError):
-    """A docker call that exited nonzero, named by its command and exit only (D-10). `missing`
-    tells whether docker said that no container or object has the name it was given."""
+    """A docker call that exited nonzero, or whose client did not launch, named by its command and
+    its exit or the launch's error number only (D-10). `missing` tells whether docker said that no
+    container or object has the name it was given."""
 
-    def __init__(self, command: str, code: int, missing: bool) -> None:
-        super().__init__(f"docker {command} exited {code}")
+    def __init__(self, command: str, outcome: str, missing: bool = False) -> None:
+        super().__init__(f"docker {command} {outcome}")
         self.missing = missing
 
 
@@ -325,19 +389,27 @@ def _docker(
     """One docker call, as one argument list, with `input` on its standard input and `env` as the
     environment docker runs with when given, else this process's, and what it wrote to stdout. A
     nonzero exit raises naming the docker command and its exit only: the input, the environment
-    and what docker writes may carry the container's environment (D-10)."""
-    done = subprocess.run(
-        ["docker", *args], input=input, capture_output=True, timeout=timeout, check=False, env=env
-    )
-    if done.returncode:
+    and what docker writes may carry the container's environment (D-10). A launch of docker's
+    client the system refuses, as fork does with EAGAIN when no process can be spared, raises the
+    same way, naming the command and the error number only, and carrying no other error along."""
+    try:
+        done = subprocess.run(
+            ["docker", *args], input=input, capture_output=True, timeout=timeout, check=False,
+            env=env,
+        )
+    except OSError as error:
+        unlaunched = error.errno
+    else:
+        if not done.returncode:
+            return done.stdout
         missing = any(words in done.stderr for words in _NO_SUCH)
-        raise _Refused(args[0], done.returncode, missing)
-    return done.stdout
+        raise _Refused(args[0], f"exited {done.returncode}", missing)
+    raise _Refused(args[0], f"did not launch (errno {unlaunched})")
 
 
 def _wait(seconds: float) -> None:
-    """Every wait between two reads of a move's health check goes through here, so a test can
-    replace it."""
+    """Every wait between two reads of a move's health check, or of the name a put-back frees,
+    goes through here, so a test can replace it."""
     time.sleep(seconds)
 
 
