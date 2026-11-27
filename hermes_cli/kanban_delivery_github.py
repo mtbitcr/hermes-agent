@@ -23,7 +23,8 @@ copy into a missing or empty folder, with no credential, and names the repositor
 A fetch of one commit (GitHubTransport.fetch_commit) runs the same way: the git that carries the credential fetches
 that commit alone, named by its 40 hex digits, into a fresh copy, and the commit goes on from that copy into a bare
 repository's one ref, with no credential. That exact fetch of one owner app commit is the release_source step's one
-operation, and no other step's: the step makes no REST call, fetches no main and reads no other repository.
+operation, and no other step's: the step makes no REST call, fetches no main and reads no other repository. One
+transport fetches one commit, the first it is asked for, so its one token serves that commit alone.
 """
 from __future__ import annotations
 
@@ -88,7 +89,8 @@ STEP_PERMISSIONS = MappingProxyType({
     "bootstrap": MappingProxyType({"contents": "write", "workflows": "write"}),
     # The release host's fetch of one exact owner app commit (owner app release plan card 2, the owner's answer to
     # Q1): contents read and nothing more. That fetch (fetch_commit, which no other step may make) is the step's one
-    # operation: it makes no REST call, not even a branch head, fetches no main and reads no other repository.
+    # operation, and one transport makes it for one commit: it makes no REST call, not even a branch head, fetches no
+    # main and reads no other repository.
     "release_source": MappingProxyType({"contents": "read"}),
 })
 
@@ -343,6 +345,7 @@ class GitHubTransport:
             get_default_hermes_root() / "secrets" / "github-app" / "raphael-agent-factory.pem")
         self._routes = [(e, _path_pattern(e.template, repository)) for e in REST_ALLOWLIST if e.permission]
         self._token: str | None = None
+        self._commit: str | None = None  # the one commit fetch_commit serves, bound at its first call
 
     def request(self, method: str, path: str, *, query=None, body=None) -> dict:
         """Call one allowlisted endpoint. Returns {"status", "data"}, where data holds the fixed
@@ -532,6 +535,10 @@ class GitHubTransport:
             raise GitHubTransportError("step_not_permitted")  # the owner app's commits alone: before any token or git
         if not _is_sha(sha):
             raise GitHubTransportError("bad_commit")  # before any token, folder or git exists
+        if self._commit is None:
+            self._commit = sha  # bound before any credential exists, and kept though this fetch fails
+        elif self._commit != sha:
+            raise GitHubTransportError("step_not_permitted")  # one credential, one commit: another needs a transport
         url, scheme = self._push_url()  # the source, fixed before any credential exists
         copy = os.path.abspath(copy)
         try:

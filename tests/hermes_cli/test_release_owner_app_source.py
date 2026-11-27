@@ -6,7 +6,9 @@ token request. The App key is a throwaway made in the test and placed where the 
 platform root, and the only token is the stand-in's fake one.
 """
 import importlib
+import io
 import stat
+import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
@@ -14,8 +16,8 @@ from pathlib import Path
 import pytest
 
 from tests.hermes_cli.test_kanban_delivery_github import (  # noqa: F401  (github is a fixture)
-    BASIC, DUMMY, SAMPLE, TOKEN, _block_sockets, _carries, _files_text, _git, _module, _new_key, _pem, _record_git,
-    _record_mkdtemp, _subcommand, _transport_module, github,
+    _RUN, BASIC, DUMMY, SAMPLE, TOKEN, _block_sockets, _carries, _files_text, _git, _module, _new_key, _pem,
+    _record_git, _record_mkdtemp, _subcommand, _transport_module, github,
 )
 
 OWNER_APP = "mtbitcr/raphael-workspace"
@@ -35,10 +37,10 @@ def _expected_copy(root):
     return root / "kanban" / "release-source" / "raphael-workspace.git"
 
 
-def _owner_app(tmp_path):
+def _owner_app(tmp_path, card=None):
     """The owner app repository on a bare remote laid out like GitHub: a real merge of a card branch with a tag on it,
-    main one commit past it, and a branch beside both, so a fetch of anything more than the merge would show. Returns
-    the origin, the remote and the commits by name."""
+    main one commit past it, and a branch beside both, so a fetch of anything more than the merge would show. The card
+    commit also holds the files of `card`, by name. Returns the origin, the remote and the commits by name."""
     work = tmp_path / "owner-app"
     _git("init", "-q", "-b", "main", str(work))
     identity = ("-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false")
@@ -58,7 +60,8 @@ def _owner_app(tmp_path):
     (work / "app" / "current.html").symlink_to("page.html")  # and a link
     commits = {"base": commit("base", {"README.md": "# raphael-workspace\n", "app/page.html": "<p>one</p>\n"})}
     _git("checkout", "-q", "-b", "card", cwd=work)
-    commits["card"] = commit("card", {"app/page.html": "<p>two</p>\n", "app/deep/nested/data.json": "{}\n"})
+    commits["card"] = commit("card", {"app/page.html": "<p>two</p>\n", "app/deep/nested/data.json": "{}\n",
+                                      **(card or {})})
     _git("checkout", "-q", "main", cwd=work)
     commits["beside"] = commit("beside", {"docs/notes.md": "notes\n"})
     _git(*identity, "merge", "-q", "--no-ff", "-m", "Merge card", "card", cwd=work)
@@ -74,12 +77,12 @@ def _owner_app(tmp_path):
     return remotes.as_uri(), bare, commits
 
 
-def _release_host(github, monkeypatch, tmp_path):
+def _release_host(github, monkeypatch, tmp_path, card=None):
     """The transport pointed at the stand-in and the owner app's origin, the platform root at tmp_path/root with the
     stand-in's App key where the transport reads it, and every temporary folder made under tmp_path/tmp, so the
     tests can read every file a fetch leaves."""
     mod = _transport_module(monkeypatch, github)
-    origin, bare, commits = _owner_app(tmp_path)
+    origin, bare, commits = _owner_app(tmp_path, card)
     monkeypatch.setattr(mod, "GIT_ORIGIN", origin)
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")  # the platform default root, kept in tmp_path too
     root = tmp_path / "root"
@@ -130,6 +133,61 @@ def _archive_tree(archive, into):
     return _git("write-tree", cwd=into)
 
 
+def _blob(git_dir, commit, path):
+    """The bytes the repository holds for `path` in `commit`, as they are: no attribute, conversion or decoding."""
+    return _RUN(["git", "--git-dir", str(git_dir), "cat-file", "blob", f"{commit}:{path}"], check=True,
+                capture_output=True).stdout
+
+
+def _retar(archive, change):
+    """Write the tar at `archive` again, each regular file's bytes passed through `change(name, data)`: None drops
+    the file."""
+    with tarfile.open(archive) as tar:
+        members = [(member, tar.extractfile(member).read() if member.isfile() else None) for member in tar.getmembers()]
+        headers = tar.pax_headers
+    with tarfile.open(archive, "w", format=tarfile.PAX_FORMAT, pax_headers=headers) as tar:
+        for member, data in members:
+            if member.isfile():
+                data = change(member.name, data)
+                if data is None:
+                    continue
+                member.size = len(data)
+            tar.addfile(member, None if data is None else io.BytesIO(data))
+
+
+def _rewrite_after_archive(monkeypatch, source, change):
+    """The module's git runner, with the tar each git archive writes rewritten by `change` right after that git.
+    Returns the archives rewritten."""
+    run, rewritten = source._run_git, []
+
+    def run_git(argv, env):
+        result = run(argv, env)
+        if _subcommand(argv) == "archive":
+            rewritten.append(next(word.removeprefix("--output=") for word in argv if word.startswith("--output=")))
+            _retar(rewritten[-1], change)
+        return result
+
+    monkeypatch.setattr(source, "_run_git", run_git)
+    return rewritten
+
+
+# The merge's own .gitattributes asks git archive to leave a tracked file out (export-ignore), to rewrite one
+# (export-subst) and to convert two on the way out (text eol=crlf, ident): the archive must still be the merge's tree.
+_EXPORT_RULES = {
+    ".gitattributes": "ignored.txt export-ignore\nstamp.txt export-subst\ncrlf.txt text eol=crlf\nident.txt ident\n",
+    "ignored.txt": "a tracked file that export-ignore would leave out\n",
+    "stamp.txt": "built from $Format:%H$\n",
+    "crlf.txt": "one\ntwo\n",
+    "ident.txt": "$Id$\n",
+}
+
+# What could stand between git archive and the build: a file of the tree left out, or one file's bytes changed.
+_TAMPERING = {
+    "omission": lambda name, data: None if name == "README.md" else data,
+    "substitution": lambda name, data: b"# not the reviewed file\n" if name == "README.md" else data,
+}
+
+
 def test_the_copy_holds_exactly_the_asked_merge_and_the_archive_is_its_tree(github, monkeypatch, tmp_path):
     host = _release_host(github, monkeypatch, tmp_path)
     merge, bare = host["commits"]["merge"], host["bare"]
@@ -149,6 +207,58 @@ def test_the_copy_holds_exactly_the_asked_merge_and_the_archive_is_its_tree(gith
     assert list(archive.parent.iterdir()) == [archive]  # the archive alone, in a private build folder
     assert stat.S_IMODE(archive.parent.stat().st_mode) == 0o700
     assert [folder for folder in made if folder.exists()] == [archive.parent]  # every other private folder is gone
+
+
+def test_the_archive_is_the_commit_tree_byte_for_byte_whatever_its_own_gitattributes_ask(github, monkeypatch, tmp_path):
+    """None of the merge's own export rules and conversions applies. Each file is read straight from the tar, since
+    unpacking it into a repository would apply the attributes again and hide a conversion, and holds the bytes of its
+    blob on the origin."""
+    host = _release_host(github, monkeypatch, tmp_path, _EXPORT_RULES)
+    merge, bare = host["commits"]["merge"], host["bare"]
+    source, attributes = _source_module(), _expected_copy(host["root"]) / "info" / "attributes"
+    source.fetch_source(merge)
+    attributes.write_text("* export-ignore\n")  # a rule left in the copy's own attributes file is overwritten
+
+    archive = source.fetch_source(merge)
+
+    faithful = b"* -export-ignore -export-subst -text -eol -crlf -ident -filter -working-tree-encoding\n"
+    assert attributes.read_bytes() == faithful and stat.S_IMODE(attributes.parent.stat().st_mode) == 0o700
+    with tarfile.open(archive) as tar:
+        files = {member.name: tar.extractfile(member).read() for member in tar.getmembers() if member.isfile()}
+        links = {member.name: member.linkname for member in tar.getmembers() if member.issym()}
+    entries = [line.split(None, 3) for line in _git("--git-dir", str(bare), "ls-tree", "-r", merge).splitlines()]
+    assert sorted(files) == sorted(path for mode, _, _, path in entries if mode != "120000")
+    assert links == {"app/current.html": "page.html"}
+    for path, data in files.items():
+        assert data == _blob(bare, merge, path), path  # byte for byte, the blob on the origin
+    assert files["ignored.txt"] == _EXPORT_RULES["ignored.txt"].encode()  # export-ignore left nothing out
+    assert files["stamp.txt"] == b"built from $Format:%H$\n"  # export-subst rewrote nothing
+    assert files["crlf.txt"] == b"one\ntwo\n"  # eol=crlf converted no line end
+    assert files["ident.txt"] == b"$Id$\n"  # and ident expanded nothing
+    assert _archive_commit(archive) == merge
+    plain = tmp_path / "plain.tar"  # the control: git archive run on the origin, where the merge's attributes apply
+    _git("--git-dir", str(bare), "archive", "--format=tar", f"--output={plain}", merge)
+    with tarfile.open(plain) as tar:
+        exported = {member.name: tar.extractfile(member).read() for member in tar.getmembers() if member.isfile()}
+    assert "ignored.txt" not in exported
+    assert [name for name in ("stamp.txt", "crlf.txt", "ident.txt") if exported[name] == files[name]] == []
+
+
+@pytest.mark.parametrize("tampering", sorted(_TAMPERING))
+def test_an_archive_that_is_not_the_commit_tree_is_refused_and_leaves_no_build_folder(
+        github, monkeypatch, tmp_path, tampering):
+    """The proof: right after git archive the tar is written again, one file left out or one file's bytes changed.
+    The archive is checked against the commit's tree before it is returned, so it is refused and removed."""
+    host = _release_host(github, monkeypatch, tmp_path)
+    source = _source_module()
+    rewritten, made = _rewrite_after_archive(monkeypatch, source, _TAMPERING[tampering]), _record_mkdtemp(monkeypatch)
+
+    with pytest.raises(host["mod"].GitHubTransportError) as refused:
+        source.fetch_source(host["commits"]["merge"])
+
+    assert refused.value.reason == "archive_failed"
+    assert len(rewritten) == 1 and Path(rewritten[0]).parent in made  # the archive was written, then rewritten
+    assert not [folder for folder in made if folder.exists()] and list((tmp_path / "tmp").iterdir()) == []
 
 
 _NOT_A_COMMIT = [
@@ -277,6 +387,34 @@ def test_under_the_dispatcher_worker_environment_the_copy_lands_under_the_kanban
     assert github["token_requests"] == [OWNER_APP_TOKEN]
 
 
+def test_a_relative_kanban_root_is_anchored_once_at_the_working_directory_of_the_call(github, monkeypatch, tmp_path):
+    """HERMES_KANBAN_HOME may be relative, and kanban_home() then is too. The copy is anchored at the working
+    directory of the call, so every git, each run in a private folder, names that one copy: none is made inside a
+    temporary folder."""
+    host = _release_host(github, monkeypatch, tmp_path)
+    merge, bare = host["commits"]["merge"], host["bare"]
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(Path("shared") / "root"))
+    source, made, inside = _source_module(), _record_mkdtemp(monkeypatch), []
+
+    def run(argv, *args, **kwargs):  # each git, then a look for a copy inside every private folder made so far
+        result = _RUN(argv, *args, **kwargs)
+        inside.extend(path for folder in made if folder.exists() for path in folder.rglob("raphael-workspace.git"))
+        return result
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    archive = source.fetch_source(merge)
+
+    copy = _expected_copy(tmp_path / "shared" / "root")
+    assert source.copy_path() == copy and source.copy_path().is_absolute()
+    assert [name for _, name in _refs(copy)] == [merge] and _objects(copy, "commit") == _history(bare, merge)
+    assert _archive_commit(archive) == merge
+    tree = _git("--git-dir", str(bare), "rev-parse", f"{merge}^{{tree}}")
+    assert _archive_tree(archive, tmp_path / "unpacked") == tree
+    assert made and inside == []  # no copy inside any temporary folder
+
+
 def test_the_step_list_holds_release_source_with_exactly_contents_read():
     steps = _module().STEP_PERMISSIONS
     assert "release_source" in steps and dict(steps["release_source"]) == CONTENTS_READ
@@ -368,6 +506,53 @@ def test_a_commit_the_owner_app_does_not_hold_is_refused_and_leaves_no_folder(gi
     assert _refs(_expected_copy(host["root"])) == []
     for path, text in _files_text(tmp_path).items():
         assert TOKEN not in text and BASIC not in text, path
+
+
+def test_one_transport_fetches_one_commit_and_another_commit_needs_a_token_of_its_own(github, monkeypatch, tmp_path):
+    """Each credential serves exactly one commit: a release_source transport is bound to the first commit it fetches.
+    Another commit on it is refused before any token, git or folder, the bound commit again is served on the same
+    token, and the other commit takes a transport and a token request of its own."""
+    host = _release_host(github, monkeypatch, tmp_path)
+    mod, merge, other = host["mod"], host["commits"]["merge"], host["commits"]["other"]
+    copy = tmp_path / "copy.git"
+    _git("init", "-q", "--bare", str(copy))
+    transport = mod.GitHubTransport("release_source", OWNER_APP, key_path=github["key_file"])
+    assert transport.fetch_commit(copy, merge) == merge
+    assert github["token_requests"] == [OWNER_APP_TOKEN]
+    refs, calls, made = _refs(copy), _record_git(monkeypatch), _record_mkdtemp(monkeypatch)
+
+    with pytest.raises(mod.GitHubTransportError) as refused:
+        transport.fetch_commit(copy, other)
+
+    assert refused.value.reason == "step_not_permitted"
+    assert github["token_requests"] == [OWNER_APP_TOKEN] and calls == [] and made == []
+    assert _refs(copy) == refs == [["refs/heads/fetched", merge]]  # the copy's refs are unchanged
+    assert transport.fetch_commit(copy, merge) == merge  # the same credential and the same commit again
+    assert github["token_requests"] == [OWNER_APP_TOKEN]
+    fresh = mod.GitHubTransport("release_source", OWNER_APP, key_path=github["key_file"])
+    assert fresh.fetch_commit(copy, other) == other  # the other commit: a transport and a token request of its own
+    assert github["token_requests"] == [OWNER_APP_TOKEN] * 2 and _refs(copy) == [["refs/heads/fetched", other]]
+
+
+def test_a_transport_whose_first_fetch_failed_stays_bound_to_that_commit(github, monkeypatch, tmp_path):
+    """The binding holds though the first fetch failed, the origin not holding that commit: a later fetch of another
+    commit on the same transport is refused, with no further token request and no git."""
+    host = _release_host(github, monkeypatch, tmp_path)
+    mod = host["mod"]
+    copy = tmp_path / "copy.git"
+    _git("init", "-q", "--bare", str(copy))
+    transport = mod.GitHubTransport("release_source", OWNER_APP, key_path=github["key_file"])
+    with pytest.raises(mod.GitHubTransportError) as refused:
+        transport.fetch_commit(copy, "f" * 40)
+    assert refused.value.reason == "fetch_failed"
+    requests, calls, made = list(github["token_requests"]), _record_git(monkeypatch), _record_mkdtemp(monkeypatch)
+
+    with pytest.raises(mod.GitHubTransportError) as refused:
+        transport.fetch_commit(copy, host["commits"]["merge"])
+
+    assert refused.value.reason == "step_not_permitted"
+    assert github["token_requests"] == requests == [OWNER_APP_TOKEN] and calls == [] and made == []
+    assert _refs(copy) == []
 
 
 @pytest.mark.parametrize("repository", [OWNER_APP, PLATFORM])
