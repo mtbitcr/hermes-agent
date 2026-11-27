@@ -36,9 +36,11 @@
 # RUN_DIR/failed-step.log, written in place (no temporary file, no rename) before the owner line; the next run
 # removes it at its start, so it describes the newest run and a passing run leaves none. It stays on Server 1: it
 # is never sent or printed. The result still holds a fixed reason only, never a value or the page's text.
-# Holding is best-effort: when the folder cannot be made or the held file cannot be opened, the runner prints one
-# line to its standard error, runs every command once with its output dropped, decides as it always did, and a
-# failed step leaves a file of the header lines only.
+# Holding is best-effort: when the folder cannot be made, the held file cannot be opened, or the answer of a check
+# cannot be added to it, the runner prints one line to its standard error, runs every command once with its output
+# dropped (the check that was under way decides as it always did), and a failed step leaves a file of the header
+# lines only. The file is made by a subshell that reads the held output through tail and cut, so that its memory use
+# is bounded by the lines kept; when it fails, one line goes to the standard error and the run goes on as before.
 #
 # Settings, set by the operator in the unit's environment (start.sh passes them on) unless noted:
 #   HERMES_HOME                Server 1 platform home: the run folder is HERMES_HOME/journeys (lock and result),
@@ -150,22 +152,18 @@ store_result() {
   return 1
 }
 
-# write_failed_step_log STEP FINISHED BODY: the header lines, then (BODY 1) the last lines of the held output, each
-# cut by character. A NUL byte is a character of its own: the held file is read in pieces between NULs (ptxt, with
-# pnul 1 where a NUL follows the piece and 0 where a line ends). Any write that fails fails the whole.
-write_failed_step_log() {
+# last_characters: the lines on its standard input (at most KEPT_LINES, none longer than 4 * KEPT_WIDTH bytes), each cut
+# by character. A NUL byte is a character of its own: the input is read in pieces between NULs (ptxt, with pnul 1 where
+# a NUL follows the piece and 0 where a line ends). Any write that fails fails the whole.
+last_characters() {
   local LC_ALL=C.UTF-8 seg nul more=1 n=0 i k first=0 ends=0 left take
   local -a ptxt=() pnul=() parts=()
-  printf 'step=%s\n' "$1" || return 1
-  if [[ -n $JOURNEY ]]; then printf 'journey=%s\n' "$JOURNEY" || return 1; fi
-  printf 'started=%s\nfinished=%s\n' "$STARTED" "$2" || return 1
-  [[ $3 == 1 ]] || return 0
   while ((more)); do
     IFS= read -r -d '' seg && nul=1 || { nul=0 more=0; }
     mapfile -t parts <<< "$seg"
     for ((k = 0; k < ${#parts[@]} - 1; k++)); do ptxt[n]=${parts[k]} pnul[n]=0 n=$((n + 1)); done
     ptxt[n]=${parts[-1]} pnul[n]=$nul n=$((n + 1))
-  done < "$HELD_FILE" 2> /dev/null
+  done
   if ((n > 0)) && [[ ${pnul[n - 1]} == 0 && -z ${ptxt[n - 1]} ]]; then n=$((n - 1)); fi
   for ((i = n - 1; i >= 0; i--)); do
     if [[ ${pnul[i]} == 0 || $i -eq $((n - 1)) ]] && ((++ends > KEPT_LINES)); then first=$((i + 1)); break; fi
@@ -185,9 +183,21 @@ write_failed_step_log() {
   done
 }
 
-# keep_failed_step STEP FINISHED BODY: written in place. A failure here changes nothing else about the run.
+# write_failed_step_log STEP FINISHED BODY: the header lines, then (BODY 1) the last lines of the held output. The held
+# file is streamed through tail and cut, so that no more than the lines kept (each cut to 4 * KEPT_WIDTH bytes, which
+# holds its first KEPT_WIDTH characters) is ever read into the shell. Any step of it that fails fails the whole.
+write_failed_step_log() {
+  printf 'step=%s\n' "$1" || return 1
+  if [[ -n $JOURNEY ]]; then printf 'journey=%s\n' "$JOURNEY" || return 1; fi
+  printf 'started=%s\nfinished=%s\n' "$STARTED" "$2" || return 1
+  [[ $3 == 1 ]] || return 0
+  tail -n "$KEPT_LINES" -- "$HELD_FILE" | cut -b "1-$((KEPT_WIDTH * 4))" | last_characters
+}
+
+# keep_failed_step STEP FINISHED BODY: written in place, in a subshell of its own, so that nothing in the formatting can
+# stop the run. A failure here changes nothing else about the run.
 keep_failed_step() {
-  write_failed_step_log "$1" "$2" "$3" 2> /dev/null > "$FAILED_STEP_LOG" && return 0
+  (write_failed_step_log "$1" "$2" "$3") 2> /dev/null > "$FAILED_STEP_LOG" && return 0
   echo "run_once: the output of the failed step could not be kept" >&2
 }
 
@@ -298,17 +308,18 @@ hold() {
 remote() { hold ssh "$JOURNEY_RUNNER_SSH" "$1"; }
 # remote_answer COMMAND: the answer is read as a command substitution reads it (standard output alone, no input, no
 # NUL byte, no trailing line feed); the errors go to the held output, and when the command has ended the answer is
-# added to it, as it was read.
+# added to it, as it was read. An append that fails turns the holding off.
 remote_answer() {
-  local status
+  local status appended=1
   ANSWER=""
   if open_held; then
     {
       ANSWER=$(ssh "$JOURNEY_RUNNER_SSH" "$1" 2>&"$HFD" < /dev/null {HFD}>&-)
       status=$?
-      printf '%s' "$ANSWER" >&"$HFD"
+      printf '%s' "$ANSWER" >&"$HFD" || appended=0
     } 2> /dev/null
     exec {HFD}>&-
+    ((appended)) || capture_off
   else
     { ANSWER=$(ssh "$JOURNEY_RUNNER_SSH" "$1" 2> /dev/null < /dev/null); status=$?; } 2> /dev/null
   fi

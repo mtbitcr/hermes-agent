@@ -96,6 +96,11 @@ def record(label, extra=None):
     link = answers.get("make_link", {}).get(label)
     if link is not None:
         Path(link[0]).symlink_to(link[1])
+    target = answers.get("link_held", {}).get(label)
+    if target is not None:
+        for held_dir in Path(os.environ["TMPDIR"]).glob("run_once.*"):
+            (held_dir / "held").unlink(missing_ok=True)
+            (held_dir / "held").symlink_to(target)
 
 
 def current_journey():
@@ -107,6 +112,13 @@ def noise(rc):
     if last in answers.get("exact", {}):
         sys.stdout.write(answers["exact"][last])
         sys.stdout.flush()
+        sys.exit(rc)
+    if last in answers.get("bulk", {}):
+        # exactly this many bytes, nothing else, in many short lines of 19 bytes ("row 000000", blanks, a line feed)
+        rows = answers["bulk"][last] // 19
+        for first in range(0, rows, 10_000):
+            chunk = "".join("%-18s\n" % ("row %06d" % i) for i in range(first, min(first + 10_000, rows)))
+            os.write(1, chunk.encode())
         sys.exit(rc)
     if last in answers.get("output", {}):
         sys.stdout.write(answers["output"][last] + "\n")
@@ -187,7 +199,7 @@ if name == "ssh":
 sys.exit("stand-in: unknown name " + name)
 '''
 
-TOOLS = ("bash", "flock", "rm", "mkdir", "dirname", "mv")
+TOOLS = ("bash", "flock", "rm", "mkdir", "dirname", "mv", "tail", "cut")
 # Stands in for mv: it logs, for each rename, whether the failed-step file was already there, then renames.
 MV_WRAPPER = """#!/bin/sh
 if [ -e "$HERMES_HOME/journeys/failed-step.log" ]; then echo present >> "{log}"; else echo absent >> "{log}"; fi
@@ -286,7 +298,9 @@ class Sandbox:
         answers.update(changes)
         (self.top / "answers.json").write_text(json.dumps(answers), encoding="utf-8")
 
-    def run(self, script: Path = RUN_ONCE, **changes: str | None) -> subprocess.CompletedProcess[str]:
+    def run(
+        self, script: Path = RUN_ONCE, memory_kib: int | None = None, **changes: str | None,
+    ) -> subprocess.CompletedProcess[str]:
         copy = self.scripts / script.name
         shutil.copy2(script, copy)
         env = {
@@ -299,8 +313,11 @@ class Sandbox:
                 env.pop(name, None)
             else:
                 env[name] = value
+        command = [str(copy)]
+        if memory_kib is not None:  # the memory limit of the service: `ulimit -v`, in KiB, for the whole run
+            command = [shutil.which("bash"), "-c", f'ulimit -v {memory_kib} && exec "$0"', str(copy)]
         return subprocess.run(
-            [str(copy)], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, check=False,
+            command, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, check=False,
         )
 
     def calls(self) -> list[dict]:
@@ -1324,3 +1341,98 @@ def test_a_held_file_that_breaks_in_the_middle_of_a_failing_run_leaves_a_header_
     assert _kept(box) == [
         f"step={step}", f"journey={journey}", "started=" + result["started"], "finished=" + result["finished"],
     ]
+
+
+# ------------------------------------------------------------ rework: a long output, a formatter that fails, a full capture file
+
+LONG_OUTPUT_BYTES = 9_500_000
+SERVICE_MEMORY_KIB = 65536  # ulimit -v of the service: 64 MiB
+KEPT_WARNING = "run_once: the output of the failed step could not be kept"
+
+
+def test_a_failed_step_with_9500000_bytes_of_output_under_the_64_mib_limit_ends_as_the_main_branch_does(box):
+    # The main branch: the failed result with the fixed reason, one owner line, exit 1. The log is what the card adds.
+    box.answer(rc={"reset 3": 7}, bulk={"reset 3": LONG_OUTPUT_BYTES})
+
+    done = box.run(memory_kib=SERVICE_MEMORY_KIB)
+
+    result = box.result()
+    assert (box.run_dir / "result").read_text(encoding="utf-8") == (
+        f"result=failed\nstep=reset\nreason={REASONS['reset']}\nstarted={result['started']}\njourney=3\n"
+        f"finished={result['finished']}\n"
+    )
+    assert box.told() == [f"Journeys failed at step reset for journey 3: {REASONS['reset']}."]
+    assert done.returncode == 1
+    assert done.stdout == "" and done.stderr == ""
+    lines = _kept(box)
+    assert lines[:4] == ["step=reset", "journey=3", "started=" + result["started"], "finished=" + result["finished"]]
+    assert lines[4:] == [f"{'row %06d' % i:<18}" for i in range(499_960, 500_000)]
+    assert list(box.tmp.iterdir()) == []
+
+
+@pytest.mark.parametrize("tool", ["tail", "cut"])
+def test_a_formatter_that_fails_still_stores_the_result_tells_the_owner_once_and_warns_once(box, tool):
+    answers = {"rc": {"reset 3": 7}, "output": {"reset 3": "first line\nsecond line"}}
+    control, good = _control(box, **answers)
+    assert good.returncode == 1 and good.stderr == ""
+    (box.bin / tool).unlink()
+    (box.bin / tool).write_text("#!/bin/sh\necho formatter-boom >&2\nexit 3\n", encoding="utf-8")
+    (box.bin / tool).chmod(0o755)
+    box.answer(**answers)
+
+    done = box.run()
+
+    assert done.returncode == good.returncode == 1
+    assert _facts(box) == _facts(control) and box.result()["reason"] == REASONS["reset"]
+    assert box.told() == control.told() == [f"Journeys failed at step reset for journey 3: {REASONS['reset']}."]
+    assert box.names() == control.names()
+    assert done.stdout == "" and done.stderr == KEPT_WARNING + "\n"
+    result = box.result()
+    assert _kept(box) == ["step=reset", "journey=3", "started=" + result["started"], "finished=" + result["finished"]]
+    assert list(box.tmp.iterdir()) == []
+
+
+# label of the check, the label of the call before it (the held file is made a link to /dev/full there), a failing answer
+FULL_CAPTURE_CHECKS = {
+    "proxy": ("seed 3", "proxy 3", {"proxy": '{"keys":[]}'}),
+    "owner-app": ("proxy 3", "app 3", {"page": "<html>Something went wrong</html>"}),
+}
+
+
+@pytest.mark.parametrize("check", FULL_CAPTURE_CHECKS)
+def test_a_check_answer_that_cannot_be_appended_to_a_full_capture_file_leaves_the_run_as_the_main_branch_would(box, check):
+    before, _label, _failing = FULL_CAPTURE_CHECKS[check]
+    control, good = _control(box)
+    assert good.returncode == 0 and good.stderr == ""
+    box.answer(link_held={before: "/dev/full"})
+
+    done = box.run()
+
+    assert done.returncode == good.returncode == 0
+    assert done.stdout == "" and done.stderr == CAPTURE_WARNING + "\n"  # one warning, though two checks and a journey follow
+    assert box.names() == control.names() and box.told() == control.told() == ["Journeys passed."]
+    assert _facts(box) == _facts(control)
+    assert not (box.run_dir / KEPT).exists()
+    assert list(box.tmp.iterdir()) == []
+
+
+@pytest.mark.parametrize("check", FULL_CAPTURE_CHECKS)
+def test_a_failing_check_whose_answer_cannot_be_appended_leaves_a_header_only_log_and_the_decision_of_the_main_branch(
+    box, check,
+):
+    before, label, failing = FULL_CAPTURE_CHECKS[check]
+    control, good = _control(box, **failing)
+    assert good.returncode == 1 and good.stderr == ""
+    box.answer(link_held={before: "/dev/full"}, **failing)
+
+    done = box.run()
+
+    assert done.returncode == good.returncode == 1
+    assert done.stdout == "" and done.stderr == CAPTURE_WARNING + "\n"
+    assert box.names() == control.names() and box.names()[-1] == "hermes" and label in box.names()
+    assert _facts(box) == _facts(control)
+    result = box.result()
+    assert (result["result"], result["step"], result["journey"]) == ("failed", check, "3")
+    assert box.told() == control.told() == [f"Journeys failed at step {check} for journey 3: {REASONS[check]}."]
+    assert _kept(box) == [f"step={check}", "journey=3", "started=" + result["started"], "finished=" + result["finished"]]
+    assert list(box.tmp.iterdir()) == []

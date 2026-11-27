@@ -194,7 +194,7 @@ if name == "curl":
 sys.exit("stand-in: unknown name " + name)
 '''
 
-TOOLS = ("bash", "flock", "rm", "mkdir", "dirname", "date")
+TOOLS = ("bash", "flock", "rm", "mkdir", "dirname", "date", "tail", "cut")
 
 
 def _issuer_and_kid() -> tuple[str, str]:
