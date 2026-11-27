@@ -238,12 +238,13 @@ def _safe_component(name: str) -> bool:
     return not (PurePosixPath(name).is_absolute() or PureWindowsPath(name).drive)
 
 
-def _saved_examples(root: Path, trees: Iterable[tuple[str, ast.Module]], scan_target) -> tuple[list[tuple[str, bool]], list[tuple[str, int]]]:
+def _saved_examples(root: Path, trees: Iterable[tuple[str, ast.Module]], scan_target, scan_folder) -> tuple[list[tuple[str, bool]], list[tuple[str, int]]]:
     """What the ``owner_payload_example`` calls of *trees* (test file path, syntax tree) read: the
     saved example rows, one per call and file, as (path relative to *root*, whether it is listed
     only as "every example of the family"); and, for each call whose family is not resolved, the test file and the line of
     the call. *scan_target(path, follow)* is the scan's own test of a file: the path it really is,
-    or ``None`` when the scan would skip it (outside the repository, owned, in a skipped folder)."""
+    or ``None`` when the scan would skip it (outside the repository, owned, in a skipped folder).
+    *scan_folder(path)* is the same test of a family folder, made before any file is looked up or listed."""
     found: list[tuple[str, bool]] = []
     unresolved: list[tuple[str, int]] = []
     for rel_test, tree in trees:
@@ -269,16 +270,9 @@ def _saved_examples(root: Path, trees: Iterable[tuple[str, ast.Module]], scan_ta
             if not all(_safe_component(n) for n in (family, kind) if n is not None):
                 continue
             folder = root / EXAMPLES_DIR / family
-            if kind is not None:
-                files = [folder / f"{kind}.json"]
-            else:
-                try:
-                    real_folder = folder.resolve(strict=True).relative_to(root).as_posix()
-                except (OSError, RuntimeError, ValueError):
-                    continue
-                if SKIP_DIRS.intersection(real_folder.split("/")):
-                    continue
-                files = sorted(folder.glob("*.json"))
+            if not scan_folder(folder):
+                continue
+            files = [folder / f"{kind}.json"] if kind is not None else sorted(folder.glob("*.json"))
             for file in files:
                 if scan_target(file, True) is not None:
                     found.append((file.relative_to(root).as_posix(), kind is None))
@@ -333,6 +327,18 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
         if is_owned_path(rel) or not real.is_file():
             return None
         return real
+
+    def scan_folder(path: Path) -> bool:
+        """Whether the scan may look into the folder *path*: it, by its path and where it resolves,
+        is inside the repository, under no skipped folder name and not an owned folder or inside one."""
+        try:
+            rels = (path.relative_to(root).as_posix(), path.resolve(strict=True).relative_to(root).as_posix())
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return not any(
+            SKIP_DIRS.intersection(rel.split("/")) or any(rel == d or rel.startswith(d + "/") for d in owned_dirs)
+            for rel in rels
+        )
 
     hints: list[Hint] = []
     test_imports: dict[str, set[str]] = {}
@@ -398,7 +404,7 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
     helpers = {rel for rel, names in test_imports.items() if pinning & names}
     hints.extend(Hint(rel, (), (), True) for rel in sorted(helpers))
     listed = {h.path for h in hints}
-    saved, unresolved = _saved_examples(root, [(rel, tree) for rel, tree in example_trees.items() if rel in listed], scan_target)
+    saved, unresolved = _saved_examples(root, [(rel, tree) for rel, tree in example_trees.items() if rel in listed], scan_target, scan_folder)
     hints.extend(Hint(rel, (5,), (), False, every) for rel, every in saved)
     hints.extend(Hint(rel, (5,), (), False, False, line) for rel, line in unresolved)
     keyed = {h.path for h in hints if 4 in h.rules}

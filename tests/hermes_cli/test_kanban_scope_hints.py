@@ -718,6 +718,49 @@ def test_a_family_folder_is_checked_before_it_is_enumerated_and_its_files_are_ch
     assert set(_saved_rows(shown)) == {f"{SAVED}/again/one.json", f"{SAVED}/again/two.json"}
 
 
+@pytest.fixture
+def listed_folders(monkeypatch):
+    """The folders whose files ``Path.glob`` is asked to list."""
+    seen: list[Path] = []
+    real_glob = Path.glob
+
+    def spy(self, pattern, *args, **kwargs):
+        seen.append(self)
+        return real_glob(self, pattern, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "glob", spy)
+    return seen
+
+
+def _family_call(family: str) -> str:
+    return f"def test_a(owner_payload_example, kind):\n    owner_payload_example({family!r}, kind, {{}})\n"
+
+
+def test_a_family_folder_that_is_owned_skipped_or_leads_out_is_not_enumerated(saved_repo, tmp_path, listed_folders):
+    outside = tmp_path / "outside"
+    _write(outside / "x.json", "{}\n")
+    _write(saved_repo / "node_modules" / "skipped" / "y.json", "{}\n")
+    _write(saved_repo / SAVED / "node_modules" / "z.json", "{}\n")
+    (saved_repo / SAVED / "away").symlink_to(outside, target_is_directory=True)
+    (saved_repo / SAVED / "skipdir").symlink_to(saved_repo / "node_modules" / "skipped", target_is_directory=True)
+    (saved_repo / SAVED / "again").symlink_to(saved_repo / SAVED / "fam", target_is_directory=True)
+    owned = (OWNED, f"{SAVED}/fam")
+    for family in ("fam", "again", "node_modules", "away", "skipdir"):
+        _, lines = _rule_5_rows(saved_repo, _family_call(family), owned)
+        assert _saved_only(lines) == {}, family
+    assert listed_folders == []
+
+
+def test_an_eligible_family_folder_is_still_enumerated_and_gives_the_same_rows(saved_repo, tmp_path, listed_folders):
+    (saved_repo / SAVED / "again").symlink_to(saved_repo / SAVED / "fam", target_is_directory=True)
+    _, lines = _rule_5_rows(saved_repo, _family_call("fam"))
+    assert _saved_only(lines) == FAMILY_ROWS
+    assert listed_folders == [saved_repo / SAVED / "fam"]
+    _, lines = _rule_5_rows(saved_repo, _family_call("again"))
+    assert _saved_only(lines) == {f"{SAVED}/again/one.json": FAMILY_LABEL, f"{SAVED}/again/two.json": FAMILY_LABEL}
+    assert listed_folders == [saved_repo / SAVED / "fam", saved_repo / SAVED / "again"]
+
+
 # Card 2, one narrow rule: an argument is resolved only by a string literal at the call, or by a
 # plain name that the whole file binds once, at module level, to a string literal. No scope rule.
 NOT_RESOLVED = "rule 5 (saved example not resolved)"
