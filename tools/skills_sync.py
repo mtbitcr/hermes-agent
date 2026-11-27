@@ -28,7 +28,6 @@ from tools.skill_usage import _read_skill_name, read_suppressed_names
 from tools.skills_sync_optional import (
     _ignore_runtime_cache, _is_runtime_cache, _read_hub_install_paths,
 )
-from tools.skills_sync_roles import sync_role_skills, sync_role_skills_alone, take_role_records
 from utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -538,16 +537,15 @@ def sync_skills(quiet: bool = False) -> dict:
         print("  (profile opted out of bundled skills via .no-bundled-skills — seeding essential skills only)")
     bundled_dir = _get_bundled_dir()
     if not bundled_dir.exists():
-        return sync_role_skills_alone(quiet, reset, {  # the role pass runs without general skills
-                "copied": [], "updated": [], "skipped": 0, "user_modified": [], "cleaned": [],
+        from tools.skills_sync_roles import sync_role_skills  # the role pass runs after the general one
+        return sync_role_skills({"copied": [], "updated": [], "skipped": 0, "user_modified": [], "cleaned": [],
                 "suppressed": [], "total_bundled": 0, "not_seeded_by_marker": 0,
-                "optional_provenance_backfilled": [], "kept": [], "refused": []})
+                "optional_provenance_backfilled": [], "kept": [], "refused": []}, quiet)
     _skills_dir().mkdir(parents=True, exist_ok=True)
     all_bundled = _discover_bundled_skills(bundled_dir)
     suppressed = _read_suppressed_names()
     external_index = _build_external_skill_index()
     st = _SyncState(manifest=_read_manifest(), quiet=quiet, reset=reset)
-    role_lines = take_role_records(st, bundled_dir, all_bundled)  # no role line is a general skill's evidence
     # The marker stops NEW built-ins: a name with a manifest line gets only _update_in_marked_role.
     bundled_skills = [(name, src) for name, src in all_bundled
                       if not marked or name in st.manifest or name in ESSENTIAL_SKILLS]
@@ -576,19 +574,17 @@ def sync_skills(quiet: bool = False) -> dict:
             _update_existing_skill(st, skill_name, skill_src, dest, bundled_hash)
         else:
             st.skipped += 1  # in manifest but not on disk — user deleted it
-    # The role's own skills (role-skills/<role>/, marker or not); their lines are released names.
-    role_skills = sync_role_skills(st, bundled_dir, all_bundled, suppressed, external_index,
-                                   role_lines, bundled_skills, marked)
     # Clean manifest entries for skills removed upstream. Skipped when opted out: a marked role
     # changes no line but the one an update writes.
-    cleaned = [] if marked else sorted(set(st.manifest) - {name for name, _ in bundled_skills} - role_skills)
+    cleaned = [] if marked else sorted(set(st.manifest) - {name for name, _ in bundled_skills})
     for name in cleaned:
         del st.manifest[name]
     _seed_category_descriptions(bundled_dir, {
         _compute_relative_dest(src, bundled_dir).parent
         for name, src in bundled_skills if name in ESSENTIAL_SKILLS} if marked else None)
     _store_manifest(st.manifest)
-    return {
+    from tools.skills_sync_roles import sync_role_skills  # the role pass runs after the general one
+    return sync_role_skills({
         "copied": st.copied, "updated": st.updated, "skipped": st.skipped, "user_modified": st.user_modified,
         "cleaned": cleaned, "suppressed": st.suppressed, "relocated": st.relocated,
         # What the role may be seeded with: a marked role, only the essentials in the catalog.
@@ -600,7 +596,7 @@ def sync_skills(quiet: bool = False) -> dict:
         "optional_provenance_backfilled": [],
         "shadowed_by_external": st.shadowed_by_external,
         "kept": st.kept, "refused": st.refused,
-        "skipped_opt_out": marked}  # lets callers report "opted out", not a normal sync
+        "skipped_opt_out": marked}, quiet)  # lets callers report "opted out", not a normal sync
 
 
 def _rmtree_writable(path: Path) -> None:

@@ -34,6 +34,7 @@ PLANNER, BUILDER = "raphael-planner", "raphael-claude-worker"
 OTHER = "raphael-verifier"  # a role with no folder under role-skills/: its run has no role pass
 PLAN, BUILD = "team-operations/handing-build-work", "team-operations/running-build-work"
 NAME = "handing-build-work"
+ROLE_RECORD = ".role_skills_manifest"  # the role pass's own record, beside .bundled_manifest (own-record point 6)
 LISTS = ("copied", "updated", "kept", "refused", "suppressed", "shadowed_by_external")
 NO_LISTS = {key: [] for key in LISTS}
 # What ``sync_skills`` returns today when the general catalogue is not there.
@@ -133,6 +134,13 @@ def _manifest(home: Path) -> dict:
     return dict(line.split(":", 1) for line in lines if line)
 
 
+def _role_record(home: Path) -> dict:
+    """The role pass's own record file, read as ``_manifest`` reads ``.bundled_manifest``."""
+    path = home / "skills" / ROLE_RECORD
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    return dict(line.split(":", 1) for line in lines if line)
+
+
 def _names(result: dict) -> dict:
     """The skill names in each list of the result (``kept`` and ``refused`` hold ``{"name", "reason"}``)."""
     return {key: [item["name"] if isinstance(item, dict) else item for item in result[key]] for key in LISTS}
@@ -156,9 +164,9 @@ def _tree(folder: Path) -> dict:
 
 
 def _without_record(home: Path) -> dict:
-    """``_tree(home)`` but the record file, where a role line is the one difference from a twin."""
+    """``_tree(home)`` but the role record, the one difference from a twin (``.bundled_manifest`` is equal)."""
     tree = _tree(home)
-    tree.pop("skills/.bundled_manifest", None)
+    tree.pop(f"skills/{ROLE_RECORD}", None)
     return tree
 
 
@@ -209,6 +217,36 @@ def _lists(result: dict) -> dict:
     return {key: result[key] for key in LISTS}
 
 
+def _outside(home: Path, places) -> dict:
+    """``_tree`` of ``skills/`` but ``.role_skills_manifest`` and each role skill's place (relative to
+    ``skills/``): the place, each entry inside it and each folder on the way to it (own-record point 21)."""
+    places = [Path(place) for place in places]
+    return {rel: entry for rel, entry in _tree(home / "skills").items()
+            if rel != ROLE_RECORD and not any(Path(rel) == place or place in Path(rel).parents
+                                              or Path(rel) in place.parents for place in places)}
+
+
+def _step(home: Path, control_root: Path, roles: Path, places, role: dict) -> dict:
+    """One release step of a point-20 sequence with its control home (own-record point 21): a copy of
+    ``home`` under ``control_root/profiles/`` is seeded with the checkout's ``role-skills/`` (``roles``)
+    renamed aside, then ``home`` with it there. The home's result is the control's with ``role``, the
+    role pass's entries, appended to its lists; ``.bundled_manifest`` and ``skills/`` outside ``places``
+    and outside ``.role_skills_manifest`` are equal. Returns the home's result."""
+    control = control_root / "profiles" / home.name
+    shutil.copytree(home, control, symlinks=True)
+    aside = roles.with_name("role-skills-aside")
+    roles.rename(aside)
+    try:
+        expected = _seed(control)
+    finally:
+        aside.rename(roles)
+    result = _seed(home)
+    assert result == {key: value + role[key] if key in role else value for key, value in expected.items()}
+    assert _manifest(home) == _manifest(control)
+    assert _outside(home, places) == _outside(control, places)
+    return result
+
+
 # -- Point 10, the table ---------------------------------------------------------------------------
 
 def test_10a_a_new_role_skill_is_copied_with_its_record_line(release, monkeypatch):
@@ -218,7 +256,8 @@ def test_10a_a_new_role_skill_is_copied_with_its_record_line(release, monkeypatc
 
     assert result["copied"] == [NAME]
     assert _files(release.planner / "skills" / PLAN) == _files(src)
-    assert _manifest(release.planner) == {NAME: _dir_hash(src)}
+    assert _role_record(release.planner) == {NAME: _dir_hash(src)}
+    assert _manifest(release.planner) == {}
 
 
 def test_10b_a_deleted_role_copy_stays_deleted(release, monkeypatch):
@@ -264,7 +303,8 @@ def test_10c_an_exact_role_copy_is_adopted_and_no_byte_of_it_is_written(release,
     result = _sync(monkeypatch, release.planner)
 
     assert (_files(copy), _stat(md), _stat(copy)) == before  # bytes, change times and inode
-    assert _manifest(release.planner) == {NAME: _dir_hash(src)}
+    assert _role_record(release.planner) == {NAME: _dir_hash(src)}
+    assert _manifest(release.planner) == {}
     assert not any(_names(result).values())  # an adopted copy is in none of the lists
 
 
@@ -281,7 +321,7 @@ def test_10c_an_exact_copy_at_a_hub_install_path_is_kept_and_not_adopted(release
 
     assert result["kept"] == [{"name": NAME, "reason": "changed"}]
     assert _files(copy) == before
-    assert NAME not in _manifest(release.planner)
+    assert NAME not in _manifest(release.planner) and NAME not in _role_record(release.planner)
 
 
 @pytest.mark.parametrize("kind, reason", [
@@ -305,7 +345,7 @@ def test_10d_a_changed_role_copy_is_kept_and_named_with_its_reason(release, monk
     assert result["kept"] == [{"name": NAME, "reason": reason}]
     assert result["copied"] == result["updated"] == result["refused"] == []
     assert _files(copy) == before
-    assert NAME not in _manifest(release.planner)
+    assert NAME not in _manifest(release.planner) and NAME not in _role_record(release.planner)
 
 
 @pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
@@ -321,21 +361,23 @@ def test_10e_an_adopted_copy_is_updated_when_the_released_text_changes(release, 
 
     assert result["updated"] == [NAME]
     assert _files(release.planner / "skills" / PLAN) == _files(src)
-    assert _manifest(release.planner) == {NAME: _dir_hash(src)}
+    assert _role_record(release.planner) == {NAME: _dir_hash(src)}
+    assert _manifest(release.planner) == {}
 
 
 def test_10e_a_recorded_role_copy_that_a_person_changed_is_kept_with_no_update(release, monkeypatch):
     _write_skill(release.roles / PLANNER, PLAN, "planner v1")
     _sync(monkeypatch, release.planner)
     _edit(release.planner / "skills" / PLAN)
-    before, line = _files(release.planner / "skills" / PLAN), _manifest(release.planner)
+    before, line = _files(release.planner / "skills" / PLAN), _role_record(release.planner)
     _write_skill(release.roles / PLANNER, PLAN, "planner v2")
 
     result = _sync(monkeypatch, release.planner)
 
     assert result["kept"] == [{"name": NAME, "reason": "changed"}] and result["updated"] == []
     assert _files(release.planner / "skills" / PLAN) == before
-    assert _manifest(release.planner) == line
+    assert _role_record(release.planner) == line != {}
+    assert _manifest(release.planner) == {}
 
 
 # -- Points 7 to 9, 11 and 12 ----------------------------------------------------------------------
@@ -348,8 +390,8 @@ def test_7_8_a_role_skill_reaches_only_its_own_role(release, monkeypatch):
     assert _sync(monkeypatch, release.planner)["copied"] == [NAME]
     assert _sync(monkeypatch, release.builder)["copied"] == ["running-build-work"]
     assert _sync(monkeypatch, other)["copied"] == []
-    assert sorted(_files(release.planner / "skills")) == [".bundled_manifest", f"{PLAN}/SKILL.md"]
-    assert sorted(_files(release.builder / "skills")) == [".bundled_manifest", f"{BUILD}/SKILL.md"]
+    assert sorted(_files(release.planner / "skills")) == [".bundled_manifest", ROLE_RECORD, f"{PLAN}/SKILL.md"]
+    assert sorted(_files(release.builder / "skills")) == [".bundled_manifest", ROLE_RECORD, f"{BUILD}/SKILL.md"]
     assert sorted(_files(other / "skills")) == [".bundled_manifest"]
 
 
@@ -363,6 +405,7 @@ def test_7_the_root_home_and_a_home_outside_profiles_get_no_role_skill(release, 
         assert not any(_names(result).values()), home
         assert not os.path.lexists(home / "skills" / "team-operations"), home
         assert _manifest(home) == {}, home
+        assert not os.path.lexists(home / "skills" / ROLE_RECORD), home
 
 
 def test_9_a_role_with_the_no_bundled_skills_marker_gets_its_role_skill(release, monkeypatch):
@@ -395,6 +438,7 @@ def test_11_a_role_skill_with_the_name_of_a_general_skill_is_refused_and_nothing
     # Only the general skill, at its own place, is seeded (a marked role stops it).
     assert result["copied"] == ([] if marked else [NAME])
     assert _manifest(release.planner) == ({} if marked else {NAME: _dir_hash(general)})
+    assert not os.path.lexists(release.planner / "skills" / ROLE_RECORD)
 
 
 def test_12_a_role_skill_record_line_survives_the_cleanup_in_a_role_with_no_marker(release, monkeypatch):
@@ -406,7 +450,8 @@ def test_12_a_role_skill_record_line_survives_the_cleanup_in_a_role_with_no_mark
     result = _sync(monkeypatch, release.planner)
 
     assert result["cleaned"] == ["spike"]  # the cleanup ran
-    assert _manifest(release.planner) == {NAME: _dir_hash(src)}
+    assert _role_record(release.planner) == {NAME: _dir_hash(src)}
+    assert _manifest(release.planner) == {}  # the cleanup reads no role record (own-record point 19)
     assert _sync(monkeypatch, release.planner)["cleaned"] == []
 
 
@@ -419,7 +464,7 @@ def test_8_the_role_copy_lands_at_the_same_inner_path(release, monkeypatch):
     _sync(monkeypatch, release.planner)
 
     assert sorted(_files(release.planner / "skills")) == [
-        ".bundled_manifest", f"{rel}/SKILL.md", f"{rel}/references/checklist.md"]
+        ".bundled_manifest", ROLE_RECORD, f"{rel}/SKILL.md", f"{rel}/references/checklist.md"]
     assert _files(release.planner / "skills" / rel) == _files(src)
 
 
@@ -468,9 +513,15 @@ def test_13_where_the_table_is_silent_a_role_skill_goes_as_a_general_skill_of_a_
 
         result = _sync(monkeypatch, home)
 
-        seen.append(({key: result[key] for key in LISTS}, result["skipped"], _manifest(home), _files(outside)))
-    assert seen[0] == seen[1]
-    assert seen[1][2] == {}  # no line in any of these cases: the next sync tries again
+        seen.append(({key: result[key] for key in LISTS}, result["skipped"], _manifest(home), _role_record(home),
+                     _files(outside)))
+    if case == "a name an external skills folder provides":  # own-record point 19: the reason name
+        assert seen[0][0] == {**NO_LISTS, "shadowed_by_external": [NAME]}
+        assert seen[1][0] == {**NO_LISTS, "refused": [{"name": NAME, "reason": "name"}]}
+        assert seen[1][1:] == (0, *seen[0][2:])
+    else:
+        assert seen[0] == seen[1]
+    assert seen[1][2] == seen[1][3] == {}  # no line in any of these cases: the next sync tries again
     if case == "a failed copy":
         assert copies == [PLAN, PLAN] and not any(seen[1][0].values())
     else:
@@ -563,7 +614,8 @@ def test_the_release_seeding_adopts_an_exact_planner_copy_and_gives_the_builder_
 
     assert result is not None
     assert not any(NAME in names for names in _names(result).values())
-    assert _manifest(release.planner) == {NAME: _dir_hash(src)}
+    assert _role_record(release.planner) == {NAME: _dir_hash(src)}
+    assert (release.planner / "skills" / ".bundled_manifest").read_bytes() == b""  # as the general pass wrote it
     assert hashlib.sha256(md.read_bytes()).hexdigest() == sha
     assert seed_profile_skills(release.builder, quiet=True, full_result=True)["copied"] == ["running-build-work"]
     assert not os.path.lexists(release.builder / "skills" / PLAN)
@@ -597,7 +649,8 @@ def test_addition_3_the_release_seeds_the_checkout_role_skills_whatever_hermes_b
         assert result["copied"] == ([] if marked else ["spike"]) + [src.name]
         assert result["kept"] == result["refused"] == []
         assert _files(home / "skills" / rel) == _files(src)
-        assert _manifest(home) == {src.name: _dir_hash(src), **({} if marked else {"spike": _dir_hash(spike)})}
+        assert _role_record(home) == {src.name: _dir_hash(src)}
+        assert _manifest(home) == ({} if marked else {"spike": _dir_hash(spike)})
         assert not os.path.lexists(home / "skills" / "decoy")
 
 
@@ -616,7 +669,8 @@ def test_addition_4_the_role_pass_runs_when_the_general_catalogue_is_not_there(t
 
     assert _seed(planner) == {**NO_CATALOGUE, "copied": [NAME]}
     assert _files(planner / "skills" / PLAN) == _files(src)
-    assert _manifest(planner) == {NAME: _dir_hash(src)}
+    assert _role_record(planner) == {NAME: _dir_hash(src)}
+    assert _manifest(planner) == {}
 
 
 # -- The addition: the plain shape of a role skill (points 6 and 7) ----------------------------------
@@ -797,9 +851,10 @@ def test_addition_10_an_exact_copy_is_adopted_only_when_the_hub_lock_is_not_ther
     result = _seed(planner)
 
     assert _lists(result) == {**NO_LISTS, "kept": [{"name": NAME, "reason": "changed"}] if owned else []}
-    assert _manifest(planner) == ({} if owned else {NAME: _dir_hash(src)})
+    assert _role_record(planner) == ({} if owned else {NAME: _dir_hash(src)})
+    assert _manifest(planner) == {}
     assert (_sha(md), _stat(md)) == (sha, stat)
-    record = {} if owned else {"skills/.bundled_manifest": f"{NAME}:{_dir_hash(src)}\n".encode("utf-8")}
+    record = {} if owned else {f"skills/{ROLE_RECORD}": f"{NAME}:{_dir_hash(src)}\n".encode("utf-8")}
     assert _tree(planner) == {**before, **record}
 
 
@@ -837,10 +892,9 @@ def test_addition_11_an_exact_copy_is_kept_with_hub_lock_when_the_lock_cannot_be
             lock.chmod(0o644)
 
     assert without["copied"] == ["hermes-agent"] and without["kept"] == []
-    assert with_role == {**without, "kept": [{"name": NAME, "reason": "hub_lock"}],
-                         "skipped": without["skipped"] + 1}
+    assert with_role == {**without, "kept": [{"name": NAME, "reason": "hub_lock"}]}  # no count changes
     assert _tree(planner) == _tree(twin)
-    assert NAME not in _manifest(planner) and _sha(md) == sha
+    assert NAME not in _manifest(planner) and NAME not in _role_record(planner) and _sha(md) == sha
 
 
 @pytest.mark.parametrize("form", [
@@ -889,15 +943,15 @@ def test_addition_12_13_a_general_description_in_the_place_of_a_role_skill_refus
     for release_no in range(2):  # the second release finds what the first one wrote
         with_role, without = _seed(planner), _seed(twin)
 
+        # Own-record points 10 and 11: a description is no place of a general skill, so no overlap; with
+        # no marker the general pass wrote it into the copy before the role pass, which keeps it (line d).
         if marked:
-            assert with_role == {**without, "skipped": without["skipped"] + 1}  # adopted: in no list
-        elif release_no == 0:
-            assert with_role == {**without, "refused": [{"name": NAME, "reason": "overlap"}]}
+            assert with_role == without  # adopted: in no list, and no count changes
         else:
-            assert with_role == {**without, "kept": [{"name": NAME, "reason": "changed"}],
-                                 "skipped": without["skipped"] + 1}
+            assert with_role == {**without, "kept": [{"name": NAME, "reason": "changed"}]}
         assert without["refused"] == [] and _without_record(planner) == _without_record(twin)
-        assert _manifest(planner) == {**_manifest(twin), **({NAME: _dir_hash(src)} if marked else {})}
+        assert _manifest(planner) == _manifest(twin)
+        assert _role_record(planner) == ({NAME: _dir_hash(src)} if marked else {})
     assert (planner / "skills" / PLAN / "DESCRIPTION.md").is_file() == (not marked)  # the general pass's own
 
 
@@ -935,8 +989,19 @@ def test_addition_12_13_a_role_skill_where_the_general_pass_writes_is_refused_an
     _use_role_skills(monkeypatch, tmp_path / "no-role-skills")
     without = _sync(monkeypatch, twin)
 
-    assert with_role == {**without, "refused": without["refused"] + [{"name": name, "reason": "overlap"}]}
-    assert _tree(home) == _tree(twin)
+    # Own-record points 10 and 11: only a general skill's place gives overlap; a description, a backup
+    # place or the record file does not, and the table decides (line d for what the general pass left).
+    role = {"its own description where the general pass writes one": {"kept": [{"name": name, "reason": "changed"}]},
+            "a general skill at its backup place": {"copied": [name]},
+            "the record file at its place": {"kept": [{"name": name, "reason": "changed"}]},
+            }.get(case, {"refused": [{"name": name, "reason": "overlap"}]})
+    assert with_role == {key: value + role[key] if key in role else value for key, value in without.items()}
+    assert _manifest(home) == _manifest(twin)
+    if case == "a general skill at its backup place":
+        assert _outside(home, [PLAN]) == _outside(twin, [PLAN])
+        assert _files(home / "skills" / PLAN) == _files(src) and _role_record(home) == {name: _dir_hash(src)}
+    else:
+        assert _tree(home) == _tree(twin)
 
 
 # -- Review round 2 -----------------------------------------------------------------------------------
@@ -1005,8 +1070,8 @@ def test_review2_2_a_role_record_is_no_evidence_for_a_later_general_skill_of_the
     twin = _twin(planner, tmp_path / "twin", OTHER)
     copy = _files(planner / "skills" / PLAN)
     first, first_twin = _seed(planner), _seed(twin)
-    assert first == {**first_twin, "skipped": first_twin["skipped"] + 1}  # adopted: in no list
-    assert _manifest(planner) == {NAME: _dir_hash(src)}
+    assert first == first_twin  # adopted: in no list, and no count changes
+    assert _role_record(planner) == {NAME: _dir_hash(src)} and _manifest(planner) == _manifest(twin)
     _write_skill(general, f"software-development/{NAME}", "the general one")
 
     with_role, without = _seed(planner), _seed(twin)
@@ -1015,7 +1080,8 @@ def test_review2_2_a_role_record_is_no_evidence_for_a_later_general_skill_of_the
     assert without["copied"] == ([] if marked else [NAME]) and without["relocated"] == []
     assert _files(planner / "skills" / PLAN) == copy
     assert _without_record(planner) == _without_record(twin)
-    assert _manifest(planner) == {**_manifest(twin), **({NAME: _dir_hash(src)} if marked else {})}
+    assert _manifest(planner) == _manifest(twin)
+    assert _role_record(planner) == {NAME: _dir_hash(src)}
 
 
 @pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
@@ -1159,13 +1225,13 @@ def test_review2_5_an_exact_copy_around_a_description_is_adopted_only_where_the_
     with_role, without = _seed(planner), _seed(twin)
 
     if marked:
-        assert with_role == {**without, "skipped": without["skipped"] + 1}  # adopted: in no list
-        assert _manifest(planner) == {**_manifest(twin), NAME: _dir_hash(src)}
+        assert with_role == without  # adopted: in no list, and no count changes
+        assert _manifest(planner) == _manifest(twin) and _role_record(planner) == {NAME: _dir_hash(src)}
         assert ({path: _stat(path) for path in [copy, *sorted(copy.rglob("*"))]}, _files(copy)) == before
         assert _without_record(planner) == _without_record(twin)
-    else:
-        assert with_role == {**without, "refused": [{"name": NAME, "reason": "overlap"}]}
-        assert _tree(planner) == _tree(twin) and NAME not in _manifest(planner)
+    else:  # own-record point 11: no overlap; the copy the general pass wrote into is kept (line d)
+        assert with_role == {**without, "kept": [{"name": NAME, "reason": "changed"}]}
+        assert _tree(planner) == _tree(twin) and NAME not in _manifest(planner) and _role_record(planner) == {}
     assert (copy / "DESCRIPTION.md").is_file() == (not marked)
 
 
@@ -1184,3 +1250,448 @@ def test_review2_5_a_role_skill_at_or_inside_a_general_skills_place_is_refused_w
 
     assert _lists(result) == {**NO_LISTS, "refused": [{"name": NAME, "reason": "overlap"}]}
     assert _tree(home) == before
+
+
+# -- The owner's own-record rule after review round 3 (points 5 to 14 and 20 to 23) ------------------
+
+@pytest.mark.parametrize("catalogue", [True, False], ids=["general catalogue", "no general catalogue"])
+def test_own_record_5_the_role_pass_runs_once_after_the_general_pass_ended_at_both_returns(
+        release, monkeypatch, tmp_path, catalogue):
+    """The call sites import ``sync_role_skills`` at call time: the wrapper sees each call, with the
+    general result, and ``.bundled_manifest`` on disk already as the run leaves it."""
+    src = _write_skill(release.roles / PLANNER, PLAN, "planner")
+    _write_skill(release.skills, "general-cat/general-skill", "general")
+    if not catalogue:
+        monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(tmp_path / "not-there"))
+    home = _home(release.planner, marked=False)
+    control = _twin(home, tmp_path / "control")
+    _use_role_skills(monkeypatch, tmp_path / "no-role-skills")
+    expected = _sync(monkeypatch, control)
+    _use_role_skills(monkeypatch, release.roles)
+    calls = []
+    real = skills_sync_roles.sync_role_skills
+
+    def wrapped(result, quiet=False):
+        calls.append((json.loads(json.dumps(result)), (home / "skills" / ".bundled_manifest").read_bytes()))
+        return real(result, quiet)
+    monkeypatch.setattr(skills_sync_roles, "sync_role_skills", wrapped)
+
+    result = _sync(monkeypatch, home)
+
+    assert len(calls) == 1
+    general, record_at_call = calls[0]
+    assert general == expected
+    assert record_at_call == (home / "skills" / ".bundled_manifest").read_bytes()
+    assert _manifest(home) == _manifest(control) == (
+        {"general-skill": _dir_hash(release.skills / "general-cat" / "general-skill")} if catalogue else {})
+    assert result == {**expected, "copied": expected["copied"] + [NAME]}
+    assert _role_record(home) == {NAME: _dir_hash(src)}
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+def test_own_record_6_the_role_record_is_its_own_file_beside_the_general_record_made_with_its_first_line(
+        release, monkeypatch, tmp_path, marked):
+    src = _write_skill(release.roles / PLANNER, PLAN, "planner")
+    _write_skill(release.skills, "general-cat/general-skill", "general")
+    home = _home(release.planner, marked=marked)
+    control = _twin(home, tmp_path / "control")
+    record = home / "skills" / ROLE_RECORD
+
+    result = _sync(monkeypatch, home)
+    _use_role_skills(monkeypatch, tmp_path / "no-role-skills")
+    expected = _sync(monkeypatch, control)
+
+    assert result == {**expected, "copied": expected["copied"] + [NAME]}
+    assert record.read_text(encoding="utf-8") == f"{NAME}:{_dir_hash(src)}\n"
+    assert record.parent == (home / "skills" / ".bundled_manifest").parent
+    assert _role_record(home) == {NAME: _dir_hash(src)}
+    assert NAME not in _manifest(home)
+    assert _manifest(home) == _manifest(control)
+    assert _outside(home, [PLAN]) == _outside(control, [PLAN])
+    assert not os.path.lexists(control / "skills" / ROLE_RECORD)
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+def test_own_record_20_1_a_role_skill_with_a_general_name_and_its_old_text_is_refused_as_the_general_skill_updates(
+        tmp_path, monkeypatch, checkout, marked):
+    """Sequence 1 of the third review: release 1 delivers a general skill with its line; release 2
+    changes its text and newly offers a role skill of its name and its release-1 text at another place."""
+    general = _general(monkeypatch, tmp_path / "release" / "skills")
+    _write_skill(general, "general-cat/shared", "release 1")
+    home = _home(tmp_path / "root" / "profiles" / PLANNER, marked=False)
+    places = ["team-operations/shared"]
+
+    assert _step(home, tmp_path / "control-1", checkout, places, {})["copied"] == ["shared"]
+    if marked:
+        _mark(home)  # the line is there: the marked role gets the update of an unchanged copy
+    _write_skill(checkout / PLANNER, "team-operations/shared", "release 1")
+    _write_skill(general, "general-cat/shared", "release 2")
+    assert _dir_hash(checkout / PLANNER / "team-operations" / "shared") == _manifest(home)["shared"]
+
+    result = _step(home, tmp_path / "control-2", checkout, places, {"refused": [{"name": "shared", "reason": "name"}]})
+
+    assert result["updated"] == ["shared"]
+    assert _manifest(home) == {"shared": _dir_hash(general / "general-cat" / "shared")}
+    assert not os.path.lexists(home / "skills" / "team-operations")
+    assert not os.path.lexists(home / "skills" / ROLE_RECORD)
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+def test_own_record_20_2_a_general_skill_moves_its_category_and_a_role_skill_takes_the_old_place_and_name(
+        tmp_path, monkeypatch, checkout, marked):
+    """Sequence 2: release 1 delivers a general skill in category A; release 2 moves it to B and offers a
+    role skill of its name at A. With no marker the general pass relocates and updates it as the control."""
+    general = _general(monkeypatch, tmp_path / "release" / "skills")
+    _write_skill(general, "cat-a/moving", "release 1")
+    home = _home(tmp_path / "root" / "profiles" / PLANNER, marked=False)
+    places = ["cat-a/moving"]
+    assert _step(home, tmp_path / "control-1", checkout, places, {})["copied"] == ["moving"]
+    if marked:
+        _mark(home)
+    shutil.rmtree(general / "cat-a")
+    _write_skill(general, "cat-b/moving", "release 2")
+    _write_skill(checkout / PLANNER, "cat-a/moving", "the role's")
+
+    result = _step(home, tmp_path / "control-2", checkout, places, {"refused": [{"name": "moving", "reason": "name"}]})
+
+    assert (result["relocated"], result["updated"]) == (([], []) if marked else (["moving"], ["moving"]))
+    assert _role_record(home) == {}
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+def test_own_record_20_3_an_adopted_role_copy_changed_by_a_person_and_then_a_general_skill_of_its_name(
+        tmp_path, monkeypatch, checkout, marked):
+    """Sequence 3: an exact role copy is adopted; then a person changes it and the released role text
+    changes; then a general skill takes the same name at another place. No role line is evidence for
+    the general pass."""
+    general = _general(monkeypatch, tmp_path / "release" / "skills")
+    src = _write_skill(checkout / PLANNER, PLAN, "release 1")
+    home = _home(tmp_path / "root" / "profiles" / PLANNER, marked=marked)
+    shutil.copytree(src, home / "skills" / PLAN)
+    line = {NAME: _dir_hash(src)}
+    _step(home, tmp_path / "control-1", checkout, [PLAN], {})  # adopted: in no list
+    assert _role_record(home) == line
+    _edit(home / "skills" / PLAN)
+    copy = _files(home / "skills" / PLAN)
+    _write_skill(checkout / PLANNER, PLAN, "release 2")
+    _step(home, tmp_path / "control-2", checkout, [PLAN],
+          {"user_modified": [NAME], "kept": [{"name": NAME, "reason": "changed"}]})
+    _write_skill(general, f"software-development/{NAME}", "the general one")
+
+    result = _step(home, tmp_path / "control-3", checkout, [PLAN], {"refused": [{"name": NAME, "reason": "name"}]})
+
+    assert result["copied"] == ([] if marked else [NAME])  # the control's: the role line is not read
+    assert _files(home / "skills" / PLAN) == copy and _role_record(home) == line
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+def test_own_record_20_4_a_general_skill_retires_as_a_role_skill_takes_its_name_at_its_old_place(
+        tmp_path, monkeypatch, checkout, marked):
+    """Sequence 4: with no marker the cleanup drops the general line and the role skill finds the old
+    general copy, changed against its text: kept (line d). With the marker the general line stays, and
+    the role skill is refused with ``name``."""
+    general = _general(monkeypatch, tmp_path / "release" / "skills")
+    _write_skill(general, "cat-g/retiring", "the general text")
+    home = _home(tmp_path / "root" / "profiles" / PLANNER, marked=False)
+    places = ["cat-g/retiring"]
+    assert _step(home, tmp_path / "control-1", checkout, places, {})["copied"] == ["retiring"]
+    if marked:
+        _mark(home)
+    old = _files(home / "skills" / "cat-g" / "retiring")
+    shutil.rmtree(general / "cat-g")
+    _write_skill(checkout / PLANNER, "cat-g/retiring", "the role text")
+
+    role = ({"refused": [{"name": "retiring", "reason": "name"}]} if marked
+            else {"kept": [{"name": "retiring", "reason": "changed"}]})
+    result = _step(home, tmp_path / "control-2", checkout, places, role)
+
+    assert result["cleaned"] == ([] if marked else ["retiring"])
+    assert ("retiring" in _manifest(home)) == marked
+    assert _files(home / "skills" / "cat-g" / "retiring") == old and _role_record(home) == {}
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+def test_own_record_20_5_a_role_skill_seeded_where_a_later_general_skill_has_its_backup_place(
+        tmp_path, monkeypatch, checkout, marked):
+    """Sequence 5: a role skill at ``cat-x/tool.bak``; release 2 adds a general skill at ``cat-x/tool``,
+    release 3 changes it. With no marker the general pass moves the "orphan backup" to ``cat-x/tool`` as
+    in the control and keeps it; the role line stays and the role pass writes nothing (line b). With the
+    marker the general skill is not seeded and the role copy stays at its place."""
+    general = _general(monkeypatch, tmp_path / "release" / "skills")
+    src = _write_skill(checkout / PLANNER, "cat-x/tool.bak", "the role's", name="role-tool")
+    home = _home(tmp_path / "root" / "profiles" / PLANNER, marked=marked)
+    places = ["cat-x/tool.bak"]
+    _step(home, tmp_path / "control-1", checkout, places, {"copied": ["role-tool"]})
+    line, copy = _role_record(home), _files(home / "skills" / "cat-x" / "tool.bak")
+    assert line == {"role-tool": _dir_hash(src)}
+
+    for release_no, text in ((2, "v1"), (3, "v2")):
+        _write_skill(general, "cat-x/tool", text, name="tool")
+        result = _step(home, tmp_path / f"control-{release_no}", checkout, places, {})
+
+        assert result["kept"] == ([] if marked else [{"name": "tool", "reason": "changed"}])
+        assert _role_record(home) == line
+        assert _files(home / "skills" / "cat-x" / ("tool.bak" if marked else "tool")) == copy
+        assert os.path.lexists(home / "skills" / "cat-x" / "tool.bak") == marked
+        assert "tool" not in _manifest(home)
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+def test_own_record_20_6_a_role_skill_seeded_beneath_a_folder_that_later_becomes_a_general_skill(
+        tmp_path, monkeypatch, checkout, marked):
+    general = _general(monkeypatch, tmp_path / "release" / "skills")
+    src = _write_skill(checkout / PLANNER, "cat-y/outer/inner-skill", "the role's")
+    home = _home(tmp_path / "root" / "profiles" / PLANNER, marked=marked)
+    places = ["cat-y/outer/inner-skill"]
+    _step(home, tmp_path / "control-1", checkout, places, {"copied": ["inner-skill"]})
+    copy = _files(home / "skills" / "cat-y" / "outer")
+    _write_skill(general, "cat-y/outer", "general", name="outer")
+
+    result = _step(home, tmp_path / "control-2", checkout, places,
+                   {"refused": [{"name": "inner-skill", "reason": "overlap"}]})
+
+    assert result["kept"] == ([] if marked else [{"name": "outer", "reason": "changed"}])  # it keeps the folder
+    assert _files(home / "skills" / "cat-y" / "outer") == copy
+    assert _role_record(home) == {"inner-skill": _dir_hash(src)} and "outer" not in _manifest(home)
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+def test_own_record_20_7_an_external_folder_provides_the_name_of_an_adopted_copy_that_holds_a_description(
+        tmp_path, monkeypatch, checkout, marked):
+    general = _general(monkeypatch, tmp_path / "release" / "skills")
+    _write_skill(general, "autonomous-ai-agents/hermes-agent", "essential")
+    (general / PLAN).mkdir(parents=True)
+    (general / PLAN / "DESCRIPTION.md").write_text("The general description\n", encoding="utf-8")
+    src = _write_skill(checkout / PLANNER, PLAN, "the role's")
+    (src / "DESCRIPTION.md").write_text("The role's description\n", encoding="utf-8")
+    home = _home(tmp_path / "root" / "profiles" / PLANNER, marked=marked)
+    copy = home / "skills" / PLAN
+    shutil.copytree(src, copy)
+    _step(home, tmp_path / "control-1", checkout, [PLAN], {})  # adopted: in no list
+    assert _role_record(home) == {NAME: _dir_hash(src)}
+    outside = tmp_path / "external"
+    _write_skill(outside, f"devops/{NAME}", "external")
+    (home / "config.yaml").write_text(f"skills:\n  external_dirs:\n    - {outside}\n", encoding="utf-8")
+    before = {path: _stat(path) for path in [copy, *sorted(copy.rglob("*"))]}, _files(copy)
+
+    _step(home, tmp_path / "control-2", checkout, [PLAN], {"refused": [{"name": NAME, "reason": "name"}]})
+
+    assert ({path: _stat(path) for path in [copy, *sorted(copy.rglob("*"))]}, _files(copy)) == before
+    assert _files(copy) == _files(src) and _role_record(home) == {NAME: _dir_hash(src)}
+
+
+def test_own_record_14_no_role_skill_of_this_repository_shares_a_name_or_a_place_with_a_general_skill():
+    general = _discover_bundled_skills(REPO / "skills")
+    names = {name for name, _ in general}
+    places = [src.relative_to(REPO / "skills") for _, src in general]
+    assert names and places  # it reads the release's general skills
+    pairs = []
+    for role_dir in sorted(path for path in (REPO / "role-skills").iterdir() if path.is_dir()):
+        for name, src in _discover_bundled_skills(role_dir):
+            place = src.relative_to(role_dir)
+            pairs += [(role_dir.name, name, place.as_posix(), other.as_posix()) for other in places
+                      if place == other or other in place.parents or place in other.parents]
+            pairs += [(role_dir.name, name, place.as_posix(), "name")] if name in names else []
+    assert pairs == []
+    assert {role.name for role in (REPO / "role-skills").iterdir()} >= {PLANNER, BUILDER}
+
+
+@pytest.mark.parametrize("case", ["a role with no role skill", "a role whose role skills are all refused"])
+def test_own_record_6_a_role_whose_role_skills_write_no_line_gets_no_record_file(release, monkeypatch, tmp_path, case):
+    _write_skill(release.roles / PLANNER, PLAN, "planner")
+    _write_skill(release.roles / PLANNER, "other-cat/second", "second")
+    if case == "a role whose role skills are all refused":
+        _write_skill(release.skills, f"software-development/{NAME}", "general")  # name
+        _write_skill(release.skills, "other-cat", "general", name="holder")  # overlap
+        home = _home(release.planner, marked=False)
+    else:
+        home = _home(release.root / "profiles" / OTHER, marked=False)
+    control = _twin(home, tmp_path / "control")
+
+    result = _sync(monkeypatch, home)
+    _use_role_skills(monkeypatch, tmp_path / "no-role-skills")
+    expected = _sync(monkeypatch, control)
+
+    refused = ([{"name": "second", "reason": "overlap"}, {"name": NAME, "reason": "name"}]  # catalogue order
+               if case == "a role whose role skills are all refused" else [])
+    assert result == {**expected, "refused": expected["refused"] + refused}
+    assert not os.path.lexists(home / "skills" / ROLE_RECORD)
+    assert _tree(home) == _tree(control)
+
+
+def test_own_record_6_a_record_write_that_fails_leaves_the_earlier_record_file_and_no_temporary_file(
+        release, monkeypatch):
+    import utils
+    first = _write_skill(release.roles / PLANNER, PLAN, "planner")
+    home = _home(release.planner)
+    assert _sync(monkeypatch, home)["copied"] == [NAME]
+    record = home / "skills" / ROLE_RECORD
+    earlier = record.read_bytes()
+    second = _write_skill(release.roles / PLANNER, "other-cat/second", "second")
+    real = utils.atomic_replace
+
+    def failing(src, dst, *args, **kwargs):
+        if Path(dst).name == ROLE_RECORD:
+            raise OSError("disk full")
+        return real(src, dst, *args, **kwargs)
+    monkeypatch.setattr(utils, "atomic_replace", failing)
+
+    result = _sync(monkeypatch, home)
+
+    assert result["copied"] == ["second"]  # the copy stands; its line was not written
+    assert record.read_bytes() == earlier == f"{NAME}:{_dir_hash(first)}\n".encode("utf-8")
+    assert sorted(path.name for path in (home / "skills").iterdir() if path.is_file()) == [
+        ".bundled_manifest", ROLE_RECORD]
+    monkeypatch.setattr(utils, "atomic_replace", real)
+    assert _lists(_sync(monkeypatch, home)) == NO_LISTS  # the next sync adopts the exact copy
+    assert _role_record(home) == {NAME: _dir_hash(first), "second": _dir_hash(second)}
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+def test_own_record_8_one_release_copies_adopts_and_updates_and_writes_nowhere_else(
+        release, monkeypatch, tmp_path, marked):
+    _write_skill(release.skills, "general-cat/general-skill", "general v1")
+    (release.skills / "general-cat" / "DESCRIPTION.md").write_text("General\n", encoding="utf-8")
+    _write_skill(release.skills, "autonomous-ai-agents/hermes-agent", "essential v1")
+    _write_skill(release.roles / PLANNER, "team-operations/updated-skill", "v1")
+    home = _home(release.planner, marked=marked)
+    assert _sync(monkeypatch, home)["copied"][-1:] == ["updated-skill"]
+    new = _write_skill(release.roles / PLANNER, "team-operations/new-skill", "new")
+    adopted = _write_skill(release.roles / PLANNER, "team-operations/adopted-skill", "adopted")
+    shutil.copytree(adopted, home / "skills" / "team-operations" / "adopted-skill")
+    updated = _write_skill(release.roles / PLANNER, "team-operations/updated-skill", "v2")
+    _write_skill(release.skills, "general-cat/general-skill", "general v2")
+    control = _twin(home, tmp_path / "control")
+    places = [f"team-operations/{name}" for name in ("new-skill", "adopted-skill", "updated-skill")]
+
+    result = _sync(monkeypatch, home)
+    _use_role_skills(monkeypatch, tmp_path / "no-role-skills")
+    expected = _sync(monkeypatch, control)
+
+    assert result == {**expected, "copied": expected["copied"] + ["new-skill"],
+                      "updated": expected["updated"] + ["updated-skill"]}
+    assert _outside(home, places) == _outside(control, places)
+    assert _manifest(home) == _manifest(control)
+    assert not [path for path in (home / "skills").rglob("*.bak")]
+    assert _role_record(home) == {name: _dir_hash(src) for name, src in (
+        ("new-skill", new), ("adopted-skill", adopted), ("updated-skill", updated))}
+    for name, src in (("new-skill", new), ("adopted-skill", adopted), ("updated-skill", updated)):
+        assert _files(home / "skills" / "team-operations" / name) == _files(src)
+
+
+def test_own_record_9_a_file_outside_a_skill_folder_of_the_role_catalogue_is_not_copied(release, monkeypatch):
+    _write_skill(release.roles / PLANNER, PLAN, "planner")
+    (release.roles / PLANNER / "team-operations" / "DESCRIPTION.md").write_text("Team\n", encoding="utf-8")
+    (release.roles / PLANNER / "README.md").write_text("no skill here\n", encoding="utf-8")
+    home = _home(release.planner)
+
+    assert _sync(monkeypatch, home)["copied"] == [NAME]
+    assert sorted(_files(home / "skills")) == [".bundled_manifest", ROLE_RECORD, f"{PLAN}/SKILL.md"]
+
+
+@needs_symlinks
+@pytest.mark.parametrize("record", ["a link", "a fifo", "a folder"])
+def test_own_record_10_link_a_role_record_that_is_no_regular_file_refuses_the_role_and_is_never_opened(
+        release, monkeypatch, tmp_path, record):
+    if record == "a fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("named pipes are POSIX")
+    _write_skill(release.roles / PLANNER, PLAN, "planner")
+    home = _home(release.planner)
+    path = home / "skills" / ROLE_RECORD
+    if record == "a link":
+        (tmp_path / "elsewhere").write_text(f"{NAME}:0\n", encoding="utf-8")
+        path.symlink_to(tmp_path / "elsewhere")
+    elif record == "a fifo":
+        os.mkfifo(path)
+    else:
+        path.mkdir()
+    before = _tree(home)
+
+    result = _in_time(lambda: _sync(monkeypatch, home), path) if record == "a fifo" else _sync(monkeypatch, home)
+
+    assert _lists(result) == {**NO_LISTS, "refused": [{"name": PLANNER, "reason": "link"}]}
+    assert _tree(home) == before  # no copy, and the record file is as it was
+    if record == "a link":
+        assert (tmp_path / "elsewhere").read_text(encoding="utf-8") == f"{NAME}:0\n"
+
+
+@pytest.mark.parametrize("source", ["a general skill", "a line of .bundled_manifest", "an external skills folder"])
+def test_own_record_10_name_each_source_refuses_an_exact_copy_before_a_write(release, monkeypatch, tmp_path, source):
+    src = _write_skill(release.roles / PLANNER, PLAN, "planner")
+    home = _home(release.planner)  # the marker: no cleanup drops a line of .bundled_manifest
+    shutil.copytree(src, home / "skills" / PLAN)
+    if source == "a general skill":
+        _write_skill(release.skills, f"software-development/{NAME}", "general")
+    elif source == "a line of .bundled_manifest":
+        (home / "skills" / ".bundled_manifest").write_text(f"{NAME}:0123\n", encoding="utf-8")
+    else:
+        _write_skill(tmp_path / "external", f"devops/{NAME}", "external")
+        (home / "config.yaml").write_text(f"skills:\n  external_dirs:\n    - {tmp_path / 'external'}\n",
+                                          encoding="utf-8")
+    control = _twin(home, tmp_path / "control")
+
+    result = _sync(monkeypatch, home)
+    _use_role_skills(monkeypatch, tmp_path / "no-role-skills")
+    expected = _sync(monkeypatch, control)
+
+    assert result == {**expected, "refused": expected["refused"] + [{"name": NAME, "reason": "name"}]}
+    assert _tree(home) == _tree(control)
+    assert not os.path.lexists(home / "skills" / ROLE_RECORD)
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+@pytest.mark.parametrize("general_rel", [PLAN, "team-operations", f"{PLAN}/inner"],
+                         ids=["equal places", "the role place inside a general place", "a general place inside"])
+def test_own_record_10_overlap_comes_from_the_places_of_general_skills(
+        release, monkeypatch, tmp_path, general_rel, marked):
+    _write_skill(release.roles / PLANNER, PLAN, "planner")
+    _write_skill(release.skills, general_rel, "general", name="general-name")
+    home = _home(release.planner, marked=marked)
+    control = _twin(home, tmp_path / "control")
+
+    result = _sync(monkeypatch, home)
+    _use_role_skills(monkeypatch, tmp_path / "no-role-skills")
+    expected = _sync(monkeypatch, control)
+
+    assert result == {**expected, "refused": expected["refused"] + [{"name": NAME, "reason": "overlap"}]}
+    assert _tree(home) == _tree(control)
+    assert not os.path.lexists(home / "skills" / ROLE_RECORD)
+
+
+@pytest.mark.parametrize("catalogue", [True, False], ids=["general catalogue", "no general catalogue"])
+def test_own_record_6_an_exact_copy_in_a_marked_planner_home_is_adopted_in_its_own_record_by_the_release(
+        tmp_path, monkeypatch, checkout, catalogue):
+    """Review round 3, blocking finding 2, through the release's own call: the line goes to
+    ``.role_skills_manifest``, and ``.bundled_manifest`` is the control's, with the role catalogue hidden."""
+    if catalogue:
+        _write_skill(_general(monkeypatch, tmp_path / "release" / "skills"), "software-development/spike", "v1")
+    else:
+        monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(tmp_path / "not-there"))
+    src = shutil.copytree(REPO / "role-skills" / PLANNER / PLAN, checkout / PLANNER / PLAN)
+    home = _home(tmp_path / "root" / "profiles" / PLANNER)
+    shutil.copytree(src, home / "skills" / PLAN)
+    md = home / "skills" / PLAN / "SKILL.md"
+    before = hashlib.sha256(md.read_bytes()).hexdigest(), _stat(md)
+
+    _step(home, tmp_path / "control", checkout, [PLAN], {})  # adopted: in no list
+
+    assert (home / "skills" / ROLE_RECORD).read_text(encoding="utf-8") == f"{NAME}:{_dir_hash(src)}\n"
+    assert (home / "skills" / ".bundled_manifest").read_bytes() == b""
+    assert (hashlib.sha256(md.read_bytes()).hexdigest(), _stat(md)) == before
+
+
+def test_own_record_10_nested_a_role_skill_folder_that_holds_a_second_skill_gets_no_write_and_no_line(
+        release, monkeypatch, tmp_path):
+    src = _write_skill(release.roles / PLANNER, PLAN, "planner")
+    _write_skill(src, "inner", "a second skill inside")
+    home = _home(release.planner)
+    control = _twin(home, tmp_path / "control")
+
+    result = _sync(monkeypatch, home)
+    _use_role_skills(monkeypatch, tmp_path / "no-role-skills")
+    expected = _sync(monkeypatch, control)
+
+    assert result == {**expected, "refused": expected["refused"] + [
+        {"name": NAME, "reason": "nested"}, {"name": "inner", "reason": "nested"}]}
+    assert _tree(home) == _tree(control)
+    assert not os.path.lexists(home / "skills" / ROLE_RECORD)

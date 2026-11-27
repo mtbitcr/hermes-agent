@@ -1,52 +1,45 @@
-"""Role skills: one pass of ``sync_skills`` that gives each role the skills of its own folder.
+"""Role skills: a pass after the general pass of ``sync_skills``, with its own record.
 
-A role is a home whose parent folder is named ``profiles``; its name is the home folder's name. Its
-skills are the folders with a ``SKILL.md`` under ``role-skills/<role>/`` of the released checkout,
-beside ``tools/`` (``HERMES_BUNDLED_SKILLS`` moves the general catalogue only), each copied to the
-same inner path under the role's ``skills/``. The pass runs also when the general catalogue is not
-there. Any other home, the root home included, gets none. The marker ``.no-bundled-skills`` stops
-general skills, not these, and their record lines are released names, so the cleanup keeps them.
+A role is a home whose parent folder is named ``profiles``, named as the home folder; any other home gets
+nothing. Its skills are the skill folders under ``role-skills/<role>/`` of the released checkout, beside
+``tools/`` (``HERMES_BUNDLED_SKILLS`` moves the general catalogue only), each at the same inner path under
+the role's ``skills/``. The marker ``.no-bundled-skills`` does not stop them.
 
-The source is walked with no link followed, each entry's type checked before a text is read. Before
-a write, a role whose home, ``skills/`` or record file is a link (or a record file that is no regular
-file) gets nothing and one refusal under its name, and a role skill outside the plain shape is refused
-with a reason: ``link`` (a link on the way from ``role-skills/``, refused under its own name, a link
-inside the skill's folder, a ``SKILL.md`` that is no regular file, refused unread under its folder's
-name, or the role's folder itself as its folder), ``nested`` (its folder holds a second ``SKILL.md``,
-or is inside a folder that does), ``name`` (a skill under ``skills/`` has its name) or ``overlap``
-(its place is a general skill's place or inside one; or its place or backup place and a place the
-general pass writes are one, or one holds the other: the whole catalogue's places when the pass
-would write bytes into the role, else the places the general pass writes in this run). Only symbolic
-links are read: a hard link or a mount is not seen.
-
-A role skill in the plain shape goes as a general skill goes in a role with no marker, with two
-differences: a record line with no folder at the place is a deleted copy (nothing is written, no
-other folder is searched); an exact copy with no record line is adopted (its line is written, and no
-byte of it) when the hub lock is not there, or is a regular file of the hub's valid form that owns no
-install at, above or inside its place. Any other lock keeps the copy with no line. The record line of
-a role skill that a general skill shares the name of is taken out before the general loop, so it is
-no evidence of a renamed or deleted general skill, and put back after it unless a general line took
-its place.
+``sync_skills`` hands its finished result to ``sync_role_skills`` at both of its returns, so the general
+pass is the main branch's and reads nothing of this one. This pass keeps its lines in
+``.role_skills_manifest`` beside ``.bundled_manifest`` (the same ``name:hash`` lines, written atomically,
+made with its first line), reads ``.bundled_manifest`` only to refuse a name, and writes only its role
+skills' folders and its record. Each refusal is decided before the first write: the whole role, under its
+name, with ``link`` (a linked home or ``skills/``, a record file that is no regular file or cannot be
+read); a role skill with ``link``, ``nested``, ``name`` (a general skill of the checkout, a line of
+``.bundled_manifest`` or an external skills folder has its name) or ``overlap`` (its place and a general
+skill's place are one, or one holds the other). Only symbolic links are read: a hard link or a mount is
+not seen. Each other role skill goes by the table of the facts sheet, against its line in the role record.
 """
 
 import json
+import logging
 import os
 import stat
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from agent.skill_utils import ESSENTIAL_SKILLS, is_excluded_skill_path
+from utils import atomic_write_text
 
 if TYPE_CHECKING:
     from tools.skills_sync import _SyncState
 
+logger = logging.getLogger(__name__)
+
 ROLE_SKILLS_DIR = "role-skills"
+ROLE_RECORD = ".role_skills_manifest"  # the role pass's own record, beside .bundled_manifest
 HUB_LOCK_VERSION = 1  # ``HubLockFile.EMPTY["version"]`` (tools/skills_hub.py, which loads the network stack)
 REFUSALS = {  # reason -> why nothing was written for the role skill
-    "link": "a link is on the way from role-skills/ to it or inside it",
+    "link": "a link is on the way to it or inside it",
     "nested": "its folder holds a second SKILL.md",
-    "name": "a skill under skills/ has this name",
-    "overlap": "the general skills write at its place",
+    "name": "a general skill, a line of .bundled_manifest or an external skills folder has this name",
+    "overlap": "its place and a general skill's place are one, or one holds the other",
 }
 
 
@@ -109,54 +102,9 @@ def _role_skills(role: str) -> Tuple[Path, List[Tuple[str, Path, Optional[str]]]
     return role_dir, sorted(found, key=lambda item: item[1])
 
 
-def _plain_home() -> bool:
-    """The home, its ``skills/`` and its record file are no links, and the record file, when it is
-    there, is a regular file: the role pass reads and writes nowhere else (addition point 8)."""
-    ss = _ss()
-    if os.path.islink(ss._hermes_home()) or os.path.islink(ss._skills_dir()):
-        return False
-    try:
-        return stat.S_ISREG(os.lstat(ss._manifest_file()).st_mode)
-    except (FileNotFoundError, NotADirectoryError):
-        return True
-    except OSError:
-        return False
-
-
-def _general_places(bundled_dir: Path, all_bundled: List[Tuple[str, Path]]) -> List[Path]:
-    """Each place the general pass may write, the whole catalogue whatever the marker: each general
-    skill and its backup, each category description, the record file."""
-    ss = _ss()
-    skills = [ss._compute_relative_dest(src, bundled_dir) for _, src in all_bundled]
-    return [*skills, *(place.with_suffix(".bak") for place in skills),
-            *(ss._skills_dir() / md.relative_to(bundled_dir) for md in bundled_dir.rglob("DESCRIPTION.md")),
-            ss._manifest_file()]
-
-
-def _written_in_run(bundled_dir: Path, bundled_skills: List[Tuple[str, Path]], marked: bool) -> List[Path]:
-    """Each place the general pass writes in this run, read before the role pass writes: each skill of
-    its loop and its backup, each category description ``_seed_category_descriptions`` writes (under
-    its own conditions: with the marker only the essential skills' categories, not already there, no
-    link on the way), the record file."""
-    ss = _ss()
-    skills = [ss._compute_relative_dest(src, bundled_dir) for _, src in bundled_skills]
-    only = {place.parent for (name, _), place in zip(bundled_skills, skills) if name in ESSENTIAL_SKILLS}
-    descriptions = [place for place in (ss._skills_dir() / md.relative_to(bundled_dir)
-                                        for md in bundled_dir.rglob("DESCRIPTION.md"))
-                    if (not marked or place.parent in only) and not os.path.lexists(place)
-                    and ss._copy_change(place.parent, None) != "link"]
-    return [*skills, *(place.with_suffix(".bak") for place in skills), *descriptions, ss._manifest_file()]
-
-
 def _holds(one: Path, other: Path) -> bool:
     """The two places are one, or one holds the other."""
     return one == other or one in other.parents or other in one.parents
-
-
-def _overlaps(dest: Path, written: List[Path]) -> bool:
-    """The role skill's place or backup place and a written place are one, or one holds the other."""
-    return any(_holds(mine, other) for mine in (dest, dest.with_suffix(".bak")) for other in written)
-
 
 def _hub_lock_paths() -> Optional[Set[str]]:
     """The ``skills/``-relative places of the hub lock's installs, in the hub's normal form: none when
@@ -185,133 +133,168 @@ def _hub_lock_paths() -> Optional[Set[str]]:
         return None
 
 
-def _install_role_skill(st: "_SyncState", name: str, src: Path, dest: Path, released: str) -> None:
-    """A role skill with no record line. With no folder at its place, ``_install_new_skill`` copies
-    it (a link on the way and a failed copy as for any skill). An exact copy is adopted when the hub
-    lock is not there, or is valid and owns no install at, above or inside its place: the line is
-    written, no byte of the copy. Any other copy is kept and named."""
-    ss = _ss()
-    if not os.path.lexists(dest):
-        ss._install_new_skill(st, name, src, dest, released)
-        return
+def _record_file() -> Path:
+    """The role pass's own record file, beside ``.bundled_manifest`` (own-record point 6)."""
+    return _ss()._skills_dir() / ROLE_RECORD
+
+
+def _read_record(path: Path) -> Dict[str, str]:
+    """``{name: hash}`` of a record file in ``_read_manifest``'s line form (``name:hash``, stripped, blank
+    lines skipped); empty when it is not there. Unlike ``_read_manifest``, a read failure raises."""
     try:
-        st.skipped += 1
-        if ss._copy_change(dest, released) is None:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, NotADirectoryError):
+        return {}
+    pairs = (line.partition(":") for line in map(str.strip, lines) if line)
+    return {name.strip(): hash_val.strip() for name, _, hash_val in pairs}
+
+
+def _write_role_record(entries: Dict[str, str]) -> None:
+    """Atomic write of the role record, as ``_write_manifest_or_raise`` writes the general one; raises on
+    failure."""
+    atomic_write_text(_record_file(), "".join(f"{n}:{h}\n" for n, h in sorted(entries.items())),
+                      tmp_prefix=".role_skills_manifest_", preserve_mode=True)
+
+
+def _read_home() -> Optional[Tuple[Dict[str, str], Dict[str, str]]]:
+    """The general record and the role record, each read once; None when the home or its ``skills/`` is a
+    link, or a record file is there and is no regular file (it is not opened then) or cannot be read."""
+    ss = _ss()
+    if os.path.islink(ss._hermes_home()) or os.path.islink(ss._skills_dir()):
+        return None
+    records = []
+    for path in (ss._manifest_file(), _record_file()):
+        try:
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                return None
+            records.append(_read_record(path))
+        except (FileNotFoundError, NotADirectoryError):
+            records.append({})
+        except (OSError, ValueError):
+            return None
+    return records[0], records[1]
+
+
+def _update_role_skill(st: "_SyncState", name: str, src: Path, place: Path, released: str) -> None:
+    """Table line e: ``_update_existing_skill`` with the role record as the record, and one guard: with
+    an entry at the backup place the copy is kept, so the pass removes no path but the copy it replaces."""
+    ss = _ss()
+    origin = st.manifest.get(name, "")
+    reason = ss._copy_change(place, origin)
+    if origin and released == origin:  # the release is unchanged: nothing to deliver
+        if reason is not None:
+            st.kept.append({"name": name, "reason": reason})
+        return
+    if reason is not None:
+        st.user_modified.append(name)
+        st.kept.append({"name": name, "reason": reason})
+        st.say(f"  ~ {name} (kept as yours: {reason})")
+        return
+    if os.path.lexists(place.with_suffix(".bak")):  # never remove an entry the pass did not write
+        st.kept.append({"name": name, "reason": "backup present"})
+        st.say(f"  ~ {name} (kept as it is: backup present)")
+        return
+    failed = "copy write failed"
+
+    def record() -> None:
+        nonlocal failed
+        failed = "record write failed"
+        _write_role_record({**st.manifest, name: released})
+    try:
+        ss._replace_skill_dir(src, place, record)
+    except Exception as e:
+        st.refused.append({"name": name, "reason": failed})
+        st.say(f"  ! Failed to update {name} ({failed}; old copy kept): {e}")
+        return
+    st.manifest[name] = released
+    st.updated.append(name)
+    st.say(f"  ↑ {name} (updated)")
+
+
+def sync_role_skills(result: dict, quiet: bool = False) -> dict:
+    """The role pass, after the general pass ended with ``result``: ``result`` with the role skills'
+    entries after the general ones in ``copied``, ``updated``, ``kept``, ``refused``, ``suppressed`` and
+    ``user_modified``; no other key and no count changes, and an adopted copy is in no list."""
+    ss = _ss()
+    role = _role_name(ss._hermes_home())
+    if role is None:
+        return result
+    role_dir, entries = _role_skills(role)
+    if not entries:
+        return result
+    records = _read_home()
+    if records is None:
+        if not quiet:
+            print(f"  ! {role}: no role skill was delivered: this home, its skills/ folder or a record file "
+                  f"is a link, no regular file or cannot be read")
+        return {**result, "refused": [*result["refused"], {"name": role, "reason": "link"}]}
+    general_lines, role_lines = records
+    bundled_dir = ss._get_bundled_dir()
+    catalogue = ss._discover_bundled_skills(bundled_dir)  # empty when it is not there
+    general_names = {name for name, _ in catalogue}
+    general_places = [ss._compute_relative_dest(src, bundled_dir) for _, src in catalogue]
+    external_index = ss._build_external_skill_index()
+    suppressed = ss._read_suppressed_names()
+    st = ss._SyncState(manifest=dict(role_lines), quiet=quiet)
+
+    plain = []  # every refusal is decided before the first write (own-record point 10)
+    for name, src, refusal in entries:
+        place = None if refusal else ss._skills_dir() / src.relative_to(role_dir)
+        if refusal:
+            pass
+        elif name in general_names or name in general_lines or name in external_index:
+            refusal = "name"
+        elif any(_holds(place, other) for other in general_places):
+            refusal = "overlap"
+        elif not os.path.lexists(place) and ss._copy_change(place, None) == "link":
+            refusal = "link"
+        if refusal:
+            st.refused.append({"name": name, "reason": refusal})
+            st.say(f"  ! {name} (role skill) was not delivered: {REFUSALS[refusal]}")
+        else:
+            plain.append((name, src, place))
+
+    recorded = False  # a line of table line a or c, written once below
+    for name, src, place in plain:
+        if name in suppressed and name not in ESSENTIAL_SKILLS:
+            st.suppressed.append(name)
+            continue
+        released = ss._dir_hash(src)
+        if not os.path.lexists(place):
+            if name in st.manifest:  # b: a person deleted the copy, and it stays deleted
+                continue
+            try:  # a
+                ss._copy_dir(src, place)
+            except OSError as e:
+                st.say(f"  ! Failed to copy {name}: {e}")  # no line: the next sync retries
+                continue
+            st.copied.append(name)
+            st.manifest[name] = released
+            recorded = True
+            st.say(f"  + {name}")
+        elif name in st.manifest:  # e
+            _update_role_skill(st, name, src, place, released)
+        elif ss._copy_change(place, released) is None:  # c: an exact copy
             owned = _hub_lock_paths()
             if owned is None:
                 st.kept.append({"name": name, "reason": "hub_lock"})
                 st.say(f"  ⚠ {name}: this role's skill is already in place, but the hub lock cannot be "
                        f"read — the copy was kept and not recorded.")
-                return
-            rel = ss._rel_skills_posix(dest)
-            if not any(_holds(Path(rel), Path(path)) for path in owned):
+            elif any(_holds(Path(ss._rel_skills_posix(place)), Path(path)) for path in owned):
+                st.kept.append({"name": name, "reason": ss._copy_change(place, None)})
+                st.say(f"  ⚠ {name}: this role's skill is already in place, but a hub install owns it "
+                       f"— the copy was kept and not recorded.")
+            else:  # adopted: its line, and no byte of the copy
                 st.manifest[name] = released
-                return
-        st.kept.append({"name": name, "reason": ss._copy_change(dest, None)})
-        st.say(f"  ⚠ {name}: this role's skill shipped but you already have a local skill by this "
-               f"name — yours was kept.")
-    except OSError as e:  # as _install_new_skill: no line, the next sync retries
-        st.say(f"  ! {name} (role skill) was not checked: {e}")
-
-
-def take_role_records(st: "_SyncState", bundled_dir: Path, all_bundled: List[Tuple[str, Path]]) -> Dict[str, str]:
-    """Before the general loop: the record lines of this role's skills whose name a general skill of
-    the run has (the role pass refuses them with ``name``) and that are role lines, taken out of
-    ``st.manifest`` so the loop reads none as a renamed or deleted general skill; ``sync_role_skills``
-    puts them back. A line is a role line when it is the role skill's released hash and not the general
-    skill's, or when the role skill's place, apart from the general skill's place, holds an exact copy
-    for it and the general skill's place does not. Any other line is a general record and stays. Only
-    role skills of the plain shape are hashed, in a home that passes ``_plain_home``."""
-    ss = _ss()
-    role = _role_name(ss._hermes_home())
-    if role is None or not _plain_home():
-        return {}
-    role_dir, role_skills = _role_skills(role)
-    taken: Dict[str, str] = {}
-    for name, src, refusal in role_skills:
-        line = st.manifest.get(name, "")
-        generals = [(ss._compute_relative_dest(other, bundled_dir), other)
-                    for each, other in all_bundled if each == name]
-        if refusal is not None or not line or not generals or name in taken:
-            continue
-        place = ss._compute_relative_dest(src, role_dir)
-        if ((line == ss._dir_hash(src) and all(ss._dir_hash(other) != line for _, other in generals))
-                or (ss._copy_change(place, line) is None and all(
-                    not _holds(place, dest) and ss._copy_change(dest, line) is not None for dest, _ in generals))):
-            taken[name] = st.manifest.pop(name)
-    return taken
-
-
-def sync_role_skills(st: "_SyncState", bundled_dir: Path, all_bundled: List[Tuple[str, Path]],
-                     suppressed: Set[str], external_index: Set[str], taken: Optional[Dict[str, str]] = None,
-                     bundled_skills: Optional[List[Tuple[str, Path]]] = None, marked: bool = False) -> Set[str]:
-    """Seed the role skills of the active home into ``st`` (``sync_skills`` stores the manifest).
-    ``taken``: the lines ``take_role_records`` took, put back first unless a general line of this run
-    took their place; ``bundled_skills`` and ``marked``: the general loop's skills and the marker.
-    Returns the role skills' names, refused ones too, which the cleanup keeps; an empty set for a home
-    that is no role."""
-    for name, line in (taken or {}).items():
-        st.manifest.setdefault(name, line)
-    ss = _ss()
-    role = _role_name(ss._hermes_home())
-    if role is None:
-        return set()
-    role_dir, role_skills = _role_skills(role)
-    names = {name for name, _, _ in role_skills}
-    if not role_skills:
-        return names
-    if not _plain_home():  # maybe another role's
-        st.refused.append({"name": role, "reason": "link"})
-        st.say(f"  ! {role}: no role skill was delivered: this home, its skills/ folder or its record file "
-               f"is a link or no regular file")
-        return names
-    general = {name for name, _ in all_bundled}
-    whole = _general_places(bundled_dir, all_bundled)
-    in_run = _written_in_run(bundled_dir, all_bundled if bundled_skills is None else bundled_skills, marked)
-    general_skills = [ss._compute_relative_dest(src, bundled_dir) for _, src in all_bundled]
-    for name, src, reason in role_skills:
-        if reason is None and name in general:
-            reason = "name"
-        if reason is None:  # the table line, then the places that line must keep clear
-            dest = ss._compute_relative_dest(src, role_dir)
-            released = ss._dir_hash(src)
-            line = st.manifest.get(name)
-            writes = (line is None and not os.path.lexists(dest)) or (
-                bool(line) and line != released and os.path.lexists(dest) and ss._copy_change(dest, line) is None)
-            if (any(dest == place or place in dest.parents for place in general_skills)
-                    or _overlaps(dest, whole if writes else in_run)):
-                reason = "overlap"
-        if reason is not None:  # before any write: no file, no line
-            st.refused.append({"name": name, "reason": reason})
-            st.say(f"  ! {name} (role skill) was not delivered: {REFUSALS[reason]}")
-            continue
-        if name in suppressed and name not in ESSENTIAL_SKILLS:
-            st.suppressed.append(name)
-            continue
-        if name in external_index:
-            ss._defer_to_external(st, name, dest, released)
-        elif name not in st.manifest:
-            _install_role_skill(st, name, src, dest, released)
-        elif os.path.lexists(dest):
-            ss._update_existing_skill(st, name, src, dest, released)
-        else:
-            st.skipped += 1  # a line and no copy: a person deleted it, and it stays deleted
-    return names
-
-
-def sync_role_skills_alone(quiet: bool, reset: Set[str], result: dict) -> dict:
-    """``sync_skills`` when the general catalogue is not there: ``result``, today's result for that
-    case, with the role pass. A home with no role skills gets ``result`` as it is, and no write; a home
-    that fails ``_plain_home`` gets one refusal, and its record file is not read."""
-    ss = _ss()
-    role = _role_name(ss._hermes_home())
-    if role is None or not _role_skills(role)[1]:
-        return result
-    st = ss._SyncState(manifest=ss._read_manifest() if _plain_home() else {}, quiet=quiet, reset=reset)
-    recorded = dict(st.manifest)
-    sync_role_skills(st, ss._get_bundled_dir(), [], ss._read_suppressed_names(), ss._build_external_skill_index())
-    if st.manifest != recorded:
-        ss._store_manifest(st.manifest)
-    return {**result, "copied": st.copied, "updated": st.updated, "skipped": st.skipped,
-            "user_modified": st.user_modified, "suppressed": st.suppressed, "kept": st.kept,
-            "refused": st.refused}
+                recorded = True
+        else:  # d
+            st.kept.append({"name": name, "reason": ss._copy_change(place, None)})
+            st.say(f"  ⚠ {name}: this role's skill shipped but you already have a local skill by this "
+                   f"name — yours was kept.")
+    if recorded:
+        try:
+            _write_role_record(st.manifest)
+        except Exception as e:  # as _store_manifest: logged, not raised
+            logger.debug("Failed to write the role skills record %s: %s", _record_file(), e, exc_info=True)
+    return {**result, **{key: [*result[key], *getattr(st, key)]
+                         for key in ("copied", "updated", "kept", "refused", "suppressed", "user_modified")}}
