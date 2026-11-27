@@ -28,6 +28,7 @@ from tools.skill_usage import _read_skill_name, read_suppressed_names
 from tools.skills_sync_optional import (
     _ignore_runtime_cache, _is_runtime_cache, _read_hub_install_paths,
 )
+from tools.skills_sync_roles import sync_role_skills
 from utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -573,9 +574,11 @@ def sync_skills(quiet: bool = False) -> dict:
             _update_existing_skill(st, skill_name, skill_src, dest, bundled_hash)
         else:
             st.skipped += 1  # in manifest but not on disk — user deleted it
+    # The role's own skills (role-skills/<role>/, marker or not); their lines are released names.
+    role_skills = sync_role_skills(st, bundled_dir, all_bundled, suppressed, external_index)
     # Clean manifest entries for skills removed upstream. Skipped when opted out: a marked role
     # changes no line but the one an update writes.
-    cleaned = [] if marked else sorted(set(st.manifest) - {name for name, _ in bundled_skills})
+    cleaned = [] if marked else sorted(set(st.manifest) - {name for name, _ in bundled_skills} - role_skills)
     for name in cleaned:
         del st.manifest[name]
     _seed_category_descriptions(bundled_dir, {
