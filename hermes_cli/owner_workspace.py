@@ -3004,12 +3004,20 @@ def owner_task_pin_select(conn: sqlite3.Connection, alias: str) -> str:
     ``model_policy_lock`` but is missing any column the lock's digest binds
     cannot prove a pin either, so the lock column is still projected and the
     pin reads back as invalid/unknown rather than as unlocked.
+
+    The card's switch record (:func:`owner_retry_route.keep_switch`) is
+    projected too, as ``owner_switch_`` columns, when the board has the store;
+    the check never creates it.
     """
+    store = owner_retry_route._RUN_PINS
     try:
         present = {
             str(row[1])
             for row in conn.execute("PRAGMA table_info(tasks)")
         }
+        switches = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (store,),
+        ).fetchone() is not None
     except sqlite3.Error as exc:
         raise OwnerWorkspaceError(
             "snapshot_unavailable",
@@ -3021,7 +3029,14 @@ def owner_task_pin_select(conn: sqlite3.Connection, alias: str) -> str:
     selected = [
         column for column in _OWNER_TASK_PIN_COLUMNS if column in present
     ]
-    return "".join(f", {alias}.{column}" for column in selected)
+    tail = "".join(f", {alias}.{column}" for column in selected)
+    if not switches:
+        return tail
+    return tail + "".join(
+        f", (SELECT {store}.{column} FROM {store} WHERE {store}.task_id = {alias}.id)"
+        f" AS owner_switch_{column}"
+        for column in ("held_run_id", *_OWNER_TASK_PIN_COLUMNS)
+    )
 
 
 @dataclass(frozen=True)
@@ -3041,7 +3056,39 @@ class OwnerTaskRoutePin:
     reasoning_effort: str = ""
 
 
-def owner_task_route_pin(row: Any) -> Optional[OwnerTaskRoutePin]:
+@dataclass(frozen=True)
+class OwnerRouteSwitch:
+    """A switched card's one switch record beside its present pin.
+
+    :func:`_owner_project_run_receipt` checks a run of the card before
+    ``held_run_id`` against no pin, the held run against ``previous`` (the pin
+    before the switch) and a later run against ``present``.
+    """
+
+    held_run_id: int
+    previous: Optional[OwnerTaskRoutePin]
+    present: Optional[OwnerTaskRoutePin]
+
+
+def owner_task_route_pin(row: Any) -> OwnerTaskRoutePin | OwnerRouteSwitch | None:
+    """Return the task's pin, or its :class:`OwnerRouteSwitch` when ``row`` carries a switch record.
+
+    Both pins are read by :func:`_owner_route_pin`, the same check.
+    """
+    present = _owner_route_pin(row)
+    try:
+        held_run_id = row["owner_switch_held_run_id"]
+    except (IndexError, KeyError, TypeError):
+        return present
+    if held_run_id is None:
+        return present
+    previous = _owner_route_pin({
+        column: row[f"owner_switch_{column}"] for column in _OWNER_TASK_PIN_COLUMNS
+    })
+    return OwnerRouteSwitch(int(held_run_id), previous, present)
+
+
+def _owner_route_pin(row: Any) -> Optional[OwnerTaskRoutePin]:
     """Return one task's persisted route authority, or None when unlocked.
 
     ``None`` only for a row that cannot carry a lock at all (a pre-lock schema,
@@ -3251,7 +3298,7 @@ def _owner_rate_limited_summary(run: kanban_db.Run) -> str:
 
 def _owner_project_run_receipt(
     run: kanban_db.Run,
-    task_pin: Optional[OwnerTaskRoutePin],
+    task_pin: OwnerTaskRoutePin | OwnerRouteSwitch | None,
     *,
     owner_retry_reason: Any = None,
     owner_waiting: bool = False,
@@ -3279,7 +3326,19 @@ def _owner_project_run_receipt(
     ``OWNER_WAITING_CAPABILITY``: a review that asked for changes then reads
     as rework rather than stopped work, and a blocked run carries the
     owner-safe ``stop_reason`` its own summary recorded.
+
+    A ``task_pin`` that is an :class:`OwnerRouteSwitch` gives this run its pin
+    by the owner's table of 2026-11-27, for every reader: a run before the held
+    run has no provable route, the held run is checked against the switch
+    record's pin and a later run against the card's present pin.
     """
+    if isinstance(task_pin, OwnerRouteSwitch):
+        if run.id < task_pin.held_run_id:
+            task_pin = OwnerTaskRoutePin(valid=False)
+        elif run.id == task_pin.held_run_id:
+            task_pin = task_pin.previous
+        else:
+            task_pin = task_pin.present
     outcome = (run.outcome or run.status or "").strip().lower()
     if run.status == "running":
         owner_outcome, summary = "running", "Work is still in progress."
@@ -3339,7 +3398,7 @@ def _owner_project_run_projection(
     run: kanban_db.Run,
     task_title: Any,
     *,
-    task_pin: Optional[OwnerTaskRoutePin],
+    task_pin: OwnerTaskRoutePin | OwnerRouteSwitch | None,
     has_newer_run: bool,
     retry_origin: str = kanban_db.RETRY_ORIGIN_UNATTRIBUTED,
     run_context: bool,
@@ -3395,9 +3454,8 @@ def _owner_project_run_projection(
 
 def _owner_run_retry_reasons(
     conn: sqlite3.Connection, run_ids: list,
-    *, previous_pins: dict[int, OwnerTaskRoutePin] | None = None,
 ) -> dict[int, str]:
-    """Read the latest owner reason. Include prior pins when the caller needs them.
+    """Map each of ``run_ids`` that an owner retried to the reason they gave.
 
     The binding is the ``owner_retry`` event's own ``run_id``, which
     :func:`kanban_db.unblock_task` copies from the very event that recorded
@@ -3413,8 +3471,6 @@ def _owner_run_retry_reasons(
     reasons: dict[int, str] = {}
     if not run_ids:
         return reasons
-    if previous_pins is not None:
-        previous_pins.update(_owner_run_previous_pins(conn, run_ids))
     slots = ",".join("?" for _ in run_ids)
     for row in conn.execute(
         "SELECT e.run_id AS run_id, e.payload AS payload FROM task_events e "
@@ -3426,32 +3482,10 @@ def _owner_run_retry_reasons(
             payload = json.loads(row["payload"]) if row["payload"] else None
         except (json.JSONDecodeError, TypeError):
             payload = None
-        if not isinstance(payload, dict):
-            continue
-        run_id = int(row["run_id"])
-        reason = payload.get("reason")
+        reason = payload.get("reason") if isinstance(payload, dict) else None
         if isinstance(reason, str) and reason.strip():
-            reasons[run_id] = reason
+            reasons[int(row["run_id"])] = reason
     return reasons
-
-
-def _owner_run_previous_pins(
-    conn: sqlite3.Connection, run_ids: list,
-) -> dict[int, OwnerTaskRoutePin]:
-    """Map each run that started before its card's route switch to the pin it can prove.
-
-    The switch keeps that pin for each such run while the card's history is
-    still complete (:func:`owner_retry_route.keep_run_pins`), in a table that
-    event cleanup never prunes, so cleanup changes no answer. A kept pin is
-    checked as a card's own; an unproven or missing one reads as unknown, never
-    as a later pin. A run after its card's latest switch is absent and keeps
-    its card's current pin.
-    """
-    return {
-        run_id: (owner_task_route_pin(row) if row is not None else None)
-        or OwnerTaskRoutePin(valid=False)
-        for run_id, row in owner_retry_route.kept_run_pins(conn, run_ids).items()
-    }
 
 
 def _select_owner_project_task_rows(
@@ -3985,10 +4019,8 @@ def read_project_snapshot(
         # reason is looked up by that exact run id — never by task-and-time
         # proximity, which would hand one attempt's reason to another. A run
         # nobody retried resolves to nothing and says nothing.
-        previous_pins: dict[int, OwnerTaskRoutePin] = {}
         retry_reasons = _owner_run_retry_reasons(
             conn, [row["id"] for row in run_rows[:_OWNER_PROJECT_MAX_RUNS]],
-            previous_pins=previous_pins,
         )
         # The list is globally newest-first, so the first row carrying a given
         # exact task id is that task's newest run and every later row for the
@@ -4044,7 +4076,7 @@ def read_project_snapshot(
                 _owner_project_run_projection(
                     run,
                     row["task_title"],
-                    task_pin=previous_pins.get(run.id) or owner_task_route_pin(row),
+                    task_pin=owner_task_route_pin(row),
                     has_newer_run=run_task_id in task_ids_with_newer_run,
                     retry_origin=retry_origins.get(
                         run.id, kanban_db.RETRY_ORIGIN_UNATTRIBUTED
@@ -7820,7 +7852,15 @@ def _retry_provider_wait(
                 return "This retry choice is no longer available. Reload this Project and check the work."
             if not owner_retry_route.openai_ready(offer.previous["assignee"]):
                 return "This role needs a valid sign-in for the selected provider. This work is still waiting."
-            owner_retry_route.keep_run_pins(conn, task_id, offer, int(held["id"]))
+            # The switch record is written with the route, or nothing is retried.
+            conn.execute("SAVEPOINT owner_switch_record")
+            try:
+                owner_retry_route.keep_switch(conn, task_id, offer, int(held["id"]))
+            except sqlite3.Error:
+                conn.execute("ROLLBACK TO SAVEPOINT owner_switch_record")
+                conn.execute("RELEASE SAVEPOINT owner_switch_record")
+                return "This retry choice could not be saved, so nothing was retried. This work is still waiting."
+            conn.execute("RELEASE SAVEPOINT owner_switch_record")
             owner_retry_route.repin(conn, task_id, offer, int(held["id"]))
             owner_retry = {**owner_retry, "previous_route": offer.previous}
         kanban_db._append_event(

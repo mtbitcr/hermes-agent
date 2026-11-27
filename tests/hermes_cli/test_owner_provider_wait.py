@@ -455,9 +455,10 @@ def test_after_an_alternate_route_retry_each_earlier_stop_keeps_the_receipt_its_
         [event] = _events(conn, task_id, "owner_retry")
         assert event.run_id == second.id
     known = ("known", "estimated")
-    # Newest first: the stop the owner retried, then the attempt before it.
+    # Newest first: the stop the owner retried, then the attempt before it,
+    # which reads unknown after the switch (rule of 2026-11-27, point 4a).
     assert before == [known, known]
-    assert after == [known, ("unknown", "unknown") if repinned_between else known]
+    assert after == [known, ("unknown", "unknown")]
 
 
 @pytest.mark.parametrize("pruned", ["first_run_events", "retry_event"])
@@ -599,6 +600,334 @@ def test_event_cleanup_after_an_alternate_route_retry_changes_no_earlier_stop_re
     assert before == [("known", "estimated"), unknown]
     assert after == before
     assert cleaned == before
+
+
+# The owner's rule of 2026-11-27: an approved switch writes one switch record
+# for its card, and each run of that card reads by the table of point 4, the
+# same in the project snapshot and in the run detail.
+_ROLE = "raphael-claude-worker"
+_ANTHROPIC_SESSION = "placeholder-session-0101"
+_OPENAI_SESSION = "placeholder-session-0102"
+_KNOWN, _UNKNOWN = ("known", "estimated"), ("unknown", "unknown")
+_SWITCH_REFUSAL = (
+    "This retry choice could not be saved, so nothing was retried. This work is still waiting."
+)
+
+
+def _deep_route(provider: str) -> dict:
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    assignment = model_policy.task_assignment_for(_ROLE, provider, "deep")
+    return {
+        "provider_override": provider, "model_override": assignment.model,
+        "reasoning_effort": assignment.reasoning_effort, "execution_tier": "deep",
+        "model_policy_lock": model_policy.mint_policy_lock(
+            _ROLE, provider, assignment.model, assignment.reasoning_effort, "deep",
+        ),
+    }
+
+
+def _deep_project(root: Path, owner: ow.OwnerContext, name: str, monkeypatch) -> dict:
+    """A Project the owner reads; each made-up session's receipt names one deep worker route."""
+    import sqlite3
+
+    profile_home = Path(os.environ["HERMES_HOME"])
+    with monkeypatch.context() as shared_root:
+        shared_root.setenv("HERMES_HOME", str(root))
+        project = _project(owner, name)
+        with contextlib.closing(sqlite3.connect(root / "projects.db")) as source:
+            with contextlib.closing(sqlite3.connect(profile_home / "projects.db")) as target:
+                source.backup(target)
+    (root / "profiles" / _ROLE).mkdir(exist_ok=True)
+    routes = {_ANTHROPIC_SESSION: _deep_route("anthropic"), _OPENAI_SESSION: _deep_route("openai-codex")}
+
+    def receipt(session_id: str, _profile: str):
+        route = routes.get(session_id)
+        return None if route is None else {
+            "schema_version": 3, "engine": "hermes", "profile": _ROLE,
+            "provider": route["provider_override"], "model": route["model_override"],
+            "reasoning_effort": route["reasoning_effort"], "route_evidence": "session-row",
+            "cost": {"state": "estimated", "currency": "USD", "scope": "dominant-main-route", "amount": 0.25},
+        }
+
+    monkeypatch.setattr(kb, "_trusted_runtime_receipt", receipt)
+    return project
+
+
+def _deep_card(conn, project: dict, title: str) -> str:
+    return kb.create_task(
+        conn, title=title, assignee=_ROLE, project_id=project["project_id"],
+        requires_review=True, **_deep_route("anthropic"),
+    )
+
+
+def _deep_stop(conn, board: str, task_id: str, pid: int, session_id: str, clock, monkeypatch, *, provider: str = "anthropic"):
+    """The dispatcher spawns the card; its worker links ``session_id`` and records its stop at ``provider``."""
+    _result, spawned = _tick(conn, board, {task_id: pid})
+    assert spawned == [task_id]
+    run_id = kb.get_task(conn, task_id).current_run_id
+    assert kb.heartbeat_worker(conn, task_id, expected_run_id=run_id, session_id=session_id)
+    with monkeypatch.context() as worker:
+        worker.setenv("HERMES_KANBAN_TASK", task_id)
+        worker.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+        assert kb.record_run_rate_limit_reset(
+            conn, task_id, run_id=run_id, reset_at=clock["t"] + COOLDOWN, provider=provider,
+        )
+    kb._record_worker_exit(pid, kb.KANBAN_RATE_LIMIT_EXIT_CODE << 8)
+    kb.detect_crashed_workers(conn)
+    run = kb.get_run(conn, run_id)
+    assert run.outcome == "rate_limited"
+    assert kanban_provider_stops._recorded_for(run.metadata) == (True, provider)
+    return run
+
+
+def _switch(owner: ow.OwnerContext, project: dict, task_id: str, env: dict, monkeypatch, key: str) -> dict:
+    """The owner retries the held card on the route its snapshot offers, with that offer's token."""
+    with _as_worker(monkeypatch, {**env, "HERMES_OPENAI_RETRY_TASK_ID": task_id}):
+        snapshot = ow.read_project_snapshot(owner, project["slug"], provider_wait=True)
+        choice = next(
+            task["retry_route"]
+            for column in snapshot["columns"] for task in column["tasks"] if task["id"] == task_id
+        )
+        return _retry(owner, project, task_id, key, route_token=choice["token"])
+
+
+def _both_readers(owner: ow.OwnerContext, project: dict, board: str, env: dict, monkeypatch) -> dict:
+    """Each run's receipt by run id, read by the project snapshot and equal in the run detail."""
+    from plugins.kanban.dashboard import plugin_api
+
+    with _as_worker(monkeypatch, env):
+        snapshot = ow.read_project_snapshot(owner, project["slug"])
+    with _board(board) as conn:
+        run_ids = [row[0] for row in conn.execute(
+            "SELECT r.id FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+            "WHERE t.project_id = ? AND t.task_kind = 'work' ORDER BY r.started_at DESC, r.id DESC",
+            (project["project_id"],),
+        )]
+    monkeypatch.setattr(plugin_api, "WORKSPACE_BOARD", board)
+    receipts = {}
+    for run_id, run in zip(run_ids, snapshot["runs"], strict=True):
+        detail = plugin_api._workspace_run_response(run_id)["run"]["receipt"]
+        # On main the run detail never carries the owner's retry reason.
+        assert {key: value for key, value in run["receipt"].items() if key != "owner_retry"} == detail
+        receipts[run_id] = detail
+    return receipts
+
+
+def _states(receipts: dict, *run_ids: int) -> list:
+    return [(receipts[run_id]["runtime"]["state"], receipts[run_id]["cost"]["state"]) for run_id in run_ids]
+
+
+def _switch_scene(root: Path, owner: ow.OwnerContext, clock, monkeypatch) -> SimpleNamespace:
+    """Three deep worker cards on one board, read through both readers at each step.
+
+    Card ``m`` stops three times on its own Anthropic route and the owner
+    switches it on the third; it then stops on its present OpenAI route and on
+    the old one. Card ``x`` stops once on a receipt naming the OpenAI route
+    before it has it, and the owner switches it. Card ``n`` is never switched.
+    """
+    from hermes_cli import owner_retry_route
+
+    project = _deep_project(root, owner, "Switch Records", monkeypatch)
+    board = project["board"]
+    monkeypatch.setattr(owner_retry_route, "openai_ready", lambda _role: True)
+    scene = SimpleNamespace(project=project, board=board, env=_steward_env(root, board))
+    with _board(board) as conn:
+        scene.m = _deep_card(conn, project, "Draft the placeholder brief")
+        first = _deep_stop(conn, board, scene.m, 4301, _ANTHROPIC_SESSION, clock, monkeypatch)
+        clock["t"] = _resume_at(first) + 1
+        second = _deep_stop(conn, board, scene.m, 4302, _ANTHROPIC_SESSION, clock, monkeypatch)
+        clock["t"] = _resume_at(second) + 1
+        held = _deep_stop(conn, board, scene.m, 4303, _ANTHROPIC_SESSION, clock, monkeypatch)
+    scene.earlier, scene.held = [first.id, second.id], held.id
+    clock["t"] = held.ended_at + 60
+    scene.before = _both_readers(owner, project, board, scene.env, monkeypatch)
+    assert _switch(owner, project, scene.m, scene.env, monkeypatch, "switch-m")["ok"] is True
+    scene.switched = _both_readers(owner, project, board, scene.env, monkeypatch)
+    with _board(board) as conn:
+        present = _deep_stop(
+            conn, board, scene.m, 4304, _OPENAI_SESSION, clock, monkeypatch, provider="openai-codex",
+        )
+        clock["t"] = _resume_at(present) + 1
+        stale = _deep_stop(
+            conn, board, scene.m, 4305, _ANTHROPIC_SESSION, clock, monkeypatch, provider="openai-codex",
+        )
+        scene.later = [present.id, stale.id]
+        scene.x = _deep_card(conn, project, "Check the placeholder figures")
+        scene.x_held = _deep_stop(conn, board, scene.x, 4306, _OPENAI_SESSION, clock, monkeypatch).id
+        scene.n = _deep_card(conn, project, "Sort the placeholder notes")
+        scene.n_run = _deep_stop(conn, board, scene.n, 4307, _ANTHROPIC_SESSION, clock, monkeypatch).id
+    clock["t"] += 60
+    scene.x_before = _both_readers(owner, project, board, scene.env, monkeypatch)
+    assert _switch(owner, project, scene.x, scene.env, monkeypatch, "switch-x")["ok"] is True
+    scene.final = _both_readers(owner, project, board, scene.env, monkeypatch)
+    return scene
+
+
+def test_after_a_switch_two_runs_before_the_held_run_read_unknown_in_both_readers(root, owner, clock, monkeypatch):
+    scene = _switch_scene(root, owner, clock, monkeypatch)
+    assert _states(scene.before, *scene.earlier) == [_KNOWN, _KNOWN]
+    assert _states(scene.switched, *scene.earlier) == [_UNKNOWN, _UNKNOWN]
+    assert _states(scene.final, *scene.earlier) == [_UNKNOWN, _UNKNOWN]
+
+
+def test_after_a_switch_a_held_run_matching_the_record_reads_as_main_reads_a_matching_run(
+    root, owner, clock, monkeypatch,
+):
+    scene = _switch_scene(root, owner, clock, monkeypatch)
+    assert _states(scene.before, scene.held) == [_KNOWN]
+    assert scene.switched[scene.held] == scene.before[scene.held]
+    assert scene.final[scene.held] == scene.before[scene.held]
+
+
+def test_after_a_switch_a_held_run_not_matching_the_record_reads_unknown_in_both_readers(
+    root, owner, clock, monkeypatch,
+):
+    scene = _switch_scene(root, owner, clock, monkeypatch)
+    # Its receipt names the OpenAI route, never the Anthropic pin the record keeps.
+    assert _states(scene.x_before, scene.x_held) == [_UNKNOWN]
+    assert _states(scene.final, scene.x_held) == [_UNKNOWN]
+
+
+def test_after_a_switch_a_later_run_is_checked_against_the_present_pin_in_both_readers(
+    root, owner, clock, monkeypatch,
+):
+    scene = _switch_scene(root, owner, clock, monkeypatch)
+    # The first names the card's present OpenAI route, the second its old one.
+    assert _states(scene.final, *scene.later) == [_KNOWN, _UNKNOWN]
+    assert _states(scene.final, scene.held) == [_KNOWN]
+
+
+@pytest.mark.parametrize("cleanup", ["every_event", "claimed_and_spawned"])
+def test_event_cleanup_after_a_switch_changes_no_receipt_in_either_reader(
+    cleanup, root, owner, clock, monkeypatch,
+):
+    scene = _switch_scene(root, owner, clock, monkeypatch)
+    cards = (scene.m, scene.x, scene.n)
+    with _board(scene.board) as conn:
+        if cleanup == "every_event":
+            for task_id in cards:
+                assert kb.archive_task(conn, task_id)
+            # Normal 30-day cleanup, its cutoff past every event of the cards.
+            clock["t"] += 30 * 24 * 3600 + 1
+            assert kb.gc_events(conn) > 0
+        else:
+            slots = ", ".join("?" for _ in scene.earlier)
+            assert conn.execute(
+                "DELETE FROM task_events WHERE kind IN ('claimed', 'spawned') "
+                f"AND run_id IN ({slots})",
+                scene.earlier,
+            ).rowcount > 0
+        earlier = [
+            event for event in kb.list_events(conn, scene.m) if event.run_id in scene.earlier
+        ]
+    if cleanup == "every_event":
+        assert not earlier
+    else:
+        assert earlier
+        assert not [event for event in earlier if event.kind in ("claimed", "spawned")]
+    cleaned = _both_readers(owner, scene.project, scene.board, scene.env, monkeypatch)
+    assert cleaned == scene.final
+    assert _states(cleaned, *scene.earlier, scene.held, *scene.later, scene.x_held, scene.n_run) == [
+        _UNKNOWN, _UNKNOWN, _KNOWN, _KNOWN, _UNKNOWN, _UNKNOWN, _KNOWN,
+    ]
+
+
+def test_a_card_with_no_switch_record_reads_as_on_main_in_both_readers(root, owner, clock, monkeypatch):
+    scene = _switch_scene(root, owner, clock, monkeypatch)
+    route = _deep_route("anthropic")
+    # Before any switch the board has no store; each run reads as main reads it.
+    assert _states(scene.before, *scene.earlier, scene.held) == [_KNOWN, _KNOWN, _KNOWN]
+    # Beside two cards with a record, the card with none still does.
+    assert scene.final[scene.n_run] == scene.x_before[scene.n_run]
+    assert scene.final[scene.n_run]["runtime"] == {
+        "state": "known", "engine": "hermes", "profile": _ROLE, "provider": "anthropic",
+        "model": route["model_override"], "reasoning_effort": route["reasoning_effort"],
+    }
+    assert _states(scene.final, scene.n_run) == [_KNOWN]
+
+
+def test_a_switch_whose_record_cannot_be_written_is_refused_and_the_card_keeps_its_route(
+    root, owner, clock, monkeypatch,
+):
+    from hermes_cli import owner_retry_route
+
+    project = _deep_project(root, owner, "Unsaved Switch", monkeypatch)
+    board = project["board"]
+    monkeypatch.setattr(owner_retry_route, "openai_ready", lambda _role: True)
+    env = _steward_env(root, board)
+    with _board(board) as conn:
+        task_id = _deep_card(conn, project, "Draft the placeholder brief")
+        held = _deep_stop(conn, board, task_id, 4311, _ANTHROPIC_SESSION, clock, monkeypatch)
+        # A store of the record's own shape that refuses every record.
+        conn.execute(
+            "CREATE TABLE owner_retry_run_pins (task_id TEXT PRIMARY KEY, "
+            "held_run_id INTEGER NOT NULL, assignee TEXT, provider_override TEXT, "
+            "model_override TEXT, reasoning_effort TEXT, execution_tier TEXT, model_policy_lock TEXT)"
+        )
+        conn.execute(
+            "CREATE TRIGGER owner_retry_run_pins_refused BEFORE INSERT ON owner_retry_run_pins "
+            "BEGIN SELECT RAISE(ABORT, 'placeholder refusal'); END"
+        )
+    clock["t"] = held.ended_at + 60
+
+    def board_state() -> tuple:
+        with _board(board) as conn:
+            return (
+                tuple(conn.execute(
+                    "SELECT assignee, provider_override, model_override, reasoning_effort, "
+                    "execution_tier, model_policy_lock FROM tasks WHERE id = ?", (task_id,),
+                ).fetchone()),
+                [(event.id, event.kind, event.run_id) for event in kb.list_events(conn, task_id)],
+                [tuple(row) for row in conn.execute("SELECT * FROM owner_retry_run_pins")],
+                [tuple(row) for row in conn.execute(
+                    "SELECT type, name, sql FROM sqlite_master "
+                    "WHERE tbl_name = 'owner_retry_run_pins' ORDER BY name"
+                )],
+                kb.check_respawn_guard(conn, task_id),
+            )
+
+    before = board_state()
+    assert before[0][1] == "anthropic"
+    assert before[2] == []
+    assert before[-1] == "rate_limit_cooldown"
+    refused = _switch(owner, project, task_id, env, monkeypatch, "switch-unsaved")
+    assert refused["ok"] is False, refused
+    assert refused["reason"] == _SWITCH_REFUSAL
+    assert board_state() == before
+    with _board(board) as conn:
+        assert not _events(conn, task_id, "model_route_repinned")
+        assert not _events(conn, task_id, "owner_retry")
+
+
+def test_on_a_board_with_no_switch_store_the_run_detail_reads_as_main_and_creates_nothing(
+    root, owner, clock, monkeypatch,
+):
+    import sqlite3
+
+    from plugins.kanban.dashboard import plugin_api
+
+    project = _deep_project(root, owner, "No Switch Store", monkeypatch)
+    board = project["board"]
+    env = _steward_env(root, board)
+    with _board(board) as conn:
+        task_id = _deep_card(conn, project, "Draft the placeholder brief")
+        run = _deep_stop(conn, board, task_id, 4321, _ANTHROPIC_SESSION, clock, monkeypatch)
+    [receipt] = _both_readers(owner, project, board, env, monkeypatch).values()
+    route = _deep_route("anthropic")
+    assert receipt["runtime"] == {
+        "state": "known", "engine": "hermes", "profile": _ROLE, "provider": "anthropic",
+        "model": route["model_override"], "reasoning_effort": route["reasoning_effort"],
+    }
+    assert receipt["cost"]["state"] == "estimated"
+    path = kb.kanban_db_path(board=board)
+    stored = path.read_bytes()
+    assert plugin_api._workspace_run_response(run.id)["run"]["receipt"] == receipt
+    assert path.read_bytes() == stored
+    with contextlib.closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'owner_retry_run_pins'"
+        ).fetchall() == []
 
 
 def test_a_retry_while_the_limit_holds_leaves_the_card_waiting_with_a_new_reset_and_no_breaker_trip(
