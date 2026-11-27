@@ -15,6 +15,8 @@ import json
 import os
 import shutil
 import sys
+import threading
+from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,6 +44,7 @@ OWNED = {"version": 1, "installed": {NAME: {  # a hub lock that owns the planner
     "source": "official", "identifier": f"official/{PLAN}", "install_path": PLAN}}}
 
 needs_symlinks = pytest.mark.skipif(sys.platform == "win32", reason="symlinks need extra rights on Windows")
+needs_fifo = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes are POSIX")
 # Root reads and writes whatever the mode, so a chmod-based denial only shows for other users.
 needs_real_permissions = pytest.mark.skipif(
     sys.platform == "win32" or os.geteuid() == 0, reason="chmod-based access denial needs a non-root user")
@@ -147,8 +150,32 @@ def _tree(folder: Path) -> dict:
         for name in dirs + files:
             path = Path(top) / name
             tree[path.relative_to(folder).as_posix()] = (
-                ("link", os.readlink(path)) if path.is_symlink() else "dir" if path.is_dir() else path.read_bytes())
+                ("link", os.readlink(path)) if path.is_symlink() else "dir" if path.is_dir()
+                else "fifo" if path.is_fifo() else path.read_bytes())
     return tree
+
+
+def _without_record(home: Path) -> dict:
+    """``_tree(home)`` but the record file, where a role line is the one difference from a twin."""
+    tree = _tree(home)
+    tree.pop("skills/.bundled_manifest", None)
+    return tree
+
+
+def _in_time(call, fifo: Path, seconds: float = 20):
+    """``call()``, failed and not blocked when it opens ``fifo`` to read: it runs in a thread, and a reader
+    still blocked after ``seconds`` is let go by a writer that opens and closes the FIFO."""
+    out = {}
+    thread = threading.Thread(target=lambda: out.update(result=call()), daemon=True)
+    thread.start()
+    thread.join(seconds)
+    blocked = thread.is_alive()
+    if blocked:
+        with suppress(OSError):
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        thread.join(seconds)
+    assert not blocked, f"the call opened {fifo} to read"
+    return out["result"]
 
 
 def _sha(path: Path) -> str:
@@ -596,16 +623,16 @@ def test_addition_4_the_role_pass_runs_when_the_general_catalogue_is_not_there(t
 
 @needs_symlinks
 @pytest.mark.parametrize("case, refused", [pytest.param(case, refused, id=case) for case, refused in (
-    ("the role's folder", [{"name": "running-build-work", "reason": "link"}]),
-    ("role-skills", [{"name": NAME, "reason": "link"}]),
-    ("a category folder in the role's folder", []),
-    ("the skill folder", []),
+    ("the role's folder", [{"name": PLANNER, "reason": "link"}]),
+    ("role-skills", [{"name": "role-skills", "reason": "link"}]),
+    ("a category folder in the role's folder", [{"name": "team-operations", "reason": "link"}]),
+    ("the skill folder", [{"name": NAME, "reason": "link"}]),
 )])
 def test_addition_6a_a_link_on_the_way_from_role_skills_gives_the_role_no_skill(
         checkout, tmp_path, monkeypatch, case, refused):
     """Review finding 2, through the release's own call: the planner's way to a skill passes a link, to
-    the builder's folders or out of the checkout. A link below the role's folder hides what it reaches
-    from the discovery, as it does for a general skill, so nothing is named."""
+    the builder's folders or out of the checkout. Each link is refused under its own name, and nothing
+    is read through it (review 2 finding 4)."""
     if case == "role-skills":
         _write_skill(tmp_path / "elsewhere" / PLANNER, PLAN, "not in the checkout")
         checkout.rmdir()
@@ -644,7 +671,7 @@ def test_addition_6a_a_skill_md_in_the_role_folder_itself_is_refused_with_each_s
 
 @needs_symlinks
 @pytest.mark.parametrize("case, name", [pytest.param(case, name, id=case) for case, name in (
-    ("a link to the other role's SKILL.md", "running-build-work"),  # the name the discovery reads
+    ("a link to the other role's SKILL.md", NAME),  # its folder's own name: nothing is read through it
     ("a folder", NAME),
 )])
 def test_addition_6b_a_role_skill_whose_skill_md_is_no_regular_file_is_refused(
@@ -842,26 +869,35 @@ def test_addition_11_each_lock_form_that_is_not_valid_keeps_the_exact_copy_with_
 # -- The addition: a place that the general pass writes (points 12 and 13) ---------------------------
 
 @pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
-def test_addition_12_13_a_general_description_in_the_place_of_a_role_skill_refuses_it_in_each_release(
+def test_addition_12_13_a_general_description_in_the_place_of_a_role_skill_refuses_it_where_the_general_pass_writes_it(
         tmp_path, monkeypatch, marked):
     """Review finding 5, through the release's own call: an exact copy of the planner skill, and a general
-    description inside its place. The check reads the whole general catalogue, so the role with the
-    marker, where the general pass writes no description there, is refused too (addition point 15).
-    Two releases; in each, the twin home is seeded by a role with no role skills."""
+    description inside its place. Only a description the general pass writes in the run refuses the copy
+    (review 2 finding 5): with the marker it writes none there, and the copy is adopted in the first
+    release; with no marker the first release refuses the copy and writes the description into it, so
+    the second finds a changed copy and keeps it. Two releases; in each, the twin home is seeded by a
+    role with no role skills."""
     general = _general(monkeypatch, tmp_path / "general")
     _write_skill(general, "autonomous-ai-agents/hermes-agent", "essential")
     (general / PLAN).mkdir(parents=True)
     (general / PLAN / "DESCRIPTION.md").write_text("A general description\n", encoding="utf-8")
+    src = REPO / "role-skills" / PLANNER / PLAN
     planner = _home(tmp_path / "root" / "profiles" / PLANNER, marked=marked)
-    shutil.copytree(REPO / "role-skills" / PLANNER / PLAN, planner / "skills" / PLAN)
+    shutil.copytree(src, planner / "skills" / PLAN)
     twin = _twin(planner, tmp_path / "twin", OTHER)
 
-    for _ in range(2):  # the second release finds what the first one wrote
+    for release_no in range(2):  # the second release finds what the first one wrote
         with_role, without = _seed(planner), _seed(twin)
 
-        assert with_role == {**without, "refused": [{"name": NAME, "reason": "overlap"}]}
-        assert without["refused"] == [] and _tree(planner) == _tree(twin)
-    assert NAME not in _manifest(planner)
+        if marked:
+            assert with_role == {**without, "skipped": without["skipped"] + 1}  # adopted: in no list
+        elif release_no == 0:
+            assert with_role == {**without, "refused": [{"name": NAME, "reason": "overlap"}]}
+        else:
+            assert with_role == {**without, "kept": [{"name": NAME, "reason": "changed"}],
+                                 "skipped": without["skipped"] + 1}
+        assert without["refused"] == [] and _without_record(planner) == _without_record(twin)
+        assert _manifest(planner) == {**_manifest(twin), **({NAME: _dir_hash(src)} if marked else {})}
     assert (planner / "skills" / PLAN / "DESCRIPTION.md").is_file() == (not marked)  # the general pass's own
 
 
@@ -901,3 +937,250 @@ def test_addition_12_13_a_role_skill_where_the_general_pass_writes_is_refused_an
 
     assert with_role == {**without, "refused": without["refused"] + [{"name": name, "reason": "overlap"}]}
     assert _tree(home) == _tree(twin)
+
+
+# -- Review round 2 -----------------------------------------------------------------------------------
+
+@needs_symlinks
+@pytest.mark.parametrize("catalogue", [True, False], ids=["general catalogue", "no general catalogue"])
+@pytest.mark.parametrize("record", ["a link to the builder's record", "a folder"])
+def test_review2_1_a_role_whose_record_file_is_a_link_or_no_regular_file_gets_nothing_and_one_refusal(
+        tmp_path, monkeypatch, record, catalogue):
+    """Review 2 finding 1, through the release's own call: the planner's record file is a link to the
+    builder's, seeded first, or a folder. No role file and no role line is written, there or through it."""
+    if catalogue:
+        _general(monkeypatch, tmp_path / "general")
+    else:
+        monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(tmp_path / "not-there"))
+    roles = tmp_path / "root" / "profiles"
+    builder = _home(roles / BUILDER)
+    assert _seed(builder)["copied"] == ["running-build-work"]
+    planner = _home(roles / PLANNER)
+    manifest = planner / "skills" / ".bundled_manifest"
+    manifest.unlink()
+    if record == "a folder":
+        manifest.mkdir()
+    else:
+        manifest.symlink_to(builder / "skills" / ".bundled_manifest")
+    before = _tree(roles)
+
+    result = _seed(planner)
+
+    refused = [{"name": PLANNER, "reason": "link"}]
+    if catalogue:
+        assert _lists(result) == {**NO_LISTS, "refused": refused}
+    else:
+        assert result == {**NO_CATALOGUE, "refused": refused}
+    assert _tree(roles) == before
+
+
+@needs_fifo
+def test_review2_1_with_no_general_catalogue_a_record_file_that_is_a_fifo_is_refused_and_never_opened(
+        release, monkeypatch, tmp_path):
+    _write_skill(release.roles / PLANNER, PLAN, "planner")
+    monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(tmp_path / "not-there"))
+    home = _home(release.planner)
+    manifest = home / "skills" / ".bundled_manifest"
+    manifest.unlink()
+    os.mkfifo(manifest)
+    before = _tree(home)
+
+    result = _in_time(lambda: _sync(monkeypatch, home), manifest)
+
+    assert result == {**NO_CATALOGUE, "refused": [{"name": PLANNER, "reason": "link"}]}
+    assert _tree(home) == before
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+def test_review2_2_a_role_record_is_no_evidence_for_a_later_general_skill_of_the_same_name(
+        checkout, tmp_path, monkeypatch, marked):
+    """Review 2 finding 2, through the release's own call, two releases: the first adopts an exact role
+    copy; the second adds a general skill of the same name at another inner path. The twin home holds the
+    same files and is seeded with no role skills: the general result and bytes are its own, the role
+    copy stays at its place with its bytes, and the role skill is refused with ``name``."""
+    general = _general(monkeypatch, tmp_path / "general")
+    src = _write_skill(checkout / PLANNER, PLAN, "planner")
+    planner = _home(tmp_path / "root" / "profiles" / PLANNER, marked=marked)
+    shutil.copytree(src, planner / "skills" / PLAN)
+    twin = _twin(planner, tmp_path / "twin", OTHER)
+    copy = _files(planner / "skills" / PLAN)
+    first, first_twin = _seed(planner), _seed(twin)
+    assert first == {**first_twin, "skipped": first_twin["skipped"] + 1}  # adopted: in no list
+    assert _manifest(planner) == {NAME: _dir_hash(src)}
+    _write_skill(general, f"software-development/{NAME}", "the general one")
+
+    with_role, without = _seed(planner), _seed(twin)
+
+    assert with_role == {**without, "refused": [{"name": NAME, "reason": "name"}]}
+    assert without["copied"] == ([] if marked else [NAME]) and without["relocated"] == []
+    assert _files(planner / "skills" / PLAN) == copy
+    assert _without_record(planner) == _without_record(twin)
+    assert _manifest(planner) == {**_manifest(twin), **({NAME: _dir_hash(src)} if marked else {})}
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+def test_review2_2_a_general_record_stays_one_when_a_role_skill_of_the_same_name_comes(
+        checkout, tmp_path, monkeypatch, marked):
+    """Review 2 finding 2, the other way: the general skill is delivered first, with its line; then a role
+    skill of the same name comes at another inner path, and the general skill changes. The general
+    result is the twin's, and the role skill is refused with ``name``."""
+    general = _general(monkeypatch, tmp_path / "general")
+    _write_skill(general, f"software-development/{NAME}", "the general one")
+    planner = _home(tmp_path / "root" / "profiles" / PLANNER, marked=False)
+    twin = _twin(planner, tmp_path / "twin", OTHER)
+    assert _seed(planner)["copied"] == [NAME] and _seed(twin)["copied"] == [NAME]
+    if marked:
+        _mark(planner), _mark(twin)
+    _write_skill(checkout / PLANNER, PLAN, "planner")
+    _write_skill(general, f"software-development/{NAME}", "the general one, changed")
+
+    with_role, without = _seed(planner), _seed(twin)
+
+    assert with_role == {**without, "refused": [{"name": NAME, "reason": "name"}]}
+    assert without["updated"] == [NAME]
+    assert _tree(planner) == _tree(twin)
+
+
+@pytest.mark.parametrize("case", [
+    "no version", "another version", "an install path that is not its entry's name",
+    "an install path out of skills/", "one entry valid and one not",
+    pytest.param("a linked hub folder", marks=needs_symlinks),
+    pytest.param("a linked lock file", marks=needs_symlinks),
+    pytest.param("a fifo lock file", marks=needs_fifo),
+])
+def test_review2_3_an_exact_copy_is_kept_with_hub_lock_when_the_lock_is_not_the_hubs_valid_form(
+        release, monkeypatch, tmp_path, case):
+    """Review 2 finding 3: the lock's version, each entry's install path by the hub's own validator, and
+    the lock's own entry type (a link or a FIFO is never opened). The seeding goes on."""
+    src = _write_skill(release.roles / PLANNER, PLAN, "planner v1")
+    home = _home(release.planner)
+    shutil.copytree(src, home / "skills" / PLAN)
+    entry = OWNED["installed"][NAME]
+    forms = {
+        "no version": {"installed": {}},
+        "another version": {"version": 2, "installed": {}},
+        "an install path that is not its entry's name": {"version": 1, "installed": {"other": entry}},
+        "an install path out of skills/": {"version": 1, "installed": {NAME: {**entry, "install_path": f"../{NAME}"}}},
+        "one entry valid and one not": {"version": 1, "installed": {
+            "spike": {**entry, "install_path": "software-development/spike"},
+            "bad": {**entry, "install_path": "software-development/other"}}},
+    }
+    lock = home / "skills" / ".hub" / "lock.json"
+    if case in forms:
+        _hub_lock(home / "skills", forms[case])
+    elif case == "a linked hub folder":
+        (home / "skills" / ".hub").symlink_to(_hub_lock(tmp_path / "elsewhere", {"version": 1, "installed": {}}).parent)
+    elif case == "a linked lock file":
+        lock.parent.mkdir()
+        lock.symlink_to(_hub_lock(tmp_path / "elsewhere", {"version": 1, "installed": {}}))
+    else:
+        lock.parent.mkdir()
+        os.mkfifo(lock)
+    before = _tree(home)
+
+    result = _in_time(lambda: _sync(monkeypatch, home), lock)
+
+    assert _lists(result) == {**NO_LISTS, "kept": [{"name": NAME, "reason": "hub_lock"}]}
+    assert _tree(home) == before
+
+
+@pytest.mark.parametrize("name, path", [
+    pytest.param(NAME, f"./{PLAN}/", id="its place written another way"),
+    pytest.param("inner", f"{PLAN}/inner", id="a place inside its place"),
+    pytest.param("team-operations", "team-operations", id="a place that holds its place"),
+])
+def test_review2_3_a_valid_lock_owns_the_place_by_the_hubs_normal_form_and_keeps_the_exact_copy(
+        release, monkeypatch, name, path):
+    src = _write_skill(release.roles / PLANNER, PLAN, "planner v1")
+    home = _home(release.planner)
+    shutil.copytree(src, home / "skills" / PLAN)
+    _hub_lock(home / "skills", {"version": 1, "installed": {name: {"source": "official", "install_path": path}}})
+    before = _tree(home)
+
+    result = _sync(monkeypatch, home)
+
+    assert _lists(result) == {**NO_LISTS, "kept": [{"name": NAME, "reason": "changed"}]}
+    assert _tree(home) == before
+
+
+def test_review2_3_the_supported_lock_version_is_the_hubs():
+    from tools.skills_hub import HubLockFile
+    assert skills_sync_roles.HUB_LOCK_VERSION == HubLockFile.EMPTY["version"]
+
+
+@needs_fifo
+def test_review2_4_a_skill_md_that_is_a_fifo_is_refused_at_once_under_its_folder_name(release, monkeypatch):
+    md = release.roles / PLANNER / PLAN / "SKILL.md"
+    md.parent.mkdir(parents=True)
+    os.mkfifo(md)
+    home = _home(release.planner)
+    before = _tree(home)
+
+    result = _in_time(lambda: _sync(monkeypatch, home), md)
+
+    assert _lists(result) == {**NO_LISTS, "refused": [{"name": NAME, "reason": "link"}]}
+    assert _tree(home) == before
+
+
+def test_review2_4_8_with_no_link_the_walk_finds_what_the_general_discovery_finds(release):
+    """Facts point 8 on a plain tree: same names and folders, skills inside skills and excluded paths
+    included; the walk adds only its refusals."""
+    role_dir = release.roles / PLANNER
+    for rel, name in ((PLAN, ""), ("data/etl/loader", "custom-name"), (f"{PLAN}/inner", ""),
+                      (f"{PLAN}/scripts/helper", ""), ("tools/node_modules/hidden", ""), ("a/.git/x", "")):
+        _write_skill(role_dir, rel, "x", name=name)
+    (role_dir / "data" / "notes.md").write_text("not a skill\n", encoding="utf-8")
+
+    walked = skills_sync_roles._role_skills(PLANNER)[1]
+
+    assert [(name, folder) for name, folder, _ in walked] == sorted(
+        _discover_bundled_skills(role_dir), key=lambda item: item[1])
+    assert {folder.name: refusal for _, folder, refusal in walked} == {
+        "handing-build-work": "nested", "inner": "nested", "loader": None}
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+def test_review2_5_an_exact_copy_around_a_description_is_adopted_only_where_the_general_pass_does_not_write_it(
+        tmp_path, monkeypatch, marked):
+    """Review 2 finding 5, through the release's own call: with the marker the general pass writes no
+    description into the exact copy, which is adopted (its line, and no byte or change time of its
+    files); with no marker it writes the description, as on the twin, and the copy is refused."""
+    general = _general(monkeypatch, tmp_path / "general")
+    _write_skill(general, "autonomous-ai-agents/hermes-agent", "essential")
+    (general / PLAN).mkdir(parents=True)
+    (general / PLAN / "DESCRIPTION.md").write_text("A general description\n", encoding="utf-8")
+    src = REPO / "role-skills" / PLANNER / PLAN
+    planner = _home(tmp_path / "root" / "profiles" / PLANNER, marked=marked)
+    copy = planner / "skills" / PLAN
+    shutil.copytree(src, copy)
+    twin = _twin(planner, tmp_path / "twin", OTHER)
+    before = {path: _stat(path) for path in [copy, *sorted(copy.rglob("*"))]}, _files(copy)
+
+    with_role, without = _seed(planner), _seed(twin)
+
+    if marked:
+        assert with_role == {**without, "skipped": without["skipped"] + 1}  # adopted: in no list
+        assert _manifest(planner) == {**_manifest(twin), NAME: _dir_hash(src)}
+        assert ({path: _stat(path) for path in [copy, *sorted(copy.rglob("*"))]}, _files(copy)) == before
+        assert _without_record(planner) == _without_record(twin)
+    else:
+        assert with_role == {**without, "refused": [{"name": NAME, "reason": "overlap"}]}
+        assert _tree(planner) == _tree(twin) and NAME not in _manifest(planner)
+    assert (copy / "DESCRIPTION.md").is_file() == (not marked)
+
+
+@pytest.mark.parametrize("general_rel", [PLAN, "team-operations"], ids=["at its place", "holding its place"])
+def test_review2_5_a_role_skill_at_or_inside_a_general_skills_place_is_refused_whatever_the_run(
+        release, monkeypatch, general_rel):
+    """Addition point 12: with the marker the general pass does not write that general skill, and the
+    exact role copy is still refused."""
+    src = _write_skill(release.roles / PLANNER, PLAN, "planner")
+    _write_skill(release.skills, general_rel, "general", name="other-name")
+    home = _home(release.planner)
+    shutil.copytree(src, home / "skills" / PLAN)
+    before = _tree(home)
+
+    result = _sync(monkeypatch, home)
+
+    assert _lists(result) == {**NO_LISTS, "refused": [{"name": NAME, "reason": "overlap"}]}
+    assert _tree(home) == before

@@ -28,7 +28,7 @@ from tools.skill_usage import _read_skill_name, read_suppressed_names
 from tools.skills_sync_optional import (
     _ignore_runtime_cache, _is_runtime_cache, _read_hub_install_paths,
 )
-from tools.skills_sync_roles import sync_role_skills, sync_role_skills_alone
+from tools.skills_sync_roles import sync_role_skills, sync_role_skills_alone, take_role_records
 from utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -547,6 +547,7 @@ def sync_skills(quiet: bool = False) -> dict:
     suppressed = _read_suppressed_names()
     external_index = _build_external_skill_index()
     st = _SyncState(manifest=_read_manifest(), quiet=quiet, reset=reset)
+    role_lines = take_role_records(st, bundled_dir, all_bundled)  # no role line is a general skill's evidence
     # The marker stops NEW built-ins: a name with a manifest line gets only _update_in_marked_role.
     bundled_skills = [(name, src) for name, src in all_bundled
                       if not marked or name in st.manifest or name in ESSENTIAL_SKILLS]
@@ -576,7 +577,8 @@ def sync_skills(quiet: bool = False) -> dict:
         else:
             st.skipped += 1  # in manifest but not on disk — user deleted it
     # The role's own skills (role-skills/<role>/, marker or not); their lines are released names.
-    role_skills = sync_role_skills(st, bundled_dir, all_bundled, suppressed, external_index)
+    role_skills = sync_role_skills(st, bundled_dir, all_bundled, suppressed, external_index,
+                                   role_lines, bundled_skills, marked)
     # Clean manifest entries for skills removed upstream. Skipped when opted out: a marked role
     # changes no line but the one an update writes.
     cleaned = [] if marked else sorted(set(st.manifest) - {name for name, _ in bundled_skills} - role_skills)
