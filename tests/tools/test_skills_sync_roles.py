@@ -1,9 +1,13 @@
 """Each role skill reaches its own role at a release, and an exact copy is adopted.
 
-Each test runs the real sync against a temporary release repository (``skills/`` beside
-``role-skills/``, set through ``HERMES_BUNDLED_SKILLS``) and temporary homes, set through
-``HERMES_HOME``; a role is a home under a folder named ``profiles``. A "release" is a change to
-the repository followed by the sync. The test names carry the point of the card's facts they hold.
+Each test runs the real sync against a temporary release repository (``skills/``, set through
+``HERMES_BUNDLED_SKILLS``, beside ``role-skills/``, set by replacing the one function that gives the
+checkout's ``role-skills/``) and temporary homes, set through ``HERMES_HOME``; a role is a home under a
+folder named ``profiles``. The release's own call, ``seed_profile_skills``, runs the sync in a child
+from the checkout, which no replaced function reaches: its tests use this repository's
+``role-skills/``, or a scratch checkout that links this repository's entries beside a fixture
+``role-skills/``. A "release" is a change to the repository followed by the sync. The test names
+carry the point of the card's facts they hold ("addition": the owner's addition after review round 1).
 """
 
 import hashlib
@@ -16,18 +20,31 @@ from types import SimpleNamespace
 
 import pytest
 
+import hermes_cli.profiles as profiles
 import tools.skills_sync as skills_sync
+import tools.skills_sync_roles as skills_sync_roles
 from hermes_cli.profiles import seed_profile_skills
 from tools.skill_usage import _read_skill_name
 from tools.skills_sync import NO_BUNDLED_SKILLS_MARKER, _dir_hash, _discover_bundled_skills, sync_skills
 
 REPO = Path(__file__).resolve().parents[2]
 PLANNER, BUILDER = "raphael-planner", "raphael-claude-worker"
+OTHER = "raphael-verifier"  # a role with no folder under role-skills/: its run has no role pass
 PLAN, BUILD = "team-operations/handing-build-work", "team-operations/running-build-work"
 NAME = "handing-build-work"
 LISTS = ("copied", "updated", "kept", "refused", "suppressed", "shadowed_by_external")
+NO_LISTS = {key: [] for key in LISTS}
+# What ``sync_skills`` returns today when the general catalogue is not there.
+NO_CATALOGUE = {"copied": [], "updated": [], "skipped": 0, "user_modified": [], "cleaned": [], "suppressed": [],
+                "total_bundled": 0, "not_seeded_by_marker": 0, "optional_provenance_backfilled": [],
+                "kept": [], "refused": []}
+OWNED = {"version": 1, "installed": {NAME: {  # a hub lock that owns the planner skill's place
+    "source": "official", "identifier": f"official/{PLAN}", "install_path": PLAN}}}
 
 needs_symlinks = pytest.mark.skipif(sys.platform == "win32", reason="symlinks need extra rights on Windows")
+# Root reads and writes whatever the mode, so a chmod-based denial only shows for other users.
+needs_real_permissions = pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0, reason="chmod-based access denial needs a non-root user")
 
 
 @pytest.fixture
@@ -37,9 +54,29 @@ def release(tmp_path, monkeypatch):
     for path in (repo / "skills", repo / "role-skills"):
         path.mkdir(parents=True)
     monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(repo / "skills"))
+    _use_role_skills(monkeypatch, repo / "role-skills")
     root = tmp_path / "root"
     return SimpleNamespace(skills=repo / "skills", roles=repo / "role-skills", root=root,
                            planner=root / "profiles" / PLANNER, builder=root / "profiles" / BUILDER)
+
+
+@pytest.fixture
+def checkout(tmp_path, monkeypatch):
+    """A scratch released checkout for the release's own call: a link to each entry of this repository
+    beside a fixture ``role-skills/``, which it returns. The child runs from the folder above
+    ``hermes_cli/``."""
+    root = tmp_path / "checkout"
+    (root / "role-skills").mkdir(parents=True)
+    for entry in REPO.iterdir():
+        if entry.name not in ("role-skills", "skills"):
+            (root / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+    monkeypatch.setattr(profiles, "__file__", str(root / "hermes_cli" / "profiles.py"))
+    return root / "role-skills"
+
+
+def _use_role_skills(monkeypatch, folder: Path) -> None:
+    """The checkout's ``role-skills/``, replaced by ``folder`` in this process (addition point 5)."""
+    monkeypatch.setattr(skills_sync_roles, "role_skills_dir", lambda: folder)
 
 
 def _sync(monkeypatch, home: Path) -> dict:
@@ -48,12 +85,28 @@ def _sync(monkeypatch, home: Path) -> dict:
     return sync_skills(quiet=True)
 
 
-def _write_skill(root: Path, rel: str, body: str) -> Path:
+def _seed(home: Path) -> dict:
+    """One seeding of ``home`` through the release's own call: a child from the checkout, whole result."""
+    result = seed_profile_skills(home, quiet=True, full_result=True)
+    assert result is not None
+    return result
+
+
+def _write_skill(root: Path, rel: str, body: str, name: str = "") -> Path:
     folder = root / rel
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "SKILL.md").write_text(
-        f"---\nname: {folder.name}\ndescription: test skill\n---\n{body}\n", encoding="utf-8")
+        f"---\nname: {name or folder.name}\ndescription: test skill\n---\n{body}\n", encoding="utf-8")
     return folder
+
+
+def _home(home: Path, *, marked: bool = True) -> Path:
+    """A role home as the host holds one (facts 4 and 5): its ``skills/`` with a record file, and the marker."""
+    (home / "skills").mkdir(parents=True)
+    (home / "skills" / ".bundled_manifest").write_text("", encoding="utf-8")
+    if marked:
+        _mark(home)
+    return home
 
 
 def _edit(folder: Path) -> None:
@@ -85,6 +138,48 @@ def _names(result: dict) -> dict:
 def _stat(path: Path) -> tuple:
     info = path.stat()
     return info.st_mtime_ns, info.st_ctime_ns, info.st_ino
+
+
+def _tree(folder: Path) -> dict:
+    """Every entry under ``folder``, no link followed: relative path -> its bytes, ("link", target) or "dir"."""
+    tree = {}
+    for top, dirs, files in os.walk(folder):
+        for name in dirs + files:
+            path = Path(top) / name
+            tree[path.relative_to(folder).as_posix()] = (
+                ("link", os.readlink(path)) if path.is_symlink() else "dir" if path.is_dir() else path.read_bytes())
+    return tree
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _hub_lock(skills: Path, form) -> Path:
+    """The hub lock of a role's ``skills/``: ``form`` is its JSON value, or its bytes as they are."""
+    path = skills / ".hub" / "lock.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(form if isinstance(form, bytes) else json.dumps(form).encode("utf-8"))
+    return path
+
+
+def _twin(home: Path, twin_root: Path, role: str = "") -> Path:
+    """A copy of ``home``'s tree, made before any sync, for the same run with no role pass (addition
+    point 13): a role with no folder under ``role-skills/`` (``role``), or no role skills at all."""
+    twin = twin_root / "profiles" / (role or home.name)
+    shutil.copytree(home, twin, symlinks=True)
+    return twin
+
+
+def _general(monkeypatch, folder: Path) -> Path:
+    """The general catalogue of the run, through ``HERMES_BUNDLED_SKILLS`` (the child gets it too)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(folder))
+    return folder
+
+
+def _lists(result: dict) -> dict:
+    return {key: result[key] for key in LISTS}
 
 
 # -- Point 10, the table ---------------------------------------------------------------------------
@@ -323,6 +418,7 @@ def test_13_where_the_table_is_silent_a_role_skill_goes_as_a_general_skill_of_a_
         skills = base / "repo" / "skills"
         skills.mkdir(parents=True)
         monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(skills))
+        _use_role_skills(monkeypatch, base / "repo" / "role-skills")
         if kind == "general":
             _write_skill(skills, PLAN, "v1")
             home = base / "home"
@@ -404,6 +500,7 @@ def test_15_general_skills_give_the_same_result_and_bytes_with_the_role_pass_and
         home = repo.parent / "root" / "profiles" / PLANNER
         (repo / "skills").mkdir(parents=True)
         monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(repo / "skills"))
+        _use_role_skills(monkeypatch, repo / "role-skills")
         monkeypatch.setenv("HERMES_HOME", str(home))
         results = _general_release(repo, home, marked=marked, role_skills=role_skills)
         runs.append(([{key: sorted(value, key=repr) if isinstance(value, list) else value
@@ -428,8 +525,7 @@ def test_22_the_two_build_loop_skills_are_in_the_repository_with_their_names(rol
 
 def test_the_release_seeding_adopts_an_exact_planner_copy_and_gives_the_builder_no_planner_skill(
         release, monkeypatch):
-    src = _write_skill(release.roles / PLANNER, PLAN, "planner v1")
-    _write_skill(release.roles / BUILDER, BUILD, "builder v1")
+    src = REPO / "role-skills" / PLANNER / PLAN  # the child reads the checkout's role-skills/ (addition 3)
     for home in (release.planner, release.builder):
         _mark(home)
     shutil.copytree(src, release.planner / "skills" / PLAN)
@@ -444,3 +540,364 @@ def test_the_release_seeding_adopts_an_exact_planner_copy_and_gives_the_builder_
     assert hashlib.sha256(md.read_bytes()).hexdigest() == sha
     assert seed_profile_skills(release.builder, quiet=True, full_result=True)["copied"] == ["running-build-work"]
     assert not os.path.lexists(release.builder / "skills" / PLAN)
+
+
+# -- The addition after review round 1: the source (points 3 to 5) -----------------------------------
+
+def test_addition_3_5_one_function_gives_the_role_skills_folder_beside_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(tmp_path / "skills"))  # it moves the general catalogue only
+    folder = skills_sync_roles.role_skills_dir()
+    assert folder == Path(skills_sync.__file__).parent.parent / "role-skills"
+    assert folder.resolve() == REPO / "role-skills"
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+def test_addition_3_the_release_seeds_the_checkout_role_skills_whatever_hermes_bundled_skills_names(
+        tmp_path, monkeypatch, marked):
+    """Review finding 1, through the release's own call: another general catalogue, with role skills
+    beside it, moves no role skill."""
+    other = _general(monkeypatch, tmp_path / "other-release" / "skills").parent
+    spike = _write_skill(other / "skills", "software-development/spike", "v1")
+    for role, rel in ((PLANNER, PLAN), (BUILDER, BUILD)):
+        for decoy in (rel, "decoy/decoy-skill"):
+            _write_skill(other / "role-skills" / role, decoy, "not the release's")
+    for role, rel in ((PLANNER, PLAN), (BUILDER, BUILD)):
+        home = _home(tmp_path / "root" / "profiles" / role, marked=marked)
+        src = REPO / "role-skills" / role / rel
+
+        result = _seed(home)
+
+        assert result["copied"] == ([] if marked else ["spike"]) + [src.name]
+        assert result["kept"] == result["refused"] == []
+        assert _files(home / "skills" / rel) == _files(src)
+        assert _manifest(home) == {src.name: _dir_hash(src), **({} if marked else {"spike": _dir_hash(spike)})}
+        assert not os.path.lexists(home / "skills" / "decoy")
+
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+def test_addition_4_the_role_pass_runs_when_the_general_catalogue_is_not_there(tmp_path, monkeypatch, marked):
+    """Review finding 1, through the release's own call: a general catalogue that is not there stops
+    the general pass only. The root home, and a role with no role skills, get today's result."""
+    monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(tmp_path / "not-there"))
+    root = _home(tmp_path / "root", marked=marked)
+    planner = _home(root / "profiles" / PLANNER, marked=marked)
+    for home in (root, _home(root / "profiles" / OTHER, marked=marked)):
+        before = _tree(root)
+        assert _seed(home) == NO_CATALOGUE
+        assert _tree(root) == before
+    src = REPO / "role-skills" / PLANNER / PLAN
+
+    assert _seed(planner) == {**NO_CATALOGUE, "copied": [NAME]}
+    assert _files(planner / "skills" / PLAN) == _files(src)
+    assert _manifest(planner) == {NAME: _dir_hash(src)}
+
+
+# -- The addition: the plain shape of a role skill (points 6 and 7) ----------------------------------
+
+@needs_symlinks
+@pytest.mark.parametrize("case, refused", [pytest.param(case, refused, id=case) for case, refused in (
+    ("the role's folder", [{"name": "running-build-work", "reason": "link"}]),
+    ("role-skills", [{"name": NAME, "reason": "link"}]),
+    ("a category folder in the role's folder", []),
+    ("the skill folder", []),
+)])
+def test_addition_6a_a_link_on_the_way_from_role_skills_gives_the_role_no_skill(
+        checkout, tmp_path, monkeypatch, case, refused):
+    """Review finding 2, through the release's own call: the planner's way to a skill passes a link, to
+    the builder's folders or out of the checkout. A link below the role's folder hides what it reaches
+    from the discovery, as it does for a general skill, so nothing is named."""
+    if case == "role-skills":
+        _write_skill(tmp_path / "elsewhere" / PLANNER, PLAN, "not in the checkout")
+        checkout.rmdir()
+        checkout.symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+    else:
+        builder = _write_skill(checkout / BUILDER, BUILD, "builder")
+        link, target = {"the role's folder": (checkout / PLANNER, checkout / BUILDER),
+                        "a category folder in the role's folder": (checkout / PLANNER / "team-operations",
+                                                                   builder.parent),
+                        "the skill folder": (checkout / PLANNER / PLAN, builder)}[case]
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target, target_is_directory=True)
+    _general(monkeypatch, tmp_path / "general")
+    planner = _home(tmp_path / "root" / "profiles" / PLANNER)
+    before = _tree(planner)
+
+    result = _seed(planner)
+
+    assert _lists(result) == {**NO_LISTS, "refused": refused}
+    assert _tree(planner) == before
+
+
+def test_addition_6a_a_skill_md_in_the_role_folder_itself_is_refused_with_each_skill_inside(release, monkeypatch):
+    _write_skill(release.roles, PLANNER, "the whole role", name="role-root")
+    _write_skill(release.roles / PLANNER, PLAN, "planner")
+    home = _home(release.planner)
+    before = _tree(home)
+
+    result = _sync(monkeypatch, home)
+
+    assert sorted(result["refused"], key=lambda item: item["name"]) == [
+        {"name": NAME, "reason": "nested"}, {"name": "role-root", "reason": "link"}]
+    assert _lists(result) == {**NO_LISTS, "refused": result["refused"]}
+    assert _tree(home) == before
+
+
+@needs_symlinks
+@pytest.mark.parametrize("case, name", [pytest.param(case, name, id=case) for case, name in (
+    ("a link to the other role's SKILL.md", "running-build-work"),  # the name the discovery reads
+    ("a folder", NAME),
+)])
+def test_addition_6b_a_role_skill_whose_skill_md_is_no_regular_file_is_refused(
+        checkout, tmp_path, monkeypatch, case, name):
+    """Review finding 2, through the release's own call."""
+    builder = _write_skill(checkout / BUILDER, BUILD, "builder")
+    md = checkout / PLANNER / PLAN / "SKILL.md"
+    md.parent.mkdir(parents=True)
+    if case == "a folder":
+        md.mkdir()
+        (md / "notes.md").write_text("a note\n", encoding="utf-8")
+    else:
+        md.symlink_to(builder / "SKILL.md")
+    _general(monkeypatch, tmp_path / "general")
+    planner = _home(tmp_path / "root" / "profiles" / PLANNER)
+    before = _tree(planner)
+
+    result = _seed(planner)
+
+    assert _lists(result) == {**NO_LISTS, "refused": [{"name": name, "reason": "link"}]}
+    assert _tree(planner) == before
+
+
+@needs_symlinks
+@pytest.mark.parametrize("case", ["a file", "a folder"])
+def test_addition_6c_a_role_skill_with_a_link_inside_is_refused(release, monkeypatch, case):
+    builder = _write_skill(release.roles / BUILDER, BUILD, "builder")
+    src = _write_skill(release.roles / PLANNER, PLAN, "planner")
+    if case == "a file":
+        (src / "references").mkdir()
+        (src / "references" / "checklist.md").symlink_to(builder / "SKILL.md")
+    else:
+        (src / "references").symlink_to(builder, target_is_directory=True)
+    home = _home(release.planner)
+    before = _tree(home)
+
+    result = _sync(monkeypatch, home)
+
+    assert _lists(result) == {**NO_LISTS, "refused": [{"name": NAME, "reason": "link"}]}
+    assert _tree(home) == before
+
+
+@needs_symlinks
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+def test_addition_6d_a_role_skill_folder_that_holds_a_second_skill_is_refused_as_a_whole(
+        checkout, tmp_path, monkeypatch, marked):
+    """Review finding 4, through the release's own call: the inner skill has a general skill's name.
+    The twin home is seeded in the same run by a role with no role skills."""
+    general = _general(monkeypatch, tmp_path / "general")
+    _write_skill(general, "software-development/shared-name", "general")
+    _write_skill(checkout / PLANNER, PLAN, "planner")
+    _write_skill(checkout / PLANNER, f"{PLAN}/inner/shared-name", "the role's own")
+    planner = _home(tmp_path / "root" / "profiles" / PLANNER, marked=marked)
+    twin = _twin(planner, tmp_path / "twin", OTHER)
+
+    with_role, without = _seed(planner), _seed(twin)
+
+    assert sorted(with_role["refused"], key=lambda item: item["name"]) == [
+        {"name": NAME, "reason": "nested"}, {"name": "shared-name", "reason": "nested"}]
+    assert with_role == {**without, "refused": with_role["refused"]} and without["refused"] == []
+    assert without["copied"] == ([] if marked else ["shared-name"])
+    assert _tree(planner) == _tree(twin)
+
+
+# -- The addition: the place in the role (point 8) ---------------------------------------------------
+
+@needs_symlinks
+@pytest.mark.parametrize("catalogue", [True, False], ids=["general catalogue", "no general catalogue"])
+@pytest.mark.parametrize("link", ["home", "skills"])
+def test_addition_8_a_role_whose_home_or_skills_folder_is_a_link_gets_nothing_and_one_refusal(
+        tmp_path, monkeypatch, link, catalogue):
+    """Review finding 2, through the release's own call: the planner's home, or its skills/, is a link to
+    the builder's, seeded first. The planner's seeding changes no byte of either."""
+    if catalogue:
+        _general(monkeypatch, tmp_path / "general")
+    else:
+        monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(tmp_path / "not-there"))
+    roles = tmp_path / "root" / "profiles"
+    builder = _home(roles / BUILDER)
+    assert _seed(builder)["copied"] == ["running-build-work"]
+    planner = roles / PLANNER
+    if link == "home":
+        planner.symlink_to(builder, target_is_directory=True)
+    else:
+        _mark(planner)
+        (planner / "skills").symlink_to(builder / "skills", target_is_directory=True)
+    before = _tree(roles)
+
+    result = _seed(planner)
+
+    refused = [{"name": PLANNER, "reason": "link"}]
+    if catalogue:
+        assert _lists(result) == {**NO_LISTS, "refused": refused}
+    else:
+        assert result == {**NO_CATALOGUE, "refused": refused}
+    assert _tree(roles) == before
+
+
+# -- The addition: the hub lock (points 10 and 11) ---------------------------------------------------
+
+@pytest.mark.parametrize("case", ["no hub folder", "no lock file", "a lock of other paths",
+                                  "a lock that owns its place"])
+def test_addition_10_an_exact_copy_is_adopted_only_when_the_hub_lock_is_not_there_or_owns_other_paths(
+        tmp_path, monkeypatch, case):
+    """Review finding 3, through the release's own call: the planner home holds an exact copy."""
+    _general(monkeypatch, tmp_path / "general")
+    src = REPO / "role-skills" / PLANNER / PLAN
+    planner = _home(tmp_path / "root" / "profiles" / PLANNER)
+    shutil.copytree(src, planner / "skills" / PLAN)
+    md = planner / "skills" / PLAN / "SKILL.md"
+    if case == "no lock file":
+        (planner / "skills" / ".hub").mkdir()
+    elif case == "a lock of other paths":  # one is the start of the place's text, not a folder above it
+        entry = OWNED["installed"][NAME]
+        _hub_lock(planner / "skills", {"version": 1, "installed": {
+            "handing-build": {**entry, "install_path": "team-operations/handing-build"},
+            "other": {**entry, "install_path": "team-operations/other"}}})
+    elif case == "a lock that owns its place":
+        _hub_lock(planner / "skills", OWNED)
+    owned = case == "a lock that owns its place"
+    before, sha, stat = _tree(planner), _sha(md), _stat(md)
+
+    result = _seed(planner)
+
+    assert _lists(result) == {**NO_LISTS, "kept": [{"name": NAME, "reason": "changed"}] if owned else []}
+    assert _manifest(planner) == ({} if owned else {NAME: _dir_hash(src)})
+    assert (_sha(md), _stat(md)) == (sha, stat)
+    record = {} if owned else {"skills/.bundled_manifest": f"{NAME}:{_dir_hash(src)}\n".encode("utf-8")}
+    assert _tree(planner) == {**before, **record}
+
+
+@pytest.mark.parametrize("case", [
+    pytest.param("unreadable", marks=needs_real_permissions),
+    "a folder",  # the twin of "unreadable" that holds as root
+    "truncated",
+    "installed is no map",
+])
+def test_addition_11_an_exact_copy_is_kept_with_hub_lock_when_the_lock_cannot_be_read_or_has_no_valid_form(
+        tmp_path, monkeypatch, case):
+    """Review finding 3, through the release's own call: an exact copy at the place its lock names (a
+    readable lock keeps it as "changed", test 10). The seeding, with the essential general skill, ends
+    as for the twin home of a role with no role skills, in the same run."""
+    general = _general(monkeypatch, tmp_path / "general")
+    _write_skill(general, "autonomous-ai-agents/hermes-agent", "essential")
+    planner = _home(tmp_path / "root" / "profiles" / PLANNER)
+    shutil.copytree(REPO / "role-skills" / PLANNER / PLAN, planner / "skills" / PLAN)
+    md = planner / "skills" / PLAN / "SKILL.md"
+    if case == "a folder":
+        (planner / "skills" / ".hub" / "lock.json").mkdir(parents=True)
+    else:
+        forms = {"truncated": json.dumps(OWNED)[:-5].encode("utf-8"),
+                 "installed is no map": {**OWNED, "installed": list(OWNED["installed"].values())}}
+        _hub_lock(planner / "skills", forms.get(case, OWNED))
+    twin = _twin(planner, tmp_path / "twin", OTHER)
+    locks = [home / "skills" / ".hub" / "lock.json" for home in (planner, twin)] if case == "unreadable" else []
+    sha = _sha(md)
+    try:
+        for lock in locks:
+            lock.chmod(0)
+        with_role, without = _seed(planner), _seed(twin)
+    finally:
+        for lock in locks:
+            lock.chmod(0o644)
+
+    assert without["copied"] == ["hermes-agent"] and without["kept"] == []
+    assert with_role == {**without, "kept": [{"name": NAME, "reason": "hub_lock"}],
+                         "skipped": without["skipped"] + 1}
+    assert _tree(planner) == _tree(twin)
+    assert NAME not in _manifest(planner) and _sha(md) == sha
+
+
+@pytest.mark.parametrize("form", [
+    pytest.param(b"", id="empty"),
+    pytest.param(b"\xff", id="no utf-8"),
+    pytest.param([], id="no map"),
+    pytest.param({"version": 1}, id="no installed map"),
+    pytest.param({"version": 1, "installed": {NAME: "official"}}, id="an entry that is no map"),
+    pytest.param({"version": 1, "installed": {"other": {"source": "official"}}}, id="an entry with no install path"),
+    pytest.param({"version": 1, "installed": {NAME: {"install_path": 5}}}, id="an install path that is no text"),
+    pytest.param({"version": 1, "installed": {NAME: {"install_path": "/"}}}, id="an empty install path"),
+])
+def test_addition_11_each_lock_form_that_is_not_valid_keeps_the_exact_copy_with_hub_lock(release, monkeypatch, form):
+    src = _write_skill(release.roles / PLANNER, PLAN, "planner v1")
+    home = _home(release.planner)
+    shutil.copytree(src, home / "skills" / PLAN)
+    _hub_lock(home / "skills", form)
+    before = _tree(home)
+
+    result = _sync(monkeypatch, home)
+
+    assert _lists(result) == {**NO_LISTS, "kept": [{"name": NAME, "reason": "hub_lock"}]}
+    assert _tree(home) == before
+
+
+# -- The addition: a place that the general pass writes (points 12 and 13) ---------------------------
+
+@pytest.mark.parametrize("marked", [True, False], ids=["marker", "no-marker"])
+def test_addition_12_13_a_general_description_in_the_place_of_a_role_skill_refuses_it_in_each_release(
+        tmp_path, monkeypatch, marked):
+    """Review finding 5, through the release's own call: an exact copy of the planner skill, and a general
+    description inside its place. The check reads the whole general catalogue, so the role with the
+    marker, where the general pass writes no description there, is refused too (addition point 15).
+    Two releases; in each, the twin home is seeded by a role with no role skills."""
+    general = _general(monkeypatch, tmp_path / "general")
+    _write_skill(general, "autonomous-ai-agents/hermes-agent", "essential")
+    (general / PLAN).mkdir(parents=True)
+    (general / PLAN / "DESCRIPTION.md").write_text("A general description\n", encoding="utf-8")
+    planner = _home(tmp_path / "root" / "profiles" / PLANNER, marked=marked)
+    shutil.copytree(REPO / "role-skills" / PLANNER / PLAN, planner / "skills" / PLAN)
+    twin = _twin(planner, tmp_path / "twin", OTHER)
+
+    for _ in range(2):  # the second release finds what the first one wrote
+        with_role, without = _seed(planner), _seed(twin)
+
+        assert with_role == {**without, "refused": [{"name": NAME, "reason": "overlap"}]}
+        assert without["refused"] == [] and _tree(planner) == _tree(twin)
+    assert NAME not in _manifest(planner)
+    assert (planner / "skills" / PLAN / "DESCRIPTION.md").is_file() == (not marked)  # the general pass's own
+
+
+@pytest.mark.parametrize("case", [
+    "its own description where the general pass writes one",
+    "a general skill inside its place",
+    "its place inside a general skill",
+    "a general skill at its place, by another name",
+    "a general skill at its backup place",
+    "the record file at its place",
+])
+def test_addition_12_13_a_role_skill_where_the_general_pass_writes_is_refused_and_the_general_pass_is_as_it_is(
+        release, monkeypatch, tmp_path, case):
+    """Review finding 5, in a fresh role with no marker, where the general pass writes the most. The twin
+    home is synced in the same run with no role skills."""
+    rel, name = (".bundled_manifest", "record") if case == "the record file at its place" else (PLAN, NAME)
+    src = _write_skill(release.roles / PLANNER, rel, "planner", name=name)
+    if case == "its own description where the general pass writes one":
+        (src / "DESCRIPTION.md").write_text("The role's description\n", encoding="utf-8")
+        (release.skills / PLAN).mkdir(parents=True)
+        (release.skills / PLAN / "DESCRIPTION.md").write_text("The general description\n", encoding="utf-8")
+    else:
+        general_rel, general_name = {
+            "a general skill inside its place": (f"{PLAN}/extra", "extra"),
+            "its place inside a general skill": ("team-operations", "team-operations"),
+            "a general skill at its place, by another name": (PLAN, "other-name"),
+            "a general skill at its backup place": (f"{PLAN}.bak", "backup-name"),
+            "the record file at its place": ("software-development/spike", "spike"),
+        }[case]
+        _write_skill(release.skills, general_rel, "general", name=general_name)
+    home = _home(release.planner, marked=False)
+    twin = _twin(home, tmp_path / "twin")
+
+    with_role = _sync(monkeypatch, home)
+    _use_role_skills(monkeypatch, tmp_path / "no-role-skills")
+    without = _sync(monkeypatch, twin)
+
+    assert with_role == {**without, "refused": without["refused"] + [{"name": name, "reason": "overlap"}]}
+    assert _tree(home) == _tree(twin)

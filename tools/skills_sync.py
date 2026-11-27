@@ -28,7 +28,7 @@ from tools.skill_usage import _read_skill_name, read_suppressed_names
 from tools.skills_sync_optional import (
     _ignore_runtime_cache, _is_runtime_cache, _read_hub_install_paths,
 )
-from tools.skills_sync_roles import sync_role_skills
+from tools.skills_sync_roles import sync_role_skills, sync_role_skills_alone
 from utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -538,9 +538,10 @@ def sync_skills(quiet: bool = False) -> dict:
         print("  (profile opted out of bundled skills via .no-bundled-skills — seeding essential skills only)")
     bundled_dir = _get_bundled_dir()
     if not bundled_dir.exists():
-        return {"copied": [], "updated": [], "skipped": 0, "user_modified": [], "cleaned": [],
+        return sync_role_skills_alone(quiet, reset, {  # the role pass runs without general skills
+                "copied": [], "updated": [], "skipped": 0, "user_modified": [], "cleaned": [],
                 "suppressed": [], "total_bundled": 0, "not_seeded_by_marker": 0,
-                "optional_provenance_backfilled": [], "kept": [], "refused": []}
+                "optional_provenance_backfilled": [], "kept": [], "refused": []})
     _skills_dir().mkdir(parents=True, exist_ok=True)
     all_bundled = _discover_bundled_skills(bundled_dir)
     suppressed = _read_suppressed_names()
