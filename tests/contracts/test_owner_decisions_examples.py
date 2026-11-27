@@ -260,6 +260,27 @@ async def test_the_decision_list_read_with_owner_answer_serves_the_question_of_e
         assert kanban_db.block_task(
             conn, plain, reason="Which colour do you want for the button?", kind="needs_input",
         )
+        # The clock is not controlled, so each card gets its own fixed creation
+        # time and a later, distinct stop time (the time of its blocked event).
+        created_at = {asked: 1_700_000_000, limit: 1_700_001_000, plain: 1_700_002_000}
+        stopped_at = {asked: 1_700_100_000, limit: 1_700_101_000, plain: 1_700_102_000}
+        for task_id in created_at:
+            conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (created_at[task_id], task_id))
+            changed = conn.execute(
+                "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'blocked'",
+                (stopped_at[task_id], task_id),
+            ).rowcount
+            assert changed == 1
+        conn.commit()
+    iso = {
+        task_id: ow._owner_timestamp(moment)
+        for task_id, moment in {**{f"c{k}": v for k, v in created_at.items()}, **stopped_at}.items()
+    }
+    expected_stop = {"Choose the form": iso[asked], "Fix the form": iso[limit], "Pick the colour": iso[plain]}
+    expected_created = {
+        "Choose the form": iso[f"c{asked}"], "Fix the form": iso[f"c{limit}"], "Pick the colour": iso[f"c{plain}"],
+    }
+    assert len(set(expected_stop.values()) | set(expected_created.values())) == 6
     _adapter, app = _app()
     async with TestClient(TestServer(app)) as client:
         resp = await client.get("/v1/owner-workspace/decisions", params={"capabilities": "owner_answer_v1"})
@@ -269,14 +290,22 @@ async def test_the_decision_list_read_with_owner_answer_serves_the_question_of_e
     saved = owner_payload_example(FAMILY, "decision_list_owner_answer", live)
 
     assert "question" not in str(today)
-    stripped = {**live["body"], "data": [
-        {key: value for key, value in item.items() if key != "question"} for item in live["body"]["data"]
-    ]}
-    assert stripped == today["body"]
+    # The opted-in item's created_at is when the stop began; the no-token item
+    # keeps the card's creation time. Only that and the question may differ.
+    assert {item["title"]: item["created_at"] for item in live["body"]["data"]} == expected_stop
+    assert {item["title"]: item["created_at"] for item in today["body"]["data"]} == expected_created
+
+    def _without(body: dict, *dropped: str) -> dict:
+        return {**body, "data": [
+            {key: value for key, value in item.items() if key not in dropped} for item in body["data"]
+        ]}
+
+    assert _without(live["body"], "question", "created_at") == _without(today["body"], "created_at")
     for answer in (live, saved):
         assert answer["status"] == 200
         items = {item["title"]: item for item in answer["body"]["data"]}
         assert set(items) == {"Choose the form", "Fix the form", "Pick the colour"}
+        assert {title: item["created_at"] for title, item in items.items()} != expected_created
         questions = {title: item["question"] for title, item in items.items()}
         assert {title: question["stop"] for title, question in questions.items()} == {
             "Choose the form": "question", "Fix the form": "review_limit", "Pick the colour": "plain",
