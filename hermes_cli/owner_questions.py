@@ -12,6 +12,9 @@ and the platform fixes that stop's two choices.
 transaction that holds the card ``needs_input`` with the question as its
 reason. :func:`current_questions` reads back the question each card waits on
 now, and :func:`decision_questions` serves it on the Decisions list (card P2).
+:func:`accept_answer` records the owner's answer to it once, as the task event
+``owner_answer_recorded``, comments it on the card and resumes the card, in
+one write transaction (card P3).
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from typing import Any
 
 from hermes_cli.owner_text import check_owner_text
@@ -44,6 +48,10 @@ REVIEW_LIMIT_CHOICES = (
     "Repair it once more with the reviewer's corrections.",
     "Stop this work and release nothing.",
 )
+# The task event that records the owner's answer to one stop, and the author of
+# the comment that gives the answer to the worker (card P3).
+ANSWERED_EVENT = "owner_answer_recorded"
+ANSWER_AUTHOR = "owner"
 
 
 def _plain_text(value: Any, what: str, *, limit: int, sentence: bool) -> str:
@@ -250,6 +258,43 @@ def _served_declaration(payload: Any) -> dict | None:
     return payload if checked == payload else None
 
 
+def _answered(conn: sqlite3.Connection, task_ids: list[str], profile: str) -> set[str]:
+    """The cards among *task_ids* whose stop the owner has answered (card P3).
+
+    A stop is answered when the card holds an ``owner_answer_recorded`` event
+    with its ``stop_ref``. One stop lasts from the card's first ``blocked``
+    event until the card stops waiting, by the kernel's own event kinds
+    (``task_owner_waits``): a resume that is parked for a new approval blocks
+    the card again, and the stop is still the one the owner answered. Read in
+    the caller's snapshot.
+    """
+    from hermes_cli import kanban_db
+
+    kinds = (
+        ANSWERED_EVENT, *kanban_db._STOP_TRANSITION_EVENT_KINDS,
+        *kanban_db._STOP_SUPERSEDING_EVENT_KINDS,
+    )
+    stops: dict[str, list[int]] = {}
+    answers: dict[str, set[str]] = {}
+    for task_id, event_id, kind, payload in conn.execute(
+        "SELECT task_id, id, kind, payload FROM task_events WHERE kind IN ("
+        + ", ".join("?" for _ in kinds) + ") AND task_id IN ("
+        + ", ".join("?" for _ in task_ids) + ") ORDER BY id",
+        (*kinds, *task_ids),
+    ).fetchall():
+        task_id = str(task_id)
+        if kind == ANSWERED_EVENT:
+            answers.setdefault(task_id, set()).add(json.loads(payload)["stop_ref"])
+        elif kind == "blocked":
+            stops.setdefault(task_id, []).append(int(event_id))
+        else:
+            stops[task_id] = []  # the card stopped waiting: its next block is a new stop
+    return {
+        task_id for task_id, refs in answers.items()
+        if refs & {_stop_ref(profile, task_id, event_id) for event_id in stops.get(task_id, [])}
+    }
+
+
 def decision_questions(
     conn: sqlite3.Connection, task_ids: list[str], ctx: Any,
 ) -> dict[str, dict]:
@@ -265,7 +310,9 @@ def decision_questions(
     stop (S4): the question is the text ``owner_stop_reason`` gives, there
     are no choices and the owner's words are required. Each carries its
     ``stop_ref`` (S6), made from ``ctx.profile`` and the id of the card's
-    newest ``blocked`` event. Batched, and read from one snapshot, as
+    newest ``blocked`` event. A card whose stop the owner has answered
+    (:func:`accept_answer`, card P3) is left out too, and its item stays
+    today's. Batched, and read from one snapshot, as
     :func:`current_questions` is.
     """
     from hermes_cli import kanban_db
@@ -289,12 +336,13 @@ def decision_questions(
                 list(waits),
             ).fetchall()
         }
+        answered = _answered(conn, list(waits), str(ctx.profile))
     finally:
         if own_transaction and conn.in_transaction:
             conn.execute("ROLLBACK")  # a read keeps nothing
     served: dict[str, dict] = {}
     for task_id, wait in waits.items():
-        if task_id not in newest:
+        if task_id not in newest or task_id in answered:
             continue
         if task_id in declared:
             payload = _served_declaration(declared[task_id][1])
@@ -315,3 +363,61 @@ def decision_questions(
             "words_limit": WORDS_LIMIT,
         }
     return served
+
+
+def accept_answer(
+    conn: sqlite3.Connection, task_id: str, stop_ref: str, choice: int | None, words: str | None,
+    *, owner: Any,
+) -> str:
+    """Record the owner's answer to the stop *stop_ref* of a stopped card.
+
+    For the owner answer route (card P3), which resolved *task_id* through the
+    owner's own Decisions list. In one write transaction on *conn*, and the
+    first check that fails ends the call: the stop must still take an answer,
+    with no missing named input, no design options waiting and a question
+    :func:`decision_questions` serves, by the one rule it serves by; that
+    question must be served for *stop_ref*; a *choice* that is given must be
+    one it offers; and the answer must have the form it asks for, the
+    owner's words when they are required and else a choice. One
+    ``owner_answer_recorded`` event ``{stop_ref, choice, words_length,
+    actor, answered_at}`` is written; ``owner`` comments on the card with the
+    question, the choice and the words; and the card is resumed as
+    ``unblock_task`` resumes it, to ``review`` when the stop came in a review.
+
+    Returns "resumed", or "recorded" when the card is parked for re-approval
+    instead; or "not_waiting" or "not_allowed", and then nothing was
+    written. A stop takes one answer only.
+    """
+    from hermes_cli import kanban_db
+    from hermes_cli.owner_design_choices import decision_design_options
+    from hermes_cli.owner_named_inputs import decision_missing_inputs
+    from hermes_cli.owner_workspace import _owner_timestamp
+
+    now = int(time.time())
+    with kanban_db.write_txn(conn):
+        if decision_missing_inputs(conn, [task_id]).get(task_id) or decision_design_options(conn, [task_id]):
+            return "not_waiting"
+        question = decision_questions(conn, [task_id], owner).get(task_id)
+        if question is None or question["stop_ref"] != stop_ref:
+            return "not_waiting"
+        chosen = next((served for served in question["choices"] if served["n"] == choice), None)
+        if choice is not None and chosen is None:
+            return "not_waiting"
+        # The form of the answer: the owner's words when the question requires them, else a choice.
+        if (words if question["words"] == "required" else choice) is None:
+            return "not_allowed"
+        kanban_db._append_event(conn, task_id, ANSWERED_EVENT, {
+            "stop_ref": stop_ref, "choice": choice,
+            "words_length": len(words) if words is not None else 0,
+            "actor": owner.actor, "answered_at": _owner_timestamp(now),
+        })
+        lines = [f"The owner answered: {question['text']}"]
+        if chosen is not None:
+            lines.append(f"Choice {choice}: {chosen['sentence']}")
+        if words is not None:
+            lines.append(words)
+        kanban_db.add_comment(
+            conn, task_id, ANSWER_AUTHOR, "\n".join(lines), operation_key=f"owner_answer:{stop_ref}",
+        )
+        resumed = kanban_db._unblock_task_within_txn(conn, task_id, now)
+    return "resumed" if resumed else "recorded"

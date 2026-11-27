@@ -12,7 +12,8 @@ card the real apply path declared and the claim held for the owner's files
 ``POST /v1/owner-workspace/decisions/{ref}/choose/{n}`` and the list read
 with ``design_options_v1`` (card 2 of the design options plan). The list read
 with ``owner_answer_v1`` holds the question of each stopped card (card P2 of
-the owner answer plan). What is
+the owner answer plan), and the owner answer examples come from ``POST
+/v1/owner-workspace/decisions/{ref}/answer`` (card P3). What is
 asserted is described in tests/contracts/conftest.py.
 """
 
@@ -368,6 +369,56 @@ async def test_the_design_choice_examples_come_from_the_real_list_and_choose_rou
         (record,) = listed["body"]["recent_design_choices"]
         assert (record["n"], [option["n"] for option in record["options"]]) == (2, [1, 2])
         assert [option["picture"]["attachment_id"] for option in record["options"]] == decided.attachment_ids
+
+
+@pytest.mark.asyncio
+async def test_the_owner_answer_examples_come_from_the_real_list_and_answer_routes(
+    owner, owner_payload_example,
+):
+    """Card P3 of the owner answer plan: a worker's card stopped on its own
+    question, the list read with ``owner_answer_v1`` served it, and the owner
+    answered it through the answer route; the same answer sent again finds
+    the question no longer waiting, and the list no longer holds the card."""
+    project = _project(owner, "Sign Up Pages")
+    with contextlib.closing(kanban_db.connect(board=project["board"])) as conn:
+        asked = kanban_db.create_task(
+            conn, title="Choose the form", assignee="default", project_id=project["project_id"],
+        )
+        claimed = kanban_db.claim_task(conn, asked)
+        assert claimed is not None
+        oq.declare_owner_question(
+            conn, asked, "question", "Which sign up page should Raphael build first?", [
+                {"n": 1, "sentence": "Build the short form with one field."},
+                {"n": 2, "sentence": "Build the long form with every field."},
+            ], "optional", board=project["board"], expected_run_id=claimed.current_run_id,
+        )
+    _adapter, app = _app()
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/v1/owner-workspace/decisions", params={"capabilities": "owner_answer_v1"})
+        (item,) = (await resp.json())["data"]
+        ref, stop_ref = item["decision_ref"], item["question"]["stop_ref"]
+        answers = {}
+        for name in ("owner_answer_recorded", "owner_answer_not_waiting"):
+            resp = await client.post(
+                f"/v1/owner-workspace/decisions/{ref}/answer",
+                json={"stop_ref": stop_ref, "choice": 2, "words": "Keep the button green."},
+            )
+            answers[name] = {"status": resp.status, "body": await resp.json()}
+        resp = await client.get("/v1/owner-workspace/decisions", params={"capabilities": "owner_answer_v1"})
+        listed = await resp.json()
+
+    saved = {name: owner_payload_example(FAMILY, name, live) for name, live in answers.items()}
+
+    for live in (answers, saved):
+        assert live["owner_answer_recorded"] == {"status": 200, "body": {
+            "object": "hermes.owner_workspace.owner_answer",
+            "decision_ref": ref, "stop_ref": stop_ref, "choice": 2, "resumed": True,
+        }}
+        refused = live["owner_answer_not_waiting"]
+        assert refused["status"] == 404
+        assert refused["body"]["error"]["message"] == "This question is no longer waiting."
+        assert refused["body"]["error"]["code"] == "decision_not_found"
+    assert listed["data"] == []
 
 
 @pytest.mark.asyncio

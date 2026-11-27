@@ -7325,6 +7325,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 __import__("gateway.platforms.api_server_owner_inputs", fromlist=["route"]).route(self),
             ),
             ("POST", "/v1/owner-workspace/decisions/{ref}/choose/{n}", __import__("gateway.platforms.api_server_owner_choices", fromlist=["route"]).route(self)),
+            ("POST", "/v1/owner-workspace/decisions/{ref}/answer", __import__("gateway.platforms.api_server_owner_answers", fromlist=["route"]).route(self)),
             ("POST", "/v1/owner-workspace/decisions/{ref}/update", __import__("gateway.platforms.api_server_owner_model_updates", fromlist=["route"]).route(self)),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
