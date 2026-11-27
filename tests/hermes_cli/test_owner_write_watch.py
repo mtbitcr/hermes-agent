@@ -1360,11 +1360,13 @@ def test_page_lines_output_past_the_bound_is_read_and_dropped_and_the_exit_statu
         return data
 
     on_page_check_reads(monkeypatch, recording_read)
+    # A limit with less than 150 seconds leaves no room for the second try, so one stream is read.
+    monkeypatch.setattr(watch, "PAGE_CHECK_TIMEOUT_SECONDS", watch.PAGE_CHECK_RETRY_WAIT_SECONDS + watch.PAGE_CHECK_RETRY_MIN_SECONDS - 1)
     body = f"i=0\nwhile [ $i -lt 1500 ]; do echo \"FAIL page_$i 390 check\"; i=$((i+1)); done\ntouch {marker}\nexit 1\n"
     _, _, entry = real_page_run(tmp_path, body)
     written = "".join(f"FAIL page_{i} 390 check\n" for i in range(1500)).encode()
     assert len(written) > 16000
-    assert b"".join(chunks) == written * 2
+    assert b"".join(chunks) == written
     first = written[:16000]
     complete = first.count(b"\n")
     assert entry["page_lines"] == {"lines": [f"FAIL page_{i} 390 check" for i in range(20)],
@@ -1461,20 +1463,20 @@ def test_page_lines_no_pipe_runs_the_script_once_and_the_report_is_saved(tmp_pat
     real_pipe = watch.os.pipe
     refused = []
 
-    def pipe_once_refused():
-        if not refused:
+    def stdout_pipe_refused():
+        if sys._getframe(1).f_code.co_name == "_get_handles":  # the stdout pipe of each try; the exec error pipe stays
             refused.append(True)
             raise OSError("no pipe")
         return real_pipe()
 
     runs = tmp_path / "runs"
-    monkeypatch.setattr(watch.os, "pipe", pipe_once_refused)
+    monkeypatch.setattr(watch.os, "pipe", stdout_pipe_refused)
     host, outcome, entry = real_page_run(tmp_path, f"echo run >> {runs}\necho 'FAIL home 390 check'\nexit 1\n")
-    assert refused
+    assert len(refused) == 2
     assert runs.read_text(encoding="utf-8").count("run") == 2
     assert entry["outcome"] == watch.FAIL
-    assert entry["page_lines"] == {"lines": ["FAIL home 390 check"], "not_kept": 0}
-    assert entry["page_tries"][0]["page_lines"] is None
+    assert "page_lines" not in entry
+    assert [try_["page_lines"] for try_ in entry["page_tries"]] == [None, None]
     assert entry["detail"] == "did not pass"
     watch.state_path().unlink()
     host.clock = START
@@ -1588,13 +1590,14 @@ class FakeTime:
     def __init__(self):
         self.now = 1000.0
         self.slept = []
+        self.late = 0.0
 
     def monotonic(self):
         return self.now
 
     def sleep(self, seconds):
         self.slept.append(seconds)
-        self.now += seconds
+        self.now += seconds + self.late
 
 
 @pytest.fixture
@@ -1686,8 +1689,8 @@ def test_retry_a_passed_first_try_runs_the_script_once_and_writes_no_second_file
 def test_retry_the_second_try_starts_only_with_120_seconds_left(tmp_path, fake_time, monkeypatch, spent, second_try):
     limits = []
 
-    def page_check(path, seconds):
-        limits.append(seconds)
+    def page_check(path, deadline):
+        limits.append(deadline - fake_time.now)
         if len(limits) == 1:
             fake_time.now += spent
         return watch.FAIL, FAILED_LINES
@@ -1705,8 +1708,8 @@ def test_retry_the_second_try_starts_only_with_120_seconds_left(tmp_path, fake_t
 def test_retry_the_second_try_gets_the_time_that_is_left(tmp_path, fake_time, monkeypatch):
     limits = []
 
-    def page_check(path, seconds):
-        limits.append(seconds)
+    def page_check(path, deadline):
+        limits.append(deadline - fake_time.now)
         fake_time.now += 100
         return (watch.FAIL, None) if len(limits) == 1 else (watch.PASS, None)
 
@@ -1763,3 +1766,100 @@ def test_last_failure_the_next_failed_run_replaces_the_second_file(tmp_path, fak
     host.refuse(second_probe, 403, "route_not_allowed")
     host.run(run_page_check=lambda path: watch.PASS)
     assert last_failure_path().read_bytes() == watch.report_path().read_bytes() != first
+
+
+def test_retry_an_overslept_cooldown_leaves_the_first_failure_standing(tmp_path, fake_time):
+    fake_time.late = 0.2
+    host = Host(tmp_path)
+    page, outcome = recorded_run(host, fake_time, (watch.FAIL, FAILED_LINES), (watch.PASS, PASSED_LINES), spend=449.9)
+    assert fake_time.slept == [30]
+    assert len(page.calls) == 1
+    assert outcome.kind == "alert"
+    entry = page_entry(watch.report_path())
+    assert entry["outcome"] == watch.FAIL
+    assert entry["page_tries"] == [{"outcome": watch.FAIL, "page_lines": FAILED_LINES}]
+    assert last_failure_path().read_bytes() == watch.report_path().read_bytes()
+
+
+class FakeProcess:
+    """A page check process that needs ``runs_for`` seconds of the fake clock and takes ``launch`` seconds to start."""
+
+    def __init__(self, fake_time, launch, runs_for, status):
+        fake_time.now += launch
+        self.fake_time, self.left, self.status, self.waits = fake_time, runs_for, status, []
+        self.stdout = None
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if timeout is None or self.left <= timeout:
+            self.fake_time.now += self.left
+            self.left = 0
+            return self.status
+        self.fake_time.now += timeout
+        self.left -= timeout
+        raise subprocess.TimeoutExpired("page-check", timeout)
+
+    def kill(self):
+        pass
+
+
+def test_retry_the_launch_of_the_second_try_comes_out_of_the_one_limit_of_600_seconds(tmp_path, fake_time, monkeypatch):
+    specs = [(0, 20, 1), (5, 550, 0)]
+    processes = []
+
+    def popen(argv, **kwargs):
+        processes.append(FakeProcess(fake_time, *specs[len(processes)]))
+        return processes[-1]
+
+    monkeypatch.setattr(watch, "subprocess", SimpleNamespace(
+        Popen=popen, PIPE=subprocess.PIPE, DEVNULL=subprocess.DEVNULL, TimeoutExpired=subprocess.TimeoutExpired))
+    host = Host(tmp_path)
+    outcome = host.run(run_page_check=None)
+    assert fake_time.slept == [30]
+    assert len(processes) == 2
+    assert processes[1].waits[0] == 545
+    entry = page_entry(watch.report_path())
+    assert entry["outcome"] == watch.UNKNOWN
+    assert [try_["outcome"] for try_ in entry["page_tries"]] == [watch.FAIL, watch.UNKNOWN]
+    assert outcome.text == ""
+    assert last_failure_path().read_bytes() == watch.report_path().read_bytes()
+
+
+@pytest.mark.parametrize("results", [((watch.FAIL, FAILED_LINES), (watch.FAIL, FAILED_LINES)),
+                                     ((watch.FAIL, FAILED_LINES), (watch.PASS, PASSED_LINES))])
+def test_last_failure_a_write_fault_on_the_second_file_alone_changes_neither_decision_nor_exit(
+        tmp_path, fake_time, monkeypatch, capsys, results):
+    import errno
+
+    real_write = watch._write
+    faulty = [True]
+
+    def write(path, data):
+        if faulty[0] and path.name == LAST_FAILURE_FILE:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real_write(path, data)
+
+    monkeypatch.setattr(watch, "_write", write)
+    host = Host(tmp_path)
+    host.run()
+    capsys.readouterr()
+    state_before = watch.state_path().read_bytes()
+    _, faulted = recorded_run(host, fake_time, *results)
+    err = capsys.readouterr().err
+    state = watch.state_path().read_bytes()
+    report = watch.report_path().read_bytes()
+    assert not last_failure_path().exists()
+    assert "state not saved" not in err
+    assert "last failure report not saved: OSError" in err
+    faulty[0] = False
+    watch.state_path().write_bytes(state_before)
+    host.clock -= HOUR
+    _, reference = recorded_run(host, fake_time, *results)
+    assert (faulted.code, faulted.kind, faulted.text) == (reference.code, reference.kind, reference.text)
+    assert faulted.code == 0
+    assert state == watch.state_path().read_bytes()
+    assert report == watch.report_path().read_bytes()
+    assert last_failure_path().exists()

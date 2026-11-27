@@ -321,11 +321,14 @@ def run(
                              for result in results]}
         _write(report_path(), report)
         _write(state_path(), state)
-        if any(result.outcome == FAIL or any(t["outcome"] == FAIL for t in result.page_tries or ()) for result in results):
-            _write(last_failure_path(), report)
     except OSError as exc:
         print(f"owner write watch: state not saved: {type(exc).__name__}", file=sys.stderr)
         return Outcome(1, kind, text)
+    if any(result.outcome == FAIL or any(t["outcome"] == FAIL for t in result.page_tries or ()) for result in results):
+        try:
+            _write(last_failure_path(), report)
+        except OSError as exc:
+            print(f"owner write watch: last failure report not saved: {type(exc).__name__}", file=sys.stderr)
     return Outcome(0, kind, text)
 
 
@@ -350,18 +353,18 @@ def _probe(probe: Probe, base: str, key: str, send: Callable[..., Any], clock) -
 
 
 def _page_check(path: str, run_page_check: Optional[Callable[[str], Any]], clock) -> Result:
-    started = time.monotonic()
+    deadline = time.monotonic() + PAGE_CHECK_TIMEOUT_SECONDS  # one absolute limit for both tries and their waits
 
-    def attempt(seconds: float):
-        outcome = run_page_check(path) if run_page_check else _run_page_check(path, seconds)
+    def attempt():
+        outcome = run_page_check(path) if run_page_check else _run_page_check(path, deadline)
         outcome, page_lines = outcome if isinstance(outcome, tuple) else (outcome, None)
         return outcome if outcome in (PASS, FAIL, UNKNOWN) else FAIL, page_lines
 
-    tries = [attempt(PAGE_CHECK_TIMEOUT_SECONDS)]
-    left = PAGE_CHECK_TIMEOUT_SECONDS - (time.monotonic() - started)
-    if tries[0][0] == FAIL and left - PAGE_CHECK_RETRY_WAIT_SECONDS >= PAGE_CHECK_RETRY_MIN_SECONDS:
+    tries = [attempt()]
+    if tries[0][0] == FAIL and deadline - time.monotonic() - PAGE_CHECK_RETRY_WAIT_SECONDS >= PAGE_CHECK_RETRY_MIN_SECONDS:
         time.sleep(PAGE_CHECK_RETRY_WAIT_SECONDS)
-        tries.append(attempt(PAGE_CHECK_TIMEOUT_SECONDS - (time.monotonic() - started)))
+        if deadline - time.monotonic() >= PAGE_CHECK_RETRY_MIN_SECONDS:  # the sleep may have woken late
+            tries.append(attempt())
     outcome, page_lines = tries[-1]
     return Result(_PAGE_CHECK, _PAGE_CHECK_LABEL, outcome, detail="did not pass", method="run", path=path,
                   at=clock().isoformat(), page_lines=page_lines,
@@ -607,9 +610,9 @@ def _read_page_check_output(proc, deadline: float) -> Optional[bytes]:
         return None
 
 
-def _run_page_check(path: str, seconds: float):
+def _run_page_check(path: str, deadline: float):
     """``(outcome, page_lines)``: page_lines is the kept lines of the script's standard output, None when none were captured.
-    ``seconds`` is the limit of this one try."""
+    ``deadline`` is the absolute time.monotonic() limit, taken before the first launch."""
     for stdout in (subprocess.PIPE, subprocess.DEVNULL):  # no pipe: run the script as before, with no lines
         try:
             proc = subprocess.Popen([path], stdin=subprocess.DEVNULL, stdout=stdout, stderr=subprocess.DEVNULL)
@@ -618,7 +621,6 @@ def _run_page_check(path: str, seconds: float):
             pass
     else:
         return FAIL, None
-    deadline = time.monotonic() + seconds
     try:
         data = _read_page_check_output(proc, deadline) if proc.stdout else None
         try:
