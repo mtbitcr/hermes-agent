@@ -107,6 +107,21 @@ def _repositories(tmp_path):
     return work, bare, remotes.as_uri(), commits
 
 
+def _owner_app_origin(tmp_path):
+    """The owner app repository with one commit on a bare remote laid out like GitHub, and an empty bare copy to
+    fetch it into: what the release_source step's one operation, the exact fetch of that commit, needs."""
+    work = tmp_path / "owner-app"
+    _git("init", "-q", "-b", "main", str(work))
+    _git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false",
+         "commit", "-q", "--allow-empty", "-m", "owner app", cwd=work)
+    remotes, copy = tmp_path / "owner-app-remotes", tmp_path / "owner-app-copy.git"
+    bare = remotes / "mtbitcr" / "raphael-workspace.git"
+    for repository in (bare, copy):
+        _git("init", "-q", "--bare", str(repository))
+    _git("push", "-q", str(bare), "main", cwd=work)
+    return remotes.as_uri(), copy, _git("rev-parse", "HEAD", cwd=work)
+
+
 def _remote_head(bare, branch):
     return _RUN(["git", "--git-dir", str(bare), "rev-parse", "--verify", "-q", f"refs/heads/{branch}"],
                 capture_output=True, text=True).stdout.strip()
@@ -378,7 +393,7 @@ def github(tmp_path):
         thread.join()
 
 
-def test_no_administration_call_is_possible(github, monkeypatch):
+def test_no_administration_call_is_possible(github, monkeypatch, tmp_path):
     mod = _transport_module(monkeypatch, github)
     forbidden = ("protection", "rules", "settings", "hooks", "collaborators", "keys", "admin",
                  "permissions", "branches", "installation")
@@ -409,10 +424,15 @@ def test_no_administration_call_is_possible(github, monkeypatch):
     assert github["calls"]
     for method, path in github["calls"]:  # everything that reached the network was allowlisted
         assert any(m == method and rx.fullmatch(path.split("?")[0]) for m, rx in allowed), (method, path)
+    # The release_source step made no REST call: its one token request is its one operation, an exact owner app fetch.
+    origin, copy, commit = _owner_app_origin(tmp_path)
+    monkeypatch.setattr(mod, "GIT_ORIGIN", origin)
+    mod.GitHubTransport("release_source", SIBLING, key_path=github["key_file"]).fetch_commit(copy, commit)
     assert len(github["token_requests"]) == len(mod.STEP_PERMISSIONS)
-    for body in github["token_requests"]:
+    for body in github["token_requests"][:-1]:  # each other step's, for its REST calls
         assert "administration" not in json.dumps(body).lower()
         assert body["repositories"] == ["hermes-agent"]
+    assert github["token_requests"][-1] == {"repositories": ["raphael-workspace"], "permissions": {"contents": "read"}}
 
 
 def test_token_never_reaches_model_visible_output(github, monkeypatch, caplog, capfd, tmp_path):
@@ -550,7 +570,7 @@ def test_path_outside_the_allowlist_is_refused_before_any_socket(monkeypatch, tm
     assert opened == []
 
 
-def test_no_token_request_names_administration(github, monkeypatch):
+def test_no_token_request_names_administration(github, monkeypatch, tmp_path):
     mod = _transport_module(monkeypatch, github)
     for step in ({"administration": "write"}, "administration", "publish ", None):
         with pytest.raises(mod.GitHubTransportError):
@@ -560,17 +580,28 @@ def test_no_token_request_names_administration(github, monkeypatch):
     with pytest.raises(TypeError):
         mod.STEP_PERMISSIONS["admin"] = {"administration": "write"}
 
+    origin, copy, commit = _owner_app_origin(tmp_path)  # where the release_source step's one exact fetch reads
+    monkeypatch.setattr(mod, "GIT_ORIGIN", origin)
     steps = []  # each transport mints its one token in loop order, so the nth token request is the nth step's
     for repository in (REPO, SIBLING):
         for step in mod.STEP_PERMISSIONS:
             transport = mod.GitHubTransport(step, repository, key_path=github["key_file"])
-            steps.append(step)
+            minted = len(github["token_requests"])
             for entry in mod.REST_ALLOWLIST:  # every call the step may make shares its one token
                 try:
                     transport.request(entry.method, entry.template.format(**{**SAMPLE, "repo": repository}),
                                       query={k: SAMPLE[k] for k in entry.required_query})
                 except mod.GitHubTransportError as exc:
                     assert exc.reason in {"step_not_permitted", "endpoint_not_allowed", "body_not_allowed"}
+            if step == "release_source":  # no REST call: its one token is for the exact fetch of an owner app commit
+                assert len(github["token_requests"]) == minted
+                if repository == REPO:  # and on the platform repository none at all, so it is not in steps
+                    with pytest.raises(mod.GitHubTransportError) as refused:
+                        transport.fetch_commit(copy, commit)
+                    assert refused.value.reason == "step_not_permitted" and len(github["token_requests"]) == minted
+                    continue
+                transport.fetch_commit(copy, commit)
+            steps.append(step)
 
     requests = github["token_requests"]
     assert len(requests) == len(steps)  # the stand-in's own count: one per step and repository
