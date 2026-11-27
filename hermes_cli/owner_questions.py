@@ -258,41 +258,47 @@ def _served_declaration(payload: Any) -> dict | None:
     return payload if checked == payload else None
 
 
-def _answered(conn: sqlite3.Connection, task_ids: list[str], profile: str) -> set[str]:
-    """The cards among *task_ids* whose stop the owner has answered (card P3).
+def _answered(conn: sqlite3.Connection, task_ids: list[str], profile: str) -> dict[str, set[str]]:
+    """The ``stop_ref`` of each stop of *task_ids* that the owner has answered (card P3).
 
     A stop is answered when the card holds an ``owner_answer_recorded`` event
-    with its ``stop_ref``. One stop lasts from the card's first ``blocked``
-    event until the card stops waiting, by the kernel's own event kinds
-    (``task_owner_waits``): a resume that is parked for a new approval blocks
-    the card again, and the stop is still the one the owner answered. Read in
-    the caller's snapshot.
+    with its ``stop_ref``. The answer covers one more ``blocked`` event: the
+    park that :func:`accept_answer`'s own resume writes, instead of an
+    ``unblocked`` event, when the card's route must be approved again
+    (``kanban_db._pause_unpinnable_task``, ``reapproval_required`` in its
+    payload). That park is the card's first ``blocked`` event after the
+    answer to the stop before it, and while it stays the card's newest
+    ``blocked`` event the stop is still the one the owner answered. Every
+    other ``blocked`` event is a new stop: the next one after any release of
+    the card, and each later block of the parked card. Read in the caller's
+    snapshot.
     """
-    from hermes_cli import kanban_db
-
-    kinds = (
-        ANSWERED_EVENT, *kanban_db._STOP_TRANSITION_EVENT_KINDS,
-        *kanban_db._STOP_SUPERSEDING_EVENT_KINDS,
-    )
-    stops: dict[str, list[int]] = {}
-    answers: dict[str, set[str]] = {}
+    blocked: dict[str, int] = {}  # each card's newest blocked event so far
+    after_answer: set[str] = set()  # the cards whose newest event so far answers the stop of that blocked event
+    answered: dict[str, set[str]] = {}
     for task_id, event_id, kind, payload in conn.execute(
-        "SELECT task_id, id, kind, payload FROM task_events WHERE kind IN ("
-        + ", ".join("?" for _ in kinds) + ") AND task_id IN ("
-        + ", ".join("?" for _ in task_ids) + ") ORDER BY id",
-        (*kinds, *task_ids),
+        "SELECT task_id, id, kind, payload FROM task_events WHERE kind IN (?, 'blocked', 'unblocked') "
+        "AND task_id IN (" + ", ".join("?" for _ in task_ids) + ") ORDER BY id",
+        (ANSWERED_EVENT, *task_ids),
     ).fetchall():
         task_id = str(task_id)
         if kind == ANSWERED_EVENT:
-            answers.setdefault(task_id, set()).add(json.loads(payload)["stop_ref"])
-        elif kind == "blocked":
-            stops.setdefault(task_id, []).append(int(event_id))
-        else:
-            stops[task_id] = []  # the card stopped waiting: its next block is a new stop
-    return {
-        task_id for task_id, refs in answers.items()
-        if refs & {_stop_ref(profile, task_id, event_id) for event_id in stops.get(task_id, [])}
-    }
+            stop_ref = json.loads(payload)["stop_ref"]
+            answered.setdefault(task_id, set()).add(stop_ref)
+            if task_id in blocked and stop_ref == _stop_ref(profile, task_id, blocked[task_id]):
+                after_answer.add(task_id)
+            continue
+        if kind == "blocked":
+            if task_id in after_answer:
+                try:
+                    park = json.loads(payload) if payload else {}
+                except (TypeError, ValueError):
+                    park = {}
+                if isinstance(park, dict) and park.get("reapproval_required") is True:
+                    answered[task_id].add(_stop_ref(profile, task_id, int(event_id)))
+            blocked[task_id] = int(event_id)
+        after_answer.discard(task_id)
+    return answered
 
 
 def decision_questions(
@@ -310,9 +316,10 @@ def decision_questions(
     stop (S4): the question is the text ``owner_stop_reason`` gives, there
     are no choices and the owner's words are required. Each carries its
     ``stop_ref`` (S6), made from ``ctx.profile`` and the id of the card's
-    newest ``blocked`` event. A card whose stop the owner has answered
-    (:func:`accept_answer`, card P3) is left out too, and its item stays
-    today's. Batched, and read from one snapshot, as
+    newest ``blocked`` event. A card whose ``stop_ref`` names a stop the
+    owner has answered (:func:`accept_answer`, card P3; :func:`_answered`) is
+    left out too, and its item stays today's. Batched, and read from one
+    snapshot, as
     :func:`current_questions` is.
     """
     from hermes_cli import kanban_db
@@ -342,7 +349,10 @@ def decision_questions(
             conn.execute("ROLLBACK")  # a read keeps nothing
     served: dict[str, dict] = {}
     for task_id, wait in waits.items():
-        if task_id not in newest or task_id in answered:
+        if task_id not in newest:
+            continue
+        stop_ref = _stop_ref(str(ctx.profile), task_id, newest[task_id])
+        if stop_ref in answered.get(task_id, ()):
             continue
         if task_id in declared:
             payload = _served_declaration(declared[task_id][1])
@@ -356,7 +366,7 @@ def decision_questions(
         served[task_id] = {
             "object": OBJECT,
             "stop": stop,
-            "stop_ref": _stop_ref(str(ctx.profile), task_id, newest[task_id]),
+            "stop_ref": stop_ref,
             "text": text,
             "choices": [dict(choice) for choice in choices],
             "words": words,

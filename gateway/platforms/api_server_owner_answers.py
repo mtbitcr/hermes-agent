@@ -101,7 +101,7 @@ def route(adapter: Any):
 async def _body(request: web.Request) -> Optional[tuple[str, Optional[int], Optional[str]]]:
     """The ``stop_ref``, ``choice`` and ``words`` of the request's body, or ``None`` for any other body."""
     try:
-        body = json.loads(await request.read())
+        body = json.loads(await request.read(), object_pairs_hook=_members)
     except (ValueError, RecursionError, web.HTTPRequestEntityTooLarge):
         return None
     if not isinstance(body, dict) or set(body) != {"stop_ref", "choice", "words"}:
@@ -119,6 +119,14 @@ async def _body(request: web.Request) -> Optional[tuple[str, Optional[int], Opti
     if choice is None and words is None:
         return None
     return stop_ref, choice, words
+
+
+def _members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """The members of one JSON object of the body; a name given twice refuses the body while it is decoded."""
+    members = dict(pairs)
+    if len(members) != len(pairs):
+        raise ValueError("a member name is repeated")
+    return members
 
 
 def _answer(owner: ow.OwnerContext, ref: str, stop_ref: str, choice: Optional[int], words: Optional[str]) -> str:

@@ -423,15 +423,24 @@ async def test_35_i_each_refused_body_gets_400_and_the_card_is_not_looked_up(own
             # Larger than the server reads.
             {**good, "words": "a" * (1024 * 1024)},
         ]
+        # One member given twice: a refused value, then a valid one; the other way round; and one valid value twice.
+        repeats = [
+            (json.dumps({**good, name: first})[:-1] + f", {json.dumps(name)}: {json.dumps(last)}}}").encode("utf-8")
+            for name, wrong in (("stop_ref", stop_ref.upper()), ("choice", True), ("words", "Keep it\x00"))
+            for first, last in ((wrong, good[name]), (good[name], wrong), (good[name], good[name]))
+        ]
         refused = [await _answer(client, ref, body) for body in bodies]
         # The header is checked first, and a refused key never reaches the card either.
         bad_key = await _answer(client, ref, good, {"Idempotency-Key": "not a key"})
+        # The repeated members are sent with a key of their own, and the cache keeps no answer for it.
+        headers = {"Idempotency-Key": "answer-repeated-" + "c3e8a571" * 4}
+        repeated = [await _answer(client, ref, body, headers) for body in repeats]
         unchanged = _observed(card)
         refused_lookups = list(looked_up)
-        # Control: words of exactly 1000 code points, none of them in the basic plane, are taken.
-        taken = await _answer(client, ref, {**good, "words": "\U0001F600" * 1000})
+        # Control: words of exactly 1000 code points, none of them in the basic plane, are taken, under that same key.
+        taken = await _answer(client, ref, {**good, "words": "\U0001F600" * 1000}, headers)
 
-    for answer in [*refused, bad_key]:
+    for answer in [*refused, bad_key, *repeated]:
         _assert_refused(answer, 400, _STORED_FAILURE, "invalid_argument")
     assert refused_lookups == [] and unchanged == before
     assert taken == _answered(ref, stop_ref, 1, True) and looked_up == [ref]
@@ -584,6 +593,98 @@ async def test_35_m_a_card_parked_for_a_new_approval_keeps_the_answer_and_takes_
     # The list serves no question for the card: its item is today's item.
     assert listed["decision_ref"] == ref and "question" not in listed
     assert listed == today
+
+
+@pytest.mark.asyncio
+async def test_35_m_a_parked_card_promoted_by_hand_serves_its_next_question_and_takes_its_answer(owner):
+    project = _project(owner, "Sign up Website")
+    card = _card(project, "Build the sign up page")
+    question = "Which colour should the sign up button have?"
+
+    async with TestClient(TestServer(_app())) as client:
+        item = await _listed(client, card)
+        ref, old = item["decision_ref"], item["question"]["stop_ref"]
+        # The first answer's resume is parked for a new approval, as in 35m.
+        with contextlib.closing(kb.connect(board=card.board)) as conn:
+            (lock,) = conn.execute("SELECT model_policy_lock FROM tasks WHERE id = ?", (card.task_id,)).fetchone()
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET model_policy_lock = 'not-a-real-lock' WHERE id = ?", (card.task_id,))
+        first = await _answer(client, ref, {"stop_ref": old, "choice": 1, "words": None})
+        # The route is approved again, the operator promotes the card by hand (``promoted_manual``), and its worker
+        # claims it and declares a new question.
+        with contextlib.closing(kb.connect(board=card.board)) as conn:
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET model_policy_lock = ? WHERE id = ?", (lock, card.task_id))
+            assert kb.promote_task(conn, card.task_id, actor="operator") == (True, None)
+            run = kb.claim_task(conn, card.task_id)
+            assert run is not None and run.status == "running"
+            oq.declare_owner_question(
+                conn, card.task_id, "question", question, copy.deepcopy(_CHOICES), "optional",
+                board=card.board, expected_run_id=run.current_run_id,
+            )
+            new = _stop_ref(owner, card.task_id, _newest_blocked(conn, card.task_id))
+        held = _observed(card)
+        listed = await _listed(client, card)
+        stale = await _answer(client, ref, {"stop_ref": old, "choice": 1, "words": None})
+        refused = _observed(card)
+        taken = await _answer(client, ref, {"stop_ref": new, "choice": 2, "words": None})
+
+    assert first == _answered(ref, old, 1, False)
+    # The new stop is served under the same key, with a stop reference of its own.
+    assert new != old and listed["decision_ref"] == ref
+    assert listed.get("question") == {
+        "object": oq.OBJECT, "stop": "question", "stop_ref": new, "text": question, "choices": _CHOICES,
+        "words": "optional", "words_limit": oq.WORDS_LIMIT,
+    }
+    # The old stop still takes no answer, and nothing is written.
+    _assert_refused(stale, 404, _NOT_WAITING, "decision_not_found")
+    assert refused == held
+    # The new stop takes its answer and the card resumes: one answer event for each of the two stops.
+    assert taken == _answered(ref, new, 2, True)
+    done = _observed(card)
+    assert [(answer["stop_ref"], answer["choice"]) for answer in done["answers"]] == [(old, 1), (new, 2)]
+    assert done["comments"] == [
+        ("owner", f"The owner answered: {_QUESTION}\nChoice 1: {_CHOICES[0]['sentence']}"),
+        ("owner", f"The owner answered: {question}\nChoice 2: {_CHOICES[1]['sentence']}"),
+    ]
+    assert (done["status"], done["unblocked"]) == ("ready", 1)
+
+
+@pytest.mark.asyncio
+async def test_35_m_a_parked_card_parked_again_without_a_release_has_a_new_stop(owner):
+    project = _project(owner, "Sign up Website")
+    card = _card(project, "Build the sign up page")
+
+    async with TestClient(TestServer(_app())) as client:
+        item = await _listed(client, card)
+        ref, old = item["decision_ref"], item["question"]["stop_ref"]
+        with contextlib.closing(kb.connect(board=card.board)) as conn:
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET model_policy_lock = 'not-a-real-lock' WHERE id = ?", (card.task_id,))
+        first = await _answer(client, ref, {"stop_ref": old, "choice": 1, "words": None})
+        parked = await _listed(client, card)
+        # A person promotes the card while its route still cannot be confirmed: the kernel parks it again, with a new
+        # blocked event and no release.
+        with contextlib.closing(kb.connect(board=card.board)) as conn:
+            promoted, _reason = kb.promote_task(conn, card.task_id, actor="operator")
+            new = _stop_ref(owner, card.task_id, _newest_blocked(conn, card.task_id))
+        held = _observed(card)
+        listed = await _listed(client, card)
+        stale = await _answer(client, ref, {"stop_ref": old, "choice": 1, "words": None})
+        refused = _observed(card)
+        taken = await _answer(client, ref, {"stop_ref": new, "choice": None, "words": _WORDS})
+
+    assert first == _answered(ref, old, 1, False) and "question" not in parked
+    assert promoted is False
+    assert (held["status"], held["block_kind"], held["unblocked"]) == ("blocked", "needs_input", 0)
+    # The later block is a new stop: the list serves it as a plain stop, with a stop reference of its own.
+    assert new != old and listed.get("question", {}).get("stop_ref") == new
+    assert (listed["question"]["choices"], listed["question"]["words"]) == ([], "required")
+    _assert_refused(stale, 404, _NOT_WAITING, "decision_not_found")
+    assert refused == held
+    # It takes its answer; the route still cannot be confirmed, so the card is parked once more.
+    assert taken == _answered(ref, new, None, False)
+    assert [answer["stop_ref"] for answer in _observed(card)["answers"]] == [old, new]
 
 
 # ---------------------------------------------------------------------------
