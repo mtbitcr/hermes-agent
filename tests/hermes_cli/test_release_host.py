@@ -26,6 +26,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import release_host
 from hermes_cli.release_guards import GUARDS, Pins, RecordedMerge, prepare
 from hermes_cli.release_host import LiveHostReader
+from hermes_cli.release_routes import RoutePlan, RoutePlanError, plan_routes
 from tests.hermes_cli._kanban_fence_support import (
     DEFAULT_GIT_IDENTITY,
     create_fenced_board,
@@ -46,6 +47,10 @@ CONFIG_KEYS = {
     for home in ("", "profiles/coder/", "profiles/writer/")
     for name in ("config.yaml", ".env")
 }
+# The route file, and its content at PREV and at NEW: one route goes, another comes, for both roles.
+ROUTE_FILE = "gateway/platforms/api_server_route_profiles.json"
+PREV_ROUTES = {"GET /v1/models": ["default", "coder"], "GET /v1/jobs": ["default", "coder"]}
+NEW_ROUTES = {"GET /v1/models": ["default", "coder"], "POST /v1/runs": ["default", "coder"]}
 # A beta board writer in a process of its own, since SQLite shares one -shm mapping between the
 # connections of a process. It commits an open run whose worker is the given pid, then exits
 # without closing the board, or idles with it open until its input ends and then closes it.
@@ -125,14 +130,17 @@ def _merge(work, name):
 
 
 def _repository(tmp_path):
-    """A checkout at PREV whose bare origin is two merges ahead. Returns (checkout, PREV, merges)."""
+    """A checkout at PREV whose bare origin is two merges ahead; PREV holds the route file and the
+    merges keep it. Returns (checkout, PREV, merges)."""
     checkout, remote, work = tmp_path / "checkout", tmp_path / "origin.git", tmp_path / "work"
     git(tmp_path, "init", "--bare", "--initial-branch=main", str(remote))
     make_git_repo(checkout)
     (checkout / ".gitignore").write_text("venv/\n", encoding="utf-8")
     (checkout / "hermes_cli").mkdir()
     (checkout / "hermes_cli" / "__init__.py").write_text("", encoding="utf-8")
-    git(checkout, "add", ".gitignore", "hermes_cli/__init__.py")
+    (checkout / ROUTE_FILE).parent.mkdir(parents=True)
+    (checkout / ROUTE_FILE).write_text(_route_text(PREV_ROUTES), encoding="utf-8")
+    git(checkout, "add", ".gitignore", "hermes_cli/__init__.py", ROUTE_FILE)
     git(checkout, "commit", "-m", "prev", author=DEFAULT_GIT_IDENTITY)
     git(checkout, "remote", "add", "origin", str(remote))
     git(checkout, "push", "origin", "main")
@@ -219,6 +227,54 @@ def _save_config_snapshot(root, snapshot_root, name):
         target = snapshot_root / "config" / name / key
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes((root / key).read_bytes())
+
+
+def _route_text(routes):
+    """The route file's text for the routes, as git holds it."""
+    return json.dumps(routes, indent=2) + "\n"
+
+
+def _route_commits(tmp_path, *versions):
+    """A checkout whose seed commit holds no route file, then one commit for each version of it.
+    Returns the SHA of each commit, the seed's first."""
+    checkout = tmp_path / "checkout"
+    make_git_repo(checkout)
+    commits = [git(checkout, "rev-parse", "HEAD")]
+    (checkout / ROUTE_FILE).parent.mkdir(parents=True)
+    for routes in versions:
+        (checkout / ROUTE_FILE).write_text(_route_text(routes), encoding="utf-8")
+        git(checkout, "add", ROUTE_FILE)
+        git(checkout, "commit", "-m", "routes", author=DEFAULT_GIT_IDENTITY)
+        commits.append(git(checkout, "rev-parse", "HEAD"))
+    return commits
+
+
+def _route_list(*entries):
+    """A config.yaml whose API route list holds the entries, written in the plain form."""
+    lines = ["model: test", "gateway:", "  api_server:", "    allowed_routes:"]
+    return "".join(f"{line}\n" for line in [*lines, *(f"      - {entry}" for entry in entries)]).encode()
+
+
+def _route_configs(base, configs):
+    """Each role's config.yaml at its path from the root below `base`: the root's for "default",
+    the profile's for another; a role given None gets its home and no config.yaml."""
+    for role, text in configs.items():
+        home = base if role == "default" else base / "profiles" / role
+        home.mkdir(parents=True, exist_ok=True)
+        if text is not None:
+            (home / "config.yaml").write_bytes(text)
+
+
+def _plans_made(monkeypatch):
+    """The arguments of each plan_routes call the reader makes; the real plan_routes answers."""
+    calls = []
+
+    def plan(prev_file, new_file, configs):
+        calls.append((prev_file, new_file, dict(configs)))
+        return plan_routes(prev_file, new_file, configs)
+
+    monkeypatch.setattr(release_host, "plan_routes", plan)
+    return calls
 
 
 def _open_run(conn, pid):
@@ -675,6 +731,86 @@ def test_config_digests_cover_root_and_profiles_and_match_the_named_snapshot(
     assert {key for key in CONFIG_KEYS if changed[key] != named[key]} == {"profiles/writer/.env"}
     assert _check(host, "G11") is False
     assert SECRET not in repr((live, named, changed)) + caplog.text
+
+
+def test_route_plan_reads_both_route_files_and_the_config_of_each_served_role(
+    tmp_path, fence_home, monkeypatch
+):
+    """Card 4: the route file at PREV and at NEW from git, and the config.yaml of the root and of
+    its one profile; the plan is plan_routes' own on those texts, and reading writes nothing."""
+    _seed, prev, new = _route_commits(tmp_path, PREV_ROUTES, NEW_ROUTES)
+    configs = {
+        "default": _route_list("GET /v1/models", "GET /v1/jobs"),
+        "coder": _route_list("GET /v1/models", "GET /v1/jobs", "/v1/runs"),
+    }
+    _route_configs(fence_home, configs)
+    plans = _plans_made(monkeypatch)
+    host = _reader(tmp_path, fence_home)
+    before = _tree_bytes(tmp_path)
+
+    plan = host.route_plan(prev, new)
+
+    texts = (_route_text(PREV_ROUTES), _route_text(NEW_ROUTES))
+    assert plans == [(*texts, configs)]
+    assert plan == plan_routes(*texts, configs) and plan.changes
+    assert _tree_bytes(tmp_path) == before
+
+
+def test_route_plan_without_the_route_file_at_prev_or_at_new(tmp_path, fence_home):
+    """PREV without the route file plans nothing; NEW without it cannot be planned. A commit that
+    cannot be read is not taken for one without the file: its read raises."""
+    seed, new = _route_commits(tmp_path, NEW_ROUTES)
+    _route_configs(fence_home, {"default": _route_list("GET /v1/models")})
+    host = _reader(tmp_path, fence_home)
+
+    assert host.route_plan(seed, new) == RoutePlan((), ())
+    with pytest.raises(RoutePlanError):
+        host.route_plan(new, seed)
+    with pytest.raises(subprocess.CalledProcessError):
+        host.route_plan("f" * 40, new)
+
+
+def test_route_plan_follows_the_named_snapshot_only_when_asked(tmp_path, fence_home, monkeypatch):
+    """With from_snapshot the plan follows the copies in the named configuration snapshot, at the
+    paths named_config_snapshot reads, though the live files differ; without it, the live files."""
+    _seed, prev, new = _route_commits(tmp_path, PREV_ROUTES, NEW_ROUTES)
+    snapshot = {
+        "default": _route_list("GET /v1/models", "GET /v1/jobs"),
+        "coder": _route_list("GET /v1/models", "GET /v1/jobs", "/v1/runs"),
+    }
+    live = {
+        "default": _route_list("GET /v1/models", "GET /v1/jobs", "POST /v1/runs"),
+        "coder": _route_list("GET /v1/models", "GET /v1/jobs"),
+    }
+    _route_configs(tmp_path / "snapshots" / "config" / NEW, snapshot)
+    _route_configs(fence_home, live)
+    plans = _plans_made(monkeypatch)
+    host = _reader(tmp_path, fence_home)
+
+    from_snapshot, from_live = host.route_plan(prev, new, from_snapshot=True), host.route_plan(prev, new)
+
+    texts = (_route_text(PREV_ROUTES), _route_text(NEW_ROUTES))
+    assert set(host.named_config_snapshot()) == {"config.yaml", "profiles/coder/config.yaml"}
+    assert plans == [(*texts, snapshot), (*texts, live)]
+    assert from_snapshot == plan_routes(*texts, snapshot) != plan_routes(*texts, live) == from_live
+
+
+def test_route_plan_gives_none_for_a_served_role_without_config_yaml(tmp_path, fence_home, monkeypatch):
+    """A served role with no config.yaml is None in the plan's configurations, live or in the
+    named snapshot; neither read takes the other's file in its place."""
+    _seed, prev, new = _route_commits(tmp_path, PREV_ROUTES, NEW_ROUTES)
+    live = {"default": _route_list("GET /v1/models", "GET /v1/jobs"), "coder": None}
+    snapshot = {"default": None, "coder": _route_list("GET /v1/models")}
+    _route_configs(fence_home, live)
+    _route_configs(tmp_path / "snapshots" / "config" / NEW, snapshot)
+    plans = _plans_made(monkeypatch)
+    host = _reader(tmp_path, fence_home)
+
+    from_live, from_snapshot = host.route_plan(prev, new), host.route_plan(prev, new, from_snapshot=True)
+
+    texts = (_route_text(PREV_ROUTES), _route_text(NEW_ROUTES))
+    assert plans == [(*texts, live), (*texts, snapshot)]
+    assert (from_live, from_snapshot) == (plan_routes(*texts, live), plan_routes(*texts, snapshot))
 
 
 def test_reader_writes_nothing(tmp_path, fence_home, monkeypatch):
