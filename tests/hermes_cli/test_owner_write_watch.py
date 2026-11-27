@@ -1863,3 +1863,76 @@ def test_last_failure_a_write_fault_on_the_second_file_alone_changes_neither_dec
     assert state == watch.state_path().read_bytes()
     assert report == watch.report_path().read_bytes()
     assert last_failure_path().exists()
+
+
+COUNTING_SCRIPT = "n=$(cat '{count}' 2>/dev/null || echo 0)\necho $((n + 1)) > '{count}'\n[ \"$n\" -ge 1 ]\n"
+
+
+def scripted_launches(tmp_path, fake_time, monkeypatch, plan):
+    """The real _run_page_check on a script that fails its first run and passes later, behind a Popen that follows
+    ``plan``: for each launch (spend, pipe_fails). A launch that is not a pipe failure starts the real script and lets
+    it exit before the fake clock moves ``spend`` seconds on, so its exit is already reapable when it is observed."""
+    host = Host(tmp_path)
+    host.page_check.write_text("#!/bin/sh\n" + COUNTING_SCRIPT.format(count=tmp_path / "count"), encoding="utf-8")
+    host.page_check.chmod(0o755)
+    launches = []
+
+    def popen(argv, **kwargs):
+        spend, pipe_fails = plan[len(launches)] if len(launches) < len(plan) else (0, False)
+        launches.append(kwargs["stdout"])
+        if pipe_fails and kwargs["stdout"] == subprocess.PIPE:
+            fake_time.now += spend
+            raise OSError("no pipe")
+        process = subprocess.Popen(argv, **kwargs)
+        time.sleep(0.3)
+        fake_time.now += spend
+        return process
+
+    monkeypatch.setattr(watch, "subprocess", SimpleNamespace(
+        Popen=popen, PIPE=subprocess.PIPE, DEVNULL=subprocess.DEVNULL, TimeoutExpired=subprocess.TimeoutExpired))
+    outcome = host.run(run_page_check=None)
+    return launches, outcome, page_entry(watch.report_path())
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("pipe_fails", [False, True])
+def test_deadline_an_exit_first_observed_after_it_is_unknown_for_the_first_try(tmp_path, fake_time, monkeypatch, pipe_fails):
+    plan = [(601, False)] if not pipe_fails else [(0, True), (601, False)]
+    launches, outcome, entry = scripted_launches(tmp_path, fake_time, monkeypatch, plan)
+    assert len(launches) == (1 if not pipe_fails else 2)
+    assert entry["outcome"] == watch.UNKNOWN
+    assert [try_["outcome"] for try_ in entry["page_tries"]] == [watch.UNKNOWN]
+    assert outcome.text == ""
+    assert fake_time.slept == []
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("pipe_fails", [False, True])
+def test_deadline_an_exit_first_observed_after_it_is_unknown_for_the_second_try(tmp_path, fake_time, monkeypatch, pipe_fails):
+    plan = [(0, False), (700, False)] if not pipe_fails else [(0, False), (0, True), (700, False)]
+    launches, outcome, entry = scripted_launches(tmp_path, fake_time, monkeypatch, plan)
+    assert len(launches) == (2 if not pipe_fails else 3)
+    assert entry["outcome"] == watch.UNKNOWN
+    assert [try_["outcome"] for try_ in entry["page_tries"]] == [watch.FAIL, watch.UNKNOWN]
+    assert outcome.text == ""
+    assert last_failure_path().read_bytes() == watch.report_path().read_bytes()
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("lost, fallback", [(1, True), (2, False)])
+def test_fallback_the_retry_without_a_pipe_starts_only_with_120_seconds_left(tmp_path, fake_time, monkeypatch, lost, fallback):
+    launches, outcome, entry = scripted_launches(tmp_path, fake_time, monkeypatch, [(449, False), (lost, True)])
+    assert launches == [subprocess.PIPE, subprocess.PIPE] + ([subprocess.DEVNULL] if fallback else [])
+    assert [try_["outcome"] for try_ in entry["page_tries"]] == [watch.FAIL] + ([watch.PASS] if fallback else [])
+    assert entry["outcome"] == (watch.PASS if fallback else watch.FAIL)
+    assert (outcome.kind == "alert") is (not fallback)
+    assert last_failure_path().read_bytes() == watch.report_path().read_bytes()
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("lost, fallback", [(599, True), (600, False)])
+def test_fallback_the_first_try_without_a_pipe_starts_only_before_the_deadline(tmp_path, fake_time, monkeypatch, lost, fallback):
+    launches, outcome, entry = scripted_launches(tmp_path, fake_time, monkeypatch, [(lost, True)])
+    assert launches == [subprocess.PIPE] + ([subprocess.DEVNULL] if fallback else [])
+    assert [try_["outcome"] for try_ in entry["page_tries"]] == [watch.FAIL if fallback else watch.UNKNOWN]
+    assert fake_time.slept == []

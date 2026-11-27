@@ -352,19 +352,27 @@ def _probe(probe: Probe, base: str, key: str, send: Callable[..., Any], clock) -
     return Result(outcome=outcome, detail=detail, status=status, code=code, at=clock().isoformat(), **fields)
 
 
+class _RetryDeadline(float):
+    """The shared deadline as the second try gets it: each launch of its script needs PAGE_CHECK_RETRY_MIN_SECONDS left."""
+
+
 def _page_check(path: str, run_page_check: Optional[Callable[[str], Any]], clock) -> Result:
     deadline = time.monotonic() + PAGE_CHECK_TIMEOUT_SECONDS  # one absolute limit for both tries and their waits
 
-    def attempt():
-        outcome = run_page_check(path) if run_page_check else _run_page_check(path, deadline)
+    def attempt(limit):
+        outcome = run_page_check(path) if run_page_check else _run_page_check(path, limit)
+        if outcome is None and not run_page_check:  # no launch was allowed
+            return None
         outcome, page_lines = outcome if isinstance(outcome, tuple) else (outcome, None)
         return outcome if outcome in (PASS, FAIL, UNKNOWN) else FAIL, page_lines
 
-    tries = [attempt()]
+    tries = [attempt(deadline)]
     if tries[0][0] == FAIL and deadline - time.monotonic() - PAGE_CHECK_RETRY_WAIT_SECONDS >= PAGE_CHECK_RETRY_MIN_SECONDS:
         time.sleep(PAGE_CHECK_RETRY_WAIT_SECONDS)
         if deadline - time.monotonic() >= PAGE_CHECK_RETRY_MIN_SECONDS:  # the sleep may have woken late
-            tries.append(attempt())
+            second = attempt(_RetryDeadline(deadline))
+            if second:
+                tries.append(second)
     outcome, page_lines = tries[-1]
     return Result(_PAGE_CHECK, _PAGE_CHECK_LABEL, outcome, detail="did not pass", method="run", path=path,
                   at=clock().isoformat(), page_lines=page_lines,
@@ -595,9 +603,9 @@ def _read_page_check_output(proc, deadline: float) -> Optional[bytes]:
         with selectors.DefaultSelector() as selector:  # unlike select.select, no limit on the descriptor number
             selector.register(proc.stdout, selectors.EVENT_READ)
             while True:
-                ended = proc.poll() is not None
-                if not ended and time.monotonic() >= deadline:
+                if time.monotonic() >= deadline:
                     return data
+                ended = proc.poll() is not None
                 if selector.select(0 if ended else 0.05):
                     chunk = os.read(proc.stdout.fileno(), 65536)
                     if not chunk:
@@ -613,7 +621,11 @@ def _read_page_check_output(proc, deadline: float) -> Optional[bytes]:
 def _run_page_check(path: str, deadline: float):
     """``(outcome, page_lines)``: page_lines is the kept lines of the script's standard output, None when none were captured.
     ``deadline`` is the absolute time.monotonic() limit, taken before the first launch."""
+    floor = PAGE_CHECK_RETRY_MIN_SECONDS if isinstance(deadline, _RetryDeadline) else 0
     for stdout in (subprocess.PIPE, subprocess.DEVNULL):  # no pipe: run the script as before, with no lines
+        left = deadline - time.monotonic()
+        if left <= 0 or left < floor:  # every launch, the fallback too, needs its time
+            return None if floor else (UNKNOWN, None)
         try:
             proc = subprocess.Popen([path], stdin=subprocess.DEVNULL, stdout=stdout, stderr=subprocess.DEVNULL)
             break
@@ -624,7 +636,10 @@ def _run_page_check(path: str, deadline: float):
     try:
         data = _read_page_check_output(proc, deadline) if proc.stdout else None
         try:
-            outcome = PASS if proc.wait(timeout=max(deadline - time.monotonic(), 0)) == 0 else FAIL
+            left = deadline - time.monotonic()
+            if left <= 0:  # an exit first seen after the deadline decides nothing
+                raise subprocess.TimeoutExpired(path, 0)
+            outcome = PASS if proc.wait(timeout=left) == 0 else FAIL
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
