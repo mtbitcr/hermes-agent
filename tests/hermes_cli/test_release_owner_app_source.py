@@ -171,6 +171,41 @@ def _rewrite_after_archive(monkeypatch, source, change):
     return rewritten
 
 
+_IDENTITY = ("-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false")
+_PINNED = "0123456789abcdef0123456789abcdef01234567"  # the fixed commit a submodule is pinned at, held nowhere
+
+
+def _merge_pinning_a_submodule(tmp_path, host):
+    """A normal merge into main on the owner app's origin of a branch that pins a submodule: a gitlink of mode 160000
+    at _PINNED, and the .gitmodules that names it. Returns the merge."""
+    work = tmp_path / "owner-app"
+    _git("checkout", "-q", "-b", "pin", "main", cwd=work)
+    (work / ".gitmodules").write_text('[submodule "lib"]\n\tpath = vendor/lib\n\turl = https://example.invalid/lib\n')
+    _git("add", ".gitmodules", cwd=work)
+    _git("update-index", "--add", "--cacheinfo", f"160000,{_PINNED},vendor/lib", cwd=work)
+    _git(*_IDENTITY, "commit", "-q", "-m", "Pin a submodule", cwd=work)
+    _git("checkout", "-q", "main", cwd=work)
+    _git(*_IDENTITY, "merge", "-q", "--no-ff", "-m", "Merge pin", "pin", cwd=work)
+    _git("push", "-q", str(host["bare"]), "main", cwd=work)
+    return _git("rev-parse", "HEAD", cwd=work)
+
+
+def _merge_holding_an_empty_folder(tmp_path, host):
+    """A merge of the card branch on the owner app's origin whose tree is the first merge's with an empty folder
+    beside it, which no index can hold: made with git mktree and git commit-tree. Returns the merge."""
+    work, commits = tmp_path / "owner-app", host["commits"]
+
+    def mktree(listing):
+        return _RUN(["git", "mktree"], cwd=work, input=listing, check=True, capture_output=True,
+                    text=True).stdout.strip()
+
+    tree = mktree(_git("ls-tree", commits["merge"], cwd=work) + f"\n040000 tree {mktree('')}\tempty\n")
+    merge = _git(*_IDENTITY, "commit-tree", tree, "-p", commits["beside"], "-p", commits["card"], "-m", "Merge card",
+                 cwd=work)
+    _git("push", "-q", str(host["bare"]), f"{merge}:refs/heads/empty", cwd=work)
+    return merge
+
+
 # The merge's own .gitattributes asks git archive to leave a tracked file out (export-ignore), to rewrite one
 # (export-subst) and to convert two on the way out (text eol=crlf, ident): the archive must still be the merge's tree.
 _EXPORT_RULES = {
@@ -259,6 +294,47 @@ def test_an_archive_that_is_not_the_commit_tree_is_refused_and_leaves_no_build_f
     assert refused.value.reason == "archive_failed"
     assert len(rewritten) == 1 and Path(rewritten[0]).parent in made  # the archive was written, then rewritten
     assert not [folder for folder in made if folder.exists()] and list((tmp_path / "tmp").iterdir()) == []
+
+
+def test_a_merge_with_a_pinned_submodule_is_refused_and_leaves_no_build_folder(github, monkeypatch, tmp_path):
+    """The merge pins a submodule, whose gitlink git archive writes as an empty folder: unpacked, the archive rebuilds
+    no gitlink, so it cannot be the merge's tree. The merge is refused, and no build folder is left."""
+    host = _release_host(github, monkeypatch, tmp_path)
+    merge, bare = _merge_pinning_a_submodule(tmp_path, host), host["bare"]
+    assert _git("--git-dir", str(bare), "ls-tree", merge, "vendor/lib") == f"160000 commit {_PINNED}\tvendor/lib"
+    source, made = _source_module(), _record_mkdtemp(monkeypatch)
+
+    with pytest.raises(host["mod"].GitHubTransportError) as refused:
+        source.fetch_source(merge)
+
+    assert refused.value.reason == "archive_failed"
+    builds = [folder for folder in made if folder.name.startswith("hermes-release-build-")]
+    assert len(builds) == 1 and not [folder for folder in made if folder.exists()]  # the archive was made, then removed
+    assert list((tmp_path / "tmp").iterdir()) == []
+    plain = tmp_path / "plain.tar"  # the control: the merge's own archive, unpacked, rebuilds another tree
+    _git("--git-dir", str(bare), "archive", "--format=tar", f"--output={plain}", merge)
+    assert _archive_tree(plain, tmp_path / "unpacked") != _git("--git-dir", str(bare), "rev-parse", f"{merge}^{{tree}}")
+
+
+def test_a_commit_with_an_empty_folder_is_refused_and_leaves_no_build_folder(github, monkeypatch, tmp_path):
+    """The merge's tree holds an empty folder, which git archive writes and git records for no unpacked file: the
+    archive, unpacked, rebuilds another tree than the merge's. The merge is refused, and no build folder is left."""
+    host = _release_host(github, monkeypatch, tmp_path)
+    merge, bare = _merge_holding_an_empty_folder(tmp_path, host), host["bare"]
+    assert _git("--git-dir", str(bare), "ls-tree", merge, "empty").startswith("040000 tree ")
+    assert _git("--git-dir", str(bare), "ls-tree", f"{merge}:empty") == ""  # a folder with nothing in it
+    source, made = _source_module(), _record_mkdtemp(monkeypatch)
+
+    with pytest.raises(host["mod"].GitHubTransportError) as refused:
+        source.fetch_source(merge)
+
+    assert refused.value.reason == "archive_failed"
+    builds = [folder for folder in made if folder.name.startswith("hermes-release-build-")]
+    assert len(builds) == 1 and not [folder for folder in made if folder.exists()]  # the archive was made, then removed
+    assert list((tmp_path / "tmp").iterdir()) == []
+    plain = tmp_path / "plain.tar"  # the control: the merge's own archive, unpacked, rebuilds another tree
+    _git("--git-dir", str(bare), "archive", "--format=tar", f"--output={plain}", merge)
+    assert _archive_tree(plain, tmp_path / "unpacked") != _git("--git-dir", str(bare), "rev-parse", f"{merge}^{{tree}}")
 
 
 _NOT_A_COMMIT = [
@@ -413,6 +489,26 @@ def test_a_relative_kanban_root_is_anchored_once_at_the_working_directory_of_the
     tree = _git("--git-dir", str(bare), "rev-parse", f"{merge}^{{tree}}")
     assert _archive_tree(archive, tmp_path / "unpacked") == tree
     assert made and inside == []  # no copy inside any temporary folder
+
+
+def test_a_root_with_a_symlink_then_a_parent_segment_is_resolved_by_the_filesystem(github, monkeypatch, tmp_path):
+    """HERMES_KANBAN_HOME may hold a directory symlink followed by "..": the filesystem resolves ".." from the
+    symlink's target, and Kanban's files land there. So does the copy, and nothing lands at the lexical parent."""
+    host = _release_host(github, monkeypatch, tmp_path)
+    merge = host["commits"]["merge"]
+    (tmp_path / "real" / "inner").mkdir(parents=True)
+    (tmp_path / "base").mkdir()
+    (tmp_path / "base" / "link").symlink_to(tmp_path / "real" / "inner", target_is_directory=True)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "base" / "link" / ".." / "root"))
+    source = _source_module()
+
+    archive = source.fetch_source(merge)
+
+    copy = _expected_copy(tmp_path / "real" / "root")
+    assert source.copy_path() == copy
+    assert (copy / "HEAD").is_file() and [name for _, name in _refs(copy)] == [merge]
+    assert _archive_commit(archive) == merge
+    assert not (tmp_path / "base" / "root").exists()
 
 
 def test_the_step_list_holds_release_source_with_exactly_contents_read():
