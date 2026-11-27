@@ -463,32 +463,10 @@ def _resolve_owner_removal_run_authority(value: Any) -> "dict[str, Any] | None":
 
 
 def _resolve_owner_retry_run_authority(value: Any) -> "dict[str, Any] | None":
-    """Validate the closed transport shape for one owner retry run."""
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) != {
-        "operation", "idempotency_key", "payload",
-    }:
-        raise ValueError("invalid owner retry authority")
-    operation = value.get("operation")
-    idempotency_key = value.get("idempotency_key")
-    payload = value.get("payload")
-    if (
-        operation != "owner_task_retry"
-        or not isinstance(idempotency_key, str)
-        or re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", idempotency_key) is None
-        or not isinstance(payload, dict)
-        or set(payload) != {
-            "idempotency_key", "project_id", "task_id", "reason",
-        }
-        or payload.get("idempotency_key") != idempotency_key
-    ):
-        raise ValueError("invalid owner retry authority")
-    return {
-        "operation": operation,
-        "idempotency_key": idempotency_key,
-        "payload": payload,
-    }
+    from hermes_cli.owner_retry_route import resolve_retry_authority
+    return resolve_retry_authority(value)
 
 
 # Native run handlers resolved by name at dispatch time rather than imported
