@@ -930,6 +930,76 @@ def test_on_a_board_with_no_switch_store_the_run_detail_reads_as_main_and_create
         ).fetchall() == []
 
 
+@pytest.mark.parametrize("step", [
+    "owner_workspace._owner_board_counts",
+    "kanban_delivery.unfinished_delivery_task_ids",
+    "kanban_delivery_outcome.delivery_outcomes",
+    "owner_retry_route.offer",
+    "kanban_db.verified_active_worker_rows",
+    "owner_workspace._owner_run_retry_reasons",
+    "kanban_db.run_retry_origins",
+])
+def test_another_connection_commits_at_once_while_the_snapshot_reads_past_the_offer_inputs(
+    step, root, owner, clock, monkeypatch,
+):
+    """On a rollback-journal board a read left open blocks every other connection's commit.
+
+    The snapshot reads the cards, their revisions, the provider waits and the
+    held runs, which the retry offer binds, from one snapshot and keeps no read
+    open after them, so a commit beside each later step goes through at once.
+    """
+    import importlib
+    import sqlite3
+
+    project = _deep_project(root, owner, "Read Beside A Commit", monkeypatch)
+    board = project["board"]
+    env = _steward_env(root, board)
+    with _board(board) as conn:
+        task_id = _deep_card(conn, project, "Draft the placeholder brief")
+        held = _deep_stop(conn, board, task_id, 4331, _ANTHROPIC_SESSION, clock, monkeypatch)
+    clock["t"] = held.ended_at + 60
+    path = kb.kanban_db_path(board=board)
+    with contextlib.closing(sqlite3.connect(path)) as conn:
+        # Set on the file, so the test does not depend on the SQLite build.
+        assert conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+        [priority] = conn.execute("SELECT priority FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    module_name, name = step.split(".")
+    module = importlib.import_module(f"hermes_cli.{module_name}")
+    real, commits = getattr(module, name), []
+
+    def step_then_commit(*args, **kwargs):
+        result = real(*args, **kwargs)
+        try:
+            # No busy wait: a commit the reader blocks fails at once.
+            with contextlib.closing(sqlite3.connect(path, timeout=0)) as other:
+                with other:
+                    other.execute("UPDATE tasks SET priority = priority + 1 WHERE id = ?", (task_id,))
+        except sqlite3.OperationalError as exc:
+            commits.append(str(exc))
+        else:
+            commits.append("committed")
+        return result
+
+    monkeypatch.setattr(module, name, step_then_commit)
+    with _as_worker(monkeypatch, {**env, "HERMES_OPENAI_RETRY_TASK_ID": task_id}):
+        snapshot = ow.read_project_snapshot(
+            owner, project["slug"], run_context=True, owner_waiting=True, provider_wait=True,
+            delivery_state=True, delivery_outcome=True, work_item=True,
+        )
+
+    assert commits and set(commits) == {"committed"}, commits
+    with contextlib.closing(sqlite3.connect(path)) as conn:
+        assert conn.execute(
+            "SELECT priority FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone() == (priority + len(commits),)
+    card = _task(snapshot, task_id)
+    assert card["stopped_work"] == "provider_wait"
+    assert set(card["retry_route"]) == {"token", "model", "effort"}
+    assert (card["delivery"], card["delivery_outcome"]) == (None, None)
+    [run] = snapshot["runs"]
+    assert run["receipt"]["outcome"] == "waiting"
+
+
 def test_a_retry_while_the_limit_holds_leaves_the_card_waiting_with_a_new_reset_and_no_breaker_trip(
     root, owner, clock, monkeypatch,
 ):

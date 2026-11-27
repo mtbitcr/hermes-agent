@@ -3856,7 +3856,9 @@ def read_project_snapshot(
     )
     conn = _open_read_only_sqlite(board_path, label="kanban.db")
     try:
-        # Read each card and its event revision from one SQLite snapshot.
+        # Read each card, its event revision, its provider hold and its held run
+        # from one SQLite snapshot, as the retry offer binds all four. End it
+        # there: an open read blocks each commit on a rollback-journal board.
         conn.execute("BEGIN")
         task_rows = conn.execute(
             "SELECT * FROM tasks WHERE project_id = ? AND task_kind = 'work' "
@@ -3875,8 +3877,6 @@ def read_project_snapshot(
         task_ids = [task.id for task in tasks]
         visible = set(task_ids)
 
-        counts, total = _owner_board_counts(conn, project_id)
-
         event_state: dict[str, dict[str, int]] = {}
         if task_ids:
             placeholders = ",".join("?" for _ in task_ids)
@@ -3890,6 +3890,16 @@ def read_project_snapshot(
                     "latest": int(row["latest"]), "revision": int(row["revision"]),
                     "raised": int(row["raised"]),
                 }
+        provider_waits = (
+            _owner_provider_waits(conn, task_ids) if provider_wait else {}
+        )
+        retry_candidates = _owner_provider_held_runs(conn, [
+            task.id for task in tasks
+            if task.id in provider_waits and task.id == os.environ.get("HERMES_OPENAI_RETRY_TASK_ID")
+        ])
+        conn.execute("COMMIT")
+
+        counts, total = _owner_board_counts(conn, project_id)
 
         parent_map = {task_id: [] for task_id in task_ids}
         child_map = {task_id: [] for task_id in task_ids}
@@ -3923,15 +3933,8 @@ def read_project_snapshot(
         # only blocked ones, so this never hides one of those states. Only a
         # hold the dispatcher still keeps reads as waiting: a card whose hold
         # has ended keeps today's state here, though the retry still takes it.
-        provider_waits = (
-            _owner_provider_waits(conn, task_ids) if provider_wait else {}
-        )
         for task_id in provider_waits:
             stopped_work[task_id] = _OWNER_STOPPED_WORK_PROVIDER_WAIT
-        retry_candidates = _owner_provider_held_runs(conn, [
-            task.id for task in tasks
-            if task.id in provider_waits and task.id == os.environ.get("HERMES_OPENAI_RETRY_TASK_ID")
-        ])
         delivering = set()
         if delivery_state:
             from hermes_cli.kanban_delivery import unfinished_delivery_task_ids
@@ -4009,6 +4012,9 @@ def read_project_snapshot(
         # whatever the role currently admits. Selected schema-aware because
         # this is a read-only connection — a board whose kanban.db predates the
         # pin columns must project as "unlocked", never fail and never migrate.
+        # The switch store check and the runs read from one short snapshot, so
+        # a new pin never reads without its switch record.
+        conn.execute("BEGIN")
         run_rows = conn.execute(
             "SELECT r.*, t.title AS task_title"
             + owner_task_pin_select(conn, "t")
@@ -4017,6 +4023,7 @@ def read_project_snapshot(
             "ORDER BY r.started_at DESC, r.id DESC LIMIT ?",
             (project_id, _OWNER_PROJECT_MAX_RUNS + 1),
         ).fetchall()
+        conn.execute("COMMIT")
         # An owner retry names the run its stop was recorded against, so the
         # reason is looked up by that exact run id — never by task-and-time
         # proximity, which would hand one attempt's reason to another. A run
