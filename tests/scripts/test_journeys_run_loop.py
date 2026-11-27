@@ -110,8 +110,9 @@ def current_journey():
 
 def noise(rc):
     if last in answers.get("exact", {}):
-        sys.stdout.write(answers["exact"][last])
         sys.stdout.flush()
+        sys.stdout.buffer.write(answers["exact"][last].encode("utf-8", "surrogateescape"))
+        sys.stdout.buffer.flush()
         sys.exit(rc)
     if last in answers.get("bulk", {}):
         # exactly this many bytes, nothing else, in many short lines of 19 bytes ("row 000000", blanks, a line feed)
@@ -940,6 +941,18 @@ def test_the_cut_at_400_counts_characters_and_never_leaves_half_of_one(box):
 
     body = _kept(box)[3:]
     assert body == ["a" * 399 + "\u00e9", "\u00e9" * 400]
+
+
+def test_a_raw_line_of_401_six_byte_sequences_keeps_the_first_400_whole_sequences(box):
+    # Bash in C.UTF-8 counts a legacy six-byte sequence as one character, so 400 characters are 2,400 bytes.
+    sequence = b"\xfd\x80\x80\x80\x80\x80"
+    raw = (sequence * 401).decode("utf-8", "surrogateescape")
+    box.answer(rc={"refresh": 7}, exact={"refresh": raw + "\n"})
+
+    done = box.run()
+
+    assert (done.returncode, done.stdout, done.stderr) == (1, "", "")
+    assert _stored_body(box) == sequence * 400 + b"\n"
 
 
 def test_the_locale_of_the_checks_stays_byte_wise_when_a_line_is_cut(box):

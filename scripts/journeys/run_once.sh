@@ -69,6 +69,7 @@ RESULT=$RUN_DIR/result
 FAILED_STEP_LOG=$RUN_DIR/failed-step.log
 KEPT_LINES=40
 KEPT_WIDTH=400
+KEPT_SEQUENCE_BYTES=6 # the widest sequence that Bash counts as one character in C.UTF-8 (legacy five- and six-byte ones too)
 PROXY_SOURCE=$HERE/synthetic_proxy.py
 RUNNER_ENV=${JOURNEY_RUNNER_ENV:-$HOME/.hermes/journeys/runner.env}
 S2_DIR=${JOURNEY_S2_SCRIPTS_DIR:-/home/raphael-runner/raphael-journeys}
@@ -152,7 +153,7 @@ store_result() {
   return 1
 }
 
-# last_characters: the lines on its standard input (at most KEPT_LINES, none longer than 4 * KEPT_WIDTH bytes), each cut
+# last_characters: the lines on its standard input (at most KEPT_LINES, none longer than KEPT_SEQUENCE_BYTES * KEPT_WIDTH bytes), each cut
 # by character. A NUL byte is a character of its own: the input is read in pieces between NULs (ptxt, with pnul 1 where
 # a NUL follows the piece and 0 where a line ends). Any write that fails fails the whole.
 last_characters() {
@@ -184,14 +185,14 @@ last_characters() {
 }
 
 # write_failed_step_log STEP FINISHED BODY: the header lines, then (BODY 1) the last lines of the held output. The held
-# file is streamed through tail and cut, so that no more than the lines kept (each cut to 4 * KEPT_WIDTH bytes, which
-# holds its first KEPT_WIDTH characters) is ever read into the shell. Any step of it that fails fails the whole.
+# file is streamed through tail and cut, so that no more than the lines kept (each cut to
+# KEPT_SEQUENCE_BYTES * KEPT_WIDTH bytes, which holds its first KEPT_WIDTH characters) is ever read into the shell. Any step of it that fails fails the whole.
 write_failed_step_log() {
   printf 'step=%s\n' "$1" || return 1
   if [[ -n $JOURNEY ]]; then printf 'journey=%s\n' "$JOURNEY" || return 1; fi
   printf 'started=%s\nfinished=%s\n' "$STARTED" "$2" || return 1
   [[ $3 == 1 ]] || return 0
-  tail -n "$KEPT_LINES" -- "$HELD_FILE" | cut -b "1-$((KEPT_WIDTH * 4))" | last_characters
+  tail -n "$KEPT_LINES" -- "$HELD_FILE" | cut -b "1-$((KEPT_WIDTH * KEPT_SEQUENCE_BYTES))" | last_characters
 }
 
 # keep_failed_step STEP FINISHED BODY: written in place, in a subshell of its own, so that nothing in the formatting can
