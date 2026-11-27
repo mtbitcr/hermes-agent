@@ -23,8 +23,15 @@ takes its place does not start or does not pass its health check, the move takes
 gives the last working container its name back, starts it, checks its health and raises
 `PutBack`. Taking it away is safe to retry: the move reads the name again after a refusal, waits a
 bounded time for a removal docker has under way, and renames away one docker does not remove.
-Which move runs when, the readback after each and when the backup goes belong to the
-runner of the owner app part.
+Putting it back is safe to retry too: the move reads by its Id where the last working container
+is and whether it runs, takes only the step still missing, and takes a refused step again a
+bounded number of times. A move reads the Id under the name before it parks that container, and
+reads back a parking rename or a forward's stop docker refused, as docker may have applied one
+whose reply was lost: a parked container goes on with the move, and a forward's stopped one is
+put back. A restore reads the kept name before it starts or parks any container: one there is
+the last working container of a move that ended midway, put back when the restore's own takeover
+fails, unless the container under the name passes its health check now. Which move runs when,
+the readback after each and when the backup goes belong to the runner of the owner app part.
 
 Every docker call is one argument list through `_docker`, and no value of the environment is ever
 an argument (D-10). Docker run reads the environment on its standard input, as an env file, but
@@ -83,6 +90,8 @@ setTimeout(() => process.exit(1), %d);
 
 # What docker writes, exiting nonzero, when no container or object has the name it was given.
 _NO_SUCH = (b"No such container", b"No such object")
+# What docker writes, exiting nonzero, when another container has the name a rename gives.
+_IN_USE = b"is already in use"
 # Docker's bind propagations; a bind made without one has rprivate.
 _PROPAGATIONS = ("rprivate", "private", "rshared", "shared", "rslave", "slave")
 # What a bind mount's configuration may hold, all of which --mount carries; of its BindOptions,
@@ -102,6 +111,7 @@ _PROXIES = (
 _SECCOMP_NAMED = ("seccomp=unconfined", "seccomp:unconfined", "seccomp=builtin", "seccomp:builtin")
 _UNUSABLE_BACKUP = "no backup container docker can put back as it was"
 _NOT_PASSED = "the container that took the place did not pass its health check"
+_STILL_TAKEN = "the name is still taken, so the last working container is not back"
 
 # What a readback meets when docker or the container does not answer as it should: no docker, a
 # refusal, the time limit, or a print that is not a container record.
@@ -134,7 +144,10 @@ class OwnerAppHost:
     the last working container under the name with "-last-working" after it until the container
     that takes its place passed its health check; one left there stopped, as when docker refuses
     its removal at the end of a move, the next such move takes away first, before anything stops
-    (`_park`), never removing it before the container under the name passed its health check.
+    (`_park`), never removing it before the container under the name passed its health check. It
+    reads the kept name again after a refused removal or rename: a leftover that has gone frees
+    the name, one docker is removing is waited for a bounded time, and a container there that
+    runs or has another Id is left alone, the move raising before anything stops.
     """
 
     def __init__(self, *, container: str, label: str) -> None:
@@ -150,79 +163,150 @@ class OwnerAppHost:
         anew on `image` with the running one's own settings and check its health. The settings
         and the new image (`_from_image`) are read, and refused, before anything changes. A new
         container that does not start or does not pass its health check is removed and the old
-        one put back (`_take_place`); the forward itself removes no container that ran."""
+        one put back (`_take_place`); the forward itself removes no container that ran. A refused
+        rename or stop is read back by the old container's Id, read first: a rename docker
+        applied though its reply was lost goes on, and a stop docker applied puts the old
+        container back and raises `PutBack`. Else, as when docker says another container has
+        the backup name, the refusal is raised, and the old container still runs."""
         record = _inspect(self.container)
         arguments, env_file, env = _run_arguments(record, self.container, image)
         _from_image(record, _image(image), env)
-        _docker("rename", self.container, self.backup)
-        _docker("stop", "--time", str(STOP_SECONDS), self.backup)
-        self._take_place(self.backup, True, lambda: _docker(*arguments, input=env_file, env=env))
+        ident = _ident(record)
+        try:
+            _docker("rename", self.container, self.backup)
+        except _Refused as refused:
+            if refused.taken or not self._parked(self.backup, ident):
+                raise
+        try:
+            _docker("stop", "--time", str(STOP_SECONDS), self.backup)
+            stopped = None
+        except _Refused as refused:
+            backup = _find(self.backup)
+            if backup is None or _ident(backup) != ident or _runs(backup):
+                raise
+            stopped = str(refused)
+        if stopped is not None:
+            self._put_back(self.backup, ident, True)
+            raise PutBack(stopped)
+        self._take_place(
+            self.backup, ident, True, lambda: _docker(*arguments, input=env_file, env=env)
+        )
 
     def back(self) -> None:
-        """Put the old container back under its own name: the backup read first, then the new one
-        renamed and stopped, the backup renamed back and started again, and the new one removed
-        once the old one passed its health check (`_back_in_place`). Without a backup docker can
-        read and put back as it was (`_usable`), back refuses before anything changes."""
+        """Put the old container back under its own name: the backup read first, then the Id
+        under the name, then the new one renamed and stopped, the backup renamed back and started
+        again, and the new one removed once the old one passed its health check
+        (`_back_in_place`). Without a backup docker can read and put back as it was (`_usable`),
+        back refuses before anything changes."""
         backup = _find(self.backup)
         if backup is None:
             raise RuntimeError("no backup container to go back to")
         if not _usable(backup):
             raise RuntimeError(_UNUSABLE_BACKUP)
-        self._back_in_place(backup)
+        self._back_in_place(backup, _ident(_find(self.container)))
 
     def forward_repeat(self, image: str) -> None:
         """The helper's forward-repeat (D-6): the running new container renamed and stopped, made
         once more on `image` from the settings of the old container, which the backup keeps, and
         the first one removed once the second passed its health check (`_take_place`). A backup
         docker cannot put back as it was (`_usable`) refuses before anything changes, as do
-        settings and a new image a forward refuses."""
+        settings and a new image a forward refuses. The Id under the name is read before the
+        rename (`_park`)."""
         backup = _inspect(self.backup)
         if not _usable(backup):
             raise RuntimeError(_UNUSABLE_BACKUP)
         arguments, env_file, env = _run_arguments(backup, self.container, image)
         _from_image(backup, _image(image), env)
+        ident = _ident(_find(self.container))
 
         def make() -> None:
             _docker("stop", "--time", str(STOP_SECONDS), self.kept)
             _docker(*arguments, input=env_file, env=env)
 
-        self._park()
-        self._take_place(self.kept, True, make)
-        _docker("rm", "-f", self.kept)
+        self._park(ident)
+        self._take_place(self.kept, ident, True, make)
+        self._drop(ident)
 
     def remove_backup(self) -> None:
         """The helper's last step: the old container, kept as the backup, removed."""
         _docker("rm", "-f", self.backup)
 
     def restore(self, old_image: str) -> None:
-        """The helper's recovery (B3). A container under the name on `old_image` stays. Otherwise
-        the backup is read first, and only once it is there on `old_image`, in a state docker can
-        put back as it was (`_usable`), is it renamed back, and started unless it runs. A
-        container under the name then takes the kept name and stops first, and goes only once the
-        old container passed its health check (`_back_in_place`). Without such a backup to put
-        back, or when docker fails to read either name, other than to say no container has it,
-        the restore refuses before anything changes. The helper's wait is the runner's readback of
-        the old version."""
+        """The helper's recovery (B3), safe to run after a move whose process ended at any step.
+        A container under the name on `old_image` that runs and that docker reads as healthy
+        stays, and nothing more is read. Otherwise the kept name is read before any container
+        starts or is parked: a container there is the last working container of a move that
+        ended before the container that took its place passed its health check, unless the
+        container under the name passes it now, which leaves it a leftover (`_park`). That last
+        working container is stopped before any start, and removed only once the old container
+        passed its health check; when the old one does not, it is put back and `PutBack` raised
+        (`_take_place`). The backup is read first, and only once it is there on `old_image`, in a
+        state docker can put back as it was (`_usable`), is it renamed back, and started unless
+        it runs. A container under the name on another image takes the kept name and stops first,
+        and goes only once the old container passed its health check (`_back_in_place`); one
+        that failed in place of a container under the kept name is removed first. Without such a
+        backup to put back, or when docker fails to read a name, other than to say no container
+        has it, the restore refuses before anything changes. The helper's wait is the runner's
+        readback of the old version."""
         current = _find(self.container)
-        if current is None or current["Config"].get("Image") != old_image:
-            backup = _find(self.backup)
-            if backup is None or backup["Config"].get("Image") != old_image:
-                raise RuntimeError("no backup container on the old image to put back")
-            if not _usable(backup):
-                raise RuntimeError(_UNUSABLE_BACKUP)
-            if current is not None:
-                self._back_in_place(backup)
+        if current is not None and current["Config"].get("Image") == old_image:
+            health = current["State"].get("Health") or {}
+            if _runs(current) and health.get("Status") == "healthy":
                 return
-            _docker("rename", self.backup, self.container)
-            current = backup
-        if current["State"].get("Status") != "running":
-            _docker("start", self.container)
+            kept = _find(self.kept)
+            if kept is None:
+                if current["State"].get("Status") != "running":
+                    _docker("start", self.container)
+                return
+            ident = _ident(kept)
+            if _runs(current):
+                if self._passes():
+                    return
+                self._put_back(self.kept, ident, False)
+                raise PutBack(_NOT_PASSED)
 
-    def _back_in_place(self, backup: Mapping[str, Any]) -> None:
-        """The backup, read as `backup`, in place of the container under the name: that one
-        renamed to the kept name and stopped, the backup renamed back and started unless it runs,
-        and the one it replaced removed only once the backup passed its health check
-        (`_take_place`)."""
+            def start_old() -> None:
+                _docker("stop", "--time", str(STOP_SECONDS), self.kept)
+                _docker("start", self.container)
+
+            self._take_place(self.kept, ident, False, start_old)
+            self._drop(ident)
+            return
+        backup = _find(self.backup)
+        if backup is None or backup["Config"].get("Image") != old_image:
+            raise RuntimeError("no backup container on the old image to put back")
+        if not _usable(backup):
+            raise RuntimeError(_UNUSABLE_BACKUP)
+        if current is None and _runs(backup):
+            _docker("rename", self.backup, self.container)
+            return
+        kept = _find(self.kept)
+        if kept is None and current is None:
+            _docker("rename", self.backup, self.container)
+            _docker("start", self.container)
+            return
+        if kept is None or (current is not None and _runs(current) and self._passes()):
+            self._back_in_place(backup, _ident(current))
+            return
+        ident = _ident(kept)
+        if current is not None:
+            self._clear(True, ident)
+        self._take_place(self.kept, ident, False, self._start_backup(backup))
+        self._drop(ident)
+
+    def _back_in_place(self, backup: Mapping[str, Any], ident: str) -> None:
+        """The backup, read as `backup`, in place of the container under the name, whose Id is
+        `ident`: that one renamed to the kept name (`_park`) and stopped, the backup renamed back
+        and started unless it runs, and the one it replaced removed only once the backup passed
+        its health check (`_take_place`, `_drop`)."""
+        self._park(ident)
+        self._take_place(self.kept, ident, False, self._start_backup(backup))
+        self._drop(ident)
+
+    def _start_backup(self, backup: Mapping[str, Any]) -> Callable[[], None]:
+        """The steps that bring the backup, read as `backup`, up under the name in place of the
+        last working container under the kept name: that one stopped first, then the backup
+        renamed back and started unless it runs."""
 
         def start_backup() -> None:
             _docker("stop", "--time", str(STOP_SECONDS), self.kept)
@@ -230,84 +314,166 @@ class OwnerAppHost:
             if backup["State"].get("Status") != "running":
                 _docker("start", self.container)
 
-        self._park()
-        self._take_place(self.kept, False, start_backup)
-        _docker("rm", "-f", self.kept)
+        return start_backup
 
-    def _park(self) -> None:
-        """The container under the name renamed to the kept name, before anything stops. When
-        docker refuses that and a container that does not run is left under the kept name, as
-        when docker refused its removal at the end of a move or a put-back failed, that one goes
-        first. It is neither the container under the name nor the backup. It is removed only once
-        the container under the name passed its health check, as that one then replaced it and
-        passed; else, or when docker refuses its removal, it is renamed away, with
-        `UNREMOVED_SUFFIX` and its short Id after the name, for the owner to remove. With no such
-        container there, or a running one, the refusal is raised, before anything changes."""
+    def _park(self, ident: str) -> None:
+        """The container under the name, whose Id is `ident`, renamed to the kept name, before
+        anything stops. A refused rename is read back on the kept name: `ident` there, and no
+        container under the name, means docker applied it and its reply was lost, and the move
+        goes on. A container there that does not run, as when docker refused its removal at the
+        end of a move or a put-back failed, goes first. It is neither the container under the
+        name nor the backup. It is removed only once the container under the name passed its
+        health check, as that one then replaced it and passed; else, or when docker refuses its
+        removal, it is renamed away, with `UNREMOVED_SUFFIX` and its short Id after the name, for
+        the owner to remove. After each refused step the kept name is read again, up to the
+        runner's number of readback attempts, as far apart (`_wait`): once that container has
+        gone, as when a removal docker had under way ended, the rename is tried again, and a
+        removal still under way is waited for. With no container there at the first read, or a
+        running one or one with another Id, the first refusal is raised, before anything
+        changes."""
         try:
             _docker("rename", self.container, self.kept)
             return
         except _Refused as refused:
             failure = refused
-        left = _find(self.kept)
-        if left is None or left["State"].get("Running") or left["State"].get("Status") == "running":
-            raise failure
-        removed = False
+        leftover = None
+        for attempt in range(READBACK_ATTEMPTS):
+            if attempt:
+                _wait(READBACK_INTERVAL_SECONDS)
+            left = _find(self.kept)
+            if left is not None and _ident(left) == ident:
+                if _find(self.container) is None:
+                    return
+                raise failure
+            if left is None and leftover is None:
+                raise failure
+            if left is not None:
+                if leftover not in (None, _ident(left)) or _runs(left):
+                    raise failure
+                if leftover is not None and left["State"].get("Status") == "removing":
+                    continue
+                leftover = _ident(left)
+                try:
+                    self._take_away(left)
+                except _Refused:
+                    continue
+            try:
+                _docker("rename", self.container, self.kept)
+                return
+            except _Refused:
+                pass
+        raise failure
+
+    def _take_away(self, left: Mapping[str, Any]) -> None:
+        """The container `left`, which does not run, off the kept name: removed when the container
+        under the name passes its health check, else, or when docker refuses its removal, renamed
+        away, with `UNREMOVED_SUFFIX` and its short Id after the name."""
         if self._passes():
             try:
                 _docker("rm", "-f", self.kept)
-                removed = True
+                return
             except _Refused:
                 pass
-        if not removed:
-            away = self.container + UNREMOVED_SUFFIX + str(left.get("Id", ""))[:12]
-            _docker("rename", self.kept, away)
-        _docker("rename", self.container, self.kept)
+        away = self.container + UNREMOVED_SUFFIX + _ident(left)[:12]
+        _docker("rename", self.kept, away)
 
-    def _take_place(self, kept: str, made: bool, steps: Callable[[], object]) -> None:
-        """`steps` bring the container that takes the place of the last working one, kept stopped
-        under `kept`, up under the name, and then its health check (`_passes`) runs. When docker
-        refuses a step or the check does not pass, the last working container goes back
-        (`_put_back`) and `PutBack` is raised, naming the refused docker command and its exit
-        only, or the failed check. `made` tells whether the move made the container that takes the
-        place, which is then removed; else it is the backup, which goes back to the backup name."""
+    def _parked(self, parking: str, ident: str) -> bool:
+        """Whether a refused rename of the container with Id `ident` from the name to `parking`
+        went through all the same, as when docker applied it and its reply was lost: that Id is
+        under `parking`, and no container is under the name."""
+        there = _find(parking)
+        return there is not None and _ident(there) == ident and _find(self.container) is None
+
+    def _take_place(
+        self, kept: str, ident: str, made: bool, steps: Callable[[], object]
+    ) -> None:
+        """`steps` bring the container that takes the place of the last working one, whose Id is
+        `ident`, kept stopped under `kept`, up under the name, and then its health check
+        (`_passes`) runs. When docker refuses a step or the check does not pass, the last working
+        container goes back (`_put_back`) and `PutBack` is raised, naming the refused docker
+        command and its exit only, or the failed check. `made` tells whether the move made the
+        container that takes the place, which is then removed; else it is the backup, which goes
+        back to the backup name."""
         try:
             steps()
             failure = None if self._passes() else _NOT_PASSED
         except _Refused as refused:
             failure = str(refused)
         if failure is not None:
-            self._put_back(kept, made)
+            self._put_back(kept, ident, made)
             raise PutBack(failure)
 
-    def _put_back(self, kept: str, made: bool) -> None:
+    def _put_back(self, kept: str, ident: str, made: bool) -> None:
         """The container under the name, if any, taken away (`_clear`), and the last working
-        container given the name back from `kept`, started and checked. A refused step or a failed
-        check raises here, not `PutBack`: the last working container is then not back."""
-        self._clear(made)
-        _docker("rename", kept, self.container)
-        _docker("start", self.container)
+        container, with Id `ident`, given the name back from `kept` and started (`_bring`), then
+        checked. A step still refused or a failed check raises here, not `PutBack`: the last
+        working container is then not back."""
+        self._clear(made, ident)
+        self._bring(ident, kept)
         if not self._passes():
             raise RuntimeError("the last working container, put back, failed its health check")
 
-    def _clear(self, made: bool) -> None:
+    def _bring(self, ident: str, kept: str) -> None:
+        """The container with Id `ident` brought from `kept` under the name and running, safe to
+        retry: the names are read before the first attempt and after each refusal, to find where
+        that Id is and whether it runs, and only the step still missing is taken, the rename or
+        the start; a step docker confirmed needs no read. A refused step is tried again, up to
+        the runner's number of readback attempts for each step, as far apart (`_wait`), so that a
+        refused launch or a reply lost after docker applied the step does no harm. Raises when
+        that Id is under neither name, when another container has the name, or with the last
+        refusal once a step ran out of attempts."""
+        tries = {"rename": 0, "start": 0}
+        failure: _Refused | None = None
+        read = True
+        under_name = runs = False
+        while True:
+            if read:
+                live = _find(self.container)
+                if live is not None and _ident(live) != ident:
+                    raise RuntimeError(_STILL_TAKEN)
+                found = live if live is not None else _find(kept)
+                if found is None or _ident(found) != ident:
+                    raise RuntimeError("the last working container is under neither name")
+                under_name, runs = live is not None, _runs(found)
+            if under_name and runs:
+                return
+            step = ["start", self.container] if under_name else ["rename", kept, self.container]
+            if tries[step[0]] == READBACK_ATTEMPTS and failure is not None:
+                raise failure
+            if tries[step[0]]:
+                _wait(READBACK_INTERVAL_SECONDS)
+            tries[step[0]] += 1
+            try:
+                _docker(*step)
+            except _Refused as refused:
+                failure, read = refused, True
+                continue
+            read = False
+            if under_name:
+                runs = True
+            under_name = True
+
+    def _clear(self, made: bool, ident: str) -> None:
         """The name freed of the container that took the place, if one has it: removed when the
-        move made it, else stopped and renamed back to the backup name. After a refusal the name
-        is read again, up to the runner's number of readback attempts, as far apart (`_wait`), so
-        that this is safe to retry: no container under the name frees it; a removal docker has
-        under way is waited for; and a container the move made that docker did not remove is
-        stopped and renamed away, with `UNREMOVED_SUFFIX` and its short Id after the name. A
-        container under the name with another Id is left alone. A name still taken then raises."""
+        move made it, else stopped and renamed back to the backup name. The last working
+        container, with Id `ident`, under the name already is left there. After a refusal the
+        name is read again, up to the runner's number of readback attempts, as far apart
+        (`_wait`), so that this is safe to retry: no container under the name frees it; a removal
+        docker has under way is waited for; and a container the move made that docker did not
+        remove is stopped and renamed away, with `UNREMOVED_SUFFIX` and its short Id after the
+        name. A container under the name with another Id is left alone. A name still taken then
+        raises."""
         taking = None
         for attempt in range(READBACK_ATTEMPTS):
             if attempt:
                 _wait(READBACK_INTERVAL_SECONDS)
             try:
                 record = _find(self.container)
-                if record is None:
+                if record is None or _ident(record) == ident:
                     return
                 if taking is None:
-                    taking = str(record.get("Id", ""))
-                elif record.get("Id", "") != taking:
+                    taking = _ident(record)
+                elif _ident(record) != taking:
                     break
                 if attempt and record["State"].get("Status") == "removing":
                     continue
@@ -320,7 +486,20 @@ class OwnerAppHost:
                 return
             except _Refused:
                 pass
-        raise RuntimeError("the name is still taken, so the last working container is not back")
+        raise RuntimeError(_STILL_TAKEN)
+
+    def _drop(self, ident: str) -> None:
+        """The last working container, with Id `ident`, removed from the kept name once the
+        container that took its place passed its health check. A refusal is read back: with no
+        container of that Id under the kept name, as when docker removed it and the reply was
+        lost, the move went through; else the refusal is raised, and the container stays there
+        for the next move (`_park`)."""
+        try:
+            _docker("rm", "-f", self.kept)
+        except _Refused:
+            left = _find(self.kept)
+            if left is not None and _ident(left) == ident:
+                raise
 
     def _passes(self) -> bool:
         """A move's health check of the container under the name: `health_ok`, read up to the
@@ -373,11 +552,15 @@ class OwnerAppHost:
 class _Refused(RuntimeError):
     """A docker call that exited nonzero, or whose client did not launch, named by its command and
     its exit or the launch's error number only (D-10). `missing` tells whether docker said that no
-    container or object has the name it was given."""
+    container or object has the name it was given, and `taken` whether docker said that another
+    container has the name a rename gives, so that the rename did not happen."""
 
-    def __init__(self, command: str, outcome: str, missing: bool = False) -> None:
+    def __init__(
+        self, command: str, outcome: str, missing: bool = False, taken: bool = False
+    ) -> None:
         super().__init__(f"docker {command} {outcome}")
         self.missing = missing
+        self.taken = taken
 
 
 def _docker(
@@ -403,13 +586,14 @@ def _docker(
         if not done.returncode:
             return done.stdout
         missing = any(words in done.stderr for words in _NO_SUCH)
-        raise _Refused(args[0], f"exited {done.returncode}", missing)
+        raise _Refused(args[0], f"exited {done.returncode}", missing, _IN_USE in done.stderr)
     raise _Refused(args[0], f"did not launch (errno {unlaunched})")
 
 
 def _wait(seconds: float) -> None:
-    """Every wait between two reads of a move's health check, or of the name a put-back frees,
-    goes through here, so a test can replace it."""
+    """Every wait between two reads of a move's health check, of the name a put-back frees or of
+    the kept name a move frees, and between two attempts of a put-back step, goes through here, so
+    a test can replace it."""
     time.sleep(seconds)
 
 
@@ -449,6 +633,17 @@ def _image(image: str) -> Any:
     except (ValueError, TypeError, LookupError):
         pass
     raise RuntimeError("docker inspect printed no image record")
+
+
+def _ident(record: Mapping[str, Any] | None) -> str:
+    """The Id in the container record `record`, or none for no record."""
+    return "" if record is None else str(record.get("Id", ""))
+
+
+def _runs(record: Mapping[str, Any]) -> bool:
+    """Whether docker reads the container in `record` as running, by its flag or its status."""
+    state = record["State"]
+    return bool(state.get("Running")) or state.get("Status") == "running"
 
 
 def _usable(record: Mapping[str, Any]) -> bool:

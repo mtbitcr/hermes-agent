@@ -160,15 +160,23 @@ REMOVE_KEPT = ["rm", "-f", KEPT]
 PASSED = [INSPECT, ["exec", CONTAINER, "node", "-e", release_owner_app_host.HEALTH_READ]]
 # The forward reads the new image before any change (point 14), and checks the new container.
 FORWARD = [INSPECT, INSPECT_IMAGE, RENAME_TO_BACKUP, STOP_BACKUP, RUN_NEW, *PASSED]
+# docker inspect of the name a move keeps the last working container under.
+INSPECT_KEPT = ["inspect", "--type", "container", KEPT]
 # Back reads the backup before it changes anything (finding 2), and removes the new container
-# only once the old one passed its health check.
-BACK = [INSPECT_BACKUP, RENAME_TO_KEPT, STOP_KEPT, RENAME_BACK, START, *PASSED, REMOVE_KEPT]
-FORWARD_REPEAT = [
-    INSPECT_BACKUP, INSPECT_IMAGE, RENAME_TO_KEPT, STOP_KEPT, RUN_NEW, *PASSED, REMOVE_KEPT
+# only once the old one passed its health check. Back and forward-repeat read the Id under the
+# name before they park that container, so that a refused rename can be read back (round 3).
+BACK = [
+    INSPECT_BACKUP, INSPECT, RENAME_TO_KEPT, STOP_KEPT, RENAME_BACK, START, *PASSED, REMOVE_KEPT
 ]
-# The restore of the old container while the new one runs under the name.
+FORWARD_REPEAT = [
+    INSPECT_BACKUP, INSPECT_IMAGE, INSPECT, RENAME_TO_KEPT, STOP_KEPT, RUN_NEW, *PASSED,
+    REMOVE_KEPT,
+]
+# The restore of the old container while the new one runs under the name; it reads the kept name
+# before it parks a container there (round 3).
 RESTORE = [
-    INSPECT, INSPECT_BACKUP, RENAME_TO_KEPT, STOP_KEPT, RENAME_BACK, START, *PASSED, REMOVE_KEPT
+    INSPECT, INSPECT_BACKUP, INSPECT_KEPT, RENAME_TO_KEPT, STOP_KEPT, RENAME_BACK, START, *PASSED,
+    REMOVE_KEPT,
 ]
 
 # The stand-in docker. It records every call as one JSON line, and what a call reads from the env
@@ -195,7 +203,12 @@ RESTORE = [
 # second one with docker's own words (Moby's daemon/delete.go), and the one under way then ends, the
 # container gone, once docker inspect read it "removal_reads" more times, none by default. A
 # command in "removal_ends_before" finds such a container gone already, as docker does when the
-# removal under way ends just before it.
+# removal under way ends just before it. A rename to a name another container has is refused with
+# docker's own words for that conflict. Each container that docker run or docker start brings up
+# while another one runs is noted in "overlaps", its Id and the other's, which no move may cause.
+# "replies_lost" holds calls, each [the call, how many such calls to let through first]: docker
+# applies that call, and its reply is lost on the way, so the client exits 1 with a transport error
+# and no word of docker's (the entry then goes).
 STAND_IN_DOCKER = r'''
 import json
 import os
@@ -231,6 +244,9 @@ def refuse(code=1):
 
 
 def running(name):
+    for other in containers.values():
+        if other is not containers[name] and other["State"].get("Status") == "running":
+            state.setdefault("overlaps", []).append([containers[name]["Id"], other["Id"]])
     containers[name]["State"] = {
         "Status": "running", **STOPPED, "Running": True, "Health": {"Status": "healthy"}
     }
@@ -283,6 +299,12 @@ if command == "inspect":
         sys.stderr.write("Error: No such container: " + last + "\n")
         sys.exit(1)
 elif command == "rename":
+    if last in containers:
+        sys.stderr.write(
+            "Error response from daemon: Error when allocating new name: Conflict. The container"
+            ' name "/' + last + '" is already in use by container "' + containers[last]["Id"]
+            + '".\n'
+        )
     if args[1] not in containers or last in containers:
         refuse()
     containers[last] = containers.pop(args[1])
@@ -357,6 +379,16 @@ elif command == "exec":
         sys.exit(1)
 else:
     refuse()
+lost = state.get("replies_lost", [])
+for entry in lost:
+    if entry[0] == args:
+        entry[1] -= 1
+        if entry[1] < 0:
+            lost.remove(entry)
+            save()
+            sys.stderr.write("error during connect: unexpected EOF\n")
+            sys.exit(1)
+        break
 save()
 '''
 
@@ -404,6 +436,24 @@ class StandInDocker:
         self.inputs_file.unlink(missing_ok=True)
 
 
+class ProcessEnded(BaseException):
+    """The move's process ends right after a docker call returned, as when the host kills it; no
+    handler of the adapter catches it, as none catches more than docker's failures."""
+
+
+def reached(stand_in: StandInDocker, state: dict, key: str, call: list[str]) -> bool:
+    """Whether `call` is the one an entry of `key` in `state` names, once the calls that entry lets
+    through first went: that entry then goes. A count it lowered is saved."""
+    for entry in state.get(key, []):
+        if entry[0] == call:
+            entry[1] -= 1
+            if entry[1] < 0:
+                state[key].remove(entry)
+            stand_in.save(state)
+            return entry[1] < 0
+    return False
+
+
 @pytest.fixture(autouse=True)
 def docker(tmp_path, monkeypatch) -> StandInDocker:
     """Every test runs with the stand-in docker alone on PATH, holding the old container running
@@ -421,6 +471,9 @@ def docker(tmp_path, monkeypatch) -> StandInDocker:
     monkeypatch.setattr(release_owner_app_host, "_wait", lambda seconds: None)
     # docker's client launches, but once for each command in "launch_fails": the system refuses
     # that launch, as fork does with EAGAIN when no process can be spared, and docker never sees it.
+    # "launch_refusals" names calls the same way as "replies_lost" does, [the call, how many such
+    # calls to let through first], for one refused launch of that very call; after the call an
+    # entry of "process_ends" names returned, the move's process ends (`ProcessEnded`).
     real_run = subprocess.run
 
     def launch(argv, **options):
@@ -429,7 +482,12 @@ def docker(tmp_path, monkeypatch) -> StandInDocker:
             state["launch_fails"].remove(argv[1])
             stand_in.save(state)
             raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
-        return real_run(argv, **options)
+        if argv[:1] == ["docker"] and reached(stand_in, state, "launch_refusals", argv[1:]):
+            raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+        done = real_run(argv, **options)
+        if argv[:1] == ["docker"] and reached(stand_in, stand_in.state(), "process_ends", argv[1:]):
+            raise ProcessEnded(argv[1])
+        return done
 
     monkeypatch.setattr(subprocess, "run", launch)
     stand_in.save(
@@ -1185,16 +1243,14 @@ def test_the_restore_after_a_failed_back_or_forward_repeat_puts_the_old_containe
     assert_only_the_old_container_runs(docker)
 
 
-# docker inspect of the name a move keeps the last working container under.
-INSPECT_KEPT = ["inspect", "--type", "container", KEPT]
-
-
 def test_a_restore_right_after_a_forward_repeat_whose_last_removal_was_refused_goes_through(docker):
     """A forward-repeat whose removal of the container it replaced docker refused leaves that one
     stopped under the kept name. A restore on a fresh adapter, from that state as the move left
     it, finds the kept name taken before anything stops, reads the one there, and removes it only
     once the container under the name passed its health check, as that one replaced it; then it
-    keeps that container there and puts the old one back as always."""
+    keeps that container there and puts the old one back as always. It reads the kept name first
+    (round 3): the container under the name passes its health check, so the one there is a
+    leftover, not the last working container of a move that ended midway."""
     host().forward(NEW_IMAGE)
     docker.change(fail=["rm"])
     with pytest.raises(RuntimeError, match="^docker rm exited 1$"):
@@ -1207,7 +1263,7 @@ def test_a_restore_right_after_a_forward_repeat_whose_last_removal_was_refused_g
     host().restore(OLD_IMAGE)
 
     assert docker.calls() == [
-        *RESTORE[:3], INSPECT_KEPT, *PASSED, REMOVE_KEPT, *RESTORE[2:]
+        *RESTORE[:3], *PASSED, RESTORE[3], INSPECT_KEPT, *PASSED, REMOVE_KEPT, *RESTORE[3:]
     ]
     assert_only_the_old_container_runs(docker)
 
@@ -1238,7 +1294,7 @@ def test_the_next_rehearsal_after_a_back_or_restore_whose_last_removal_was_refus
 
     assert docker.calls() == [
         *FORWARD,
-        *BACK[:2], INSPECT_KEPT, *PASSED, REMOVE_KEPT, *BACK[1:],
+        *BACK[:3], INSPECT_KEPT, *PASSED, REMOVE_KEPT, *BACK[2:],
         *FORWARD,
         *FORWARD_REPEAT,
         *RESTORE,
@@ -1297,7 +1353,8 @@ def test_a_restore_takes_only_docker_s_word_that_no_container_has_the_name_as_no
     docker, words
 ):
     """docker inspect exits nonzero and says no container or object has the name: the restore
-    then puts the backup back under it."""
+    then puts the backup back under it, once it read that no container is kept under the kept
+    name either (round 3)."""
     backup = old_container()
     backup["State"] = {"Status": "exited", **STOPPED, "Health": {"Status": "unhealthy"}}
     docker.change(
@@ -1307,7 +1364,7 @@ def test_a_restore_takes_only_docker_s_word_that_no_container_has_the_name_as_no
 
     host().restore(OLD_IMAGE)
 
-    assert docker.calls() == [INSPECT, INSPECT_BACKUP, RENAME_BACK, START]
+    assert docker.calls() == [INSPECT, INSPECT_BACKUP, INSPECT_KEPT, RENAME_BACK, START]
     assert_only_the_old_container_runs(docker)
 
 
@@ -1624,7 +1681,9 @@ def test_a_removal_docker_has_under_way_is_waited_for_a_bounded_number_of_times(
     if reads == 2:
         assert type(error.value) is release_owner_app_host.PutBack
         rename_back = RENAME_BACK if move == "forward" else RENAME_KEPT_BACK
-        assert reread[:4] == [INSPECT, INSPECT, INSPECT, rename_back]
+        # The put-back reads where the last working container is before its rename (round 3).
+        kept = INSPECT_BACKUP if move == "forward" else INSPECT_KEPT
+        assert reread[:6] == [INSPECT, INSPECT, INSPECT, INSPECT, kept, rename_back]
         assert (containers[CONTAINER]["Id"], containers[CONTAINER]["State"]["Status"]) == (
             last, "running",
         )
@@ -2001,3 +2060,279 @@ def test_the_moves_and_readbacks_import_nothing(docker):
 
     assert set(sys.modules) - loaded == set()
     assert docker.containers()[CONTAINER]["Config"]["Image"] == NEW_IMAGE
+
+
+# Round three: a step docker applied though its reply was lost, a refused launch of a put-back step,
+# a move's process that ends between two calls, and a removal that ends between two calls.
+
+UNHEALTHY = TAKING_THE_PLACE_FAILS["a failed health check"]
+# Each move's put-back rename and start, and how many such calls the move made before them.
+PUT_BACK_STEPS = {
+    "forward": {"rename": (RENAME_BACK, 0), "start": (START, 0)},
+    "back": {"rename": (RENAME_KEPT_BACK, 0), "start": (START, 1)},
+    "forward_repeat": {"rename": (RENAME_KEPT_BACK, 0), "start": (START, 0)},
+    "restore": {"rename": (RENAME_KEPT_BACK, 0), "start": (START, 1)},
+}
+# The rename that parks the last working container in each move.
+PARKING = {
+    "forward": RENAME_TO_BACKUP,
+    "back": RENAME_TO_KEPT,
+    "forward_repeat": RENAME_TO_KEPT,
+    "restore": RENAME_TO_KEPT,
+}
+
+
+def assert_runs_under_the_name(docker: StandInDocker, wanted: str) -> None:
+    """The container with Id `wanted` runs under the name and passed the health check last, and no
+    two containers ever ran at once."""
+    state = docker.state()
+    record = state["containers"][CONTAINER]
+    assert (record["Id"], record["State"]["Status"]) == (wanted, "running")
+    assert docker.calls()[-len(PASSED):] == PASSED or docker.calls()[-1] == REMOVE_KEPT
+    assert state.get("overlaps", []) == []
+
+
+@pytest.mark.parametrize("fault", ["launch_refusals", "replies_lost"])
+@pytest.mark.parametrize("step", ["rename", "start"])
+@pytest.mark.parametrize("move", list(SWAPS))
+def test_a_put_back_step_that_fails_once_is_done_again_until_the_last_working_one_runs(
+    docker, move, step, fault
+):
+    """Finding 62f72019: the put-back reads where the last working container's Id is and whether
+    it runs before each attempt, does only the step still missing, and tries a refused step again;
+    PutBack comes only once that Id runs under the name and passed its health check."""
+    if move != "forward":
+        host().forward(NEW_IMAGE)
+    last, taking = SWAPS[move]
+    call, earlier = PUT_BACK_STEPS[move][step]
+    docker.change(comes_up={taking: UNHEALTHY}, **{fault: [[call, earlier]]})
+    docker.forget_calls()
+
+    with pytest.raises(release_owner_app_host.PutBack):
+        swap(move)
+
+    assert docker.state()[fault] == []
+    assert_runs_under_the_name(docker, last)
+    assert docker.calls()[-len(PASSED):] == PASSED
+
+
+@pytest.mark.parametrize("move", list(SWAPS))
+def test_a_parking_rename_docker_applied_with_its_reply_lost_goes_on_with_the_move(docker, move):
+    """Finding e6c60169: the move read the Id under the name before it parks that container; a
+    parking rename whose reply is lost after docker applied it is read back by that Id under the
+    parking name, and the move goes on."""
+    if move != "forward":
+        host().forward(NEW_IMAGE)
+    taking = SWAPS[move][1]
+    docker.change(replies_lost=[[PARKING[move], 0]])
+
+    swap(move)
+
+    assert docker.state()["replies_lost"] == []
+    assert_runs_under_the_name(docker, taking)
+
+
+def test_a_forward_whose_stop_docker_applied_with_its_reply_lost_puts_the_old_container_back(
+    docker,
+):
+    """Finding e6c60169: a refused stop of the forward is read back by the old container's Id under
+    the backup name; stopped, it gets its name back, starts and passes, and the forward reports
+    PutBack."""
+    docker.change(replies_lost=[[STOP_BACKUP, 0]])
+
+    with pytest.raises(release_owner_app_host.PutBack):
+        host().forward(NEW_IMAGE)
+
+    assert_runs_under_the_name(docker, "the-old-container")
+    assert sorted(docker.containers()) == [CONTAINER]
+
+
+@pytest.mark.parametrize(
+    ("move", "ended_after", "backup_fails"),
+    [
+        ("back", RENAME_TO_KEPT, False),
+        ("back", STOP_KEPT, True),
+        ("back", START, True),
+        ("forward_repeat", RUN_NEW, True),
+    ],
+    ids=["back-parked", "back-stopped", "back-started-an-unhealthy-backup",
+         "forward_repeat-started-an-unhealthy-replacement"],
+)
+def test_a_restore_after_a_move_that_ended_midway_puts_back_the_last_working_one(
+    docker, move, ended_after, backup_fails
+):
+    """Finding f39a8c4d: a fresh restore reads the live, backup and kept names before it starts or
+    parks a container. The container kept by a move that ended before its replacement passed is the
+    last working container: it is stopped before any start, never removed nor renamed away before
+    a container under the name passed, and put back, checked, when the backup fails."""
+    host().forward(NEW_IMAGE)
+    comes_up = {"made-2": UNHEALTHY}
+    if backup_fails:
+        comes_up["the-old-container"] = UNHEALTHY
+    docker.change(comes_up=comes_up, process_ends=[[ended_after, 0]])
+    with pytest.raises(ProcessEnded):
+        swap(move)
+    assert docker.state()["process_ends"] == []
+
+    if backup_fails:
+        with pytest.raises(release_owner_app_host.PutBack):
+            host().restore(OLD_IMAGE)
+        assert_runs_under_the_name(docker, "made-1")
+        assert "the-old-container" in [c["Id"] for c in docker.containers().values()]
+    else:
+        host().restore(OLD_IMAGE)
+        assert_runs_under_the_name(docker, "the-old-container")
+        assert sorted(docker.containers()) == [CONTAINER]
+
+
+@pytest.mark.parametrize("move", ["forward_repeat", "back", "restore"])
+def test_a_removal_that_ends_between_two_calls_frees_the_kept_name_for_the_next_moves(
+    docker, move
+):
+    """Finding 065d7145: the move's final removal leaves the kept container being removed, from the
+    move's own output and no record edited after it. The next restore, after a forward for a back
+    or a restore, re-reads the kept name after a refused cleanup: the removal that ended there frees
+    the name, and the restore parks the container under the name there and goes through."""
+    owner_app = host()
+    owner_app.forward(NEW_IMAGE)
+    docker.change(rm_leaves="removing")
+    with pytest.raises(RuntimeError, match="^docker rm exited 1$"):
+        swap(move)
+    assert docker.containers()[KEPT]["State"]["Status"] == "removing"
+    docker.change(rm_leaves=None)
+    if move != "forward_repeat":
+        host().forward(NEW_IMAGE)
+
+    host().restore(OLD_IMAGE)
+
+    assert_runs_under_the_name(docker, "the-old-container")
+    assert sorted(docker.containers()) == [CONTAINER]
+
+
+# The class test (round 3): each move from the D-6 rehearsal state (a forward from the fixture's,
+# the others after a forward), the container taking the place passing or failing its health
+# check, and one fault at one mutating call the move makes: the call's launch refused once
+# ("refused"), docker applying it with its reply lost once ("lost"), or the move's process ending
+# right after it, then a restore on a fresh adapter ("ended"). Each move's mutating calls, named:
+# those up to the one that starts the container taking the place, then those after it when that
+# one passes, and those after it when it fails.
+STOP_LIVE = ["stop", "--time", "30", CONTAINER]
+CLASS_CALLS = {
+    "forward": (
+        [("rename", RENAME_TO_BACKUP), ("stop", STOP_BACKUP), ("run", RUN_NEW)],
+        [],
+        [("rm", REMOVE), ("rename-back", RENAME_BACK), ("start-back", START)],
+    ),
+    "back": (
+        [
+            ("rename", RENAME_TO_KEPT), ("stop", STOP_KEPT), ("rename-backup", RENAME_BACK),
+            ("start", START),
+        ],
+        [("rm-kept", REMOVE_KEPT)],
+        [
+            ("stop-failed", STOP_LIVE), ("rename-failed", RENAME_TO_BACKUP),
+            ("rename-back", RENAME_KEPT_BACK), ("start-back", START),
+        ],
+    ),
+    "forward_repeat": (
+        [("rename", RENAME_TO_KEPT), ("stop", STOP_KEPT), ("run", RUN_NEW)],
+        [("rm-kept", REMOVE_KEPT)],
+        [("rm", REMOVE), ("rename-back", RENAME_KEPT_BACK), ("start-back", START)],
+    ),
+}
+FAULTS = {"refused": "launch_refusals", "lost": "replies_lost", "ended": "process_ends"}
+# The cases that run, as (move, health, call, fault): eight of the matrix, each taking a course no
+# other test here takes, to keep the file well under three minutes. Of the others, most repeat
+# another case's state and course, or a test's above: a fault before the container taking the
+# place starts leaves the same state whether that one would pass or fail; a refused launch leaves
+# what docker's nonzero exit leaves, as the tests of refused steps above pin; the restore after a
+# forward makes back's very calls, in back's order, as forward-repeat makes back's stop of the kept
+# container; and a process that ended where the state is the fixture's, or the one a forward
+# leaves, comes to the restore tests above. The rest are left out for time alone.
+CLASS_CASES = [
+    ("forward", "passes", "run", "lost"),
+    ("back", "passes", "stop", "refused"),
+    ("back", "passes", "stop", "ended"),
+    ("back", "passes", "rename-backup", "ended"),
+    ("back", "passes", "start", "lost"),
+    ("back", "passes", "rm-kept", "lost"),
+    ("back", "fails", "stop-failed", "refused"),
+    ("back", "fails", "stop-failed", "ended"),
+]
+
+
+def class_cases() -> list:
+    cases = []
+    for move, health, step, fault in CLASS_CASES:
+        before, passes, fails = CLASS_CALLS[move]
+        steps = [*before, *(passes if health == "passes" else fails)]
+        index = [name for name, _ in steps].index(step)
+        call = steps[index][1]
+        earlier = [made for _, made in steps[:index]].count(call)
+        cases.append(pytest.param(
+            move, health, call, earlier, fault, id=f"{move}-{health}-{step}-{fault}"
+        ))
+    return cases
+
+
+def names(docker: StandInDocker) -> dict:
+    return {
+        name: (record["Id"], record["State"]["Status"])
+        for name, record in docker.containers().items()
+    }
+
+
+@pytest.mark.parametrize(("move", "health", "call", "earlier", "fault"), class_cases())
+def test_one_fault_at_any_call_of_a_move_keeps_one_working_container_under_the_name(
+    docker, move, health, call, earlier, fault
+):
+    """No two containers run at once; the container that ran last is removed only once the one
+    taking its place passed; a container runs under the name and passed, or the move raised
+    before any takeover with nothing changed (but for the forward whose refused stop leaves the
+    old container running under the backup name, as the candidate's test pins); after PutBack the
+    container under the name is the one that ran last; and after a process that ended, a restore
+    on a fresh adapter leaves the old image running under the name, or raises PutBack with the
+    container that ran last running there."""
+    if move != "forward":
+        host().forward(NEW_IMAGE)
+    last, taking = SWAPS[move]
+    before = names(docker)
+    docker.change(
+        comes_up={taking: UNHEALTHY} if health == "fails" else {},
+        **{FAULTS[fault]: [[call, earlier]]},
+    )
+    docker.forget_calls()
+
+    raised = None
+    try:
+        swap(move)
+    except (RuntimeError, ProcessEnded) as error:
+        raised = error
+
+    assert docker.state()[FAULTS[fault]] == []
+    assert docker.state().get("overlaps", []) == []
+    after = names(docker)
+    ids = [ident for ident, _ in after.values()]
+    if last not in ids:
+        assert after[CONTAINER] == (taking, "running") and health == "passes"
+    if fault == "ended":
+        assert isinstance(raised, ProcessEnded)
+        try:
+            host().restore(OLD_IMAGE)
+        except release_owner_app_host.PutBack:
+            assert_runs_under_the_name(docker, last)
+        else:
+            record = docker.containers()[CONTAINER]
+            assert record["Config"]["Image"] == OLD_IMAGE
+            assert record["State"]["Status"] == "running"
+        assert docker.state().get("overlaps", []) == []
+    elif isinstance(raised, release_owner_app_host.PutBack):
+        assert_runs_under_the_name(docker, last)
+    elif raised is None:
+        assert after[CONTAINER] == (taking, "running") and health == "passes"
+    elif after.get(CONTAINER) == (taking, "running") and PASSED[-1] in docker.calls():
+        assert health == "passes"
+    elif (move, call, fault) == ("forward", STOP_BACKUP, "refused"):
+        assert after == {BACKUP: ("the-old-container", "running")}
+    else:
+        assert after == before
