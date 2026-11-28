@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -208,6 +210,14 @@ SEPARATED = f"release{os.pathsep}stable"
 LAYOUTS = pytest.mark.parametrize(
     "repo", [None, SEPARATED], indirect=True, ids=["plain layout", "below a separator-named folder"]
 )
+PARENTS = pytest.mark.parametrize(
+    "parent", ["plain", SEPARATED], ids=["a plain parent", "a parent with the path separator"]
+)
+ODD_NAMES = {
+    "CR in the middle": "a\rb", "CR at the end": "ab\r", "CR LF in the middle": "a\r\nb", "CR LF at the end": "ab\r\n",
+    "LF at the end": "ab\n",
+}
+ODD = pytest.mark.parametrize("name", list(ODD_NAMES.values()), ids=list(ODD_NAMES))
 
 
 @pytest.fixture
@@ -301,98 +311,149 @@ def test_p7_reads_tuple_rows_and_row_objects_alike(conn):
 # --- point 8: the default reader ---------------------------------------------------------
 
 
-def fake_run(stdout=b"", returncode=0, raises=None):
-    def run(argv, **kwargs):
-        if raises is not None:
-            raise raises
-        out = stdout.decode() if kwargs.get("text") or kwargs.get("encoding") else stdout
-        return subprocess.CompletedProcess(argv, returncode, stdout=out, stderr=b"")
+def text_requested(kwargs):
+    """The options that make Popen read text: it then decodes and turns CRLF and CR into LF."""
+    return any(kwargs.get(name) for name in ("text", "universal_newlines", "encoding", "errors"))
 
-    return run
+
+def right_root(worktree) -> bytes:
+    """What git prints for a checkout root: the real path of the stored folder, as bytes, and one line feed."""
+    return os.path.realpath(os.fsencode(worktree)) + b"\n"
+
+
+def clean_git_env():
+    """The child environment of the default reader: no GIT_ variable of the caller, replacements and Trace2 off."""
+    env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    env.update(GIT_NO_REPLACE_OBJECTS="1", GIT_TRACE2="0", GIT_TRACE2_EVENT="0", GIT_TRACE2_PERF="0")
+    return env
+
+
+class FakeGit:
+    """Stands in for subprocess.run and acts like it: bytes unless text mode is asked for, ValueError for a NUL."""
+
+    def __init__(self, first, second=None):
+        # Each answer is bytes (exit 0), (bytes, exit code) or an exception to raise; ``first`` is for rev-parse.
+        self.answers = {"rev-parse": first, "ls-tree": second}
+        self.calls = []
+
+    def __call__(self, *args, **kwargs):
+        argv = args[0] if args else kwargs.pop("args")
+        self.calls.append((list(argv), kwargs))
+        if any("\x00" in part for part in argv):
+            raise ValueError("embedded null byte")
+        answer = self.answers.get(argv[3])
+        assert answer is not None, f"no answer is scripted for git {argv[3]}"
+        if isinstance(answer, BaseException):
+            raise answer
+        stdout, code = answer if isinstance(answer, tuple) else (answer, 0)
+        if text_requested(kwargs):
+            stdout = stdout.decode(kwargs.get("encoding") or "utf-8", kwargs.get("errors") or "strict")
+            stdout = stdout.replace("\r\n", "\n").replace("\r", "\n")
+        if not (kwargs.get("capture_output") or kwargs.get("stdout") == subprocess.PIPE):
+            stdout = None
+        return subprocess.CompletedProcess(argv, code, stdout=stdout, stderr=b"")
+
+    @property
+    def commands(self):
+        return [argv[3] for argv, _ in self.calls]
+
+
+@contextlib.contextmanager
+def spying_on_git(monkeypatch):
+    """Real git runs; each call of subprocess.run made inside the block is noted as ``(argv, kwargs)``."""
+    calls = []
+    real_run = subprocess.run
+
+    def spy(*args, **kwargs):
+        calls.append((list(args[0] if args else kwargs["args"]), kwargs))
+        return real_run(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mod.subprocess, "run", spy)
+        yield calls
 
 
 LINE = f"100644 blob {BLOB}\ttests/test_alpha.py\n".encode()
 
 
+def test_f0_the_fake_runner_acts_like_subprocess_run_for_bytes_text_and_a_nul():
+    sent = b"a\r\nb\rc\r\n\n"
+    child = [sys.executable, "-c", f"import sys; sys.stdout.buffer.write({sent!r})"]
+    real_bytes = subprocess.run(child, capture_output=True)
+    real_text = subprocess.run(child, capture_output=True, text=True)
+    fake = FakeGit(None, sent)
+    argv = ["git", "-C", "w", "ls-tree"]
+    assert fake(argv, capture_output=True).stdout == real_bytes.stdout == sent
+    assert fake(argv, capture_output=True, text=True).stdout == real_text.stdout == "a\nb\nc\n\n"
+    assert fake(argv, capture_output=True, encoding="utf-8", errors="surrogateescape").stdout == real_text.stdout
+    assert fake(argv).stdout is None
+    with pytest.raises(ValueError):
+        subprocess.run(["git", "-C", "w\x00x"], capture_output=True)
+    with pytest.raises(ValueError):
+        fake(["git", "-C", "w\x00x", "ls-tree"], capture_output=True)
+
+
 def test_p8_default_reader_runs_git_ls_tree_as_an_argument_list_without_shell_in_30_seconds(repo, monkeypatch):
     blob = repo.oracle("tests/test_alpha.py")
-    calls = []
-    real_run = subprocess.run
-
-    def spy(*args, **kwargs):
-        calls.append((args, kwargs))
-        return real_run(*args, **kwargs)
-
-    monkeypatch.setattr(mod.subprocess, "run", spy)
-    entry = mod._git_read_base_entry(str(repo.work), repo.base, "tests/test_alpha.py")
+    with spying_on_git(monkeypatch) as calls:
+        entry = mod._git_read_base_entry(str(repo.work), repo.base, "tests/test_alpha.py")
     assert entry == ("100644", blob)
-    ((args, kwargs),) = calls
-    argv = args[0] if args else kwargs["args"]
-    assert argv == ["git", "-C", str(repo.work), "ls-tree", repo.base, "--", "tests/test_alpha.py"]
-    assert not kwargs.get("shell")
-    assert kwargs["timeout"] == 30
+    assert [argv for argv, _ in calls] == [
+        ["git", "-C", str(repo.work), "rev-parse", "--show-toplevel"],
+        ["git", "-C", str(repo.work), "ls-tree", repo.base, "--", "tests/test_alpha.py"],
+    ]
+    for _argv, kwargs in calls:
+        assert not kwargs.get("shell")
+        assert kwargs["timeout"] == 30
 
 
 @LAYOUTS
-def test_p8_default_reader_runs_rev_parse_before_ls_tree_only_when_the_parent_holds_the_path_separator(
-    repo, monkeypatch
-):
-    separated = repo.work.parent != repo.root
-    assert has_separator_parent(repo.work) == separated, "the layout decides the path separator"
+def test_p8_default_reader_runs_rev_parse_before_ls_tree_for_every_layout_with_no_ceiling(repo, monkeypatch):
+    assert has_separator_parent(repo.work) == (repo.work.parent != repo.root), "the layout decides the separator"
     blob = repo.oracle("tests/test_alpha.py")
     for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CEILING_DIRECTORIES", "GIT_TRACE2_EVENT"):
         monkeypatch.setenv(name, str(repo.root / "elsewhere"))
-    calls = []
-    real_run = subprocess.run
-
-    def spy(*args, **kwargs):
-        calls.append((args, kwargs))
-        return real_run(*args, **kwargs)
-
-    monkeypatch.setattr(mod.subprocess, "run", spy)
-    assert mod._git_read_base_entry(str(repo.work), repo.base, "tests/test_alpha.py") == ("100644", blob)
-    rev_parse = ["git", "-C", str(repo.work), "rev-parse", "--show-toplevel"]
-    ls_tree = ["git", "-C", str(repo.work), "ls-tree", repo.base, "--", "tests/test_alpha.py"]
-    assert [args[0] if args else kwargs["args"] for args, kwargs in calls] == (
-        [rev_parse, ls_tree] if separated else [ls_tree]
-    )
-    expected_env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
-    expected_env.update(GIT_NO_REPLACE_OBJECTS="1", GIT_TRACE2="0", GIT_TRACE2_EVENT="0", GIT_TRACE2_PERF="0")
-    if not separated:
-        expected_env["GIT_CEILING_DIRECTORIES"] = os.path.realpath(repo.root)
-    for _args, kwargs in calls:
+    with spying_on_git(monkeypatch) as calls:
+        assert mod._git_read_base_entry(str(repo.work), repo.base, "tests/test_alpha.py") == ("100644", blob)
+    assert [argv for argv, _ in calls] == [
+        ["git", "-C", str(repo.work), "rev-parse", "--show-toplevel"],
+        ["git", "-C", str(repo.work), "ls-tree", repo.base, "--", "tests/test_alpha.py"],
+    ]
+    for _argv, kwargs in calls:
         assert not kwargs.get("shell")
         assert kwargs["timeout"] == 30
-        assert kwargs["env"] == expected_env
-        assert kwargs["capture_output"] and kwargs["encoding"] == "utf-8" and kwargs["errors"] == "surrogateescape"
+        assert kwargs["env"] == clean_git_env()
+        assert kwargs["capture_output"] and not text_requested(kwargs)
 
 
 def test_p8_default_reader_gives_mode_and_id_for_exactly_one_line_for_that_path(monkeypatch):
-    monkeypatch.setattr(mod.subprocess, "run", fake_run(LINE))
+    monkeypatch.setattr(mod.subprocess, "run", FakeGit(right_root("/w"), LINE))
     assert mod._git_read_base_entry("/w", BASE, "tests/test_alpha.py") == ("100644", BLOB)
     other_mode = LINE.replace(b"100644", b"100755")
-    monkeypatch.setattr(mod.subprocess, "run", fake_run(other_mode))
+    monkeypatch.setattr(mod.subprocess, "run", FakeGit(right_root("/w"), other_mode))
     assert mod._git_read_base_entry("/w", BASE, "tests/test_alpha.py") == ("100755", BLOB)
 
 
 OTHER_RESULTS = {
-    "no line": fake_run(b""),
-    "two lines": fake_run(LINE + LINE.replace(b"alpha", b"beta")),
-    "a line for another path": fake_run(LINE.replace(b"alpha", b"alpha.bak")),
-    "a non-zero exit": fake_run(LINE, returncode=128),
-    "a time-out": fake_run(raises=subprocess.TimeoutExpired("git", 30)),
-    "an os error": fake_run(raises=FileNotFoundError("git")),
-    "a permission error": fake_run(raises=PermissionError("git")),
-    "no tab": fake_run(f"100644 blob {BLOB} tests/test_alpha.py\n".encode()),
-    "two fields": fake_run(b"100644 blob\ttests/test_alpha.py\n"),
-    "a folder": fake_run(f"040000 tree {BLOB}\ttests/test_alpha.py\n".encode()),
-    "a submodule": fake_run(f"160000 commit {BLOB}\ttests/test_alpha.py\n".encode()),
+    "no line": b"",
+    "two lines": LINE + LINE.replace(b"alpha", b"beta"),
+    "a line for another path": LINE.replace(b"alpha", b"alpha.bak"),
+    "a non-zero exit": (LINE, 128),
+    "a time-out": subprocess.TimeoutExpired("git", 30),
+    "an os error": FileNotFoundError("git"),
+    "a permission error": PermissionError("git"),
+    "no tab": f"100644 blob {BLOB} tests/test_alpha.py\n".encode(),
+    "two fields": b"100644 blob\ttests/test_alpha.py\n",
+    "a folder": f"040000 tree {BLOB}\ttests/test_alpha.py\n".encode(),
+    "a submodule": f"160000 commit {BLOB}\ttests/test_alpha.py\n".encode(),
+    "a NUL after the name": LINE.replace(b".py\n", b".py\x00\n"),
+    "a carriage return after the name": LINE.replace(b".py\n", b".py\r\n"),
 }
 
 
-@pytest.mark.parametrize("run", list(OTHER_RESULTS.values()), ids=list(OTHER_RESULTS))
-def test_p8_default_reader_gives_none_for_each_other_result(monkeypatch, run):
-    monkeypatch.setattr(mod.subprocess, "run", run)
+@pytest.mark.parametrize("answer", list(OTHER_RESULTS.values()), ids=list(OTHER_RESULTS))
+def test_p8_default_reader_gives_none_for_each_other_result(monkeypatch, answer):
+    monkeypatch.setattr(mod.subprocess, "run", FakeGit(right_root("/w"), answer))
     assert mod._git_read_base_entry("/w", BASE, "tests/test_alpha.py") is None
 
 
@@ -421,54 +482,121 @@ def test_p8_default_reader_gives_none_for_a_base_commit_that_does_not_exist(repo
     assert mod._git_read_base_entry(str(repo.work), "f" * 40, "tests/test_alpha.py") is None
 
 
-def scripted_run(calls, first):
-    """A fake runner: ``first`` answers rev-parse, and ls-tree gives LINE; every command is noted in ``calls``."""
-
-    def run(argv, **kwargs):
-        calls.append(argv)
-        return (first if "rev-parse" in argv else fake_run(LINE))(argv, **kwargs)
-
-    return run
-
-
-FIRST_ANSWERS = [
-    "a non-zero exit", "no output", "an enclosing folder", "a folder that does not exist", "a time-out", "an os error",
-    "a NUL in the stored folder",
-]
-
-
-@pytest.mark.parametrize("answer", FIRST_ANSWERS)
-def test_p8_default_reader_gives_none_and_never_starts_ls_tree_when_the_first_command_does_not_show_the_folder(
-    tmp_path, monkeypatch, answer
+@pytest.mark.parametrize("spelling", ["as it is", "with a trailing slash", "through a symbolic link"])
+def test_f1_the_ok_path_makes_two_calls_in_order_with_the_exact_arguments_and_one_clean_env(
+    tmp_path, monkeypatch, spelling
 ):
-    stored = tmp_path / SEPARATED / "checkout"
+    folder = tmp_path / SEPARATED / "checkout"
+    folder.mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(folder, target_is_directory=True)
+    stored = {"as it is": str(folder), "with a trailing slash": f"{folder}/", "through a symbolic link": str(link)}[spelling]
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CEILING_DIRECTORIES"):
+        monkeypatch.setenv(name, str(tmp_path / "elsewhere"))
+    fake = FakeGit(right_root(stored), LINE)
+    monkeypatch.setattr(mod.subprocess, "run", fake)
+    assert mod._git_read_base_entry(stored, BASE, "tests/test_alpha.py") == ("100644", BLOB)
+    assert [argv for argv, _ in fake.calls] == [
+        ["git", "-C", stored, "rev-parse", "--show-toplevel"],
+        ["git", "-C", stored, "ls-tree", BASE, "--", "tests/test_alpha.py"],
+    ]
+    first, second = (kwargs for _, kwargs in fake.calls)
+    for kwargs in (first, second):
+        assert not kwargs.get("shell")
+        assert kwargs["timeout"] == 30
+        assert kwargs["capture_output"] and not text_requested(kwargs)
+    assert first["env"] == second["env"] == clean_git_env()
+    env = first["env"]
+    assert not {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CEILING_DIRECTORIES"} & set(env)
+    assert env["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert [env["GIT_TRACE2"], env["GIT_TRACE2_EVENT"], env["GIT_TRACE2_PERF"]] == ["0", "0", "0"]
+
+
+STEP_ONE_REFUSALS = {
+    "another root": lambda root, link: b"/somewhere/else\n",
+    "a parent of the stored folder": lambda root, link: os.path.dirname(root) + b"\n",
+    "a folder below the stored folder": lambda root, link: root + b"/inner\n",
+    "the stored folder with a trailing slash": lambda root, link: root + b"/\n",
+    "the stored folder with a dot": lambda root, link: root + b"/.\n",
+    "the stored folder through a symbolic link": lambda root, link: os.fsencode(link) + b"\n",
+    "a non-zero exit with the right root printed": lambda root, link: (root + b"\n", 128),
+    "a time-out": lambda root, link: subprocess.TimeoutExpired("git", 30),
+    "an os error": lambda root, link: FileNotFoundError("git"),
+    "a permission error": lambda root, link: PermissionError("git"),
+    "no output": lambda root, link: b"",
+    "only a line feed": lambda root, link: b"\n",
+    "no final line feed": lambda root, link: root,
+    "a second line": lambda root, link: root + b"\n" + root + b"\n",
+    "the root followed by two line feeds": lambda root, link: root + b"\n\n",
+    "a line feed before the root": lambda root, link: b"\n" + root + b"\n",
+    "a carriage return before the line feed": lambda root, link: root + b"\r\n",
+    "a NUL byte after the root": lambda root, link: root + b"\x00\n",
+    "a NUL byte inside the root": lambda root, link: root[:-1] + b"\x00" + root[-1:] + b"\n",
+}
+
+
+@PARENTS
+@pytest.mark.parametrize("answer", list(STEP_ONE_REFUSALS), ids=list(STEP_ONE_REFUSALS))
+def test_f2_each_refusal_of_step_one_makes_one_call_and_gives_none(tmp_path, monkeypatch, parent, answer):
+    stored = tmp_path / parent / "checkout"
     stored.mkdir(parents=True)
-    first = {
-        "a non-zero exit": fake_run(f"{stored}\n".encode(), returncode=128),
-        "no output": fake_run(b""),
-        "an enclosing folder": fake_run(f"{stored.parent}\n".encode()),
-        "a folder that does not exist": fake_run(f"{stored.parent / 'gone'}\n".encode()),
-        "a time-out": fake_run(raises=subprocess.TimeoutExpired("git", 30)),
-        "an os error": fake_run(raises=FileNotFoundError("git")),
-        "a NUL in the stored folder": fake_run(f"{stored}\n".encode()),
-    }[answer]
-    worktree = str(stored) + ("\x00x" if answer == "a NUL in the stored folder" else "")
-    calls = []
-    monkeypatch.setattr(mod.subprocess, "run", scripted_run(calls, first))
-    assert mod._git_read_base_entry(worktree, BASE, "tests/test_alpha.py") is None
-    assert [argv[3] for argv in calls] == ([] if "NUL" in answer else ["rev-parse"]), "ls-tree is never started"
+    link = tmp_path / "link"
+    link.symlink_to(stored, target_is_directory=True)
+    fake = FakeGit(STEP_ONE_REFUSALS[answer](os.path.realpath(os.fsencode(stored)), link), LINE)
+    monkeypatch.setattr(mod.subprocess, "run", fake)
+    assert mod._git_read_base_entry(str(stored), BASE, "tests/test_alpha.py") is None
+    assert fake.commands == ["rev-parse"], "ls-tree is never started"
 
 
-@pytest.mark.parametrize("name", ["checkout", "checkout\n"], ids=["a plain name", "a name that ends in a newline"])
-def test_p8_default_reader_runs_ls_tree_second_when_the_first_command_names_the_stored_folder(
-    tmp_path, monkeypatch, name
+def test_f2_a_nul_in_the_stored_folder_gives_none_and_never_starts_ls_tree(tmp_path, monkeypatch):
+    stored = tmp_path / "checkout"
+    stored.mkdir()
+    fake = FakeGit(right_root(stored), LINE)
+    monkeypatch.setattr(mod.subprocess, "run", fake)
+    assert mod._git_read_base_entry(f"{stored}\x00x", BASE, "tests/test_alpha.py") is None
+    assert "ls-tree" not in fake.commands
+
+
+@PARENTS
+@ODD
+def test_f3_a_folder_name_with_cr_or_crlf_is_read_from_the_raw_bytes_and_any_other_byte_refuses(
+    tmp_path, monkeypatch, parent, name
 ):
-    stored = tmp_path / SEPARATED / name
+    stored = tmp_path / parent / name
     stored.mkdir(parents=True)
-    calls = []
-    monkeypatch.setattr(mod.subprocess, "run", scripted_run(calls, fake_run(f"{stored}\n".encode())))
+    line = right_root(stored)
+    fake = FakeGit(line, LINE)
+    monkeypatch.setattr(mod.subprocess, "run", fake)
     assert mod._git_read_base_entry(str(stored), BASE, "tests/test_alpha.py") == ("100644", BLOB)
-    assert [argv[3] for argv in calls] == ["rev-parse", "ls-tree"]
+    assert fake.commands == ["rev-parse", "ls-tree"]
+    one_byte_off = (
+        [line[:i] + bytes([line[i] ^ 1]) + line[i + 1:] for i in range(len(line))]
+        + [line[:i] + line[i + 1:] for i in range(len(line))]
+        + [line[:i] + b"x" + line[i:] for i in range(len(line) + 1)]
+        + [line.replace(b"\r\n", b"\n", 1), line.replace(b"\r", b"\n", 1), line.replace(b"\r", b"", 1)]
+    )
+    for wrong in one_byte_off:
+        if wrong == line:
+            continue
+        fake = FakeGit(wrong, LINE)
+        monkeypatch.setattr(mod.subprocess, "run", fake)
+        assert mod._git_read_base_entry(str(stored), BASE, "tests/test_alpha.py") is None, wrong
+        assert fake.commands == ["rev-parse"], wrong
+
+
+@PARENTS
+def test_f3_a_folder_name_that_is_not_utf_8_is_compared_by_its_bytes(tmp_path, monkeypatch, parent):
+    stored = tmp_path / parent / os.fsdecode(b"check\xffout")
+    stored.mkdir(parents=True)
+    root = os.path.realpath(os.fsencode(stored))
+    fake = FakeGit(root + b"\n", LINE)
+    monkeypatch.setattr(mod.subprocess, "run", fake)
+    assert mod._git_read_base_entry(str(stored), BASE, "tests/test_alpha.py") == ("100644", BLOB)
+    for other in (b"\xfe", "\ufffd".encode()):  # a decoding with replacement reads both as the stored name
+        fake = FakeGit(root.replace(b"\xff", other) + b"\n", LINE)
+        monkeypatch.setattr(mod.subprocess, "run", fake)
+        assert mod._git_read_base_entry(str(stored), BASE, "tests/test_alpha.py") is None, other
+        assert fake.commands == ["rev-parse"], other
 
 
 # --- point 9: one test for each check ------------------------------------------------------
@@ -1212,6 +1340,164 @@ def test_17m_a_checkout_below_a_multibyte_folder_named_with_the_path_separator_g
     assert triple(real(conn, "tests/test_new.py")) == (False, "not_at_base", None)
 
 
+@pytest.mark.parametrize("quote_path", ["false", "true"], ids=["printed as it is", "quoted by git"])
+def test_17m_the_default_reader_reads_a_name_with_bytes_that_are_not_utf_8(repo, quote_path):
+    repo.git("config", "core.quotePath", quote_path)
+    path = "tests/test_\udcff.py"
+    repo.put(path, b"odd\n")
+    base = repo.commit("a name that is not utf-8", parent=repo.head)
+    assert mod._git_read_base_entry(str(repo.work), base, path) == ("100644", repo.oracle(path, base))
+
+
+# --- R3: git itself must name the stored folder as the checkout root, or the answer is not_at_base ----
+
+
+def kernel_card(c, stored):
+    """The card as the dispatcher stores it: the workspace path first, then the base recorded from that folder."""
+    card = kb.create_task(
+        c, title="checkout", owned_paths=["hermes_cli/widget.py"], workspace_kind="worktree",
+        workspace_path=str(stored), initial_status="running",
+    )
+    kb.set_workspace_path(c, card, str(stored))
+    base = kb.record_worktree_base(c, card, stored)
+    task = kb.get_task(c, card)
+    assert (task.workspace_path, task.base_commit) == (str(stored), base)
+    return card, base
+
+
+def raw_git(folder, *args, env):
+    return subprocess.run(["git", "-C", str(folder), *args], env=env, capture_output=True)
+
+
+def commands(calls):
+    return [argv[3] for argv, _kwargs in calls]
+
+
+def make_checkout(repo, stored, kind):
+    """A real checkout at ``stored``: a linked worktree of the repository at its base, or a repository of its own."""
+    if kind == "linked worktree":
+        repo.git("worktree", "add", "-q", "--detach", str(stored), repo.base)
+        return Repo(stored, repo.env, repo.root)
+    stored.mkdir(parents=True)
+    own = Repo(stored, repo.env, repo.root)
+    own.git("init", "-q")
+    own.put("tests/test_alpha.py", b"alpha\n")
+    own.base = own.head = own.commit("base")
+    return own
+
+
+KINDS = pytest.mark.parametrize("kind", ["linked worktree", "plain repository"])
+LISTED = b"100644 blob "
+
+
+@LAYOUTS
+def test_r3_1_the_git_folder_of_the_project_as_the_stored_workspace_gives_not_at_base(conn, repo, monkeypatch):
+    stored = repo.work / ".git"
+    assert raw_git(stored, "rev-parse", "--show-toplevel", env=repo.env).returncode != 0, "git names no checkout there"
+    listed = raw_git(stored, "ls-tree", repo.head, "--", "tests/test_alpha.py", env=repo.env)
+    assert listed.stdout.startswith(LISTED), "a plain read from the git folder lists the entry"
+    card, base = kernel_card(conn, stored)
+    assert base == repo.head
+    with spying_on_git(monkeypatch) as calls:
+        assert triple(real(conn, "tests/test_alpha.py", card)) == (False, "not_at_base", None)
+        assert mod._git_read_base_entry(str(stored), base, "tests/test_alpha.py") is None
+    assert commands(calls) == ["rev-parse", "rev-parse"], "ls-tree is never started"
+
+
+@PARENTS
+def test_r3_2_a_linked_workspace_whose_git_config_names_a_working_tree_elsewhere_gives_not_at_base(
+    conn, repo, tmp_path, monkeypatch, parent
+):
+    linked, elsewhere = tmp_path / parent / "linked", tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    repo.git("worktree", "add", "-q", "--detach", str(linked), repo.base)
+    repo.git("config", "extensions.worktreeConfig", "true")
+    Repo(linked, repo.env, repo.root).git("config", "--worktree", "core.worktree", str(elsewhere))
+    top = raw_git(linked, "rev-parse", "--show-toplevel", env=repo.env)
+    assert top.stdout == os.fsencode(elsewhere) + b"\n", "git itself does not name the stored folder as its top level"
+    listed = raw_git(linked, "ls-tree", repo.base, "--", "tests/test_alpha.py", env=repo.env)
+    assert listed.stdout.startswith(LISTED), "a plain read from that folder lists the entry"
+    card, base = kernel_card(conn, linked)
+    assert base == repo.base
+    with spying_on_git(monkeypatch) as calls:
+        assert triple(real(conn, "tests/test_alpha.py", card)) == (False, "not_at_base", None)
+    assert commands(calls) == ["rev-parse"], "ls-tree is never started"
+
+
+@pytest.mark.parametrize(
+    "parent",
+    [SEPARATED, os.pathsep, f"a{os.pathsep}{os.pathsep}b", f"x{os.pathsep}y/z{os.pathsep}w"],
+    ids=["one separator", "only the separator", "two in a row", "at two depths"],
+)
+@KINDS
+def test_r3_3_a_real_checkout_below_a_parent_folder_with_the_path_separator_gives_ok_and_the_base_blob(
+    conn, repo, tmp_path, parent, kind
+):
+    stored = tmp_path / parent / "checkout"
+    checkout = make_checkout(repo, stored, kind)
+    assert os.pathsep in os.path.dirname(os.path.realpath(stored))
+    card, base = kernel_card(conn, stored)
+    assert triple(real(conn, "tests/test_alpha.py", card)) == (
+        True, "ok", checkout.oracle("tests/test_alpha.py", base),
+    )
+    assert triple(real(conn, "tests/test_new.py", card)) == (False, "not_at_base", None)
+
+
+@ODD
+@PARENTS
+def test_r3_4_a_real_checkout_with_cr_or_crlf_in_its_name_gives_ok_and_the_base_blob(
+    conn, repo, tmp_path, name, parent
+):
+    # A linked worktree: the card store cannot record the base of a plain repository at such a name.
+    stored = tmp_path / parent / name
+    checkout = make_checkout(repo, stored, "linked worktree")
+    top = raw_git(stored, "rev-parse", "--show-toplevel", env=repo.env)
+    assert top.stdout == os.fsencode(stored) + b"\n", "git itself names the stored folder, byte for byte"
+    as_text = subprocess.run(
+        ["git", "-C", str(stored), "rev-parse", "--show-toplevel"], env=repo.env, capture_output=True, text=True
+    )
+    assert (as_text.stdout.removesuffix("\n") == str(stored)) == ("\r" not in name), "only a text read loses a CR"
+    card, base = kernel_card(conn, stored)
+    assert triple(real(conn, "tests/test_alpha.py", card)) == (
+        True, "ok", checkout.oracle("tests/test_alpha.py", base),
+    )
+    assert triple(real(conn, "tests/test_new.py", card)) == (False, "not_at_base", None)
+
+
+@LAYOUTS
+@pytest.mark.parametrize(
+    "folder", NESTED_FOLDERS, ids=["a plain folder", "a folder below a separator-named one", "a multibyte folder"]
+)
+def test_r3_5_an_ordinary_folder_inside_a_repository_gives_not_at_base_after_one_call_with_no_ceiling(
+    conn, nested, monkeypatch, folder
+):
+    stored = nested.work / folder
+    top = raw_git(stored, "rev-parse", "--show-toplevel", env=nested.env)
+    assert top.stdout == os.fsencode(nested.work) + b"\n", "git names the repository around the folder"
+    listed = raw_git(stored, "ls-tree", nested.head, "--", "tests/test_nested.py", env=nested.env)
+    assert listed.stdout.startswith(LISTED), "a plain read from inside the folder lists the path"
+    card, base = kernel_card(conn, stored)
+    assert base == nested.head
+    assert "GIT_CEILING_DIRECTORIES" not in os.environ
+    with spying_on_git(monkeypatch) as calls:
+        assert triple(real(conn, "tests/test_nested.py", card)) == (False, "not_at_base", None)
+    assert commands(calls) == ["rev-parse"], "ls-tree is never started"
+    assert all("GIT_CEILING_DIRECTORIES" not in kwargs["env"] for _argv, kwargs in calls)
+
+
+@PARENTS
+def test_r3_6_a_real_checkout_whose_folder_name_is_not_utf_8_is_read_by_its_bytes(repo, tmp_path, parent):
+    # The card store holds text only, so no card can name such a folder: this holds the reader, not the function.
+    stored = tmp_path / parent / os.fsdecode(b"check\xffout\xfe")
+    checkout = make_checkout(repo, stored, "linked worktree")
+    top = raw_git(stored, "rev-parse", "--show-toplevel", env=repo.env)
+    assert top.stdout == os.fsencode(stored) + b"\n", "git prints the bytes of the folder, not a text"
+    assert mod._git_read_base_entry(str(stored), repo.base, "tests/test_alpha.py") == (
+        "100644", checkout.oracle("tests/test_alpha.py", repo.base),
+    )
+    assert mod._git_read_base_entry(str(stored), repo.base, "tests/test_new.py") is None
+
+
 # --- point 13: the limits the owner accepts --------------------------------------------------
 
 
@@ -1305,6 +1591,22 @@ def test_input_a_card_of_the_previous_version_with_no_project_base_commit_or_wor
     assert triple(check(conn, task_id="t2")) == (True, "ok", BLOB)
 
 
+@pytest.mark.parametrize(
+    "base, worktree",
+    [(None, WORKTREE), ("", WORKTREE), (BASE, None), (BASE, ""), (None, None)],
+    ids=["no base", "empty base", "no worktree", "empty worktree", "neither"],
+)
+def test_input_a_card_of_the_previous_version_never_starts_git_with_the_default_reader(
+    conn, monkeypatch, base, worktree
+):
+    def no_git(*args, **kwargs):
+        raise AssertionError(f"git must not start: {args}")
+
+    monkeypatch.setattr(mod.subprocess, "run", no_git)
+    add_card(conn, project=None, base=base, worktree=worktree)
+    assert triple(real(conn, TEST_PATH)) == (False, "not_at_base", None)
+
+
 def test_input_stored_base_commit_and_worktree_reach_the_reader_unchanged(conn):
     add_card(conn, base="bäse-日本\x00z", worktree="/work/日本 tree\x00z")
     reader = Reader()
@@ -1312,7 +1614,7 @@ def test_input_stored_base_commit_and_worktree_reach_the_reader_unchanged(conn):
     assert reader.calls == [("/work/日本 tree\x00z", "bäse-日本\x00z", TEST_PATH)]
 
 
-# --- the stored workspace: the input that the default reader takes its ceiling from ----------
+# --- the stored workspace: the input that the default reader finds its repository from -------
 
 
 def stored_answer(conn, stored, path, base):

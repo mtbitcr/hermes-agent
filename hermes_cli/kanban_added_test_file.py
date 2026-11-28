@@ -72,18 +72,14 @@ def _unquoted_name(name: str) -> Optional[str]:
     return _ESCAPE.sub(_unescape, quoted.group(1)).decode("utf-8", "surrogateescape")
 
 
-def _is_checkout_root(worktree: str, env: dict[str, str]) -> bool:
-    """True when git's own discovery from ``worktree`` ends at ``worktree`` itself and not in a repository around it."""
-    done = subprocess.run(
-        ["git", "-C", worktree, "rev-parse", "--show-toplevel"],
+def _run_git(worktree: str, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[bytes]:
+    """Both steps of the read run through here so that they share one environment and one set of limits."""
+    return subprocess.run(
+        ["git", "-C", worktree, *args],
         capture_output=True,
-        encoding="utf-8",
-        errors="surrogateescape",
         env=env,
         timeout=_GIT_TIMEOUT_SECONDS,
     )
-    top = done.stdout.removesuffix("\n")  # a folder name may end in a newline of its own, so never strip
-    return done.returncode == 0 and bool(top) and os.path.samefile(top, worktree)
 
 
 def _git_read_base_entry(worktree: str, base_commit: str, path: str) -> Optional[tuple[str, str]]:
@@ -92,36 +88,29 @@ def _git_read_base_entry(worktree: str, base_commit: str, path: str) -> Optional
         return None
     # A GIT_DIR or the like in the worker's environment would answer from another repository.
     env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    # No replacement ref may stand in for the base; no Trace2 target in a git config may write a file.
+    env.update(
+        GIT_NO_REPLACE_OBJECTS="1",
+        GIT_TRACE2="0",
+        GIT_TRACE2_EVENT="0",
+        GIT_TRACE2_PERF="0",
+    )
     try:
-        ceiling = os.path.dirname(os.path.realpath(worktree))
-        # No replacement ref may stand in for the base; no Trace2 target in a git config may write a file.
-        env.update(
-            GIT_NO_REPLACE_OBJECTS="1",
-            GIT_TRACE2="0",
-            GIT_TRACE2_EVENT="0",
-            GIT_TRACE2_PERF="0",
-        )
-        if os.pathsep in ceiling:
-            # A ceiling list splits at the separator and cannot name this parent, so git's own discovery, which keeps
-            # its ownership checks, must show that the folder is a checkout's root and not a folder inside another.
-            if not _is_checkout_root(worktree, env):
-                return None
-        else:
-            # Git may not climb above the checkout's parent, so a plain folder inside another repository is no checkout.
-            env["GIT_CEILING_DIRECTORIES"] = ceiling
-        done = subprocess.run(
-            ["git", "-C", worktree, "ls-tree", base_commit, "--", path],
-            capture_output=True,
-            encoding="utf-8",
-            errors="surrogateescape",
-            env=env,
-            timeout=_GIT_TIMEOUT_SECONDS,
-        )
+        # Only a folder that git itself names as the checkout root is the card's checkout. Compare bytes with one
+        # line feed cut, because a folder name may hold CR or end in a line feed.
+        top = _run_git(worktree, env, "rev-parse", "--show-toplevel")
+        if (
+            top.returncode != 0
+            or not top.stdout.endswith(b"\n")
+            or top.stdout[:-1] != os.path.realpath(os.fsencode(worktree))
+        ):
+            return None
+        done = _run_git(worktree, env, "ls-tree", base_commit, "--", path)
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
     if done.returncode != 0:
         return None
-    lines = done.stdout.removesuffix("\n").split("\n")
+    lines = done.stdout.decode("utf-8", "surrogateescape").removesuffix("\n").split("\n")
     if len(lines) != 1:
         return None
     meta, tab, name = lines[0].partition("\t")
