@@ -4369,7 +4369,9 @@ def list_owner_decisions(
     ``owner_input_upload`` is set only for a reader that named
     ``OWNER_INPUT_UPLOAD_CAPABILITY``. Each owner-input item of a card that
     declares named inputs then carries ``missing_inputs``, the inputs the owner
-    has not given yet (see :func:`decision_missing_inputs`).
+    has not given yet (see :func:`decision_missing_inputs`), except the item
+    of a brief stop (below): the upload route takes only a card held
+    ``needs_input``.
 
     ``closed_suggestions`` is set only for a reader that named
     ``OWNER_CLOSED_SUGGESTIONS_CAPABILITY``. A suggestion with a live checked
@@ -4387,8 +4389,11 @@ def list_owner_decisions(
     with no limit and merged in each Project's own order before its window,
     with the fixed reason, and with a ``question`` that asks whether Raphael
     should continue the work. The item's ``created_at`` is when that stop
-    began. All reads of the request share one snapshot. Every other item, and
-    every item for another reader, is unchanged.
+    began. A brief stop whose named input is missing is listed with no
+    question and no ``missing_inputs``, still dated by its stop, and takes no
+    answer while the input is missing. All reads of the request share one
+    snapshot. Every other item, and every item for another reader, is
+    unchanged.
     """
     from hermes_cli.owner_recommendation_closures import live_closure_filter, recent_closed_suggestions
 
@@ -4500,8 +4505,10 @@ def list_owner_decisions(
                     key=lambda row: (-int(row["created_at"]), str(row["id"])),
                 )
             if owner_input_upload:
+                # No upload for a brief stop: the upload route takes only a card held needs_input.
                 missing = decision_missing_inputs(conn, [
                     str(row["id"]) for row in rows[:_OWNER_DECISIONS_LIMIT]
+                    if str(row["id"]) not in brief
                 ])
             if design_options:
                 options = decision_design_options(conn, [
@@ -4614,14 +4621,16 @@ def list_owner_decisions(
                 wait = waits[str(row["id"])]
                 decisions[-1]["reason"] = owner_stop_reason(wait["reason"])
                 decisions[-1]["created_at"] = _owner_timestamp(wait["since"])
+            if str(row["id"]) in brief:
+                decisions[-1]["created_at"] = _owner_timestamp(brief[str(row["id"])]["since"])
             if kind == "owner_input" and str(row["id"]) in missing:
                 decisions[-1]["missing_inputs"] = missing[str(row["id"])]
             if kind == "owner_input" and str(row["id"]) in options:
                 decisions[-1]["design_options"] = options[str(row["id"])]
             if kind == "owner_input" and str(row["id"]) in questions:
                 decisions[-1]["question"] = questions[str(row["id"])]
-                stop = brief.get(str(row["id"])) or waits[str(row["id"])]
-                decisions[-1]["created_at"] = _owner_timestamp(stop["since"])
+                if str(row["id"]) not in brief:
+                    decisions[-1]["created_at"] = _owner_timestamp(waits[str(row["id"])]["since"])
 
     authority_order = {"owner_input": 0, "capability": 1}
     decisions.sort(

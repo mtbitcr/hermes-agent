@@ -1024,6 +1024,8 @@ def test_a_brief_stop_with_a_missing_named_input_keeps_its_own_route_as_a_capabi
             card: int(conn.execute("SELECT created_at FROM tasks WHERE id = ?", (card,)).fetchone()[0])
             for card in (brief, capability)
         }
+        stopped_at = _event_time(conn, _newest_blocked(conn, brief))
+        assert created[brief] != stopped_at
         stop_ref = _current_ref(owner, conn, brief)
         before = (_record(conn, brief), _written(conn))
         assert oq.accept_answer(conn, brief, stop_ref, 1, None, owner=owner) == "not_waiting"
@@ -1032,8 +1034,11 @@ def test_a_brief_stop_with_a_missing_named_input_keeps_its_own_route_as_a_capabi
     for flags in ({"owner_answer": True}, {"owner_answer": True, "owner_input_upload": True}):
         item, held = _found(owner, brief, **flags), _found(owner, capability, **flags)
         assert item is not None and "question" not in item
-        assert item["reason"] == _FIXED and item["created_at"] == ow._owner_timestamp(created[brief])
-        own = ("decision_ref", "title", "created_at")
+        assert item["reason"] == _FIXED and item["created_at"] == ow._owner_timestamp(stopped_at)
+        # The upload route takes only a card held needs_input, so a brief stop is offered no upload.
+        assert "missing_inputs" not in item
+        assert ("missing_inputs" in held) is ("owner_input_upload" in flags)
+        own = ("decision_ref", "title", "created_at", "missing_inputs")
         assert {key: value for key, value in item.items() if key not in own} == {
             key: value for key, value in held.items() if key not in own
         }
