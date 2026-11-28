@@ -15,6 +15,13 @@ now, and :func:`decision_questions` serves it on the Decisions list (card P2).
 :func:`accept_answer` records the owner's answer to it once, as the task event
 ``owner_answer_recorded``, comments it on the card and resumes the card, in
 one write transaction (card P3).
+
+A card the kernel blocked with the block kind ``transient`` stopped for a
+short-lived reason, and nothing resumes it by itself. :func:`brief_stops`
+finds each such card that still waits, and :func:`decision_questions` serves
+it as the one question whether Raphael should continue it, with a fixed text
+and one fixed choice (card P5). A worker cannot declare that stop: it is not
+one of :data:`STOPS`.
 """
 
 from __future__ import annotations
@@ -52,6 +59,12 @@ REVIEW_LIMIT_CHOICES = (
 # the comment that gives the answer to the worker (card P3).
 ANSWERED_EVENT = "owner_answer_recorded"
 ANSWER_AUTHOR = "owner"
+# The stop of a card the kernel blocked as ``transient``, served as one fixed question with one fixed choice (card P5).
+BRIEF_STOP = "stopped_briefly"
+BRIEF_TEXT = "This work stopped for a short-lived reason. Should Raphael continue it?"
+BRIEF_CHOICES = ({"n": 1, "sentence": "Continue the work."},)
+# The most cards one query reads, as the kernel's ``task_owner_waits`` batches its own reads.
+_BATCH = 500
 
 
 def _plain_text(value: Any, what: str, *, limit: int, sentence: bool) -> str:
@@ -301,6 +314,68 @@ def _answered(conn: sqlite3.Connection, task_ids: list[str], profile: str) -> di
     return answered
 
 
+def brief_stops(
+    conn: sqlite3.Connection, task_ids: list[str], profile: str,
+) -> dict[str, dict[str, int]]:
+    """The cards of *task_ids* that stopped briefly and wait on the owner now, each with its stop (card P5).
+
+    A work card with the status ``blocked`` and the block kind ``transient``
+    is a brief stop by the rule ``task_owner_waits`` applies to its own two
+    kinds, with the kernel's two event lists read at each call: the card's
+    newest event of ``_STOP_TRANSITION_EVENT_KINDS`` is a ``blocked`` event,
+    and no event of ``_STOP_SUPERSEDING_EVENT_KINDS`` has a higher id. A
+    ``gave_up`` stop never counts. A stop whose ``stop_ref`` the owner has
+    answered (:func:`_answered`) is left out. Each entry is ``{"event_id",
+    "since"}``: the id of that ``blocked`` event, which the ``stop_ref`` is
+    made from for *profile*, and its ``created_at``, the time of the stop.
+
+    Batched, and read inside the transaction the caller holds, so the reads of
+    one call see one snapshot. A read that fails raises ``sqlite3.Error`` and
+    serves no brief stop, where ``task_owner_waits`` would return nothing: an
+    owner question must never drop out of the list unseen.
+    """
+    from hermes_cli import kanban_db
+
+    transitions = kanban_db._STOP_TRANSITION_EVENT_KINDS
+    superseding = kanban_db._STOP_SUPERSEDING_EVENT_KINDS
+    kinds = (*transitions, *superseding)
+    stops: dict[str, dict[str, int]] = {}
+    for start in range(0, len(task_ids), _BATCH):
+        batch = task_ids[start:start + _BATCH]
+        blocked = [
+            str(row[0]) for row in conn.execute(
+                "SELECT id FROM tasks WHERE task_kind = 'work' AND status = 'blocked' "
+                "AND block_kind = 'transient' AND id IN (" + ", ".join("?" for _ in batch) + ")",
+                batch,
+            ).fetchall()
+        ]
+        if not blocked:
+            continue
+        latest_stop: dict[str, tuple[int, str, int]] = {}  # each card's newest stop transition
+        latest_superseding: dict[str, int] = {}
+        for task_id, event_id, kind, created_at in conn.execute(
+            "SELECT task_id, id, kind, created_at FROM task_events WHERE kind IN ("
+            + ", ".join("?" for _ in kinds) + ") AND task_id IN ("
+            + ", ".join("?" for _ in blocked) + ") ORDER BY id",
+            (*kinds, *blocked),
+        ).fetchall():
+            task_id = str(task_id)
+            if kind in transitions:
+                latest_stop[task_id] = (int(event_id), kind, int(created_at))
+            if kind in superseding:
+                latest_superseding[task_id] = int(event_id)
+        current = {
+            task_id: (event_id, created_at)
+            for task_id, (event_id, kind, created_at) in latest_stop.items()
+            if kind == "blocked" and latest_superseding.get(task_id, 0) <= event_id
+        }
+        answered = _answered(conn, list(current), profile) if current else {}
+        for task_id, (event_id, created_at) in current.items():
+            if _stop_ref(profile, task_id, event_id) not in answered.get(task_id, ()):
+                stops[task_id] = {"event_id": event_id, "since": created_at}
+    return stops
+
+
 def decision_questions(
     conn: sqlite3.Connection, task_ids: list[str], ctx: Any,
 ) -> dict[str, dict]:
@@ -314,13 +389,15 @@ def decision_questions(
     declaration. A card whose current declaration fails them is left out, and
     its item stays today's. A card with no current declaration is a plain
     stop (S4): the question is the text ``owner_stop_reason`` gives, there
-    are no choices and the owner's words are required. Each carries its
-    ``stop_ref`` (S6), made from ``ctx.profile`` and the id of the card's
-    newest ``blocked`` event. A card whose ``stop_ref`` names a stop the
-    owner has answered (:func:`accept_answer`, card P3; :func:`_answered`) is
-    left out too, and its item stays today's. Batched, and read from one
-    snapshot, as
-    :func:`current_questions` is.
+    are no choices and the owner's words are required. A card that stopped
+    briefly (:func:`brief_stops`, card P5) is served as the stop
+    :data:`BRIEF_STOP`: the fixed :data:`BRIEF_TEXT`, the one choice
+    :data:`BRIEF_CHOICES` and optional words, whatever the card declared
+    before. Each carries its ``stop_ref`` (S6), made from ``ctx.profile`` and
+    the id of the card's newest ``blocked`` event. A card whose ``stop_ref``
+    names a stop the owner has answered (:func:`accept_answer`, card P3;
+    :func:`_answered`) is left out too, and its item stays today's. Batched,
+    and read from one snapshot, as :func:`current_questions` is.
     """
     from hermes_cli import kanban_db
     from hermes_cli.owner_workspace import owner_stop_reason
@@ -332,18 +409,21 @@ def decision_questions(
         conn.execute("BEGIN")
     try:
         waits = kanban_db.task_owner_waits(conn, task_ids)
-        if not waits:
-            return {}
-        declared = current_questions(conn, list(waits))
-        newest = {
-            str(task_id): int(event_id)
-            for task_id, event_id in conn.execute(
-                "SELECT task_id, MAX(id) FROM task_events WHERE kind = 'blocked' AND task_id IN ("
-                + ", ".join("?" for _ in waits) + ") GROUP BY task_id",
-                list(waits),
-            ).fetchall()
-        }
-        answered = _answered(conn, list(waits), str(ctx.profile))
+        brief = brief_stops(conn, task_ids, str(ctx.profile))
+        declared: dict[str, tuple[int, dict]] = {}
+        newest: dict[str, int] = {}
+        answered: dict[str, set[str]] = {}
+        if waits:
+            declared = current_questions(conn, list(waits))
+            newest = {
+                str(task_id): int(event_id)
+                for task_id, event_id in conn.execute(
+                    "SELECT task_id, MAX(id) FROM task_events WHERE kind = 'blocked' AND task_id IN ("
+                    + ", ".join("?" for _ in waits) + ") GROUP BY task_id",
+                    list(waits),
+                ).fetchall()
+            }
+            answered = _answered(conn, list(waits), str(ctx.profile))
     finally:
         if own_transaction and conn.in_transaction:
             conn.execute("ROLLBACK")  # a read keeps nothing
@@ -372,6 +452,16 @@ def decision_questions(
             "words": words,
             "words_limit": WORDS_LIMIT,
         }
+    for task_id, stop in brief.items():
+        served[task_id] = {
+            "object": OBJECT,
+            "stop": BRIEF_STOP,
+            "stop_ref": _stop_ref(str(ctx.profile), task_id, stop["event_id"]),
+            "text": BRIEF_TEXT,
+            "choices": [dict(choice) for choice in BRIEF_CHOICES],
+            "words": "optional",
+            "words_limit": WORDS_LIMIT,
+        }
     return served
 
 
@@ -388,8 +478,11 @@ def accept_answer(
     :func:`decision_questions` serves, by the one rule it serves by; that
     question must be served for *stop_ref*; a *choice* that is given must be
     one it offers; and the answer must have the form it asks for, the
-    owner's words when they are required and else a choice. One
-    ``owner_answer_recorded`` event ``{stop_ref, choice, words_length,
+    owner's words when they are required and else a choice. The stop of a
+    card that stopped briefly (:func:`brief_stops`, card P5) asks for its one
+    choice and takes the owner's words as an option, so its answer is that
+    choice, with or without words, and words with no choice are not allowed.
+    One ``owner_answer_recorded`` event ``{stop_ref, choice, words_length,
     actor, answered_at}`` is written; ``owner`` comments on the card with the
     question, the choice and the words; and the card is resumed as
     ``unblock_task`` resumes it, to ``review`` when the stop came in a review.
