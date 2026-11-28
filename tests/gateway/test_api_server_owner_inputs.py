@@ -36,7 +36,7 @@ from tests.gateway.test_api_server_owner_waiting import (  # noqa: F401
     _write_owner_workspace_config,
     owner,
 )
-from tests.hermes_cli.test_owner_input_hold import _MENU, _OPENING_HOURS, _PRICE_LIST, _card
+from tests.hermes_cli.test_owner_input_hold import _MENU, _OPENING_HOURS, _PRICE_LIST, _card, _late_card
 from tests.hermes_cli.test_owner_workspace import (  # noqa: F401
     _configured_provider,
     ctx,
@@ -213,7 +213,7 @@ async def test_a_card_held_on_a_board_outside_the_owners_projects_is_refused(ctx
 
 @pytest.mark.asyncio
 async def test_a_card_that_is_not_waiting_for_a_file_is_refused(ctx, owner):
-    setup, ready = _card(ctx, _PRICE_LIST)
+    setup, ready = _late_card(ctx, _PRICE_LIST)
     with contextlib.closing(kb.connect(board=setup["board"])) as conn:
         # A question for the owner: blocked needs_input, but it names no file.
         question = kb.create_task(

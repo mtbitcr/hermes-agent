@@ -14,7 +14,9 @@ reads that declaration back against the card's attachments. ``claim_task``
 holds a card that still misses one (:class:`InputHold`), and the Decisions
 feed names what is missing (:func:`decision_missing_inputs`, card C2). The
 owner upload route stores each file the owner gives and releases the card
-once none is missing (:func:`accept_upload`, card C3).
+once none is missing (:func:`accept_upload`, card C3). The approval already
+holds a card it releases to ``todo`` (:func:`hold_on_activation`, card P1),
+so the owner can give the file before the card's first claim.
 """
 
 from __future__ import annotations
@@ -258,6 +260,46 @@ class InputHold:
             run_id=blocked["run_id"],
             reason=HOLD_SENTENCE,
         )
+
+
+def hold_on_activation(conn: sqlite3.Connection, task_id: str) -> dict[str, Any] | None:
+    """The missing-input hold of ``activate_owner_work`` (card P1).
+
+    Built as :meth:`InputHold.hold`, for a card the activation just moved to
+    ``todo``, in the activation's own write transaction: a work card whose
+    declared inputs the owner has not all given is blocked ``needs_input``
+    with :data:`HOLD_SENTENCE` by the same call, so no run is made. Returns
+    the arguments of ``kanban_task_blocked``, which ``activate_owner_work``
+    fires once its transaction has committed, or None when nothing is held.
+    The board is the one of *conn*, because the activation opens its connection
+    on the Project's board without making that board current.
+    """
+    from hermes_cli import kanban_db
+
+    declared = conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ? AND status = 'todo' "
+        "AND task_kind = 'work' AND EXISTS (SELECT 1 FROM task_events "
+        "WHERE task_id = tasks.id AND kind = ?)",
+        (task_id, DECLARED_EVENT),
+    ).fetchone()
+    if declared is None or not missing_inputs(conn, task_id):
+        return None
+    # The call blocks only a ready or running card. The card passes through
+    # ready inside this same transaction, so no other connection sees it there.
+    conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+    blocked = kanban_db._block_task_within_txn(
+        conn, task_id, reason=HOLD_SENTENCE, kind="needs_input",
+        expected_run_id=None, synthesize_run=False,
+    )
+    if blocked is None:
+        return None
+    return {
+        "task_id": task_id,
+        "board": kanban_db._board_slug_for_connection(conn),
+        "assignee": blocked["assignee"],
+        "run_id": blocked["run_id"],
+        "reason": HOLD_SENTENCE,
+    }
 
 
 def decision_missing_inputs(
