@@ -4369,7 +4369,9 @@ def list_owner_decisions(
     ``owner_input_upload`` is set only for a reader that named
     ``OWNER_INPUT_UPLOAD_CAPABILITY``. Each owner-input item of a card that
     declares named inputs then carries ``missing_inputs``, the inputs the owner
-    has not given yet (see :func:`decision_missing_inputs`).
+    has not given yet (see :func:`decision_missing_inputs`), except the item
+    of a brief stop (below): the upload route takes only a card held
+    ``needs_input``.
 
     ``closed_suggestions`` is set only for a reader that named
     ``OWNER_CLOSED_SUGGESTIONS_CAPABILITY``. A suggestion with a live checked
@@ -4381,10 +4383,17 @@ def list_owner_decisions(
     waits on the owner now, with no missing named input and no design
     options, then carries ``question`` (see
     :func:`hermes_cli.owner_questions.decision_questions`), and a current
-    capability stop joins as owner input as it does for ``owner_waiting``. The
-    item's ``created_at`` is when that stop began. All reads of the request
-    share one snapshot. Every other item, and every item for another reader,
-    is unchanged.
+    capability stop joins as owner input as it does for ``owner_waiting``. So
+    does a current brief stop (card P5), a work card the kernel blocked as
+    ``transient`` (see :func:`hermes_cli.owner_questions.brief_stops`): read
+    with no limit and merged in each Project's own order before its window,
+    with the fixed reason, and with a ``question`` that asks whether Raphael
+    should continue the work. The item's ``created_at`` is when that stop
+    began. A brief stop whose named input is missing is listed with no
+    question and no ``missing_inputs``, still dated by its stop, and takes no
+    answer while the input is missing. All reads of the request share one
+    snapshot. Every other item, and every item for another reader, is
+    unchanged.
     """
     from hermes_cli.owner_recommendation_closures import live_closure_filter, recent_closed_suggestions
 
@@ -4413,6 +4422,7 @@ def list_owner_decisions(
             board_path = kanban_db.board_dir(board_slug) / "kanban.db"
 
         waits: dict[str, dict] = {}
+        brief: dict[str, dict[str, int]] = {}
         missing: dict[str, list[dict]] = {}
         options: dict[str, dict] = {}
         questions: dict[str, dict] = {}
@@ -4472,9 +4482,33 @@ def list_owner_decisions(
                     ],
                     key=lambda row: (-int(row["created_at"]), str(row["id"])),
                 )
+            if owner_answer:
+                from hermes_cli.owner_questions import brief_stops
+
+                # Unbounded for the same reason as the capability stops: only the
+                # CURRENT brief stops (card P5) join, and none is in ``waits``.
+                brief_rows = conn.execute(
+                    "SELECT id, title, status, created_at, task_kind, block_kind, "
+                    "review_policy, recommendation_label, recommendation_rationale, "
+                    "recommendation_decision, recommendation_kind "
+                    "FROM tasks WHERE project_id = ? "
+                    "AND task_kind = 'work' AND status = 'blocked' "
+                    "AND block_kind = 'transient' ORDER BY created_at DESC, id ASC",
+                    (project_id,),
+                ).fetchall()
+                brief = brief_stops(conn, [str(row["id"]) for row in brief_rows], str(ctx.profile))
+                rows = sorted(
+                    [
+                        *rows,
+                        *(row for row in brief_rows if str(row["id"]) in brief),
+                    ],
+                    key=lambda row: (-int(row["created_at"]), str(row["id"])),
+                )
             if owner_input_upload:
+                # No upload for a brief stop: the upload route takes only a card held needs_input.
                 missing = decision_missing_inputs(conn, [
                     str(row["id"]) for row in rows[:_OWNER_DECISIONS_LIMIT]
+                    if str(row["id"]) not in brief
                 ])
             if design_options:
                 options = decision_design_options(conn, [
@@ -4564,6 +4598,11 @@ def list_owner_decisions(
                 kind = "owner_input"
                 title = owner_title(row["title"])
                 reason = "Raphael needs your answer before this work can continue."
+            elif owner_answer and row["block_kind"] == "transient":
+                authority = "task"
+                kind = "owner_input"
+                title = owner_title(row["title"])
+                reason = "Raphael needs your answer before this work can continue."
             decisions.append({
                 "decision_ref": _owner_decision_ref(
                     ctx, authority=authority, native_id=str(row["id"])
@@ -4582,13 +4621,16 @@ def list_owner_decisions(
                 wait = waits[str(row["id"])]
                 decisions[-1]["reason"] = owner_stop_reason(wait["reason"])
                 decisions[-1]["created_at"] = _owner_timestamp(wait["since"])
+            if str(row["id"]) in brief:
+                decisions[-1]["created_at"] = _owner_timestamp(brief[str(row["id"])]["since"])
             if kind == "owner_input" and str(row["id"]) in missing:
                 decisions[-1]["missing_inputs"] = missing[str(row["id"])]
             if kind == "owner_input" and str(row["id"]) in options:
                 decisions[-1]["design_options"] = options[str(row["id"])]
             if kind == "owner_input" and str(row["id"]) in questions:
                 decisions[-1]["question"] = questions[str(row["id"])]
-                decisions[-1]["created_at"] = _owner_timestamp(waits[str(row["id"])]["since"])
+                if str(row["id"]) not in brief:
+                    decisions[-1]["created_at"] = _owner_timestamp(waits[str(row["id"])]["since"])
 
     authority_order = {"owner_input": 0, "capability": 1}
     decisions.sort(

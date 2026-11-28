@@ -6,8 +6,9 @@ never a body; that the owner workspace is enabled; the shape of the ``Idempotenc
 object of exactly ``stop_ref``, ``choice`` and ``words``, before any card is looked up; that ``{ref}`` is a key of the
 owner's own Decisions list for a card stopped for the owner right now (``_waiting_card``); and the idempotency cache.
 ``accept_answer`` then confirms, inside its own write transaction, that the stop still takes this answer, records it
-once, comments it on the card as ``owner`` and resumes the card. A refusal is never cached, and no answer holds an
-internal detail.
+once, comments it on the card as ``owner`` and resumes the card. A card that stopped briefly (block kind ``transient``,
+card P5) takes its answer by the same route, with the one choice that continues the work. A refusal is never cached,
+and no answer holds an internal detail.
 """
 
 from __future__ import annotations
@@ -143,9 +144,10 @@ def _waiting_card(owner: ow.OwnerContext, ref: str) -> Optional[tuple[str, Path,
     """Resolve *ref* through the owner's own Decisions list to a card stopped for the owner right now.
 
     Built as ``_waiting_card`` of ``api_server_owner_inputs`` is built, with one difference: the card is held with the
-    block kind ``needs_input`` or ``capability``. Reads the cards ``list_owner_decisions`` lists, in the same Project
-    scope, and recomputes their keys, so a key is never reversed and a native id, a suggestion or a key minted for
-    another owner never matches. Returns ``(board, its kanban.db, task id)`` or ``None``, and never writes.
+    block kind ``needs_input``, ``capability`` or ``transient`` (a card that stopped briefly, card P5). Reads the cards
+    ``list_owner_decisions`` lists, in the same Project scope, and recomputes their keys, so a key is never reversed
+    and a native id, a suggestion or a key minted for another owner never matches. Returns ``(board, its kanban.db,
+    task id)`` or ``None``, and never writes.
     """
     for project in ow.list_committed_projects(owner):
         if project["archived"]:
@@ -159,7 +161,7 @@ def _waiting_card(owner: ow.OwnerContext, ref: str) -> Optional[tuple[str, Path,
         try:
             rows = conn.execute(
                 "SELECT id FROM tasks WHERE project_id = ? AND task_kind = 'work' "
-                "AND status = 'blocked' AND block_kind IN ('needs_input', 'capability')",
+                "AND status = 'blocked' AND block_kind IN ('needs_input', 'capability', 'transient')",
                 (project_id,),
             ).fetchall()
         finally:
