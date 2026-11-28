@@ -3,7 +3,7 @@
 Owned paths cannot change after a card exists, so the proposer needs to see what pins
 or reads them before the card is created. Given a repository root, the owned paths and
 optionally the keys the card will change, ``find_hints`` lists the files outside the
-owned paths that match one of six rules:
+owned paths that match one of seven rules (rule 7 only for each ``symbols`` name given):
 
 1. a Python file under ``tests/`` that imports a module in the owned paths; one step
    further, a test that imports a module of a test file listed by this rule (it has no
@@ -34,6 +34,18 @@ owned paths that match one of six rules:
    does not count. One row per node, of the test file itself, with the line of the node, in the form
    of the rule 5 row that holds a line ("whole-answer comparison"), after every other row of the
    file. The count of rule 6 counts these rows.
+7. a call of a named function: for each name in ``symbols`` (the repeatable ``--symbol NAME`` option of
+   ``scripts/kanban_scope_hints.py``; a plain Python name in NFKC form, else
+   ``ValueError`` before any file is read; a repeated name counts once), in each Python file the main
+   scan reads (a leading U+FEFF that stops the parse is dropped), each ``ast.Call`` node at any depth
+   whose function is the plain name (``ast.Name``) or an attribute (``ast.Attribute``) ending in that
+   name, with any expression before the dot. A closed list: no name is resolved, so a call through an
+   import alias or a variable is not listed, and a call of another object's method of that name is.
+   A name or attribute with no call, a decorator without parentheses, a definition, an import and a
+   string or comment do not count. One row per node, of the file itself, with the symbol and the line
+   of the node ("calls a named function: NAME"), after every other row of the file, in the order of
+   the node (line, then column). A file that only this rule names is not a listed file for rules 5
+   and 6. The count of rule 7 counts these rows; with no symbol it is 0.
 
 An owned folder owns every file in it, for every rule; ``.`` owns the whole repository
 (nothing is listed). The search only reads. It never follows a path outside the repository
@@ -51,9 +63,11 @@ from __future__ import annotations
 
 import ast
 import codecs
+import keyword
 import mmap
 import os
 import re
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -69,6 +83,7 @@ RULE_NAMES = {
     4: "quoted key",
     5: "saved example",
     6: "whole-answer comparison",
+    7: "calls a named function",
 }
 EXAMPLES_DIR = "tests/contracts/owner_payloads"
 EXAMPLE_CALL = "owner_payload_example"
@@ -81,7 +96,8 @@ class Hint:
     """One file to consider owning: every rule that matched it, and the keys for rule 4
     (``every_example``: a rule 5 row listed because the record kind was not resolved;
     ``unresolved_line``: a rule 5 row for a test file, for the call at that line whose family
-    was not resolved; a rule 6 row for a test file, for the comparison at that line)."""
+    was not resolved; a rule 6 row for a test file, for the comparison at that line; a rule 7 row,
+    for the call of ``symbol`` at that line)."""
 
     path: str
     rules: tuple[int, ...]
@@ -89,6 +105,7 @@ class Hint:
     imports_pinning_test: bool = False
     every_example: bool = False
     unresolved_line: int = 0
+    symbol: str = ""
 
 
 @dataclass(frozen=True)
@@ -312,15 +329,43 @@ def _whole_answer_lines(tree: ast.Module) -> list[int]:
     return lines
 
 
-def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ()) -> Report:
+def _check_symbols(symbols: Iterable[str]) -> tuple[str, ...]:
+    """The distinct *symbols* in the order of their first place; ``ValueError`` for one that is not a
+    plain name (``str.isidentifier``, not a keyword) equal to its own NFKC form, the form in which
+    the parser stores each name."""
+    symbols = tuple(symbols)
+    for symbol in symbols:
+        if not symbol.isidentifier() or keyword.iskeyword(symbol) or unicodedata.normalize("NFKC", symbol) != symbol:
+            raise ValueError(f"symbol {symbol!r} is not a plain Python name in NFKC form")
+    return tuple(dict.fromkeys(symbols))
+
+
+def _called_lines(tree: ast.Module, symbols: frozenset[str]) -> list[tuple[int, str]]:
+    """The line and symbol of each ``ast.Call`` node of *tree*, at any depth, whose function is the plain
+    name or an attribute ending in one of *symbols*; one entry per node, in the order of the node."""
+    nodes = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+            if name in symbols:
+                nodes.append((node.lineno, node.col_offset, name))
+    nodes.sort(key=lambda n: n[:2])
+    return [(line, name) for line, _, name in nodes]
+
+
+def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = (), symbols: Sequence[str] = ()) -> Report:
     """Search *root* for the files that pin or read the *owned* paths (see the module doc).
 
-    Raises ``ValueError`` when *root* is not a folder or an owned path resolves outside it.
+    Raises ``ValueError`` when *root* is not a folder, an owned path resolves outside it, or a
+    symbol is not a plain name in NFKC form (before any file is read).
     """
     root = _resolve_root(root)
     owned_paths = _normalize_owned(root, owned)
     owned_dirs = [rel for rel, is_dir in owned_paths if is_dir]
     keys = tuple(dict.fromkeys(keys))
+    symbols = _check_symbols(symbols)
+    wanted = frozenset(symbols)
     if "." in owned_dirs:
         return Report((), {rule: 0 for rule in RULE_NAMES})
     owned_files = {rel for rel, is_dir in owned_paths if not is_dir}
@@ -377,6 +422,7 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
     test_imports: dict[str, set[str]] = {}
     example_trees: dict[str, ast.Module] = {}
     whole_lines: dict[str, list[int]] = {}
+    call_hints: list[Hint] = []
     unreadable: list[str] = []
     for path in _walk_files(root, root, unlistable):
         rel = path.relative_to(root).as_posix()
@@ -419,18 +465,20 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
             if is_test and 1 not in rules:
                 test_imports[rel] = imports_seen
             read_tree = tree
-            if is_test and tree is None and text.startswith("\ufeff"):
+            if tree is None and (is_test or wanted) and text.startswith("\ufeff"):
                 try:
                     bomless = ast.parse(text[1:])
                 except (SyntaxError, ValueError, RecursionError):
                     bomless = None
-                if bomless is not None and any(
+                if is_test and bomless is not None and any(
                     isinstance(node, ast.Call) and _call_name(node) == EXAMPLE_CALL for node in ast.walk(bomless)
                 ):
                     example_trees[rel] = bomless
                 read_tree = bomless
             if is_test and read_tree is not None and (lines := _whole_answer_lines(read_tree)):
                 whole_lines[rel] = lines
+            if wanted and read_tree is not None:
+                call_hints.extend(Hint(rel, (7,), (), False, False, line, name) for line, name in _called_lines(read_tree, wanted))
         if names_path:
             rules.add(3)
         if matched_keys:
@@ -446,8 +494,10 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
     hints.extend(Hint(rel, (5,), (), False, every) for rel, every in saved)
     hints.extend(Hint(rel, (5,), (), False, False, line) for rel, line in unresolved)
     hints.extend(Hint(rel, (6,), (), False, False, line) for rel, lines in whole_lines.items() if rel in listed for line in lines)
+    hints.extend(call_hints)
     keyed = {h.path for h in hints if 4 in h.rules}
-    hints.sort(key=lambda h: (h.path not in keyed, h.path, h.imports_pinning_test or h.rules == (6,), h.rules in ((5,), (6,))))
+    hints.sort(key=lambda h: (
+        h.path not in keyed, h.path, h.rules == (7,), h.imports_pinning_test or h.rules == (6,), h.rules in ((5,), (6,))))
     counts = {rule: sum(rule in h.rules for h in hints) for rule in RULE_NAMES}
     return Report(tuple(hints), counts, tuple(sorted({*unreadable, *unlistable})))
 
@@ -455,7 +505,7 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
 def format_report(report: Report) -> list[str]:
     """One ``path<TAB>rules`` line per hint, one ``unreadable<TAB>path`` line per file that
     could not be read or folder (``path/``) that could not be listed, then one
-    ``# rule N (...): count`` line per rule (1 to 6) and, only when some path was unreadable, a
+    ``# rule N (...): count`` line per rule (1 to 7) and, only when some path was unreadable, a
     ``# unreadable: N`` line."""
     lines = []
     for hint in report.hints:
@@ -463,7 +513,9 @@ def format_report(report: Report) -> list[str]:
         for rule in hint.rules:
             detail = ": " + ", ".join(f'"{k}"' for k in hint.keys) if rule == 4 else (
                 ": " + EVERY_EXAMPLE if rule == 5 and hint.every_example else "")
-            if rule in (5, 6) and hint.unresolved_line:
+            if rule == 7:
+                labels.append(f"rule 7 ({RULE_NAMES[7]}: {hint.symbol}): line {hint.unresolved_line}")
+            elif rule in (5, 6) and hint.unresolved_line:
                 labels.append(f"rule {rule} ({NOT_RESOLVED if rule == 5 else RULE_NAMES[6]}): line {hint.unresolved_line}")
             else:
                 labels.append(f"rule {rule} ({RULE_NAMES[rule]}{detail})")
