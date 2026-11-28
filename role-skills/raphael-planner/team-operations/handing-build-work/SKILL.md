@@ -39,6 +39,16 @@ Make every tool call one command, under 300 characters, with no raw line break o
 - The box is two hours of work: step 6 above carries it.
 - Keep the change near 500 changed lines or less. A larger change becomes two or more cards, and each card delivers one complete piece of behaviour that works on its own.
 
+## Edges decided before the build
+
+Every build card holds these three parts, decided before the build. A card with no input form, or with no actors that work at one time, says so in one line.
+
+1. the closed list of supported input forms;
+2. the closed list of supported orderings of concurrent actors, each with its named interleaving test;
+3. "Any other form or ordering is refused before any state change, with a named refusal test."
+
+When the facts sheet asks for "every form" of an open format or "any order" of concurrent actors, propose the closed list as one owner decision in the plan, before the build card is approved.
+
 ## Before sending the build task
 
 - Confirm both sections are copied in full, with the install line, the launch flags, the compaction window and the 401 relaunch sentence exactly as this skill gives them and no `--model` or `--effort`.
