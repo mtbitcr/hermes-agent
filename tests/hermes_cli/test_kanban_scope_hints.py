@@ -6,6 +6,7 @@ real repository or the network.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import os
@@ -13,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -165,7 +167,7 @@ def test_output_without_a_test_helper_is_unchanged(repo):
     report = hints.find_hints(repo, [OWNED], [KEY])
     assert HELPER_LABEL not in "\n".join(hints.format_report(report))
     assert not any(getattr(h, "imports_pinning_test", False) for h in report.hints)
-    assert report.counts == {1: 2, 2: 2, 3: 2, 4: 3, 5: 0, 6: 0}
+    assert report.counts == {1: 2, 2: 2, 3: 2, 4: 3, 5: 0, 6: 0, 7: 0}
     assert _lines(report)["tests/test_pin_plain.py"] == "rule 1 (test imports owned module)"
 
 
@@ -228,7 +230,7 @@ def test_key_lists_exactly_the_files_with_that_quoted_key_first_and_prints_count
         "scripts/tool.py": (2, 3),
         "tests/test_pin_plain.py": (1,),
     }
-    assert report.counts == {1: 2, 2: 2, 3: 2, 4: 4, 5: 0, 6: 0}
+    assert report.counts == {1: 2, 2: 2, 3: 2, 4: 4, 5: 0, 6: 0, 7: 0}
 
     # Through the script: same order, every rule on the line, one count per rule.
     script = _load_script()
@@ -239,14 +241,14 @@ def test_key_lists_exactly_the_files_with_that_quoted_key_first_and_prints_count
     by_path = {line.split("\t")[0]: line.split("\t")[1] for line in out if line and not line.startswith("#")}
     assert "rule 1" in by_path["tests/test_pin_key.py"] and "rule 4" in by_path["tests/test_pin_key.py"]
     counts = [line for line in out if line.startswith("#")]
-    assert len(counts) == 6
-    assert [line.split(":")[-1].strip() for line in counts] == ["2", "2", "2", "4", "0", "0"]
-    assert all(f"rule {n}" in line for n, line in zip((1, 2, 3, 4, 5, 6), counts))
+    assert len(counts) == 7
+    assert [line.split(":")[-1].strip() for line in counts] == ["2", "2", "2", "4", "0", "0", "0"]
+    assert all(f"rule {n}" in line for n, line in zip((1, 2, 3, 4, 5, 6, 7), counts))
 
-    # Without a key all six counts are still printed, rule 4 at zero.
+    # Without a key all seven counts are still printed, rule 4 at zero.
     assert script.main(["--root", str(repo), OWNED]) == 0
     counts = [line for line in capsys.readouterr().out.splitlines() if line.startswith("#")]
-    assert len(counts) == 6 and counts[3].endswith(": 0")
+    assert len(counts) == 7 and counts[3].endswith(": 0")
 
 
 def test_search_writes_nothing(repo, capsys):
@@ -310,7 +312,7 @@ def test_owned_folder_is_read_like_an_owned_file_by_each_rule(tmp_path, capsys):
 
     by_file = hints.find_hints(root, ["pkg/widget.py", "pkg/__init__.py"], [KEY])
     assert _rules(by_file) == expected
-    assert by_file.counts == {1: 1, 2: 1, 3: 1, 4: 1, 5: 0, 6: 0}
+    assert by_file.counts == {1: 1, 2: 1, 3: 1, 4: 1, 5: 0, 6: 0, 7: 0}
     for folder in ("pkg", "pkg/", str(root / "pkg")):
         by_folder = hints.find_hints(root, [folder], [KEY])
         assert _paths(by_folder) == _paths(by_file)
@@ -320,12 +322,12 @@ def test_owned_folder_is_read_like_an_owned_file_by_each_rule(tmp_path, capsys):
     # The whole repository as the owned scope owns every file: nothing to list, all counts zero.
     for whole in (".", "./", str(root)):
         report = hints.find_hints(root, [whole], [KEY])
-        assert report.hints == () and report.counts == {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0}
+        assert report.hints == () and report.counts == {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}
     script = _load_script()
     assert script.main(["--root", str(root), "--owned", ".", "--key", KEY]) == 0
     out = capsys.readouterr().out.splitlines()
     assert _output_paths("\n".join(out)) == []
-    assert [line.split(":")[-1].strip() for line in out] == ["0", "0", "0", "0", "0", "0"]
+    assert [line.split(":")[-1].strip() for line in out] == ["0", "0", "0", "0", "0", "0", "0"]
 
 
 def test_file_the_search_cannot_read_is_named_and_counted(repo, capsys):
@@ -342,9 +344,9 @@ def test_file_the_search_cannot_read_is_named_and_counted(repo, capsys):
     out = capsys.readouterr().out.splitlines()
     assert [line for line in out if "bad.txt" in line] == ["unreadable\tdata/bad.txt"]
     assert [line for line in out if line.startswith("# unreadable")] == ["# unreadable: 1"]
-    # The key matches are still first, and the six rule counts are still printed.
+    # The key matches are still first, and the seven rule counts are still printed.
     assert _output_paths("\n".join(out))[:3] == ["config/settings.json", "docs/notes.md", "tests/test_pin_key.py"]
-    assert len([line for line in out if line.startswith("# rule")]) == 6
+    assert len([line for line in out if line.startswith("# rule")]) == 7
 
 
 def _run_cli_unprivileged(args: list[str], build, locked: dict[str, int]) -> subprocess.CompletedProcess:
@@ -423,7 +425,7 @@ def test_helper_with_a_key_hit_keeps_its_rule_4_row_and_the_counts(helper_repo):
     rows = [line for line in hints.format_report(report) if line.startswith("tests/b.py\t")]
     assert rows == [f'tests/b.py\trule 4 (quoted key: "{KEY}")', f"tests/b.py\t{HELPER_LABEL}"]
     assert [h.rules for h in report.hints if h.path == "tests/b.py"] == [(4,), ()]
-    assert report.counts == {1: 2, 2: 0, 3: 0, 4: 1, 5: 0, 6: 0}
+    assert report.counts == {1: 2, 2: 0, 3: 0, 4: 1, 5: 0, 6: 0, 7: 0}
 
 
 def test_helper_naming_the_owned_path_keeps_its_rule_3_row_and_the_counts(helper_repo):
@@ -432,7 +434,7 @@ def test_helper_naming_the_owned_path_keeps_its_rule_3_row_and_the_counts(helper
     rows = [line for line in hints.format_report(report) if line.startswith("tests/b.py\t")]
     assert rows == ["tests/b.py\trule 3 (names owned path)", f"tests/b.py\t{HELPER_LABEL}"]
     assert [h.rules for h in report.hints if h.path == "tests/b.py"] == [(3,), ()]
-    assert report.counts == {1: 2, 2: 0, 3: 1, 4: 0, 5: 0, 6: 0}
+    assert report.counts == {1: 2, 2: 0, 3: 1, 4: 0, 5: 0, 6: 0, 7: 0}
 
 
 SAVED = "tests/contracts/owner_payloads"
@@ -589,7 +591,7 @@ def test_saved_example_with_its_own_rule_4_row_keeps_it_and_gets_a_separate_rule
     plain = hints.find_hints(saved_repo, [OWNED], ["unit_running"])
     plain_lines = hints.format_report(plain)
     own = f'{SAVED}/fam/one.json\trule 4 (quoted key: "unit_running")'
-    assert plain_lines[0] == own and plain.counts == {1: 0, 2: 0, 3: 0, 4: 1, 5: 0, 6: 0}
+    assert plain_lines[0] == own and plain.counts == {1: 0, 2: 0, 3: 0, 4: 1, 5: 0, 6: 0, 7: 0}
 
     _write(saved_repo / "tests" / "test_lit.py",
            "import hermes_cli.widget\n\n"
@@ -599,7 +601,7 @@ def test_saved_example_with_its_own_rule_4_row_keeps_it_and_gets_a_separate_rule
     assert lines[:2] == [own, f"{SAVED}/fam/one.json\t{SAVED_LABEL}"]
     assert [h.rules for h in report.hints[:2]] == [(4,), (5,)]
     assert [h.keys for h in report.hints[:2]] == [("unit_running",), ()]
-    assert report.counts == {1: 1, 2: 0, 3: 0, 4: 1, 5: 1, 6: 0}
+    assert report.counts == {1: 1, 2: 0, 3: 0, 4: 1, 5: 1, 6: 0, 7: 0}
     # Besides the rule 5 row and its count line, the new test file's own row is the only change.
     rest = [line for line in lines if SAVED_LABEL not in line and not line.startswith("# rule 5")]
     assert [line for line in rest if "test_lit.py" not in line and not line.startswith("# rule 1")] == [
@@ -614,7 +616,7 @@ def test_helper_row_that_calls_owner_payload_example_is_read_too(helper_repo):
     report = hints.find_hints(helper_repo, [OWNED])
     assert _lines(report)["tests/b.py"] == HELPER_LABEL
     assert _lines(report)[f"{SAVED}/fam/one.json"] == SAVED_LABEL
-    assert report.counts == {1: 2, 2: 0, 3: 0, 4: 0, 5: 1, 6: 0}
+    assert report.counts == {1: 2, 2: 0, 3: 0, 4: 0, 5: 1, 6: 0, 7: 0}
 
 
 def test_rule_5_has_its_own_count_line_after_the_four_of_today(saved_repo):
@@ -624,7 +626,7 @@ def test_rule_5_has_its_own_count_line_after_the_four_of_today(saved_repo):
            "    owner_payload_example('other', 'three', {})\n"
            "    return {k: owner_payload_example('fam', k, a) for k, a in answers.items()}\n")
     report = hints.find_hints(saved_repo, [OWNED])
-    assert report.counts == {1: 1, 2: 0, 3: 0, 4: 0, 5: 3, 6: 0}
+    assert report.counts == {1: 1, 2: 0, 3: 0, 4: 0, 5: 3, 6: 0, 7: 0}
     assert hints.RULE_NAMES[5] == "saved example"
     counts = [line for line in hints.format_report(report) if line.startswith("#")]
     assert counts == [
@@ -634,8 +636,9 @@ def test_rule_5_has_its_own_count_line_after_the_four_of_today(saved_repo):
         "# rule 4 (quoted key): 0",
         "# rule 5 (saved example): 3",
         "# rule 6 (whole-answer comparison): 0",
+        "# rule 7 (calls a named function): 0",
     ]
-    assert hints.find_hints(saved_repo, ["."]).counts == {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0}
+    assert hints.find_hints(saved_repo, ["."]).counts == {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}
 
 
 def _one_row(saved_repo, source: str) -> dict[str, str]:
@@ -994,7 +997,7 @@ def test_the_rule_5_count_line_equals_the_number_of_its_rows(saved_repo):
     rows = [line for line in out if not line.startswith("#") and "rule 5" in line]
     assert len(rows) == 4 and sum(1 for h in report.hints if 5 in h.rules) == 4
     assert [line for line in out if line.startswith("# rule 5")] == ["# rule 5 (saved example): 4"]
-    assert report.counts == {1: 1, 2: 0, 3: 0, 4: 0, 5: 4, 6: 0}
+    assert report.counts == {1: 1, 2: 0, 3: 0, 4: 0, 5: 4, 6: 0, 7: 0}
 
 
 def test_a_test_file_that_is_not_listed_gets_no_not_resolved_row(saved_repo):
@@ -1120,9 +1123,9 @@ def _six_hints(report) -> list:
 
 def test_rule_6_is_named_in_rule_names_and_has_its_count_line_last():
     assert hints.RULE_NAMES[6] == "whole-answer comparison"
-    assert list(hints.RULE_NAMES) == [1, 2, 3, 4, 5, 6]
+    assert list(hints.RULE_NAMES) == [1, 2, 3, 4, 5, 6, 7]
     report = hints.Report((), {rule: 0 for rule in hints.RULE_NAMES})
-    assert hints.format_report(report)[-1] == "# rule 6 (whole-answer comparison): 0"
+    assert hints.format_report(report)[-2] == "# rule 6 (whole-answer comparison): 0"
 
 
 @pytest.mark.parametrize("op", ["==", "!="])
@@ -1287,10 +1290,10 @@ def test_a_test_file_with_a_syntax_error_gives_no_rule_6_row_and_rules_1_to_5_ar
     report, rows, expected = _six(saved_repo, good)
     assert rows == expected and len(rows) == 1 and report.counts[6] == 1
     assert [h.rules for h in report.hints if h.path == "tests/test_broken.py"] == [(3,)]
-    assert report.counts == {1: 1, 2: 0, 3: 1, 4: 0, 5: 1, 6: 1}
+    assert report.counts == {1: 1, 2: 0, 3: 1, 4: 0, 5: 1, 6: 1, 7: 0}
     only_broken = hints.find_hints(saved_repo, [OWNED, WHOLE])
     assert [h for h in only_broken.hints if 6 in h.rules] == []
-    assert only_broken.counts == {1: 0, 2: 0, 3: 1, 4: 0, 5: 0, 6: 0}
+    assert only_broken.counts == {1: 0, 2: 0, 3: 1, 4: 0, 5: 0, 6: 0, 7: 0}
     assert "# rule 6 (whole-answer comparison): 0" in hints.format_report(only_broken)
 
 
@@ -1375,8 +1378,8 @@ def test_the_count_line_of_rule_6_equals_the_number_of_its_rows(saved_repo, caps
     all_rows = [line for line in out if RULE_6 in line and not line.startswith("#")]
     assert len(all_rows) == 4 == report.counts[6] == len(_six_hints(report))
     assert [line for line in out if line.startswith("# rule 6")] == ["# rule 6 (whole-answer comparison): 4"]
-    assert out[-1] == "# rule 6 (whole-answer comparison): 4"
-    assert report.counts == {1: 2, 2: 0, 3: 0, 4: 0, 5: 2, 6: 4}
+    assert out[-2] == "# rule 6 (whole-answer comparison): 4"
+    assert report.counts == {1: 2, 2: 0, 3: 0, 4: 0, 5: 2, 6: 4, 7: 0}
     # The reader prints the same lines.
     script = _load_script()
     assert script.main(["--root", str(saved_repo), "--owned", OWNED]) == 0
@@ -1411,3 +1414,518 @@ def test_the_rule_6_rows_of_a_helper_row_come_after_its_helper_row_and_rule_5_ro
         f"tests/b.py\t{RULE_6}: line 5",
     ]
     assert report.counts[6] == 1
+
+
+# Card 4, rule 7: each call of a named function (``--symbol NAME``): the plain name ``NAME(...)`` or
+# an attribute that ends in ``NAME`` (``x.NAME(...)``). A closed list; no name is resolved.
+RULE_7 = "rule 7 (calls a named function"
+COUNT_7 = "# rule 7 (calls a named function): "
+SYM = "target_fn"
+
+
+@pytest.fixture
+def calls_repo(tmp_path):
+    root = tmp_path / "calls_repo"
+    _write(root / ".git" / "config", "")
+    _write(root / "hermes_cli" / "__init__.py", "")
+    _write(root / OWNED, "def build():\n    return 1\n")
+    return root
+
+
+def _src(text: str, symbol: str = SYM) -> str:
+    return text.replace("NAME", symbol)
+
+
+def _row_line(path: str, symbol: str, line: int) -> str:
+    return f"{path}\t{RULE_7}: {symbol}): line {line}"
+
+
+def _expected_rows(path: str, source: str, symbol: str = SYM) -> list[str]:
+    """One row per ``# hit`` line, two for ``# hit x2``."""
+    rows = []
+    for number, line in enumerate(source.splitlines(), 1):
+        times = 2 if "# hit x2" in line else 1 if "# hit" in line else 0
+        rows.extend([_row_line(path, symbol, number)] * times)
+    return rows
+
+
+def _call_rows(report) -> list[str]:
+    return [line for line in hints.format_report(report) if f"{RULE_7}: " in line and not line.startswith("#")]
+
+
+def _count_7(report) -> str:
+    return next(line for line in hints.format_report(report) if line.startswith("# rule 7"))
+
+
+def _without_rule_7(lines: list[str]) -> list[str]:
+    return [line for line in lines if f"{RULE_7}: " not in line and not line.startswith("# rule 7")]
+
+
+def _calls(root, source: str, *, path: str = "lib/mod.py", symbols=(SYM,), owned=(OWNED,), raw: bytes | None = None):
+    target = root / path
+    if raw is None:
+        _write(target, source)
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+    return hints.find_hints(root, list(owned), symbols=list(symbols))
+
+
+def test_rule_7_is_named_and_has_its_count_line_last():
+    assert hints.RULE_NAMES[7] == "calls a named function"
+    report = hints.Report((), {rule: 0 for rule in hints.RULE_NAMES})
+    assert hints.format_report(report)[-1] == COUNT_7 + "0"
+
+
+@pytest.mark.parametrize("path", ["tests/test_calls.py", "lib/mod.py"])
+def test_a_plain_call_and_two_attribute_calls_give_one_row_each_with_their_line(calls_repo, path):
+    source = _src("import os\n\nNAME(1)  # hit\nmod.NAME(2)  # hit\nobj.part.NAME(3)  # hit\n"
+                  "other(4)\nmod.other(5)\nNAME_2(6)\nxNAME(7)\nobj.NAME_2(8)\n")
+    report = _calls(calls_repo, source, path=path)
+    assert _call_rows(report) == _expected_rows(path, source) and len(_call_rows(report)) == 3
+    assert report.counts[7] == 3 and _count_7(report) == COUNT_7 + "3"
+    assert _paths(report) == [path, path, path]
+    assert all(h.rules == (7,) for h in report.hints)
+
+
+def test_a_call_in_a_nested_function_a_class_a_lambda_and_a_comprehension_gives_a_row(calls_repo):
+    source = _src(
+        "def outer():\n"
+        "    def inner():\n"
+        "        NAME(1)  # hit\n"
+        "    class K:\n"
+        "        attr = mod.NAME(2)  # hit\n"
+        "        def m(self):\n"
+        "            return self.NAME(3)  # hit\n"
+        "    return lambda: NAME(4)  # hit\n"
+        "values = [NAME(i) for i in items]  # hit\n"
+        "pairs = {k: obj.NAME(v) for k, v in d}  # hit\n"
+        "gen = (x for x in NAME(5))  # hit\n"
+        "if cond(NAME(6)):  # hit\n"
+        "    pass\n"
+        "async def coro():\n"
+        "    return await NAME(7)  # hit\n"
+        "text = f'{NAME(8)}'  # hit\n")
+    report = _calls(calls_repo, source)
+    assert _call_rows(report) == _expected_rows("lib/mod.py", source) and report.counts[7] == 10
+
+
+NOT_CALLS = {
+    "import alias": "from m import NAME as other\nother(1)\n",
+    "variable holding the function": "f = NAME\nf(1)\n",
+    "name passed as an argument": "map(NAME, items)\n",
+    "decorator without parentheses": "@NAME\ndef f():\n    pass\n",
+    "attribute decorator without parentheses": "@mod.NAME\ndef f():\n    pass\n",
+    "getattr": "getattr(obj, 'NAME')()\n",
+    "definition": "def NAME():\n    pass\n",
+    "class definition": "class NAME:\n    pass\n",
+    "import": "import NAME\nfrom m import NAME\n",
+    "attribute without a call": "x = obj.NAME\ny = obj.part.NAME\n",
+    "string": "s = 'NAME(1)'\nt = \"mod.NAME(2)\"\n",
+    "docstring": "def f():\n    '''Calls NAME(1) and mod.NAME(2).'''\n",
+    "comment": "# NAME(1)\nx = 1  # mod.NAME(2)\n",
+    "subscript function": "NAME[0](1)\nobj.NAME[0](2)\n",
+    "boolean function": "(NAME or other)(1)\n",
+    "attribute of the name": "NAME.attr(1)\n",
+    "keyword argument": "f(NAME=1)\n",
+    "assignment": "NAME = 1\n",
+    "other name": "NAME_2(1)\nxNAME(2)\nobj.NAME_2(3)\n",
+}
+
+
+@pytest.mark.parametrize("source", list(NOT_CALLS.values()), ids=list(NOT_CALLS))
+def test_a_form_that_the_closed_list_does_not_hold_gives_no_rule_7_row(calls_repo, source):
+    source = _src(source)
+    compile(source, "<case>", "exec")
+    report = _calls(calls_repo, source)
+    assert _call_rows(report) == [] and report.counts[7] == 0 and report.hints == ()
+    assert _count_7(report) == COUNT_7 + "0"
+
+
+@pytest.mark.parametrize("decorator", ["@NAME(1)", "@mod.NAME(1)"])
+@pytest.mark.parametrize("target", ["def f():\n    pass\n", "class C:\n    pass\n"])
+def test_a_decorator_with_parentheses_is_a_call_and_gives_one_row(calls_repo, decorator, target):
+    source = _src("x = 1\n" + decorator + "  # hit\n" + target)
+    report = _calls(calls_repo, source)
+    assert _call_rows(report) == _expected_rows("lib/mod.py", source) and report.counts[7] == 1
+
+
+def test_a_call_of_a_call_counts_the_inner_call_only(calls_repo):
+    source = _src("NAME(1)(2)  # hit\n")
+    report = _calls(calls_repo, source)
+    assert _call_rows(report) == _expected_rows("lib/mod.py", source) and report.counts[7] == 1
+
+
+@pytest.mark.parametrize("line", [
+    "NAME(1); NAME(2)  # hit x2",
+    "x = NAME(1) + mod.NAME(2)  # hit x2",
+    "NAME(NAME(1))  # hit x2",
+    "a.NAME(1).NAME(2)  # hit x2",
+])
+def test_two_calls_on_one_line_give_two_rows(calls_repo, line):
+    source = _src("x = 0\n" + line + "\n")
+    report = _calls(calls_repo, source)
+    assert _call_rows(report) == [_row_line("lib/mod.py", SYM, 2)] * 2 and report.counts[7] == 2
+
+
+def test_a_call_that_runs_over_several_lines_gives_one_row_with_the_line_of_the_node(calls_repo):
+    source = _src("x = 0\nobj.\\\n    NAME(  # hit\n        1,\n        2)\n")
+    report = _calls(calls_repo, source)
+    assert report.counts[7] == 1
+    assert _call_rows(report) == [_row_line("lib/mod.py", SYM, 2)]
+
+
+def test_a_call_in_an_owned_file_or_owned_folder_gives_no_row(calls_repo):
+    _write(calls_repo / "hermes_cli" / "owned_dir" / "inner.py", _src("NAME(1)\nmod.NAME(2)\n"))
+    _write(calls_repo / OWNED, _src("def build():\n    return NAME(1)\n"))
+    _write(calls_repo / "lib" / "mod.py", _src("NAME(1)  # outside\n"))
+    report = hints.find_hints(calls_repo, [OWNED, "hermes_cli/owned_dir"], symbols=[SYM])
+    assert _call_rows(report) == [_row_line("lib/mod.py", SYM, 1)] and report.counts[7] == 1
+    assert _paths(report) == ["lib/mod.py"]
+    whole = hints.find_hints(calls_repo, ["."], symbols=[SYM])
+    assert whole.hints == () and whole.counts == {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0}
+
+
+def test_a_file_with_a_syntax_error_gives_no_rule_7_row_and_rules_1_to_6_are_as_before(calls_repo):
+    broken = _src(f"# {OWNED}\nimport hermes_cli.widget\nNAME(1)\ndef (:\n")
+    with pytest.raises(SyntaxError):
+        compile(broken, "<case>", "exec")
+    _write(calls_repo / "tests" / "test_broken.py", broken)
+    _write(calls_repo / "lib" / "ok.py", _src("NAME(1)  # hit\n"))
+    plain = hints.find_hints(calls_repo, [OWNED])
+    report = hints.find_hints(calls_repo, [OWNED], symbols=[SYM])
+    assert _call_rows(report) == [_row_line("lib/ok.py", SYM, 1)] and report.counts[7] == 1
+    assert "tests/test_broken.py" in _paths(plain) and "tests/test_broken.py" in _paths(report)
+    assert not [h for h in report.hints if h.path == "tests/test_broken.py" and 7 in h.rules]
+    assert _without_rule_7(hints.format_report(report)) == _without_rule_7(hints.format_report(plain))
+
+
+@pytest.mark.parametrize("path", ["tests/test_bom.py", "lib/mod.py"])
+def test_a_file_with_a_leading_byte_order_mark_and_a_call_gives_its_row(calls_repo, path):
+    source = _src("x = 0\nNAME(1)  # hit\nmod.NAME(2)  # hit\n")
+    with pytest.raises((SyntaxError, ValueError)):
+        ast.parse("\ufeff" + source)
+    report = _calls(calls_repo, "", path=path, raw=b"\xef\xbb\xbf" + source.encode("utf-8"))
+    assert _call_rows(report) == _expected_rows(path, source) and report.counts[7] == 2
+
+
+def test_a_file_with_a_byte_order_mark_and_a_syntax_error_gives_no_row(calls_repo):
+    raw = b"\xef\xbb\xbf" + _src("NAME(1)\ndef (:\n").encode("utf-8")
+    report = _calls(calls_repo, "", path="lib/mod.py", raw=raw)
+    assert _call_rows(report) == [] and report.counts[7] == 0 and report.hints == ()
+
+
+def test_a_byte_order_mark_gives_the_same_rule_7_row_and_a_symbol_changes_no_row_of_rules_1_to_6(calls_repo):
+    source = f"# {OWNED}\nimport hermes_cli.widget\n\ndef test_a(x):\n    assert x == {{'a': 1}}\n    NAME(1)\n"
+    results = {}
+    for name, prefix in (("plain", b""), ("bom", b"\xef\xbb\xbf")):
+        root = calls_repo.parent / name
+        _write(root / ".git" / "config", "")
+        _write(root / OWNED, "def build():\n    return 1\n")
+        (root / "tests").mkdir()
+        (root / "tests" / "test_x.py").write_bytes(prefix + _src(source).encode("utf-8"))
+        with_symbol = hints.find_hints(root, [OWNED], symbols=[SYM])
+        without = hints.find_hints(root, [OWNED])
+        assert _without_rule_7(hints.format_report(with_symbol)) == _without_rule_7(hints.format_report(without))
+        results[name] = _call_rows(with_symbol)
+    assert results["bom"] == results["plain"] == [_row_line("tests/test_x.py", SYM, 6)]
+
+
+def test_two_symbols_give_the_rows_of_each_and_a_repeated_symbol_gives_each_row_one_time(calls_repo):
+    source = ("alpha_fn(1)  # hit\nbeta_fn(2)\nobj.alpha_fn(3)  # hit\nmod.beta_fn(4)\ngamma_fn(5)\n")
+    expected = [_row_line("lib/mod.py", "alpha_fn", 1), _row_line("lib/mod.py", "beta_fn", 2),
+                _row_line("lib/mod.py", "alpha_fn", 3), _row_line("lib/mod.py", "beta_fn", 4)]
+    once = _calls(calls_repo, source, symbols=["alpha_fn", "beta_fn"])
+    assert _call_rows(once) == expected and once.counts[7] == 4
+    again = hints.find_hints(calls_repo, [OWNED], symbols=["alpha_fn", "beta_fn", "alpha_fn", "beta_fn"])
+    assert _call_rows(again) == expected and again.counts[7] == 4 and again.hints == once.hints
+    reverse = hints.find_hints(calls_repo, [OWNED], symbols=["beta_fn", "alpha_fn", "beta_fn"])
+    assert _call_rows(reverse) == expected and reverse.counts[7] == 4
+    only = hints.find_hints(calls_repo, [OWNED], symbols=["alpha_fn"])
+    assert _call_rows(only) == [expected[0], expected[2]] and only.counts[7] == 2
+
+
+def test_a_symbol_that_is_never_called_gives_no_row_and_the_count_zero(calls_repo):
+    report = _calls(calls_repo, _src("NAME(1)\nmod.NAME(2)\n"), symbols=["never_called"])
+    assert _call_rows(report) == [] and report.counts[7] == 0 and report.hints == ()
+    assert _count_7(report) == COUNT_7 + "0"
+
+
+def test_an_empty_file_and_an_empty_symbol_list_give_no_row(calls_repo):
+    report = _calls(calls_repo, "", symbols=[SYM])
+    assert report.hints == () and report.counts[7] == 0
+    assert hints.find_hints(calls_repo, [OWNED], symbols=[]).counts[7] == 0
+    assert hints.find_hints(calls_repo, [OWNED], symbols=()).counts[7] == 0
+
+
+REFUSED = ["", "a.b", "1x", "class", "ﬁnd", "None", "a b", " a", "a\n", "a\x00b", "a-b", "a(", "ｆind"]
+
+
+@pytest.fixture
+def no_file_is_read(monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError("a file was read before the symbol was refused")
+
+    monkeypatch.setattr(hints, "_examine", refuse)
+    monkeypatch.setattr(hints, "_walk_files", refuse)
+
+
+@pytest.mark.parametrize("symbol", REFUSED)
+@pytest.mark.parametrize("owned", [[OWNED], ["."]])
+def test_a_symbol_that_is_not_a_plain_nfkc_name_is_refused_before_a_file_is_read(calls_repo, no_file_is_read, symbol, owned):
+    with pytest.raises(ValueError):
+        hints.find_hints(calls_repo, owned, symbols=[symbol])
+    with pytest.raises(ValueError):
+        hints.find_hints(calls_repo, owned, symbols=[SYM, symbol])
+
+
+@pytest.mark.parametrize("symbol", [s for s in REFUSED if "\x00" not in s])
+def test_a_refused_symbol_gives_exit_2_and_nothing_on_standard_output_through_the_script(calls_repo, symbol):
+    run = subprocess.run(
+        [sys.executable, str(SCRIPT), "--root", str(calls_repo), "--owned", OWNED, "--symbol", SYM, "--symbol", symbol],
+        env={"PATH": os.environ.get("PATH", "")}, capture_output=True, text=True, timeout=60,
+    )
+    assert run.returncode == 2 and run.stdout == ""
+    assert run.stderr.startswith("kanban-scope-hints:")
+
+
+def test_the_script_refuses_a_symbol_with_owned_dot_and_prints_nothing(calls_repo, capsys):
+    script = _load_script()
+    assert script.main(["--root", str(calls_repo), "--owned", ".", "--symbol", "a.b"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == "" and "a.b" in captured.err
+
+
+@pytest.mark.parametrize("symbol", ["größe", "名前", "_", "__x__", "match", "print", "x1"])
+def test_a_non_ascii_symbol_in_nfkc_form_and_soft_keywords_are_admitted_and_found(calls_repo, symbol):
+    source = f"import os\n{symbol}(1)  # hit\nobj.{symbol}(2)  # hit\n"
+    report = _calls(calls_repo, source, symbols=[symbol])
+    assert _call_rows(report) == _expected_rows("lib/mod.py", source, symbol) and report.counts[7] == 2
+
+
+def test_multibyte_text_before_a_call_keeps_the_line_of_the_row(calls_repo):
+    source = "# größe 名前 ünï\ns = 'ß名\U0001f600'\n\ngröße(1)  # hit\n"
+    report = _calls(calls_repo, source, symbols=["größe"])
+    assert _call_rows(report) == [_row_line("lib/mod.py", "größe", 4)]
+
+
+def test_a_call_written_in_a_compatibility_form_is_found_by_its_nfkc_symbol(calls_repo):
+    source = "\ufb01nd(1)\nobj.\ufb01nd(2)\n"
+    assert unicodedata.normalize("NFKC", "\ufb01nd") == "find"
+    report = _calls(calls_repo, source, symbols=["find"])
+    assert _call_rows(report) == [_row_line("lib/mod.py", "find", 1), _row_line("lib/mod.py", "find", 2)]
+
+
+def test_with_no_symbol_the_output_has_no_rule_7_row_and_the_count_line_zero(calls_repo, capsys):
+    _write(calls_repo / "lib" / "mod.py", _src("NAME(1)\nmod.NAME(2)\n"))
+    report = hints.find_hints(calls_repo, [OWNED])
+    assert report.hints == () and report.counts[7] == 0
+    assert hints.format_report(report)[-1] == COUNT_7 + "0"
+    assert hints.find_hints(calls_repo, [OWNED], ()).counts[7] == 0
+    assert hints.find_hints(calls_repo, [OWNED]) == hints.find_hints(calls_repo, [OWNED], symbols=())
+    script = _load_script()
+    assert script.main(["--root", str(calls_repo), "--owned", OWNED]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert not [line for line in out if f"{RULE_7}: " in line]
+    assert out[-1] == COUNT_7 + "0"
+
+
+def _everything_repo(root: Path) -> None:
+    _write(root / ".git" / "config", f"[x]\n\tpath = {OWNED}\n\tkey = '{KEY}'\n")
+    _write(root / "hermes_cli" / "__init__.py", "")
+    _write(root / OWNED, f"def build():\n    return '{KEY}'\n")
+    _write(root / SAVED / "fam" / "one.json", "{}\n")
+    _write(root / SAVED / "fam" / "two.json", "{}\n")
+    _write(root / "hermes_cli" / "reader.py", _src("from hermes_cli.widget import build\nNAME(1)\n"))
+    _write(root / "scripts" / "tool.py", _src(f"from hermes_cli.widget import build\nP = '{OWNED}'\nobj.NAME(2)\n"))
+    _write(root / "tests" / "test_pin.py", _src(
+        f"import hermes_cli.widget\n\ndef test_a(owner_payload_example, f, x):\n"
+        f"    owner_payload_example('fam', 'one', {{}})\n    owner_payload_example(f, 'one', {{}})\n"
+        f"    assert x == {{'a': 1}}\n    assert x != set()\n    NAME(3)\n    assert x == '{KEY}'\n"))
+    _write(root / "tests" / "a.py", "import hermes_cli.widget\n")
+    _write(root / "tests" / "test_pin_a.py", "import tests.a\n")
+    _write(root / "tests" / "b.py", _src("from tests.a import helper\nmod.NAME(4)\n"))
+    _write(root / "docs" / "notes.md", f"See `{OWNED}`; NAME(5) '{KEY}'.\n")
+    _write(root / "lib" / "only_calls.py", _src("def f(o, x):\n    o.owner_payload_example('fam', 'one', {})\n"
+                                               "    assert x == {1}\n    return NAME(6)\n"))
+
+
+def test_rules_1_to_6_keep_their_rows_labels_and_counts_with_a_symbol_and_without(tmp_path):
+    root = tmp_path / "all"
+    _everything_repo(root)
+    plain = hints.find_hints(root, [OWNED], [KEY])
+    with_symbol = hints.find_hints(root, [OWNED], [KEY], symbols=[SYM])
+    assert plain.counts[7] == 0 and with_symbol.counts[7] == 5
+    assert {k: v for k, v in with_symbol.counts.items() if k != 7} == {k: v for k, v in plain.counts.items() if k != 7}
+    assert _without_rule_7(hints.format_report(with_symbol)) == _without_rule_7(hints.format_report(plain))
+    assert [h for h in with_symbol.hints if h.rules != (7,)] == list(plain.hints)
+    assert plain.counts[5] >= 2 and plain.counts[6] >= 2
+    with_two = hints.find_hints(root, [OWNED], [KEY], symbols=[SYM, "other_name"])
+    assert _without_rule_7(hints.format_report(with_two)) == _without_rule_7(hints.format_report(plain))
+
+
+CALLER_ONLY = "tests/test_only_calls.py"
+CALLER_ONLY_BODY = ("def test_a(owner_payload_example, x):\n"
+                    "    owner_payload_example('fam', 'one', {})\n"
+                    "    assert x == {1}\n"
+                    "    NAME(1)\n")
+COUNT_LINES_0 = [f"# rule {n} ({hints.RULE_NAMES[n]}): 0" for n in range(1, 7)]
+
+
+def _caller_only_repo(root: Path, head: str) -> None:
+    _write(root / ".git" / "config", "")
+    _write(root / "hermes_cli" / "__init__.py", "")
+    _write(root / OWNED, "def build():\n    return 1\n")
+    _write(root / SAVED / "fam" / "one.json", "{}\n")
+    _write(root / CALLER_ONLY, head + _src(CALLER_ONLY_BODY))
+
+
+def test_a_file_that_only_rule_7_names_is_not_a_listed_file_for_rules_5_and_6(tmp_path):
+    root = tmp_path / "only"
+    _caller_only_repo(root, "")
+    report = hints.find_hints(root, [OWNED], symbols=[SYM])
+    assert hints.format_report(report) == [_row_line(CALLER_ONLY, SYM, 4), *COUNT_LINES_0, COUNT_7 + "1"]
+    assert hints.format_report(hints.find_hints(root, [OWNED])) == [*COUNT_LINES_0, COUNT_7 + "0"]
+
+
+def test_the_same_test_file_listed_by_rule_3_gets_its_rule_5_and_6_rows_and_then_its_rule_7_row(tmp_path):
+    root = tmp_path / "listed"
+    _caller_only_repo(root, f"P = '{OWNED}'\n")
+    report = hints.find_hints(root, [OWNED], symbols=[SYM])
+    assert hints.format_report(report) == [
+        f"{SAVED}/fam/one.json\t{SAVED_LABEL}",
+        f"{CALLER_ONLY}\trule 3 (names owned path)",
+        f"{CALLER_ONLY}\t{RULE_6}: line 4",
+        _row_line(CALLER_ONLY, SYM, 5),
+        *[f"# rule {n} ({hints.RULE_NAMES[n]}): {1 if n in (3, 5, 6) else 0}" for n in range(1, 7)],
+        COUNT_7 + "1",
+    ]
+
+
+def test_the_rows_of_rule_7_of_a_file_come_after_each_other_row_of_that_file_in_node_order(tmp_path):
+    root = tmp_path / "all"
+    _everything_repo(root)
+    _write(root / "tests" / "b.py", _src(
+        "from tests.a import helper\nNAME(0)\n\ndef t(o, f, x):\n    o.owner_payload_example(f, 'one', {})\n"
+        "    assert x == {1}\n    NAME(1); NAME(2)\n    return NAME(3)\n"))
+    report = hints.find_hints(root, [OWNED], symbols=[SYM])
+    own = [line for line in hints.format_report(report) if line.startswith("tests/b.py")]
+    assert own == [
+        f"tests/b.py\t{NOT_RESOLVED}: line 5",
+        f"tests/b.py\t{HELPER_LABEL}",
+        f"tests/b.py\t{RULE_6}: line 6",
+        _row_line("tests/b.py", SYM, 2),
+        _row_line("tests/b.py", SYM, 7),
+        _row_line("tests/b.py", SYM, 7),
+        _row_line("tests/b.py", SYM, 8),
+    ]
+    lines = [line for line in hints.format_report(report) if line.startswith(("tests/test_pin.py", "scripts/tool.py"))]
+    pin = [line for line in lines if line.startswith("tests/test_pin.py")]
+    assert pin[-1].startswith("tests/test_pin.py\trule 7") and all("rule 7" not in line for line in pin[:-1])
+    tool = [line for line in lines if line.startswith("scripts/tool.py")]
+    assert tool[0] == f"scripts/tool.py\trule 2 (imports name from owned module); rule 3 (names owned path)"
+    assert tool[1] == _row_line("scripts/tool.py", SYM, 3) and len(tool) == 2
+
+
+def test_rows_of_distinct_symbols_on_one_line_come_in_source_column_order_through_the_report_and_the_script(calls_repo, capsys):
+    _write(calls_repo / "lib" / "mod.py", "outer(inner()); last()\nlast(outer(inner()))\n")
+    expected = [_row_line("lib/mod.py", name, line) for line, name in
+                [(1, "outer"), (1, "inner"), (1, "last"), (2, "last"), (2, "outer"), (2, "inner")]]
+    report = hints.find_hints(calls_repo, [OWNED], symbols=["last", "inner", "outer"])
+    assert _call_rows(report) == expected and report.counts[7] == 6
+    script = _load_script()
+    args = ["--root", str(calls_repo), "--owned", OWNED, "--symbol", "outer", "--symbol", "inner", "--symbol", "last"]
+    assert script.main(args) == 0
+    assert capsys.readouterr().out.splitlines()[:6] == expected
+
+
+def test_a_row_of_rule_7_has_its_symbol_and_line(calls_repo):
+    report = _calls(calls_repo, _src("x = 1\nNAME(1)\n"))
+    assert report.hints == (hints.Hint("lib/mod.py", (7,), symbol=SYM, unresolved_line=2),)
+
+
+def test_the_count_line_of_rule_7_equals_the_number_of_its_rows(tmp_path, capsys):
+    root = tmp_path / "all"
+    _everything_repo(root)
+    report = hints.find_hints(root, [OWNED], symbols=[SYM])
+    rows = [h for h in report.hints if 7 in h.rules]
+    assert len(rows) == report.counts[7] == len(_call_rows(report)) == 5
+    assert [line for line in hints.format_report(report) if line.startswith("# rule 7")] == [COUNT_7 + "5"]
+    script = _load_script()
+    assert script.main(["--root", str(root), "--owned", OWNED, "--symbol", SYM]) == 0
+    printed = capsys.readouterr().out.splitlines()
+    assert printed == hints.format_report(report) and printed[-1] == COUNT_7 + "5"
+    assert script.main(["--root", str(root), "--owned", OWNED, "--symbol", SYM, "--symbol", "other_name", "--symbol", SYM]) == 0
+    assert capsys.readouterr().out.splitlines() == printed
+
+
+def test_rule_7_reads_only_the_python_files_that_the_scan_reads(calls_repo, tmp_path):
+    _write(calls_repo / "scripts" / "run.sh", _src("NAME(1)\n"))
+    _write(calls_repo / "lib" / "stub.pyi", _src("NAME(1)\n"))
+    _write(calls_repo / "docs" / "notes.md", _src("NAME(1)\n"))
+    _write(calls_repo / "node_modules" / "dep.py", _src("NAME(1)\n"))
+    _write(calls_repo / "venv" / "dep.py", _src("NAME(1)\n"))
+    _write(tmp_path / "outside" / "out.py", _src("NAME(1)\n"))
+    (calls_repo / "lib" / "link.py").parent.mkdir(exist_ok=True)
+    (calls_repo / "lib" / "link.py").symlink_to(tmp_path / "outside" / "out.py")
+    (calls_repo / "lib" / "dangling.py").symlink_to(tmp_path / "outside" / "missing.py")
+    _write(calls_repo / "lib" / "real.py", _src("NAME(1)\n"))
+    report = hints.find_hints(calls_repo, [OWNED], symbols=[SYM])
+    assert _call_rows(report) == [_row_line("lib/real.py", SYM, 1)] and report.counts[7] == 1
+
+
+def test_a_binary_file_with_a_nul_byte_and_a_file_that_is_not_utf_8_give_no_row(calls_repo):
+    _write(calls_repo / "lib" / "good.py", _src("NAME(1)\n"))
+    (calls_repo / "lib" / "nul.py").write_bytes(b"x = 1\n\x00\n" + _src("NAME(1)\n").encode())
+    (calls_repo / "lib" / "latin.py").write_bytes(b"# \xe9\n" + _src("NAME(1)\n").encode())
+    report = hints.find_hints(calls_repo, [OWNED], symbols=[SYM])
+    assert _call_rows(report) == [_row_line("lib/good.py", SYM, 1)] and report.counts[7] == 1
+    assert report.unreadable == ("lib/latin.py",)
+    assert hints.format_report(report)[-1] == "# unreadable: 1"
+    assert hints.find_hints(calls_repo, [OWNED]).unreadable == ("lib/latin.py",)
+
+
+def test_a_nul_character_after_the_probe_gives_no_row_and_does_not_stop_the_search(calls_repo):
+    _write(calls_repo / "lib" / "good.py", _src("NAME(1)\n"))
+    padding = "# " + "x" * 9000 + "\n"
+    (calls_repo / "lib" / "late_nul.py").write_bytes((padding + _src("NAME(1)\nNAME(2)\n") + "s = '\x00'\n").encode())
+    report = hints.find_hints(calls_repo, [OWNED], symbols=[SYM])
+    assert _call_rows(report) == [_row_line("lib/good.py", SYM, 1)] and report.counts[7] == 1
+
+
+def test_the_search_runs_and_imports_no_file_that_it_reads_for_rule_7(calls_repo, tmp_path):
+    marker = tmp_path / "ran.txt"
+    source = _src(f"open({str(marker)!r}, 'w').write('ran')\nimport no_such_module_for_rule_7\nraise SystemExit(3)\nNAME(1)\n")
+    _write(calls_repo / "lib" / "runs.py", source)
+    snapshot, before = _snapshot(calls_repo), set(sys.modules)
+    report = hints.find_hints(calls_repo, [OWNED], symbols=[SYM])
+    assert report.counts[7] == 1
+    assert not marker.exists()
+    assert not [m for m in set(sys.modules) - before if "runs" in m or "no_such_module_for_rule_7" in m]
+    assert _snapshot(calls_repo) == snapshot
+
+
+def test_the_script_passes_each_symbol_and_writes_nothing_into_the_repository(calls_repo, capsys):
+    _write(calls_repo / "lib" / "mod.py", "alpha_fn(1)\nobj.beta_fn(2)\n")
+    snapshot = _snapshot(calls_repo)
+    script = _load_script()
+    assert script.main(["--root", str(calls_repo), "--owned", OWNED, "--symbol", "alpha_fn", "--symbol", "beta_fn"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[:2] == [_row_line("lib/mod.py", "alpha_fn", 1), _row_line("lib/mod.py", "beta_fn", 2)]
+    assert out[-1] == COUNT_7 + "2"
+    assert _snapshot(calls_repo) == snapshot
+
+
+def test_the_command_with_a_symbol_lists_a_synthetic_caller_with_its_line(tmp_path):
+    root = tmp_path / "synthetic"
+    _write(root / ".git" / "config", "")
+    _write(root / "hermes_cli" / "__init__.py", "")
+    _write(root / OWNED, "def build():\n    return 1\n")
+    _write(root / "scripts" / "caller.py", _src("import sys\n\nresult = NAME(sys.argv)\n"))
+    run = subprocess.run(
+        [sys.executable, str(SCRIPT), "--root", str(root), "--owned", OWNED, "--symbol", SYM],
+        env={"PATH": os.environ.get("PATH", "")}, capture_output=True, text=True, timeout=60,
+    )
+    assert run.returncode == 0, run.stderr
+    assert [line for line in run.stdout.splitlines() if not line.startswith("#")] == [_row_line("scripts/caller.py", SYM, 3)]
+    assert run.stdout.splitlines()[-1] == COUNT_7 + "1"
