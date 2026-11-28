@@ -98,6 +98,7 @@ def offer(task: kanban_db.Task, held: sqlite3.Row, *, revision: int) -> RetryRou
         assignment = model_policy.task_assignment_for(role, _PROVIDER, tier)
         lock = model_policy.mint_policy_lock(
             role, _PROVIDER, assignment.model, assignment.reasoning_effort, tier,
+            owner_retry=True,
         )
     except ValueError:
         return None

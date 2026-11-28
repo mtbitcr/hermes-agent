@@ -552,17 +552,25 @@ def _lock_digest(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+# Only the owner's retry of the one named card mints this route's lock; no other caller may.
+_RETRY_ONLY_ROUTES = frozenset({("raphael-builder", "openai-codex", "routine")})
+
+
 def mint_policy_lock(
     assignee: str,
     provider: str,
     model: str,
     reasoning_effort: str,
     execution_tier: str,
+    *,
+    owner_retry: bool = False,
 ) -> str:
     """Return the durable lock for one exact owner-approved task route.
 
     Raises ``ValueError`` unless the five components are together an admitted
     route right now, so an unmintable route can never become a stored lock.
+    A route in ``_RETRY_ONLY_ROUTES`` is minted only for the owner's retry of
+    the named card, which passes the boolean ``True``; no other value counts.
     """
     parts = _normalized_lock_parts(
         assignee, provider, model, reasoning_effort, execution_tier
@@ -570,6 +578,11 @@ def mint_policy_lock(
     error = _route_authority_error(*parts, admit_pinned_effort=True)
     if error:
         raise ValueError(error)
+    if (parts[0], parts[1], parts[4]) in _RETRY_ONLY_ROUTES and owner_retry is not True:
+        raise ValueError(
+            f"policy-locked route {parts[0]!r}/{parts[1]!r}/{parts[4]!r} "
+            "is approved only by the owner's retry of the named card"
+        )
     return f"{POLICY_LOCK_AUTHORITY}:v{POLICY_LOCK_VERSION}:{_lock_digest(*parts)}"
 
 

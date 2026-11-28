@@ -2360,7 +2360,7 @@ def openai_coding_route(host, monkeypatch, request):
     monkeypatch.setenv("HERMES_PROFILE", role)
     route = model_policy.task_assignment_for(role, provider, tier)
     lock = model_policy.mint_policy_lock(
-        role, provider, route.model, route.reasoning_effort, tier,
+        role, provider, route.model, route.reasoning_effort, tier, owner_retry=True,
     )
     with kb.connect_closing() as conn, kb.write_txn(conn):
         conn.execute(

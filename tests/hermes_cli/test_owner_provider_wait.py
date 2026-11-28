@@ -489,22 +489,22 @@ def test_alternate_retry_cannot_repin_a_card_the_setting_does_not_name(
 
 
 @pytest.mark.parametrize(
-    ("lock", "refusal"),
+    ("lock", "refusal", "reported"),
     [
-        pytest.param(None, "approved route lock", id="no_lock"),
-        pytest.param("", "approved route lock", id="empty_lock"),
+        pytest.param(None, "approved route lock", "approved only by the owner's retry", id="no_lock"),
+        pytest.param("", "approved route lock", "approved only by the owner's retry", id="empty_lock"),
         pytest.param(
             ("raphael-claude-worker", "openai-codex", "gpt-6.2-sol", "max", "deep"),
-            "does not bind this route", id="deep_worker_lock",
+            "does not bind this route", "does not bind this route", id="deep_worker_lock",
         ),
         pytest.param(
             ("raphael-builder", "anthropic", "claude-opus-5-5", "max", "deep"),
-            "does not bind this route", id="deep_builder_lock",
+            "does not bind this route", "does not bind this route", id="deep_builder_lock",
         ),
     ],
 )
 def test_a_routine_builder_card_on_the_alternate_route_never_starts_without_its_exact_lock(
-    root, owner, clock, monkeypatch, lock, refusal,
+    root, owner, clock, monkeypatch, lock, refusal, reported,
 ):
     from plugins.dashboard_auth.raphael_workspace import model_policy
 
@@ -519,6 +519,7 @@ def test_a_routine_builder_card_on_the_alternate_route_never_starts_without_its_
     route = model_policy.task_assignment_for("raphael-builder", "openai-codex", "routine")
     exact = model_policy.mint_policy_lock(
         "raphael-builder", "openai-codex", route.model, route.reasoning_effort, "routine",
+        owner_retry=True,
     )
     with _board(scene.board) as conn:
         for task_id in (control, refused):
@@ -545,7 +546,7 @@ def test_a_routine_builder_card_on_the_alternate_route_never_starts_without_its_
         assert spawned == [control]
         [(skipped, reason)] = result.skipped_route_unproven
         assert skipped == refused
-        assert refusal in reason
+        assert reported in reason
         task = kb.get_task(conn, refused)
         assert task.status != "running"
         assert (task.current_run_id, task.claim_lock, task.worker_pid) == (None, None, None)
@@ -553,6 +554,191 @@ def test_a_routine_builder_card_on_the_alternate_route_never_starts_without_its_
         assert "running" not in [status for _run_id, status in refused_runs]
         assert kb.get_task(conn, control).status == "running"
         assert [status for _run_id, status in conn.execute(runs, (control,))][-1] == "running"
+
+
+def test_the_kernel_never_mints_the_routine_builder_alternate_lock_from_a_stored_route(root):
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    builder = model_policy.task_assignment_for("raphael-builder", "openai-codex", "routine")
+    worker = model_policy.task_assignment_for("raphael-claude-worker", "openai-codex", "deep")
+    # The kernel's wrapper passes no retry flag, so it is an ordinary caller.
+    with pytest.raises(ValueError, match="retry"):
+        kb.mint_policy_lock(
+            "raphael-builder", "openai-codex", builder.model, builder.reasoning_effort, "routine",
+        )
+    deep_lock = kb.mint_policy_lock(
+        "raphael-claude-worker", "openai-codex", worker.model, worker.reasoning_effort, "deep",
+    )
+    assert kb.policy_lock_error(
+        deep_lock, "raphael-claude-worker", "openai-codex", worker.model, worker.reasoning_effort, "deep",
+    ) is None
+
+    cards = {}
+    with kb.connect_closing() as conn:
+        for role, tier, route in (
+            ("raphael-builder", "routine", builder), ("raphael-claude-worker", "deep", worker),
+        ):
+            (root / "profiles" / role).mkdir(exist_ok=True)
+            cards[role] = kb.create_task(conn, title=f"Stored on the alternate route: {role}", assignee=role)
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET execution_tier = ?, provider_override = ?, model_override = ?, "
+                    "reasoning_effort = ?, model_policy_lock = NULL WHERE id = ?",
+                    (tier, "openai-codex", route.model, route.reasoning_effort, cards[role]),
+                )
+        with kb.write_txn(conn):
+            allowed = {role: kb.authorize_executable_transition(conn, task_id) for role, task_id in cards.items()}
+        rows = {
+            role: conn.execute(
+                "SELECT status, block_kind, model_policy_lock FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            for role, task_id in cards.items()
+        }
+        refusals = {role: kb.route_authority_error(conn, task_id) for role, task_id in cards.items()}
+    # The builder card parks for re-approval with no lock written; the deep Worker card is proven as before.
+    assert allowed == {"raphael-builder": False, "raphael-claude-worker": True}
+    assert tuple(rows["raphael-builder"]) == ("blocked", "needs_input", None)
+    assert "retry" in refusals["raphael-builder"]
+    assert (rows["raphael-claude-worker"]["status"], rows["raphael-claude-worker"]["model_policy_lock"]) == (
+        "ready", deep_lock,
+    )
+    assert refusals["raphael-claude-worker"] is None
+
+
+def _git_in(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Placeholder", "-c", "user.email=placeholder@example.invalid",
+            "-c", "commit.gpgsign=false", *args,
+        ],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _delivery_repository(tmp_path: Path) -> tuple[Path, str]:
+    """A git repository of one commit that the registry names as the primary folder of the Project ``delivery-project``."""
+    from hermes_cli import projects_db
+
+    repo = tmp_path / "delivery-repository"
+    repo.mkdir()
+    _git_in(repo, "init", "-q")
+    (repo / "app.py").write_text("placeholder = 1\n", encoding="utf-8")
+    _git_in(repo, "add", "app.py")
+    _git_in(repo, "commit", "-q", "-m", "placeholder")
+    with projects_db.connect_closing() as registry:
+        projects_db.create_project(
+            registry, name="delivery-project", id="delivery-project", primary_path=str(repo),
+        )
+    return repo, _git_in(repo, "rev-parse", "HEAD")
+
+
+def _finished_builder_card(conn, repo: Path, head: str, risk_tier: int, receipt: tuple | None) -> str:
+    """A done routine Builder card of the Project, governed on its Claude route, whose accepted handover names the
+    Builder and whose latest run carries the runtime receipt of ``receipt`` (provider, model, effort), or none."""
+    from hermes_cli.kanban_risk_tier import pinned_reasoning_effort
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    claude = model_policy.task_assignment_for("raphael-builder", "anthropic", "routine")
+    effort = pinned_reasoning_effort(risk_tier, None)
+    source = kb.create_task(
+        conn, title="Build the placeholder feature", assignee="raphael-builder", project_id="delivery-project",
+        provider_override="anthropic", model_override=claude.model, reasoning_effort=effort,
+        execution_tier="routine", risk_tier=risk_tier, owned_paths=["app.py"], requires_review=True,
+        model_policy_lock=kb.mint_policy_lock("raphael-builder", "anthropic", claude.model, effort, "routine"),
+    )
+    metadata = {"worker_session_id": f"session-{source}"}
+    if receipt is not None:
+        metadata["runtime_receipt"] = {
+            "schema_version": 3, "engine": "hermes", "profile": "raphael-builder",
+            "route_evidence": "dominant-session-usage",
+            **dict(zip(("provider", "model", "reasoning_effort"), receipt)),
+        }
+    with kb.write_txn(conn):
+        kb._append_event(conn, source, "review_requested", {"implementer": "raphael-builder", "reviewer": "raphael-verifier"})
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at, metadata) "
+            "VALUES (?, 'raphael-builder', 'done', 'completed', ?, ?, ?)",
+            (source, T0, T0 + 1, json.dumps(metadata)),
+        )
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (source,))
+    _git_in(repo, "branch", f"delivery-return/{source}-{head[:12]}", head)
+    return source
+
+
+def _returned_for_a_failed_check(conn, repo: Path, source: str, head: str) -> dict:
+    """The failed required check's return of ``source`` at ``head``, written by the delivery's one continuation writer."""
+    from hermes_cli import kanban_delivery as kd
+
+    row = {"source_task_id": source, "pull_request_head": head, "pull_request_number": 7}
+    body = kd._red_body(row, "A required check failed.", ["tests/test_app.py::test_placeholder"])
+    with kb.write_txn(conn):
+        return kd._continuation(conn, kb.kanban_db_path(), row, body, (repo, f"delivery-return/{source}-{head[:12]}"))
+
+
+@pytest.mark.parametrize("risk_tier", [1, 2])
+def test_a_continuation_without_its_own_approval_never_starts_on_the_alternate_builder_route(
+    root, tmp_path, monkeypatch, risk_tier,
+):
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    monkeypatch.delenv("HERMES_OPENAI_RETRY_TASK_ID", raising=False)
+    (root / "profiles" / "raphael-builder").mkdir(exist_ok=True)
+    repo, head = _delivery_repository(tmp_path)
+    claude = model_policy.task_assignment_for("raphael-builder", "anthropic", "routine")
+    alternate = model_policy.task_assignment_for("raphael-builder", "openai-codex", "routine")
+    pinned = {1: "high", 2: "max"}[risk_tier]
+    receipts = {
+        "claude": ("anthropic", claude.model, pinned),
+        "no_receipt": None,
+        "alternate": ("openai-codex", alternate.model, alternate.reasoning_effort),
+    }
+    with kb.connect_closing() as conn:
+        # The alternate receipt first and alone: no other card is ready, so no concurrency limit can be why
+        # the card does not start. The card was never named by the owner, so it parks for re-approval.
+        source = _finished_builder_card(conn, repo, head, risk_tier, receipts["alternate"])
+        returned = _returned_for_a_failed_check(conn, repo, source, head)
+        item = returned["rework"]
+        _result, spawned = _tick(conn, None, {item: 4901})
+        task = kb.get_task(conn, item)
+        seen = {
+            "parked": "retry" in returned.get("parked", ""),
+            "status": task.status,
+            "block_kind": conn.execute("SELECT block_kind FROM tasks WHERE id = ?", (item,)).fetchone()[0],
+            "lock": task.model_policy_lock,
+            "claim": (task.current_run_id, task.claim_lock, task.worker_pid),
+            "runs": conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (item,)).fetchone()[0],
+            "spawned": spawned,
+        }
+        assert seen == {
+            "parked": True, "status": "blocked", "block_kind": "needs_input", "lock": None,
+            "claim": (None, None, None), "runs": 0, "spawned": [],
+        }
+        assert kb.route_authority_error(conn, item)
+        assert kb.policy_lock_error(
+            task.model_policy_lock, task.assignee, task.provider_override, task.model_override,
+            task.reasoning_effort, task.execution_tier,
+        )
+
+        # The Claude receipt, and a run with no receipt at all, continue as they did: ready on the
+        # Claude route with a lock that verifies, and the dispatcher starts one of them.
+        controls = {}
+        for name in ("claude", "no_receipt"):
+            source = _finished_builder_card(conn, repo, head, risk_tier, receipts[name])
+            returned = _returned_for_a_failed_check(conn, repo, source, head)
+            assert "parked" not in returned, name
+            controls[name] = returned["rework"]
+            task = kb.get_task(conn, controls[name])
+            assert (task.status, task.provider_override, task.model_override, task.reasoning_effort) == (
+                "ready", "anthropic", claude.model, pinned,
+            ), name
+            assert kb.policy_lock_error(
+                task.model_policy_lock, task.assignee, task.provider_override, task.model_override,
+                task.reasoning_effort, task.execution_tier,
+            ) is None, name
+            assert kb.route_authority_error(conn, controls[name]) is None, name
+        _result, spawned = _tick(conn, None, {task_id: 4902 + number for number, task_id in enumerate(controls.values())})
+        assert spawned and set(spawned) <= set(controls.values())
+        assert kb.get_task(conn, item).status == "blocked"
 
 
 @pytest.mark.parametrize("repinned_between", [False, True], ids=["two_stops", "repinned_between"])
