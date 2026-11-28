@@ -477,7 +477,7 @@ class TestExactMethodRouteRules:
         assert rows == [("POST", f"{feed}/{{decision_ref}}/undo_close")] + [
             ("POST", f"{feed}/{{decision_ref}}/{action}")
             for action in ("accept", "reject", "defer")
-        ] + [("POST", f"{feed}/{{ref}}/inputs/{{n}}")] + [("POST", f"{feed}/{{ref}}/choose/{{n}}")] + [("POST", f"{feed}/{{ref}}/update")]
+        ] + [("POST", f"{feed}/{{ref}}/inputs/{{n}}")] + [("POST", f"{feed}/{{ref}}/choose/{{n}}")] + [("POST", f"{feed}/{{ref}}/answer")] + [("POST", f"{feed}/{{ref}}/update")]
 
         async def ok(_request):
             return web.json_response({"ok": True})

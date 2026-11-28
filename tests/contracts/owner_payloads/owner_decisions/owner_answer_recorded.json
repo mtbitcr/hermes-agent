@@ -1,0 +1,10 @@
+{
+  "body": {
+    "choice": 2,
+    "decision_ref": "decision_2ee3d445ac7178ed5ee231e781515086",
+    "object": "hermes.owner_workspace.owner_answer",
+    "resumed": true,
+    "stop_ref": "stop_de32405c02eb8f653db2dab211c5456e"
+  },
+  "status": 200
+}
