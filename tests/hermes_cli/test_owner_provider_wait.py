@@ -280,10 +280,27 @@ def test_a_retry_makes_a_held_ready_card_spawnable_on_the_next_tick(root, owner,
 
 
 @pytest.mark.parametrize(
-    ("role", "tier"),
-    [("raphael-claude-worker", "deep"), ("raphael-builder", "routine")],
+    ("role", "tier", "offered"),
+    [
+        ("default", "routine", True),
+        ("default", "deep", True),
+        ("raphael-planner", "routine", True),
+        ("raphael-planner", "deep", True),
+        ("raphael-business", "routine", True),
+        ("raphael-business", "deep", True),
+        ("raphael-verifier", "routine", True),
+        ("raphael-verifier", "deep", True),
+        ("raphael-claude-worker", "deep", True),
+        ("raphael-builder", "routine", True),
+        ("raphael-designer", "routine", False),
+        ("raphael-designer", "deep", False),
+        ("raphael-claude-worker", "routine", False),
+        ("raphael-builder", "deep", False),
+    ],
 )
-def test_alternate_retry_requires_a_fresh_choice_after_a_card_change(root, owner, clock, monkeypatch, role, tier):
+def test_alternate_retry_requires_a_fresh_choice_after_a_card_change(
+    root, owner, clock, monkeypatch, role, tier, offered,
+):
     from hermes_cli import owner_retry_route
     from plugins.dashboard_auth.raphael_workspace import model_policy
 
@@ -302,12 +319,13 @@ def test_alternate_retry_requires_a_fresh_choice_after_a_card_change(root, owner
     lock = model_policy.mint_policy_lock(
         role, "anthropic", assignment.model, assignment.reasoning_effort, tier,
     )
+    requires_review = role not in ow.REVIEW_REQUIREMENT_REFUSED_ASSIGNEES
     with _board(board) as conn:
         task_id = kb.create_task(
             conn, title="Draft the placeholder brief", assignee=role,
             project_id=project["project_id"], provider_override="anthropic",
             model_override=assignment.model, reasoning_effort=assignment.reasoning_effort,
-            execution_tier=tier, model_policy_lock=lock, requires_review=True,
+            execution_tier=tier, model_policy_lock=lock, requires_review=requires_review,
         )
         held = _held(conn, board, task_id, 4211)
     clock["t"] = held.ended_at + 60
@@ -317,13 +335,16 @@ def test_alternate_retry_requires_a_fresh_choice_after_a_card_change(root, owner
     def read_choice():
         snapshot = ow.read_project_snapshot(owner, project["slug"], provider_wait=True)
         return next(
-            task["retry_route"]
+            task.get("retry_route")
             for column in snapshot["columns"] for task in column["tasks"] if task["id"] == task_id
         )
 
     env = _steward_env(root, board)
     with _as_worker(monkeypatch, env):
         old_choice = read_choice()
+    assert (old_choice is not None) is offered
+    if not offered:
+        return
 
     with _board(board) as conn:
         earlier_revision = kb.task_event_revision(conn, task_id)
@@ -351,9 +372,72 @@ def test_alternate_retry_requires_a_fresh_choice_after_a_card_change(root, owner
         assert kb.get_run(conn, held.id).outcome == "rate_limited"
         task = kb.get_task(conn, task_id)
         assert task.provider_override == "openai-codex"
-        assert task.requires_review
+        assert task.requires_review == requires_review
         _result, spawned = _tick(conn, board, {task_id: 4212})
         assert spawned == [task_id]
+
+
+@pytest.mark.parametrize(
+    ("role", "tier"),
+    [
+        ("default", "routine"),
+        ("default", "deep"),
+        ("raphael-planner", "routine"),
+        ("raphael-planner", "deep"),
+        ("raphael-business", "routine"),
+        ("raphael-business", "deep"),
+        ("raphael-verifier", "routine"),
+        ("raphael-verifier", "deep"),
+        ("raphael-claude-worker", "deep"),
+        ("raphael-builder", "routine"),
+    ],
+)
+@pytest.mark.parametrize("setting", [None, ""], ids=["unset", "empty"])
+def test_alternate_retry_is_offered_in_no_lane_while_the_setting_names_no_card(
+    root, owner, clock, monkeypatch, role, tier, setting,
+):
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    import sqlite3
+
+    profile_home = Path(os.environ["HERMES_HOME"])
+    with monkeypatch.context() as shared_root:
+        shared_root.setenv("HERMES_HOME", str(root))
+        project = _project(owner, "Setting Names No Card")
+        with contextlib.closing(sqlite3.connect(root / "projects.db")) as source:
+            with contextlib.closing(sqlite3.connect(profile_home / "projects.db")) as target:
+                source.backup(target)
+    board = project["board"]
+    (root / "profiles" / role).mkdir()
+    assignment = model_policy.task_assignment_for(role, "anthropic", tier)
+    lock = model_policy.mint_policy_lock(
+        role, "anthropic", assignment.model, assignment.reasoning_effort, tier,
+    )
+    with _board(board) as conn:
+        task_id = kb.create_task(
+            conn, title="Draft the placeholder brief", assignee=role,
+            project_id=project["project_id"], provider_override="anthropic",
+            model_override=assignment.model, reasoning_effort=assignment.reasoning_effort,
+            execution_tier=tier, model_policy_lock=lock,
+            requires_review=role not in ow.REVIEW_REQUIREMENT_REFUSED_ASSIGNEES,
+        )
+        held = _held(conn, board, task_id, 4211)
+    clock["t"] = held.ended_at + 60
+    monkeypatch.delenv("HERMES_OPENAI_RETRY_TASK_ID", raising=False)
+    env = _steward_env(root, board)
+    assert "HERMES_OPENAI_RETRY_TASK_ID" not in env
+
+    def read_card(named: str | None) -> dict:
+        worker_env = env if named is None else {**env, "HERMES_OPENAI_RETRY_TASK_ID": named}
+        with _as_worker(monkeypatch, worker_env):
+            snapshot = ow.read_project_snapshot(owner, project["slug"], provider_wait=True)
+        return _task(snapshot, task_id)
+
+    card = read_card(setting)
+    assert card["stopped_work"] == "provider_wait"
+    assert "retry_route" not in card
+    # Control: the setting naming this same card is the one thing that makes the offer.
+    assert set(read_card(task_id)["retry_route"]) == {"token", "model", "effort"}
 
 
 def _alternate_scene(
@@ -436,8 +520,6 @@ def test_alternate_retry_is_offered_to_no_card_while_the_setting_names_none(
     [
         ("raphael-claude-worker", "routine"),
         ("raphael-builder", "deep"),
-        ("raphael-planner", "routine"),
-        ("raphael-planner", "deep"),
     ],
 )
 def test_alternate_retry_is_not_offered_for_a_named_card_outside_the_two_lanes(

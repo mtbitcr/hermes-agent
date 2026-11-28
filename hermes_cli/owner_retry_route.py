@@ -14,10 +14,6 @@ from hermes_cli import kanban_db, kanban_provider_stops
 from plugins.dashboard_auth.raphael_workspace import model_policy
 
 
-_RETRY_LANES = frozenset({
-    ("raphael-claude-worker", "deep"),
-    ("raphael-builder", "routine"),
-})
 _PROVIDER = "openai-codex"
 _PIN_COLUMNS = (
     "assignee", "provider_override", "model_override", "reasoning_effort",
@@ -80,7 +76,6 @@ def offer(task: kanban_db.Task, held: sqlite3.Row, *, revision: int) -> RetryRou
     if (
         task.id != os.environ.get("HERMES_OPENAI_RETRY_TASK_ID")
         or task.status != "ready"
-        or (role, tier) not in _RETRY_LANES
         or task.provider_override != "anthropic"
         or not task.model_policy_lock
         or any(value is not None for value in (task.claim_lock, task.current_run_id, task.worker_pid))
@@ -94,6 +89,7 @@ def offer(task: kanban_db.Task, held: sqlite3.Row, *, revision: int) -> RetryRou
     if kanban_provider_stops._recorded_for(metadata) != (True, "anthropic"):
         return None
 
+    # Model policy stays the authority for both role-wide and task-only routes.
     try:
         assignment = model_policy.task_assignment_for(role, _PROVIDER, tier)
         lock = model_policy.mint_policy_lock(
