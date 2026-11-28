@@ -243,9 +243,13 @@ def tree_snapshot(root: Path):
         dirnames.sort()
         for name in sorted(filenames):
             full = Path(dirpath) / name
-            seen[str(full.relative_to(root))] = hashlib.sha256(full.read_bytes()).hexdigest()
+            stat = full.lstat()
+            seen[str(full.relative_to(root))] = (
+                hashlib.sha256(full.read_bytes()).hexdigest(), stat.st_size, stat.st_mtime_ns,
+            )
         for name in dirnames:
-            seen[str((Path(dirpath) / name).relative_to(root)) + "/"] = None
+            full = Path(dirpath) / name
+            seen[str(full.relative_to(root)) + "/"] = full.lstat().st_mtime_ns
     return seen
 
 
@@ -808,18 +812,18 @@ def test_p10_no_call_writes_an_owned_path_added_event(conn, code):
 
 
 def test_p11_the_table_has_one_sentence_for_each_code_of_point_9_and_no_other():
-    assert set(mod.SENTENCES) == set(CODES)
-    assert len(set(mod.SENTENCES.values())) == len(CODES)
+    assert set(mod.SENTENCES) == {*CODES, "ok"}
+    assert len(set(mod.SENTENCES.values())) == len(CODES) + 1
 
 
-@pytest.mark.parametrize("code", CODES)
+@pytest.mark.parametrize("code", [*CODES, "ok"])
 def test_17k_each_sentence_passes_the_owner_text_check_unchanged_and_holds_no_slash(code):
     sentence = mod.SENTENCES[code]
     assert check_owner_text(sentence, "planner_prose") == sentence
     assert "/" not in sentence
 
 
-@pytest.mark.parametrize("code", CODES)
+@pytest.mark.parametrize("code", [*CODES, "ok"])
 def test_p11_a_sentence_is_one_plain_sentence_that_names_no_path_id_or_commit(code):
     sentence = mod.SENTENCES[code]
     assert sentence == sentence.strip() and sentence[0].isupper()
@@ -829,8 +833,8 @@ def test_p11_a_sentence_is_one_plain_sentence_that_names_no_path_id_or_commit(co
     assert code not in sentence and code.replace("_", " ") not in sentence
 
 
-@pytest.mark.parametrize("code", CODES)
-def test_p11_every_failure_code_the_function_gives_has_a_sentence(conn, code):
+@pytest.mark.parametrize("code", [*CODES, "ok"])
+def test_p11_every_code_the_function_gives_has_a_sentence(conn, code):
     task_id, path, reader = SCENARIOS[code](conn)
     got = check(conn, path, task_id=task_id, reader=reader)
     assert got.code == code
@@ -917,12 +921,37 @@ def real_card(c, repo, **kwargs):
     return add_card(c, base=repo.base, worktree=str(repo.work), **kwargs)
 
 
+TRACE_LOGS = ("trace2-normal.log", "trace2-event.log", "trace2-perf.log")
+
+
+def configure_tracing_into_the_worktree(repo):
+    """The temporary HOME names one Trace2 log inside the worktree for each of the three targets."""
+    home = Path(os.environ["HOME"])
+    assert home.is_relative_to(repo.work.parent), "the fixture keeps HOME inside the temporary folder"
+    for key, name in zip(("normalTarget", "eventTarget", "perfTarget"), TRACE_LOGS):
+        repo.git("config", "--file", str(home / ".gitconfig"), f"trace2.{key}", str(repo.work / name))
+    plain = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    subprocess.run(["git", "-C", str(repo.work), "ls-tree", repo.base, "--", "tests/test_alpha.py"],
+                   env=plain, check=True, capture_output=True)
+    logs = [repo.work / name for name in TRACE_LOGS]
+    assert all(log.is_file() and log.stat().st_size > 0 for log in logs), "a plain git read writes the logs"
+    for log in logs:
+        log.unlink()
+
+
+@pytest.mark.parametrize(
+    "tracing", [False, True], ids=["no tracing configured", "tracing configured into the worktree"]
+)
 @pytest.mark.parametrize("path", ["tests/test_alpha.py", "tests/test_missing.py", "tests/test_exec.py"])
-def test_17l_the_worktree_is_the_same_before_and_after_a_call_with_the_default_reader(conn, repo, path):
+def test_17l_the_worktree_is_the_same_before_and_after_a_call_with_the_default_reader(
+    conn, repo, path, tracing
+):
     real_card(conn, repo)
     stray = repo.work / "tests" / "stray.txt"
     stray.parent.mkdir()
     stray.write_text("stray\n", encoding="utf-8")
+    if tracing:
+        configure_tracing_into_the_worktree(repo)
     before = tree_snapshot(repo.work)
     real(conn, path)
     assert tree_snapshot(repo.work) == before
@@ -936,11 +965,22 @@ def test_17m_the_default_reader_gives_mode_and_blob_for_a_file(repo):
         assert mod._git_read_base_entry(str(repo.work), repo.base, path) == ("100644", repo.oracle(path))
 
 
-def test_17m_the_default_reader_reads_the_base_commit_and_not_the_head(repo):
+@pytest.mark.parametrize("replaced", [False, True], ids=["no replacement ref", "a replacement ref for the base"])
+def test_17m_the_default_reader_reads_the_base_commit_and_not_the_head(conn, repo, replaced):
     path = "tests/test_alpha.py"
-    assert repo.oracle(path) != repo.oracle(path, repo.head)
-    assert mod._git_read_base_entry(str(repo.work), repo.base, path) == ("100644", repo.oracle(path))
-    assert mod._git_read_base_entry(str(repo.work), repo.head, path) == ("100644", repo.oracle(path, repo.head))
+    base_blob, head_blob, gone_blob = repo.oracle(path), repo.oracle(path, repo.head), repo.oracle("tests/test_gone.py")
+    assert base_blob != head_blob
+    if replaced:
+        repo.git("replace", repo.base, repo.head)
+        assert repo.oracle(path) == head_blob, "a plain git read of the base now answers from the replacement"
+    assert mod._git_read_base_entry(str(repo.work), repo.base, path) == ("100644", base_blob)
+    assert mod._git_read_base_entry(str(repo.work), repo.head, path) == ("100644", head_blob)
+    assert mod._git_read_base_entry(str(repo.work), repo.base, "tests/test_gone.py") == ("100644", gone_blob)
+    assert mod._git_read_base_entry(str(repo.work), repo.base, "tests/test_new.py") is None
+    real_card(conn, repo)
+    assert triple(real(conn, path)) == (True, "ok", base_blob)
+    assert triple(real(conn, "tests/test_gone.py")) == (True, "ok", gone_blob)
+    assert triple(real(conn, "tests/test_new.py")) == (False, "not_at_base", None)
 
 
 @pytest.mark.parametrize("path", ["tests/test_missing.py", "tests/test_new.py", "nope", "tests/test_alpha.pyc"])
@@ -1006,6 +1046,50 @@ def test_17m_a_linked_worktree_of_the_card_reads_the_same_base(conn, repo, tmp_p
     assert triple(real(conn, "tests/test_alpha.py")) == (True, "ok", repo.oracle("tests/test_alpha.py"))
     assert triple(real(conn, "tests/test_new.py")) == (False, "not_at_base", None)
     assert tree_snapshot(linked) == before
+
+
+NESTED_FOLDERS = ("pkg", f"a{os.pathsep}b/pkg", "日本 é/pkg")
+
+
+@pytest.fixture
+def nested(repo):
+    """The repository with an ordinary folder for each of NESTED_FOLDERS; the base holds a test file below it."""
+    for folder in NESTED_FOLDERS:
+        repo.put(f"{folder}/tests/test_nested.py", f"nested in {folder}\n".encode())
+        (repo.work / folder).mkdir(parents=True)
+    repo.head = repo.commit("nested test files", parent=repo.head)
+    return repo
+
+
+def test_17m_an_ordinary_folder_inside_a_repository_is_not_a_checkout_at_the_stored_location(conn, nested):
+    stored = nested.work / "pkg"
+    card = kb.create_task(
+        conn, title="folder", owned_paths=["hermes_cli/widget.py"], workspace_kind="worktree",
+        workspace_path=str(stored), initial_status="running",
+    )
+    resolved = kb.resolve_workspace(kb.get_task(conn, card))
+    assert resolved == stored and not (stored / ".git").exists(), "the kernel takes the ordinary folder as the worktree"
+    base = kb.record_worktree_base(conn, card, resolved)
+    assert base == nested.head, "the kernel records the base of the enclosing repository for an ordinary folder"
+    assert nested.oracle("pkg/tests/test_nested.py", base), "the nested file is in the base below the folder"
+    assert nested.git("ls-tree", base, "--", "tests/test_nested.py") == "", "the proposed path is not in the base"
+    assert triple(mod.check_added_test_file(conn, card, "tests/test_nested.py")) == (False, "not_at_base", None)
+    assert mod._git_read_base_entry(str(stored), base, "tests/test_nested.py") is None
+
+
+def test_17m_a_linked_worktree_made_by_the_kernel_inside_the_main_checkout_is_a_checkout(conn, repo):
+    card = kb.create_task(
+        conn, title="linked", owned_paths=["hermes_cli/widget.py"], workspace_kind="worktree",
+        workspace_path=str(repo.work), initial_status="running",
+    )
+    stored = kb.resolve_workspace(kb.get_task(conn, card))
+    assert stored != repo.work and stored.is_relative_to(repo.work) and (stored / ".git").is_file()
+    assert kb.record_worktree_base(conn, card, stored) == repo.head
+    before = tree_snapshot(stored)
+    assert triple(real(conn, "tests/test_new.py", card)) == (True, "ok", repo.oracle("tests/test_new.py", repo.head))
+    assert triple(real(conn, "tests/test_alpha.py", card)) == (True, "ok", repo.oracle("tests/test_alpha.py", repo.head))
+    assert triple(real(conn, "tests/test_gone.py", card)) == (False, "not_at_base", None)
+    assert tree_snapshot(stored) == before
 
 
 # --- point 13: the limits the owner accepts --------------------------------------------------
@@ -1105,6 +1189,120 @@ def test_input_stored_base_commit_and_worktree_reach_the_reader_unchanged(conn):
     reader = Reader()
     assert check(conn, reader=reader).ok
     assert reader.calls == [("/work/日本 tree\x00z", "bäse-日本\x00z", TEST_PATH)]
+
+
+# --- the stored workspace: the input that the default reader takes its ceiling from ----------
+
+
+def stored_answer(conn, stored, path, base):
+    task_id = f"t{conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] + 1}"
+    add_card(conn, task_id, base=base, worktree=None if stored is None else str(stored))
+    return triple(real(conn, path, task_id))
+
+
+def refused_at_base(conn, stored, path, base):
+    assert stored_answer(conn, stored, path, base) == (False, "not_at_base", None)
+
+
+def answered_ok(conn, repo, stored, path, base):
+    assert stored_answer(conn, stored, path, base) == (True, "ok", repo.oracle(path, base))
+
+
+@pytest.mark.parametrize("stored", ["", None], ids=["empty", "missing"])
+def test_input_an_empty_or_missing_stored_workspace_gives_not_at_base(conn, repo, monkeypatch, stored):
+    monkeypatch.chdir(repo.work)
+    refused_at_base(conn, stored, "tests/test_alpha.py", repo.base)
+
+
+def test_input_the_default_reader_gives_none_for_an_empty_workspace_and_does_not_read_the_current_folder(
+    repo, monkeypatch
+):
+    monkeypatch.chdir(repo.work)
+    assert mod._git_read_base_entry("", repo.base, "tests/test_alpha.py") is None
+
+
+def a_file(path):
+    path.write_text("not a folder\n", encoding="utf-8")
+    return str(path)
+
+
+MISSING_WORKSPACES = {
+    "a folder that does not exist": lambda repo, tmp: str(tmp / "nothing"),
+    "a folder below a folder that does not exist": lambda repo, tmp: str(tmp / "nothing" / "deeper"),
+    "a folder that does not exist below a checkout": lambda repo, tmp: str(repo.work / "gone" / "deeper"),
+    "a file": lambda repo, tmp: a_file(tmp / "a file"),
+    "a path longer than the system allows": lambda repo, tmp: str(tmp) + ("/" + "d" * 100) * 50,
+}
+
+
+@pytest.mark.parametrize("make", list(MISSING_WORKSPACES.values()), ids=list(MISSING_WORKSPACES))
+def test_input_a_stored_workspace_that_does_not_exist_or_is_not_a_folder_gives_not_at_base(
+    conn, repo, tmp_path, make
+):
+    refused_at_base(conn, make(repo, tmp_path), "tests/test_alpha.py", repo.base)
+
+
+@pytest.mark.parametrize("where", ["after the checkout", "between two folders", "alone"])
+def test_input_a_nul_in_the_stored_workspace_gives_not_at_base_and_never_raises(conn, repo, where):
+    stored = {
+        "after the checkout": f"{repo.work}\x00",
+        "between two folders": f"{repo.work.parent}\x00/{repo.work.name}",
+        "alone": "\x00",
+    }[where]
+    refused_at_base(conn, stored, "tests/test_alpha.py", repo.base)
+
+
+def test_input_a_stored_workspace_below_a_multibyte_folder_name_is_a_checkout_only_when_it_is_one(
+    conn, nested, tmp_path
+):
+    linked = tmp_path / "日本語 é" / "linked"
+    nested.git("worktree", "add", "-q", "--detach", str(linked), nested.base)
+    answered_ok(conn, nested, linked, "tests/test_alpha.py", nested.base)
+    refused_at_base(conn, linked, "tests/test_new.py", nested.base)
+    refused_at_base(conn, nested.work / "日本 é" / "pkg", "tests/test_nested.py", nested.head)
+
+
+def test_input_a_stored_workspace_below_a_folder_named_with_the_path_separator_gives_not_at_base(
+    conn, nested, tmp_path
+):
+    refused_at_base(conn, nested.work / NESTED_FOLDERS[1], "tests/test_nested.py", nested.head)
+    separated = tmp_path / f"a{os.pathsep}b"
+    nested.git("worktree", "add", "-q", "--detach", str(separated), nested.base)
+    answered_ok(conn, nested, separated, "tests/test_alpha.py", nested.base)
+
+
+def test_input_a_symbolic_link_as_the_stored_workspace_is_followed_to_where_it_leads(conn, nested, tmp_path):
+    link = tmp_path / "link"
+    link.symlink_to(nested.work / "pkg", target_is_directory=True)
+    refused_at_base(conn, link, "tests/test_nested.py", nested.head)
+    above = tmp_path / "link above"
+    above.symlink_to(nested.work, target_is_directory=True)
+    refused_at_base(conn, above / "pkg", "tests/test_nested.py", nested.head)
+    answered_ok(conn, nested, above, "tests/test_alpha.py", nested.base)
+    linked = tmp_path / "linked"
+    nested.git("worktree", "add", "-q", "--detach", str(linked), nested.base)
+    to_linked = tmp_path / "link to the worktree"
+    to_linked.symlink_to(linked, target_is_directory=True)
+    answered_ok(conn, nested, to_linked, "tests/test_alpha.py", nested.base)
+    refused_at_base(conn, to_linked, "tests/test_new.py", nested.base)
+
+
+def test_input_a_stored_workspace_that_is_not_in_canonical_form_is_read_where_it_leads(conn, nested):
+    work = str(nested.work)
+    for stored in (work + "/", work + "/.", f"{nested.work.parent}//{nested.work.name}", work + "/pkg/.."):
+        answered_ok(conn, nested, stored, "tests/test_alpha.py", nested.base)
+        refused_at_base(conn, stored, "tests/test_new.py", nested.base)
+    for stored in (work + "/pkg/", work + "/pkg/.", work + "/pkg/../pkg", work + "//pkg"):
+        refused_at_base(conn, stored, "tests/test_nested.py", nested.head)
+
+
+def test_input_a_relative_stored_workspace_is_read_from_the_current_folder(conn, nested, monkeypatch):
+    monkeypatch.chdir(nested.work.parent)
+    name = nested.work.name
+    for stored in (name, f"./{name}", f"{name}/pkg/.."):
+        answered_ok(conn, nested, stored, "tests/test_alpha.py", nested.base)
+        refused_at_base(conn, stored, "tests/test_new.py", nested.base)
+    refused_at_base(conn, f"{name}/pkg", "tests/test_nested.py", nested.head)
 
 
 def test_input_a_closed_store_raises_and_gives_no_answer(conn):
