@@ -212,14 +212,14 @@ def test_task_route_uses_opus_max_only_for_deep_anthropic_work():
         ) == assignment_for(profile, "openai-codex")
 
 
-@pytest.mark.parametrize("tier", ["routine", "deep"])
-def test_no_builder_lane_leaves_the_claude_family(tier):
-    """Delivery/infrastructure work is high-risk coding: Claude only.
+def test_deep_builder_cannot_leave_the_claude_family():
+    """At the deep tier, delivery/infrastructure work is high-risk coding: Claude only.
 
     Both directions matter. The OpenAI builder assignment must not exist
     (option exposure and setup selection both read the matrix), and no lock
     naming that route may be mintable.
     """
+    tier = "deep"
     with pytest.raises(ValueError):
         assignment_for("raphael-builder", "openai-codex")
     with pytest.raises(ValueError):
@@ -245,10 +245,12 @@ def test_no_builder_lane_leaves_the_claude_family(tier):
     ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")
 
 
-def test_openai_deep_worker_requires_an_exact_task_lock():
+@pytest.mark.parametrize(
+    ("role", "approved_tier"),
+    [("raphael-claude-worker", "deep"), ("raphael-builder", "routine")],
+)
+def test_openai_task_route_requires_an_exact_lock(role, approved_tier):
     """The alternate Worker route requires the deep tier."""
-    role = "raphael-claude-worker"
-    approved_tier = "deep"
     with pytest.raises(ValueError):
         assignment_for(role, "openai-codex")
     for tier in ("routine", "deep"):
@@ -257,6 +259,7 @@ def test_openai_deep_worker_requires_an_exact_task_lock():
             assert (lane.model, lane.reasoning_effort) == ("gpt-6.2-sol", "max")
             assert model_policy.mint_policy_lock(
                 role, "openai-codex", lane.model, lane.reasoning_effort, tier,
+                owner_retry=role == "raphael-builder",
             ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")
         else:
             with pytest.raises(ValueError):
@@ -280,6 +283,117 @@ def test_openai_deep_worker_requires_an_exact_task_lock():
     assert model_policy.mint_policy_lock(
         role, deep.provider, deep.model, deep.reasoning_effort, "deep",
     ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")
+
+
+RETRY_ONLY_ROUTE = ("raphael-builder", "openai-codex", "gpt-6.2-sol", "max", "routine")
+DEEP_WORKER_ROUTE = ("raphael-claude-worker", "openai-codex", "gpt-6.2-sol", "max", "deep")
+
+
+def _lock_the_previous_head_minted(*route):
+    """The lock of the head before the retry-only gate: its authority, its version and the digest of the five parts."""
+    return (
+        f"{model_policy.POLICY_LOCK_AUTHORITY}:v{model_policy.POLICY_LOCK_VERSION}"
+        f":{model_policy._lock_digest(*route)}"
+    )
+
+
+def _old_refusal(route):
+    """The message the ordinary mint gave this route before the gate: the route check's own text."""
+    return model_policy._route_authority_error(
+        *model_policy._normalized_lock_parts(*route), admit_pinned_effort=True,
+    )
+
+
+def test_only_an_owner_retry_mints_the_routine_builder_alternate_lock():
+    with pytest.raises(ValueError, match="retry") as refused:
+        model_policy.mint_policy_lock(*RETRY_ONLY_ROUTE)
+    assert _old_refusal(RETRY_ONLY_ROUTE) is None
+    assert str(refused.value)
+    with pytest.raises(ValueError, match="retry"):
+        model_policy.mint_policy_lock(*RETRY_ONLY_ROUTE, owner_retry=False)
+
+    lock = model_policy.mint_policy_lock(*RETRY_ONLY_ROUTE, owner_retry=True)
+    assert model_policy.policy_lock_error(lock, *RETRY_ONLY_ROUTE) is None
+    # The head before the gate stored this very lock for the route, and it verifies as it did.
+    stored = _lock_the_previous_head_minted(*RETRY_ONLY_ROUTE)
+    assert lock == stored
+    assert model_policy.policy_lock_error(stored, *RETRY_ONLY_ROUTE) is None
+
+
+@pytest.mark.parametrize("flag", [1, "yes", "True", None, 0, "", [True], 1.0], ids=repr)
+def test_only_the_boolean_true_is_an_owner_retry(flag):
+    with pytest.raises(ValueError, match="retry"):
+        model_policy.mint_policy_lock(*RETRY_ONLY_ROUTE, owner_retry=flag)
+
+
+def test_a_retry_flag_is_keyword_only():
+    with pytest.raises(TypeError):
+        model_policy.mint_policy_lock(*RETRY_ONLY_ROUTE, True)
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        pytest.param(("raphael-builder ", " openai-codex", "gpt-6.2-sol", " MAX ", " Routine"), id="spaced_and_cased"),
+        pytest.param(("raphael-builder", "openai-codex", "gpt-6.2-sol ", "Max", "ROUTINE"), id="cased"),
+    ],
+)
+def test_the_normalized_route_is_what_the_gate_reads(route):
+    with pytest.raises(ValueError, match="retry"):
+        model_policy.mint_policy_lock(*route)
+    assert model_policy.mint_policy_lock(*route, owner_retry=True) == _lock_the_previous_head_minted(
+        *RETRY_ONLY_ROUTE
+    )
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        pytest.param(("raphael-builder", "openai-codex", "gpt-6.2-sol", "max", "deep"), id="builder_deep"),
+        pytest.param(("raphael-builder", "openai-codex", "gpt-6.2", "max", "routine"), id="wrong_model"),
+        pytest.param(("raphael-builder", "openai-codex", "gpt-6.2-sol", "high", "routine"), id="wrong_effort"),
+        pytest.param(("raphael-builder", "openai-codex", "gpt-6.2-sol", "max", "urgent"), id="wrong_tier"),
+        pytest.param(("raphael-builder", "openai-codex", "gpt-6.2-sol", "max", ""), id="no_tier"),
+        pytest.param(("raphael-builder", "openai-codex", "", "", "routine"), id="empty"),
+        pytest.param(("raphael-builder", "openai-codex", None, None, "routine"), id="missing"),
+        pytest.param(("raphael-builder", "openai-codex", "gpt-6.2-sol\x00", "max", "routine"), id="nul_in_model"),
+        pytest.param(("raphael-builder\x00", "openai-codex", "gpt-6.2-sol", "max", "routine"), id="nul_in_role"),
+        pytest.param(("raphael-builder", "openai-codex", "gpt-6.2-sol", "max", "routine\x00"), id="nul_in_tier"),
+        pytest.param(("raphaël-builder", "openai-codex", "gpt-6.2-sol", "max", "routine"), id="multibyte_role"),
+        pytest.param(("raphael-builder", "openai-codex", "gpt-6.2-sol中文", "max", "routine"), id="multibyte_model"),
+        pytest.param(("raphael-builder", "openai-codex", "gpt-6.2-sol", "max", "routîne"), id="multibyte_tier"),
+    ],
+)
+def test_a_route_the_gate_does_not_hold_is_refused_by_the_route_check_with_or_without_a_retry(route):
+    expected = _old_refusal(route)
+    assert expected
+    for flag in (False, True):
+        with pytest.raises(ValueError) as refused:
+            model_policy.mint_policy_lock(*route, owner_retry=flag)
+        assert str(refused.value) == expected
+    with pytest.raises(ValueError) as refused:
+        model_policy.mint_policy_lock(*route)
+    assert str(refused.value) == expected
+
+
+def test_the_retry_only_gate_leaves_the_deep_worker_lane_and_every_claude_route_to_the_plain_call():
+    plain = model_policy.mint_policy_lock(*DEEP_WORKER_ROUTE)
+    assert plain == _lock_the_previous_head_minted(*DEEP_WORKER_ROUTE)
+    assert model_policy.policy_lock_error(plain, *DEEP_WORKER_ROUTE) is None
+    assert model_policy.mint_policy_lock(*DEEP_WORKER_ROUTE, owner_retry=True) == plain
+
+    for role in ("raphael-builder", "raphael-claude-worker"):
+        for tier in ("routine", "deep"):
+            claude = task_assignment_for(role, "anthropic", tier)
+            for effort in {claude.reasoning_effort, "max"}:
+                route = (role, "anthropic", claude.model, effort, tier)
+                lock = model_policy.mint_policy_lock(*route)
+                assert lock == _lock_the_previous_head_minted(*route)
+                assert model_policy.policy_lock_error(lock, *route) is None
+                assert model_policy.mint_policy_lock(*route, owner_retry=True) == lock
+    role_wide = assignment_for("raphael-planner", "anthropic")
+    route = ("raphael-planner", "anthropic", role_wide.model, role_wide.reasoning_effort, "routine")
+    assert model_policy.mint_policy_lock(*route) == _lock_the_previous_head_minted(*route)
 
 
 def test_role_wide_model_update_does_not_move_the_task_only_route():
@@ -897,8 +1011,10 @@ def test_a_superseded_configured_route_is_readable_but_grants_no_new_authority(
     ("default", "anthropic", "claude-opus-5", "high"),
     # A superseded deep-only lane was never a base route.
     ("raphael-verifier", "openai-codex", "gpt-6-astra", "xhigh"),
-    # No lane on this provider at all, then or now.
+    # The builder has no role-wide lane on this provider, then or now.
     ("raphael-builder", "openai-codex", "gpt-5.6-sol", "max"),
+    # Its task-only routine route is no configured route either.
+    ("raphael-builder", "openai-codex", "gpt-6.2-sol", "max"),
     # Never-admissible values stay refused regardless of lineage.
     ("default", "anthropic", "claude-fable-5", "max"),
     ("default", "anthropic", "claude-opus-ultracode-1", "max"),
@@ -919,6 +1035,33 @@ def test_a_configured_route_the_lineage_never_admitted_there_is_refused(
         configured_assignment_for(profile)
     with pytest.raises(ValueError):
         resolve_task_assignment(profile, "routine")
+
+
+def test_the_route_fence_pins_nothing_for_a_builder_saved_on_its_task_only_route(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    from hermes_cli import kanban_db, owner_workspace as ow
+
+    _on_disk_route(monkeypatch, tmp_path, "openai-codex", "gpt-6.2-sol", "max")
+    kanban_db.init_db()
+    with kanban_db.connect() as conn:
+        task_id = kanban_db.create_task(
+            conn, title="receipt-owned owner work", assignee="raphael-builder",
+            execution_tier="routine",
+        )
+    monkeypatch.setattr(
+        ow, "_owner_receipt_task_ids", lambda: {kanban_db.DEFAULT_BOARD: {task_id}},
+    )
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.fence_effective_task_routes("raphael-builder")
+
+    assert excinfo.value.code == "invalid_model_route"
+    with kanban_db.connect() as conn:
+        task = kanban_db.get_task(conn, task_id)
+    assert (task.provider_override, task.model_override, task.model_policy_lock) == (
+        None, None, None,
+    )
 
 
 @pytest.mark.parametrize("route", [
@@ -1028,7 +1171,7 @@ def test_a_current_runtime_route_still_reads_as_the_current_assignment(
     # A superseded model at an effort it never had.
     ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "xhigh"),
     ("default", "anthropic", "claude-opus-5", "high"),
-    # No lane on this provider at all, then or now.
+    # The builder has no role-wide lane on this provider, then or now.
     ("raphael-builder", "openai-codex", "gpt-5.6-sol", "max"),
     ("other-profile", "anthropic", "claude-opus-5", "max"),
     # Never-admissible values stay refused regardless of lineage.
