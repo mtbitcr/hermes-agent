@@ -160,3 +160,74 @@ def test_builder_skill_changed_only_by_the_build_loop_additions():
         f"{ADDITION_D_HEADING}\n\n{ADDITION_D_PARAGRAPH}\n\n", "", 1
     )
     assert hashlib.sha256(remainder.encode("utf-8")).hexdigest() == ORIGINAL_SHA256
+
+
+PLANNER_SKILL = (
+    REPO_ROOT
+    / "role-skills"
+    / "raphael-planner"
+    / "team-operations"
+    / "handing-build-work"
+    / "SKILL.md"
+)
+
+PLANNER_ORIGINAL_SHA256 = (
+    "5ca31625220e5d09b4d65798fff47ee55f49b5dab794400d2b182d6b82716ce8"
+)
+
+EDGES_SECTION_LINES = (
+    "## Edges decided before the build",
+    "",
+    "Every build card holds these three parts, decided before the build. A card with "
+    "no input form, or with no actors that work at one time, says so in one line.",
+    "",
+    "1. the closed list of supported input forms;",
+    "2. the closed list of supported orderings of concurrent actors, each with its "
+    "named interleaving test;",
+    '3. "Any other form or ordering is refused before any state change, with a named '
+    'refusal test."',
+    "",
+    'When the facts sheet asks for "every form" of an open format or "any order" of '
+    "concurrent actors, propose the closed list as one owner decision in the plan, "
+    "before the build card is approved.",
+)
+
+EDGES_SECTION = "\n".join(EDGES_SECTION_LINES)
+
+PLANNER_NEXT_HEADING = "## Before sending the build task"
+
+
+def _planner_text() -> str:
+    return PLANNER_SKILL.read_bytes().decode("utf-8")
+
+
+def test_planner_skill_holds_the_edges_section_with_its_three_rule_lines():
+    assert len(EDGES_SECTION_LINES) == 9
+
+    text = _planner_text()
+    assert text.count(EDGES_SECTION) == 1
+    assert text.count(PLANNER_NEXT_HEADING) == 1
+    assert text.count(f"{EDGES_SECTION}\n\n{PLANNER_NEXT_HEADING}\n") == 1
+
+    lines = text.split("\n")
+    heading = lines.index(PLANNER_NEXT_HEADING)
+    assert lines[heading - 11 : heading] == ["", *EDGES_SECTION_LINES, ""]
+    assert lines[heading - 12] != ""
+    assert lines.count(EDGES_SECTION_LINES[0]) == 1
+
+
+def test_planner_skill_changed_only_by_the_edges_section():
+    raw = PLANNER_SKILL.read_bytes()
+    assert b"\r" not in raw
+    assert raw.endswith(b"\n")
+    text = raw.decode("utf-8")
+
+    block = f"{EDGES_SECTION}\n\n{PLANNER_NEXT_HEADING}"
+    assert text.count(block) == 1
+    remainder = text.replace(block, PLANNER_NEXT_HEADING, 1)
+
+    assert len(remainder) == len(text) - len(EDGES_SECTION) - 2
+    assert (
+        hashlib.sha256(remainder.encode("utf-8")).hexdigest()
+        == PLANNER_ORIGINAL_SHA256
+    )
