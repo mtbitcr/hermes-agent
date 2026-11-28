@@ -44,6 +44,7 @@
   "POST /v1/owner-workspace/decisions/{decision_ref}/defer": [],
   "POST /v1/owner-workspace/decisions/{decision_ref}/reject": [],
   "POST /v1/owner-workspace/decisions/{decision_ref}/undo_close": [],
+  "POST /v1/owner-workspace/decisions/{ref}/answer": [],
   "POST /v1/owner-workspace/decisions/{ref}/choose/{n}": [],
   "POST /v1/owner-workspace/decisions/{ref}/inputs/{n}": [],
   "POST /v1/owner-workspace/decisions/{ref}/update": [],
