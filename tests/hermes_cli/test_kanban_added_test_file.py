@@ -160,9 +160,10 @@ SCENARIOS = {
 
 
 class Repo:
-    def __init__(self, work, env):
+    def __init__(self, work, env, root):
         self.work = work
         self.env = env
+        self.root = root
         self.base = self.head = None
 
     def git(self, *args, stdin=None):
@@ -203,8 +204,16 @@ BASE_FILES = {
 }
 
 
+SEPARATED = f"release{os.pathsep}stable"
+LAYOUTS = pytest.mark.parametrize(
+    "repo", [None, SEPARATED], indirect=True, ids=["plain layout", "below a separator-named folder"]
+)
+
+
 @pytest.fixture
-def repo(tmp_path, monkeypatch):
+def repo(tmp_path, monkeypatch, request):
+    """The repository; an indirect parameter names the folder below tmp_path that holds the repository folder."""
+    holder = tmp_path / request.param if getattr(request, "param", None) else tmp_path
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -220,9 +229,9 @@ def repo(tmp_path, monkeypatch):
         GIT_COMMITTER_EMAIL="committer@example.invalid",
         GIT_COMMITTER_DATE="2026-01-01T00:00:00+0000",
     )
-    work = tmp_path / "wörk tree 日本"
-    work.mkdir()
-    r = Repo(work, env)
+    work = holder / "wörk tree 日本"
+    work.mkdir(parents=True)
+    r = Repo(work, env, tmp_path)
     r.git("init", "-q")
     for path, data in BASE_FILES.items():
         r.put(path, data)
@@ -324,6 +333,40 @@ def test_p8_default_reader_runs_git_ls_tree_as_an_argument_list_without_shell_in
     assert kwargs["timeout"] == 30
 
 
+@LAYOUTS
+def test_p8_default_reader_runs_rev_parse_before_ls_tree_only_when_the_parent_holds_the_path_separator(
+    repo, monkeypatch
+):
+    separated = repo.work.parent != repo.root
+    assert has_separator_parent(repo.work) == separated, "the layout decides the path separator"
+    blob = repo.oracle("tests/test_alpha.py")
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CEILING_DIRECTORIES", "GIT_TRACE2_EVENT"):
+        monkeypatch.setenv(name, str(repo.root / "elsewhere"))
+    calls = []
+    real_run = subprocess.run
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(mod.subprocess, "run", spy)
+    assert mod._git_read_base_entry(str(repo.work), repo.base, "tests/test_alpha.py") == ("100644", blob)
+    rev_parse = ["git", "-C", str(repo.work), "rev-parse", "--show-toplevel"]
+    ls_tree = ["git", "-C", str(repo.work), "ls-tree", repo.base, "--", "tests/test_alpha.py"]
+    assert [args[0] if args else kwargs["args"] for args, kwargs in calls] == (
+        [rev_parse, ls_tree] if separated else [ls_tree]
+    )
+    expected_env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    expected_env.update(GIT_NO_REPLACE_OBJECTS="1", GIT_TRACE2="0", GIT_TRACE2_EVENT="0", GIT_TRACE2_PERF="0")
+    if not separated:
+        expected_env["GIT_CEILING_DIRECTORIES"] = os.path.realpath(repo.root)
+    for _args, kwargs in calls:
+        assert not kwargs.get("shell")
+        assert kwargs["timeout"] == 30
+        assert kwargs["env"] == expected_env
+        assert kwargs["capture_output"] and kwargs["encoding"] == "utf-8" and kwargs["errors"] == "surrogateescape"
+
+
 def test_p8_default_reader_gives_mode_and_id_for_exactly_one_line_for_that_path(monkeypatch):
     monkeypatch.setattr(mod.subprocess, "run", fake_run(LINE))
     assert mod._git_read_base_entry("/w", BASE, "tests/test_alpha.py") == ("100644", BLOB)
@@ -376,6 +419,56 @@ def test_p8_default_reader_gives_none_for_a_worktree_that_is_not_a_repository(re
 
 def test_p8_default_reader_gives_none_for_a_base_commit_that_does_not_exist(repo):
     assert mod._git_read_base_entry(str(repo.work), "f" * 40, "tests/test_alpha.py") is None
+
+
+def scripted_run(calls, first):
+    """A fake runner: ``first`` answers rev-parse, and ls-tree gives LINE; every command is noted in ``calls``."""
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return (first if "rev-parse" in argv else fake_run(LINE))(argv, **kwargs)
+
+    return run
+
+
+FIRST_ANSWERS = [
+    "a non-zero exit", "no output", "an enclosing folder", "a folder that does not exist", "a time-out", "an os error",
+    "a NUL in the stored folder",
+]
+
+
+@pytest.mark.parametrize("answer", FIRST_ANSWERS)
+def test_p8_default_reader_gives_none_and_never_starts_ls_tree_when_the_first_command_does_not_show_the_folder(
+    tmp_path, monkeypatch, answer
+):
+    stored = tmp_path / SEPARATED / "checkout"
+    stored.mkdir(parents=True)
+    first = {
+        "a non-zero exit": fake_run(f"{stored}\n".encode(), returncode=128),
+        "no output": fake_run(b""),
+        "an enclosing folder": fake_run(f"{stored.parent}\n".encode()),
+        "a folder that does not exist": fake_run(f"{stored.parent / 'gone'}\n".encode()),
+        "a time-out": fake_run(raises=subprocess.TimeoutExpired("git", 30)),
+        "an os error": fake_run(raises=FileNotFoundError("git")),
+        "a NUL in the stored folder": fake_run(f"{stored}\n".encode()),
+    }[answer]
+    worktree = str(stored) + ("\x00x" if answer == "a NUL in the stored folder" else "")
+    calls = []
+    monkeypatch.setattr(mod.subprocess, "run", scripted_run(calls, first))
+    assert mod._git_read_base_entry(worktree, BASE, "tests/test_alpha.py") is None
+    assert [argv[3] for argv in calls] == ([] if "NUL" in answer else ["rev-parse"]), "ls-tree is never started"
+
+
+@pytest.mark.parametrize("name", ["checkout", "checkout\n"], ids=["a plain name", "a name that ends in a newline"])
+def test_p8_default_reader_runs_ls_tree_second_when_the_first_command_names_the_stored_folder(
+    tmp_path, monkeypatch, name
+):
+    stored = tmp_path / SEPARATED / name
+    stored.mkdir(parents=True)
+    calls = []
+    monkeypatch.setattr(mod.subprocess, "run", scripted_run(calls, fake_run(f"{stored}\n".encode())))
+    assert mod._git_read_base_entry(str(stored), BASE, "tests/test_alpha.py") == ("100644", BLOB)
+    assert [argv[3] for argv in calls] == ["rev-parse", "ls-tree"]
 
 
 # --- point 9: one test for each check ------------------------------------------------------
@@ -921,13 +1014,17 @@ def real_card(c, repo, **kwargs):
     return add_card(c, base=repo.base, worktree=str(repo.work), **kwargs)
 
 
+def has_separator_parent(stored) -> bool:
+    return os.pathsep in os.path.dirname(os.path.realpath(stored))
+
+
 TRACE_LOGS = ("trace2-normal.log", "trace2-event.log", "trace2-perf.log")
 
 
 def configure_tracing_into_the_worktree(repo):
     """The temporary HOME names one Trace2 log inside the worktree for each of the three targets."""
     home = Path(os.environ["HOME"])
-    assert home.is_relative_to(repo.work.parent), "the fixture keeps HOME inside the temporary folder"
+    assert home.is_relative_to(repo.root), "the fixture keeps HOME inside the temporary folder"
     for key, name in zip(("normalTarget", "eventTarget", "perfTarget"), TRACE_LOGS):
         repo.git("config", "--file", str(home / ".gitconfig"), f"trace2.{key}", str(repo.work / name))
     plain = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
@@ -939,6 +1036,7 @@ def configure_tracing_into_the_worktree(repo):
         log.unlink()
 
 
+@LAYOUTS
 @pytest.mark.parametrize(
     "tracing", [False, True], ids=["no tracing configured", "tracing configured into the worktree"]
 )
@@ -965,6 +1063,7 @@ def test_17m_the_default_reader_gives_mode_and_blob_for_a_file(repo):
         assert mod._git_read_base_entry(str(repo.work), repo.base, path) == ("100644", repo.oracle(path))
 
 
+@LAYOUTS
 @pytest.mark.parametrize("replaced", [False, True], ids=["no replacement ref", "a replacement ref for the base"])
 def test_17m_the_default_reader_reads_the_base_commit_and_not_the_head(conn, repo, replaced):
     path = "tests/test_alpha.py"
@@ -1061,8 +1160,10 @@ def nested(repo):
     return repo
 
 
+@LAYOUTS
 def test_17m_an_ordinary_folder_inside_a_repository_is_not_a_checkout_at_the_stored_location(conn, nested):
     stored = nested.work / "pkg"
+    assert has_separator_parent(stored) == (nested.work.parent != nested.root), "the layout decides the separator"
     card = kb.create_task(
         conn, title="folder", owned_paths=["hermes_cli/widget.py"], workspace_kind="worktree",
         workspace_path=str(stored), initial_status="running",
@@ -1077,6 +1178,7 @@ def test_17m_an_ordinary_folder_inside_a_repository_is_not_a_checkout_at_the_sto
     assert mod._git_read_base_entry(str(stored), base, "tests/test_nested.py") is None
 
 
+@LAYOUTS
 def test_17m_a_linked_worktree_made_by_the_kernel_inside_the_main_checkout_is_a_checkout(conn, repo):
     card = kb.create_task(
         conn, title="linked", owned_paths=["hermes_cli/widget.py"], workspace_kind="worktree",
@@ -1084,12 +1186,30 @@ def test_17m_a_linked_worktree_made_by_the_kernel_inside_the_main_checkout_is_a_
     )
     stored = kb.resolve_workspace(kb.get_task(conn, card))
     assert stored != repo.work and stored.is_relative_to(repo.work) and (stored / ".git").is_file()
-    assert kb.record_worktree_base(conn, card, stored) == repo.head
+    assert has_separator_parent(stored) == (repo.work.parent != repo.root), "the layout decides the path separator"
+    base = kb.record_worktree_base(conn, card, stored)
+    assert base == repo.head
+    branch = Repo(stored, repo.env, repo.root)
+    branch.put("tests/test_after_base.py", b"after the base\n")
+    branch.commit("after the base", parent=base)
+    assert branch.oracle("tests/test_after_base.py", "HEAD"), "the card's branch holds a file that the base does not"
     before = tree_snapshot(stored)
     assert triple(real(conn, "tests/test_new.py", card)) == (True, "ok", repo.oracle("tests/test_new.py", repo.head))
     assert triple(real(conn, "tests/test_alpha.py", card)) == (True, "ok", repo.oracle("tests/test_alpha.py", repo.head))
     assert triple(real(conn, "tests/test_gone.py", card)) == (False, "not_at_base", None)
+    assert triple(real(conn, "tests/test_missing.py", card)) == (False, "not_at_base", None)
+    assert triple(real(conn, "tests/test_after_base.py", card)) == (False, "not_at_base", None)
     assert tree_snapshot(stored) == before
+
+
+@pytest.mark.parametrize(
+    "repo", [f"{SEPARATED}/リリース{os.pathsep}安定版 ünï"], indirect=True, ids=["a multibyte folder below it"]
+)
+def test_17m_a_checkout_below_a_multibyte_folder_named_with_the_path_separator_gives_ok(conn, repo):
+    assert has_separator_parent(repo.work) and not repo.work.parent.name.isascii()
+    real_card(conn, repo)
+    assert triple(real(conn, "tests/test_alpha.py")) == (True, "ok", repo.oracle("tests/test_alpha.py"))
+    assert triple(real(conn, "tests/test_new.py")) == (False, "not_at_base", None)
 
 
 # --- point 13: the limits the owner accepts --------------------------------------------------
@@ -1112,6 +1232,7 @@ def test_p13b_the_check_does_not_read_the_test_content_or_the_disk(conn, repo):
     assert triple(real(conn, "tests/test_ondisk.py")) == (False, "not_at_base", None)
 
 
+@LAYOUTS
 def test_p13c_git_variables_that_name_another_repository_do_not_move_the_read(conn, repo, tmp_path, monkeypatch):
     other = tmp_path / "other"
     other.mkdir()
@@ -1262,13 +1383,39 @@ def test_input_a_stored_workspace_below_a_multibyte_folder_name_is_a_checkout_on
     refused_at_base(conn, nested.work / "日本 é" / "pkg", "tests/test_nested.py", nested.head)
 
 
-def test_input_a_stored_workspace_below_a_folder_named_with_the_path_separator_gives_not_at_base(
+def test_input_a_stored_workspace_below_a_folder_named_with_the_path_separator_is_a_checkout_only_when_it_is_one(
     conn, nested, tmp_path
 ):
     refused_at_base(conn, nested.work / NESTED_FOLDERS[1], "tests/test_nested.py", nested.head)
     separated = tmp_path / f"a{os.pathsep}b"
     nested.git("worktree", "add", "-q", "--detach", str(separated), nested.base)
     answered_ok(conn, nested, separated, "tests/test_alpha.py", nested.base)
+    parent = tmp_path / SEPARATED / "linked"
+    grandparent = tmp_path / SEPARATED / "inner" / "linked"
+    for linked in (parent, grandparent):
+        nested.git("worktree", "add", "-q", "--detach", str(linked), nested.base)
+        assert has_separator_parent(linked)
+        answered_ok(conn, nested, linked, "tests/test_alpha.py", nested.base)
+        refused_at_base(conn, linked, "tests/test_new.py", nested.base)
+        refused_at_base(conn, linked, "tests/test_missing.py", nested.base)
+    assert os.pathsep not in grandparent.parent.name and os.pathsep in grandparent.parent.parent.name
+    to_checkout = tmp_path / "link to the separated checkout"
+    to_checkout.symlink_to(parent, target_is_directory=True)
+    answered_ok(conn, nested, to_checkout, "tests/test_alpha.py", nested.base)
+    refused_at_base(conn, to_checkout, "tests/test_new.py", nested.base)
+    above = tmp_path / "link above the separated checkout"
+    above.symlink_to(parent.parent, target_is_directory=True)
+    answered_ok(conn, nested, above / "linked", "tests/test_alpha.py", nested.base)
+    refused_at_base(conn, above / "linked", "tests/test_new.py", nested.base)
+    to_folder = tmp_path / "link to the ordinary folder"
+    to_folder.symlink_to(nested.work / NESTED_FOLDERS[1], target_is_directory=True)
+    assert has_separator_parent(to_folder)
+    refused_at_base(conn, to_folder, "tests/test_nested.py", nested.head)
+    leaving = tmp_path / SEPARATED / "link to the plain checkout"
+    leaving.symlink_to(nested.work, target_is_directory=True)
+    assert not has_separator_parent(leaving) and os.pathsep in str(leaving)
+    answered_ok(conn, nested, leaving, "tests/test_alpha.py", nested.base)
+    refused_at_base(conn, leaving, "tests/test_new.py", nested.base)
 
 
 def test_input_a_symbolic_link_as_the_stored_workspace_is_followed_to_where_it_leads(conn, nested, tmp_path):
