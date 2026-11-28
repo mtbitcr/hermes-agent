@@ -279,7 +279,11 @@ def test_a_retry_makes_a_held_ready_card_spawnable_on_the_next_tick(root, owner,
         assert spawned == [task_id]
 
 
-def test_deep_worker_retry_requires_a_fresh_choice_after_a_card_change(root, owner, clock, monkeypatch):
+@pytest.mark.parametrize(
+    ("role", "tier"),
+    [("raphael-claude-worker", "deep"), ("raphael-builder", "routine")],
+)
+def test_alternate_retry_requires_a_fresh_choice_after_a_card_change(root, owner, clock, monkeypatch, role, tier):
     from hermes_cli import owner_retry_route
     from plugins.dashboard_auth.raphael_workspace import model_policy
 
@@ -288,23 +292,22 @@ def test_deep_worker_retry_requires_a_fresh_choice_after_a_card_change(root, own
     profile_home = Path(os.environ["HERMES_HOME"])
     with monkeypatch.context() as shared_root:
         shared_root.setenv("HERMES_HOME", str(root))
-        project = _project(owner, "Deep Worker Retry")
+        project = _project(owner, "Alternate Route Retry")
         with contextlib.closing(sqlite3.connect(root / "projects.db")) as source:
             with contextlib.closing(sqlite3.connect(profile_home / "projects.db")) as target:
                 source.backup(target)
     board = project["board"]
-    role = "raphael-claude-worker"
     (root / "profiles" / role).mkdir()
-    assignment = model_policy.task_assignment_for(role, "anthropic", "deep")
+    assignment = model_policy.task_assignment_for(role, "anthropic", tier)
     lock = model_policy.mint_policy_lock(
-        role, "anthropic", assignment.model, assignment.reasoning_effort, "deep",
+        role, "anthropic", assignment.model, assignment.reasoning_effort, tier,
     )
     with _board(board) as conn:
         task_id = kb.create_task(
             conn, title="Draft the placeholder brief", assignee=role,
             project_id=project["project_id"], provider_override="anthropic",
             model_override=assignment.model, reasoning_effort=assignment.reasoning_effort,
-            execution_tier="deep", model_policy_lock=lock, requires_review=True,
+            execution_tier=tier, model_policy_lock=lock, requires_review=True,
         )
         held = _held(conn, board, task_id, 4211)
     clock["t"] = held.ended_at + 60

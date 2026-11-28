@@ -2351,6 +2351,28 @@ def test_artifact_round_trip_moves_real_bytes_without_model_text(host, sdk):
     assert box.files.read_bytes(imported["path"]) == data
 
 
+@pytest.fixture(params=[(sd.WORKER_PROFILE, "deep"), ("raphael-builder", "routine")])
+def openai_coding_route(host, monkeypatch, request):
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    role, tier = request.param
+    provider = "openai-codex"
+    monkeypatch.setenv("HERMES_PROFILE", role)
+    route = model_policy.task_assignment_for(role, provider, tier)
+    lock = model_policy.mint_policy_lock(
+        role, provider, route.model, route.reasoning_effort, tier,
+    )
+    with kb.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET assignee=?, owned_paths=?, model_override=?, provider_override=?, "
+            "reasoning_effort=?, execution_tier=?, model_policy_lock=?, requires_review=1 "
+            "WHERE id=?",
+            (role, '["app.py"]', route.model, provider, route.reasoning_effort, tier, lock, host.task_id),
+        )
+    return host
+
+
+# The deep worker lane only; two older tests below keep testing exactly that lane.
 @pytest.fixture
 def openai_deep_worker(host):
     from plugins.dashboard_auth.raphael_workspace import model_policy
@@ -2372,7 +2394,7 @@ def openai_deep_worker(host):
     return host
 
 
-def test_openai_deep_worker_provisions_without_claude_sign_in(openai_deep_worker, sdk, monkeypatch):
+def test_openai_coding_route_provisions_without_claude_sign_in(openai_coding_route, sdk, monkeypatch):
     monkeypatch.setattr(sd, "_resolve_host_credential", lambda: "")
 
     out = _provision()
@@ -2384,7 +2406,7 @@ def test_openai_deep_worker_provisions_without_claude_sign_in(openai_deep_worker
     assert not box.vault_calls
 
 
-def test_openai_deep_worker_renews_without_claude_sign_in(openai_deep_worker, sdk, monkeypatch):
+def test_openai_coding_route_renews_without_claude_sign_in(openai_coding_route, sdk, monkeypatch):
     _provision()
     box = FakeSandbox.created[-1]
     box.expires_in_seconds = 120

@@ -16,6 +16,7 @@ from plugins.dashboard_auth.raphael_workspace import model_policy
 
 _RETRY_LANES = frozenset({
     ("raphael-claude-worker", "deep"),
+    ("raphael-builder", "routine"),
 })
 _PROVIDER = "openai-codex"
 _PIN_COLUMNS = (

@@ -212,14 +212,14 @@ def test_task_route_uses_opus_max_only_for_deep_anthropic_work():
         ) == assignment_for(profile, "openai-codex")
 
 
-@pytest.mark.parametrize("tier", ["routine", "deep"])
-def test_no_builder_lane_leaves_the_claude_family(tier):
-    """Delivery/infrastructure work is high-risk coding: Claude only.
+def test_deep_builder_cannot_leave_the_claude_family():
+    """At the deep tier, delivery/infrastructure work is high-risk coding: Claude only.
 
     Both directions matter. The OpenAI builder assignment must not exist
     (option exposure and setup selection both read the matrix), and no lock
     naming that route may be mintable.
     """
+    tier = "deep"
     with pytest.raises(ValueError):
         assignment_for("raphael-builder", "openai-codex")
     with pytest.raises(ValueError):
@@ -245,10 +245,12 @@ def test_no_builder_lane_leaves_the_claude_family(tier):
     ).startswith(f"{model_policy.POLICY_LOCK_AUTHORITY}:v")
 
 
-def test_openai_deep_worker_requires_an_exact_task_lock():
+@pytest.mark.parametrize(
+    ("role", "approved_tier"),
+    [("raphael-claude-worker", "deep"), ("raphael-builder", "routine")],
+)
+def test_openai_task_route_requires_an_exact_lock(role, approved_tier):
     """The alternate Worker route requires the deep tier."""
-    role = "raphael-claude-worker"
-    approved_tier = "deep"
     with pytest.raises(ValueError):
         assignment_for(role, "openai-codex")
     for tier in ("routine", "deep"):
@@ -897,7 +899,7 @@ def test_a_superseded_configured_route_is_readable_but_grants_no_new_authority(
     ("default", "anthropic", "claude-opus-5", "high"),
     # A superseded deep-only lane was never a base route.
     ("raphael-verifier", "openai-codex", "gpt-6-astra", "xhigh"),
-    # No lane on this provider at all, then or now.
+    # The builder has no role-wide lane on this provider, then or now.
     ("raphael-builder", "openai-codex", "gpt-5.6-sol", "max"),
     # Never-admissible values stay refused regardless of lineage.
     ("default", "anthropic", "claude-fable-5", "max"),
@@ -1028,7 +1030,7 @@ def test_a_current_runtime_route_still_reads_as_the_current_assignment(
     # A superseded model at an effort it never had.
     ("raphael-verifier", "openai-codex", "gpt-5.6-sol", "xhigh"),
     ("default", "anthropic", "claude-opus-5", "high"),
-    # No lane on this provider at all, then or now.
+    # The builder has no role-wide lane on this provider, then or now.
     ("raphael-builder", "openai-codex", "gpt-5.6-sol", "max"),
     ("other-profile", "anthropic", "claude-opus-5", "max"),
     # Never-admissible values stay refused regardless of lineage.

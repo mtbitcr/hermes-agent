@@ -155,6 +155,9 @@ _TASK_ONLY_ROUTES = {
     ("raphael-claude-worker", "openai-codex", "deep"): _assignment(
         "raphael-claude-worker", "openai-codex", "gpt-6.2-sol", "GPT-6.2 Sol", "max",
     ),
+    ("raphael-builder", "openai-codex", "routine"): _assignment(
+        "raphael-builder", "openai-codex", "gpt-6.2-sol", "GPT-6.2 Sol", "max",
+    ),
 }
 
 # Deep overrides require a role-wide assignment. Without an override, deep
