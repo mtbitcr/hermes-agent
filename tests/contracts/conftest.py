@@ -284,6 +284,8 @@ CLOSED_VOCABULARIES = (
         "hermes.owner_workspace.closure_undo",
         # owner_questions.py OBJECT, the ``question`` of an owner-input item read with owner_answer_v1.
         "hermes.owner_workspace.owner_question",
+        # api_server_owner_answers.py returns this object after the owner's answer to a stopped card (card P3).
+        "hermes.owner_workspace.owner_answer",
     })),
     # owner_questions.py decision_questions: the stops it serves; "stopped_briefly" (S5) is a later card's.
     ("owner_decisions", (_DECISION_LIST, "data", "kind=owner_input", "question", "stop"),
