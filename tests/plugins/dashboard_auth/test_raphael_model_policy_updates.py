@@ -195,6 +195,276 @@ def test_options_projection_offers_to_model_in_place_of_from_model():
     assert _offered(None) == ["claude-opus-6", "claude-sonnet-5-5"]
 
 
+def test_planner_switch_offers_the_approved_openai_version():
+    provider, _from_model, to_model = _SOL
+    model_policy.apply_model_update_record(_entry(_SOL))
+    native = {
+        "providers": [{
+            "slug": provider,
+            "authenticated": True,
+            "models": [to_model],
+        }],
+    }
+
+    (option,) = project_options_payload(native, profile="raphael-planner")["providers"]
+
+    assert option["models"] == [to_model]
+    assert option["assignment"]["model"] == to_model
+    for tier in _TIERS:
+        assert option["task_routes"][tier] == option["assignment"]
+
+
+def test_options_response_uses_one_model_update_snapshot_during_undo(monkeypatch):
+    provider, from_model, to_model = _SOL
+    update = _entry(_SOL)
+    model_policy.apply_model_update_record(update)
+    native = {
+        "providers": [{
+            "slug": provider,
+            "authenticated": True,
+            "models": [from_model, to_model],
+        }],
+    }
+    assignment_payload = model_policy._assignment_payload
+    undone = False
+
+    def payload_during_undo(assignment):
+        nonlocal undone
+        # The owner can undo the update while the response renders a task route.
+        if not undone:
+            undone = True
+            model_policy.apply_model_update_record({**update, "state": "rolled_back"})
+        return assignment_payload(assignment)
+
+    monkeypatch.setattr(model_policy, "_assignment_payload", payload_during_undo)
+
+    for expected_model in (to_model, from_model):
+        (option,) = project_options_payload(native, profile="raphael-planner")["providers"]
+        assert option["models"] == [expected_model]
+        assert option["assignment"]["model"] == expected_model
+        for tier in _TIERS:
+            assert option["task_routes"][tier] == option["assignment"]
+
+
+def _native_with_every_matrix_model() -> dict:
+    """A native listing: one row per admitted provider, offering every model the matrix names on it."""
+    routes = [*model_policy._matrix_routes(), *model_policy._TASK_ONLY_ROUTES.values()]
+    return {
+        "providers": [
+            {
+                "slug": provider,
+                "authenticated": True,
+                "models": list(
+                    dict.fromkeys(r.model for r in routes if r.provider == provider)
+                ),
+            }
+            for provider in admitted_provider_ids()
+        ],
+    }
+
+
+# Names that match no matrix key as written: empty, padded, unknown, multibyte and NUL.
+_ODD_PROFILES = ("", " raphael-planner ", "no-such-role", "raphaël\x00")
+
+
+def _options_from_the_matrix_readers(native: dict, profile, revision) -> dict:
+    """The answer with no update record, built only from readers the projection does not own."""
+    key = str(profile or "").strip()
+    rows = []
+    for raw in native["providers"]:
+        provider = raw["slug"]
+        if not key:
+            offered = {
+                assignment_for(route.profile, route.provider).model
+                for route in model_policy._ASSIGNMENTS.values()
+                if route.provider == provider
+            }
+        else:
+            try:
+                offered = {assignment_for(key, provider).model}
+            except ValueError:
+                offered = set()
+            else:
+                offered |= {
+                    task_assignment_for(key, provider, tier).model for tier in _TIERS
+                }
+        base = model_policy._ASSIGNMENTS.get((str(profile or ""), provider))
+        rows.append({
+            "slug": provider,
+            "authenticated": raw["authenticated"] is True,
+            "models": [model for model in raw["models"] if model in offered],
+            "assignment": (
+                None if base is None else model_policy._assignment_payload(base)
+            ),
+            "task_routes": (
+                None
+                if base is None
+                else {
+                    tier: model_policy._assignment_payload(
+                        task_assignment_for(base.profile, provider, tier)
+                    )
+                    for tier in sorted(_TIERS)
+                }
+            ),
+        })
+    return {"profile": profile, "revision": revision, "providers": rows}
+
+
+def _count_calls(monkeypatch, name: str) -> list:
+    """Wrap ``model_policy.<name>``; the returned list gains one item per call."""
+    real = getattr(model_policy, name)
+    calls = []
+
+    def counting(*args, **kwargs):
+        calls.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(model_policy, name, counting)
+    return calls
+
+
+def test_options_with_no_model_update_record_equal_the_matrix_answer_byte_for_byte(
+    monkeypatch,
+):
+    assert not _record_path().exists()
+    native = _native_with_every_matrix_model()
+    profiles = (None, *admitted_profile_ids(), *_ODD_PROFILES)
+    expected = {
+        profile: json.dumps(_options_from_the_matrix_readers(native, profile, "rev-1"))
+        for profile in profiles
+    }
+    for profile in (None, *admitted_profile_ids()):
+        assert any(row["models"] for row in json.loads(expected[profile])["providers"])
+
+    def assert_every_answer_is_the_matrix_answer(state):
+        for profile in profiles:
+            answer = project_options_payload(native, profile=profile, revision="rev-1")
+            assert json.dumps(answer) == expected[profile], (state, profile)
+
+    # The record is absent.
+    assert_every_answer_is_the_matrix_answer("absent")
+
+    # The record is there and holds no update.
+    _write_record()
+    assert_every_answer_is_the_matrix_answer("empty")
+
+    # The record cannot be read, whatever is at its path: every unreadable shape
+    # the policy fails closed on, and one more whose text carries a NUL.
+    shapes = {
+        **_UNREADABLE,
+        "nul-text": lambda path: path.write_bytes(b'{"version": 1, "updates": []}\x00'),
+    }
+    for state, make in shapes.items():
+        path = _record_path()
+        if path.is_dir():
+            path.rmdir()
+        else:
+            path.unlink()
+        make(path)
+        assert_every_answer_is_the_matrix_answer(state)
+
+    # The read of the record raises the error the policy already treats as "no update".
+    reads = []
+
+    def unreadable():
+        reads.append(True)
+        raise EnrollmentUnavailable("the Raphael model update record could not be read")
+
+    monkeypatch.setattr(model_policy, "read_model_updates", unreadable)
+    assert_every_answer_is_the_matrix_answer("raises")
+    assert len(reads) >= len(profiles)
+
+
+def test_task_only_route_in_the_options_is_not_moved_by_an_approved_update(monkeypatch):
+    provider, from_model, to_model = _SOL
+    profile = "raphael-planner"
+    # A route qualified for one tier on the very model the update replaces: an
+    # update applied to it would move it.
+    task_only = replace(
+        model_policy._ASSIGNMENTS[(profile, provider)],
+        model=from_model,
+        model_label="Qualified for this task alone",
+        reasoning_effort="high",
+    )
+    monkeypatch.setitem(
+        model_policy._TASK_ONLY_ROUTES, (profile, provider, "routine"), task_only
+    )
+    model_policy.apply_model_update_record(_entry(_SOL))
+    model_policy.apply_model_update_record(_entry(_OPUS, decision_ref="decision-2"))
+    assert assignment_for(profile, provider).model == to_model
+    native = {
+        "providers": [{
+            "slug": provider,
+            "authenticated": True,
+            "models": [from_model, to_model],
+        }],
+    }
+
+    def written():
+        return (
+            {child.name: _snapshot(child) for child in sorted(_record_path().parent.iterdir())},
+            dict(model_policy._ASSIGNMENTS),
+            dict(model_policy._TASK_ONLY_ROUTES),
+            dict(model_policy._DEEP_ROUTES),
+        )
+
+    locks = _count_calls(monkeypatch, "_enrollment_registry_lock")
+    before = written()
+    (option,) = project_options_payload(native, profile=profile)["providers"]
+
+    assert option["task_routes"]["routine"] == model_policy._assignment_payload(task_only)
+    assert option["task_routes"]["deep"]["model"] == to_model
+    assert option["assignment"]["model"] == to_model
+    assert option["models"] == [from_model, to_model]
+    for tier in _TIERS:
+        assert option["task_routes"][tier] == model_policy._assignment_payload(
+            task_assignment_for(profile, provider, tier)
+        )
+
+    # A task-only route with no role-wide route beside it offers nothing, update or not.
+    (builder,) = project_options_payload(native, profile="raphael-builder")["providers"]
+    assert builder["models"] == []
+    assert builder["assignment"] is None
+    assert builder["task_routes"] is None
+
+    # Every other route gets the update, as the policy readers give it: the
+    # role's base route, and each tier route with its deep lane.
+    every_model = _native_with_every_matrix_model()
+    compared = 0
+    for role in admitted_profile_ids():
+        for row in project_options_payload(every_model, profile=role)["providers"]:
+            if row["assignment"] is None:
+                continue
+            compared += 1
+            slug = row["slug"]
+            assert row["assignment"] == model_policy._assignment_payload(
+                assignment_for(role, slug)
+            ), (role, slug)
+            for tier in _TIERS:
+                assert row["task_routes"][tier] == model_policy._assignment_payload(
+                    task_assignment_for(role, slug, tier)
+                ), (role, slug, tier)
+    assert compared
+
+    # Building the options wrote no record or route and took no lock.
+    assert written() == before
+    assert not locks
+
+
+def test_one_options_answer_reads_the_model_update_record_exactly_one_time(monkeypatch):
+    model_policy.apply_model_update_record(_entry(_SOL))
+    native = _native_with_every_matrix_model()
+    reader = _count_calls(monkeypatch, "_model_updates")
+    file_reads = _count_calls(monkeypatch, "_load_model_updates")
+
+    for profile in (None, *admitted_profile_ids(), *_ODD_PROFILES):
+        reader.clear()
+        file_reads.clear()
+        project_options_payload(native, profile=profile)
+        assert len(reader) == 1, repr(profile)
+        assert len(file_reads) == 1, repr(profile)
+
+
 # ---------------------------------------------------------------------------
 # Locks: the old route keeps verifying and can never be minted again
 # ---------------------------------------------------------------------------

@@ -155,6 +155,9 @@ _TASK_ONLY_ROUTES = {
     ("raphael-claude-worker", "openai-codex", "deep"): _assignment(
         "raphael-claude-worker", "openai-codex", "gpt-6.2-sol", "GPT-6.2 Sol", "max",
     ),
+    ("raphael-builder", "openai-codex", "routine"): _assignment(
+        "raphael-builder", "openai-codex", "gpt-6.2-sol", "GPT-6.2 Sol", "max",
+    ),
 }
 
 # Deep overrides require a role-wide assignment. Without an override, deep
@@ -377,6 +380,11 @@ def _superseded_configured_assignment(
     """
     if disable_fallbacks is not True:
         return None
+    # A task-only route is no role-wide base route, so no lineage vouches for it.
+    try:
+        _matrix_assignment(profile, provider)
+    except ValueError:
+        return None
     parts = _normalized_lock_parts(
         profile, provider, model, reasoning_effort, "routine"
     )
@@ -544,17 +552,25 @@ def _lock_digest(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+# Only the owner's retry of the one named card mints this route's lock; no other caller may.
+_RETRY_ONLY_ROUTES = frozenset({("raphael-builder", "openai-codex", "routine")})
+
+
 def mint_policy_lock(
     assignee: str,
     provider: str,
     model: str,
     reasoning_effort: str,
     execution_tier: str,
+    *,
+    owner_retry: bool = False,
 ) -> str:
     """Return the durable lock for one exact owner-approved task route.
 
     Raises ``ValueError`` unless the five components are together an admitted
     route right now, so an unmintable route can never become a stored lock.
+    A route in ``_RETRY_ONLY_ROUTES`` is minted only for the owner's retry of
+    the named card, which passes the boolean ``True``; no other value counts.
     """
     parts = _normalized_lock_parts(
         assignee, provider, model, reasoning_effort, execution_tier
@@ -562,6 +578,11 @@ def mint_policy_lock(
     error = _route_authority_error(*parts, admit_pinned_effort=True)
     if error:
         raise ValueError(error)
+    if (parts[0], parts[1], parts[4]) in _RETRY_ONLY_ROUTES and owner_retry is not True:
+        raise ValueError(
+            f"policy-locked route {parts[0]!r}/{parts[1]!r}/{parts[4]!r} "
+            "is approved only by the owner's retry of the named card"
+        )
     return f"{POLICY_LOCK_AUTHORITY}:v{POLICY_LOCK_VERSION}:{_lock_digest(*parts)}"
 
 
@@ -1385,27 +1406,33 @@ def project_oauth_payload(payload: Mapping[str, Any]) -> dict:
     return {"providers": providers}
 
 
-def _admitted_models_for(profile: Optional[str], provider: str) -> set:
+def _admitted_models_for(
+    profile: Optional[str], provider: str, updates: tuple[dict, ...]
+) -> set[str]:
     """Model ids selectable through a role-wide provider assignment.
 
     With no profile named (a generic availability read) this stays the whole
-    provider-wide admitted set, exactly as before.
+    provider-wide admitted set, exactly as before. The caller reads the update
+    record one time and passes it in as ``updates``; this never reads it again.
     """
     key = str(profile or "").strip()
     if not key:
-        updates = _model_updates()
         return {
             _apply_model_updates(assignment, updates)[0].model
             for assignment in _ASSIGNMENTS.values()
             if assignment.provider == provider
         }
     try:
-        base = assignment_for(key, provider)
+        base = _matrix_assignment(key, provider)
     except ValueError:
         return set()
-    models = {base.model}
+    models = {_apply_model_updates(base, updates)[0].model}
     for tier in _EXECUTION_TIERS:
-        models.add(task_assignment_for(key, provider, tier).model)
+        route = _matrix_task_assignment(key, provider, tier)
+        # A task-only route stays as qualified, as in task_assignment_for.
+        if (key, provider, tier) not in _TASK_ONLY_ROUTES:
+            route = _apply_model_updates(route, updates)[0]
+        models.add(route.model)
     return models
 
 
@@ -1431,8 +1458,10 @@ def project_options_payload(
     For a named profile, selectable models come from role-wide assignments
     and their task tiers. A task-only provider needs a task lock.
     """
+    # An owner undo can replace the record while this response is built.
+    updates = _model_updates()
     admitted = {
-        provider: _admitted_models_for(profile, provider)
+        provider: _admitted_models_for(profile, provider, updates)
         for provider in admitted_provider_ids()
     }
     rows = []
@@ -1458,12 +1487,15 @@ def project_options_payload(
             base_assignment = _ASSIGNMENTS.get((str(profile or ""), provider))
             task_routes = None
             if base_assignment is not None:
-                task_routes = {
-                    tier: _assignment_payload(
-                        task_assignment_for(base_assignment.profile, provider, tier)
-                    )
-                    for tier in sorted(_EXECUTION_TIERS)
-                }
+                base_assignment, _ = _apply_model_updates(base_assignment, updates)
+                task_routes = {}
+                for tier in sorted(_EXECUTION_TIERS):
+                    key = (base_assignment.profile, provider, tier)
+                    route = _matrix_task_assignment(*key)
+                    # A task-only route stays as qualified, as in task_assignment_for.
+                    if key not in _TASK_ONLY_ROUTES:
+                        route, _ = _apply_model_updates(route, updates)
+                    task_routes[tier] = _assignment_payload(route)
             rows.append({
                 "slug": provider,
                 "authenticated": raw.get("authenticated") is True,

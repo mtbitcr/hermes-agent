@@ -16,6 +16,7 @@ from plugins.dashboard_auth.raphael_workspace import model_policy
 
 _RETRY_LANES = frozenset({
     ("raphael-claude-worker", "deep"),
+    ("raphael-builder", "routine"),
 })
 _PROVIDER = "openai-codex"
 _PIN_COLUMNS = (
@@ -97,6 +98,7 @@ def offer(task: kanban_db.Task, held: sqlite3.Row, *, revision: int) -> RetryRou
         assignment = model_policy.task_assignment_for(role, _PROVIDER, tier)
         lock = model_policy.mint_policy_lock(
             role, _PROVIDER, assignment.model, assignment.reasoning_effort, tier,
+            owner_retry=True,
         )
     except ValueError:
         return None
