@@ -165,7 +165,7 @@ def test_output_without_a_test_helper_is_unchanged(repo):
     report = hints.find_hints(repo, [OWNED], [KEY])
     assert HELPER_LABEL not in "\n".join(hints.format_report(report))
     assert not any(getattr(h, "imports_pinning_test", False) for h in report.hints)
-    assert report.counts == {1: 2, 2: 2, 3: 2, 4: 3, 5: 0}
+    assert report.counts == {1: 2, 2: 2, 3: 2, 4: 3, 5: 0, 6: 0}
     assert _lines(report)["tests/test_pin_plain.py"] == "rule 1 (test imports owned module)"
 
 
@@ -228,7 +228,7 @@ def test_key_lists_exactly_the_files_with_that_quoted_key_first_and_prints_count
         "scripts/tool.py": (2, 3),
         "tests/test_pin_plain.py": (1,),
     }
-    assert report.counts == {1: 2, 2: 2, 3: 2, 4: 4, 5: 0}
+    assert report.counts == {1: 2, 2: 2, 3: 2, 4: 4, 5: 0, 6: 0}
 
     # Through the script: same order, every rule on the line, one count per rule.
     script = _load_script()
@@ -239,14 +239,14 @@ def test_key_lists_exactly_the_files_with_that_quoted_key_first_and_prints_count
     by_path = {line.split("\t")[0]: line.split("\t")[1] for line in out if line and not line.startswith("#")}
     assert "rule 1" in by_path["tests/test_pin_key.py"] and "rule 4" in by_path["tests/test_pin_key.py"]
     counts = [line for line in out if line.startswith("#")]
-    assert len(counts) == 5
-    assert [line.split(":")[-1].strip() for line in counts] == ["2", "2", "2", "4", "0"]
-    assert all(f"rule {n}" in line for n, line in zip((1, 2, 3, 4, 5), counts))
+    assert len(counts) == 6
+    assert [line.split(":")[-1].strip() for line in counts] == ["2", "2", "2", "4", "0", "0"]
+    assert all(f"rule {n}" in line for n, line in zip((1, 2, 3, 4, 5, 6), counts))
 
-    # Without a key all five counts are still printed, rule 4 at zero.
+    # Without a key all six counts are still printed, rule 4 at zero.
     assert script.main(["--root", str(repo), OWNED]) == 0
     counts = [line for line in capsys.readouterr().out.splitlines() if line.startswith("#")]
-    assert len(counts) == 5 and counts[3].endswith(": 0")
+    assert len(counts) == 6 and counts[3].endswith(": 0")
 
 
 def test_search_writes_nothing(repo, capsys):
@@ -310,7 +310,7 @@ def test_owned_folder_is_read_like_an_owned_file_by_each_rule(tmp_path, capsys):
 
     by_file = hints.find_hints(root, ["pkg/widget.py", "pkg/__init__.py"], [KEY])
     assert _rules(by_file) == expected
-    assert by_file.counts == {1: 1, 2: 1, 3: 1, 4: 1, 5: 0}
+    assert by_file.counts == {1: 1, 2: 1, 3: 1, 4: 1, 5: 0, 6: 0}
     for folder in ("pkg", "pkg/", str(root / "pkg")):
         by_folder = hints.find_hints(root, [folder], [KEY])
         assert _paths(by_folder) == _paths(by_file)
@@ -320,12 +320,12 @@ def test_owned_folder_is_read_like_an_owned_file_by_each_rule(tmp_path, capsys):
     # The whole repository as the owned scope owns every file: nothing to list, all counts zero.
     for whole in (".", "./", str(root)):
         report = hints.find_hints(root, [whole], [KEY])
-        assert report.hints == () and report.counts == {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+        assert report.hints == () and report.counts == {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0}
     script = _load_script()
     assert script.main(["--root", str(root), "--owned", ".", "--key", KEY]) == 0
     out = capsys.readouterr().out.splitlines()
     assert _output_paths("\n".join(out)) == []
-    assert [line.split(":")[-1].strip() for line in out] == ["0", "0", "0", "0", "0"]
+    assert [line.split(":")[-1].strip() for line in out] == ["0", "0", "0", "0", "0", "0"]
 
 
 def test_file_the_search_cannot_read_is_named_and_counted(repo, capsys):
@@ -342,9 +342,9 @@ def test_file_the_search_cannot_read_is_named_and_counted(repo, capsys):
     out = capsys.readouterr().out.splitlines()
     assert [line for line in out if "bad.txt" in line] == ["unreadable\tdata/bad.txt"]
     assert [line for line in out if line.startswith("# unreadable")] == ["# unreadable: 1"]
-    # The key matches are still first, and the five rule counts are still printed.
+    # The key matches are still first, and the six rule counts are still printed.
     assert _output_paths("\n".join(out))[:3] == ["config/settings.json", "docs/notes.md", "tests/test_pin_key.py"]
-    assert len([line for line in out if line.startswith("# rule")]) == 5
+    assert len([line for line in out if line.startswith("# rule")]) == 6
 
 
 def _run_cli_unprivileged(args: list[str], build, locked: dict[str, int]) -> subprocess.CompletedProcess:
@@ -423,7 +423,7 @@ def test_helper_with_a_key_hit_keeps_its_rule_4_row_and_the_counts(helper_repo):
     rows = [line for line in hints.format_report(report) if line.startswith("tests/b.py\t")]
     assert rows == [f'tests/b.py\trule 4 (quoted key: "{KEY}")', f"tests/b.py\t{HELPER_LABEL}"]
     assert [h.rules for h in report.hints if h.path == "tests/b.py"] == [(4,), ()]
-    assert report.counts == {1: 2, 2: 0, 3: 0, 4: 1, 5: 0}
+    assert report.counts == {1: 2, 2: 0, 3: 0, 4: 1, 5: 0, 6: 0}
 
 
 def test_helper_naming_the_owned_path_keeps_its_rule_3_row_and_the_counts(helper_repo):
@@ -432,7 +432,7 @@ def test_helper_naming_the_owned_path_keeps_its_rule_3_row_and_the_counts(helper
     rows = [line for line in hints.format_report(report) if line.startswith("tests/b.py\t")]
     assert rows == ["tests/b.py\trule 3 (names owned path)", f"tests/b.py\t{HELPER_LABEL}"]
     assert [h.rules for h in report.hints if h.path == "tests/b.py"] == [(3,), ()]
-    assert report.counts == {1: 2, 2: 0, 3: 1, 4: 0, 5: 0}
+    assert report.counts == {1: 2, 2: 0, 3: 1, 4: 0, 5: 0, 6: 0}
 
 
 SAVED = "tests/contracts/owner_payloads"
@@ -589,7 +589,7 @@ def test_saved_example_with_its_own_rule_4_row_keeps_it_and_gets_a_separate_rule
     plain = hints.find_hints(saved_repo, [OWNED], ["unit_running"])
     plain_lines = hints.format_report(plain)
     own = f'{SAVED}/fam/one.json\trule 4 (quoted key: "unit_running")'
-    assert plain_lines[0] == own and plain.counts == {1: 0, 2: 0, 3: 0, 4: 1, 5: 0}
+    assert plain_lines[0] == own and plain.counts == {1: 0, 2: 0, 3: 0, 4: 1, 5: 0, 6: 0}
 
     _write(saved_repo / "tests" / "test_lit.py",
            "import hermes_cli.widget\n\n"
@@ -599,7 +599,7 @@ def test_saved_example_with_its_own_rule_4_row_keeps_it_and_gets_a_separate_rule
     assert lines[:2] == [own, f"{SAVED}/fam/one.json\t{SAVED_LABEL}"]
     assert [h.rules for h in report.hints[:2]] == [(4,), (5,)]
     assert [h.keys for h in report.hints[:2]] == [("unit_running",), ()]
-    assert report.counts == {1: 1, 2: 0, 3: 0, 4: 1, 5: 1}
+    assert report.counts == {1: 1, 2: 0, 3: 0, 4: 1, 5: 1, 6: 0}
     # Besides the rule 5 row and its count line, the new test file's own row is the only change.
     rest = [line for line in lines if SAVED_LABEL not in line and not line.startswith("# rule 5")]
     assert [line for line in rest if "test_lit.py" not in line and not line.startswith("# rule 1")] == [
@@ -614,7 +614,7 @@ def test_helper_row_that_calls_owner_payload_example_is_read_too(helper_repo):
     report = hints.find_hints(helper_repo, [OWNED])
     assert _lines(report)["tests/b.py"] == HELPER_LABEL
     assert _lines(report)[f"{SAVED}/fam/one.json"] == SAVED_LABEL
-    assert report.counts == {1: 2, 2: 0, 3: 0, 4: 0, 5: 1}
+    assert report.counts == {1: 2, 2: 0, 3: 0, 4: 0, 5: 1, 6: 0}
 
 
 def test_rule_5_has_its_own_count_line_after_the_four_of_today(saved_repo):
@@ -624,7 +624,7 @@ def test_rule_5_has_its_own_count_line_after_the_four_of_today(saved_repo):
            "    owner_payload_example('other', 'three', {})\n"
            "    return {k: owner_payload_example('fam', k, a) for k, a in answers.items()}\n")
     report = hints.find_hints(saved_repo, [OWNED])
-    assert report.counts == {1: 1, 2: 0, 3: 0, 4: 0, 5: 3}
+    assert report.counts == {1: 1, 2: 0, 3: 0, 4: 0, 5: 3, 6: 0}
     assert hints.RULE_NAMES[5] == "saved example"
     counts = [line for line in hints.format_report(report) if line.startswith("#")]
     assert counts == [
@@ -633,8 +633,9 @@ def test_rule_5_has_its_own_count_line_after_the_four_of_today(saved_repo):
         "# rule 3 (names owned path): 0",
         "# rule 4 (quoted key): 0",
         "# rule 5 (saved example): 3",
+        "# rule 6 (whole-answer comparison): 0",
     ]
-    assert hints.find_hints(saved_repo, ["."]).counts == {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+    assert hints.find_hints(saved_repo, ["."]).counts == {1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0}
 
 
 def _one_row(saved_repo, source: str) -> dict[str, str]:
@@ -993,7 +994,7 @@ def test_the_rule_5_count_line_equals_the_number_of_its_rows(saved_repo):
     rows = [line for line in out if not line.startswith("#") and "rule 5" in line]
     assert len(rows) == 4 and sum(1 for h in report.hints if 5 in h.rules) == 4
     assert [line for line in out if line.startswith("# rule 5")] == ["# rule 5 (saved example): 4"]
-    assert report.counts == {1: 1, 2: 0, 3: 0, 4: 0, 5: 4}
+    assert report.counts == {1: 1, 2: 0, 3: 0, 4: 0, 5: 4, 6: 0}
 
 
 def test_a_test_file_that_is_not_listed_gets_no_not_resolved_row(saved_repo):
@@ -1089,3 +1090,324 @@ def test_a_listed_test_file_with_a_byte_order_mark_keeps_its_rule_5_row(tmp_path
     assert "tests/test_lit.py\trule 3 (names owned path)" in results["bom"]
     assert f"{SAVED}/fam/one.json\t{SAVED_LABEL}" in results["bom"]
     assert "# rule 5 (saved example): 1" in results["bom"]
+
+
+# Card 3, rule 6: each whole-answer comparison (== or != beside a dict display, a set display, or a
+# call of the plain name set or frozenset) in the test files that rule 5 reads gives one row.
+RULE_6 = "rule 6 (whole-answer comparison)"
+WHOLE = "tests/test_whole.py"
+WHOLE_HEAD = ("import hermes_cli.widget\n\n"
+              "def _pin(owner_payload_example):\n"
+              "    owner_payload_example('fam', 'one', {})\n\n")
+FORMS = ["{'a': 1}", "{1, 2}", "set(x)", "frozenset(x)"]
+
+
+def _six(saved_repo, source: str, name: str = "test_whole.py", head: str = WHOLE_HEAD, owned=(OWNED,)):
+    """Write one listed test file that rule 5 reads; return the report, its rule 6 lines and the
+    rows expected for the source lines that end with ``# hit``."""
+    text = head + source
+    _write(saved_repo / "tests" / name, text)
+    report = hints.find_hints(saved_repo, list(owned))
+    rows = [line for line in hints.format_report(report) if RULE_6 in line and not line.startswith("#")]
+    expected = [f"tests/{name}\t{RULE_6}: line {n}" for n, t in enumerate(text.split("\n"), 1)
+                if t.rstrip().endswith("# hit")]
+    return report, rows, expected
+
+
+def _six_hints(report) -> list:
+    return [h for h in report.hints if 6 in h.rules]
+
+
+def test_rule_6_is_named_in_rule_names_and_has_its_count_line_last():
+    assert hints.RULE_NAMES[6] == "whole-answer comparison"
+    assert list(hints.RULE_NAMES) == [1, 2, 3, 4, 5, 6]
+    report = hints.Report((), {rule: 0 for rule in hints.RULE_NAMES})
+    assert hints.format_report(report)[-1] == "# rule 6 (whole-answer comparison): 0"
+
+
+@pytest.mark.parametrize("op", ["==", "!="])
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("form", FORMS)
+def test_each_form_on_either_side_with_either_operator_gives_one_row_with_its_line(saved_repo, form, side, op):
+    expr = f"x {op} {form}" if side == "right" else f"{form} {op} x"
+    report, rows, expected = _six(saved_repo, f"def test_a(x):\n    assert {expr}  # hit\n")
+    assert len(expected) == 1 and rows == expected
+    assert report.counts[6] == 1
+    assert [h.rules for h in report.hints if h.path == WHOLE] == [(1,), (6,)]
+
+
+@pytest.mark.parametrize("expr", [
+    "1 < x == {'a': 1}",
+    "x == y < 3 != frozenset(z)",
+    "{1, 2} == x < y",
+    "set(y) != x < 3 < z",
+])
+def test_a_chained_comparison_with_one_counted_operator_gives_one_row(saved_repo, expr):
+    report, rows, expected = _six(saved_repo, f"def test_a(x, y, z):\n    assert {expr}  # hit\n")
+    assert len(rows) == 1 and rows == expected
+    assert report.counts[6] == 1
+
+
+def test_a_chained_comparison_with_two_counted_operators_is_still_one_node_and_one_row(saved_repo):
+    report, rows, expected = _six(saved_repo, "def test_a(x, y):\n    assert {1} == x != {2}  # hit\n")
+    assert rows == expected and len(rows) == 1 and report.counts[6] == 1
+
+
+NOT_COUNTED = {
+    "name bound to a dict": "A = {'a': 1}\n\ndef test_a(x):\n    assert x == A\n",
+    "name bound to a set": "A = {1, 2}\n\ndef test_a(x):\n    assert A != x\n",
+    "name bound to a frozenset call": "A = frozenset([1])\n\ndef test_a(x):\n    assert x == A\n",
+    "dict comprehension": "def test_a(x, y):\n    assert x == {k: 1 for k in y}\n",
+    "set comprehension": "def test_a(x, y):\n    assert {k for k in y} != x\n",
+    "list comprehension": "def test_a(x, y):\n    assert x == [k for k in y]\n",
+    "generator expression": "def test_a(x, y):\n    assert x == (k for k in y)\n",
+    "list": "def test_a(x):\n    assert x == [1, 2]\n",
+    "empty list": "def test_a(x):\n    assert [] != x\n",
+    "tuple": "def test_a(x):\n    assert x == (1, 2)\n",
+    "empty tuple": "def test_a(x):\n    assert x != ()\n",
+    "call of dict": "def test_a(x):\n    assert x == dict(a=1)\n",
+    "call through builtins.set": "import builtins\n\ndef test_a(x, y):\n    assert x == builtins.set(y)\n",
+    "call through an attribute frozenset": "def test_a(x, y, b):\n    assert b.frozenset(y) != x\n",
+    "call of a call of set": "def test_a(x, y, z):\n    assert x == set(y)(z)\n",
+    "call on a dict display": "def test_a(x):\n    assert x == {'a': 1}.get('a')\n",
+    "other names": "def test_a(x, y):\n    assert x == Set(y) and x == sorted(y) and x == list(y)\n",
+    "subscript and attribute": "def test_a(x, y):\n    assert x == y['a'] and x != y.items\n",
+    "a display that is no operand of a comparison": (
+        "def test_a(x, f):\n    y = {'a': 1}\n    f(x, {1}, set(x))\n    assert x\n    return {1} | set(x)\n"),
+    "comparison of two plain operands": "def test_a(x, y):\n    assert x == y != 3\n",
+    "empty file body": "",
+}
+
+
+@pytest.mark.parametrize("case", list(NOT_COUNTED))
+def test_a_form_that_the_closed_list_does_not_hold_gives_no_row(saved_repo, case):
+    report, rows, _ = _six(saved_repo, NOT_COUNTED[case])
+    assert rows == [] and _six_hints(report) == []
+    assert report.counts[6] == 0
+    assert any(h.path == WHOLE for h in report.hints)
+
+
+@pytest.mark.parametrize("expr", [
+    "{'a': 1} < x", "x < {'a': 1}", "{'a': 1} > x", "x <= {'a': 1}",
+    "x in {'a': 1}", "x not in {'a': 1}", "x in {1, 2}", "x in set(y)",
+    "x is {}", "x is not {'a': 1}", "{} is x", "x is set(y)", "x is not frozenset(y)",
+    "{1} <= x", "x >= frozenset(y)",
+    "{'a': 1} < x == y", "x == y in {1}", "x != y is {}", "x == y < set(z)", "y is {} is z",
+])
+def test_a_display_beside_another_operator_gives_no_row_even_in_a_chain(saved_repo, expr):
+    report, rows, _ = _six(saved_repo, f"def test_a(x, y, z):\n    assert {expr}\n")
+    assert rows == [] and report.counts[6] == 0
+
+
+def test_a_comparison_at_any_depth_gives_one_row_each(saved_repo):
+    source = (
+        "import pytest\n\n"
+        "class TestA:\n"
+        "    def test_a(self, x, y):\n"
+        "        def inner():\n"
+        "            return x == {'a': 1}  # hit\n"
+        "        assert [v for v in y if v != set(x)]  # hit\n"
+        "        assert {k: v == frozenset(y) for k, v in x.items()}  # hit\n"
+        "        assert (lambda: x == {1})()  # hit\n"
+        "        with pytest.raises(ValueError, match=str(x != {2})):  # hit\n"
+        "            pass\n"
+        "        assert inner(), x == {3}  # hit\n"
+        "\n"
+        "@pytest.mark.parametrize('v', [{1} == {1}])  # hit\n"
+        "def test_b(v, w=({} == {})):  # hit\n"
+        "    assert v\n"
+        "\n"
+        "async def test_c(x):\n"
+        "    async with x as y:\n"
+        "        assert y != {4}  # hit\n"
+        "\n"
+        "assert f'{set() == 1}'  # hit\n"
+        "TOP = 3 == set()  # hit\n"
+    )
+    report, rows, expected = _six(saved_repo, source)
+    assert len(expected) == 11 and rows == expected
+    assert report.counts[6] == 11
+
+
+def test_nested_and_same_line_comparisons_give_one_row_per_node(saved_repo):
+    head_lines = WHOLE_HEAD.count("\n")
+    source = ("def test_a(x, f):\n"
+              "    assert f(x == {1}) == {2}\n"
+              "    assert x == {1}; assert x != {2}\n")
+    report, rows, _ = _six(saved_repo, source)
+    first, second = head_lines + 2, head_lines + 3
+    assert rows == [f"{WHOLE}\t{RULE_6}: line {first}"] * 2 + [f"{WHOLE}\t{RULE_6}: line {second}"] * 2
+    assert report.counts[6] == 4
+
+
+def test_a_row_of_rule_6_has_the_shape_of_the_rule_5_row_that_holds_a_line(saved_repo):
+    source = ("def test_a(x, family, owner_payload_example):\n"
+              "    owner_payload_example(family, 'one', {})\n"
+              "    assert x == {'a': 1}\n")
+    report, _, _ = _six(saved_repo, source)
+    base = WHOLE_HEAD.count("\n")
+    assert [(h.path, h.rules) for h in report.hints if h.path == WHOLE] == [(WHOLE, (1,)), (WHOLE, (5,)), (WHOLE, (6,))]
+    five, six = [h for h in report.hints if h.path == WHOLE][1:]
+    assert five == hints.Hint(WHOLE, (5,), unresolved_line=base + 2)
+    assert six == hints.Hint(WHOLE, (6,), unresolved_line=base + 3)
+    assert (six.keys, six.imports_pinning_test, six.every_example) == (five.keys, five.imports_pinning_test, five.every_example)
+    lines = [line for line in hints.format_report(report) if line.startswith(WHOLE)]
+    assert lines == [
+        f"{WHOLE}\trule 1 (test imports owned module)",
+        f"{WHOLE}\t{NOT_RESOLVED}: line {base + 2}",
+        f"{WHOLE}\t{RULE_6}: line {base + 3}",
+    ]
+
+
+def test_rules_1_to_5_keep_their_rows_labels_and_counts_when_a_file_also_has_rule_6_rows(saved_repo):
+    plain = ("def test_a(x, family, owner_payload_example):\n"
+             "    owner_payload_example(family, 'one', {})\n"
+             "    owner_payload_example('other', 'three', {})\n")
+    before, _, _ = _six(saved_repo, plain)
+    lines_before = hints.format_report(before)
+    after, rows, expected = _six(saved_repo, plain + "    assert x == {'a': 1}  # hit\n    assert x != set()  # hit\n")
+    lines_after = hints.format_report(after)
+    assert len(rows) == 2 and rows == expected
+    assert [h for h in after.hints if 6 not in h.rules] == list(before.hints)
+    assert [line for line in lines_after if RULE_6 not in line and not line.startswith("# rule 6")] == [
+        line for line in lines_before if not line.startswith("# rule 6")]
+    assert {k: v for k, v in after.counts.items() if k != 6} == {k: v for k, v in before.counts.items() if k != 6}
+    assert before.counts[6] == 0 and after.counts[6] == 2
+    unresolved = f"{WHOLE}\t{NOT_RESOLVED}: line {WHOLE_HEAD.count(chr(10)) + 2}"
+    assert lines_after.index(unresolved) < lines_after.index(rows[0]) < lines_after.index(rows[1])
+
+
+def test_a_test_file_with_a_syntax_error_gives_no_rule_6_row_and_rules_1_to_5_are_as_before(saved_repo):
+    good = ("def test_good(x):\n    assert x == {'a': 1}  # hit\n")
+    broken = (f"# {OWNED}\nimport hermes_cli.widget\n\ndef test_bad(x, owner_payload_example):\n"
+              "    owner_payload_example('fam', 'one', {})\n    assert x == {'a': 1}\n    assert (\n")
+    with pytest.raises(SyntaxError):
+        compile(broken, "<case>", "exec")
+    _write(saved_repo / "tests" / "test_broken.py", broken)
+    report, rows, expected = _six(saved_repo, good)
+    assert rows == expected and len(rows) == 1 and report.counts[6] == 1
+    assert [h.rules for h in report.hints if h.path == "tests/test_broken.py"] == [(3,)]
+    assert report.counts == {1: 1, 2: 0, 3: 1, 4: 0, 5: 1, 6: 1}
+    only_broken = hints.find_hints(saved_repo, [OWNED, WHOLE])
+    assert [h for h in only_broken.hints if 6 in h.rules] == []
+    assert only_broken.counts == {1: 0, 2: 0, 3: 1, 4: 0, 5: 0, 6: 0}
+    assert "# rule 6 (whole-answer comparison): 0" in hints.format_report(only_broken)
+
+
+def test_a_file_with_a_nul_byte_gives_no_rule_6_row_and_does_not_stop_the_search(saved_repo):
+    body = "def test_a(x):\n    assert x == {'a': 1}\n"
+    probe = hints.BINARY_PROBE_BYTES
+    late = WHOLE_HEAD + "# " + "x" * probe + "\n" + body + "# nul \0 here\n"
+    _write(saved_repo / "tests" / "test_late_nul.py", late)
+    early = WHOLE_HEAD + body + "# nul \0 here\n"
+    _write(saved_repo / "tests" / "test_early_nul.py", early)
+    report, rows, expected = _six(saved_repo, "def test_ok(x):\n    assert x == set()  # hit\n")
+    assert rows == expected and len(rows) == 1
+    assert report.counts[6] == 1
+    assert not [h for h in report.hints if h.path in ("tests/test_late_nul.py", "tests/test_early_nul.py") and 6 in h.rules]
+
+
+def test_multibyte_text_keeps_the_line_of_the_row(saved_repo):
+    source = ("# 日本語のコメント ключ ✓\n"
+              "def test_a(x):\n"
+              "    label = '値 ключ 🚀'; assert x == {'ключ': '値'}  # hit\n"
+              "    assert x != {'🚀'}  # hit\n")
+    report, rows, expected = _six(saved_repo, source)
+    assert len(expected) == 2 and rows == expected and report.counts[6] == 2
+
+
+def test_a_listed_test_file_with_no_comparison_has_a_zero_count_and_no_row(saved_repo):
+    report, rows, _ = _six(saved_repo, "def test_a(x):\n    assert x\n")
+    assert rows == [] and report.counts[6] == 0
+    assert "# rule 6 (whole-answer comparison): 0" in hints.format_report(report)
+    empty = hints.find_hints(saved_repo, [OWNED, WHOLE])
+    assert empty.counts[6] == 0 and not [h for h in empty.hints if 6 in h.rules]
+
+
+def test_a_listed_test_file_with_a_byte_order_mark_gets_the_same_rule_6_rows(tmp_path):
+    source = f"# {OWNED}\n" + WHOLE_HEAD + "def test_a(x):\n    assert x == {'a': 1}\n    assert x != set()\n"
+    results = {}
+    for name, prefix in (("plain", b""), ("bom", b"\xef\xbb\xbf")):
+        root = tmp_path / name
+        _write(root / ".git" / "config", "")
+        _write(root / OWNED, "def build():\n    return 1\n")
+        _write(root / SAVED / "fam" / "one.json", "{}\n")
+        target = root / "tests" / "test_whole.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(prefix + source.encode("utf-8"))
+        report = hints.find_hints(root, [OWNED])
+        results[name] = ([h for h in report.hints if 6 in h.rules], report.counts[6])
+    assert results["bom"] == results["plain"]
+    assert len(results["bom"][0]) == 2 and results["bom"][1] == 2
+
+
+def test_rule_6_reads_only_the_test_files_that_rule_5_reads(saved_repo):
+    compare = "def test_a(x):\n    assert x == {'a': 1}\n"
+    call = "def _pin(o):\n    o.owner_payload_example('fam', 'one', {})\n"
+    read = "import hermes_cli.widget\n" + call + compare
+    # Read (every listed test file, whether or not it calls owner_payload_example): a listed test
+    # file with and without the call, and a helper row.
+    _write(saved_repo / "tests" / "test_read.py", read)
+    _write(saved_repo / "tests" / "a.py", "import hermes_cli.widget\n")
+    _write(saved_repo / "tests" / "test_pin_a.py", "import tests.a\n")
+    _write(saved_repo / "tests" / "test_helper.py", "from tests.a import helper\n" + call + compare)
+    # Not read: not listed; not under tests/; owned by the card.
+    _write(saved_repo / "tests" / "test_no_call.py", "import hermes_cli.widget\n" + compare)
+    _write(saved_repo / "tests" / "test_unlisted.py", call + compare)
+    _write(saved_repo / "lib" / "reader.py", "from hermes_cli.widget import build\n" + call + compare)
+    _write(saved_repo / "tests" / "test_owned.py", read)
+    report = hints.find_hints(saved_repo, [OWNED, "tests/test_owned.py"])
+    assert sorted({h.path for h in report.hints if 6 in h.rules}) == [
+        "tests/test_helper.py", "tests/test_no_call.py", "tests/test_read.py"]
+    assert report.counts[6] == 3
+    assert not [h for h in report.hints if 5 in h.rules and h.unresolved_line]
+    assert _lines(report)[f"{SAVED}/fam/one.json"] == SAVED_LABEL
+
+
+def test_the_count_line_of_rule_6_equals_the_number_of_its_rows(saved_repo, capsys):
+    _write(saved_repo / "tests" / "test_other.py",
+           "import hermes_cli.widget\n\ndef t(o, x):\n    o.owner_payload_example('fam', 'one', {})\n"
+           "    assert x == frozenset()\n")
+    report, rows, expected = _six(saved_repo, (
+        "def test_a(x):\n    assert x == {'a': 1}  # hit\n    assert x != {2}  # hit\n    assert x == set(x)  # hit\n"))
+    assert rows[1:] == expected and len(rows) == 4
+    out = hints.format_report(report)
+    all_rows = [line for line in out if RULE_6 in line and not line.startswith("#")]
+    assert len(all_rows) == 4 == report.counts[6] == len(_six_hints(report))
+    assert [line for line in out if line.startswith("# rule 6")] == ["# rule 6 (whole-answer comparison): 4"]
+    assert out[-1] == "# rule 6 (whole-answer comparison): 4"
+    assert report.counts == {1: 2, 2: 0, 3: 0, 4: 0, 5: 2, 6: 4}
+    # The reader prints the same lines.
+    script = _load_script()
+    assert script.main(["--root", str(saved_repo), "--owned", OWNED]) == 0
+    printed = capsys.readouterr().out.splitlines()
+    assert printed == out
+
+
+def test_the_search_runs_and_imports_no_test_file_that_it_reads_for_rule_6(saved_repo, tmp_path):
+    marker = tmp_path / "ran.txt"
+    source = (f"open({str(marker)!r}, 'w').write('ran')\nimport no_such_module_for_rule_6\nraise SystemExit(3)\n"
+              "def test_a(x):\n    assert x == {'a': 1}  # hit\n")
+    _write(saved_repo / "tests" / "test_whole.py", WHOLE_HEAD + source)
+    snapshot, before = _snapshot(saved_repo), set(sys.modules)
+    report = hints.find_hints(saved_repo, [OWNED])
+    assert report.counts[6] == 1
+    assert not marker.exists()
+    assert not [m for m in set(sys.modules) - before if "test_whole" in m or "no_such_module_for_rule_6" in m]
+    assert _snapshot(saved_repo) == snapshot
+
+
+def test_the_rule_6_rows_of_a_helper_row_come_after_its_helper_row_and_rule_5_rows_stay_put(saved_repo):
+    _write(saved_repo / "tests" / "a.py", "import hermes_cli.widget\n")
+    _write(saved_repo / "tests" / "test_pin_a.py", "import tests.a\n")
+    _write(saved_repo / "tests" / "b.py",
+           "from tests.a import helper\n\ndef t(o, f, x):\n    o.owner_payload_example(f, 'one', {})\n"
+           "    assert x == {1}\n")
+    report = hints.find_hints(saved_repo, [OWNED])
+    own = [line for line in hints.format_report(report) if line.startswith("tests/b.py")]
+    assert own == [
+        f"tests/b.py\t{NOT_RESOLVED}: line 4",
+        f"tests/b.py\t{HELPER_LABEL}",
+        f"tests/b.py\t{RULE_6}: line 5",
+    ]
+    assert report.counts[6] == 1

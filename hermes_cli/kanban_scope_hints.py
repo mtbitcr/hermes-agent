@@ -3,7 +3,7 @@
 Owned paths cannot change after a card exists, so the proposer needs to see what pins
 or reads them before the card is created. Given a repository root, the owned paths and
 optionally the keys the card will change, ``find_hints`` lists the files outside the
-owned paths that match one of five rules:
+owned paths that match one of six rules:
 
 1. a Python file under ``tests/`` that imports a module in the owned paths; one step
    further, a test that imports a module of a test file listed by this rule (it has no
@@ -27,6 +27,13 @@ owned paths that match one of five rules:
    ``SKIP_DIRS``; a family folder is checked the same way before it is read), one row per call
    and file, as its own row (rules ``(5,)``, no keys) right after the file's own row when it has one, which is never
    rewritten. The count of rule 5 counts each of these rows.
+6. a whole-answer comparison: in each test file that rule 5 reads (each listed test file, a helper
+   row included, parsed the same way), each ``ast.Compare`` node, at any depth, that has an ``==`` or ``!=`` beside a dict display,
+   a set display, or a call of the plain name ``set`` or ``frozenset``. A closed list: no name is
+   resolved, and a comprehension, a list, a tuple, a call of ``dict`` or a call through an attribute
+   does not count. One row per node, of the test file itself, with the line of the node, in the form
+   of the rule 5 row that holds a line ("whole-answer comparison"), after every other row of the
+   file. The count of rule 6 counts these rows.
 
 An owned folder owns every file in it, for every rule; ``.`` owns the whole repository
 (nothing is listed). The search only reads. It never follows a path outside the repository
@@ -61,6 +68,7 @@ RULE_NAMES = {
     3: "names owned path",
     4: "quoted key",
     5: "saved example",
+    6: "whole-answer comparison",
 }
 EXAMPLES_DIR = "tests/contracts/owner_payloads"
 EXAMPLE_CALL = "owner_payload_example"
@@ -73,7 +81,7 @@ class Hint:
     """One file to consider owning: every rule that matched it, and the keys for rule 4
     (``every_example``: a rule 5 row listed because the record kind was not resolved;
     ``unresolved_line``: a rule 5 row for a test file, for the call at that line whose family
-    was not resolved)."""
+    was not resolved; a rule 6 row for a test file, for the comparison at that line)."""
 
     path: str
     rules: tuple[int, ...]
@@ -279,6 +287,31 @@ def _saved_examples(root: Path, trees: Iterable[tuple[str, ast.Module]], scan_ta
     return found, unresolved
 
 
+_WHOLE_ANSWER_CALLS = frozenset({"set", "frozenset"})
+
+
+def _is_whole_answer(node: ast.expr) -> bool:
+    return isinstance(node, (ast.Dict, ast.Set)) or (
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _WHOLE_ANSWER_CALLS
+    )
+
+
+def _whole_answer_lines(tree: ast.Module) -> list[int]:
+    """The line of each ``ast.Compare`` node of *tree*, at any depth, with an ``==`` or ``!=`` beside
+    a dict display, a set display or a call of the plain name ``set`` or ``frozenset``; one line per
+    node, in the order of the node."""
+    nodes = [n for n in ast.walk(tree) if isinstance(n, ast.Compare)]
+    lines = []
+    for node in sorted(nodes, key=lambda n: (n.lineno, n.col_offset)):
+        operands = [node.left, *node.comparators]
+        if any(
+            isinstance(op, (ast.Eq, ast.NotEq)) and (_is_whole_answer(left) or _is_whole_answer(right))
+            for op, left, right in zip(node.ops, operands, operands[1:])
+        ):
+            lines.append(node.lineno)
+    return lines
+
+
 def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ()) -> Report:
     """Search *root* for the files that pin or read the *owned* paths (see the module doc).
 
@@ -343,6 +376,7 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
     hints: list[Hint] = []
     test_imports: dict[str, set[str]] = {}
     example_trees: dict[str, ast.Module] = {}
+    whole_lines: dict[str, list[int]] = {}
     unreadable: list[str] = []
     for path in _walk_files(root, root, unlistable):
         rel = path.relative_to(root).as_posix()
@@ -384,6 +418,7 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
                     rules.add(1)
             if is_test and 1 not in rules:
                 test_imports[rel] = imports_seen
+            read_tree = tree
             if is_test and tree is None and text.startswith("\ufeff"):
                 try:
                     bomless = ast.parse(text[1:])
@@ -393,6 +428,9 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
                     isinstance(node, ast.Call) and _call_name(node) == EXAMPLE_CALL for node in ast.walk(bomless)
                 ):
                     example_trees[rel] = bomless
+                read_tree = bomless
+            if is_test and read_tree is not None and (lines := _whole_answer_lines(read_tree)):
+                whole_lines[rel] = lines
         if names_path:
             rules.add(3)
         if matched_keys:
@@ -407,8 +445,9 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
     saved, unresolved = _saved_examples(root, [(rel, tree) for rel, tree in example_trees.items() if rel in listed], scan_target, scan_folder)
     hints.extend(Hint(rel, (5,), (), False, every) for rel, every in saved)
     hints.extend(Hint(rel, (5,), (), False, False, line) for rel, line in unresolved)
+    hints.extend(Hint(rel, (6,), (), False, False, line) for rel, lines in whole_lines.items() if rel in listed for line in lines)
     keyed = {h.path for h in hints if 4 in h.rules}
-    hints.sort(key=lambda h: (h.path not in keyed, h.path, h.imports_pinning_test, h.rules == (5,)))
+    hints.sort(key=lambda h: (h.path not in keyed, h.path, h.imports_pinning_test or h.rules == (6,), h.rules in ((5,), (6,))))
     counts = {rule: sum(rule in h.rules for h in hints) for rule in RULE_NAMES}
     return Report(tuple(hints), counts, tuple(sorted({*unreadable, *unlistable})))
 
@@ -416,7 +455,7 @@ def find_hints(root: Path | str, owned: Sequence[str], keys: Sequence[str] = ())
 def format_report(report: Report) -> list[str]:
     """One ``path<TAB>rules`` line per hint, one ``unreadable<TAB>path`` line per file that
     could not be read or folder (``path/``) that could not be listed, then one
-    ``# rule N (...): count`` line per rule (1 to 5) and, only when some path was unreadable, a
+    ``# rule N (...): count`` line per rule (1 to 6) and, only when some path was unreadable, a
     ``# unreadable: N`` line."""
     lines = []
     for hint in report.hints:
@@ -424,8 +463,8 @@ def format_report(report: Report) -> list[str]:
         for rule in hint.rules:
             detail = ": " + ", ".join(f'"{k}"' for k in hint.keys) if rule == 4 else (
                 ": " + EVERY_EXAMPLE if rule == 5 and hint.every_example else "")
-            if rule == 5 and hint.unresolved_line:
-                labels.append(f"rule 5 ({NOT_RESOLVED}): line {hint.unresolved_line}")
+            if rule in (5, 6) and hint.unresolved_line:
+                labels.append(f"rule {rule} ({NOT_RESOLVED if rule == 5 else RULE_NAMES[6]}): line {hint.unresolved_line}")
             else:
                 labels.append(f"rule {rule} ({RULE_NAMES[rule]}{detail})")
         lines.append(f"{hint.path}\t{'; '.join(labels)}")
