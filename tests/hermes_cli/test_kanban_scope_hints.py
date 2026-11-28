@@ -1764,14 +1764,42 @@ def test_rules_1_to_6_keep_their_rows_labels_and_counts_with_a_symbol_and_withou
     assert _without_rule_7(hints.format_report(with_two)) == _without_rule_7(hints.format_report(plain))
 
 
+CALLER_ONLY = "tests/test_only_calls.py"
+CALLER_ONLY_BODY = ("def test_a(owner_payload_example, x):\n"
+                    "    owner_payload_example('fam', 'one', {})\n"
+                    "    assert x == {1}\n"
+                    "    NAME(1)\n")
+COUNT_LINES_0 = [f"# rule {n} ({hints.RULE_NAMES[n]}): 0" for n in range(1, 7)]
+
+
+def _caller_only_repo(root: Path, head: str) -> None:
+    _write(root / ".git" / "config", "")
+    _write(root / "hermes_cli" / "__init__.py", "")
+    _write(root / OWNED, "def build():\n    return 1\n")
+    _write(root / SAVED / "fam" / "one.json", "{}\n")
+    _write(root / CALLER_ONLY, head + _src(CALLER_ONLY_BODY))
+
+
 def test_a_file_that_only_rule_7_names_is_not_a_listed_file_for_rules_5_and_6(tmp_path):
-    root = tmp_path / "all"
-    _everything_repo(root)
-    plain = hints.find_hints(root, [OWNED], [KEY])
-    assert "lib/only_calls.py" not in _paths(plain)
-    report = hints.find_hints(root, [OWNED], [KEY], symbols=[SYM])
-    assert [h.rules for h in report.hints if h.path == "lib/only_calls.py"] == [(7,)]
-    assert report.counts[5] == plain.counts[5] and report.counts[6] == plain.counts[6]
+    root = tmp_path / "only"
+    _caller_only_repo(root, "")
+    report = hints.find_hints(root, [OWNED], symbols=[SYM])
+    assert hints.format_report(report) == [_row_line(CALLER_ONLY, SYM, 4), *COUNT_LINES_0, COUNT_7 + "1"]
+    assert hints.format_report(hints.find_hints(root, [OWNED])) == [*COUNT_LINES_0, COUNT_7 + "0"]
+
+
+def test_the_same_test_file_listed_by_rule_3_gets_its_rule_5_and_6_rows_and_then_its_rule_7_row(tmp_path):
+    root = tmp_path / "listed"
+    _caller_only_repo(root, f"P = '{OWNED}'\n")
+    report = hints.find_hints(root, [OWNED], symbols=[SYM])
+    assert hints.format_report(report) == [
+        f"{SAVED}/fam/one.json\t{SAVED_LABEL}",
+        f"{CALLER_ONLY}\trule 3 (names owned path)",
+        f"{CALLER_ONLY}\t{RULE_6}: line 4",
+        _row_line(CALLER_ONLY, SYM, 5),
+        *[f"# rule {n} ({hints.RULE_NAMES[n]}): {1 if n in (3, 5, 6) else 0}" for n in range(1, 7)],
+        COUNT_7 + "1",
+    ]
 
 
 def test_the_rows_of_rule_7_of_a_file_come_after_each_other_row_of_that_file_in_node_order(tmp_path):
@@ -1797,6 +1825,18 @@ def test_the_rows_of_rule_7_of_a_file_come_after_each_other_row_of_that_file_in_
     tool = [line for line in lines if line.startswith("scripts/tool.py")]
     assert tool[0] == f"scripts/tool.py\trule 2 (imports name from owned module); rule 3 (names owned path)"
     assert tool[1] == _row_line("scripts/tool.py", SYM, 3) and len(tool) == 2
+
+
+def test_rows_of_distinct_symbols_on_one_line_come_in_source_column_order_through_the_report_and_the_script(calls_repo, capsys):
+    _write(calls_repo / "lib" / "mod.py", "outer(inner()); last()\nlast(outer(inner()))\n")
+    expected = [_row_line("lib/mod.py", name, line) for line, name in
+                [(1, "outer"), (1, "inner"), (1, "last"), (2, "last"), (2, "outer"), (2, "inner")]]
+    report = hints.find_hints(calls_repo, [OWNED], symbols=["last", "inner", "outer"])
+    assert _call_rows(report) == expected and report.counts[7] == 6
+    script = _load_script()
+    args = ["--root", str(calls_repo), "--owned", OWNED, "--symbol", "outer", "--symbol", "inner", "--symbol", "last"]
+    assert script.main(args) == 0
+    assert capsys.readouterr().out.splitlines()[:6] == expected
 
 
 def test_a_row_of_rule_7_has_its_symbol_and_line(calls_repo):
@@ -1876,22 +1916,16 @@ def test_the_script_passes_each_symbol_and_writes_nothing_into_the_repository(ca
     assert _snapshot(calls_repo) == snapshot
 
 
-def test_the_call_of_find_hints_in_the_script_is_listed_with_its_line_on_a_copy_of_the_repository_files(tmp_path):
-    root = tmp_path / "copy"
-    module = Path(hints.__file__).resolve()
+def test_the_command_with_a_symbol_lists_a_synthetic_caller_with_its_line(tmp_path):
+    root = tmp_path / "synthetic"
     _write(root / ".git" / "config", "")
-    for source in (module, SCRIPT):
-        _write(root / source.relative_to(module.parents[1]), source.read_text(encoding="utf-8"))
-    script_text = (root / "scripts" / "kanban_scope_hints.py").read_text(encoding="utf-8")
-    lines = [n.lineno for n in ast.walk(ast.parse(script_text))
-             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "find_hints"]
-    assert len(lines) == 1
+    _write(root / "hermes_cli" / "__init__.py", "")
+    _write(root / OWNED, "def build():\n    return 1\n")
+    _write(root / "scripts" / "caller.py", _src("import sys\n\nresult = NAME(sys.argv)\n"))
     run = subprocess.run(
-        [sys.executable, str(SCRIPT), "--root", str(root), "--owned", "hermes_cli/kanban_scope_hints.py",
-         "--symbol", "find_hints"],
+        [sys.executable, str(SCRIPT), "--root", str(root), "--owned", OWNED, "--symbol", SYM],
         env={"PATH": os.environ.get("PATH", "")}, capture_output=True, text=True, timeout=60,
     )
     assert run.returncode == 0, run.stderr
-    rows = [line for line in run.stdout.splitlines() if line.startswith("scripts/kanban_scope_hints.py\t") and RULE_7 in line]
-    assert rows == [f"scripts/kanban_scope_hints.py\t{RULE_7}: find_hints): line {lines[0]}"]
+    assert [line for line in run.stdout.splitlines() if not line.startswith("#")] == [_row_line("scripts/caller.py", SYM, 3)]
     assert run.stdout.splitlines()[-1] == COUNT_7 + "1"

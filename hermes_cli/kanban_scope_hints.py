@@ -34,7 +34,8 @@ owned paths that match one of seven rules (rule 7 only for each ``symbols`` name
    does not count. One row per node, of the test file itself, with the line of the node, in the form
    of the rule 5 row that holds a line ("whole-answer comparison"), after every other row of the
    file. The count of rule 6 counts these rows.
-7. a call of a named function: for each name in ``symbols`` (a plain Python name in NFKC form, else
+7. a call of a named function: for each name in ``symbols`` (the repeatable ``--symbol NAME`` option of
+   ``scripts/kanban_scope_hints.py``; a plain Python name in NFKC form, else
    ``ValueError`` before any file is read; a repeated name counts once), in each Python file the main
    scan reads (a leading U+FEFF that stops the parse is dropped), each ``ast.Call`` node at any depth
    whose function is the plain name (``ast.Name``) or an attribute (``ast.Attribute``) ending in that
