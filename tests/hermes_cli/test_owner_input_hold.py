@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -61,6 +62,31 @@ _DECISION_KEYS = {
 _DECISIONS = "/v1/owner-workspace/decisions"
 
 
+def _seen_on_named_board(board, task_id: str):
+    """(status, number of 'blocked' events) of the card in the store of *board*.
+
+    Read through a second, read-only connection. None when no board is named
+    (never the current one), the store cannot be read or it holds no such card.
+    It never raises: a hook that raises is swallowed and hides the failure.
+    """
+    if not board:
+        return None
+    try:
+        store = str(kb.kanban_db_path(board=board))
+        if not _observe(store, "SELECT COUNT(*) FROM tasks WHERE id = ?", task_id):
+            return None
+        return (
+            _observe(store, "SELECT status FROM tasks WHERE id = ?", task_id),
+            _observe(
+                store,
+                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'blocked'",
+                task_id,
+            ),
+        )
+    except (OSError, ValueError, sqlite3.Error):
+        return None
+
+
 @pytest.fixture
 def fired_hooks():
     """Each kanban_task_blocked and kanban_task_claimed call, in order.
@@ -69,15 +95,19 @@ def fired_hooks():
     tests/hermes_cli/test_kanban_lifecycle_hooks.py does. Each entry also holds
     the card's status as a second, read-only connection to ``store`` (set by
     the test) saw it while the hook ran: a hook fired inside the transaction
-    would still see the card as it was before.
+    would still see the card as it was before. ``on_named_board`` lists, call
+    for call, what :func:`_seen_on_named_board` read on the board the call names.
     """
     manager = get_plugin_manager()
     saved = {name: list(callbacks) for name, callbacks in manager._hooks.items()}
-    seen = SimpleNamespace(store=None, fired=[])
+    seen = SimpleNamespace(store=None, fired=[], on_named_board=[])
 
     def capture(hook: str, fields: dict) -> None:
         status = _observe(
             seen.store, "SELECT status FROM tasks WHERE id = ?", fields["task_id"],
+        )
+        seen.on_named_board.append(
+            _seen_on_named_board(fields.get("board"), fields["task_id"])
         )
         # The manager adds its telemetry marker to every hook; keep only what
         # the caller passed.
@@ -108,6 +138,19 @@ def _card(ctx, *inputs: dict) -> tuple[dict, str]:
     ))
     assert result["ok"] is True
     (task_id,) = result["created_task_ids"]
+    return setup, task_id
+
+
+def _late_card(ctx, *inputs: dict) -> tuple[dict, str]:
+    """(Project, card) of :func:`_card` whose *inputs* are declared after its activation.
+
+    The hold at the activation never sees such a declaration, so the card is
+    ready and only the hold at the claim holds it.
+    """
+    setup, task_id = _card(ctx)
+    with contextlib.closing(kb.connect(board=setup["board"])) as conn:
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, oni.DECLARED_EVENT, oni._declaration(list(inputs)))
     return setup, task_id
 
 
@@ -157,7 +200,7 @@ def _assert_held(conn, task_id: str) -> None:
 
 
 def test_a_ready_card_missing_an_input_is_held_and_no_run_starts(ctx, fired_hooks):
-    setup, task_id = _card(ctx, _PRICE_LIST)
+    setup, task_id = _late_card(ctx, _PRICE_LIST)
     with contextlib.closing(kb.connect(board=setup["board"])) as conn:
         fired_hooks.store = _store_file(conn)
         assert _status(conn, task_id) == "ready"
@@ -194,7 +237,7 @@ def test_a_ready_card_missing_an_input_is_held_and_no_run_starts(ctx, fired_hook
 
 
 def test_the_same_card_is_claimed_once_the_owner_gave_each_file(ctx, fired_hooks):
-    setup, task_id = _card(ctx, _PRICE_LIST, _OPENING_HOURS)
+    setup, task_id = _late_card(ctx, _PRICE_LIST, _OPENING_HOURS)
     board = setup["board"]
     with contextlib.closing(kb.connect(board=board)) as conn:
         fired_hooks.store = _store_file(conn)
@@ -256,7 +299,7 @@ def test_a_card_without_a_declaration_is_claimed_as_today(ctx, fired_hooks):
 
 
 def test_a_card_still_waiting_on_a_parent_is_not_held(ctx, fired_hooks):
-    setup, task_id = _card(ctx, _PRICE_LIST)
+    setup, task_id = _late_card(ctx, _PRICE_LIST)
     with contextlib.closing(kb.connect(board=setup["board"])) as conn:
         fired_hooks.store = _store_file(conn)
         parent = kb.create_task(
@@ -280,7 +323,7 @@ def test_a_card_still_waiting_on_a_parent_is_not_held(ctx, fired_hooks):
 
 
 def test_a_running_card_is_never_held(ctx, fired_hooks):
-    setup, task_id = _card(ctx, _PRICE_LIST)
+    setup, task_id = _late_card(ctx, _PRICE_LIST)
     board = setup["board"]
     with contextlib.closing(kb.connect(board=board)) as conn:
         fired_hooks.store = _store_file(conn)
@@ -420,3 +463,275 @@ async def test_only_a_reader_naming_the_capability_gets_missing_inputs(ctx, owne
     # A repeated parameter or an unknown token is today's answer exactly.
     for answer in refused:
         assert answer == today
+
+
+# ---------------------------------------------------------------------------
+# The hold at the activation (card P1)
+# ---------------------------------------------------------------------------
+
+_TITLE = "Publish the price page"
+# The parking of the one approval whose cards the tests below release.
+_GENERATION = kb.park_generation(actor="owner", profile="default", idempotency_key="card-p1")
+
+
+def _park(conn, task_id: str, *inputs: dict) -> str:
+    """Park *task_id* under :data:`_GENERATION`, as an approval parks its work.
+
+    The card declares *inputs* through the real declaration; without any it
+    declares nothing.
+    """
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = ?, park_generation = ? WHERE id = ?",
+            (kb.PARKED_STATUS, _GENERATION, task_id),
+        )
+        if inputs:
+            oni.declare_named_inputs(
+                conn, [{"title": _TITLE, "inputs": list(inputs)}], [task_id],
+            )
+    return task_id
+
+
+def _parked(conn, project_id: str, *inputs: dict, parents: tuple = ()) -> str:
+    """One new card of *project_id*, parked by :func:`_park`."""
+    task_id = kb.create_task(
+        conn, title=_TITLE, assignee="default", project_id=project_id, parents=parents,
+    )
+    return _park(conn, task_id, *inputs)
+
+
+def _parent(conn, project_id: str) -> str:
+    """A parent card that is not done."""
+    return kb.create_task(
+        conn, title="Collect the prices", assignee="default", project_id=project_id,
+    )
+
+
+def _state(conn, task_id: str) -> tuple[dict, list[str], list[dict]]:
+    """The card's row, the kinds of its events and its runs."""
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return dict(row), [event.kind for event in kb.list_events(conn, task_id)], _runs(conn, task_id)
+
+
+def test_activation_holds_card_with_missing_input(ctx):
+    setup, task_id = _card(ctx, _PRICE_LIST)
+    with contextlib.closing(kb.connect(board=setup["board"])) as conn:
+        # Right after the approval, never claimed: held, and no run exists.
+        _assert_held(conn, task_id)
+        (blocked,) = _events(conn, task_id, "blocked")
+        # The claim's hold records exactly this.
+        assert blocked.payload == {
+            "reason": oni.HOLD_SENTENCE,
+            "kind": "needs_input",
+            "recurrences": 1,
+            "source_status": "ready",
+        }
+        assert blocked.run_id is None
+        kinds = [event.kind for event in kb.list_events(conn, task_id)]
+        assert kinds.index("owner_work_activated") < kinds.index("blocked")
+    # So the Decisions page offers the Upload at once.
+    (item,) = ow.list_owner_decisions(ctx, owner_input_upload=True)["data"]
+    assert item["title"] == _TITLE
+    assert item["missing_inputs"] == [{
+        "n": 1, "name": "price list", "type_label": "spreadsheet (CSV)",
+        "max_bytes": oni.MAX_INPUT_BYTES,
+    }]
+
+
+def test_activation_leaves_card_without_declaration(ctx):
+    setup, task_id = _card(ctx)
+    with contextlib.closing(kb.connect(board=setup["board"])) as conn:
+        assert _status(conn, task_id) == "ready"
+        assert _events(conn, task_id, "blocked") == []
+    assert ow.list_owner_decisions(ctx, owner_input_upload=True)["data"] == []
+
+
+def test_activation_leaves_card_with_each_file_given(ctx, fired_hooks):
+    setup = _bootstrap_board(ctx)
+    board = setup["board"]
+    with contextlib.closing(kb.connect(board=board)) as conn:
+        fired_hooks.store = _store_file(conn)
+        task_id = _parked(conn, setup["project_id"], _PRICE_LIST, _OPENING_HOURS)
+        _give(conn, board, task_id, "price-list.csv")
+        _give(conn, board, task_id, "opening-hours.txt")
+
+        assert kb.activate_owner_work(conn, [task_id], generation=_GENERATION) == [task_id]
+
+        assert _status(conn, task_id) == "ready"
+        assert _events(conn, task_id, "blocked") == []
+    assert fired_hooks.fired == []
+
+
+def test_activation_leaves_restored_blocked_dependent(ctx, fired_hooks):
+    setup = _bootstrap_board(ctx)
+    with contextlib.closing(kb.connect(board=setup["board"])) as conn:
+        # A dependent a person blocked, which the plan parked out of blocked;
+        # it declares a file the owner has not given.
+        dependent = kb.create_task(
+            conn, title=_TITLE, assignee="default", project_id=setup["project_id"],
+        )
+        assert kb.block_task(
+            conn, dependent, reason="Which venue should we book?", kind="needs_input",
+        ) is True
+        _park(conn, dependent, _PRICE_LIST)
+        added = _parked(conn, setup["project_id"], _PRICE_LIST)
+        fired_hooks.store = _store_file(conn)
+        row, kinds, runs = _state(conn, dependent)
+
+        released = kb.activate_owner_work(
+            conn, [dependent, added], generation=_GENERATION,
+            restore_statuses={dependent: "blocked"},
+        )
+
+        assert released == [dependent, added]
+        # Back in blocked exactly as today: no hold, nothing else changed.
+        assert _state(conn, dependent) == (
+            {**row, "status": "blocked", "park_generation": None},
+            [*kinds, "owner_work_activated"],
+            runs,
+        )
+        # The card this same call moved to todo is held.
+        _assert_held(conn, added)
+    assert [fields["task_id"] for _hook, fields, _status in fired_hooks.fired] == [added]
+
+
+def test_activation_replay_holds_once(ctx, fired_hooks):
+    setup = _bootstrap_board(ctx)
+    with contextlib.closing(kb.connect(board=setup["board"])) as conn:
+        fired_hooks.store = _store_file(conn)
+        held = _parked(conn, setup["project_id"], _PRICE_LIST)
+        waiting = _parked(
+            conn, setup["project_id"], _MENU, parents=(_parent(conn, setup["project_id"]),),
+        )
+        assert kb.activate_owner_work(
+            conn, [held, waiting], generation=_GENERATION,
+        ) == [held, waiting]
+        # A person releases the second without its file: todo, behind its parent.
+        assert kb.unblock_task(conn, waiting) is True
+        assert _status(conn, waiting) == "todo"
+        before = [_state(conn, task_id) for task_id in (held, waiting)]
+
+        # The same approval's activation again, as a replay of its receipt runs it.
+        assert kb.activate_owner_work(conn, [held, waiting], generation=_GENERATION) == []
+
+        # It holds and releases nothing.
+        assert [_state(conn, task_id) for task_id in (held, waiting)] == before
+        _assert_held(conn, held)
+        for task_id in (held, waiting):
+            assert [event.payload for event in _events(conn, task_id, "owner_work_activated")] == [None]
+    assert [(hook, fields["task_id"]) for hook, fields, _status in fired_hooks.fired] == [
+        ("kanban_task_blocked", held),
+        ("kanban_task_blocked", waiting),
+    ]
+
+
+def test_activation_holds_card_behind_a_parent(ctx):
+    setup = _bootstrap_board(ctx)
+    board = setup["board"]
+    with contextlib.closing(kb.connect(board=board)) as conn:
+        parent = _parent(conn, setup["project_id"])
+        task_id = _parked(conn, setup["project_id"], _PRICE_LIST, parents=(parent,))
+
+        assert kb.activate_owner_work(conn, [task_id], generation=_GENERATION) == [task_id]
+
+        # Waiting for its file at once, although its parent is not done.
+        _assert_held(conn, task_id)
+        assert _status(conn, parent) != "done"
+        # The Upload of its last missing file releases it behind its parent.
+        assert oni.accept_upload(
+            conn, task_id, 1, b"item,price\ntea,3\n", "text/csv", board=board,
+        ) == "released"
+        assert _status(conn, task_id) == "todo"
+
+
+def test_upload_releases_card_held_at_activation(ctx):
+    setup, task_id = _card(ctx, _PRICE_LIST, _OPENING_HOURS)
+    board = setup["board"]
+    with contextlib.closing(kb.connect(board=board)) as conn:
+        _assert_held(conn, task_id)
+        assert oni.accept_upload(
+            conn, task_id, 1, b"item,price\ntea,3\n", "text/csv", board=board,
+        ) == "stored"
+        _assert_held(conn, task_id)
+
+        assert oni.accept_upload(
+            conn, task_id, 2, b"Monday to Friday\n", "text/plain", board=board,
+        ) == "released"
+
+        assert _status(conn, task_id) == "ready"
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.status == "running"
+
+
+def test_claim_still_holds_a_card_missing_an_input(ctx, fired_hooks):
+    setup, task_id = _card(ctx, _PRICE_LIST)
+    with contextlib.closing(kb.connect(board=setup["board"])) as conn:
+        fired_hooks.store = _store_file(conn)
+        _assert_held(conn, task_id)
+        # A person releases the card without its file.
+        assert kb.unblock_task(conn, task_id) is True
+        assert _status(conn, task_id) == "ready"
+
+        assert kb.claim_task(conn, task_id) is None
+
+        _assert_held(conn, task_id)
+        assert [event.payload["recurrences"] for event in _events(conn, task_id, "blocked")] == [1, 2]
+        assignee = kb.get_task(conn, task_id).assignee
+    assert fired_hooks.fired == [(
+        "kanban_task_blocked",
+        {
+            "task_id": task_id,
+            "profile_name": get_active_profile_name(),
+            "board": kb.get_current_board(),
+            "assignee": assignee,
+            "run_id": None,
+            "reason": oni.HOLD_SENTENCE,
+        },
+        "blocked",
+    )]
+
+
+def test_activation_hook_fires_once_per_held_card_after_commit(ctx, fired_hooks):
+    setup = _bootstrap_board(ctx)
+    # The approval opens the Project's board without making it the current one.
+    assert setup["board"] != kb.get_current_board()
+    with contextlib.closing(kb.connect(board=setup["board"])) as conn:
+        fired_hooks.store = _store_file(conn)
+        first = _parked(conn, setup["project_id"], _PRICE_LIST)
+        plain = _parked(conn, setup["project_id"])
+        second = _parked(conn, setup["project_id"], _OPENING_HOURS, _MENU)
+
+        # Forced to fail after both holds: the last card names no status to
+        # return to, so the transaction rolls back.
+        with pytest.raises(ValueError, match="cannot restore"):
+            kb.activate_owner_work(
+                conn, [first, second, plain], generation=_GENERATION,
+                restore_statuses={plain: "nowhere"},
+            )
+        assert fired_hooks.fired == []
+        for task_id in (first, second, plain):
+            assert _status(conn, task_id) == kb.PARKED_STATUS
+            assert _events(conn, task_id, "blocked") == []
+
+        assert kb.activate_owner_work(
+            conn, [first, plain, second], generation=_GENERATION,
+        ) == [first, plain, second]
+        assignee = kb.get_task(conn, first).assignee
+    # Once for each held card, after the commit: another connection already
+    # saw it blocked. A reader of the board each call names finds that block, once.
+    assert fired_hooks.on_named_board == [("blocked", 1), ("blocked", 1)]
+    assert fired_hooks.fired == [
+        (
+            "kanban_task_blocked",
+            {
+                "task_id": task_id,
+                "profile_name": get_active_profile_name(),
+                "board": setup["board"],
+                "assignee": assignee,
+                "run_id": None,
+                "reason": oni.HOLD_SENTENCE,
+            },
+            "blocked",
+        )
+        for task_id in (first, second)
+    ]

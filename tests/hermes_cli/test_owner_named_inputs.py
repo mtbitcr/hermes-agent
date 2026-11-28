@@ -424,9 +424,9 @@ def test_a_new_project_with_inputs_declares_them_once_on_its_card(ctx):
     board = result["board"]
     assert _events(board, first, "named_inputs_declared") == [_DECLARED_PRICE_LIST]
     assert _events(board, second, "named_inputs_declared") == []
-    # No card is parked for a missing input in this card: the declaring card
-    # is activated exactly like its sibling.
-    assert _status(board, first) not in {"blocked", kb.PARKED_STATUS}
+    # Activated like its sibling, the declaring card waits at once for the
+    # file the owner has not given yet (card P1).
+    assert _status(board, first) == "blocked"
     # A replay of the committed receipt declares nothing twice.
     assert _apply(ctx, binding, approve=False)["task_ids"] == [first, second]
     assert _events(board, first, "named_inputs_declared") == [_DECLARED_PRICE_LIST]
@@ -447,7 +447,7 @@ def test_a_plan_change_with_inputs_declares_them_once_on_its_card(ctx):
     assert _events(setup["board"], created, "named_inputs_declared") == [
         _DECLARED_PRICE_LIST,
     ]
-    assert _status(setup["board"], created) not in {"blocked", kb.PARKED_STATUS}
+    assert _status(setup["board"], created) == "blocked"
     assert _apply(ctx, binding, approve=False)["created_task_ids"] == [created]
     assert _events(setup["board"], created, "named_inputs_declared") == [
         _DECLARED_PRICE_LIST,

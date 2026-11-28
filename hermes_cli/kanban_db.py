@@ -121,6 +121,7 @@ from hermes_cli.kanban_risk_tier import (
 from hermes_cli.kanban_run_metadata_merge import merge_edited_run_metadata, strip_kernel_keys
 from hermes_cli.kanban_schedule_stop import capture_worker, stop_after_commit
 from hermes_cli.owner_named_inputs import OWNER_UPLOADER, InputHold, missing_inputs
+from hermes_cli.owner_named_inputs import hold_on_activation
 from hermes_cli.sqlite_util import (
     InitLockDirectoryAbsent,
     InitLockUnavailable,
@@ -22546,6 +22547,7 @@ def activate_owner_work(
         return []
     restore = dict(restore_statuses or {})
     released: list[str] = []
+    holds: list[dict] = []
     with write_txn(conn):
         for task_id in ids:
             target = restore.get(task_id, "todo")
@@ -22560,6 +22562,12 @@ def activate_owner_work(
             if cur.rowcount == 1:
                 released.append(task_id)
                 _append_event(conn, task_id, "owner_work_activated", None)
+                # Named inputs the owner has not all given hold the card at once (card P1).
+                hold = hold_on_activation(conn, task_id) if target == "todo" else None
+                if hold is not None:
+                    holds.append(hold)
+    for hold in holds:
+        _fire_kanban_lifecycle_hook("kanban_task_blocked", **hold)
     with _after_durable_commit(f"activate_owner_work({generation})"):
         recompute_ready(conn)
     return released
