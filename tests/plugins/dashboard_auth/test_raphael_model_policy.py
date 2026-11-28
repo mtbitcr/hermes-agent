@@ -901,6 +901,8 @@ def test_a_superseded_configured_route_is_readable_but_grants_no_new_authority(
     ("raphael-verifier", "openai-codex", "gpt-6-astra", "xhigh"),
     # The builder has no role-wide lane on this provider, then or now.
     ("raphael-builder", "openai-codex", "gpt-5.6-sol", "max"),
+    # Its task-only routine route is no configured route either.
+    ("raphael-builder", "openai-codex", "gpt-6.2-sol", "max"),
     # Never-admissible values stay refused regardless of lineage.
     ("default", "anthropic", "claude-fable-5", "max"),
     ("default", "anthropic", "claude-opus-ultracode-1", "max"),
@@ -921,6 +923,33 @@ def test_a_configured_route_the_lineage_never_admitted_there_is_refused(
         configured_assignment_for(profile)
     with pytest.raises(ValueError):
         resolve_task_assignment(profile, "routine")
+
+
+def test_the_route_fence_pins_nothing_for_a_builder_saved_on_its_task_only_route(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    from hermes_cli import kanban_db, owner_workspace as ow
+
+    _on_disk_route(monkeypatch, tmp_path, "openai-codex", "gpt-6.2-sol", "max")
+    kanban_db.init_db()
+    with kanban_db.connect() as conn:
+        task_id = kanban_db.create_task(
+            conn, title="receipt-owned owner work", assignee="raphael-builder",
+            execution_tier="routine",
+        )
+    monkeypatch.setattr(
+        ow, "_owner_receipt_task_ids", lambda: {kanban_db.DEFAULT_BOARD: {task_id}},
+    )
+
+    with pytest.raises(ow.OwnerWorkspaceError) as excinfo:
+        ow.fence_effective_task_routes("raphael-builder")
+
+    assert excinfo.value.code == "invalid_model_route"
+    with kanban_db.connect() as conn:
+        task = kanban_db.get_task(conn, task_id)
+    assert (task.provider_override, task.model_override, task.model_policy_lock) == (
+        None, None, None,
+    )
 
 
 @pytest.mark.parametrize("route", [

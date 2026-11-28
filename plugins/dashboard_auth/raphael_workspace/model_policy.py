@@ -380,6 +380,11 @@ def _superseded_configured_assignment(
     """
     if disable_fallbacks is not True:
         return None
+    # A task-only route is no role-wide base route, so no lineage vouches for it.
+    try:
+        _matrix_assignment(profile, provider)
+    except ValueError:
+        return None
     parts = _normalized_lock_parts(
         profile, provider, model, reasoning_effort, "routine"
     )

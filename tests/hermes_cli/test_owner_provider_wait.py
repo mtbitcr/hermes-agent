@@ -356,6 +356,205 @@ def test_alternate_retry_requires_a_fresh_choice_after_a_card_change(root, owner
         assert spawned == [task_id]
 
 
+def _alternate_scene(
+    root: Path, owner: ow.OwnerContext, clock, monkeypatch, name: str, *lanes: tuple,
+) -> SimpleNamespace:
+    """One Project with a card held by the provider limit on its Claude route for each (role, tier) of ``lanes``.
+
+    ``worker_env(setting)`` is the environment the dispatcher gives a worker and
+    ``read(setting)`` the owner's page read with the capability under it: the
+    server setting is left out for ``None`` and is that text otherwise.
+    """
+    import sqlite3
+
+    from hermes_cli import owner_retry_route
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    profile_home = Path(os.environ["HERMES_HOME"])
+    with monkeypatch.context() as shared_root:
+        shared_root.setenv("HERMES_HOME", str(root))
+        project = _project(owner, name)
+        with contextlib.closing(sqlite3.connect(root / "projects.db")) as source:
+            with contextlib.closing(sqlite3.connect(profile_home / "projects.db")) as target:
+                source.backup(target)
+    board = project["board"]
+    task_ids = []
+    with _board(board) as conn:
+        for role, tier in lanes:
+            (root / "profiles" / role).mkdir(exist_ok=True)
+            assignment = model_policy.task_assignment_for(role, "anthropic", tier)
+            lock = model_policy.mint_policy_lock(
+                role, "anthropic", assignment.model, assignment.reasoning_effort, tier,
+            )
+            task_ids.append(kb.create_task(
+                conn, title=f"Draft the placeholder brief {len(task_ids) + 1}", assignee=role,
+                project_id=project["project_id"], provider_override="anthropic",
+                model_override=assignment.model, reasoning_effort=assignment.reasoning_effort,
+                execution_tier=tier, model_policy_lock=lock, requires_review=True,
+            ))
+            held = _held(conn, board, task_ids[-1], 4800 + len(task_ids))
+    clock["t"] = held.ended_at + 60
+    monkeypatch.delenv("HERMES_OPENAI_RETRY_TASK_ID", raising=False)
+    monkeypatch.setattr(owner_retry_route, "openai_ready", lambda _role: True)
+    env = _steward_env(root, board)
+    assert "HERMES_OPENAI_RETRY_TASK_ID" not in env
+
+    def worker_env(setting: str | None) -> dict:
+        return env if setting is None else {**env, "HERMES_OPENAI_RETRY_TASK_ID": setting}
+
+    def read(setting: str | None) -> dict:
+        with _as_worker(monkeypatch, worker_env(setting)):
+            return ow.read_project_snapshot(owner, project["slug"], provider_wait=True)
+
+    return SimpleNamespace(
+        project=project, board=board, task_ids=task_ids, env=env, worker_env=worker_env, read=read,
+    )
+
+
+@pytest.mark.parametrize("setting", [None, "", "tâche-中文"], ids=["unset", "empty", "multibyte"])
+def test_alternate_retry_is_offered_to_no_card_while_the_setting_names_none(
+    root, owner, clock, monkeypatch, setting,
+):
+    scene = _alternate_scene(
+        root, owner, clock, monkeypatch, "Setting Names None",
+        ("raphael-claude-worker", "deep"), ("raphael-builder", "routine"),
+    )
+    page = scene.read(setting)
+    assert [
+        task["id"] for column in page["columns"] for task in column["tasks"] if "retry_route" in task
+    ] == []
+    # Named, a card is offered its route and the rest of the page reads as it did.
+    for task_id in scene.task_ids:
+        named = scene.read(task_id)
+        assert set(_task(named, task_id)["retry_route"]) == {"token", "model", "effort"}
+        del _task(named, task_id)["retry_route"]
+        assert named == page
+
+
+@pytest.mark.parametrize(
+    ("role", "tier"),
+    [
+        ("raphael-claude-worker", "routine"),
+        ("raphael-builder", "deep"),
+        ("raphael-planner", "routine"),
+        ("raphael-planner", "deep"),
+    ],
+)
+def test_alternate_retry_is_not_offered_for_a_named_card_outside_the_two_lanes(
+    root, owner, clock, monkeypatch, role, tier,
+):
+    scene = _alternate_scene(root, owner, clock, monkeypatch, "Outside The Two Lanes", (role, tier))
+    [task_id] = scene.task_ids
+    with _board(scene.board) as conn:
+        kb.assert_claimable_route(conn, task_id)
+    card = _task(scene.read(task_id), task_id)
+    assert card["stopped_work"] == "provider_wait"
+    assert "retry_route" not in card
+
+
+@pytest.mark.parametrize(
+    ("role", "tier"),
+    [("raphael-claude-worker", "deep"), ("raphael-builder", "routine")],
+)
+@pytest.mark.parametrize("setting", [None, "", "placeholder-other-card"], ids=["unset", "empty", "other_card"])
+def test_alternate_retry_cannot_repin_a_card_the_setting_does_not_name(
+    root, owner, clock, monkeypatch, role, tier, setting,
+):
+    scene = _alternate_scene(root, owner, clock, monkeypatch, "Setting Does Not Name It", (role, tier))
+    [task_id], board = scene.task_ids, scene.board
+    token = _task(scene.read(task_id), task_id)["retry_route"]["token"]
+    with _board(board) as conn:
+        before = kb.get_task(conn, task_id)
+    assert before.provider_override == "anthropic"
+
+    with _as_worker(monkeypatch, scene.worker_env(setting)):
+        refused = _retry(owner, scene.project, task_id, "retry-unnamed", route_token=token)
+    assert refused["ok"] is False
+    assert refused["reason"] == "This retry choice is no longer available. Reload this Project and check the work."
+
+    with _board(board) as conn:
+        assert kb.get_task(conn, task_id) == before
+        assert not _events(conn, task_id, "owner_retry")
+        assert not _events(conn, task_id, "model_route_repinned")
+        assert not conn.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'owner_retry_run_pins'"
+        ).fetchall()
+        assert kb.check_respawn_guard(conn, task_id) == "rate_limit_cooldown"
+    # The setting naming the card is the one thing missing: the same choice is offered again.
+    assert _task(scene.read(task_id), task_id)["retry_route"]["token"] == token
+    with _board(board) as conn:
+        result, spawned = _tick(conn, board, {task_id: 4821})
+        assert (task_id, "rate_limit_cooldown") in result.respawn_guarded
+        assert spawned == []
+
+
+@pytest.mark.parametrize(
+    ("lock", "refusal"),
+    [
+        pytest.param(None, "approved route lock", id="no_lock"),
+        pytest.param("", "approved route lock", id="empty_lock"),
+        pytest.param(
+            ("raphael-claude-worker", "openai-codex", "gpt-6.2-sol", "max", "deep"),
+            "does not bind this route", id="deep_worker_lock",
+        ),
+        pytest.param(
+            ("raphael-builder", "anthropic", "claude-opus-5-5", "max", "deep"),
+            "does not bind this route", id="deep_builder_lock",
+        ),
+    ],
+)
+def test_a_routine_builder_card_on_the_alternate_route_never_starts_without_its_exact_lock(
+    root, owner, clock, monkeypatch, lock, refusal,
+):
+    from plugins.dashboard_auth.raphael_workspace import model_policy
+
+    scene = _alternate_scene(
+        root, owner, clock, monkeypatch, "Exact Lock To Start",
+        ("raphael-builder", "routine"), ("raphael-builder", "routine"),
+    )
+    control, refused = scene.task_ids
+    for key, task_id in (("control", control), ("refused", refused)):
+        switched = _switch(owner, scene.project, task_id, scene.env, monkeypatch, f"switch-{key}")
+        assert switched["ok"] is True, switched
+    route = model_policy.task_assignment_for("raphael-builder", "openai-codex", "routine")
+    exact = model_policy.mint_policy_lock(
+        "raphael-builder", "openai-codex", route.model, route.reasoning_effort, "routine",
+    )
+    with _board(scene.board) as conn:
+        for task_id in (control, refused):
+            task = kb.get_task(conn, task_id)
+            assert (
+                task.assignee, task.execution_tier, task.provider_override,
+                task.model_override, task.reasoning_effort, task.model_policy_lock, task.status,
+            ) == (
+                "raphael-builder", "routine", "openai-codex",
+                route.model, route.reasoning_effort, exact, "ready",
+            )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET model_policy_lock = ? WHERE id = ?",
+                (model_policy.mint_policy_lock(*lock) if isinstance(lock, tuple) else lock, refused),
+            )
+        runs = "SELECT id, status FROM task_runs WHERE task_id = ? ORDER BY id"
+        refused_runs = [tuple(row) for row in conn.execute(runs, (refused,))]
+        with pytest.raises(RuntimeError, match=refusal):
+            kb.claim_task(conn, refused)
+
+        result, spawned = _tick(conn, scene.board, {control: 4831, refused: 4832})
+        # The card with its exact lock starts; the other one is turned away and starts nothing.
+        assert spawned == [control]
+        [(skipped, reason)] = result.skipped_route_unproven
+        assert skipped == refused
+        assert refusal in reason
+        task = kb.get_task(conn, refused)
+        assert task.status != "running"
+        assert (task.current_run_id, task.claim_lock, task.worker_pid) == (None, None, None)
+        assert [tuple(row) for row in conn.execute(runs, (refused,))] == refused_runs
+        assert "running" not in [status for _run_id, status in refused_runs]
+        assert kb.get_task(conn, control).status == "running"
+        assert [status for _run_id, status in conn.execute(runs, (control,))][-1] == "running"
+
+
 @pytest.mark.parametrize("repinned_between", [False, True], ids=["two_stops", "repinned_between"])
 def test_after_an_alternate_route_retry_each_earlier_stop_keeps_the_receipt_its_route_history_proves(
     repinned_between, root, owner, clock, monkeypatch,
