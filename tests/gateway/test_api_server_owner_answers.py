@@ -6,6 +6,9 @@ takes the owner's answer to it: ``accept_answer`` records it once as the event `
 card as ``owner`` and resumes the card, in one write transaction. Each test takes the key and the stop reference of its
 card from the list, drives the adapter's real routes into the real kernel inside the per-test ``HERMES_HOME``, and every
 count it proves is read by a second, plain connection to the card's own store.
+
+Card P5 adds the card the kernel blocked as ``transient``: the list serves it the one choice to continue the work, and
+the same route takes that answer.
 """
 
 from __future__ import annotations
@@ -49,11 +52,16 @@ from tests.gateway.test_api_server_owner_suggestion_decisions import (  # noqa: 
     owner,
 )
 from tests.hermes_cli.test_owner_questions_feed import (
+    _BRIEF,
+    _BRIEF_TEXT,
     _CHOICES,
+    _CONTINUE,
+    _FIXED,
     _PATH,
     _PLAIN,
     _QUESTION,
     _WORKER,
+    _brief_question,
     _newest_blocked,
     _stop_ref,
 )
@@ -837,3 +845,378 @@ def test_35_o_under_a_workers_env_the_answer_reaches_the_cards_own_board_and_the
         assert conn.execute("SELECT COUNT(*) FROM task_events").fetchone() == worker_events
         assert conn.execute("SELECT COUNT(*) FROM task_comments").fetchone() == (0,)
     assert sorted(profile_home.rglob("*")) == in_profile_home
+
+
+# ---------------------------------------------------------------------------
+# Card P5: the owner continues a card that stopped briefly
+# ---------------------------------------------------------------------------
+
+
+# The gateway's idempotency cache lives as long as the process, so no key here is one that another test answers under.
+_BRIEF_KEY = "answer-brief-" + "d27a46c1" * 4
+_BRIEF_LATE_KEY = "answer-brief-late-" + "1f93b7e0" * 4
+
+
+def _brief_card(project: dict, title: str = "Build the sign up page", **kwargs) -> SimpleNamespace:
+    """A work card of *project* that the kernel blocked with the block kind ``transient``."""
+    return _card(project, title, stop=None, kind="transient", reason=_BRIEF, **kwargs)
+
+
+def _stop_of(owner, card) -> tuple[str, str]:
+    """The key and the stop reference of the card's current stop, made as the list makes them."""
+    with contextlib.closing(kb.connect(board=card.board)) as conn:
+        event_id = _newest_blocked(conn, card.task_id)
+    return ow._owner_decision_ref(owner, authority="task", native_id=card.task_id), _stop_ref(
+        owner, card.task_id, event_id,
+    )
+
+
+def _continue(stop_ref: str, words: str | None = None) -> dict:
+    return {"stop_ref": stop_ref, "choice": 1, "words": words}
+
+
+def _with_question(feed: dict, stop: str) -> list[dict]:
+    return [item for item in feed["data"] if item.get("question", {}).get("stop") == stop]
+
+
+def _own_rows(card) -> dict:
+    """``_observed`` without ``events``, which counts the whole board's events and so moves with any card's answer."""
+    return {key: value for key, value in _observed(card).items() if key != "events"}
+
+
+@pytest.mark.asyncio
+async def test_p5_k_an_answer_to_a_brief_stop_resumes_the_card_once_and_a_wrong_stop_ref_is_not_waiting(owner):
+    project = _project(owner, "Sign up Website")
+    card, other = _brief_card(project), _brief_card(project, "Build the price page")
+    ref, stop_ref = _stop_of(owner, card)
+    headers = {"Idempotency-Key": _BRIEF_KEY}
+    before = int(time.time())
+
+    async with TestClient(TestServer(_app())) as client:
+        item, bystander = await _listed(client, card), await _listed(client, other)
+        body = _continue(stop_ref)
+        # A stop reference the card never had, and the real one of the other card, are refused and write nothing; a
+        # refusal is never cached, so the same key still takes the answer.
+        wrong = [
+            await _answer(client, ref, _continue(wrong_ref), headers)
+            for wrong_ref in ("stop_" + "0" * 32, bystander["question"]["stop_ref"])
+        ]
+        refused = _observed(card)
+        first = await _answer(client, ref, body, headers)
+        recorded = _observed(card)
+        replay = await _answer(client, ref, body, headers)
+        replayed = _observed(card)
+        conflict = await _answer(client, ref, _continue(stop_ref, _WORDS), headers)
+        late = await _answer(client, ref, body, {"Idempotency-Key": _BRIEF_LATE_KEY})
+        _status, _raw, feed = await _feed(client, "owner_answer_v1")
+        still = await _listed(client, other)
+
+    # The list serves the brief stop under the key and the stop reference of any other stop.
+    assert (item["decision_ref"], item["authority"], item["kind"], item["reason"]) == (
+        ref, "task", "owner_input", _FIXED,
+    )
+    assert item["question"]["stop_ref"] == stop_ref
+    with contextlib.closing(kb.connect(board=card.board)) as conn:
+        assert item["question"] == _brief_question(owner, card.task_id, _newest_blocked(conn, card.task_id))
+    for answer in wrong:
+        _assert_refused(answer, 404, _NOT_WAITING, "decision_not_found")
+    assert (refused["status"], refused["block_kind"], refused["answers"], refused["comments"], refused["unblocked"]) == (
+        "blocked", "transient", [], [], 0,
+    )
+    assert first == _answered(ref, stop_ref, 1, True)
+    assert replay == first and replayed == recorded
+    _assert_refused(conflict, 409, _STORED_FAILURE, "idempotency_conflict")
+    _assert_refused(late, 404, _NOT_WAITING, "decision_not_found")
+    assert _observed(card) == recorded
+    # One event with exactly its five keys, one comment of the author owner, and the card resumed once.
+    (answered,) = recorded["answers"]
+    assert {key: value for key, value in answered.items() if key != "answered_at"} == {
+        "stop_ref": stop_ref, "choice": 1, "words_length": 0, "actor": owner.actor,
+    }
+    assert _iso(before) <= answered["answered_at"] <= _iso(time.time())
+    assert recorded["comments"] == [
+        ("owner", f"The owner answered: {_BRIEF_TEXT}\nChoice 1: {_CONTINUE[0]['sentence']}"),
+    ]
+    assert (recorded["status"], recorded["unblocked"]) == ("ready", 1)
+    # It no longer waits, so the list no longer lists it; the other card's brief stop is served as before.
+    assert [entry for entry in feed["data"] if entry["title"] == card.title] == []
+    assert still == bystander
+    seen = _observed(other)
+    assert (seen["status"], seen["block_kind"], seen["answers"], seen["comments"], seen["unblocked"]) == (
+        "blocked", "transient", [], [], 0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_p5_h_a_brief_stop_takes_choice_one_with_or_without_words_and_refuses_each_other_form(owner):
+    project = _project(owner, "Sign up Website")
+    card = _brief_card(project)
+    emoji = "\U0001F600" * 1000
+
+    async with TestClient(TestServer(_app())) as client:
+        item = await _listed(client, card)
+        ref, stop_ref = item["decision_ref"], item["question"]["stop_ref"]
+        before = _observed(card)
+
+        async def send(**form):
+            return await _answer(client, ref, {"stop_ref": stop_ref, **form})
+
+        # Words with no choice, as the stop offers a choice: not allowed.
+        not_allowed = await send(choice=None, words=_WORDS)
+        # A choice the stop does not offer, with and without words: the stop is not waiting for it.
+        not_offered = [await send(choice=n, words=text) for n in (2, 3, 4) for text in (None, _WORDS)]
+        # A choice or words the body check refuses, and neither of the two.
+        malformed = [
+            *[await send(choice=n, words=None) for n in (0, -1, 5, True, False, 1.0, "1", [1])],
+            *[
+                await send(choice=1, words=text)
+                for text in ("", "   ", "a" * 1001, "Keep\tit", "Keep it\x00", "Keep it\x07", 7)
+            ],
+            await send(choice=None, words=None),
+            await _answer(client, ref, {"stop_ref": stop_ref, "choice": 1}),
+            await _answer(client, ref, {"choice": 1, "words": None}),
+            await _answer(client, ref, {"stop_ref": stop_ref, "words": None}),
+        ]
+        unchanged = _observed(card)
+        # Choice 1 with the most words the stop takes, none of them in the basic plane.
+        taken = await send(choice=1, words=emoji)
+
+    assert (item["question"]["choices"], item["question"]["words"]) == (_CONTINUE, "optional")
+    _assert_refused(not_allowed, 400, _STORED_FAILURE, "invalid_argument")
+    for answer in not_offered:
+        _assert_refused(answer, 404, _NOT_WAITING, "decision_not_found")
+    for answer in malformed:
+        _assert_refused(answer, 400, _STORED_FAILURE, "invalid_argument")
+    assert unchanged == before
+    assert taken == _answered(ref, stop_ref, 1, True)
+    seen = _observed(card)
+    (answered,) = seen["answers"]
+    assert (answered["choice"], answered["words_length"]) == (1, 1000)
+    assert seen["comments"] == [
+        ("owner", f"The owner answered: {_BRIEF_TEXT}\nChoice 1: {_CONTINUE[0]['sentence']}\n{emoji}"),
+    ]
+    assert (seen["status"], seen["unblocked"]) == ("ready", 1)
+
+
+@pytest.mark.asyncio
+async def test_p5_d_a_forced_failure_after_the_comment_leaves_a_brief_stop_blocked_and_untouched(owner):
+    project = _project(owner, "Sign up Website")
+    card = _brief_card(project)
+    written = []
+
+    def fail_after_the_comment(conn, task_id, now, **_kwargs):
+        written.append(tuple(conn.execute(
+            "SELECT (SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'owner_answer_recorded'), "
+            "(SELECT COUNT(*) FROM task_comments WHERE task_id = ?)", (task_id, task_id),
+        ).fetchone()))
+        raise RuntimeError(f"forced failure of {task_id} in {card.store}")
+
+    async with TestClient(TestServer(_app())) as client:
+        item = await _listed(client, card)
+        body = _continue(item["question"]["stop_ref"], _WORDS)
+        before = _observed(card)
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(kb, "_unblock_task_within_txn", fail_after_the_comment)
+            failed = await _answer(client, item["decision_ref"], body)
+        after = _observed(card)
+        again = await _listed(client, card)
+        # Control: the same answer, with nothing forced, is taken.
+        control = await _answer(client, item["decision_ref"], body)
+
+    # The event and the comment were written when the failure came, and neither stayed.
+    assert written == [(1, 1)]
+    _assert_refused(failed, 503, _STORED_FAILURE, "owner_workspace_unavailable")
+    assert "forced" not in json.dumps(failed[1]) and card.task_id not in json.dumps(failed[1])
+    assert after == before
+    assert (after["status"], after["block_kind"], after["answers"], after["comments"], after["unblocked"]) == (
+        "blocked", "transient", [], [], 0,
+    )
+    assert again == item
+    assert control == _answered(item["decision_ref"], item["question"]["stop_ref"], 1, True)
+    assert _observed(card)["unblocked"] == 1
+
+
+@pytest.mark.asyncio
+async def test_p5_g_two_answers_for_one_brief_stop_in_two_threads_resume_the_card_once(owner, monkeypatch):
+    from gateway.platforms import api_server_owner_answers
+
+    project = _project(owner, "Sign up Website")
+    card = _brief_card(project)
+    # Both threads reach accept_answer together, and the first to hold the write transaction keeps it a moment, so
+    # the second waits for it and then reads the card the first one left.
+    together, threads = threading.Barrier(2, timeout=10), set()
+    real_accept, real_unblock = api_server_owner_answers.accept_answer, kb._unblock_task_within_txn
+
+    def accept(*args, **kwargs):
+        threads.add(threading.get_ident())
+        together.wait()
+        return real_accept(*args, **kwargs)
+
+    def unblock(*args, **kwargs):
+        time.sleep(0.3)
+        return real_unblock(*args, **kwargs)
+
+    monkeypatch.setattr(api_server_owner_answers, "accept_answer", accept)
+    monkeypatch.setattr(kb, "_unblock_task_within_txn", unblock)
+
+    async with TestClient(TestServer(_app())) as client:
+        item = await _listed(client, card)
+        ref, stop_ref = item["decision_ref"], item["question"]["stop_ref"]
+        answers = await asyncio.gather(
+            _answer(client, ref, _continue(stop_ref)),
+            _answer(client, ref, _continue(stop_ref, _WORDS)),
+        )
+
+    seen = _observed(card)
+    assert len(threads) == 2
+    (taken,) = [answer for answer in answers if answer[0] == 200]
+    (refused,) = [answer for answer in answers if answer[0] != 200]
+    assert taken == _answered(ref, stop_ref, 1, True)
+    _assert_refused(refused, 404, _NOT_WAITING, "decision_not_found")
+    (answered,) = seen["answers"]
+    assert answered["stop_ref"] == stop_ref
+    assert len(seen["comments"]) == 1 and (seen["status"], seen["unblocked"]) == ("ready", 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("release", ["unblock_task", "owner_move"])
+async def test_p5_a_brief_stop_a_person_resumed_first_is_refused_and_nothing_changes(owner, release):
+    project = _project(owner, "Sign up Website")
+    card = _brief_card(project)
+
+    async with TestClient(TestServer(_app())) as client:
+        item = await _listed(client, card)
+        if release == "unblock_task":
+            with contextlib.closing(kb.connect(board=card.board)) as conn:
+                assert kb.unblock_task(conn, card.task_id)
+        else:
+            _owner_move_to_ready(owner, card)
+        resumed = _observed(card)
+        late = await _answer(client, item["decision_ref"], _continue(item["question"]["stop_ref"]))
+        _status, _raw, feed = await _feed(client, "owner_answer_v1")
+
+    _assert_refused(late, 404, _NOT_WAITING, "decision_not_found")
+    assert _observed(card) == resumed
+    assert (resumed["status"], resumed["answers"], resumed["comments"]) == ("ready", [], [])
+    assert _with_question(feed, "stopped_briefly") == []
+
+
+@pytest.mark.asyncio
+async def test_p5_c_a_card_the_kernel_gave_up_on_is_not_listed_and_takes_no_answer(owner):
+    project = _project(owner, "Sign up Website")
+    card = _brief_card(project)
+    with contextlib.closing(kb.connect(board=card.board)) as conn:
+        assert kb.unblock_task(conn, card.task_id) is True
+        assert kb.claim_task(conn, card.task_id) is not None
+        kb._record_spawn_failure(conn, card.task_id, "spawn failed", failure_limit=1)
+    ref, stop_ref = _stop_of(owner, card)
+    held = _observed(card)
+
+    async with TestClient(TestServer(_app())) as client:
+        _status, _raw, feed = await _feed(client, "owner_answer_v1")
+        late = await _answer(client, ref, _continue(stop_ref))
+
+    # Still blocked as transient, with a blocked event: only its newest stop event, gave_up, ends the stop.
+    assert (held["status"], held["block_kind"]) == ("blocked", "transient")
+    assert _with_question(feed, "stopped_briefly") == []
+    assert [entry for entry in feed["data"] if entry["title"] == card.title] == []
+    _assert_refused(late, 404, _NOT_WAITING, "decision_not_found")
+    assert _observed(card) == held
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state, change", [
+    ("dependency", "UPDATE tasks SET block_kind = 'dependency' WHERE id = ?"),
+    ("no block kind", "UPDATE tasks SET block_kind = NULL WHERE id = ?"),
+    ("control card", "UPDATE tasks SET task_kind = 'control' WHERE id = ?"),
+    ("recommendation card", "UPDATE tasks SET task_kind = 'recommendation' WHERE id = ?"),
+], ids=["dependency", "no_block_kind", "control_card", "recommendation_card"])
+async def test_p5_a_blocked_card_that_is_not_a_brief_stop_takes_no_answer_and_is_not_served_as_one(
+    owner, state, change,
+):
+    project = _project(owner, "Sign up Website")
+    card = _brief_card(project)
+    # The stop reference it had as a brief stop, a well-formed one, is computed before the card is changed.
+    ref, stop_ref = _stop_of(owner, card)
+    with contextlib.closing(kb.connect(board=card.board)) as conn:
+        with kb.write_txn(conn):
+            conn.execute(change, (card.task_id,))
+    held = _observed(card)
+
+    async with TestClient(TestServer(_app())) as client:
+        _status, _raw, feed = await _feed(client, "owner_answer_v1")
+        late = await _answer(client, ref, _continue(stop_ref))
+
+    assert _with_question(feed, "stopped_briefly") == [], state
+    _assert_refused(late, 404, _NOT_WAITING, "decision_not_found")
+    assert _observed(card) == held
+
+
+@pytest.mark.asyncio
+async def test_p5_j_a_brief_stop_with_a_missing_named_input_is_listed_without_a_question_and_takes_no_answer(owner):
+    project = _project(owner, "Sign up Website")
+    needs_file = _brief_card(project, "Load the price list", inputs=[
+        {"n": 1, "name": "price list", "type": "csv", "file": "price-list.csv"},
+    ])
+    ref, stop_ref = _stop_of(owner, needs_file)
+    before = _observed(needs_file)
+
+    async with TestClient(TestServer(_app())) as client:
+        item = await _listed(client, needs_file)
+        refused = [
+            await _answer(client, ref, {"stop_ref": stop_ref, "choice": choice, "words": words})
+            for choice, words in ((1, None), (1, _WORDS), (None, _WORDS))
+        ]
+        _status, _raw, feed = await _feed(client, "owner_answer_v1")
+
+    # The card keeps its own route: it is listed as an owner input with no question, and no answer reaches it.
+    assert (item["decision_ref"], item["authority"], item["kind"]) == (ref, "task", "owner_input")
+    assert "question" not in item
+    for answer in refused:
+        _assert_refused(answer, 404, _NOT_WAITING, "decision_not_found")
+    assert _observed(needs_file) == before
+    assert _with_question(feed, "stopped_briefly") == []
+
+
+@pytest.mark.asyncio
+async def test_p5_a_brief_stop_beside_a_question_and_a_capability_stop_takes_its_own_answer_and_only_that(owner):
+    project = _project(owner, "Sign up Website")
+    asked = _card(project, "Build the sign up page")
+    capability = _card(project, "Check the sign up page", stop=None, kind="capability", reason=_CAPABILITY)
+    brief = _brief_card(project, "Build the price page")
+    waiting = (asked, capability)
+
+    async with TestClient(TestServer(_app())) as client:
+        items = {card.task_id: await _listed(client, card) for card in (asked, capability, brief)}
+        before = {card.task_id: _own_rows(card) for card in waiting}
+        taken = await _answer(client, items[brief.task_id]["decision_ref"], _continue(
+            items[brief.task_id]["question"]["stop_ref"],
+        ))
+        after = {card.task_id: _own_rows(card) for card in waiting}
+        still = {card.task_id: await _listed(client, card) for card in waiting}
+        # Each of the other two takes the answer its own stop takes, as before.
+        question_taken = await _answer(client, items[asked.task_id]["decision_ref"], {
+            "stop_ref": items[asked.task_id]["question"]["stop_ref"], "choice": 2, "words": None,
+        })
+        capability_taken = await _answer(client, items[capability.task_id]["decision_ref"], {
+            "stop_ref": items[capability.task_id]["question"]["stop_ref"], "choice": None, "words": _WORDS,
+        })
+
+    assert [items[card.task_id]["question"]["stop"] for card in (asked, capability, brief)] == [
+        "question", "plain", "stopped_briefly",
+    ]
+    assert taken == _answered(
+        items[brief.task_id]["decision_ref"], items[brief.task_id]["question"]["stop_ref"], 1, True,
+    )
+    assert (_observed(brief)["status"], _observed(brief)["unblocked"]) == ("ready", 1)
+    assert after == before and still == {card.task_id: items[card.task_id] for card in waiting}
+    assert question_taken == _answered(
+        items[asked.task_id]["decision_ref"], items[asked.task_id]["question"]["stop_ref"], 2, True,
+    )
+    assert capability_taken == _answered(
+        items[capability.task_id]["decision_ref"], items[capability.task_id]["question"]["stop_ref"], None, True,
+    )
+    for card in (asked, capability, brief):
+        assert (_observed(card)["status"], _observed(card)["unblocked"], len(_observed(card)["answers"])) == (
+            "ready", 1, 1,
+        )
